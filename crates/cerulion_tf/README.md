@@ -26,6 +26,13 @@ frames, and the tf buffer that answers `lookup(parent, child, time)`.
 The crate docs (`cargo doc -p cerulion_tf --open`) state every rule; the user
 guide is `docs/transforms.md`.
 
+## Gates
+
+Two gates hold the crate to these rules. `tests/determinism_test.rs` pins
+exact output bits, and `mutants-baseline.txt` records the
+`cargo mutants -p cerulion_tf` result: a surviving mutant that is not listed
+there with a reason is a gap in the tests.
+
 ## License
 
 AGPL-3.0-only.

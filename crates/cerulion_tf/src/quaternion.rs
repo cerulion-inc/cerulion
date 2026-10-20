@@ -127,12 +127,24 @@ impl UnitQuaternion {
     /// can lose its low bits. Finite input therefore gives finite output
     /// whenever the rotated vector itself is representable.
     pub fn rotate(&self, v: [f64; 3]) -> [f64; 3] {
-        let m = v[0].abs().max(v[1].abs()).max(v[2].abs());
-        if m > Self::ROTATE_SCALE_ABOVE {
-            let r = self.rotate_in_range([v[0] * 0.125, v[1] * 0.125, v[2] * 0.125]);
-            return [r[0] * 8.0, r[1] * 8.0, r[2] * 8.0];
+        if needs_scaling(v) {
+            return scale3(self.rotate_in_range(scale3(v, 0.125)), 8.0);
         }
         self.rotate_in_range(v)
+    }
+
+    /// `R v + add`, with `add` joining inside the scaled range when
+    /// [`Self::rotate`] scales: a rotated vector past `f64::MAX` that `add`
+    /// brings back below it stays finite. Unscaled, it is exactly
+    /// `rotate(v)` plus `add`, component by component.
+    pub(crate) fn rotate_then_add(&self, v: [f64; 3], add: [f64; 3]) -> [f64; 3] {
+        if needs_scaling(v) {
+            let r = self.rotate_in_range(scale3(v, 0.125));
+            let a = scale3(add, 0.125);
+            return scale3([r[0] + a[0], r[1] + a[1], r[2] + a[2]], 8.0);
+        }
+        let r = self.rotate_in_range(v);
+        [r[0] + add[0], r[1] + add[1], r[2] + add[2]]
     }
 
     /// Above this largest component magnitude, [`Self::rotate`] scales the
@@ -172,7 +184,7 @@ impl UnitQuaternion {
     /// 2. `t == 0` returns `self` and `t == 1` returns `other`, bit for bit
     ///    and with their signs as given. Equal inputs (`self == other`)
     ///    return `self` bit for bit for every `t`; the renormalized blend
-    ///    could round 1 ulp away.
+    ///    could land 1 ulp away.
     /// 3. Shortest arc: when the 4-D dot product `a . b` is negative,
     ///    `other` is negated first (same rotation, the nearer sign). The sign
     ///    comes from the dot product, not from comparing `|b - a|` with
@@ -281,6 +293,18 @@ pub(crate) fn check_fraction(t: f64) -> Result<(), TfMathError> {
 /// a fixed order.
 fn norm4(v: [f64; 4]) -> f64 {
     (((v[0] * v[0] + v[1] * v[1]) + v[2] * v[2]) + v[3] * v[3]).sqrt()
+}
+
+/// Whether a vector's largest component is above
+/// [`UnitQuaternion::ROTATE_SCALE_ABOVE`], so rotating it needs the 1/8
+/// scaling.
+fn needs_scaling(v: [f64; 3]) -> bool {
+    v[0].abs().max(v[1].abs()).max(v[2].abs()) > UnitQuaternion::ROTATE_SCALE_ABOVE
+}
+
+/// Every component times `k`. Only ever called with an exact power of two.
+fn scale3(v: [f64; 3], k: f64) -> [f64; 3] {
+    [v[0] * k, v[1] * k, v[2] * k]
 }
 
 /// The cross product `a x b`.

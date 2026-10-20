@@ -282,7 +282,7 @@ fn equal_quaternions_interpolate_to_themselves() {
 
 #[test]
 fn equal_quaternions_slerp_to_themselves_bit_for_bit() {
-    // (1 - t) q + t q renormalized can round 1 ulp off q, so equal inputs
+    // (1 - t) q + t q renormalized can land 1 ulp off q, so equal inputs
     // must short-circuit. 0.1, 0.2, 0.3 make a blend that is not exact.
     let a = q(0.1, 0.2, 0.3, 0.9);
     for t in [0.1, 0.3, 0.5, 0.7, 0.9] {

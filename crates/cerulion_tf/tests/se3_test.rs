@@ -414,6 +414,25 @@ fn transform_inverse_and_compose_accept_a_translation_near_the_f64_limit() {
 }
 
 #[test]
+fn apply_point_adds_the_translation_before_the_result_can_overflow() {
+    // 45 about z maps (1.7e308, 1.7e308, 3e307) to (0, 3.4e308 / sqrt 2,
+    // 3e307): the rotated y alone is past f64::MAX, but the translation
+    // brings it back to 3.4e308 / sqrt 2 - 1e308 = 1.4041630560342616e308
+    // (from 40-digit arithmetic).
+    let s = 0.382_683_432_365_089_8; // sin 22.5
+    let c = 0.923_879_532_511_286_7; // cos 22.5
+    let t = tf([5e307, -1e308, -7e307], q(0.0, 0.0, s, c));
+    let got = t.apply_point([1.7e308, 1.7e308, 3e307]);
+    assert!(got.iter().all(|v| v.is_finite()), "got {got:?}");
+    // A few ulps at this magnitude.
+    assert_close3(got, [5e307, 1.404_163_056_034_261_6e308, -4e307], 1e294);
+    // compose builds its translation the same way, so it accepts this too.
+    let far = tf([1.7e308, 1.7e308, 3e307], UnitQuaternion::IDENTITY);
+    let chained = t.compose(&far).unwrap();
+    assert_eq!(chained.translation(), got);
+}
+
+#[test]
 fn rotation_at_the_scaling_threshold_is_exact_for_the_identity() {
     // At the threshold itself no scaling applies, so the identity returns
     // even a subnormal component bit for bit (a 1/8 scaling would round

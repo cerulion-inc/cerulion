@@ -64,12 +64,7 @@ impl Transform {
     /// result, and so does a finite point whose image `R p + t` is past
     /// `f64::MAX`.
     pub fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
-        let r = self.rotation.rotate(p);
-        [
-            r[0] + self.translation[0],
-            r[1] + self.translation[1],
-            r[2] + self.translation[2],
-        ]
+        self.rotation.rotate_then_add(p, self.translation)
     }
 
     /// Maps a direction (a free vector) from child to parent coordinates:
@@ -123,7 +118,7 @@ impl Transform {
     /// `t == 0` returns `self` and `t == 1` returns `other`, bit for bit.
     /// A translation component that is equal at both ends is returned as
     /// is, so a frame that does not move interpolates to itself bit for bit
-    /// (the blend `(1 - t) a + t a` can round 1 ulp away from `a`). Other
+    /// (the blend `(1 - t) a + t a` can land 1 ulp away from `a`). Other
     /// components stay within rounding of the segment between their
     /// endpoints, so two finite translations do not overflow when blended.
     ///
@@ -141,7 +136,7 @@ impl Transform {
         }
         let (a, b) = (self.translation, other.translation);
         let u = 1.0 - t;
-        // Equal components short-circuit: the blend can round 1 ulp off.
+        // Equal components short-circuit: the blend can land 1 ulp off.
         let blend = |from: f64, to: f64| if from == to { from } else { u * from + t * to };
         Ok(Self {
             translation: [blend(a[0], b[0]), blend(a[1], b[1]), blend(a[2], b[2])],
