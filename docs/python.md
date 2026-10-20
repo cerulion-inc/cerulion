@@ -440,6 +440,7 @@ refused, like `loan` and `env`.
 
 ```python-source
 import cerulion
+from cerulion.msgs.geometry_msgs import PoseStamped
 
 GOAL = """
 header: {stamp: {sec: 0, nanosec: 0}, frame_id: "map"}
@@ -450,7 +451,7 @@ pose:
 
 @cerulion.node(period_ms=500)
 class Goal:
-    out = cerulion.output("geometry_msgs/PoseStamped")
+    out = cerulion.output(PoseStamped)
 
     def tick(self):
         self.publish_yaml("out", GOAL)

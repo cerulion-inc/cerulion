@@ -1,10 +1,11 @@
-import cerulion as cer
+import cerulion
+from cerulion.msgs import Probe
 
 
-@cer.node(period_ms=10)
+@cerulion.node(period_ms=10)
 class CodecDict:
-    inp = cer.input("Probe", depth=1)
-    out = cer.output("Probe")
+    inp = cerulion.input(Probe, depth=1)
+    out = cerulion.output(Probe)
 
     def tick(self):
         # The received message read back as a dict, republished from one.

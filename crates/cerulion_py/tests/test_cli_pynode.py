@@ -372,14 +372,15 @@ pose:
 """
 
 POSE_NODE = f'''\
-import cerulion as cer
+import cerulion
+from cerulion.msgs.geometry_msgs import PoseStamped
 
 POSE = """{POSE_YAML}"""
 
 
-@cer.node(period_ms=10)
+@cerulion.node(period_ms=10)
 class PosePub:
-    out = cer.output("geometry_msgs/PoseStamped")
+    out = cerulion.output(PoseStamped)
 
     def tick(self):
         self.publish_yaml("out", POSE)

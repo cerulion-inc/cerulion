@@ -1,11 +1,12 @@
 import os
 
-import cerulion as cer
+import cerulion
+from cerulion.msgs import Samples
 
 
-@cer.node(period_ms=10)
+@cerulion.node(period_ms=10)
 class Codec:
-    out = cer.output("Samples", max_slice_len_default=96)
+    out = cerulion.output(Samples, max_slice_len_default=96)
 
     def tick(self):
         case = os.environ.get("CERULION_PYNODE_CASE")
@@ -22,7 +23,7 @@ class Codec:
             frame = self._cer_schemas.yaml_to_message("Samples", 'name: ""\nsamples: []\n')
             try:
                 self._cer_publish_frame("out", frame + bytes(8))
-            except cer.EncodeError as err:
+            except cerulion.EncodeError as err:
                 if err.kind != "FrameLoanSizeMismatch":
                     raise
         else:
