@@ -107,7 +107,7 @@
 50 crates/cerulion_core/src/codegen/generator/structs.rs
 2 crates/cerulion_core/src/codegen/generator/wire_impl.rs
 1 crates/cerulion_core/src/codegen/layout.rs
-6 crates/cerulion_core/src/codegen/resolve.rs
+5 crates/cerulion_core/src/codegen/resolve.rs
 1 crates/cerulion_core/src/codegen/route_budget.rs
 1 crates/cerulion_core/src/codegen/schema.rs
 9 crates/cerulion_core/src/codegen/slice_ceiling.rs
