@@ -1,0 +1,12 @@
+exit: Some(0)
+--- stdout
+schema: geometry_msgs/Point
+source: built-in (ROS 2)
+wire fixed size: 24 bytes
+hash: 0xe2e86dbf1b427b9b
+fields: 3
+  x: float64 (fixed)
+  y: float64 (fixed)
+  z: float64 (fixed)
+
+--- stderr
