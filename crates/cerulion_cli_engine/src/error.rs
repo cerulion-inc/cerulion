@@ -57,6 +57,44 @@ pub enum CliError {
     /// (`cerulion login`) where the failure is a missing/expired identity.
     #[error("{0}")]
     Login(String),
+    /// One or more nodes returned `NodeError::Fatal` during the run and were
+    /// stopped: `(node id, the fatal error's message)` in graph order. The run
+    /// itself completed; the process exits with [`EXIT_NODE_FATAL`].
+    #[error("{}", render_node_fatal(.nodes))]
+    NodeFatal { nodes: Vec<(String, String)> },
+}
+
+/// Exit status of a `graph run` in which a node was stopped by a fatal error.
+/// The same number as `bag play --resim --verify`'s node-failure exit.
+pub const EXIT_NODE_FATAL: u8 = 3;
+
+impl CliError {
+    /// The process exit status for this error: [`EXIT_NODE_FATAL`] for
+    /// [`CliError::NodeFatal`], 1 for everything else.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NodeFatal { .. } => EXIT_NODE_FATAL,
+            _ => 1,
+        }
+    }
+}
+
+fn render_node_fatal(nodes: &[(String, String)]) -> String {
+    let parts: Vec<String> = nodes
+        .iter()
+        .map(|(node, message)| format!("node '{node}' stopped on a fatal error: {message}"))
+        .collect();
+    parts.join("; ")
+}
+
+/// The verdict for a finished run: `Err(NodeFatal)` when any node was
+/// stopped by a fatal error, else `Ok`.
+pub fn node_fatal_verdict(nodes: Vec<(String, String)>) -> CliResult<()> {
+    if nodes.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::NodeFatal { nodes })
+    }
 }
 
 /// Result type alias for CLI operations.
@@ -100,6 +138,31 @@ pub fn render_user_error(error: &CliError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_with_no_fatal_node_is_ok() {
+        assert!(node_fatal_verdict(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_fatal_node_exits_3_and_names_every_node_and_message() {
+        let err = node_fatal_verdict(vec![
+            ("lidar".to_string(), "Fatal error: lost".to_string()),
+            ("imu".to_string(), "Fatal error: bus off".to_string()),
+        ])
+        .expect_err("a fatal node fails the run");
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(
+            err.to_string(),
+            "node 'lidar' stopped on a fatal error: Fatal error: lost; \
+             node 'imu' stopped on a fatal error: Fatal error: bus off"
+        );
+    }
+
+    #[test]
+    fn every_other_error_keeps_exit_1() {
+        assert_eq!(CliError::Validation("x".to_string()).exit_code(), 1);
+    }
 
     #[test]
     fn missing_libpython_remedy_also_covers_a_typed_node_error() {

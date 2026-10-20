@@ -18,7 +18,7 @@ use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 
-/// `(CER_ERROR_KIND word, expected kind, expected message)`, hand-written.
+/// `(CERULION_TEST_ERROR_KIND word, expected kind, expected message)`, hand-written.
 const VECTORS: &[(&str, NodeErrorKind, &str)] = &[
     ("logic", NodeErrorKind::Logic, "Logic error: probe logic"),
     (

@@ -6030,6 +6030,9 @@ pub fn graph_run(
     let env_us = std::env::var(CPU_DMA_LOCK_US_ENV).ok();
     let auto_cap = cerulion_core::dma_lock::deepest_nonflushing_cap_us();
 
+    // Nodes stopped by `NodeError::Fatal`, harvested from the runtime just
+    // before it shuts down; folded into the run's verdict (exit 3) below.
+    let fatal_nodes: Vec<(String, String)>;
     match time_source {
         TimeSource::Virtual => {
             // DETERMINISTIC path (replay / bench): VirtualClock + 1 ms poll loop.
@@ -6093,6 +6096,7 @@ pub fn graph_run(
                 graph_run_step(&mut runtime, false);
             }
             tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
         TimeSource::Real | TimeSource::External => {
@@ -6484,12 +6488,13 @@ pub fn graph_run(
                 gw.forward_shutdown(graph_name);
             }
             tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
     }
     // Both monolith arms end here: stop the `ros2:` children gracefully and
-    // fold a `--peer-loss fail` death into the verdict.
-    ros2_children.finish(Ok(()))
+    // fold a `--peer-loss fail` death and any fatal node into the verdict.
+    ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
 }
 
 /// Run ONE worker process of a multi-process deployment from
@@ -20120,6 +20125,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // note (the counters live in-cdylib, where the host cannot read them) —
     // never silently nothing.
     runtime.log_publisher_reconciliation_stats();
+    // Nodes stopped by `NodeError::Fatal`: reported (exit 3) only after the
+    // bag is finalized, so a fatal run still leaves its recording.
+    let fatal_nodes = runtime.node_fatal_errors();
 
     // ---- (9) Ordered teardown: STOP the graph FIRST (publishers drop), THEN
     // signal bagd (SIGTERM → clean final-drain + finalize), THEN bounded-wait.
@@ -20141,7 +20149,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // was already logged above.
     run_result?;
 
-    bagd_result
+    bagd_result?;
+    crate::error::node_fatal_verdict(fatal_nodes)
 }
 
 /// Report the recorder's exit outcome LOUDLY:

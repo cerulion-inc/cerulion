@@ -3,11 +3,12 @@
 //! that the error's KIND crosses the cdylib boundary as a typed value.
 //!
 //! The node reads two keys from its env snapshot in `init` (the frozen
-//! snapshot, never the live process env, so a resim sees the same values):
+//! snapshot, never the live process env, so a resim sees the same values;
+//! the `CERULION_` prefix keeps them in a recording's default env allowlist):
 //!
-//! - `CER_ERROR_KIND`: `logic`, `invalid_input`, `fatal`, `custom`,
+//! - `CERULION_TEST_ERROR_KIND`: `logic`, `invalid_input`, `fatal`, `custom`,
 //!   `transport` or `io`. Empty means the node never fails.
-//! - `CER_ERROR_AT`: `init`, `shutdown`, or a tick number `N` (1-based): the
+//! - `CERULION_TEST_ERROR_AT`: `init`, `shutdown`, or a tick number `N` (1-based): the
 //!   node publishes on ticks before `N` and returns the error from tick `N`
 //!   onward. Empty means tick 1.
 //!
@@ -19,7 +20,7 @@
 use cerulion_core::prelude::*;
 use native_ros2_messages::geometry_msgs::Vector3;
 
-/// The error for one `CER_ERROR_KIND` word, or `None` for no failure.
+/// The error for one `CERULION_TEST_ERROR_KIND` word, or `None` for no failure.
 fn error_for(kind: &str) -> Option<NodeError> {
     Some(match kind {
         "logic" => NodeError::Logic("probe logic".to_string()),
@@ -47,8 +48,8 @@ struct ErrorKindProbe {
 #[cerulion_node_impl]
 impl ErrorKindProbe {
     fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
-        self.kind = ctx.env_str("CER_ERROR_KIND", "");
-        self.at = ctx.env_str("CER_ERROR_AT", "");
+        self.kind = ctx.env_str("CERULION_TEST_ERROR_KIND", "");
+        self.at = ctx.env_str("CERULION_TEST_ERROR_AT", "");
         if self.at == "init" {
             if let Some(e) = error_for(&self.kind) {
                 return Err(e);

@@ -27,7 +27,7 @@ use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use serial_test::serial;
 
-/// `(CER_ERROR_KIND word, expected kind, expected message)`, hand-written.
+/// `(CERULION_TEST_ERROR_KIND word, expected kind, expected message)`, hand-written.
 const VECTORS: &[(&str, NodeErrorKind, &str)] = &[
     ("logic", NodeErrorKind::Logic, "Logic error: probe logic"),
     (
@@ -69,8 +69,8 @@ fn cdylib_context(tt: &TestTransport, topic: &str, kind: &str, at: &str) -> Node
     let mut publishers: IndexMap<String, AnyPublisher> = IndexMap::new();
     publishers.insert("out".to_string(), AnyPublisher::Ipc(publisher));
     let mut env = HashMap::new();
-    env.insert("CER_ERROR_KIND".to_string(), kind.to_string());
-    env.insert("CER_ERROR_AT".to_string(), at.to_string());
+    env.insert("CERULION_TEST_ERROR_KIND".to_string(), kind.to_string());
+    env.insert("CERULION_TEST_ERROR_AT".to_string(), at.to_string());
     NodeContext::with_runtime_env(
         publishers,
         IndexMap::new(),

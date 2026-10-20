@@ -336,7 +336,9 @@ fn dispatch(cli: Cli) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", render_user_error(&e));
-            ExitCode::FAILURE
+            // 1 for every error, except a run that stopped a node on a fatal
+            // error (`EXIT_NODE_FATAL`).
+            ExitCode::from(e.exit_code())
         }
     }
 }
