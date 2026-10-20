@@ -1906,3 +1906,66 @@ fn walk_keeping_holds_no_zero_size_elements() {
         0
     );
 }
+
+/// Zero-width fixed strings carry no bytes: a fixed array of them prints
+/// its declared number of empty strings and reads back.
+#[test]
+fn a_fixed_array_of_zero_width_strings_prints_its_declared_length() {
+    let schema = one_field_schema(
+        "Z",
+        "s",
+        FieldType::FixedArray {
+            element_type: Box::new(FieldType::StringFixed(0)),
+            length: 3,
+        },
+    );
+    let (set, _) = SchemaSet::from_schemas(vec![schema]).unwrap();
+    let w = set.walker();
+    let frame = empty_frame(&set, "Z");
+    assert_both_ways(w, "Z", &frame, "s: [\"\", \"\", \"\"]\n");
+    assert_eq!(
+        decode_err(w, "Z", "s: [\"\", \"\"]\n"),
+        "s: expected exactly 3 elements, got 2"
+    );
+}
+
+/// `M0` holds eight levels of message arrays above `M8`'s `string[]`.
+const ARRAY_CHAIN_YAML: &str = "schemas:\n  M8:\n    fields:\n      string[] s: {}\n  M7:\n    fields:\n      M8[] a: {}\n  M6:\n    fields:\n      M7[] a: {}\n  M5:\n    fields:\n      M6[] a: {}\n  M4:\n    fields:\n      M5[] a: {}\n  M3:\n    fields:\n      M4[] a: {}\n  M2:\n    fields:\n      M3[] a: {}\n  M1:\n    fields:\n      M2[] a: {}\n  M0:\n    fields:\n      M1[] a: {}\n";
+
+/// The text of `M<top>` (`top < 8`) with one element per array, down to
+/// `s: <leaf>`.
+fn array_chain_text(top: usize, leaf: &str) -> String {
+    let mut text = "a:\n".to_string();
+    for level in 0..7 - top {
+        text.push_str(&format!("{:w$}- a:\n", "", w = 2 + 4 * level));
+    }
+    text.push_str(&format!("{:w$}- s: {leaf}\n", "", w = 2 + 4 * (7 - top)));
+    text
+}
+
+/// The reader refuses an array the walker would not decode, so every
+/// message it accepts prints back.
+#[test]
+fn arrays_past_the_walker_depth_are_refused_on_read() {
+    let set = set_from_yaml(ARRAY_CHAIN_YAML);
+    let w = set.walker();
+    // Nine nested arrays: the ninth, `s`, is refused.
+    let text = array_chain_text(0, "[\"x\"]");
+    assert_eq!(
+        decode_err(w, "M0", &text),
+        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: arrays of messages nest deeper than 8 levels"
+    );
+    // An empty `string[]` still writes its count, so it is refused too.
+    assert_eq!(
+        decode_err(w, "M0", &array_chain_text(0, "[]")),
+        "a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].s: arrays of messages nest deeper than 8 levels"
+    );
+    // Eight nested arrays read and print back.
+    let eight = array_chain_text(1, "[\"x\"]");
+    assert_eq!(
+        eight,
+        "a:\n  - a:\n      - a:\n          - a:\n              - a:\n                  - a:\n                      - a:\n                          - s: [\"x\"]\n"
+    );
+    let frame = yaml_to_message(w, "M1", eight.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), eight);
+}

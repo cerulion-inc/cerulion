@@ -1524,7 +1524,7 @@ pub const MAX_WALK_NESTING: u32 = 256;
 /// through `walk_payload` at the same array depth; a *recursive* schema
 /// (`Node { Node child, string tag }`) there is bounded by
 /// [`MAX_WALK_NESTING`] instead.
-const MAX_NESTED_ARRAY_DEPTH: u32 = 8;
+pub(crate) const MAX_NESTED_ARRAY_DEPTH: u32 = 8;
 
 /// Upper bound on the element `Vec`'s UP-FRONT capacity.
 ///

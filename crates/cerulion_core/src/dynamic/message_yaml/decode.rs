@@ -5,7 +5,10 @@ use serde_yaml::{Mapping, Value};
 
 use super::encode::format_f32;
 use super::scan::find_anchor_or_alias;
-use super::{push_field, push_index, shown, type_name, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG};
+use super::{
+    push_field, push_index, shown, type_name, MAX_YAML_ARRAY_DEPTH, MAX_YAML_DEPTH,
+    YAML_TRUNCATED_TAG,
+};
 use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
 use crate::codegen::layout::WireLayout;
 use crate::codegen::{FieldBounds, FieldDef, FieldType, FrameWalker, MessageSchema};
@@ -65,6 +68,7 @@ pub fn yaml_to_message(
     let mut builder = Builder {
         walker,
         path: String::new(),
+        array_depth: 0,
     };
     let payload = builder.body(layout, &value, 0)?;
     let total = WireHeader::SIZE + payload.len();
@@ -129,6 +133,9 @@ fn kind(v: &Value) -> &'static str {
 struct Builder<'w> {
     walker: &'w FrameWalker,
     path: String,
+    /// How many elements of variable-message arrays enclose the value
+    /// being built.
+    array_depth: usize,
 }
 
 impl<'w> Builder<'w> {
@@ -161,6 +168,19 @@ impl<'w> Builder<'w> {
             }),
             other => Ok(other),
         }
+    }
+
+    /// Refuse an element array with bytes past [`MAX_YAML_ARRAY_DEPTH`]:
+    /// the walker would hand them back undecoded. A counted array writes
+    /// its count even when empty; back-to-back elements write nothing then.
+    fn array_within_depth(&self, items: &[Value], counted: bool) -> Result<(), DynamicError> {
+        if (counted || !items.is_empty()) && self.array_depth >= MAX_YAML_ARRAY_DEPTH {
+            return Err(DynamicError::YamlArraysTooDeep {
+                path: self.here(),
+                max: MAX_YAML_ARRAY_DEPTH,
+            });
+        }
+        Ok(())
     }
 
     fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
@@ -547,6 +567,7 @@ impl<'w> Builder<'w> {
                 let at = Builder {
                     walker: self.walker,
                     path,
+                    array_depth: self.array_depth,
                 };
                 at.untagged(item)?;
             }
@@ -655,6 +676,7 @@ impl<'w> Builder<'w> {
             | FieldType::F64 => self.byte_list(ft, elem, v, exact),
             FieldType::String => {
                 let items = self.sequence(ft, v, exact)?;
+                self.array_within_depth(items, true)?;
                 let mut out = count_prefix(items.len(), &self.path)?;
                 for (i, item) in items.iter().enumerate() {
                     let mark = self.path.len();
@@ -677,6 +699,7 @@ impl<'w> Builder<'w> {
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
                 let counted = !target.is_fixed();
+                self.array_within_depth(items, counted)?;
                 // A fieldless fixed element is zero bytes with no count, so
                 // the wire cannot say how many there were: only the empty
                 // array has a frame, and any other is refused rather than
@@ -695,7 +718,10 @@ impl<'w> Builder<'w> {
                 for (i, item) in items.iter().enumerate() {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
-                    let body = self.body(target, item, depth + 1)?;
+                    self.array_depth += usize::from(counted);
+                    let body = self.body(target, item, depth + 1);
+                    self.array_depth -= usize::from(counted);
+                    let body = body?;
                     if counted {
                         out.extend(len_prefix(body.len(), &self.path)?);
                     }
