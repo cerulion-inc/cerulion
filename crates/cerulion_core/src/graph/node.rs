@@ -744,6 +744,9 @@ impl NodeInfo {
     /// input with its stamp location, as
     /// [`crate::graph::validation::resolve_capture_sync_stamps`] resolves them
     /// from the schemas.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     pub fn with_sync_capture_stamps(
         mut self,
         locations: IndexMap<String, HeaderStampLocation>,
@@ -754,6 +757,8 @@ impl NodeInfo {
 
     /// The capture-time stamp locations, when this node matches its Sync
     /// trigger on `header.stamp`. See [`Self::with_sync_capture_stamps`].
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
         self.sync_capture.as_ref()
     }
@@ -2116,6 +2121,9 @@ impl NodeContext {
     /// of the frame that op placed. A pure read of a frame already held: no
     /// pop, no accounting. `None` for an unknown input or an empty slot, which
     /// the driver reports as a failed op.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     pub fn sync_capture_stamp(
         &self,
         input_name: &str,
@@ -3297,6 +3305,7 @@ pub trait NodeEntry: Send {
     /// Default `None`: an entry that does not declare
     /// [`Self::supports_sync_capture_stamps`] is refused capture-time matching
     /// at graph build, so this default is never asked.
+    #[doc(hidden)]
     fn sync_capture_stamp(
         &mut self,
         _input_name: &str,
@@ -3309,6 +3318,7 @@ pub trait NodeEntry: Send {
     /// Does [`Self::sync_capture_stamp`] really read the node's frames? Read
     /// once at graph build: a node that opts in to capture-time matching
     /// without it is refused with an error naming the node.
+    #[doc(hidden)]
     fn supports_sync_capture_stamps(&self) -> bool {
         false
     }

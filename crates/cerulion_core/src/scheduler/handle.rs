@@ -605,11 +605,13 @@ pub struct SyncCounters {
     /// their `header.stamp` could not be decoded (a truncated frame, a
     /// negative `sec`, a `nanosec` of a second or more). 0 on a publish-time
     /// node. Unconditional, never reset.
+    #[doc(hidden)]
     pub capture_decode_failures: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
     /// Per trigger input of a CAPTURE-TIME node: frames discarded because
     /// their `header.stamp` went backwards (by no more than the window) behind
     /// a frame this input already contributed. 0 on a publish-time node.
     /// Unconditional, never reset.
+    #[doc(hidden)]
     pub capture_backwards_drops: RwLock<IndexMap<Arc<str>, Arc<AtomicU64>>>,
     /// Does a COMPLETE aligned set sit unfired in the frozen slots right now?
     ///
@@ -758,6 +760,9 @@ impl NodeHandle {
     /// Frames on `input` of a capture-time Sync node discarded because their
     /// `header.stamp` could not be decoded. See
     /// [`SyncCounters::capture_decode_failures`].
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     pub fn sync_capture_decode_failures(&self, input: &str) -> u64 {
         SyncCounters::read(&self.sync.capture_decode_failures, input)
     }
@@ -765,6 +770,9 @@ impl NodeHandle {
     /// Frames on `input` of a capture-time Sync node discarded because their
     /// `header.stamp` went backwards. See
     /// [`SyncCounters::capture_backwards_drops`].
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
     pub fn sync_capture_backwards_drops(&self, input: &str) -> u64 {
         SyncCounters::read(&self.sync.capture_backwards_drops, input)
     }
