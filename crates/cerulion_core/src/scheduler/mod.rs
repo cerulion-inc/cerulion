@@ -39,6 +39,9 @@ pub mod node_death;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
 pub mod sync_match;
+// Capture-time Sync matching. Hidden: it has no user-facing opt-in yet.
+#[doc(hidden)]
+pub mod sync_stamp;
 pub mod trace_merge;
 pub mod trigger;
 // Inert for now: the wake-origin taxonomy the WaitSet reactor will consume.
@@ -3626,6 +3629,8 @@ impl Scheduler {
                 .map(|(input, head)| (input.clone(), head.ts))
                 .collect(),
             input_service: None,
+            sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         })
     }
 
@@ -3692,6 +3697,64 @@ impl Scheduler {
                 node.sync_heads
                     .insert(input.clone(), SyncHead::restored(*ts));
             }
+        }
+    }
+
+    /// Raise one `Sync` input's wire-stamp epoch high-water to at least `ts`
+    /// on a resumed run.
+    ///
+    /// The high-water is what an epoch reset is detected against, and it is
+    /// only ever set by a POP, so a resumed run starts with none: the first
+    /// frame after a clock restart would be filled as an ordinary head instead
+    /// of re-basing the node, and the held partner the live run voided would
+    /// discard it. A capture-time node therefore seeds this from the same
+    /// checkpointed capture stamps that seed its capture high-water, which is
+    /// what keeps the two layers deciding the same epoch.
+    ///
+    /// A value only ever raises the mark (several restore seams may each
+    /// state a stamp for the same input). A non-`Sync` or unknown node is
+    /// left alone, for the reason [`Self::restore_sync_input_timestamps`]
+    /// gives. Must be called BEFORE the first `step()`.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub(crate) fn restore_sync_stamp_high_water(&mut self, node_id: &str, input: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if !matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            return;
+        }
+        let high_water = node
+            .sync_stamp_high_water
+            .entry(input.to_string())
+            .or_insert(ts);
+        *high_water = (*high_water).max(ts);
+    }
+
+    /// The newest stamp of a `Sync` node's current clock epoch, once an epoch
+    /// reset has established one. `None` for any other node, and before the
+    /// node's first reset.
+    pub(crate) fn sync_epoch_floor(&self, node_id: &str) -> Option<u64> {
+        self.nodes.get(node_id)?.sync_epoch_floor
+    }
+
+    /// Set a `Sync` node's epoch floor on a resumed run.
+    ///
+    /// The floor is what a RE-BASED input (one an epoch reset removed the
+    /// high-water of) is tested against, and it is only ever set by a pop, so
+    /// a run resumed between a reset and that input's first in-band frame
+    /// starts with none and would fill an old-epoch straggler the live run
+    /// discards. The re-based input itself needs nothing restored: its
+    /// missing high-water already IS "awaiting re-base".
+    ///
+    /// A non-`Sync` or unknown node is left alone, for the reason
+    /// [`Self::restore_sync_input_timestamps`] gives. Must be called BEFORE
+    /// the first `step()`.
+    pub(crate) fn restore_sync_epoch_floor(&mut self, node_id: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            node.sync_epoch_floor = Some(ts);
         }
     }
 
@@ -4374,6 +4437,17 @@ impl Scheduler {
                 Arc::clone(&node.sync_counters),
             )
         })
+    }
+
+    /// The node's shared Sync counters, for a graph-build seam that counts
+    /// on them from outside the scheduler (capture-time matching).
+    pub(crate) fn sync_counters(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::scheduler::handle::SyncCounters>> {
+        self.nodes
+            .get(id)
+            .map(|node| Arc::clone(&node.sync_counters))
     }
 
     /// Hand the runtime liveliness sweep a clone of

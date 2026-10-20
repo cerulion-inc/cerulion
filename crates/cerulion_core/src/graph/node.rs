@@ -19,6 +19,9 @@
 //! (`nodes/<type>/`), resolved at graph-load time, never carried by
 //! the node itself or its FFI export.
 
+use crate::scheduler::sync_stamp::{
+    capture_stamp_ns, HeaderStampLocation, StampDecodeError, SyncFrameSlot,
+};
 use crate::scheduler::{
     BackpressureEvent, ExpectWithinEvent, LivelinessEvent, PromiseWithinEvent, QosEventStore,
     SyncAlignSite, SyncHeadOp, SyncOpAnswer,
@@ -443,6 +446,13 @@ pub struct NodeInfo {
     /// runtime consumes it through `NodeInfo::throttle_ms` to install the
     /// pre-fire time-gate.
     pub(crate) throttle_ms: Option<u64>,
+    /// Capture-time Sync matching: when `Some`, this Sync node aligns its
+    /// trigger inputs on each message's `header.stamp` instead of publish
+    /// time, and the map gives every trigger input's resolved stamp location,
+    /// keyed by input name. `None` keeps publish-time matching. Set through
+    /// [`Self::with_sync_capture_stamps`]; the graph build refuses a node whose
+    /// map misses a trigger input.
+    pub(crate) sync_capture: Option<IndexMap<String, HeaderStampLocation>>,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -637,6 +647,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -675,6 +686,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -718,6 +730,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -727,6 +740,31 @@ impl NodeInfo {
     pub fn with_policy(mut self, policy: MacroPolicy) -> Self {
         self.policy = Some(policy);
         self
+    }
+
+    /// Builder that switches a Sync node to capture-time matching: its
+    /// trigger inputs align on `header.stamp` (the time the data was
+    /// captured) instead of publish time. `locations` names every trigger
+    /// input with its stamp location, as
+    /// [`crate::graph::validation::resolve_capture_sync_stamps`] resolves them
+    /// from the schemas.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn with_sync_capture_stamps(
+        mut self,
+        locations: IndexMap<String, HeaderStampLocation>,
+    ) -> Self {
+        self.sync_capture = Some(locations);
+        self
+    }
+
+    /// The capture-time stamp locations, when this node matches its Sync
+    /// trigger on `header.stamp`. See [`Self::with_sync_capture_stamps`].
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
+        self.sync_capture.as_ref()
     }
 
     /// Builder that attaches a per-node
@@ -1433,6 +1471,14 @@ impl AnySubscriber {
         }
     }
 
+    /// The bytes of the frame a per-set Sync slot holds. See
+    /// `CerulionSubscriber::sync_frame`.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match self {
+            Self::Ipc(s) => s.sync_frame(slot),
+        }
+    }
+
     /// `Void`: serve a RESTORED (stamp-only, unbacked) head's read as
     /// "no frame", in place and WITHOUT draining. See
     /// `CerulionSubscriber::sync_void_head`.
@@ -2069,6 +2115,27 @@ impl NodeContext {
                 SyncOpAnswer::Nothing
             }
         }
+    }
+
+    /// Decode the capture stamp (`header.stamp`) of the frame a per-set Sync
+    /// slot of `input_name` holds, at `location`.
+    ///
+    /// The frame-access half of capture-time Sync matching: the align driver
+    /// performs a head op through [`Self::sync_head_op`], then reads the stamp
+    /// of the frame that op placed. A pure read of a frame already held: no
+    /// pop, no accounting. `None` for an unknown input or an empty slot, which
+    /// the driver reports as a failed op.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamp(
+        &self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        let frame = self.subscribers.get(input_name)?.sync_frame(slot)?;
+        Some(capture_stamp_ns(frame, location))
     }
 
     /// Take the edge-triggered [`BackpressureEvent`] for
@@ -3235,6 +3302,31 @@ pub trait NodeEntry: Send {
         false
     }
 
+    /// Decode the capture stamp of the frame a per-set Sync slot holds, for a
+    /// node that matches its Sync trigger on `header.stamp`. See
+    /// [`NodeContext::sync_capture_stamp`].
+    ///
+    /// Default `None`: an entry that does not declare
+    /// [`Self::supports_sync_capture_stamps`] is refused capture-time matching
+    /// at graph build, so this default is never asked.
+    #[doc(hidden)]
+    fn sync_capture_stamp(
+        &mut self,
+        _input_name: &str,
+        _slot: SyncFrameSlot,
+        _location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        None
+    }
+
+    /// Does [`Self::sync_capture_stamp`] really read the node's frames? Read
+    /// once at graph build: a node that opts in to capture-time matching
+    /// without it is refused with an error naming the node.
+    #[doc(hidden)]
+    fn supports_sync_capture_stamps(&self) -> bool {
+        false
+    }
+
     /// Does [`Self::snapshot_inputs`] REALLY freeze this
     /// node's non-trigger (latest-value) inputs, vs being the no-op default?
     ///
@@ -3549,6 +3641,23 @@ impl NodeEntry for ClosureNodeEntry {
     // warned-misuse path either way, which is why one flag governs both rather
     // than a second flag restating it.
     fn supports_sync_head_ops(&self) -> bool {
+        self.unified_drain
+    }
+
+    fn sync_capture_stamp(
+        &mut self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        self.context
+            .as_ref()?
+            .sync_capture_stamp(input_name, slot, location)
+    }
+
+    // The same condition as the head ops: the stamp is read off the slot the
+    // head ops fill, so one capability without the other cannot happen.
+    fn supports_sync_capture_stamps(&self) -> bool {
         self.unified_drain
     }
 }
@@ -7951,6 +8060,7 @@ mod tests {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);
