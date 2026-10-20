@@ -617,23 +617,18 @@ fn follow_clock<S: ClockSource>(
             break;
         }
         let read = source.read()?;
-        // A rejected frame advances nothing, so it counts as silence for the
-        // stall warning exactly as an empty poll does.
-        if !matches!(read, ClockRead::Sample(_)) && stall.poll_idle().is_some() {
-            tracing::warn!(
-                graph = %graph_name,
-                topic = SIM_CLOCK_TOPIC,
-                last_ns = feed.last_ns().unwrap_or(0),
-                "{CLOCK_STALLED_WARNING}"
-            );
-        }
-        match read {
-            ClockRead::Empty => std::thread::sleep(pacing.idle),
-            ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
+        let empty = matches!(read, ClockRead::Empty);
+        // The advance this read makes; `None` for an empty poll, a rejected
+        // frame and a refused (backward) sample alike.
+        let advance = match read {
+            ClockRead::Empty => None,
+            ClockRead::Rejected(why) => {
+                diagnostics.note_rejected(graph_name, why);
+                None
+            }
             ClockRead::Sample(ns) => {
                 let last_ns = feed.last_ns();
-                // The advance an accepted sample makes, `None` for a refused one.
-                let advance = match feed.offer(ns) {
+                match feed.offer(ns) {
                     SimClockVerdict::Forward { delta_ns } => Some(Duration::from_nanos(delta_ns)),
                     // A feed that already holds its epoch never answers
                     // `First`; it is listed with `Equal` so the match stays
@@ -643,20 +638,34 @@ fn follow_clock<S: ClockSource>(
                         diagnostics.note_backwards(graph_name, last_ns.unwrap_or(0), by_ns);
                         None
                     }
-                };
-                if let Some(advance) = advance {
-                    diagnostics.note_sample_accepted(graph_name);
-                    if stall.sample_accepted() {
-                        tracing::info!(
-                            graph = %graph_name,
-                            topic = SIM_CLOCK_TOPIC,
-                            "clock samples are arriving again"
-                        );
-                    }
-                    runtime.step(advance);
                 }
             }
+        };
+        let Some(advance) = advance else {
+            // Nothing moved graph time, so every kind of non-advance counts
+            // as silence for the stall warning.
+            if stall.poll_idle().is_some() {
+                tracing::warn!(
+                    graph = %graph_name,
+                    topic = SIM_CLOCK_TOPIC,
+                    last_ns = feed.last_ns().unwrap_or(0),
+                    "{CLOCK_STALLED_WARNING}"
+                );
+            }
+            if empty {
+                std::thread::sleep(pacing.idle);
+            }
+            continue;
+        };
+        diagnostics.note_sample_accepted(graph_name);
+        if stall.sample_accepted() {
+            tracing::info!(
+                graph = %graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                "clock samples are arriving again"
+            );
         }
+        runtime.step(advance);
     }
     Ok(())
 }
@@ -682,7 +691,7 @@ impl StallWatch {
         }
     }
 
-    /// An idle poll (nothing waiting, or a frame that was rejected):
+    /// An idle poll (nothing waiting, a rejected frame, or a refused sample):
     /// `Some(text)` exactly once per stall, the first idle poll at or past
     /// `grace` since the last accepted sample.
     fn poll_idle(&mut self) -> Option<&'static str> {
@@ -1390,27 +1399,38 @@ mod tests {
         });
     }
 
-    /// A clock topic that only ever carries rejected frames: `samples` first,
-    /// then a rejected frame on every read. It never answers `Empty`, so a
-    /// warning that only an empty poll could reach is never printed. It
-    /// clears `running` after `rejected` rejected reads.
-    struct RejectingClock {
+    /// A clock topic that, after `samples`, repeats `tail` on every read (a
+    /// rejected frame, or a sample behind the epoch). It never answers
+    /// `Empty`, so a warning that only an empty poll could reach is never
+    /// printed. It clears `running` after `repeats` tail reads.
+    struct RepeatingClock {
         samples: VecDeque<u64>,
-        rejected: usize,
+        tail: ClockRead,
+        repeats: usize,
         running: Arc<AtomicBool>,
     }
 
-    impl ClockSource for RejectingClock {
+    impl ClockSource for RepeatingClock {
         fn read(&mut self) -> CliResult<ClockRead> {
             if let Some(ns) = self.samples.pop_front() {
                 return Ok(ClockRead::Sample(ns));
             }
-            if self.rejected == 0 {
+            if self.repeats == 0 {
                 self.running.store(false, Ordering::Relaxed);
             } else {
-                self.rejected -= 1;
+                self.repeats -= 1;
             }
-            Ok(ClockRead::Rejected(ClockRejection::WrongSchema { got: 7 }))
+            Ok(self.tail)
+        }
+    }
+
+    /// A [`RepeatingClock`] whose tail is a rejected frame.
+    fn rejecting_clock(samples: &[u64], running: &Arc<AtomicBool>) -> RepeatingClock {
+        RepeatingClock {
+            samples: samples.iter().copied().collect(),
+            tail: ClockRead::Rejected(ClockRejection::WrongSchema { got: 7 }),
+            repeats: 3,
+            running: Arc::clone(running),
         }
     }
 
@@ -1425,11 +1445,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let clock = Arc::new(VirtualClock::new());
         let fires = Arc::new(AtomicU64::new(0));
-        let source = RejectingClock {
-            samples: VecDeque::new(),
-            rejected: 3,
-            running: Arc::clone(&running),
-        };
+        let source = rejecting_clock(&[], &running);
         let build_clock = Arc::clone(&clock);
         let build_fires = Arc::clone(&fires);
         let built = run_sim_time(SimTimeRun {
@@ -1462,11 +1478,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let clock = Arc::new(VirtualClock::new());
         let fires = Arc::new(AtomicU64::new(0));
-        let source = RejectingClock {
-            samples: VecDeque::from([1_000_000_000]),
-            rejected: 3,
-            running: Arc::clone(&running),
-        };
+        let source = rejecting_clock(&[1_000_000_000], &running);
         let build_clock = Arc::clone(&clock);
         let build_fires = Arc::clone(&fires);
         let runtime = run_sim_time(SimTimeRun {
@@ -1488,6 +1500,54 @@ mod tests {
                 Ok(())
             } else {
                 Err(format!("expected one stall warning, found {stalls}"))
+            }
+        });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_stream_of_backward_samples_mid_run_is_a_stall() {
+        let running = Arc::new(AtomicBool::new(true));
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        // A stamp behind the epoch on every read after it: refused, so only
+        // a refused sample can reach the stall warning.
+        let source = RepeatingClock {
+            samples: VecDeque::from([1_000_000_000]),
+            tail: ClockRead::Sample(500_000_000),
+            repeats: 3,
+            running: Arc::clone(&running),
+        };
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let runtime = run_sim_time(SimTimeRun {
+            graph_name: "sim",
+            running: &running,
+            clock: &clock,
+            build: move || build_period_runtime(build_clock, 10, build_fires),
+            source,
+            no_clock_grace: Duration::ZERO,
+            idle: Duration::ZERO,
+        })
+        .expect("ends cleanly")
+        .expect("built at the epoch");
+        runtime.shutdown();
+        assert_eq!(fires.load(Ordering::Relaxed), 0, "the clock never moved");
+        use cerulion_core::Clock as _;
+        assert_eq!(
+            clock.now_ns(),
+            1_000_000_000,
+            "a refused sample is never stored"
+        );
+        logs_assert(|lines: &[&str]| {
+            let stalls = count_lines(lines, "no clock sample has arrived on `/clock` since");
+            let returns = count_lines(lines, "clock samples are arriving again");
+            if stalls == 1 && returns == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one stall warning and no return notice, found {stalls} and {returns}"
+                ))
             }
         });
     }

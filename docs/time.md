@@ -79,7 +79,8 @@ What happens when the graph starts:
    refused with a warning and is never stored; the graph clock stands at the
    last accepted sample. A simulator that restarts its clock needs the graph
    restarted too. The warning is loud once and then counted, so a stream of
-   backward samples cannot flood the log.
+   backward samples cannot flood the log. A refused sample does not count as
+   a clock: a stream of them still reaches the stalled-clock warning below.
 5. **A clock that stops is reported.** When no sample has arrived for two
    seconds after the last accepted one, the run prints one warning per such
    gap that names `/clock`; the graph clock stands still, and nothing fires or

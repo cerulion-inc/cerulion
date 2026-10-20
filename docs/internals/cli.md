@@ -1194,3 +1194,19 @@ runs. Schema names do not enter `INFO_BYTES` (the runtime parser binds only
 hashes and sizes): they ride a `// CERULION:PORT_SCHEMAS {...}` line inside the
 INFO markers, which `node_metadata::parse_node_metadata` reads and checks against
 the declared ports.
+
+## 14. Sim time: `sim_time:` and `/clock`
+
+`sim_time_run.rs` owns the sim-time run loop. Its contract:
+
+- `resolve_time_source` folds the graph's `sim_time:` into `TimeSource` BEFORE
+  partition intent, network and record guards read it. `--time-source external`
+  IS sim time, and is held to `validate_sim_time_for`'s load rules.
+- External-policy nodes are refused from the loaded entries' metadata BEFORE the
+  transport exists.
+- The loop builds the runtime only after the first `/clock` sample and steps once
+  per accepted sample, through a data-only `/clock` tap (no listener).
+- A period fires at most once per sample: a jump fires the latest passed deadline,
+  never a catch-up burst.
+- A frame is decoded only after its wire framing is checked.
+- Every warning and refusal text is a pinned constant.

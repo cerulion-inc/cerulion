@@ -9,7 +9,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
@@ -24,12 +24,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
 - Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
   default; a new field needs round-trip + rejection oracle arms.
-- Replay = Live: `external_source()` is queried once at `run_live` entry, never under
+- Replay = Live: `external_source()` is queried once at `run_live` entry, never in
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
-- Sim time (`sim_time: true`) moves the graph clock ONLY through a `VirtualClock` and
-  `step(delta)`, one step per accepted `/clock` sample (`graph/sim_time.rs` holds the pure
-  verdicts; the CLI engine feeds it). A backward sample is refused, never stored; the
-  clock is placed at the first sample BEFORE the build, so period anchors are epoch-relative.
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
   never drop a `SeqCst` fence in the doorbell ring/park pair (its lost wake is untestable).
 - Same-PROCESS REST producers of a `multi_publisher_topics` topic publish in declaration
@@ -61,4 +57,4 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 - Per-frame byte-identity: publish in lockstep + `try_receive_one` (drain-all keeps newest).
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
-(scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+(scheduler/graph/determinism/clock), `core-testing.md`, `core-dynamic.md`.
