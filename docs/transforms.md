@@ -21,8 +21,12 @@ Transforms travel as `tf2_msgs/TFMessage`, a batch of
   fixed links of a URDF. A static transform is published once (or re-published
   harmlessly) and holds at every time.
 
-A node that listens declares both as accumulate inputs, so no frame from any
-writer is lost between two fires:
+A node that listens declares both as accumulate inputs. Each fire then
+receives every `TFMessage` that arrived since the last fire, from every
+writer, up to `cap` frames per input; past the cap the oldest frames are
+dropped. Size `cap` to the number of `TFMessage`s that can arrive between two
+fires: the broadcasters on the topic, their rates and the node's own rate,
+with margin.
 
 ```rust
 #[input(accumulate, cap = 32)]
@@ -61,10 +65,12 @@ assert_eq!(odom_lidar.translation(), [2.25, 0.0, 0.5]);
 ```
 
 The feed is one `insert` per `TransformStamped` the node receives on `/tf`
-and one `insert_static` per entry on `/tf_static`, with the stamp in
-nanoseconds and the transform built through `UnitQuaternion::new` and
-`Transform::new`. Those two constructors refuse a NaN, an infinite component
-and a zero quaternion, so a malformed transform never reaches the buffer.
+and one `insert_static` per entry on `/tf_static`. The stamp is
+`header.stamp` in nanoseconds, `sec * 1_000_000_000 + nanosec` as a `u64`; a
+negative `sec` has no place in the buffer, so refuse the message before
+`insert`. The transform is built through `UnitQuaternion::new` and
+`Transform::new`, which refuse a NaN, an infinite component and a zero
+quaternion, so a malformed transform never reaches the buffer.
 
 The rules:
 
@@ -73,17 +79,24 @@ The rules:
   that would make a frame its own ancestor (`Cycle`). The tree stays a tree.
 - **Bounded rings.** Each dynamic edge keeps its samples sorted by stamp on a
   ring of fixed capacity. A sample at a stamp the ring already holds replaces
-  it. When the ring is full, the oldest sample is evicted to make room, and a
-  sample older than everything on a full ring is dropped on arrival. Both
-  count in `evictions()`, every time. The defaults are 64 frames and 64
-  samples per edge; `TfBuffer::with_capacity` sets both, and that constructor
-  is the only place the buffer allocates. `insert` and `lookup` never touch
-  the heap, so they belong inside a tick.
+  it (tf2 ignores the repeat; here a corrected re-send wins). When the ring
+  is full, the oldest sample is evicted to make room, and a sample older than
+  everything on a full ring is dropped on arrival; that insert still returns
+  `Ok(())`, so compare `evictions()` before and after to see the drop. Every
+  dropped sample counts in `evictions()`, including the dynamic samples a
+  static insert clears. The defaults are 64 frames and 64 samples per edge;
+  `TfBuffer::with_capacity` sets both, and that constructor is the only place
+  the buffer allocates. `insert` and `lookup` never touch the heap, so they
+  belong inside a tick.
 - **Static wins.** A static edge holds at every time. A dynamic transform
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
-- **Frame ids** are at most 36 bytes. Longer ids are refused
-  (`FrameIdTooLong`); the empty id is refused (`EmptyFrameId`).
+- **Frame ids** are at most 36 bytes, counted after one leading `/` is
+  removed: `/odom` and `odom` name one frame, as in tf2. A longer id is
+  refused (`FrameIdTooLong`, naming its first 36 bytes); the empty id, and a
+  bare `/`, is refused (`EmptyFrameId`). A namespaced camera frame can be too
+  long: `robot_0/camera_aligned_depth_to_color_frame` is 43 bytes. Rename
+  such a frame before publishing it.
 - **Capacity.** A transform naming a frame the buffer has no room for is
   refused (`FrameTableFull`), and names the frame.
 
@@ -105,6 +118,10 @@ translation, shortest-arc SLERP in rotation.
 on the chain has a sample for, through the same code path. A chain of static
 edges only has no time and resolves directly.
 
+Time is a plain stamp: `lookup(parent, child, 0)` asks for 0 ns, which is out
+of range on an edge whose oldest sample is later. For the ROS meaning of
+`Time(0)`, the latest transform available, call `lookup_latest`.
+
 **Lookups never extrapolate.** One nanosecond before an edge's oldest sample
 or after its newest is an error, never a guessed transform. **Lookups never
 block.** There is no listener thread and no timeout: an error is a fact about
@@ -125,7 +142,8 @@ match self.buffer.lookup("map", "lidar", stamp_ns) {
 
 ### The errors
 
-Every variant of `TfError` names the frames involved in its text.
+Every variant of `TfError` that involves a frame names it in its text;
+`EmptyFrameId` and `Math` have no frame to name.
 
 | Variant | When | What to do |
 |---|---|---|
@@ -133,8 +151,9 @@ Every variant of `TfError` names the frames involved in its text.
 | `NoPath { parent, child }` | Both frames are known but no chain of edges joins them. | A broadcaster is missing an edge. |
 | `NotYetAvailable { parent, child, requested_ns, newest_ns }` | `requested_ns` is newer than the newest sample on the edge `parent` to `child`. | Ask again on the next fire. |
 | `OutOfRange { parent, child, requested_ns, oldest_ns, newest_ns }` | `requested_ns` is older than the oldest sample on that edge: evicted, or never buffered. | Waiting does not help; a larger ring or a fresher stamp does. |
-| `Math(TfMathError)` | Composing the chain overflowed, or a constructor refused a value. | The input data is wrong. |
-| `EmptyFrameId`, `FrameIdTooLong { len }` | The frame id is empty or over 36 bytes. | Fix the publisher's frame ids. |
+| `ChainMath { parent, child, source }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain is far too large. |
+| `Math(TfMathError)` | `UnitQuaternion::new` or `Transform::new` refused a value in the feed, carried through `?`. | The input data is wrong. |
+| `EmptyFrameId`, `FrameIdTooLong { prefix, len }` | The frame id is empty (or a bare `/`), or over 36 bytes. | Fix the publisher's frame ids. |
 | `SelfEdge { frame }` | Parent and child are the same frame. | Fix the publisher. |
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |
@@ -169,3 +188,6 @@ Frames follow REP-103: right-handed, metres, radians.
   supported; a node publishes its transforms and holds its own buffer.
 - Extrapolation of any kind, and a blocking lookup with a timeout.
 - Re-parenting a frame at runtime.
+- Frame ids over 36 bytes, such as a namespaced RealSense frame
+  (`robot_0/camera_aligned_depth_to_color_frame`, 43 bytes); rename the
+  frame.
