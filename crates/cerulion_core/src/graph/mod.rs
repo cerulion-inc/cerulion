@@ -27,6 +27,7 @@
 pub mod chain;
 pub mod config;
 pub mod drain_latch;
+pub mod launch_args;
 pub mod node;
 pub mod params;
 pub mod partition;
@@ -55,6 +56,10 @@ pub use chain::{
 };
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
+};
+pub use launch_args::{
+    parse_graph_with_launch_args, parse_override, resolve_args, substitute_text, ArgDecl, ArgDecls,
+    ArgProblem, ArgSpec, LaunchOverride, ResolvedArgs,
 };
 #[cfg(feature = "fuzz-helpers")]
 pub use node::fuzz_parse_info_json;
@@ -86,7 +91,7 @@ pub use topology::{
 pub use validation::{validate_graph, validate_graph_with, ValidationOptions};
 pub use waitset::{check_waitset_attachment_capacity, WAITSET_MAX_ATTACHMENTS};
 
-use crate::error::{TransportError, TransportResult};
+use crate::error::TransportResult;
 
 // ─── Graph Parsing ───────────────────────────────────────────
 
@@ -122,11 +127,21 @@ pub fn parse_graph(yaml: &str) -> TransportResult<GraphConfig> {
 /// occurrence with the migration instruction — the warn is the remedy, the
 /// parse error is the stop.
 pub fn parse_graph_raw(yaml: &str) -> TransportResult<GraphConfig> {
+    parse_graph_raw_with_launch_args(yaml, &[])
+}
+
+/// [`parse_graph_raw`] with launch-argument `overrides` (`name:=value` on
+/// `graph run`). Launch arguments resolve HERE, on every parse: `args:` is
+/// lifted out and every `${name}` replaced before the graph types read the
+/// document, so each reader of a graph file sees a plain graph. The plain
+/// parser passes no overrides, so every verb but `graph run` sees the
+/// declared defaults.
+pub fn parse_graph_raw_with_launch_args(
+    yaml: &str,
+    overrides: &[launch_args::LaunchOverride],
+) -> TransportResult<GraphConfig> {
     warn_on_legacy_policy_block(yaml);
-    let mut config: GraphConfig =
-        serde_yaml::from_str(yaml).map_err(|e| TransportError::GraphParseError {
-            reason: e.to_string(),
-        })?;
+    let mut config: GraphConfig = launch_args::parse_graph_with_launch_args(yaml, overrides)?;
     // The file stem is the graph name, but a string has no
     // file, so a stemless parse SEEDS the identity from the deprecated `name:`
     // key. That is the only identity such a config can have, and it is what
