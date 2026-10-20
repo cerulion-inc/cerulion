@@ -70,7 +70,7 @@ pub(crate) fn validate_sync_capture(
                 "node '{node_id}' asks to match on header.stamp, but this node kind cannot \
                  expose its frames to the sync matcher: capture-time matching is not yet \
                  available to `#[cerulion_node]` nodes (in-process or cdylib), raw-FFI \
-                 libraries, or CERULION_DRAIN_DISCIPLINE=separate (follow-up to CER-1912); \
+                 libraries, or CERULION_DRAIN_DISCIPLINE=separate; \
                  remove the header.stamp opt-in"
             ),
         });
