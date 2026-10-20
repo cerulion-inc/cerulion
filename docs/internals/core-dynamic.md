@@ -227,7 +227,8 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   own ladder). A body whose
   fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
   allocates it, and a string or scalar array past it is refused before its bytes are
-  built. One final `---` line (echo's frame separator) is dropped before parsing.
+  built. Input past `MAX_YAML_BYTES` (the encoder's own cap) is refused before
+  parsing, which bounds the value tree. One final `---` line (echo's frame separator) is dropped before parsing.
   `parse.rs` builds the `serde_yaml::Value` tree with its own visitor so an integer
   past 64 bits (which `Value` cannot hold, and serde_yaml refuses with no path) is
   kept as its decimal text: an integer field refuses it as `YamlOutOfRange` at its
@@ -263,7 +264,7 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 
 | Class | `DynamicError` variant |
 |---|---|
-| input bytes / parse / anchor | `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
+| input bytes / parse / anchor | `YamlInputTooLarge`, `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
 | value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |

@@ -32,7 +32,9 @@
 //!   of elements left out). Input that carries the tag is refused.
 //! - Anchors, aliases and tags (other than the refusal above) are refused.
 //! - Output is capped at [`MAX_YAML_BYTES`]; a message whose YAML form is
-//!   longer is refused at the field being written.
+//!   longer is refused at the field being written. Input longer than the
+//!   same cap is refused before it is parsed, so what echo prints reads
+//!   back and a parsed value tree stays a bounded multiple of the cap.
 //! - Output cut at a line budget ([`YamlEncodeOptions::max_lines`]) ends
 //!   with a column-0 `!truncated` line, which no YAML reader accepts.
 //!
@@ -72,7 +74,8 @@ pub const MAX_YAML_ARRAY_DEPTH: usize =
 /// refuses (256 MiB). An unset nested field expands to its schema's zero
 /// values, so a few bytes of frame can name far more output than any
 /// terminal or file wants; the cap turns that into an error before the
-/// output fills memory.
+/// output fills memory. [`yaml_to_message`] refuses input past the same
+/// cap.
 pub const MAX_YAML_BYTES: usize = 256 << 20;
 
 /// The display form of a field path: `(message)` for the root.

@@ -326,6 +326,17 @@ pub enum DynamicError {
         valid_up_to: usize,
     },
 
+    /// The message YAML is longer than the decoder's input cap
+    /// ([`crate::dynamic::MAX_YAML_BYTES`], the same cap the encoder holds,
+    /// so every message it prints reads back).
+    #[error("message YAML is {len} bytes, over the {max_bytes}-byte input cap")]
+    YamlInputTooLarge {
+        /// The input length, in bytes.
+        len: usize,
+        /// The cap, in bytes.
+        max_bytes: usize,
+    },
+
     /// The message YAML does not parse (the parser's message: bad syntax,
     /// a duplicate key, more than one document, nesting past its limit).
     /// Only the `message YAML does not parse: ` prefix and the trailing
