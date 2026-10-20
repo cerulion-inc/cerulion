@@ -968,7 +968,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             &self,
             out: &mut dyn ::cerulion_core::state::StateSink,
         ) -> ::cerulion_core::error::TransportResult<()> {
-            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out).map_err(|e| {
+            // The user's fields, then the node's accumulate buffers (which
+            // write nothing for a node without an accumulate input).
+            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
+                .and_then(|()| self.__cer_accumulators.capture(out))
+                .map_err(|e| {
                 ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state capture failed: {}", #diag_label, e,
@@ -983,6 +987,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         ) -> ::cerulion_core::error::TransportResult<()> {
             let mut cursor = ::cerulion_core::state::StateCursor::new(payload);
             ::cerulion_core::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
+                .and_then(|()| self.__cer_accumulators.restore(&mut cursor))
                 .map_err(|e| ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
@@ -3020,6 +3025,7 @@ fn gen_cdylib(
                                         &node.inner,
                                         &mut out,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.capture(&mut out))
                                 }),
                             ) {
                                 ::std::result::Result::Ok(o) => o,
@@ -3141,6 +3147,7 @@ fn gen_cdylib(
                                         &mut node.inner,
                                         &mut cursor,
                                     )
+                                    .and_then(|()| node.__cer_accumulators.restore(&mut cursor))
                                 }),
                             );
                             let decoded = match decoded {

@@ -235,6 +235,51 @@ fn an_event_still_pending_keeps_the_next_regime_armed_and_cap_drops_reach_the_co
 
 #[test]
 #[serial]
+#[traced_test]
+fn an_overflow_regime_logs_loud_once_counts_repeats_and_reports_its_recovery() {
+    let (mut publisher, sub, _) = pair("regime");
+    let mut ctx = context(sub);
+    let mut set = AccumulatorSet::new();
+    set.register::<Vector3>(&mut ctx, INPUT, 2)
+        .expect("register");
+    let warn = "accumulate input dropped its oldest frames";
+    let repeat = "accumulate input still dropping frames";
+    let recovered = "accumulate input collects without dropping frames again";
+
+    // Two overflowing collects in a row: one loud head, one counted repeat.
+    for _ in 0..2 {
+        for x in [1.0, 2.0, 3.0] {
+            publish(&mut publisher, x);
+        }
+        assert_eq!(fire(&mut set, &mut ctx), (vec![2.0, 3.0], 1));
+    }
+    assert!(!logs_contain(recovered), "still dropping: no recovery yet");
+    // A collect that drops nothing closes the regime and says so once.
+    publish(&mut publisher, 4.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![4.0], 0));
+    publish(&mut publisher, 5.0);
+    assert_eq!(fire(&mut set, &mut ctx), (vec![5.0], 0));
+    logs_assert(|lines: &[&str]| {
+        let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
+        match (count(warn), count(repeat), count(recovered)) {
+            (1, 1, 1) => {}
+            got => return Err(format!("want (1 loud, 1 repeat, 1 recovery), got {got:?}")),
+        }
+        if !lines
+            .iter()
+            .any(|l| l.contains(recovered) && l.contains("suppressed=1"))
+        {
+            return Err("the recovery line counts the one suppressed repeat".to_string());
+        }
+        Ok(())
+    });
+    // The regime raised exactly one event.
+    assert_eq!(take_event(&mut ctx), Some((1, 1, 2)));
+    assert_eq!(take_event(&mut ctx), None);
+}
+
+#[test]
+#[serial]
 fn a_frozen_held_frame_ends_the_collect_instead_of_reading_it_forever() {
     let (mut publisher, sub, _) = pair("held");
     let mut ctx = context(sub);

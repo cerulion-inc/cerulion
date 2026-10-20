@@ -55,8 +55,11 @@ impl Writer {
 /// What the reader saw: one entry per fire whose body ran.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Seen {
-    fires: Vec<Vec<u64>>,
+    /// The `x` of every frame, kept as the `f64` it is on the wire.
+    fires: Vec<Vec<f64>>,
     dropped_per_fire: Vec<u64>,
+    /// `dropped_total()` at each fire (recorded by the readers that track it).
+    dropped_totals: Vec<u64>,
     /// `(dropped, count_total, buffer_capacity)` of each overflow event.
     events: Vec<(u64, u64, usize)>,
 }
@@ -73,7 +76,7 @@ struct Reader {
 #[cerulion_node_impl]
 impl Reader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let xs: Vec<u64> = self.tf.iter().map(|f| f.x as u64).collect();
+        let xs: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
         let dropped = self.tf.dropped();
         let mut seen = self.seen.lock().expect("seen lock");
         seen.fires.push(xs);
@@ -106,7 +109,7 @@ struct SmallReader {
 #[cerulion_node_impl]
 impl SmallReader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let xs: Vec<u64> = self.tf.iter().map(|f| f.x as u64).collect();
+        let xs: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
         let dropped = self.tf.dropped();
         let mut seen = self.seen.lock().expect("seen lock");
         seen.fires.push(xs);
@@ -139,7 +142,7 @@ struct TinyReader {
 #[cerulion_node_impl]
 impl TinyReader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let xs: Vec<u64> = self.tf.iter().map(|f| f.x as u64).collect();
+        let xs: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
         let dropped = self.tf.dropped();
         let mut seen = self.seen.lock().expect("seen lock");
         seen.fires.push(xs);
@@ -175,7 +178,7 @@ struct GatedReader {
 #[cerulion_node_impl]
 impl GatedReader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let xs: Vec<u64> = self.tf.iter().map(|f| f.x as u64).collect();
+        let xs: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
         let _gate = self.gate.x;
         self.seen.lock().expect("seen lock").fires.push(xs);
         Ok(())
@@ -202,10 +205,10 @@ struct TriggeredReader {
 #[cerulion_node_impl]
 impl TriggeredReader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let tick = self.tick.x as u64;
-        let mut xs: Vec<u64> = Vec::new();
+        let tick = self.tick.x;
+        let mut xs: Vec<f64> = Vec::new();
         xs.push(tick);
-        xs.extend(self.tf.iter().map(|f| f.x as u64));
+        xs.extend(self.tf.iter().map(|f| f.x));
         self.seen.lock().expect("seen lock").fires.push(xs);
         Ok(())
     }
@@ -227,8 +230,8 @@ struct TwoPortReader {
 #[cerulion_node_impl]
 impl TwoPortReader {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let a: Vec<u64> = self.tf_frames.iter().map(|f| f.x as u64).collect();
-        let b: Vec<u64> = self.tf.iter().map(|f| f.x as u64).collect();
+        let a: Vec<f64> = self.tf_frames.iter().map(|f| f.x).collect();
+        let b: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
         let mut seen = self.seen.lock().expect("seen lock");
         seen.fires.push(a);
         seen.fires.push(b);
@@ -252,6 +255,36 @@ struct DeepReader {
 impl DeepReader {
     fn tick(&mut self) -> Result<(), NodeError> {
         let _ = self.tf.len();
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
+/// [`GatedReader`] with a cap of 3, recording each fire's drop counts.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct GatedTinyReader {
+    #[input]
+    gate: Vector3,
+    #[input(accumulate, cap = 3)]
+    tf: Vector3,
+    #[cerulion(reconstruct)]
+    seen: Arc<Mutex<Seen>>,
+}
+
+#[cerulion_node_impl]
+impl GatedTinyReader {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let xs: Vec<f64> = self.tf.iter().map(|f| f.x).collect();
+        let _gate = self.gate.x;
+        let (dropped, total) = (self.tf.dropped(), self.tf.dropped_total());
+        let mut seen = self.seen.lock().expect("seen lock");
+        seen.fires.push(xs);
+        seen.dropped_per_fire.push(dropped);
+        seen.dropped_totals.push(total);
         Ok(())
     }
 
@@ -402,6 +435,16 @@ fn fire_reader(rt: &mut GraphRuntime) {
     rt.step(STEP);
 }
 
+/// An oracle of whole-number `x` values as the `f64` frames carry them
+/// (`f64::from(u32)` is exact), so a fractional `x` fails the comparison
+/// instead of truncating into a match.
+fn xs(fires: Vec<Vec<u32>>) -> Vec<Vec<f64>> {
+    fires
+        .into_iter()
+        .map(|f| f.into_iter().map(f64::from).collect())
+        .collect()
+}
+
 fn seen(s: &Arc<Mutex<Seen>>) -> Seen {
     s.lock().expect("seen lock").clone()
 }
@@ -418,7 +461,7 @@ fn every_frame_from_two_writers_reaches_one_fire_in_the_documented_order() {
     let got = seen(&s);
     assert_eq!(
         got.fires,
-        vec![vec![1, 101, 2, 102, 3, 103], vec![]],
+        xs(vec![vec![1, 101, 2, 102, 3, 103], vec![]]),
         "every frame of both writers, oldest first, then an empty fire"
     );
     assert_eq!(got.dropped_per_fire, vec![0, 0]);
@@ -442,7 +485,7 @@ fn two_runs_deliver_identical_frames() {
     };
     let a = run("acc_det_a");
     let b = run("acc_det_b");
-    let oracle = vec![vec![1, 101, 2, 102], vec![3, 103]];
+    let oracle = xs(vec![vec![1, 101, 2, 102], vec![3, 103]]);
     assert_eq!(a, oracle);
     assert_eq!(b, oracle);
 }
@@ -467,12 +510,12 @@ fn a_flood_past_the_cap_keeps_the_newest_frames_counts_the_drops_and_raises_one_
     let got = seen(&s);
     assert_eq!(
         got.fires,
-        vec![
+        xs(vec![
             vec![2, 102, 3, 103],
             vec![5, 105, 6, 106],
             vec![7, 107],
             vec![9, 109, 10, 110],
-        ]
+        ])
     );
     assert_eq!(got.dropped_per_fire, vec![2, 2, 0, 2]);
     assert_eq!(
@@ -495,7 +538,7 @@ fn before_a_writers_first_delivered_frame_its_queue_evictions_cannot_be_counted(
     publish(&mut rt, 6);
     fire_reader(&mut rt);
     let got = seen(&s);
-    assert_eq!(got.fires, vec![vec![5, 105, 6, 106]]);
+    assert_eq!(got.fires, xs(vec![vec![5, 105, 6, 106]]));
     assert_eq!(got.dropped_per_fire, vec![4], "8 collected, 4 held");
     assert_eq!(got.events, vec![(4, 4, 4)]);
 }
@@ -527,7 +570,7 @@ fn queue_evictions_and_cap_drops_are_one_count_and_one_event() {
     publish(&mut rt, 6);
     fire_reader(&mut rt);
     let got = seen(&s);
-    assert_eq!(got.fires, vec![vec![1, 101], vec![106, 7, 107]]);
+    assert_eq!(got.fires, xs(vec![vec![1, 101], vec![106, 7, 107]]));
     assert_eq!(got.dropped_per_fire, vec![0, 9]);
     assert_eq!(
         got.events,
@@ -573,7 +616,7 @@ fn frames_carry_over_while_a_latest_value_input_has_not_delivered() {
     fire_reader(&mut rt);
     assert_eq!(
         seen(&s).fires,
-        vec![vec![1, 101, 2, 102, 3, 103], vec![]],
+        xs(vec![vec![1, 101, 2, 102, 3, 103], vec![]]),
         "the skipped fire's frames reach the first fire whose body runs, then none again"
     );
 }
@@ -613,7 +656,7 @@ fn a_node_fired_once_per_trigger_frame_receives_each_accumulate_frame_once() {
     // frame, the second fire none.
     assert_eq!(
         seen(&s).fires,
-        vec![vec![1001, 1, 101, 2, 102], vec![2001]],
+        xs(vec![vec![1001, 1, 101, 2, 102], vec![2001]]),
         "one fire per trigger frame; each tf frame reaches exactly one fire"
     );
 }
@@ -639,7 +682,7 @@ fn two_accumulate_ports_named_tf_and_tf_frames_each_read_their_own_topic() {
     .expect("build");
     publish(&mut rt, 2);
     fire_reader(&mut rt);
-    assert_eq!(seen(&s).fires, vec![vec![1, 2], vec![101, 102]]);
+    assert_eq!(seen(&s).fires, xs(vec![vec![1, 2], vec![101, 102]]));
 }
 
 #[test]
@@ -665,5 +708,124 @@ fn a_cap_above_the_multi_publisher_ceiling_is_refused_at_build_naming_the_cap() 
     assert!(
         err.contains("`#[input(accumulate, cap = N)]` input's cap is its depth"),
         "the refusal names the accumulate cap: {err}"
+    );
+}
+
+/// A gated tiny reader graph: two `/tf` writers and a `/gate` writer.
+fn gated_tiny(prefix: &str, s: &Arc<Mutex<Seen>>) -> GraphRuntime {
+    let entry = Box::new(GatedTinyReaderEntry::with_state(GatedTinyReader {
+        seen: Arc::clone(s),
+        ..Default::default()
+    }));
+    build_graph(
+        prefix,
+        &[TOPIC],
+        &[
+            ("writer_a", TOPIC, 0.0),
+            ("writer_b", TOPIC, 100.0),
+            ("gate_writer", "/gate", 500.0),
+        ],
+        reader_def(
+            "gated_tiny_reader",
+            vec![input("gate", "/gate"), input("tf", TOPIC)],
+        ),
+        entry,
+    )
+    .expect("build")
+}
+
+/// Deliver the gate, then fire the reader so its body runs.
+fn open_gate_and_fire(rt: &mut GraphRuntime) {
+    rt.trigger_external("gate_writer").expect("trigger gate");
+    rt.step(STEP);
+    fire_reader(rt);
+}
+
+#[test]
+#[serial]
+fn a_node_resumed_from_captured_state_serves_the_unserved_frames_and_counts() {
+    use cerulion_core::state::VecSink;
+    use cerulion_core::state_restore::AnchorBlob;
+    use std::collections::BTreeMap;
+
+    // The recorded run: 4 frames into a cap of 3 drops x = 1. The gate has
+    // not delivered, so the fire collects and skips its body: 101, 2, 102
+    // are held and owed, with one drop.
+    let live = Arc::new(Mutex::new(Seen::default()));
+    let mut recorded = gated_tiny("acc_anchor_live", &live);
+    publish(&mut recorded, 2);
+    fire_reader(&mut recorded);
+    assert!(seen(&live).fires.is_empty(), "the body has not run yet");
+    let mut blob = VecSink::new();
+    {
+        let entry = recorded.node_entry_arc_for_test("reader").expect("reader");
+        let guard = entry.lock().expect("reader lock");
+        let shape = guard.state_shape().expect("a macro node declares state");
+        AnchorBlob::write_header(shape, &mut blob).expect("header");
+        guard.capture_state(&mut blob).expect("capture");
+    }
+    // The uninterrupted run goes on from here.
+    open_gate_and_fire(&mut recorded);
+
+    // The resumed run: a fresh graph restored from the captured state, then
+    // the same continuation. No `/tf` frame is published in it.
+    let resumed = Arc::new(Mutex::new(Seen::default()));
+    let mut rt = gated_tiny("acc_anchor_resume", &resumed);
+    let anchors = BTreeMap::from([("reader".to_string(), blob.into_inner())]);
+    let report = rt.restore_node_states(&anchors).expect("restore");
+    assert_eq!(report.restored, vec!["reader".to_string()]);
+    open_gate_and_fire(&mut rt);
+
+    let want = Seen {
+        fires: xs(vec![vec![101, 2, 102]]),
+        dropped_per_fire: vec![1],
+        dropped_totals: vec![1],
+        events: vec![],
+    };
+    assert_eq!(seen(&live), want, "the uninterrupted run");
+    assert_eq!(seen(&resumed), want, "the resumed run serves the same");
+}
+
+#[test]
+#[serial]
+fn a_restore_holding_more_frames_than_the_cap_is_refused_naming_the_input() {
+    use cerulion_core::state::VecSink;
+    use cerulion_core::state_restore::AnchorBlob;
+    use std::collections::BTreeMap;
+
+    // A capture of a cap-3 input holding 3 frames, with its frame count
+    // edited to 4: more than the running input can hold.
+    let live = Arc::new(Mutex::new(Seen::default()));
+    let mut recorded = gated_tiny("acc_anchor_cap_live", &live);
+    publish(&mut recorded, 2);
+    fire_reader(&mut recorded);
+    let mut blob = VecSink::new();
+    {
+        let entry = recorded.node_entry_arc_for_test("reader").expect("reader");
+        let guard = entry.lock().expect("reader lock");
+        let shape = guard.state_shape().expect("state");
+        AnchorBlob::write_header(shape, &mut blob).expect("header");
+        guard.capture_state(&mut blob).expect("capture");
+    }
+    let mut bytes = blob.into_inner();
+    // Layout after the 16-byte anchor header and the user's fields (none
+    // captured here): u32 inputs, u32 name length, "tf", u64, u64, then the
+    // u32 frame count. Raise it from 3 to 4.
+    let at = 16 + 4 + 4 + 2 + 8 + 8;
+    assert_eq!(&bytes[at..at + 4], &3u32.to_le_bytes(), "the frame count");
+    bytes[at..at + 4].copy_from_slice(&4u32.to_le_bytes());
+    let s = Arc::new(Mutex::new(Seen::default()));
+    let rt = gated_tiny("acc_anchor_cap_resume", &s);
+    let anchors = BTreeMap::from([("reader".to_string(), bytes)]);
+    let err = match rt.restore_node_states(&anchors) {
+        Ok(_) => panic!("4 frames do not fit a cap of 3"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains(
+            "node 'gated_tiny_reader' state restore failed: accumulate input `tf` cannot be \
+             restored: the recording holds 4 frame(s), above the cap of 3"
+        ),
+        "{err}"
     );
 }

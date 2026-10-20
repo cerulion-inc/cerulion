@@ -58,6 +58,7 @@ use crate::graph::node::{AnySubscriber, BackpressurePolicy, NodeContext};
 use crate::graph::topology::{DEFAULT_CONSUMER_DEPTH, MAX_CONSUMER_DEPTH};
 use crate::message::ShmMessage;
 use crate::scheduler::BackpressureEvent;
+use crate::state::{StateCursor, StateError, StateSink};
 use crate::transport::MULTI_PUBLISHER_LOOSE_MAX;
 use crate::wire::WireHeader;
 
@@ -363,9 +364,15 @@ struct Accumulator {
     topic: String,
     buffer: AccumulateBuffer,
     check: FrameCheck,
-    /// Edge trigger for the overflow event: one event per overflow regime,
-    /// re-armed by a collect that drops nothing.
-    armed: bool,
+    /// Flood suppression for collects that drop frames: loud at the first
+    /// overflow of a regime, counted repeats, a recovery line at the first
+    /// collect that drops nothing. One regime raises one overflow event.
+    overflow: FailureRegimeLatch,
+    /// The open regime's overflow event has not reached the node yet: the
+    /// event slot still held an earlier event. Kept apart from `overflow`,
+    /// which only decides the log level, so a suppressed repeat still
+    /// delivers the event its regime owes.
+    event_owed: bool,
     /// Flood suppression for refused frames and receive faults.
     faults: FailureRegimeLatch,
     /// Flood suppression for collects that stop at the pop budget.
@@ -419,7 +426,8 @@ impl AccumulatorSet {
             topic,
             buffer,
             check: check_frame::<T>,
-            armed: true,
+            overflow: FailureRegimeLatch::new(),
+            event_owed: false,
             faults: FailureRegimeLatch::new(),
             budget: FailureRegimeLatch::new(),
         });
@@ -457,6 +465,84 @@ impl AccumulatorSet {
         }
     }
 
+    /// Encode what a resumed node needs to serve the same frames and report
+    /// the same counts: per input, in declaration order, its name, its
+    /// lifetime drop count, and the frames and drops no fire has received
+    /// yet (frames a fire already received are released at the next
+    /// collect, so they are not state).
+    ///
+    /// A set with no input writes nothing, so a node without an accumulate
+    /// input captures exactly the bytes of its own fields. The node's
+    /// generated `capture_state` appends this after those fields.
+    ///
+    /// Layout (little-endian): `u32` input count, then per input `u32` name
+    /// length, name bytes, `u64` lifetime drops, `u64` pending drops, `u32`
+    /// frame count, then per frame `u32` length and the full wire frame.
+    ///
+    /// # Errors
+    ///
+    /// What the sink refuses, or [`StateError::LengthOverflow`] for a length
+    /// past `u32`.
+    pub fn capture(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
+        if self.inputs.is_empty() {
+            return Ok(());
+        }
+        out.write(&len_u32(self.inputs.len())?.to_le_bytes())?;
+        for acc in &self.inputs {
+            out.write(&len_u32(acc.name.len())?.to_le_bytes())?;
+            out.write(acc.name.as_bytes())?;
+            let buffer = &acc.buffer;
+            out.write(&buffer.dropped_total.to_le_bytes())?;
+            let (pending_drops, pending) = if buffer.served {
+                (0u64, &buffer.slots[..0])
+            } else {
+                (buffer.dropped_since_serve, &buffer.slots[..buffer.held])
+            };
+            out.write(&pending_drops.to_le_bytes())?;
+            out.write(&len_u32(pending.len())?.to_le_bytes())?;
+            for slot in pending {
+                let bytes = slot.bytes();
+                out.write(&len_u32(bytes.len())?.to_le_bytes())?;
+                out.write(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply what [`Self::capture`] wrote to a node whose accumulate inputs
+    /// are registered (the node's `init` has run). The node's generated
+    /// `restore_state` calls this after its own fields, before the cursor's
+    /// trailing-byte check.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::AccumulateRestore`] when the recorded inputs differ from
+    /// the registered ones, an input holds more frames than its cap, or a
+    /// held frame fails the input's frame checks; the cursor's own errors
+    /// for truncated bytes. A failed restore leaves the node partly restored
+    /// and the run must fail, as for any field.
+    // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
+    // it allocates only to name a refusal
+    pub fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
+        if self.inputs.is_empty() {
+            return Ok(());
+        }
+        let count = src.read_element_count()?;
+        if count != self.inputs.len() {
+            return Err(StateError::AccumulateRestore {
+                input: self.inputs[0].name.to_string(),
+                reason: format!(
+                    "the recording holds {count} accumulate input(s), the node declares {}",
+                    self.inputs.len()
+                ),
+            });
+        }
+        for acc in &mut self.inputs {
+            acc.restore(src)?;
+        }
+        Ok(())
+    }
+
     /// Hand `name`'s frames to the fire now running (the generated tick
     /// calls this just before the node body, and only when the body runs).
     /// A second call before the next [`Self::snapshot`] hands over nothing,
@@ -490,7 +576,67 @@ impl AccumulatorSet {
     }
 }
 
+fn len_u32(len: usize) -> Result<u32, StateError> {
+    u32::try_from(len).map_err(|_| StateError::LengthOverflow { len })
+}
+
+fn read_u64(src: &mut StateCursor<'_>) -> Result<u64, StateError> {
+    Ok(u64::from_le_bytes(src.take_array::<8>()?))
+}
+
 impl Accumulator {
+    // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
+    // it allocates only to name a refusal and for a slot's first frame
+    fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
+        let refuse = |name: &str, reason: String| StateError::AccumulateRestore {
+            input: name.to_string(),
+            reason,
+        };
+        let name_len = src.read_payload_len()?;
+        let recorded = src.take(name_len)?;
+        if recorded != self.name.as_bytes() {
+            return Err(refuse(
+                &self.name,
+                format!(
+                    "the recording names input `{}` in its place",
+                    String::from_utf8_lossy(recorded)
+                ),
+            ));
+        }
+        let dropped_total = read_u64(src)?;
+        let pending_drops = read_u64(src)?;
+        let frames = src.read_element_count()?;
+        if frames > self.buffer.cap() {
+            return Err(refuse(
+                &self.name,
+                format!(
+                    "the recording holds {frames} frame(s), above the cap of {}",
+                    self.buffer.cap()
+                ),
+            ));
+        }
+        let buffer = &mut self.buffer;
+        buffer.held = 0;
+        buffer.served = false;
+        buffer.visible = false;
+        for _ in 0..frames {
+            let len = src.read_payload_len()?;
+            let frame = src.take(len)?;
+            // The schema check runs on the slot copy: the cursor's bytes
+            // carry no alignment, the slot is 8-byte aligned as a read is.
+            buffer
+                .insert(&self.topic, frame)
+                .and_then(|_| (self.check)(&self.topic, buffer.slots[buffer.held - 1].bytes()))
+                .map_err(|e| refuse(&self.name, format!("a held frame is refused: {e}")))?;
+        }
+        buffer.finish_collect();
+        // Set after the inserts, which never drop here (at most `cap`
+        // frames) but would count into these if they did.
+        buffer.dropped_total = dropped_total;
+        buffer.dropped_since_serve = pending_drops;
+        Ok(())
+    }
+
     /// The most reads one collect makes: one per frame with every
     /// per-writer queue full (`cap` frames each, at most
     /// [`MULTI_PUBLISHER_LOOSE_MAX`] writers), plus the read that finds the
@@ -536,11 +682,15 @@ impl Accumulator {
                 // A held view re-offers a frozen frame without popping it;
                 // reading on would take the same frame forever.
                 Ok(Some(view)) if view.is_held() => break,
-                Ok(Some(view)) => (self.check)(&self.topic, &view)
-                    .and_then(|()| self.buffer.insert(&self.topic, &view))
-                    .map(|_| {
-                        newest_ts = newest_ts.max(view.header().timestamp_ns);
-                    }),
+                Ok(Some(view)) => {
+                    // Every popped frame stamps the regime, a refused one
+                    // too: a collect whose readable frames are all refused
+                    // still reports when its evictions happened.
+                    newest_ts = newest_ts.max(view.header().timestamp_ns);
+                    (self.check)(&self.topic, &view)
+                        .and_then(|()| self.buffer.insert(&self.topic, &view))
+                        .map(|_| ())
+                }
                 Ok(None) => break,
                 Err(e) => Err(e),
             };
@@ -603,22 +753,51 @@ impl Accumulator {
         self.buffer.count_queue_drops(queue_drops);
         let dropped_now = cap_drops + queue_drops;
         if dropped_now == 0 {
-            self.armed = true;
+            // The regime closed; an event it still owed is not delivered
+            // late, because the counters already carry every drop.
+            self.event_owed = false;
+            if let Some(suppressed) = self.overflow.on_success() {
+                tracing::info!(
+                    input = %self.name,
+                    suppressed,
+                    total_failures = self.overflow.total_failures(),
+                    total = self.buffer.dropped_total(),
+                    "accumulate input collects without dropping frames again"
+                );
+            }
             return;
         }
-        if self.armed {
-            tracing::warn!(
+        match self.overflow.on_failure() {
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
                 input = %self.name,
-                cap = self.buffer.cap(),
                 dropped = dropped_now,
                 dropped_at_cap = cap_drops,
                 dropped_in_queue = queue_drops,
                 total = self.buffer.dropped_total(),
-                "accumulate input dropped its oldest frames"
-            );
-            // Disarm only when the event got through: an event still
+                suppressed,
+                total_failures = self.overflow.total_failures(),
+                "accumulate input still dropping frames"
+            ),
+            decision => {
+                if decision == RegimeDecision::Loud {
+                    self.event_owed = true;
+                }
+                tracing::warn!(
+                    input = %self.name,
+                    cap = self.buffer.cap(),
+                    dropped = dropped_now,
+                    dropped_at_cap = cap_drops,
+                    dropped_in_queue = queue_drops,
+                    total = self.buffer.dropped_total(),
+                    total_failures = self.overflow.total_failures(),
+                    "accumulate input dropped its oldest frames"
+                );
+            }
+        }
+        if self.event_owed {
+            // Delivered only when the event slot is free: an event still
             // pending from before keeps this regime's event owed.
-            self.armed = !ipc.queue_backpressure_event(BackpressureEvent {
+            self.event_owed = !ipc.queue_backpressure_event(BackpressureEvent {
                 policy: BackpressurePolicy::DropOldest,
                 input_name: Arc::clone(&self.name),
                 count_total: self.buffer.dropped_total(),
@@ -627,15 +806,6 @@ impl Accumulator {
                 regime_started_at_ns: newest_ts,
                 buffer_capacity: self.buffer.cap(),
             });
-        } else {
-            tracing::debug!(
-                input = %self.name,
-                dropped = dropped_now,
-                dropped_at_cap = cap_drops,
-                dropped_in_queue = queue_drops,
-                total = self.buffer.dropped_total(),
-                "accumulate input still dropping frames"
-            );
         }
     }
 }
@@ -933,6 +1103,173 @@ mod tests {
         buf.finish_collect();
         assert!(buf.is_empty());
         assert_eq!(buf.dropped_total(), 0);
+    }
+
+    fn accept(_: &str, _: &[u8]) -> TransportResult<()> {
+        Ok(())
+    }
+
+    fn refuse_all(topic: &str, _: &[u8]) -> TransportResult<()> {
+        Err(TransportError::SchemaMismatch {
+            topic: topic.to_string(),
+            expected_hash: 1,
+            actual_hash: 2,
+        })
+    }
+
+    fn set_of(inputs: &[(&str, usize)], check: FrameCheck) -> AccumulatorSet {
+        AccumulatorSet {
+            inputs: inputs
+                .iter()
+                .map(|(name, cap)| Accumulator {
+                    name: Arc::from(*name),
+                    topic: format!("/{name}"),
+                    buffer: AccumulateBuffer::new(*cap).unwrap(),
+                    check,
+                    overflow: FailureRegimeLatch::new(),
+                    event_owed: false,
+                    faults: FailureRegimeLatch::new(),
+                    budget: FailureRegimeLatch::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn capture(set: &AccumulatorSet) -> Vec<u8> {
+        let mut sink = crate::state::VecSink::new();
+        set.capture(&mut sink).expect("capture");
+        sink.into_inner()
+    }
+
+    fn restore(set: &mut AccumulatorSet, bytes: &[u8]) -> Result<(), StateError> {
+        let mut cursor = StateCursor::new(bytes);
+        set.restore(&mut cursor)?;
+        cursor.finish()
+    }
+
+    #[test]
+    fn a_node_without_accumulate_inputs_captures_and_restores_nothing() {
+        let mut set = AccumulatorSet::new();
+        assert!(capture(&set).is_empty());
+        restore(&mut set, &[]).expect("an empty section restores");
+    }
+
+    #[test]
+    fn the_capture_layout_matches_the_hand_written_bytes() {
+        let mut set = set_of(&[("tf", 2)], accept);
+        let a = frame(1, 10, &[0xA]);
+        let b = frame(2, 20, &[0xB]);
+        let c = frame(3, 30, &[0xC]);
+        collect(&mut set.inputs[0].buffer, &[a, b.clone(), c.clone()]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&1u32.to_le_bytes()); // one input
+        want.extend_from_slice(&2u32.to_le_bytes()); // name length
+        want.extend_from_slice(b"tf");
+        want.extend_from_slice(&1u64.to_le_bytes()); // lifetime drops
+        want.extend_from_slice(&1u64.to_le_bytes()); // pending drops
+        want.extend_from_slice(&2u32.to_le_bytes()); // held frames
+        for f in [&b, &c] {
+            want.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            want.extend_from_slice(f);
+        }
+        assert_eq!(capture(&set), want);
+    }
+
+    #[test]
+    fn a_restored_set_serves_the_unserved_frames_and_keeps_both_drop_counts() {
+        let mut live = set_of(&[("tf", 2), ("odom", 4)], accept);
+        collect(
+            &mut live.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        collect(&mut live.inputs[1].buffer, &[frame(9, 90, &[9])]);
+        let bytes = capture(&live);
+        let mut resumed = set_of(&[("tf", 2), ("odom", 4)], accept);
+        restore(&mut resumed, &bytes).expect("restore");
+        for (i, want) in [vec![(2, 20, 2), (3, 30, 3)], vec![(9, 90, 9)]]
+            .into_iter()
+            .enumerate()
+        {
+            let (l, r) = (&mut live.inputs[i].buffer, &mut resumed.inputs[i].buffer);
+            assert_eq!(served(r), want, "input {i}");
+            assert_eq!(served(l), want, "the uninterrupted run serves the same");
+            assert_eq!(r.dropped_for_this_fire(), l.dropped_for_this_fire());
+            assert_eq!(r.dropped_total(), l.dropped_total());
+        }
+        assert_eq!(resumed.inputs[0].buffer.dropped_total(), 1);
+    }
+
+    #[test]
+    fn frames_a_fire_already_received_are_not_captured() {
+        let mut set = set_of(&[("tf", 2)], accept);
+        collect(
+            &mut set.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        let _ = set.inputs[0].buffer.serve();
+        let mut resumed = set_of(&[("tf", 2)], accept);
+        restore(&mut resumed, &capture(&set)).expect("restore");
+        let buf = &mut resumed.inputs[0].buffer;
+        assert!(buf.serve().is_empty(), "nothing is owed after a serve");
+        assert_eq!(buf.dropped_for_this_fire(), 0);
+        assert_eq!(buf.dropped_total(), 1, "the lifetime count survives");
+    }
+
+    #[test]
+    fn a_restore_into_a_different_input_set_is_refused_naming_the_input() {
+        let mut live = set_of(&[("tf", 2)], accept);
+        collect(&mut live.inputs[0].buffer, &[frame(1, 10, &[1])]);
+        let bytes = capture(&live);
+        let cases: [(AccumulatorSet, &str); 3] = [
+            (
+                set_of(&[("odom", 2)], accept),
+                "accumulate input `odom` cannot be restored: the recording names input `tf` in \
+                 its place",
+            ),
+            (
+                set_of(&[("tf", 2), ("odom", 2)], accept),
+                "accumulate input `tf` cannot be restored: the recording holds 1 accumulate \
+                 input(s), the node declares 2",
+            ),
+            (
+                set_of(&[("tf", 2)], refuse_all),
+                "accumulate input `tf` cannot be restored: a held frame is refused: Schema \
+                 mismatch on topic '/tf': expected hash 0x0000000000000001, got \
+                 0x0000000000000002. Check that publisher and subscriber use the same schema; \
+                 if you recently changed a schema, rebuild BOTH sides (`cerulion node build \
+                 <type>`).",
+            ),
+        ];
+        for (mut set, want) in cases {
+            assert_eq!(restore(&mut set, &bytes).unwrap_err().to_string(), want);
+        }
+    }
+
+    #[test]
+    fn a_restore_holding_more_frames_than_the_cap_is_refused() {
+        let mut live = set_of(&[("tf", 3)], accept);
+        collect(
+            &mut live.inputs[0].buffer,
+            &[frame(1, 10, &[1]), frame(2, 20, &[2]), frame(3, 30, &[3])],
+        );
+        let mut smaller = set_of(&[("tf", 2)], accept);
+        assert_eq!(
+            restore(&mut smaller, &capture(&live))
+                .unwrap_err()
+                .to_string(),
+            "accumulate input `tf` cannot be restored: the recording holds 3 frame(s), above \
+             the cap of 2"
+        );
+    }
+
+    #[test]
+    fn a_truncated_section_is_refused() {
+        let mut live = set_of(&[("tf", 2)], accept);
+        collect(&mut live.inputs[0].buffer, &[frame(1, 10, &[1])]);
+        let bytes = capture(&live);
+        let mut resumed = set_of(&[("tf", 2)], accept);
+        let err = restore(&mut resumed, &bytes[..bytes.len() - 1]).unwrap_err();
+        assert!(matches!(err, StateError::Truncated { .. }), "{err}");
     }
 
     #[test]

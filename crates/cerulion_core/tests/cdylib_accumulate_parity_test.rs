@@ -91,8 +91,10 @@ impl AccumulateNode {
     }
 }
 
-/// `(count, weighted, dropped)` of each reader fire, in fire order.
-type Fires = Vec<(u64, u64, u64)>;
+/// `(count, weighted, dropped)` of each reader fire, in fire order, kept as
+/// the `f64` the reader published so a fractional value cannot truncate into
+/// a match.
+type Fires = Vec<(f64, f64, f64)>;
 
 #[cerulion_node]
 #[derive(Default)]
@@ -105,7 +107,7 @@ struct Sink {
 #[cerulion_node_impl]
 impl Sink {
     fn tick(&mut self) -> Result<(), NodeError> {
-        let fire = (self.inp.x as u64, self.inp.y as u64, self.inp.z as u64);
+        let fire = (self.inp.x, self.inp.y, self.inp.z);
         self.rec.lock().expect("rec lock").push(fire);
         Ok(())
     }
@@ -128,7 +130,8 @@ fn writer_def(id: &str) -> NodeDef {
     }
 }
 
-fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> Fires {
+/// The reader's fires, and its captured state at the end of the run.
+fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
     let config = GraphConfig {
         level_assignments: None,
         network: None,
@@ -202,7 +205,28 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> Fires {
         rt.step(STEP);
     }
     let fires = rec.lock().expect("rec lock").clone();
-    fires
+    let mut state = cerulion_core::state::VecSink::new();
+    rt.node_entry_arc_for_test("acc")
+        .expect("the reader")
+        .lock()
+        .expect("reader lock")
+        .capture_state(&mut state)
+        .expect("capture");
+    (fires, state.into_inner())
+}
+
+/// The reader's captured state once every frame is served: no user field is
+/// captured (the struct holds only ports), so it is the accumulate section
+/// alone, by hand: one input, `tf`, no drops, no frame owed.
+fn state_oracle() -> Vec<u8> {
+    let mut want = Vec::new();
+    want.extend_from_slice(&1u32.to_le_bytes());
+    want.extend_from_slice(&2u32.to_le_bytes());
+    want.extend_from_slice(b"tf");
+    want.extend_from_slice(&0u64.to_le_bytes());
+    want.extend_from_slice(&0u64.to_le_bytes());
+    want.extend_from_slice(&0u32.to_le_bytes());
+    want
 }
 
 fn cdylib_reader() -> Box<dyn NodeEntry> {
@@ -219,14 +243,14 @@ fn oracle() -> Fires {
     vec![
         // The first fire after publishing reads the frames of the two steps
         // before it: 1, 101, 2, 102. 1*1 + 2*101 + 3*2 + 4*102 = 617.
-        (4, 617, 0),
+        (4.0, 617.0, 0.0),
         // The next fire, three steps on, reads the other three steps:
         // 3, 103, 4, 104, 5, 105.
         // 1*3 + 2*103 + 3*4 + 4*104 + 5*5 + 6*105 = 1292.
-        (6, 1292, 0),
+        (6.0, 1292.0, 0.0),
         // Nothing new.
-        (0, 0, 0),
-        (0, 0, 0),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
     ]
 }
 
@@ -240,8 +264,14 @@ fn a_cdylib_accumulate_reader_receives_the_same_frames_as_the_in_process_twin() 
         &unique_prefix("accin"),
     );
     let cdylib = run(cdylib_reader(), &unique_prefix("accdy"));
-    assert_eq!(in_process, oracle(), "the in-process reader");
-    assert_eq!(cdylib, oracle(), "the cdylib reader, through the FFI");
+    assert_eq!(in_process.0, oracle(), "the in-process reader");
+    assert_eq!(cdylib.0, oracle(), "the cdylib reader, through the FFI");
+    assert_eq!(in_process.1, state_oracle(), "the in-process state capture");
+    assert_eq!(
+        cdylib.1,
+        state_oracle(),
+        "the cdylib state capture carries the accumulate section through the FFI"
+    );
 }
 
 #[cfg_attr(
@@ -253,6 +283,6 @@ fn a_cdylib_accumulate_reader_receives_the_same_frames_as_the_in_process_twin() 
 fn two_cdylib_runs_receive_identical_frames() {
     let a = run(cdylib_reader(), &unique_prefix("accdet"));
     let b = run(cdylib_reader(), &unique_prefix("accdet"));
-    assert_eq!(a, oracle());
-    assert_eq!(b, oracle());
+    assert_eq!(a.0, oracle());
+    assert_eq!(b.0, oracle());
 }
