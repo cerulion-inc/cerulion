@@ -5376,7 +5376,21 @@ impl NodeEntry for DylibNodeEntry {
             (Some(json), Some(init_with_params)) => unsafe {
                 init_with_params(ctx_ptr, json.as_ptr(), json.len())
             },
-            _ => unsafe { (self.init_fn)(ctx_ptr) },
+            (None, _) => unsafe { (self.init_fn)(ctx_ptr) },
+            (Some(_), None) => {
+                // Unreachable by construction (`set_params` refused the handoff
+                // without the symbol); refuse loudly rather than run the node on
+                // its defaults with the graph's values dropped. The context is
+                // consumed either way: the plain init takes the Box so no state
+                // is leaked, and its result is discarded for the error below.
+                let _ = unsafe { (self.init_fn)(ctx_ptr) };
+                return Err(TransportError::NodeError {
+                    node_id: self.diag_label.clone(),
+                    reason: "params were handed over but the node library exports no \
+                             cerulion_node_init_with_params symbol"
+                        .to_string(),
+                });
+            }
         };
         if handle == 0 {
             // Pull the cdylib's
