@@ -251,8 +251,9 @@ fn observe(case: &Case, home: &Path, cwd: &Path) -> String {
 
 /// Length of a leading RFC 3339 UTC timestamp and its trailing space
 /// (`2026-01-02T03:04:05.123456Z `), or `None` when the line does not open
-/// with one. Every byte of the prefix is checked, so a malformed stamp stays
-/// in the capture and fails the golden comparison.
+/// with one. Every byte of the prefix is checked and every date and time
+/// field must be in range, so a malformed stamp stays in the capture and
+/// fails the golden comparison.
 fn timestamp_prefix_len(line: &str) -> Option<usize> {
     const SHAPE: &[u8; 19] = b"dddd-dd-ddTdd:dd:dd";
     let bytes = line.as_bytes();
@@ -262,6 +263,17 @@ fn timestamp_prefix_len(line: &str) -> Option<usize> {
         sep => b == sep,
     });
     if !shaped {
+        return None;
+    }
+    // Two ASCII digits at `at`, already checked by the shape above.
+    let field = |at: usize| u32::from(head[at] - b'0') * 10 + u32::from(head[at + 1] - b'0');
+    let in_range = (1..=12).contains(&field(5))
+        && (1..=31).contains(&field(8))
+        && field(11) <= 23
+        && field(14) <= 59
+        // 60 is a leap second, which RFC 3339 allows.
+        && field(17) <= 60;
+    if !in_range {
         return None;
     }
     let mut end = SHAPE.len();
@@ -362,6 +374,15 @@ fn a_well_formed_timestamp_prefix_is_masked() {
         mask_log_line("2026-01-02T03:04:05Z WARN x\n"),
         "<TS> WARN x\n"
     );
+    // The edges of every field's range still mask.
+    assert_eq!(
+        mask_log_line("2026-12-31T23:59:60Z WARN x\n"),
+        "<TS> WARN x\n"
+    );
+    assert_eq!(
+        mask_log_line("2026-01-01T00:00:00Z WARN x\n"),
+        "<TS> WARN x\n"
+    );
 }
 
 #[test]
@@ -374,6 +395,14 @@ fn a_malformed_timestamp_prefix_is_left_in_the_capture() {
         "2026-01-02 03:04:05.123456Z INFO x\n",
         "2026-01-02T03:04:05.123456Z\n",
         "2026-01-02T03:04\n",
+        "9999-99-99T99:99:99Z INFO x\n",
+        "2026-00-02T03:04:05Z INFO x\n",
+        "2026-13-02T03:04:05Z INFO x\n",
+        "2026-01-00T03:04:05Z INFO x\n",
+        "2026-01-32T03:04:05Z INFO x\n",
+        "2026-01-02T24:04:05Z INFO x\n",
+        "2026-01-02T03:60:05Z INFO x\n",
+        "2026-01-02T03:04:61Z INFO x\n",
         "",
     ] {
         assert_eq!(mask_log_line(line), line, "{line:?}");
