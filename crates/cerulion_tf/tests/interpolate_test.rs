@@ -270,6 +270,81 @@ fn just_short_of_180_degrees_takes_the_short_arc() {
     );
 }
 
+/// Builds a quaternion that is already unit length and checks that
+/// normalizing it kept every bit, so the case tests the stored values.
+fn q_exact(c: [f64; 4]) -> UnitQuaternion {
+    let u = UnitQuaternion::from_array(c).expect("a valid hand-written quaternion");
+    assert_eq!(bits4(u.to_array()), bits4(c), "normalization moved {c:?}");
+    u
+}
+
+/// The 4-D dot product summed in the plain rounded order.
+fn rounded_dot(a: [f64; 4], b: [f64; 4]) -> f64 {
+    ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3]
+}
+
+#[test]
+fn near_a_half_turn_the_arc_follows_the_exact_dot_product_not_the_rounded_one() {
+    // Two pairs about a half turn apart whose rounded dot product has the
+    // wrong sign. The exact dot products, from the decimal expansions of
+    // the stored bits, are +3.2e-18 and -3.4e-17. At t = 0.5 the weights
+    // are equal, so the result is the normalized a + b (or a - b when b is
+    // negated). Those midpoints were worked out in 50-digit decimals; the
+    // other arc's midpoint is half a turn away from each.
+    let a = [
+        0.086_701_800_482_072_67,
+        0.035_248_699_619_889_05,
+        0.899_239_290_272_162_5,
+        0.427_327_773_259_696_8,
+    ];
+    let b = [
+        -0.035_248_699_619_888_97,
+        0.086_701_800_482_072_7,
+        -0.427_327_773_259_696_9,
+        0.899_239_290_272_162_8,
+    ];
+    assert!(
+        rounded_dot(a, b) < 0.0,
+        "the rounded sum must get the sign wrong"
+    );
+    assert_close4(
+        slerp(q_exact(a), q_exact(b), 0.5),
+        [
+            0.036_382_836_532_725_49,
+            0.086_232_025_591_187_91,
+            0.333_691_833_799_545_26,
+            0.938_024_566_322_103_5,
+        ],
+        TOL,
+    );
+    let a = [
+        -0.618_833_839_055_488_2,
+        0.455_546_564_486_500_05,
+        0.146_548_668_187_303_36,
+        -0.622_932_977_997_569_7,
+    ];
+    let b = [
+        -0.455_546_564_486_500_05,
+        -0.618_833_839_055_488_3,
+        0.622_932_977_997_569_9,
+        0.146_548_668_187_303_36,
+    ];
+    assert!(
+        rounded_dot(a, b) > 0.0,
+        "the rounded sum must get the sign wrong"
+    );
+    assert_close4(
+        slerp(q_exact(a), q_exact(b), 0.5),
+        [
+            -0.115_461_539_129_201_18,
+            0.759_701_668_918_479_3,
+            -0.336_854_575_917_712_56,
+            -0.544_105_690_015_911_5,
+        ],
+        TOL,
+    );
+}
+
 #[test]
 fn equal_quaternions_interpolate_to_themselves() {
     // A zero angle: the SLERP weights would divide zero by zero, so the

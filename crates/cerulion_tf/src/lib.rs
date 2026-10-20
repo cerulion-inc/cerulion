@@ -58,6 +58,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod error;
+mod exact;
 mod kernels;
 mod quaternion;
 mod transform;

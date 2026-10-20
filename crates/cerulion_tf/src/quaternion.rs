@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Unit quaternions: construction, product, conjugate and vector rotation.
 
+use crate::exact::dot4_sign;
 use crate::kernels::{atan_unit, sin_quarter_turn};
 use crate::TfMathError;
 
@@ -194,9 +195,10 @@ impl UnitQuaternion {
     ///    could land 1 ulp away.
     /// 3. Shortest arc: when the 4-D dot product `a . b` is negative,
     ///    `other` is negated first (same rotation, the nearer sign). The sign
-    ///    comes from the dot product, not from comparing `|b - a|` with
-    ///    `|b + a|`: near a 180 degree difference those two norms round to
-    ///    the same value while the dot product still has a sign. A dot
+    ///    is that of the exact dot product of the stored components, not of
+    ///    a rounded one and not of `|b - a|` against `|b + a|`: near a 180
+    ///    degree difference the rounded products cancel and can sum to the
+    ///    wrong sign, and the two norms round to the same value. A dot
     ///    product of exactly zero (a 180 degree difference, both arcs
     ///    equally long) keeps `other` as given.
     /// 4. The 4-D angle is `theta = 2 atan(|b - a| / |b + a|)`, accurate even
@@ -224,11 +226,11 @@ impl UnitQuaternion {
         let mut b = other.to_array();
         let mut diff = norm4([b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]]);
         let mut sum = norm4([b[0] + a[0], b[1] + a[1], b[2] + a[2], b[3] + a[3]]);
-        // The sign from the dot product: the two norms can round to the
-        // same value near a half turn although a . b is still negative.
+        // The sign from the exact dot product: the two norms can round to
+        // the same value near a half turn although a . b is still negative,
+        // and the rounded dot product itself can have the wrong sign there.
         // Negating b swaps the two norms, so no recomputation.
-        let dot = ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3];
-        if dot < 0.0 {
+        if dot4_sign(a, b) == std::cmp::Ordering::Less {
             b = [-b[0], -b[1], -b[2], -b[3]];
             std::mem::swap(&mut diff, &mut sum);
         }
