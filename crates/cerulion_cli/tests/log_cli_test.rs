@@ -5,10 +5,10 @@
 //!
 //! The filters are checked before anything is opened, so an unknown level is
 //! refused with no topic attach and no interrupt handler, whatever the host is
-//! running. A node id can only be checked against a running graph, and with
-//! none the verb says so and names the command that starts one; so does a
-//! bare `log echo` when nothing publishes the log topic. Those two arms read
-//! the live-run registry and the topic list, so each child gets its own
+//! running. A `--node` name is the logger name a record carries and needs no
+//! running graph: with nothing publishing the log topic, a filtered echo is
+//! refused the same way a bare one is, naming the command that starts a
+//! publisher. Those arms read the topic list, so each child gets its own
 //! shared-memory namespace: a `config/iceoryx2.toml` in its working directory
 //! (the first place iceoryx2 looks) with a private root and prefix, which a
 //! graph running on the host, or another test's child, cannot reach. The arms
@@ -113,7 +113,7 @@ fn log_echo_help_names_both_filters_and_the_line_format() {
     let out = cerulion(&["log", "echo", "--help"], &sb.home, &sb.cwd);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
     let stdout = text(&out.stdout);
-    assert!(stdout.contains("--node <ID>"), "{stdout}");
+    assert!(stdout.contains("--node <NAME>"), "{stdout}");
     assert!(stdout.contains("--level <LEVEL>"), "{stdout}");
     assert!(
         stdout.contains("debug, info, warn or error"),
@@ -140,8 +140,8 @@ fn an_unknown_level_is_refused_before_anything_is_opened() {
 
 #[test]
 fn an_unknown_level_is_refused_even_when_a_node_filter_is_given_too() {
-    // The level parses first, so the refusal does not depend on whether a
-    // graph is running: the same text on every host.
+    // The level parses first, so the refusal does not depend on what the
+    // host is running: the same text on every host.
     let sb = sandbox();
     let out = cerulion(
         &["log", "echo", "--node", "camera", "--level", "TRACE"],
@@ -157,15 +157,18 @@ fn an_unknown_level_is_refused_even_when_a_node_filter_is_given_too() {
 }
 
 #[test]
-fn a_node_filter_with_no_running_graph_is_refused_naming_the_start_command() {
+fn a_node_filter_needs_no_running_graph_and_meets_the_same_topic_refusal() {
+    // A name no graph declares is not refused up front: the logger names on
+    // the topic are the publishers' own, so the only refusal left is the
+    // missing topic, the same one a bare echo meets.
     let sb = sandbox();
-    let out = cerulion(&["log", "echo", "--node", "camera"], &sb.home, &sb.cwd);
+    let out = cerulion(&["log", "echo", "--node", "talker"], &sb.home, &sb.cwd);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", text(&out.stdout));
     let stderr = text(&out.stderr);
     assert!(
         stderr.ends_with(
-            "Error: --node camera cannot be checked: no graph is running on this host; start \
-             one with `cerulion graph run <graph>`\n"
+            "Error: no node on this host publishes /rosout; a ROS 2 node publishes it when \
+             started with `cerulion ros2 run <package> <executable>`\n"
         ),
         "{stderr}"
     );

@@ -19,7 +19,7 @@
 #![cfg(unix)]
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -395,11 +395,16 @@ fn a_closed_reader_ends_the_stream_cleanly_while_records_still_flow() {
 }
 
 /// Accepts every write, slowly: a reader that cannot keep up with the topic.
-struct SlowReader;
+/// It counts the writes it took, so a test can tell a stream that ended
+/// while records flowed from one that never wrote a record.
+struct SlowReader {
+    writes: Arc<AtomicUsize>,
+}
 
 impl Write for SlowReader {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         std::thread::sleep(Duration::from_millis(5));
+        self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -416,14 +421,29 @@ fn an_interrupt_ends_a_stream_that_the_reader_cannot_keep_up_with() {
     // empty while every record is rendered and written.
     let publisher = spawn_steady_publisher(stop.clone(), Duration::from_micros(500));
     let running = Arc::new(AtomicBool::new(true));
-    let (handle, rx) = spawn_echo(LogFilter::default(), running.clone(), SlowReader);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let (handle, rx) = spawn_echo(
+        LogFilter::default(),
+        running.clone(),
+        SlowReader {
+            writes: writes.clone(),
+        },
+    );
     std::thread::sleep(Duration::from_millis(800));
     running.store(false, Ordering::Relaxed);
     let res = rx.recv_timeout(Duration::from_secs(3));
     stop.store(true, Ordering::Relaxed);
-    publisher.join().expect("publisher");
+    let publisher_count = publisher.join().expect("publisher");
     handle.join().expect("echo thread");
     drop(holder);
     res.expect("the interrupt ends the stream while records still flow")
         .expect("an interrupt is a clean end");
+    assert!(
+        writes.load(Ordering::Relaxed) > 0,
+        "records were written before the interrupt, so the stream was flowing"
+    );
+    assert!(
+        publisher_count > 0,
+        "the publisher published ({publisher_count})"
+    );
 }

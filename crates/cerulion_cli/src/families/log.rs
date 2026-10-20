@@ -36,9 +36,9 @@ enum LogAction {
     /// Each line is
     /// `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`.
     Echo {
-        /// Show only this node's records (repeat the flag for several nodes).
-        /// The id must be a node of the running graph.
-        #[arg(long = "node", value_name = "ID")]
+        /// Show only the records of the node with this logger name (repeat
+        /// the flag for several nodes). For a ROS 2 node it is the node name.
+        #[arg(long = "node", value_name = "NAME")]
         node: Vec<String>,
         /// Show records at this level or above: debug, info, warn or error
         #[arg(long, value_name = "LEVEL", add = ArgValueCandidates::new(level_names))]
@@ -91,8 +91,8 @@ fn run(action: LogAction) -> CliResult<()> {
     match action {
         LogAction::Echo { node, level } => {
             // The filters are checked before anything is opened, so a bad
-            // level or an unknown node is refused at once, with no topic
-            // attach and no interrupt handler installed.
+            // level is refused at once, with no topic attach and no
+            // interrupt handler installed.
             let filter = log_cmd::resolve_filter(&node, level.as_deref())?;
             let running = crate::setup_ctrlc_handler()?;
             log_cmd::log_echo(&filter, running, &mut std::io::stdout())

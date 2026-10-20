@@ -243,7 +243,7 @@ named rather than hunting for a missing definition.
 
 | Command | Effect |
 |---|---|
-| `log echo [--node <ID>]... [--level <LEVEL>]` | Stream the log records of the running local graph, one line per record: `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`. `--node` keeps one node's records (repeat it for several); the id must be a node of the running graph. `--level` keeps records at that level or above: `debug`, `info`, `warn` or `error`. Reads the local `/rosout` topic only; see [Node logs](#node-logs). |
+| `log echo [--node <NAME>]... [--level <LEVEL>]` | Stream the log records of the running local graph, one line per record: `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`. `--node` keeps the records of the node with that logger name (repeat it for several); for a ROS 2 node it is the node name. `--level` keeps records at that level or above: `debug`, `info`, `warn` or `error`. Reads the local `/rosout` topic only; see [Node logs](#node-logs). |
 
 
 ### `cerulion ros2`
@@ -2436,7 +2436,7 @@ A record is at most 16 KiB on the wire: the wire header, the fixed fields, the o
 ### `cerulion log echo`
 
 ```text
-cerulion log echo [--node <ID>]... [--level <LEVEL>]
+cerulion log echo [--node <NAME>]... [--level <LEVEL>]
 ```
 
 Prints each record on one line, the message last:
@@ -2449,10 +2449,10 @@ The nanoseconds always print nine digits, the columns are separated by one space
 
 | Flag | Effect |
 |---|---|
-| `--node <ID>` | Keep only this node's records. Repeat the flag for several nodes. The id must be a node of a running graph: `node 'camra' is not in the running graph; nodes: camera, planner` otherwise. The id is matched as given, so when two running graphs both have a `camera` node, `--node camera` shows both. |
+| `--node <NAME>` | Keep only the records whose logger name (the `name` field) is `NAME`. Repeat the flag for several nodes. A ROS 2 node's logger name is its node name, which can differ from the `id:` of the graph entry that starts it: a `ros2:` entry `sidecar` running `demo_nodes_cpp talker` logs as `talker`. The name is matched as given and needs no running graph, so it works for a node started with `cerulion ros2 run` too. A name that matches nothing is not an error: the waiting line lists the logger names the topic did carry, `[waiting] /rosout: 0 records matching --node sidecar in 3s; nodes on the topic: talker`. |
 | `--level <LEVEL>` | Keep records at this level or above. One of `debug`, `info`, `warn`, `error` (case does not matter): `unknown log level 'warning'; accepted levels: debug, info, warn, error` otherwise. |
 
-The filters are checked before the topic is opened. `--node` needs a running graph to check against: with none, the verb says `--node camera cannot be checked: no graph is running on this host; start one with ` `cerulion graph run <graph>` and exits 1. When the live-run registry did not answer in time, or every run on the host is shutting down, it says `--node camera cannot be checked: ` followed by the reason, and exits 1; a run whose graph file cannot be read is skipped, and named in the refusal when the id is not found. A bare `log echo` while nothing publishes `/rosout` exits 1 with `no node on this host publishes /rosout; a ROS 2 node publishes it when started with ` `cerulion ros2 run <package> <executable>`. A frame on the topic that is not an `rcl_interfaces/Log` record ends the stream with exit 1 and an error that names the frame's schema hash and the `Log` one: another type on the name is a conflict no later frame repairs. The verb reads the local topic only, like `topic echo --local`: a robot's logs on another machine are read on that machine. While no record has been shown for three seconds, and every five seconds after that, a `[waiting] /rosout: 0 records in 3s` line goes to stderr, naming the filter when one is set (`0 records matching --node camera --level warn`); stdout carries records only, so a pipeline sees nothing else. When the reader of stdout goes away (`cerulion log echo | head -5`), the verb exits 0. Ctrl-C ends the stream at once, even on a topic busier than the reader.
+The filters are checked before the topic is opened. A `log echo`, filtered or not, while nothing publishes `/rosout` exits 1 with `no node on this host publishes /rosout; a ROS 2 node publishes it when started with ` `cerulion ros2 run <package> <executable>`. A frame on the topic that is not an `rcl_interfaces/Log` record ends the stream with exit 1 and an error that names the frame's schema hash and the `Log` one: another type on the name is a conflict no later frame repairs. The verb reads the local topic only, like `topic echo --local`: a robot's logs on another machine are read on that machine. While no record has been shown for three seconds, and every five seconds after that, a `[waiting] /rosout: 0 records in 3s` line goes to stderr, naming the filter when one is set (`0 records matching --node camera --level warn`) and, under `--node`, the logger names seen on the topic (at most 16, then `and others`); stdout carries records only, so a pipeline sees nothing else. When the reader of stdout goes away (`cerulion log echo | head -5`), the verb exits 0. Ctrl-C ends the stream at once, even on a topic busier than the reader.
 
 **For ROS 2 users.** The topic is `/rosout` with the same `rcl_interfaces/Log` record, and `cerulion log echo` is `ros2 topic echo /rosout` with the node and level filters built in.
 

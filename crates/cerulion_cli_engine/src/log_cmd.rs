@@ -15,7 +15,7 @@
 //! The verb reads the topic the way `topic echo --local` does (a live local
 //! shared-memory topic, no remote rung) and renders each record with
 //! [`render_line`]. The filters, the line format, the frame decode and the
-//! node check are pure functions with hand-written oracles below; the loop
+//! silence notice are pure functions with hand-written oracles below; the loop
 //! itself blocks on the topic's event listener and never polls.
 
 use std::fmt;
@@ -26,10 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cerulion_core::graph::config::GraphConfig;
 use cerulion_core::shm_runtime::read_offset_entry;
-use cerulion_core::transport::mirror_registry::GatherCompleteness;
-use cerulion_core::transport::run_registry::{gather_current_runs, RunGather, RunRecord, RunState};
 use cerulion_core::wire::WireError;
 use cerulion_core::ShmMessage;
 use native_ros2_messages::rcl_interfaces::{Log, LogFixedSection, LogShm};
@@ -103,27 +100,6 @@ impl LogLevel {
 pub enum LogFilterError {
     /// `--level` named something that is not a level.
     UnknownLevel { given: String },
-    /// `--node` named a node id no running graph has. `known` is the sorted
-    /// id set the error lists.
-    UnknownNode {
-        given: String,
-        known: Vec<String>,
-        /// `Some` when the check could not see every run: the live-run
-        /// registry did not hear every live writer, a run's graph could not
-        /// be read, or a run is shutting down. The id may belong to a run
-        /// the check could not see.
-        note: Option<String>,
-    },
-    /// `--node` was given and no graph is running on this host to check it
-    /// against: the registry settled on an empty answer.
-    NoRunningGraph { given: String },
-    /// `--node` was given and the running graphs could not be checked: the
-    /// live-run registry did not settle and no run was heard, or every run
-    /// heard is shutting down. `why` says which.
-    CouldNotCheck { given: String, why: String },
-    /// The live-run registry could not be read, or no live run's graph file
-    /// could be.
-    Unreadable(String),
 }
 
 impl fmt::Display for LogFilterError {
@@ -134,26 +110,6 @@ impl fmt::Display for LogFilterError {
                 "unknown log level '{given}'; accepted levels: {}",
                 LogLevel::ALL.map(LogLevel::name).join(", ")
             ),
-            LogFilterError::UnknownNode { given, known, note } => {
-                write!(
-                    f,
-                    "node '{given}' is not in the running graph; nodes: {}",
-                    known.join(", ")
-                )?;
-                if let Some(note) = note {
-                    write!(f, " ({note})")?;
-                }
-                Ok(())
-            }
-            LogFilterError::NoRunningGraph { given } => write!(
-                f,
-                "--node {given} cannot be checked: no graph is running on this host; start one \
-                 with `cerulion graph run <graph>`"
-            ),
-            LogFilterError::CouldNotCheck { given, why } => {
-                write!(f, "--node {given} cannot be checked: {why}")
-            }
-            LogFilterError::Unreadable(why) => f.write_str(why),
         }
     }
 }
@@ -169,7 +125,7 @@ impl From<LogFilterError> for CliError {
 /// What `log echo` lets through.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogFilter {
-    /// Node ids to show. Empty shows every node.
+    /// Logger names to show, matched as given. Empty shows every node.
     pub nodes: Vec<String>,
     /// The lowest level to show. `None` shows every level.
     pub min_level: Option<LogLevel>,
@@ -207,7 +163,7 @@ pub struct LogRecord {
     pub stamp_nanosec: u32,
     /// `level`: the severity constant as published.
     pub level: u8,
-    /// `name`: the node id.
+    /// `name`: the logger name, which a ROS 2 node sets to its node name.
     pub node: String,
     /// `function`: the `tracing` target.
     pub target: String,
@@ -373,167 +329,16 @@ fn string_field(payload: &[u8], index: usize, strict: Result<&str, WireError>) -
     }
 }
 
-/// Check every requested node id against `known` (the running graphs' node
-/// ids). `note` is carried into the error when the check could not see every
-/// run.
-pub fn validate_nodes(
-    requested: &[String],
-    known: &[String],
-    note: Option<&str>,
-) -> Result<(), LogFilterError> {
-    match requested.iter().find(|id| !known.contains(id)) {
-        None => Ok(()),
-        Some(given) => Err(LogFilterError::UnknownNode {
-            given: given.clone(),
-            known: known.to_vec(),
-            note: note.map(str::to_string),
-        }),
-    }
-}
-
-/// The node ids a run's effective `graph.yaml` declares, sorted.
-pub fn node_ids_from_graph_yaml(yaml: &str) -> Result<Vec<String>, LogFilterError> {
-    let config: GraphConfig = serde_yaml::from_str(yaml).map_err(|e| {
-        LogFilterError::Unreadable(format!("could not parse the running graph: {e}"))
-    })?;
-    let mut ids: Vec<String> = config.nodes.iter().map(|node| node.id.clone()).collect();
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
-}
-
-/// Reduce one live-run gather to the node ids `--node` is checked against,
-/// plus a note on what the check could not see.
+/// Resolve the `--node` and `--level` values into a [`LogFilter`].
 ///
-/// `read_ids` reads one run's node ids (its effective `graph.yaml`). It is a
-/// parameter so the decision is a pure function over the gather, with a
-/// hand-written vector below for every arm:
-///
-/// - a settled gather with no run: [`LogFilterError::NoRunningGraph`];
-/// - no live run, and a gather that did not settle or runs that are only
-///   shutting down: [`LogFilterError::CouldNotCheck`], never a confident
-///   "no graph is running" (the registry did not hear every writer, or heard
-///   only last words);
-/// - a live run whose graph cannot be read is skipped and named in the note,
-///   so a node of a readable run still passes; when no live run can be read,
-///   the reasons come back as [`LogFilterError::Unreadable`];
-/// - otherwise the ids are the union over the live runs, sorted and
-///   deduplicated, and the note carries the unsettled registry, the skipped
-///   runs and the runs that are shutting down, to ride into an
-///   [`LogFilterError::UnknownNode`].
-pub(crate) fn node_ids_from_gather(
-    given: &str,
-    gather: &RunGather,
-    mut read_ids: impl FnMut(&RunRecord) -> Result<Vec<String>, LogFilterError>,
-) -> Result<(Vec<String>, Option<String>), LogFilterError> {
-    let mut notes: Vec<String> = Vec::new();
-    if let GatherCompleteness::Incomplete {
-        live_writers,
-        writers_heard,
-    } = gather.completeness
-    {
-        notes.push(format!(
-            "the live-run registry did not settle ({writers_heard} of {live_writers} live \
-             writers answered), so a node of an unheard run cannot be seen; try again"
-        ));
-    }
-    for record in &gather.records {
-        if record.state == RunState::Ending {
-            notes.push(format!("run {} is shutting down", record.graph_name));
-        }
-    }
-    let live: Vec<&RunRecord> = gather
-        .records
-        .iter()
-        .filter(|record| record.state == RunState::Live)
-        .collect();
-    if live.is_empty() {
-        return Err(if notes.is_empty() {
-            LogFilterError::NoRunningGraph {
-                given: given.to_string(),
-            }
-        } else {
-            LogFilterError::CouldNotCheck {
-                given: given.to_string(),
-                why: notes.join("; "),
-            }
-        });
-    }
-    let mut ids = Vec::new();
-    let mut readable = 0usize;
-    let mut unreadable = Vec::new();
-    for record in live {
-        match read_ids(record) {
-            Ok(run_ids) => {
-                readable += 1;
-                ids.extend(run_ids);
-            }
-            Err(e) => unreadable.push(e.to_string()),
-        }
-    }
-    if readable == 0 {
-        return Err(LogFilterError::Unreadable(unreadable.join("; ")));
-    }
-    notes.extend(unreadable);
-    ids.sort();
-    ids.dedup();
-    let note = if notes.is_empty() {
-        None
-    } else {
-        Some(notes.join("; "))
-    };
-    Ok((ids, note))
-}
-
-/// The node ids of every live run on this host (the union over runs, sorted),
-/// and a note on what the check could not see.
-fn live_graph_node_ids(given: &str) -> Result<(Vec<String>, Option<String>), LogFilterError> {
-    let gather = gather_current_runs()
-        .map_err(|e| LogFilterError::Unreadable(format!("could not gather live runs: {e}")))?;
-    node_ids_from_gather(given, &gather, node_ids_of_run)
-}
-
-/// The node ids one live run's `graph.yaml` declares.
-///
-/// A registry record is a claim any local process can publish, so its
-/// `run_dir` is read only once it is verified as that run's directory under
-/// the run directory root, owned by the invoking user; the graph is read from
-/// the verified path, never the claimed one.
-fn node_ids_of_run(record: &RunRecord) -> Result<Vec<String>, LogFilterError> {
-    let unreadable = |why: String| {
-        LogFilterError::Unreadable(format!(
-            "could not read the graph of run {} ({}): {why}",
-            record.graph_name, record.run_dir
-        ))
-    };
-    let dir = trusted_run_dir(record)
-        .map_err(|why| unreadable(format!("its directory is not the run's: {why}")))?;
-    let yaml = std::fs::read_to_string(dir.join(crate::run_dir::RUN_GRAPH_FILE))
-        .map_err(|e| unreadable(e.to_string()))?;
-    node_ids_from_graph_yaml(&yaml)
-}
-
-/// The verified directory of `record`'s run.
-#[cfg(unix)]
-fn trusted_run_dir(record: &RunRecord) -> Result<std::path::PathBuf, String> {
-    crate::run_dir::verified_run_dir(std::path::Path::new(&record.run_dir), record.run_id)
-}
-
-/// The verified directory of `record`'s run: the ownership check needs a unix
-/// host, so elsewhere no run directory is trusted.
-#[cfg(not(unix))]
-fn trusted_run_dir(_record: &RunRecord) -> Result<std::path::PathBuf, String> {
-    Err("a run directory can be verified on unix only".to_string())
-}
-
-/// Resolve the `--node` and `--level` values into a [`LogFilter`], checking
-/// node ids against the running graphs.
+/// A `--node` value is the logger name a record carries, matched as given.
+/// It is not checked before the stream starts: the names on the topic are
+/// the ones its publishers choose (a ROS 2 node's own name, whatever its
+/// graph entry is called), so no graph file can list them. A name that
+/// matches nothing is answered by the silence notice instead, which lists
+/// the names the topic does carry.
 pub fn resolve_filter(nodes: &[String], level: Option<&str>) -> Result<LogFilter, LogFilterError> {
     let min_level = level.map(LogLevel::parse).transpose()?;
-    if !nodes.is_empty() {
-        let (known, note) = live_graph_node_ids(&nodes[0])?;
-        validate_nodes(nodes, &known, note.as_deref())?;
-    }
     Ok(LogFilter {
         nodes: nodes.to_vec(),
         min_level,
@@ -594,18 +399,75 @@ impl fmt::Display for UndecodableFrame {
     }
 }
 
+/// The most distinct logger names [`SeenNodes`] keeps. A topic with more
+/// publishers than this is listed with `and others` after the first ones in
+/// name order, so a flood of distinct names cannot grow the set without end.
+pub const SEEN_NODES_CAP: usize = 16;
+
+/// The logger names the records on the topic carried, kept while a `--node`
+/// filter is set so the silence notice can list what the topic does carry.
+/// Sorted, deduplicated and bounded by [`SEEN_NODES_CAP`]; an empty name is
+/// not kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeenNodes {
+    names: std::collections::BTreeSet<String>,
+    more: bool,
+}
+
+impl SeenNodes {
+    /// Keep `name`. A name already kept costs a lookup and no allocation;
+    /// a new name past the cap is counted as `and others`, not kept.
+    pub fn note(&mut self, name: &str) {
+        if name.is_empty() || self.names.contains(name) {
+            return;
+        }
+        if self.names.len() < SEEN_NODES_CAP {
+            self.names.insert(name.to_string());
+        } else {
+            self.more = true;
+        }
+    }
+
+    /// The kept names as the notice lists them: comma separated in name
+    /// order, each escaped like a fixed column of a record line, then
+    /// `and others` when names past the cap were seen. `None` when no name
+    /// was kept.
+    fn listing(&self) -> Option<String> {
+        if self.names.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for (i, name) in self.names.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            push_escaped(&mut out, name, Column::Fixed);
+        }
+        if self.more {
+            out.push_str(", and others");
+        }
+        Some(out)
+    }
+}
+
 /// The stderr line `log echo` prints while nothing has been shown for a
-/// while: how long, and what a record had to match.
-fn silence_notice(filter: &LogFilter, silent_for: Duration) -> String {
+/// while: how long, what a record had to match and, under a `--node`
+/// filter, the logger names the topic carried instead.
+fn silence_notice(filter: &LogFilter, silent_for: Duration, seen: &SeenNodes) -> String {
     let secs = silent_for.as_secs_f64();
     if filter.nodes.is_empty() && filter.min_level.is_none() {
-        format!("[waiting] {LOG_TOPIC}: 0 records in {secs:.0}s")
-    } else {
-        format!(
-            "[waiting] {LOG_TOPIC}: 0 records matching {} in {secs:.0}s",
-            filter.spelling()
-        )
+        return format!("[waiting] {LOG_TOPIC}: 0 records in {secs:.0}s");
     }
+    let mut line = format!(
+        "[waiting] {LOG_TOPIC}: 0 records matching {} in {secs:.0}s",
+        filter.spelling()
+    );
+    if !filter.nodes.is_empty() {
+        if let Some(names) = seen.listing() {
+            let _ = write!(line, "; nodes on the topic: {names}");
+        }
+    }
+    line
 }
 
 /// Stream the local log topic to `writer`, one rendered record per line,
@@ -654,6 +516,8 @@ pub fn log_echo(
     // by every shown record) and how many notices it has had.
     let mut silence_since = std::time::Instant::now();
     let mut notices_emitted: u32 = 0;
+    // The logger names seen, for the notice to list under a `--node` filter.
+    let mut seen = SeenNodes::default();
     while running.load(Ordering::Relaxed) {
         let wait_started = std::time::Instant::now();
         let mut shown: usize = 0;
@@ -674,6 +538,9 @@ pub fn log_echo(
                     let payload = msg.payload();
                     match decode_log_frame(schema_hash, payload) {
                         Some(record) => {
+                            if !filter.nodes.is_empty() {
+                                seen.note(&record.node);
+                            }
                             if filter.passes(&record) {
                                 shown += 1;
                                 note_write_error(
@@ -711,7 +578,7 @@ pub fn log_echo(
                 } else {
                     let silent_for = silence_since.elapsed();
                     if topic_cmd::silence_notice_due(silent_for, notices_emitted) {
-                        eprintln!("{}", silence_notice(filter, silent_for));
+                        eprintln!("{}", silence_notice(filter, silent_for, &seen));
                         notices_emitted = notices_emitted.saturating_add(1);
                     }
                 }
@@ -1263,305 +1130,6 @@ mod tests {
         assert_eq!(decode_log_frame(hash, &buf[s..e]), None);
     }
 
-    // ---- node ids of the running graphs ----
-
-    #[test]
-    fn requested_nodes_that_exist_pass_and_the_first_unknown_is_refused() {
-        let known: Vec<String> = ["camera", "lidar", "planner"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            validate_nodes(&["camera".to_string()], &known, None),
-            Ok(())
-        );
-        assert_eq!(
-            validate_nodes(&["planner".to_string(), "camera".to_string()], &known, None),
-            Ok(())
-        );
-        assert_eq!(validate_nodes(&[], &known, None), Ok(()));
-        let err = validate_nodes(
-            &[
-                "camera".to_string(),
-                "camra".to_string(),
-                "nope".to_string(),
-            ],
-            &known,
-            None,
-        )
-        .expect_err("unknown");
-        assert_eq!(
-            err,
-            LogFilterError::UnknownNode {
-                given: "camra".into(),
-                known: known.clone(),
-                note: None,
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            "node 'camra' is not in the running graph; nodes: camera, lidar, planner"
-        );
-    }
-
-    #[test]
-    fn the_check_note_is_named_in_the_refusal() {
-        let known = vec!["camera".to_string()];
-        let err = validate_nodes(
-            &["lidar".to_string()],
-            &known,
-            Some("the live-run registry did not settle"),
-        )
-        .expect_err("unknown");
-        assert_eq!(
-            err.to_string(),
-            "node 'lidar' is not in the running graph; nodes: camera (the live-run registry \
-             did not settle)"
-        );
-    }
-
-    #[test]
-    fn every_could_not_check_arm_names_the_flag_and_the_reason() {
-        let err = LogFilterError::NoRunningGraph {
-            given: "camera".into(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "--node camera cannot be checked: no graph is running on this host; start one \
-             with `cerulion graph run <graph>`"
-        );
-        let err = LogFilterError::CouldNotCheck {
-            given: "camera".into(),
-            why: "run demo is shutting down".into(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "--node camera cannot be checked: run demo is shutting down"
-        );
-        let err = LogFilterError::Unreadable("could not gather live runs: boom".into());
-        assert_eq!(err.to_string(), "could not gather live runs: boom");
-    }
-
-    #[test]
-    fn node_ids_come_from_the_effective_graph_yaml_sorted() {
-        let yaml = r#"
-prefix: robo
-nodes:
-  - id: planner
-    type: planner
-  - id: camera
-    type: camera
-    outputs:
-      - name: image
-        schema: sensor_msgs/Image
-"#;
-        assert_eq!(
-            node_ids_from_graph_yaml(yaml).unwrap(),
-            ["camera".to_string(), "planner".to_string()]
-        );
-        let err = node_ids_from_graph_yaml("nodes: [").expect_err("bad yaml");
-        assert!(
-            matches!(err, LogFilterError::Unreadable(ref m) if m.starts_with("could not parse the running graph: ")),
-            "{err:?}"
-        );
-    }
-
-    // ---- the gather decision, one vector per arm ----
-
-    fn run(id: u128, graph: &str, state: RunState) -> RunRecord {
-        RunRecord {
-            run_id: id,
-            supervisor_pid: 4242,
-            run_started_at_ns: 1_700_000_000_000_000_000,
-            state,
-            graph_name: graph.to_string(),
-            run_dir: format!("/runs/{graph}"),
-        }
-    }
-
-    fn settled(records: Vec<RunRecord>) -> RunGather {
-        RunGather {
-            records,
-            completeness: GatherCompleteness::Settled,
-        }
-    }
-
-    fn unsettled(records: Vec<RunRecord>, live_writers: usize, writers_heard: usize) -> RunGather {
-        RunGather {
-            records,
-            completeness: GatherCompleteness::Incomplete {
-                live_writers,
-                writers_heard,
-            },
-        }
-    }
-
-    /// Reads the ids a test hands it per graph name; a graph not in the
-    /// table is unreadable.
-    fn reader<'t>(
-        table: &'t [(&'t str, Vec<&'t str>)],
-    ) -> impl FnMut(&RunRecord) -> Result<Vec<String>, LogFilterError> + 't {
-        move |record| {
-            table
-                .iter()
-                .find(|(graph, _)| *graph == record.graph_name)
-                .map(|(_, ids)| ids.iter().map(|s| s.to_string()).collect())
-                .ok_or_else(|| {
-                    LogFilterError::Unreadable(format!(
-                        "could not read the graph of run {} ({}/graph.yaml): gone",
-                        record.graph_name, record.run_dir
-                    ))
-                })
-        }
-    }
-
-    const UNSETTLED_NOTE: &str = "the live-run registry did not settle (1 of 2 live writers \
-                                  answered), so a node of an unheard run cannot be seen; try again";
-
-    #[test]
-    fn a_settled_empty_gather_is_no_running_graph() {
-        let err =
-            node_ids_from_gather("camera", &settled(vec![]), reader(&[])).expect_err("no run");
-        assert_eq!(
-            err,
-            LogFilterError::NoRunningGraph {
-                given: "camera".into()
-            }
-        );
-    }
-
-    #[test]
-    fn an_unsettled_empty_gather_is_could_not_check_never_a_confident_no_graph() {
-        let err = node_ids_from_gather("camera", &unsettled(vec![], 2, 1), reader(&[]))
-            .expect_err("unsettled");
-        assert_eq!(
-            err,
-            LogFilterError::CouldNotCheck {
-                given: "camera".into(),
-                why: UNSETTLED_NOTE.into(),
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            format!("--node camera cannot be checked: {UNSETTLED_NOTE}")
-        );
-    }
-
-    #[test]
-    fn a_gather_with_only_ending_runs_is_could_not_check_naming_them() {
-        let gather = settled(vec![
-            run(1, "demo", RunState::Ending),
-            run(2, "nav", RunState::Ending),
-        ]);
-        let err = node_ids_from_gather(
-            "camera",
-            &gather,
-            reader(&[("demo", vec!["camera"]), ("nav", vec!["planner"])]),
-        )
-        .expect_err("ending only");
-        assert_eq!(
-            err,
-            LogFilterError::CouldNotCheck {
-                given: "camera".into(),
-                why: "run demo is shutting down; run nav is shutting down".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn live_runs_give_the_sorted_union_of_their_node_ids_and_no_note() {
-        let gather = settled(vec![
-            run(1, "demo", RunState::Live),
-            run(2, "nav", RunState::Live),
-        ]);
-        let got = node_ids_from_gather(
-            "camera",
-            &gather,
-            reader(&[
-                ("demo", vec!["planner", "camera"]),
-                ("nav", vec!["lidar", "camera"]),
-            ]),
-        )
-        .expect("readable");
-        assert_eq!(
-            got,
-            (
-                vec!["camera".to_string(), "lidar".into(), "planner".into()],
-                None
-            )
-        );
-    }
-
-    #[test]
-    fn an_unsettled_gather_with_live_runs_passes_the_ids_and_carries_the_note() {
-        let gather = unsettled(vec![run(1, "demo", RunState::Live)], 2, 1);
-        let got = node_ids_from_gather("camera", &gather, reader(&[("demo", vec!["camera"])]))
-            .expect("readable");
-        assert_eq!(
-            got,
-            (vec!["camera".to_string()], Some(UNSETTLED_NOTE.into()))
-        );
-    }
-
-    #[test]
-    fn an_unreadable_run_is_skipped_and_named_while_a_readable_one_still_answers() {
-        let gather = settled(vec![
-            run(1, "demo", RunState::Live),
-            run(2, "nav", RunState::Live),
-        ]);
-        let got = node_ids_from_gather("camera", &gather, reader(&[("demo", vec!["camera"])]))
-            .expect("one readable run");
-        assert_eq!(
-            got,
-            (
-                vec!["camera".to_string()],
-                Some("could not read the graph of run nav (/runs/nav/graph.yaml): gone".into())
-            )
-        );
-    }
-
-    #[test]
-    fn when_no_live_run_can_be_read_every_reason_comes_back_as_unreadable() {
-        let gather = settled(vec![
-            run(1, "demo", RunState::Live),
-            run(2, "nav", RunState::Live),
-        ]);
-        let err = node_ids_from_gather("camera", &gather, reader(&[])).expect_err("none readable");
-        assert_eq!(
-            err,
-            LogFilterError::Unreadable(
-                "could not read the graph of run demo (/runs/demo/graph.yaml): gone; could not \
-                 read the graph of run nav (/runs/nav/graph.yaml): gone"
-                    .into()
-            )
-        );
-    }
-
-    #[test]
-    fn an_ending_run_beside_a_live_one_is_left_out_of_the_ids_and_named_in_the_note() {
-        let gather = unsettled(
-            vec![
-                run(1, "demo", RunState::Live),
-                run(2, "old", RunState::Ending),
-            ],
-            2,
-            1,
-        );
-        let got = node_ids_from_gather(
-            "camera",
-            &gather,
-            reader(&[("demo", vec!["camera"]), ("old", vec!["lidar"])]),
-        )
-        .expect("readable");
-        assert_eq!(
-            got,
-            (
-                vec!["camera".to_string()],
-                Some(format!("{UNSETTLED_NOTE}; run old is shutting down"))
-            )
-        );
-    }
-
     // ---- the write error and the silence notice ----
 
     /// A writer whose reader has gone away: every write is `BrokenPipe`.
@@ -1605,7 +1173,11 @@ nodes:
     #[test]
     fn the_silence_notice_names_the_topic_the_elapsed_time_and_the_filter() {
         assert_eq!(
-            silence_notice(&LogFilter::default(), Duration::from_secs(3)),
+            silence_notice(
+                &LogFilter::default(),
+                Duration::from_secs(3),
+                &SeenNodes::default()
+            ),
             "[waiting] /rosout: 0 records in 3s"
         );
         let filter = LogFilter {
@@ -1613,46 +1185,86 @@ nodes:
             min_level: Some(LogLevel::Warn),
         };
         assert_eq!(
-            silence_notice(&filter, Duration::from_millis(8_400)),
+            silence_notice(&filter, Duration::from_millis(8_400), &SeenNodes::default()),
             "[waiting] /rosout: 0 records matching --node camera --level warn in 8s"
         );
     }
 
-    // ---- a forged run directory is never read ----
-
-    /// A registry record can name any directory. One outside the run
-    /// directory root, named for the run and holding a `graph.yaml` that
-    /// declares a node, is refused, and the node it declares is not learned.
-    #[cfg(unix)]
+    /// The case a graph id cannot answer: a `ros2:` entry `sidecar` runs a
+    /// node that names itself `talker`. `--node sidecar` matches nothing, and
+    /// the notice lists the name the records do carry.
     #[test]
-    fn a_run_directory_outside_the_root_is_refused_and_its_graph_is_not_read() {
-        let run_id: u128 = 0x10c0_0000_0000_0000_0000_0000_0000_0001;
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        let forged = elsewhere.path().join(format!("nav-{run_id:032x}"));
-        std::fs::create_dir(&forged).expect("forged dir");
-        std::fs::write(
-            forged.join(crate::run_dir::RUN_GRAPH_FILE),
-            "name: nav\nnodes:\n  - id: intruder\n",
-        )
-        .expect("forged graph");
-        let record = RunRecord {
-            run_id,
-            graph_name: "nav".into(),
-            run_dir: forged.display().to_string(),
-            supervisor_pid: 1,
-            run_started_at_ns: 0,
-            state: RunState::Live,
+    fn under_a_node_filter_the_silence_notice_lists_the_names_on_the_topic() {
+        let filter = LogFilter {
+            nodes: vec!["sidecar".into()],
+            min_level: None,
         };
-        let err = node_ids_of_run(&record).expect_err("a forged directory is refused");
-        let LogFilterError::Unreadable(why) = &err else {
-            panic!("refused as unreadable, got {err:?}");
-        };
-        assert!(
-            why.starts_with("could not read the graph of run nav ("),
-            "{why}"
+        let mut seen = SeenNodes::default();
+        for name in ["talker", "listener", "talker", ""] {
+            seen.note(name);
+        }
+        assert_eq!(
+            silence_notice(&filter, Duration::from_secs(3), &seen),
+            "[waiting] /rosout: 0 records matching --node sidecar in 3s; nodes on the topic: \
+             listener, talker"
         );
-        assert!(why.contains("its directory is not the run's: "), "{why}");
-        assert!(!why.contains("intruder"), "{why}");
+        // Nothing seen yet: no list.
+        assert_eq!(
+            silence_notice(&filter, Duration::from_secs(3), &SeenNodes::default()),
+            "[waiting] /rosout: 0 records matching --node sidecar in 3s"
+        );
+        // A level filter alone never lists names.
+        let level_only = LogFilter {
+            nodes: vec![],
+            min_level: Some(LogLevel::Error),
+        };
+        assert_eq!(
+            silence_notice(&level_only, Duration::from_secs(3), &seen),
+            "[waiting] /rosout: 0 records matching --level error in 3s"
+        );
+    }
+
+    /// The record's own name is what `--node` matches: the real logger name
+    /// passes, and a name that is only a graph entry id does not.
+    #[test]
+    fn the_node_filter_matches_the_logger_name_the_record_carries() {
+        let by_logger = LogFilter {
+            nodes: vec!["talker".into()],
+            min_level: None,
+        };
+        assert!(by_logger.passes(&record(20, "talker", "hello")));
+        let by_entry_id = LogFilter {
+            nodes: vec!["sidecar".into()],
+            min_level: None,
+        };
+        assert!(!by_entry_id.passes(&record(20, "talker", "hello")));
+        assert_eq!(
+            resolve_filter(&["talker".to_string()], None).expect("no graph is needed"),
+            by_logger
+        );
+    }
+
+    /// Adversarial: a flood of distinct names keeps the first ones in name
+    /// order up to the cap and says `and others`; a name in a fixed column
+    /// is escaped like a record line.
+    #[test]
+    fn the_seen_names_are_bounded_sorted_and_escaped() {
+        let mut seen = SeenNodes::default();
+        for i in (0..1000).rev() {
+            seen.note(&format!("n{i:04}"));
+        }
+        let listing = seen.listing().expect("names were seen");
+        let names: Vec<&str> = listing.split(", ").collect();
+        assert_eq!(names.len(), SEEN_NODES_CAP + 1, "{listing}");
+        assert_eq!(names.last(), Some(&"and others"));
+        // The cap keeps the first names noted, listed in name order.
+        assert_eq!(names[0], "n0984");
+        assert_eq!(names[SEEN_NODES_CAP - 1], "n0999");
+        let mut odd = SeenNodes::default();
+        odd.note("my node");
+        odd.note("bad\nname");
+        assert_eq!(odd.listing().as_deref(), Some("bad\\nname, my\\u{20}node"));
+        assert_eq!(SeenNodes::default().listing(), None);
     }
 
     // ---- the wrong-schema outcome ----
