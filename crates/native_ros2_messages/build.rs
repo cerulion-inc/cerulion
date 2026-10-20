@@ -447,7 +447,7 @@ fn nested_module(
         if same_package {
             Some(current_package.to_string())
         } else if schema_name == "Header" && std_msgs_has_header {
-            // Bind iff std_msgs/Header EXISTS in the schema set —
+            // Bind iff std_msgs/Header EXISTS in the schema set,
             // the exact condition resolve.rs::lookup checks.
             Some("std_msgs".to_string())
         } else {
