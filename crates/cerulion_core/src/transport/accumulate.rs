@@ -23,8 +23,18 @@
 //! The buffer holds at most `cap` frames. When it is full, the OLDEST frame
 //! by the order above is dropped: an arriving frame older than every held
 //! one is itself the one dropped, otherwise it replaces the oldest held
-//! frame. Every drop is counted ([`AccumulateBuffer::dropped_total`]), with
-//! no regime or rate limit on the count.
+//! frame.
+//!
+//! The cap is also the depth of each writer's transport queue. A writer that
+//! publishes more than `cap` frames between two fires loses its oldest
+//! frames in that queue before the collect can read them; the input's
+//! `drop_oldest` detector sees those as wire sequence gaps. Both kinds of
+//! drop go into the one count the node reads ([`Accumulated::dropped`],
+//! [`Accumulated::dropped_total`]) and into the input's
+//! `backpressure_drop_oldest_count`, with no regime or rate limit on the
+//! count. The one loss no count can see is a writer's frames evicted before
+//! the input received any frame from that writer: the detector has no
+//! earlier sequence to measure the gap from.
 //!
 //! # Storage
 //!
@@ -48,6 +58,7 @@ use crate::graph::node::{AnySubscriber, BackpressurePolicy, NodeContext};
 use crate::graph::topology::{DEFAULT_CONSUMER_DEPTH, MAX_CONSUMER_DEPTH};
 use crate::message::ShmMessage;
 use crate::scheduler::BackpressureEvent;
+use crate::transport::MULTI_PUBLISHER_LOOSE_MAX;
 use crate::wire::WireHeader;
 
 /// The cap an `#[input(accumulate)]` without `cap = N` gets.
@@ -199,6 +210,14 @@ impl AccumulateBuffer {
         self.dropped_since_serve
     }
 
+    /// Count `n` frames lost before they reached this buffer (evicted from
+    /// a writer's transport queue), in the same two counters a drop at the
+    /// cap goes into. Call it after [`Self::begin_collect`].
+    pub fn count_queue_drops(&mut self, n: u64) {
+        self.dropped_total += n;
+        self.dropped_since_serve += n;
+    }
+
     /// Start a step-boundary collect. Frames a fire already received are
     /// released; frames no fire has received yet stay held, so a fire that
     /// did not run (its body was skipped) loses nothing.
@@ -337,7 +356,11 @@ fn check_frame<T: ShmMessage>(topic: &str, raw: &[u8]) -> TransportResult<()> {
 
 #[derive(Debug)]
 struct Accumulator {
-    name: String,
+    /// The input (field) name, shared into each overflow event.
+    name: Arc<str>,
+    /// The topic the input is wired to (the input name when unwired), for
+    /// refusal messages.
+    topic: String,
     buffer: AccumulateBuffer,
     check: FrameCheck,
     /// Edge trigger for the overflow event: one event per overflow regime,
@@ -345,6 +368,8 @@ struct Accumulator {
     armed: bool,
     /// Flood suppression for refused frames and receive faults.
     faults: FailureRegimeLatch,
+    /// Flood suppression for collects that stop at the pop budget.
+    budget: FailureRegimeLatch,
 }
 
 /// Every accumulate input of one node, keyed by input name in declaration
@@ -376,28 +401,34 @@ impl AccumulatorSet {
         name: &str,
         cap: usize,
     ) -> TransportResult<()> {
-        if self.inputs.iter().any(|a| a.name == name) {
+        if self.inputs.iter().any(|a| &*a.name == name) {
             return Err(TransportError::InvalidTransportConfig {
                 reason: format!("accumulate input '{name}' is registered twice"),
             });
         }
         let buffer = AccumulateBuffer::new(cap)?;
-        if let Some(sub) = ctx.subscriber_mut(name) {
-            sub.mark_fifo_consume();
-        }
+        let topic = match ctx.subscriber_mut(name) {
+            Some(sub) => {
+                sub.mark_fifo_consume();
+                sub.topic().to_string() // hot-path-alloc-ok: registration, once per input at node init
+            }
+            None => name.to_string(), // hot-path-alloc-ok: registration, once per input at node init
+        };
         self.inputs.push(Accumulator {
-            name: name.to_string(), // hot-path-alloc-ok: registration, once per input at node init
+            name: Arc::from(name), // hot-path-alloc-ok: registration, once per input at node init
+            topic,
             buffer,
             check: check_frame::<T>,
             armed: true,
             faults: FailureRegimeLatch::new(),
+            budget: FailureRegimeLatch::new(),
         });
         Ok(())
     }
 
     /// Is `name` an accumulate input?
     pub fn contains(&self, name: &str) -> bool {
-        self.inputs.iter().any(|a| a.name == name)
+        self.inputs.iter().any(|a| &*a.name == name)
     }
 
     /// The step-boundary freeze for one node: every accumulate input in
@@ -407,7 +438,7 @@ impl AccumulatorSet {
     /// two node kinds read accumulate inputs identically.
     pub fn snapshot(&mut self, ctx: &mut NodeContext, names: &[String]) {
         for name in names {
-            match self.inputs.iter_mut().find(|a| a.name == *name) {
+            match self.inputs.iter_mut().find(|a| *a.name == **name) {
                 Some(acc) => match ctx.subscriber_mut(name) {
                     Some(sub) => acc.gather_frames(sub),
                     None => {
@@ -431,7 +462,7 @@ impl AccumulatorSet {
     /// A second call before the next [`Self::snapshot`] hands over nothing,
     /// so a node fired several times in one step receives each frame once.
     pub fn mark_served(&mut self, name: &str) {
-        if let Some(acc) = self.inputs.iter_mut().find(|a| a.name == name) {
+        if let Some(acc) = self.inputs.iter_mut().find(|a| &*a.name == name) {
             acc.buffer.mark_served();
         }
     }
@@ -440,9 +471,9 @@ impl AccumulatorSet {
     /// An unknown name yields an empty view (the generated tick only asks
     /// for declared accumulate inputs).
     pub fn view<T: ShmMessage>(&self, name: &str) -> Accumulated<'_, T> {
-        match self.inputs.iter().find(|a| a.name == name) {
+        match self.inputs.iter().find(|a| &*a.name == name) {
             Some(acc) => Accumulated {
-                topic: acc.name.as_str(),
+                topic: acc.topic.as_str(),
                 frames: acc.buffer.frames(),
                 dropped: acc.buffer.dropped_for_this_fire(),
                 dropped_total: acc.buffer.dropped_total(),
@@ -460,15 +491,53 @@ impl AccumulatorSet {
 }
 
 impl Accumulator {
+    /// The most reads one collect makes: one per frame with every
+    /// per-writer queue full (`cap` frames each, at most
+    /// [`MULTI_PUBLISHER_LOOSE_MAX`] writers), plus the read that finds the
+    /// queue empty. A collect stops here so a writer that refills its queue
+    /// as fast as the collect pops cannot hold the step.
+    fn read_budget(&self) -> usize {
+        self.buffer.cap() * MULTI_PUBLISHER_LOOSE_MAX + 1
+    }
+
     fn gather_frames(&mut self, sub: &mut AnySubscriber) {
+        let AnySubscriber::Ipc(ipc) = sub;
         self.buffer.begin_collect();
         let before = self.buffer.dropped_total();
+        // The input's own `drop_oldest` probe runs inside these pops: it
+        // counts transport-queue evictions into the input's counter and may
+        // raise its own event. Both drop sources are reported as ONE count
+        // and ONE event below, so an event still pending from before is set
+        // aside, and the probe's event (if any) is replaced.
+        let queue_count_before = ipc.drop_oldest_count();
+        let pending_before = ipc.try_take_backpressure_event();
         let mut newest_ts = 0u64;
+        let budget = self.read_budget();
+        let mut reads = 0usize;
         loop {
-            let frame = sub.view_raw();
+            if reads == budget {
+                match self.budget.on_failure() {
+                    RegimeDecision::Suppressed { .. } => tracing::debug!(
+                        input = %self.name,
+                        budget,
+                        "accumulate collect stopped at its read budget; the rest is read at the next fire"
+                    ),
+                    _ => tracing::warn!(
+                        input = %self.name,
+                        budget,
+                        "accumulate collect stopped at its read budget; the rest is read at the next fire"
+                    ),
+                }
+                break;
+            }
+            reads += 1;
+            let frame = ipc.view_raw();
             let outcome = match frame {
-                Ok(Some(view)) => (self.check)(&self.name, &view)
-                    .and_then(|()| self.buffer.insert(&self.name, &view))
+                // A held view re-offers a frozen frame without popping it;
+                // reading on would take the same frame forever.
+                Ok(Some(view)) if view.is_held() => break,
+                Ok(Some(view)) => (self.check)(&self.topic, &view)
+                    .and_then(|()| self.buffer.insert(&self.topic, &view))
                     .map(|_| {
                         newest_ts = newest_ts.max(view.header().timestamp_ns);
                     }),
@@ -509,25 +578,49 @@ impl Accumulator {
                 );
             }
         }
+        if reads < budget {
+            if let Some(suppressed) = self.budget.on_success() {
+                tracing::info!(
+                    input = %self.name,
+                    suppressed,
+                    "accumulate collect drains its queue within the read budget again"
+                );
+            }
+        }
         self.buffer.finish_collect();
-        let dropped_now = self.buffer.dropped_total() - before;
+        let cap_drops = self.buffer.dropped_total() - before;
+        let queue_drops = match (queue_count_before, ipc.drop_oldest_count()) {
+            (Some(b), Some(a)) => a - b,
+            _ => 0,
+        };
+        // The probe's event covers only the queue evictions this collect
+        // already counts; it is folded into the event below.
+        let _probe_event = ipc.try_take_backpressure_event();
+        if let Some(prior) = pending_before {
+            ipc.queue_backpressure_event(prior);
+        }
+        ipc.record_external_drop_oldest(cap_drops);
+        self.buffer.count_queue_drops(queue_drops);
+        let dropped_now = cap_drops + queue_drops;
         if dropped_now == 0 {
             self.armed = true;
             return;
         }
         if self.armed {
-            self.armed = false;
             tracing::warn!(
                 input = %self.name,
                 cap = self.buffer.cap(),
                 dropped = dropped_now,
+                dropped_at_cap = cap_drops,
+                dropped_in_queue = queue_drops,
                 total = self.buffer.dropped_total(),
-                "accumulate input overflowed its cap: oldest frames dropped"
+                "accumulate input dropped its oldest frames"
             );
-            let AnySubscriber::Ipc(ipc) = sub;
-            ipc.queue_backpressure_event(BackpressureEvent {
+            // Disarm only when the event got through: an event still
+            // pending from before keeps this regime's event owed.
+            self.armed = !ipc.queue_backpressure_event(BackpressureEvent {
                 policy: BackpressurePolicy::DropOldest,
-                input_name: Arc::from(self.name.as_str()), // hot-path-alloc-ok: once per overflow regime, never per frame
+                input_name: Arc::clone(&self.name),
                 count_total: self.buffer.dropped_total(),
                 count_in_regime: dropped_now,
                 dropped: dropped_now,
@@ -538,8 +631,10 @@ impl Accumulator {
             tracing::debug!(
                 input = %self.name,
                 dropped = dropped_now,
+                dropped_at_cap = cap_drops,
+                dropped_in_queue = queue_drops,
                 total = self.buffer.dropped_total(),
-                "accumulate input still over its cap"
+                "accumulate input still dropping frames"
             );
         }
     }
@@ -567,12 +662,14 @@ impl<'a, T: ShmMessage + 'a> Accumulated<'a, T> {
         self.frames.is_empty()
     }
 
-    /// Frames dropped at the cap before this fire could receive them.
+    /// Frames dropped before this fire could receive them: at the cap, or
+    /// evicted from a writer's transport queue (see the module docs).
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
 
-    /// Every frame this input has dropped at the cap, over its lifetime.
+    /// Every frame this input has dropped, at the cap or in a writer's
+    /// transport queue, over its lifetime.
     pub fn dropped_total(&self) -> u64 {
         self.dropped_total
     }

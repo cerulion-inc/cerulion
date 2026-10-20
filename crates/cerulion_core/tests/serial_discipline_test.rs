@@ -188,6 +188,16 @@ const FENCE_GROUP: &str = "default-namespace";
 /// directions — see the exclusions recorded in `.config/nextest.toml`.
 const FENCE_INVENTORY: &[(&str, &str)] = &[
     (
+        "accumulate_set_iox2_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root \
+         to drive the accumulate collect directly",
+    ),
+    (
+        "accumulate_zero_alloc_test",
+        "default-namespace manager: builds its graph with `GraphRuntime::build` on the shared \
+         root; also a process-global counting allocator",
+    ),
+    (
         "adaptive_sizing_iceoryx2_test",
         "default-namespace manager: probes pool sizing on the shared root",
     ),
