@@ -59,17 +59,20 @@ struct Probe {
 }
 
 /// One `warn_once!` call site per literal: each expansion declares its own
-/// `static` site.
+/// `static` site. Evaluates to `line!()`, which inside a macro expansion is
+/// the line of the outermost invocation: the line every one of these sites
+/// reports.
 macro_rules! sites {
-    ($p:expr; $($k:literal)*) => { $( warn_once!($p, k = $k, "site"); )* };
+    ($p:expr; $($k:literal)*) => {{ $( warn_once!($p, k = $k, "site"); )* line!() }};
 }
 
-fn run_all_sites(p: &Probe) {
+/// Runs all 65 sites on `p` and returns the line they report.
+fn run_all_sites(p: &Probe) -> u32 {
     sites!(p;
         0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
         32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60
         61 62 63 64
-    );
+    )
 }
 
 fn site_keys(lines: &[Line]) -> Vec<u32> {
@@ -92,12 +95,12 @@ fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
     let run = |p: &Probe| {
         let cap = Capture::default();
         let sub = tracing_subscriber::registry().with(cap.clone());
-        tracing::subscriber::with_default(sub, || run_all_sites(p));
+        let line = tracing::subscriber::with_default(sub, || run_all_sites(p));
         let lines = cap.0.lock().unwrap().clone();
-        lines
+        (lines, line)
     };
-    let on_a = run(&a);
-    let on_b = run(&b);
+    let (on_a, sites_line) = run(&a);
+    let (on_b, _) = run(&b);
 
     assert_eq!(site_keys(&on_a), (0..=64).collect::<Vec<u32>>());
     assert_eq!(
@@ -127,7 +130,12 @@ fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
         "the warn names the site: {:?}",
         warned_a[0]
     );
-    assert!(warned_a[0].1.iter().any(|f| f.starts_with("line=")));
+    let want_line = format!("line={sites_line}");
+    assert!(
+        warned_a[0].1.iter().any(|f| f == &want_line),
+        "the warn names the site's line, {want_line}: {:?}",
+        warned_a[0]
+    );
     assert!(warned_a[0]
         .1
         .iter()

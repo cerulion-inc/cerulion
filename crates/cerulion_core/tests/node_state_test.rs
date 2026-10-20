@@ -144,7 +144,7 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
         ..Default::default()
     };
 
-    // Stand in for `Entry::init`: give the target the two things a LIVE node's
+    // Stand in for `Entry::init`: give the target the things a LIVE node's
     // hidden runtime field holds, each distinguishable from what `Default`
     // would mint.
     let virtual_clock = VirtualClock::new();
@@ -158,8 +158,21 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
         log_sites: Default::default(),
     };
 
+    // The third thing: this instance's log state. A once site that already
+    // printed on the target must stay printed through the restore.
+    static ONCE_SITE: cerulion_core::graph::log_sites::LogSite =
+        cerulion_core::graph::log_sites::LogSite::new(file!(), line!(), module_path!());
+    assert!(cerulion_core::graph::log_sites::once_permits(
+        &target.__cer_rt,
+        &ONCE_SITE
+    ));
+
     restore_from(&mut target, &bytes);
 
+    assert!(
+        !cerulion_core::graph::log_sites::once_permits(&target.__cer_rt, &ONCE_SITE),
+        "restore must not swap in a fresh log site table: a once line would print again"
+    );
     assert_eq!(target.frames, 77);
     assert_eq!(target.label, "restored");
 

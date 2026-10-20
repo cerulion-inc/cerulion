@@ -2560,7 +2560,7 @@ The first argument is the node (`self`), in `tick`, `init`, `shutdown` or an `#[
 
 **State.** A once site emits once per node instance: two instances of one node type in a graph each print their own line, and a pause and resume does not print it again. A call site inside a loop is one site; two call sites never share state. The state is a fixed table inside each node instance, so nothing grows. The table holds 64 throttle and once call sites per linked binary: each node library counts its own, and an in-process host counts the sites of all its node types together. Past 64, the extra sites keep state that every instance of that node type shares, and the first one says so once with a `warn` that names its file and line.
 
-**Cost.** A suppressed call does not evaluate or format its arguments and allocates nothing, so these macros are safe in a hot tick. They log through the same node-side subscriber as the plain macros (see [Node (cdylib) logs](#node-cdylib-logs)).
+**Cost.** A suppressed call does not evaluate or format its arguments and allocates nothing, so these macros are safe in a hot tick. A level the build compiles out (a release build removes `debug` and `trace`) does no work at all: no clock read, no state, no table slot. They log through the same node-side subscriber as the plain macros (see [Node (cdylib) logs](#node-cdylib-logs)).
 
 ### Live-loop tuning
 

@@ -58,7 +58,10 @@
 //!
 //! A suppressed call is one atomic load of the slot number, one clock
 //! read (throttle only) and one relaxed atomic load of the slot. It does not
-//! format or evaluate its message arguments, and it allocates nothing.
+//! format or evaluate its message arguments, and it allocates nothing. A
+//! level the build compiles out (a release build removes `debug` and
+//! `trace`) costs nothing: the call does not read the clock, keeps no state
+//! and takes no slot.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -322,14 +325,18 @@ impl ThrottlePeriod for Duration {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __cer_log_throttle {
-    ($level:ident, $name:literal, $node:expr, $period:expr, $($arg:tt)+) => {{
+    ($level:ident, $LEVEL:ident, $name:literal, $node:expr, $period:expr, $($arg:tt)+) => {{
         static __CER_LOG_SITE: $crate::graph::log_sites::LogSite =
             $crate::graph::log_sites::LogSite::new(
                 ::core::file!(),
                 ::core::line!(),
                 ::core::module_path!(),
             );
-        if $crate::graph::log_sites::throttle_permits(
+        // A level this build compiles out (`release_max_level_info` removes
+        // debug and trace) does no work at all: no clock read, no state, no
+        // slot. The comparison is a constant, so the branch compiles away.
+        if $crate::tracing::Level::$LEVEL <= $crate::tracing::level_filters::STATIC_MAX_LEVEL
+            && $crate::graph::log_sites::throttle_permits(
             &$node.__cer_rt,
             &__CER_LOG_SITE,
             $crate::graph::log_sites::ThrottlePeriod::into_period($period),
@@ -337,13 +344,13 @@ macro_rules! __cer_log_throttle {
             $crate::tracing::$level!($($arg)+);
         }
     }};
-    ($level:ident, $name:literal, $node:expr, $period:expr $(,)?) => {
+    ($level:ident, $LEVEL:ident, $name:literal, $node:expr, $period:expr $(,)?) => {
         ::core::compile_error!(::core::concat!(
             "`", $name, "!` needs the node, a period and a message, \
              for example `", $name, "!(self, Duration::from_millis(500), \"text\")`"
         ))
     };
-    ($level:ident, $name:literal $($rest:tt)*) => {
+    ($level:ident, $LEVEL:ident, $name:literal $($rest:tt)*) => {
         ::core::compile_error!(::core::concat!(
             "`", $name, "!` needs the node, a period and a message, \
              for example `", $name, "!(self, Duration::from_millis(500), \"text\")`"
@@ -355,18 +362,22 @@ macro_rules! __cer_log_throttle {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __cer_log_once {
-    ($level:ident, $name:literal, $node:expr, $($arg:tt)+) => {{
+    ($level:ident, $LEVEL:ident, $name:literal, $node:expr, $($arg:tt)+) => {{
         static __CER_LOG_SITE: $crate::graph::log_sites::LogSite =
             $crate::graph::log_sites::LogSite::new(
                 ::core::file!(),
                 ::core::line!(),
                 ::core::module_path!(),
             );
-        if $crate::graph::log_sites::once_permits(&$node.__cer_rt, &__CER_LOG_SITE) {
+        // As for a throttle: a compiled-out level does no work and takes no
+        // slot.
+        if $crate::tracing::Level::$LEVEL <= $crate::tracing::level_filters::STATIC_MAX_LEVEL
+            && $crate::graph::log_sites::once_permits(&$node.__cer_rt, &__CER_LOG_SITE)
+        {
             $crate::tracing::$level!($($arg)+);
         }
     }};
-    ($level:ident, $name:literal $($rest:tt)*) => {
+    ($level:ident, $LEVEL:ident, $name:literal $($rest:tt)*) => {
         ::core::compile_error!(::core::concat!(
             "`", $name, "!` needs the node and a message, for example `",
             $name, "!(self, \"text\")`"
@@ -379,7 +390,7 @@ macro_rules! __cer_log_once {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! error_throttle {
-    ($($t:tt)*) => { $crate::__cer_log_throttle!(error, "error_throttle", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_throttle!(error, ERROR, "error_throttle", $($t)*) };
 }
 
 /// `tracing::warn!` at most once per `period` of graph time at this call
@@ -387,7 +398,7 @@ macro_rules! error_throttle {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! warn_throttle {
-    ($($t:tt)*) => { $crate::__cer_log_throttle!(warn, "warn_throttle", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_throttle!(warn, WARN, "warn_throttle", $($t)*) };
 }
 
 /// `tracing::info!` at most once per `period` of graph time at this call
@@ -395,7 +406,7 @@ macro_rules! warn_throttle {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! info_throttle {
-    ($($t:tt)*) => { $crate::__cer_log_throttle!(info, "info_throttle", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_throttle!(info, INFO, "info_throttle", $($t)*) };
 }
 
 /// `tracing::debug!` at most once per `period` of graph time at this call
@@ -403,7 +414,7 @@ macro_rules! info_throttle {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! debug_throttle {
-    ($($t:tt)*) => { $crate::__cer_log_throttle!(debug, "debug_throttle", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_throttle!(debug, DEBUG, "debug_throttle", $($t)*) };
 }
 
 /// `tracing::trace!` at most once per `period` of graph time at this call
@@ -411,7 +422,7 @@ macro_rules! debug_throttle {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! trace_throttle {
-    ($($t:tt)*) => { $crate::__cer_log_throttle!(trace, "trace_throttle", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_throttle!(trace, TRACE, "trace_throttle", $($t)*) };
 }
 
 /// `tracing::error!` the first time this call site runs on this node
@@ -419,7 +430,7 @@ macro_rules! trace_throttle {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! error_once {
-    ($($t:tt)*) => { $crate::__cer_log_once!(error, "error_once", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_once!(error, ERROR, "error_once", $($t)*) };
 }
 
 /// `tracing::warn!` the first time this call site runs on this node
@@ -427,7 +438,7 @@ macro_rules! error_once {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! warn_once {
-    ($($t:tt)*) => { $crate::__cer_log_once!(warn, "warn_once", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_once!(warn, WARN, "warn_once", $($t)*) };
 }
 
 /// `tracing::info!` the first time this call site runs on this node
@@ -435,7 +446,7 @@ macro_rules! warn_once {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! info_once {
-    ($($t:tt)*) => { $crate::__cer_log_once!(info, "info_once", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_once!(info, INFO, "info_once", $($t)*) };
 }
 
 /// `tracing::debug!` the first time this call site runs on this node
@@ -443,7 +454,7 @@ macro_rules! info_once {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! debug_once {
-    ($($t:tt)*) => { $crate::__cer_log_once!(debug, "debug_once", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_once!(debug, DEBUG, "debug_once", $($t)*) };
 }
 
 /// `tracing::trace!` the first time this call site runs on this node
@@ -451,7 +462,7 @@ macro_rules! debug_once {
 /// [`graph::log_sites`](crate::graph::log_sites).
 #[macro_export]
 macro_rules! trace_once {
-    ($($t:tt)*) => { $crate::__cer_log_once!(trace, "trace_once", $($t)*) };
+    ($($t:tt)*) => { $crate::__cer_log_once!(trace, TRACE, "trace_once", $($t)*) };
 }
 
 #[cfg(test)]
