@@ -2065,20 +2065,27 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rows (network and mirror alike) are never filtered. The renderer is the
                 // engine's oracle-tested `render_local_topics_section`; the
                 // binary prints its string verbatim.
+                if show_types {
+                    // `-t`: the same listing with each row's type, rendered by
+                    // the engine (`topic_cmd::introspect::topic_list_typed`).
+                    let ws = discover_workspace().ok();
+                    return topic_cmd::introspect::topic_list_typed(
+                        all,
+                        topic_cmd::remote_discovery_options(no_network, connect, listen),
+                        scan,
+                        ws.as_ref().map(|w| w.schemas_dir.as_path()),
+                        &mut std::io::stdout(),
+                        &mut std::io::stderr(),
+                    );
+                }
                 let topics = topic_cmd::topic_list()?;
                 let mirrors = topic_cmd::gather_mirror_identities()?;
                 let (genuine_local, streaming) =
                     topic_cmd::partition_local_topics(topics, &mirrors);
-                let local_section = if show_types {
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    let typed =
-                        topic_cmd::introspect::type_local_topics(&genuine_local, schemas_dir)?;
-                    topic_cmd::introspect::render_local_typed_topics_section(&typed, all)
-                } else {
+                print!(
+                    "{}",
                     topic_cmd::render_local_topics_section(&genuine_local, all)
-                };
-                print!("{local_section}");
+                );
                 // Automagic: remote discovery runs BY DEFAULT with
                 // scouting ON — unpaired robots on the LAN show up with no
                 // flags. `--no-network` skips it (scripts / CI / offline).

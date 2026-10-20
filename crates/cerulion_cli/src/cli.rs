@@ -1837,10 +1837,11 @@ pub enum TopicAction {
         /// appears as a robot.
         #[arg(long)]
         scan: bool,
-        /// Show each LOCAL topic's message type after its name, as
-        /// `/topic  [package/Type]` (`ros2 topic list -t`). Waits up to one
-        /// second for a message per listing; a topic that sent none in that
-        /// time shows `[unknown]`.
+        /// Show each topic's message type after its name, as
+        /// `/topic  [package/Type]` (`ros2 topic list -t`). A LOCAL topic is
+        /// typed from one message (the listing waits up to one second in
+        /// all); a REMOTE topic from its robot's catalog. A type that is not
+        /// known shows `[unknown]`.
         #[arg(short = 't', long = "show-types")]
         show_types: bool,
     },

@@ -6,7 +6,7 @@
 //! entry points reuse the same subscriber, scope and schema-naming ladder
 //! `topic info` uses.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -45,22 +45,28 @@ pub struct BwStats {
 
 /// The bandwidth of a window of frames.
 ///
-/// The rate is the bytes that arrived AFTER the earliest frame divided by the
+/// The rate is the bytes that arrived AFTER the earliest stamp divided by the
 /// time from the earliest stamp to the latest one: `n` frames span `n - 1`
 /// intervals, so a steady stream of `S` bytes every `T` seconds measures
-/// exactly `S / T`. `None` when the window cannot give a rate: no frame, one
-/// frame, or every frame on one stamp (no time span). Integer arithmetic in
-/// `u128`, so the largest sizes and spans never overflow; a rate above
-/// `u64::MAX` saturates.
+/// exactly `S / T`. Every frame ON the earliest stamp opens the span and is
+/// left out of the rate (two frames stamped together at the start are one
+/// instant, not one interval). `None` when the window cannot give a rate: no
+/// frame, one frame, or every frame on one stamp (no time span). Integer
+/// arithmetic in `u128`, so the largest sizes and spans never overflow; a
+/// rate above `u64::MAX` saturates.
 pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
-    let first = window.iter().min_by_key(|f| f.timestamp_ns)?;
+    let first_ns = window.iter().map(|f| f.timestamp_ns).min()?;
     let last_ns = window.iter().map(|f| f.timestamp_ns).max()?;
-    let span_ns = u128::from(last_ns - first.timestamp_ns);
+    let span_ns = u128::from(last_ns - first_ns);
     if span_ns == 0 {
         return None;
     }
     let total: u128 = window.iter().map(|f| u128::from(f.size_bytes)).sum();
-    let after_first = total - u128::from(first.size_bytes);
+    let after_first: u128 = window
+        .iter()
+        .filter(|f| f.timestamp_ns != first_ns)
+        .map(|f| u128::from(f.size_bytes))
+        .sum();
     let rate = (after_first * 1_000_000_000 + span_ns / 2) / span_ns;
     let frames = window.len();
     Some(BwStats {
@@ -150,12 +156,37 @@ fn malformed_type(input: &str) -> CliError {
 /// What a typed listing knows about one topic's message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicType {
-    /// The type's `package/Type` name.
+    /// The type's `package/Type` name, already safe to print.
     Named(String),
-    /// A frame arrived, but its schema hash names no built-in or workspace type.
+    /// The topic's schema hash names no built-in or workspace type.
     Unnamed(u64),
-    /// No frame arrived in the wait, so the type is unknown.
-    NoMessage,
+    /// The type is unknown: a local topic sent no frame in the wait, or a
+    /// remote robot's catalog holds neither a name nor a hash for it.
+    Unknown,
+}
+
+impl TopicType {
+    /// The type `hash` names: the first walker in `walkers` that knows the
+    /// hash gives the name, else [`TopicType::Unnamed`]. The name is
+    /// sanitized for the terminal, since a walker also reads workspace and
+    /// robot-served `.msg` text.
+    pub fn of_hash(hash: u64, walkers: &[&cerulion_core::codegen::FrameWalker]) -> Self {
+        walkers
+            .iter()
+            .find_map(|w| w.schema_name_for_hash(hash))
+            .map_or(TopicType::Unnamed(hash), |name| {
+                TopicType::Named(super::sanitize_display(name))
+            })
+    }
+
+    /// How much this answer tells: a name beats a bare hash beats nothing.
+    fn rank(&self) -> u8 {
+        match self {
+            TopicType::Named(_) => 2,
+            TopicType::Unnamed(_) => 1,
+            TopicType::Unknown => 0,
+        }
+    }
 }
 
 impl std::fmt::Display for TopicType {
@@ -163,12 +194,12 @@ impl std::fmt::Display for TopicType {
         match self {
             TopicType::Named(name) => write!(f, "[{name}]"),
             TopicType::Unnamed(hash) => write!(f, "[0x{hash:016x}]"),
-            TopicType::NoMessage => write!(f, "[unknown]"),
+            TopicType::Unknown => write!(f, "[unknown]"),
         }
     }
 }
 
-/// One local topic with its type.
+/// One topic with its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedTopic {
     /// The topic name.
@@ -177,39 +208,64 @@ pub struct TypedTopic {
     pub ty: TopicType,
 }
 
-/// Render the LOCAL section of `topic list -t`: the same section
-/// `render_local_topics_section` prints, with each row's type in brackets
-/// after the topic name (`/robot/cmd  [geometry_msgs/Vector3]`). The topic
-/// name stays the first token of the row; the `internal` marker of
-/// `--all` follows the type. Internal topics are hidden and counted exactly
-/// as in the untyped listing.
+/// Render the LOCAL section of `topic list -t`: the section
+/// `render_local_topics_section` prints (one renderer serves both), with
+/// each row's type in brackets after the topic name
+/// (`/robot/cmd  [geometry_msgs/Vector3]`). The topic name stays the first
+/// token of the row; the `internal` marker of `--all` follows the type.
 pub fn render_local_typed_topics_section(local: &[TypedTopic], show_all: bool) -> String {
-    let mut rows = String::new();
-    let mut hidden = 0usize;
-    for topic in local {
-        let internal = super::is_internal_topic(&topic.name);
-        if internal && !show_all {
-            hidden += 1;
-            continue;
+    super::render_local_topic_rows(
+        local
+            .iter()
+            .map(|t| (t.name.as_str(), Some(t.ty.to_string()))),
+        show_all,
+    )
+}
+
+/// Render the REMOTE section of `topic list -t`: the section `topic list`
+/// prints (one renderer serves both), with each row's type in brackets after
+/// the topic name and before any `● streaming` marker. A row `types` does not
+/// name shows `[unknown]`.
+pub fn render_remote_typed_topics_section(
+    disc: &super::RemoteDiscovery,
+    had_endpoints: bool,
+    streaming: &[super::MirrorStreamRow],
+    types: &BTreeMap<String, TopicType>,
+) -> String {
+    super::render_remote_topic_rows(disc, had_endpoints, streaming, &|topic| {
+        Some(types.get(topic).unwrap_or(&TopicType::Unknown).to_string())
+    })
+}
+
+/// The type of every topic the remote `catalogs` list, keyed by topic.
+///
+/// An entry's type is its catalog schema name when the robot sent one, else
+/// its schema hash named by `walker` (or [`TopicType::Unnamed`]), else
+/// [`TopicType::Unknown`]. When several robots list one topic, the most
+/// informative answer wins (a name over a hash over nothing) and, between
+/// equal answers, the robot whose name sorts first, so the result does not
+/// depend on the order the replies arrived in.
+pub fn remote_topic_types(
+    catalogs: &[cerulion_core::CatalogReply],
+    walker: &cerulion_core::codegen::FrameWalker,
+) -> BTreeMap<String, TopicType> {
+    let mut by_robot: Vec<&cerulion_core::CatalogReply> = catalogs.iter().collect();
+    by_robot.sort_by(|a, b| a.robot.cmp(&b.robot));
+    let mut types: BTreeMap<String, TopicType> = BTreeMap::new();
+    for entry in by_robot.iter().flat_map(|c| &c.entries) {
+        let ty = match (&entry.schema_name, entry.schema_hash) {
+            (Some(name), _) => TopicType::Named(super::sanitize_display(name)),
+            (None, Some(hash)) => TopicType::of_hash(hash, &[walker]),
+            (None, None) => TopicType::Unknown,
+        };
+        match types.get(&entry.topic) {
+            Some(known) if known.rank() >= ty.rank() => {}
+            _ => {
+                types.insert(entry.topic.clone(), ty);
+            }
         }
-        rows.push_str(&topic.name);
-        rows.push_str("  ");
-        rows.push_str(&topic.ty.to_string());
-        if internal {
-            rows.push_str("  ");
-            rows.push_str(super::INTERNAL_TOPIC_MARKER);
-        }
-        rows.push('\n');
     }
-    let mut out = if rows.is_empty() {
-        String::from("No active local topics.\n")
-    } else {
-        format!("TOPIC\n{rows}")
-    };
-    if hidden > 0 {
-        out.push_str(&super::render_hidden_internal_count(hidden));
-    }
-    out
+    types
 }
 
 /// The topics whose type is `type_name` (canonical `package/Type`), sorted
@@ -226,6 +282,33 @@ pub fn topics_of_type<'a>(topics: &'a [TypedTopic], type_name: &str) -> Vec<&'a 
     found
 }
 
+/// The error `topic type` gives when the topic sent no frame within `wait`.
+pub fn silent_topic_error(topic: &str, wait: Duration) -> CliError {
+    CliError::Validation(format!(
+        "topic '{}' sent no message within {}s, so its type is unknown; retry while its \
+         publisher is sending",
+        super::sanitize_display(topic),
+        wait.as_secs()
+    ))
+}
+
+/// The error `topic type` gives when no known type names the topic's hash.
+pub fn unnamed_hash_error(topic: &str, hash: u64) -> CliError {
+    CliError::Validation(format!(
+        "topic '{}' carries schema hash 0x{hash:016x}, which no built-in or workspace type \
+         names; add its `.msg` under `schemas/` to name it",
+        super::sanitize_display(topic)
+    ))
+}
+
+/// The error a receive that keeps failing gives (the `topic hz` text).
+pub fn receive_failed_error(topic: &str, error: &dyn std::fmt::Display) -> CliError {
+    CliError::Validation(format!(
+        "receive failed on topic '{}': {error}",
+        super::sanitize_display(topic)
+    ))
+}
+
 /// How long `topic type` waits for a LOCAL topic's first frame (the
 /// `topic info` wait).
 const LOCAL_FRAME_WAIT: Duration = Duration::from_secs(1);
@@ -239,29 +322,43 @@ const REMOTE_FRAME_WAIT: Duration = Duration::from_secs(3);
 /// topics costs about one wait, not one per topic.
 pub const TYPED_LISTING_WAIT: Duration = Duration::from_secs(1);
 
-/// The schema hash of the first frame `subscriber` delivers within `wait`.
+/// The schema hash of the first frame `subscriber` delivers within `wait`,
+/// `Ok(None)` when none arrived.
 ///
 /// One `wait_for_message` can return early with no frame (an event that
 /// carried no deliverable sample), so the wait repeats until a frame or the
 /// deadline, paced by the observer starvation floor so an event flood cannot
-/// spin a core.
+/// spin a core. A failed wait is retried within the observers' consecutive
+/// error budget; a failure that outlasts the budget, or that ends the wait,
+/// is returned, never read as silence.
 fn first_schema_hash(
     subscriber: &cerulion_core::CerulionSubscriber,
     wait: Duration,
-) -> Option<u64> {
+) -> Result<Option<u64>, cerulion_core::TransportError> {
     let deadline = Instant::now() + wait;
     let mut hash = None;
     let mut idle_churn: u32 = 0;
+    let mut consecutive_wait_errors: u32 = 0;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let started = Instant::now();
-        let delivered = subscriber
-            .wait_for_message(remaining, |msg| {
-                hash.get_or_insert(msg.header().schema_hash);
-            })
-            .unwrap_or(0);
-        if hash.is_some() || remaining.is_zero() {
-            return hash;
+        let received = subscriber.wait_for_message(remaining, |msg| {
+            hash.get_or_insert(msg.header().schema_hash);
+        });
+        if hash.is_some() {
+            return Ok(hash);
+        }
+        let action =
+            super::decide_wait_outcome(received.is_ok(), true, &mut consecutive_wait_errors);
+        let delivered = match received {
+            Ok(delivered) => delivered,
+            Err(e) if remaining.is_zero() || action == super::WaitOutcomeAction::Fail => {
+                return Err(e)
+            }
+            Err(_) => continue,
+        };
+        if remaining.is_zero() {
+            return Ok(None);
         }
         if let Some(pause) =
             super::decide_observer_pacing(delivered, started.elapsed(), remaining, &mut idle_churn)
@@ -272,29 +369,88 @@ fn first_schema_hash(
     }
 }
 
+/// Open `topic` for a typed listing the way `topic info` opens a genuine
+/// local producer: under a local scope the local-observation lease is taken
+/// first, and a topic that turns out to be a network mirror after the open
+/// is dropped (it is not a local topic). `None` when the topic cannot be read
+/// as a genuine local one; the reason is logged at `debug`.
+fn open_genuine_local(
+    transport: &cerulion_core::TransportManager,
+    topic: &str,
+    local_only: bool,
+) -> Option<super::ScopedSubscriber> {
+    let guard = if local_only {
+        match transport.acquire_local_topic_lease(topic) {
+            Ok(lease) => super::ObservationGuard::LocalLease {
+                _lease: Box::new(lease),
+            },
+            Err(e) => {
+                tracing::debug!(topic = %topic, error = %e, "typed listing: no local lease for the topic");
+                return None;
+            }
+        }
+    } else {
+        super::ObservationGuard::None
+    };
+    let subscriber = match transport.create_subscriber_open_only(topic) {
+        Ok(subscriber) => super::ScopedSubscriber {
+            subscriber,
+            _guard: guard,
+        },
+        Err(e) => {
+            tracing::debug!(topic = %topic, error = %e, "typed listing: the topic did not open");
+            return None;
+        }
+    };
+    match transport.is_network_mirror(topic) {
+        Ok(false) => Some(subscriber),
+        Ok(true) => {
+            tracing::debug!(topic = %topic, "typed listing: the topic became a network mirror");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(topic = %topic, error = %e, "typed listing: the mirror check failed");
+            None
+        }
+    }
+}
+
+/// Which internal topics a typed listing reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalTopics {
+    /// Read them too (`topic find`, `topic list -t --all`).
+    Read,
+    /// Skip them: they are hidden from the output, so reading them is wasted
+    /// work (`topic list -t` without `--all`). A skipped topic is
+    /// [`TopicType::Unknown`].
+    Skip,
+}
+
 /// The type of every genuine LOCAL topic in `local` (the listing after the
 /// mirror fold), in the order given. Every subscriber opens first; then each
 /// topic gets what is left of one shared [`TYPED_LISTING_WAIT`] for a frame.
-/// A frame's schema hash is named by the local walker (built-ins, the `.msg`
-/// store and the workspace `schemas/`); this listing opens no network.
+/// A frame's schema hash is named by `walker`; this listing opens no network.
 ///
-/// A topic whose subscriber cannot open (it went away between the listing
-/// and the open) or that sends no frame in the wait is
-/// [`TopicType::NoMessage`]; a hash no local type names is
-/// [`TopicType::Unnamed`].
+/// A topic is opened as a genuine local producer (see `local_only` and the
+/// mirror recheck of `topic info`). A topic that cannot be opened that way,
+/// that sends no frame in the wait, or whose receive fails is
+/// [`TopicType::Unknown`] (a failed receive is logged at `warn`); a hash
+/// `walker` does not name is [`TopicType::Unnamed`].
 pub fn type_local_topics(
     local: &[super::TopicInfo],
-    schemas_dir: Option<&Path>,
+    walker: &cerulion_core::codegen::FrameWalker,
+    local_only: bool,
+    internal: InternalTopics,
 ) -> CliResult<Vec<TypedTopic>> {
     let transport = cerulion_core::TransportManager::get_or_init()?;
-    let walker = super::local_walker_from_workspace(schemas_dir);
-    let subscribers: Vec<_> = local
+    let subscribers: Vec<Option<super::ScopedSubscriber>> = local
         .iter()
-        .map(|t| match transport.create_subscriber_open_only(&t.name) {
-            Ok(subscriber) => Some(subscriber),
-            Err(e) => {
-                tracing::debug!(topic = %t.name, error = %e, "typed listing: the topic did not open");
+        .map(|t| {
+            let skip = internal == InternalTopics::Skip && super::is_internal_topic(&t.name);
+            if skip {
                 None
+            } else {
+                open_genuine_local(&transport, &t.name, local_only)
             }
         })
         .collect();
@@ -304,36 +460,135 @@ pub fn type_local_topics(
         .zip(&subscribers)
         .map(|(topic, subscriber)| {
             let hash = subscriber.as_ref().and_then(|s| {
-                first_schema_hash(s, deadline.saturating_duration_since(Instant::now()))
+                match first_schema_hash(s, deadline.saturating_duration_since(Instant::now())) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        tracing::warn!(topic = %topic.name, error = %e, "typed listing: receive failed, so the type is unknown");
+                        None
+                    }
+                }
             });
-            let ty = match hash {
-                None => TopicType::NoMessage,
-                Some(hash) => match walker.schema_name_for_hash(hash) {
-                    Some(name) => TopicType::Named(name.to_string()),
-                    None => TopicType::Unnamed(hash),
-                },
-            };
             TypedTopic {
                 name: topic.name.clone(),
-                ty,
+                ty: hash.map_or(TopicType::Unknown, |h| TopicType::of_hash(h, &[walker])),
             }
         })
         .collect())
 }
 
-/// `cerulion topic find <type>`: every genuine LOCAL topic whose type is
-/// `type_name` (either `package/Type` or `package/msg/Type`), sorted. An
-/// unknown type is an empty list; a malformed name is an error before any
-/// topic is read.
-pub fn topic_find(type_name: &str, schemas_dir: Option<&Path>) -> CliResult<Vec<String>> {
+/// `cerulion topic list -t`: the `topic list` listing with each topic's type.
+///
+/// LOCAL rows are typed from one frame each (see [`type_local_topics`]); the
+/// section prints before the remote query starts, as in `topic list`.
+/// REMOTE rows, network and mirror alike, are typed from the robots' catalogs
+/// ([`remote_topic_types`]); with no remote query (`remote` is `None`) or a
+/// failed one, a mirror row shows `[unknown]`. A failed remote query is the
+/// one `topic list` stderr line, and the verb still succeeds.
+pub fn topic_list_typed(
+    show_all: bool,
+    remote: Option<super::RemoteTopicsOptions>,
+    scan: bool,
+    schemas_dir: Option<&Path>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<()> {
+    let mirrors = super::gather_mirror_identities()?;
+    let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    let walker = super::local_walker_from_workspace(schemas_dir);
+    let internal = if show_all {
+        InternalTopics::Read
+    } else {
+        InternalTopics::Skip
+    };
+    let typed = type_local_topics(&local, &walker, remote.is_none(), internal)?;
+    write!(
+        out,
+        "{}",
+        render_local_typed_topics_section(&typed, show_all)
+    )?;
+    out.flush()?;
+    if let Some(opts) = remote {
+        match super::query_remote_topics_and_catalogs(&opts, scan) {
+            Ok((disc, catalogs)) => {
+                let types = remote_topic_types(&catalogs, &walker);
+                write!(
+                    out,
+                    "{}",
+                    render_remote_typed_topics_section(
+                        &disc,
+                        opts.has_endpoints(),
+                        &streaming,
+                        &types
+                    )
+                )?;
+                return Ok(());
+            }
+            Err(e) => write!(err, "{}", super::render_remote_discovery_unavailable(&e))?,
+        }
+    }
+    if !streaming.is_empty() {
+        write!(
+            out,
+            "{}",
+            render_remote_typed_topics_section(
+                &super::RemoteDiscovery::empty(),
+                false,
+                &streaming,
+                &BTreeMap::new()
+            )
+        )?;
+    }
+    Ok(())
+}
+
+/// What `topic find` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundTopics {
+    /// The topics of the type, local and remote together, sorted once each.
+    pub topics: Vec<String>,
+    /// The `topic list` stderr line when the remote query failed (the local
+    /// result still stands), else `None`.
+    pub remote_unavailable: Option<String>,
+}
+
+/// `cerulion topic find <type>`: every topic whose type is `type_name`
+/// (either `package/Type` or `package/msg/Type`), sorted.
+///
+/// Genuine LOCAL topics are typed from one frame each; unless the scope is
+/// local, the remote robots `topic list` discovers are asked too and their
+/// topics typed from their catalogs. An unknown type is an empty list; a
+/// malformed name is an error before any topic is read.
+pub fn topic_find(
+    type_name: &str,
+    schemas_dir: Option<&Path>,
+    scope: TopicScope,
+) -> CliResult<FoundTopics> {
     let wanted = parse_type_name(type_name)?;
     let mirrors = super::gather_mirror_identities()?;
     let (local, _streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
-    let typed = type_local_topics(&local, schemas_dir)?;
-    Ok(topics_of_type(&typed, &wanted)
-        .into_iter()
-        .map(str::to_string)
-        .collect())
+    let walker = super::local_walker_from_workspace(schemas_dir);
+    let remote = super::remote_discovery_options(scope == TopicScope::Local, vec![], vec![]);
+    let mut typed = type_local_topics(&local, &walker, remote.is_none(), InternalTopics::Read)?;
+    let mut remote_unavailable = None;
+    if let Some(opts) = remote {
+        match super::query_remote_topics_and_catalogs(&opts, false) {
+            Ok((_disc, catalogs)) => typed.extend(
+                remote_topic_types(&catalogs, &walker)
+                    .into_iter()
+                    .map(|(name, ty)| TypedTopic { name, ty }),
+            ),
+            Err(e) => {
+                remote_unavailable = Some(super::render_remote_discovery_unavailable(&e));
+            }
+        }
+    }
+    Ok(FoundTopics {
+        topics: topics_of_type(&typed, &wanted)
+            .into_iter()
+            .map(super::sanitize_display)
+            .collect(),
+        remote_unavailable,
+    })
 }
 
 /// `cerulion topic type <topic>`: the `package/Type` name of the topic's
@@ -343,8 +598,10 @@ pub fn topic_find(type_name: &str, schemas_dir: Option<&Path>) -> CliResult<Vec<
 /// directly; a remote robot's topic through the network daemon unless the
 /// scope is local) and its first frame's schema hash is named by the same
 /// ladder: the local walker, then the remote one. A missing topic is the
-/// `topic info` not-found error. A topic that sends no frame in the wait,
-/// or whose hash no known type names, is an error that names the topic.
+/// `topic info` not-found error. A topic that sends no frame in the wait
+/// ([`silent_topic_error`]), whose receive keeps failing
+/// ([`receive_failed_error`]) or whose hash no known type names
+/// ([`unnamed_hash_error`]) is an error that names the topic.
 pub fn topic_type_with_scope(
     topic: &str,
     schemas_dir: Option<&Path>,
@@ -356,31 +613,53 @@ pub fn topic_type_with_scope(
         TopicSource::Remote { .. } => REMOTE_FRAME_WAIT,
         TopicSource::Local => LOCAL_FRAME_WAIT,
     };
-    let Some(hash) = first_schema_hash(&subscriber, wait) else {
-        return Err(CliError::Validation(format!(
-            "topic '{topic}' sent no message within {}s, so its type is unknown; \
-             retry while its publisher is sending",
-            wait.as_secs()
-        )));
+    let hash = match first_schema_hash(&subscriber, wait) {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return Err(silent_topic_error(topic, wait)),
+        Err(e) => return Err(receive_failed_error(topic, &e)),
     };
     let local_walker = super::local_walker_from_workspace(schemas_dir);
-    if let Some(name) = local_walker.schema_name_for_hash(hash) {
-        return Ok(name.to_string());
+    let mut ty = TopicType::of_hash(hash, &[&local_walker]);
+    if matches!(ty, TopicType::Unnamed(_)) {
+        ty = match &source {
+            TopicSource::Remote { walker, .. } => TopicType::of_hash(hash, &[walker]),
+            TopicSource::Local if scope == TopicScope::Local => ty,
+            TopicSource::Local => super::resolve_remote_walker_for_topic(topic)
+                .map_or(ty, |(_robot, walker)| TopicType::of_hash(hash, &[&walker])),
+        };
     }
-    let remote_name = match &source {
-        TopicSource::Remote { walker, .. } => walker.schema_name_for_hash(hash).map(str::to_string),
-        TopicSource::Local if scope == TopicScope::Local => None,
-        TopicSource::Local => super::resolve_remote_walker_for_topic(topic)
-            .and_then(|(_robot, walker)| walker.schema_name_for_hash(hash).map(str::to_string)),
-    };
-    remote_name
-        .map(|name| super::sanitize_display(&name))
-        .ok_or_else(|| {
-            CliError::Validation(format!(
-                "topic '{topic}' carries schema hash 0x{hash:016x}, which no built-in or \
-                 workspace type names; add its `.msg` under `schemas/` to name it"
-            ))
-        })
+    match ty {
+        TopicType::Named(name) => Ok(name),
+        TopicType::Unnamed(_) | TopicType::Unknown => Err(unnamed_hash_error(topic, hash)),
+    }
+}
+
+/// The line `topic bw` prints at the end of one report interval, given the
+/// frames in `ring` and how many of them arrived in this interval.
+///
+/// An interval with no new frame prints the silence line and EMPTIES the
+/// ring (keeping its capacity, so this never allocates a frame slot): the
+/// window then starts again with the next frame, so a rate never spans a
+/// pause, as `topic hz` measures each second afresh. Otherwise the line is
+/// [`render_bw_line`] over the ring, or a waiting line while the ring holds
+/// too few frames for a rate.
+pub fn bw_report_line(
+    ring: &mut VecDeque<BwFrame>,
+    arrived_this_report: usize,
+    silent_for: Duration,
+    source_desc: &str,
+) -> String {
+    if arrived_this_report == 0 {
+        ring.clear();
+        return format!(
+            "no messages received: attached to {source_desc}; 0 frames in {:.0}s",
+            silent_for.as_secs_f64()
+        );
+    }
+    match bandwidth(ring.make_contiguous()) {
+        Some(stats) => render_bw_line(&stats),
+        None => format!("waiting for more messages... (received {})", ring.len()),
+    }
 }
 
 /// `cerulion topic bw <topic>`: print the topic's bandwidth once a second
@@ -390,7 +669,8 @@ pub fn topic_type_with_scope(
 /// retry and pacing rules. Each frame adds its wire stamp and payload size to
 /// a ring allocated once before the loop, so the receive callback never
 /// allocates. A second with no new frame prints a silence line instead of
-/// repeating the last figure.
+/// repeating the last figure, and starts the window again (see
+/// [`bw_report_line`]).
 pub fn topic_bw_with_scope(
     topic: &str,
     schemas_dir: Option<&Path>,
@@ -440,9 +720,7 @@ pub fn topic_bw_with_scope(
                 super::WaitOutcomeAction::ExitCleanly => break,
                 super::WaitOutcomeAction::Continue => continue,
                 super::WaitOutcomeAction::Fail => {
-                    return Err(CliError::Validation(format!(
-                        "receive failed on topic '{topic}': {e}"
-                    )));
+                    return Err(receive_failed_error(topic, &e));
                 }
             }
         }
@@ -457,17 +735,12 @@ pub fn topic_bw_with_scope(
             std::thread::sleep(pause); // ALLOW: starvation floor, engaged ONLY on a progress-free early-returning wait (the `topic hz` rule), so it bounds CPU on event churn and is not a poll.
         }
         if last_report.elapsed() >= super::HZ_REPORT_INTERVAL {
-            let line = if arrived_this_report == 0 {
-                format!(
-                    "no messages received: attached to {source_desc}; 0 frames in {:.0}s",
-                    silence_since.elapsed().as_secs_f64()
-                )
-            } else {
-                match bandwidth(ring.make_contiguous()) {
-                    Some(stats) => render_bw_line(&stats),
-                    None => format!("waiting for more messages... (received {})", ring.len()),
-                }
-            };
+            let line = bw_report_line(
+                &mut ring,
+                arrived_this_report,
+                silence_since.elapsed(),
+                &source_desc,
+            );
             writeln!(writer, "{line}").ok();
             arrived_this_report = 0;
             last_report = Instant::now();
@@ -677,7 +950,7 @@ mod tests {
         let rows = [
             typed("/demo/a/cmd", named("geometry_msgs/Vector3")),
             typed("/demo/b/raw", TopicType::Unnamed(0xab)),
-            typed("/demo/c/idle", TopicType::NoMessage),
+            typed("/demo/c/idle", TopicType::Unknown),
         ];
         assert_eq!(
             render_local_typed_topics_section(&rows, false),
@@ -713,10 +986,7 @@ mod tests {
             "No active local topics.\n"
         );
         assert_eq!(
-            render_local_typed_topics_section(
-                &[typed("/bagd/status", TopicType::NoMessage)],
-                false
-            ),
+            render_local_typed_topics_section(&[typed("/bagd/status", TopicType::Unknown)], false),
             "No active local topics.\n1 internal topic hidden (--all shows it)\n"
         );
     }
@@ -729,7 +999,7 @@ mod tests {
             typed("/a/cmd", named("geometry_msgs/Vector3")),
             typed("/a/cmd", named("geometry_msgs/Vector3")),
             typed("/m/raw", TopicType::Unnamed(1)),
-            typed("/m/idle", TopicType::NoMessage),
+            typed("/m/idle", TopicType::Unknown),
         ];
         assert_eq!(
             topics_of_type(&rows, "geometry_msgs/Vector3"),
@@ -740,7 +1010,9 @@ mod tests {
 
     #[test]
     fn find_refuses_a_malformed_type_before_reading_any_topic() {
-        let err = topic_find("not a type", None).unwrap_err().to_string();
+        let err = topic_find("not a type", None, TopicScope::Local)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("malformed type name 'not a type'"), "{err}");
     }
 
@@ -749,5 +1021,234 @@ mod tests {
         let rows = [typed("/a/cmd", named("geometry_msgs/Vector3"))];
         assert!(topics_of_type(&rows, "geometry_msgs/Twist").is_empty());
         assert!(topics_of_type(&[], "geometry_msgs/Vector3").is_empty());
+    }
+
+    #[test]
+    fn frames_sharing_the_earliest_stamp_all_open_the_span() {
+        // Two frames at 0 are one instant: only the 100 bytes at 1 s count.
+        let window = [frame(0, 100), frame(0, 100), frame(SEC, 100)];
+        let stats = bandwidth(&window).unwrap();
+        assert_eq!(stats.bytes_per_sec, 100);
+        assert_eq!(stats.frames, 3);
+        assert_eq!(stats.mean_size, 100);
+    }
+
+    #[test]
+    fn a_silent_report_says_so_and_empties_the_window() {
+        let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(8);
+        ring.extend([frame(0, 10), frame(SEC, 10)]);
+        let capacity = ring.capacity();
+        assert_eq!(
+            bw_report_line(&mut ring, 0, Duration::from_secs(3), "local SHM"),
+            "no messages received: attached to local SHM; 0 frames in 3s"
+        );
+        assert!(ring.is_empty());
+        assert_eq!(ring.capacity(), capacity, "clearing must keep the slots");
+    }
+
+    #[test]
+    fn a_stream_that_resumes_after_a_pause_measures_only_the_new_frames() {
+        // 10 B every 100 ms, a 60 s pause, then 10 B every 100 ms again.
+        let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(100);
+        ring.extend((0..10).map(|i| frame(i * SEC / 10, 10)));
+        assert_eq!(
+            bw_report_line(&mut ring, 10, Duration::ZERO, "local SHM"),
+            "bandwidth: 100 B/s, mean: 10 B, min: 10 B, max: 10 B, window: 10"
+        );
+        bw_report_line(&mut ring, 0, Duration::from_secs(60), "local SHM");
+        ring.extend((0..10).map(|i| frame(61 * SEC + i * SEC / 10, 10)));
+        assert_eq!(
+            bw_report_line(&mut ring, 10, Duration::ZERO, "local SHM"),
+            "bandwidth: 100 B/s, mean: 10 B, min: 10 B, max: 10 B, window: 10"
+        );
+    }
+
+    #[test]
+    fn a_report_with_one_frame_waits_for_more() {
+        let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(4);
+        ring.push_back(frame(5, 10));
+        assert_eq!(
+            bw_report_line(&mut ring, 1, Duration::ZERO, "local SHM"),
+            "waiting for more messages... (received 1)"
+        );
+        assert_eq!(ring.len(), 1);
+    }
+
+    fn empty_walker() -> cerulion_core::codegen::FrameWalker {
+        cerulion_core::codegen::FrameWalker::new(vec![]).0
+    }
+
+    #[test]
+    fn a_hash_is_named_by_the_first_walker_that_knows_it() {
+        let builtins = super::super::local_walker_from_workspace(None);
+        let empty = empty_walker();
+        let string = super::super::STD_MSGS_STRING_SCHEMA_HASH;
+        assert_eq!(
+            TopicType::of_hash(string, &[&builtins]),
+            named("std_msgs/String")
+        );
+        // The local walker misses, the remote one names it.
+        assert_eq!(
+            TopicType::of_hash(string, &[&empty, &builtins]),
+            named("std_msgs/String")
+        );
+        assert_eq!(
+            TopicType::of_hash(string, &[&empty]),
+            TopicType::Unnamed(string)
+        );
+        assert_eq!(
+            TopicType::of_hash(0x1234, &[&builtins]),
+            TopicType::Unnamed(0x1234)
+        );
+        assert_eq!(TopicType::of_hash(0x1234, &[]), TopicType::Unnamed(0x1234));
+    }
+
+    fn entry(topic: &str, name: Option<&str>, hash: Option<u64>) -> cerulion_core::CatalogEntry {
+        cerulion_core::CatalogEntry {
+            topic: topic.to_string(),
+            schema_hash: hash,
+            schema_name: name.map(str::to_string),
+            provenance: cerulion_core::CatalogProvenance::Runtime,
+            producer_count: None,
+            liveness: None,
+        }
+    }
+
+    fn catalog(
+        robot: &str,
+        entries: Vec<cerulion_core::CatalogEntry>,
+    ) -> cerulion_core::CatalogReply {
+        cerulion_core::transport::cerulion_q::build_catalog_reply(robot, entries)
+    }
+
+    #[test]
+    fn remote_rows_take_the_catalog_name_then_the_hash_then_unknown() {
+        let walker = super::super::local_walker_from_workspace(None);
+        let string = super::super::STD_MSGS_STRING_SCHEMA_HASH;
+        let types = remote_topic_types(
+            &[catalog(
+                "go2",
+                vec![
+                    entry("/go2/named", Some("probe_msgs/Widget"), Some(0x99)),
+                    entry("/go2/hashed", None, Some(string)),
+                    entry("/go2/raw", None, Some(0xab)),
+                    entry("/go2/bare", None, None),
+                ],
+            )],
+            &walker,
+        );
+        let expected: BTreeMap<String, TopicType> = [
+            ("/go2/bare", TopicType::Unknown),
+            ("/go2/hashed", named("std_msgs/String")),
+            ("/go2/named", named("probe_msgs/Widget")),
+            ("/go2/raw", TopicType::Unnamed(0xab)),
+        ]
+        .into_iter()
+        .map(|(t, ty)| (t.to_string(), ty))
+        .collect();
+        assert_eq!(types, expected);
+    }
+
+    #[test]
+    fn two_robots_on_one_topic_give_the_same_answer_in_any_reply_order() {
+        let walker = empty_walker();
+        let a = catalog(
+            "alpha",
+            vec![
+                entry("/tf", None, Some(0x1)),
+                entry("/cmd", Some("geometry_msgs/Twist"), None),
+            ],
+        );
+        let b = catalog(
+            "bravo",
+            vec![
+                entry("/tf", Some("tf2_msgs/TFMessage"), None),
+                entry("/cmd", Some("geometry_msgs/Vector3"), None),
+            ],
+        );
+        for replies in [[a.clone(), b.clone()], [b, a]] {
+            let types = remote_topic_types(&replies, &walker);
+            // A name beats a bare hash, whichever robot sent it.
+            assert_eq!(types["/tf"], named("tf2_msgs/TFMessage"));
+            // Equal answers: the robot that sorts first.
+            assert_eq!(types["/cmd"], named("geometry_msgs/Twist"));
+        }
+    }
+
+    #[test]
+    fn a_catalog_name_cannot_inject_terminal_escapes() {
+        let types = remote_topic_types(
+            &[catalog("r", vec![entry("/t", Some("a\u{1b}[2J/B"), None)])],
+            &empty_walker(),
+        );
+        assert_eq!(types["/t"], named("a\u{FFFD}[2J/B"));
+    }
+
+    fn disc(topics: &[&str]) -> super::super::RemoteDiscovery {
+        super::super::RemoteDiscovery {
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+            ..super::super::RemoteDiscovery::empty()
+        }
+    }
+
+    #[test]
+    fn a_typed_remote_section_puts_the_type_after_the_topic() {
+        let types: BTreeMap<String, TopicType> =
+            [("/go2/cmd".to_string(), named("geometry_msgs/Twist"))].into();
+        assert_eq!(
+            render_remote_typed_topics_section(
+                &disc(&["/go2/cmd", "/go2/odom"]),
+                true,
+                &[],
+                &types
+            ),
+            "\nREMOTE TOPICS\n/go2/cmd  [geometry_msgs/Twist]\n/go2/odom  [unknown]\n"
+        );
+        // A mirror row: the type sits between the topic and the marker.
+        let streaming = [super::super::MirrorStreamRow {
+            topic: "/go2/odom".to_string(),
+            robot: "go2".to_string(),
+        }];
+        assert_eq!(
+            render_remote_typed_topics_section(&disc(&["/go2/cmd"]), true, &streaming, &types),
+            "\nREMOTE TOPICS\n/go2/cmd  [geometry_msgs/Twist]\n\
+             /go2/odom  [unknown]  ● streaming  go2\n"
+        );
+    }
+
+    #[test]
+    fn a_typed_remote_section_with_no_topic_is_the_plain_one_line() {
+        let typed = render_remote_typed_topics_section(&disc(&[]), true, &[], &BTreeMap::new());
+        assert_eq!(
+            typed,
+            super::super::render_remote_topics_section(&disc(&[]), true)
+        );
+        assert!(typed.starts_with("remote: none discovered"), "{typed}");
+    }
+
+    #[test]
+    fn the_type_error_arms_name_the_topic() {
+        assert_eq!(
+            silent_topic_error("/a/cmd", LOCAL_FRAME_WAIT).to_string(),
+            "topic '/a/cmd' sent no message within 1s, so its type is unknown; retry while its \
+             publisher is sending"
+        );
+        assert_eq!(
+            silent_topic_error("/a/cmd", REMOTE_FRAME_WAIT).to_string(),
+            "topic '/a/cmd' sent no message within 3s, so its type is unknown; retry while its \
+             publisher is sending"
+        );
+        assert_eq!(
+            unnamed_hash_error("/a/raw", 0xab).to_string(),
+            "topic '/a/raw' carries schema hash 0x00000000000000ab, which no built-in or \
+             workspace type names; add its `.msg` under `schemas/` to name it"
+        );
+        assert_eq!(
+            receive_failed_error("/a/cmd", &"listener gone").to_string(),
+            "receive failed on topic '/a/cmd': listener gone"
+        );
+        assert!(!unnamed_hash_error("/a\u{1b}", 1)
+            .to_string()
+            .contains('\u{1b}'));
     }
 }

@@ -43,13 +43,18 @@ enum TopicIntrospectAction {
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
     },
-    /// List the local topics that carry a message type
+    /// List the topics that carry a message type
     ///
-    /// Takes `package/Type` or the ROS 2 form `package/msg/Type`, reads one
-    /// message from every local topic and prints, one per line and sorted,
-    /// the topics of that type. A type no topic carries prints nothing and
-    /// exits 0.
+    /// Takes `package/Type` or the ROS 2 form `package/msg/Type` and prints,
+    /// one per line and sorted, the topics of that type: every LOCAL topic
+    /// (typed from one message) and every REMOTE robot's topic `topic list`
+    /// discovers (typed from its catalog). A type no topic carries prints
+    /// nothing and exits 0. Pass `--local` to read genuine local producers
+    /// only, without remote discovery.
     Find {
+        /// Read genuine local shared-memory producers only.
+        #[arg(long)]
+        local: bool,
         /// Message type, for example `geometry_msgs/Vector3`
         #[arg(value_name = "TYPE", add = ArgValueCandidates::new(completion::schema_names))]
         type_name: String,
@@ -121,9 +126,16 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
             println!("{name}");
             Ok(())
         }
-        TopicIntrospectAction::Find { type_name } => {
-            for topic in introspect::topic_find(&type_name, schemas_dir)? {
+        TopicIntrospectAction::Find { local, type_name } => {
+            let found =
+                introspect::topic_find(&type_name, schemas_dir, TopicScope::from_local(local))?;
+            for topic in &found.topics {
                 println!("{topic}");
+            }
+            // The `topic list` rule: a failed remote query is one loud
+            // stderr line, and the local result still stands.
+            if let Some(note) = &found.remote_unavailable {
+                eprint!("{note}");
             }
             Ok(())
         }
@@ -174,9 +186,14 @@ mod tests {
     #[test]
     fn topic_find_takes_a_type_name() {
         match parse(&["cerulion", "topic", "find", "geometry_msgs/msg/Vector3"]).unwrap() {
-            TopicIntrospectAction::Find { type_name } => {
+            TopicIntrospectAction::Find { local, type_name } => {
+                assert!(!local);
                 assert_eq!(type_name, "geometry_msgs/msg/Vector3")
             }
+            _ => panic!("expected find"),
+        }
+        match parse(&["cerulion", "topic", "find", "std_msgs/String", "--local"]).unwrap() {
+            TopicIntrospectAction::Find { local, .. } => assert!(local),
             _ => panic!("expected find"),
         }
     }
