@@ -332,6 +332,61 @@ fn fixed_arrays_bool_arrays_bounded_string_and_bytes() {
     assert_both_ways(set.walker(), "Shapes", &frame, SHAPES_TEXT);
 }
 
+/// The `Shapes` frame of [`SHAPES_TEXT`] with `more` empty, by hand.
+fn shapes_frame_empty_more(hash: u64) -> Vec<u8> {
+    let full = shapes_frame(hash, [0, 1, 1]);
+    // Header, fixed section and the `signed` entry are unchanged but for
+    // the total size.
+    let mut f = header(hash, 95, 68, 3);
+    f.extend_from_slice(&full[32..76]);
+    f.extend_from_slice(&[62, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0, 1, 0, 0, 0]);
+    f.extend_from_slice(&[0xFF, 0x02, 7]);
+    assert_eq!(f.len(), 95);
+    f
+}
+
+/// An empty `bool[]` is `[]` both ways, like every other empty array.
+#[test]
+fn an_empty_bool_array_is_an_empty_flow_sequence_both_ways() {
+    let set = set_from_yaml(SHAPES_YAML);
+    let frame = shapes_frame_empty_more(set.schema_hash("Shapes").unwrap());
+    let text = SHAPES_TEXT.replace("more: [false, true, true]", "more: []");
+    assert_both_ways(set.walker(), "Shapes", &frame, &text);
+    assert_eq!(
+        message_to_yaml(set.walker(), &frame).unwrap(),
+        message_to_yaml(set.walker(), &frame).unwrap(),
+        "two encodes of one frame give the same bytes"
+    );
+    let shown = YamlEncodeOptions {
+        truncate_arrays: Some(0),
+        ..Default::default()
+    };
+    assert!(message_to_yaml_with(set.walker(), &frame, shown)
+        .unwrap()
+        .contains("\nmore: []\n"));
+}
+
+/// The zero frames of the ROS 2 types that hold a `bool[]` encode, and
+/// read back byte for byte.
+#[test]
+fn zero_frames_with_a_bool_array_round_trip() {
+    let walker = builtin_walker();
+    let entry = cdr_frame("moveit_msgs/AllowedCollisionEntry", &[0; 4]);
+    assert_both_ways(
+        &walker,
+        "moveit_msgs/AllowedCollisionEntry",
+        &entry,
+        "enabled: []\n",
+    );
+    let matrix = cdr_frame("moveit_msgs/AllowedCollisionMatrix", &[0; 16]);
+    assert_both_ways(
+        &walker,
+        "moveit_msgs/AllowedCollisionMatrix",
+        &matrix,
+        "entry_names: []\nentry_values: []\ndefault_entry_names: []\ndefault_entry_values: []\n",
+    );
+}
+
 #[test]
 fn empty_message_is_an_empty_mapping_and_empty_input_reads_as_one() {
     let walker = builtin_walker();
@@ -1430,6 +1485,100 @@ pose:
     for (text, want) in cases {
         assert_eq!(decode_err(&walker, q, &text), want, "{text}");
     }
+}
+
+/// An integer past 64 bits is refused at its field as out of range (or
+/// as the wrong type), never as a parse error with no path.
+#[test]
+fn an_integer_past_64_bits_is_refused_at_its_field() {
+    let set = set_from_yaml(PROBE_YAML);
+    let w = set.walker();
+    let cases = [
+        (
+            PROBE_TEXT.replace("id: 16909060", "id: 18446744073709551616"),
+            "id: 18446744073709551616 is out of range for uint32 (0 to 4294967295)",
+        ),
+        (
+            PROBE_TEXT.replace("id: 16909060", "id: 0x10000000000000000"),
+            "id: 18446744073709551616 is out of range for uint32 (0 to 4294967295)",
+        ),
+        (
+            PROBE_TEXT.replace("flag: 7", "flag: -9223372036854775809"),
+            "flag: -9223372036854775809 is out of range for uint8 (0 to 255)",
+        ),
+        (
+            PROBE_TEXT.replace("name: \"ab\"", "name: 18446744073709551616"),
+            "name: expected string, got integer",
+        ),
+        (
+            PROBE_TEXT.replace(
+                "samples: [1.0, 2.0]",
+                "samples: [1.0, !truncated 18446744073709551616]",
+            ),
+            "samples[1]: this array was cut short for display (elements left out: \
+             18446744073709551616); print the message again with a larger --truncate-length",
+        ),
+        (
+            "18446744073709551616: 1\n".to_string(),
+            "(message): expected a field name, got integer",
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(decode_err(w, "Probe", &text), want, "{text}");
+    }
+
+    let (wide, _) = SchemaSet::from_schemas(vec![
+        one_field_schema("U", "v", FieldType::U64),
+        one_field_schema("I", "v", FieldType::I64),
+        one_field_schema(
+            "Us",
+            "v",
+            FieldType::DynamicArray {
+                element_type: Box::new(FieldType::U64),
+            },
+        ),
+    ])
+    .unwrap();
+    let w = wide.walker();
+    assert_eq!(
+        decode_err(w, "U", "v: 18446744073709551616"),
+        "v: 18446744073709551616 is out of range for uint64 (0 to 18446744073709551615)"
+    );
+    assert_eq!(
+        decode_err(w, "I", "v: -9223372036854775809"),
+        "v: -9223372036854775809 is out of range for int64 (-9223372036854775808 to 9223372036854775807)"
+    );
+    assert_eq!(
+        decode_err(w, "Us", "v: [1, 340282366920938463463374607431768211455]"),
+        "v[1]: 340282366920938463463374607431768211455 is out of range for uint64 (0 to 18446744073709551615)"
+    );
+    // Past 128 bits the parser reads the digits as a float.
+    assert_eq!(
+        decode_err(w, "U", "v: 340282366920938463463374607431768211456"),
+        "v: expected uint64, got float"
+    );
+    // The bounds themselves still read.
+    let max = yaml_to_message(w, "U", b"v: 18446744073709551615", TS).unwrap();
+    assert_eq!(&max[32..], &u64::MAX.to_le_bytes());
+    let min = yaml_to_message(w, "I", b"v: -9223372036854775808", TS).unwrap();
+    assert_eq!(&min[32..], &i64::MIN.to_le_bytes());
+}
+
+/// An integer is accepted for a float field however wide it is.
+#[test]
+fn an_integer_past_64_bits_reads_into_a_float_field() {
+    let set = set_from_yaml(PROBE_YAML);
+    let text = PROBE_TEXT.replace(
+        "samples: [1.0, 2.0]",
+        "samples: [1.0, 18446744073709551616]",
+    );
+    let frame = yaml_to_message(set.walker(), "Probe", text.as_bytes(), TS).unwrap();
+    // 2^64 is exact in float64: 0x43F0000000000000.
+    assert_eq!(&frame[72..80], &[0, 0, 0, 0, 0, 0, 0xF0, 0x43]);
+    assert_eq!(
+        message_to_yaml(set.walker(), &frame).unwrap(),
+        "id: 16909060\nflag: 7\nname: \"ab\"\nsamples: [1.0, 1.8446744073709552e19]\n"
+    );
 }
 
 #[test]

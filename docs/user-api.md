@@ -167,7 +167,9 @@ effort: [1.5]
   declares them. Every field is required on input, and a key that is not a
   field of the type is an error. A message type with no fields is `{}`
   (empty input is accepted for it).
-- **Numbers.** Integers are decimal. Floats print in the shortest form that
+- **Numbers.** Integers are decimal. An integer that does not fit its
+  field is refused as out of range at that field; past 128 bits YAML reads
+  the digits as a float, so the error is `expected uint64, got float`. Floats print in the shortest form that
   reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
   `.inf` and `-.inf`; an integer is accepted for a float field. A
   `float32` reads back to the same bits. The one exception is NaN: every

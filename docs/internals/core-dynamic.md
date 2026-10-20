@@ -204,7 +204,7 @@ let frame = yaml_to_message(walker, "geometry_msgs/Pose", yaml.as_bytes(), times
 
 The user-facing form is documented in `docs/user-api.md` ("Message YAML"); its
 keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
-(`encode.rs`, `decode.rs`, `scan.rs`, `tests.rs`).
+(`encode.rs`, `decode.rs`, `parse.rs`, `scan.rs`, `tests.rs`).
 
 - **Encode** walks the frame with `FrameWalker::walk_by_hash_keeping`, holding at most
   `truncate_arrays` decoded elements per array (every element is still decoded once and
@@ -217,7 +217,8 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   into a fixed and a variable group and loses that order). The walker's degradations
   become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
   canonically framed, a primitive array whose bytes end partway through an element,
-  a `bool[]` byte other than 0/1). The walker refuses a frame whose messages nest past
+  a `bool[]` byte other than 0/1). The walker reads an empty `bool[]` blob as an
+  empty element array, which prints `[]` like every other empty array. The walker refuses a frame whose messages nest past
   `MAX_WALK_NESTING` (256; only a recursive schema can) with `NestingTooDeep`. The empty variable-nested blob
   idiom prints the target's zero values, so the YAML is complete; decoding that YAML
   writes the full sub-frame, so that one frame shape is not byte-preserved.
@@ -227,6 +228,10 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
   allocates it, and a string or scalar array past it is refused before its bytes are
   built. One final `---` line (echo's frame separator) is dropped before parsing.
+  `parse.rs` builds the `serde_yaml::Value` tree with its own visitor so an integer
+  past 64 bits (which `Value` cannot hold, and serde_yaml refuses with no path) is
+  kept as its decimal text: an integer field refuses it as `YamlOutOfRange` at its
+  path, a float field reads it like any integer.
   serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
   block scalars. A block scalar's content is what is more indented than the node that

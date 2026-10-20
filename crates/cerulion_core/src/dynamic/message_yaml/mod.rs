@@ -45,6 +45,7 @@
 
 mod decode;
 mod encode;
+mod parse;
 mod scan;
 
 pub use decode::yaml_to_message;

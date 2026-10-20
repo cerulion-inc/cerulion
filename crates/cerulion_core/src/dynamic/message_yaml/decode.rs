@@ -4,6 +4,7 @@
 use serde_yaml::{Mapping, Value};
 
 use super::encode::format_f32;
+use super::parse::{parse, wide_integer};
 use super::scan::find_anchor_or_alias;
 use super::{
     push_field, push_index, shown, type_name, MAX_YAML_ARRAY_DEPTH, MAX_YAML_DEPTH,
@@ -60,7 +61,7 @@ pub fn yaml_to_message(
     if let Some((line, column)) = find_anchor_or_alias(text) {
         return Err(DynamicError::YamlAnchorOrAlias { line, column });
     }
-    let value: Value = serde_yaml::from_str(text).map_err(syntax_error)?;
+    let value = parse(text).map_err(syntax_error)?;
     let value = match value {
         Value::Null => Value::Mapping(Mapping::new()),
         other => other,
@@ -118,6 +119,9 @@ fn syntax_error(e: serde_yaml::Error) -> DynamicError {
 
 /// The YAML kind of a value, as error text names it.
 fn kind(v: &Value) -> &'static str {
+    if wide_integer(v).is_some() {
+        return "integer";
+    }
     match v {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -159,9 +163,13 @@ impl<'w> Builder<'w> {
                 path: self.here(),
                 omitted: match &t.value {
                     Value::Number(n) => n.to_string(),
-                    other => kind(other).to_string(),
+                    other => {
+                        wide_integer(other).map_or_else(|| kind(other).to_string(), str::to_string)
+                    }
                 },
             }),
+            // An integer past 64 bits is a plain integer to every field.
+            Value::Tagged(_) if wide_integer(v).is_some() => Ok(v),
             Value::Tagged(t) => Err(DynamicError::YamlTag {
                 path: self.here(),
                 tag: t.tag.to_string(),
@@ -486,22 +494,24 @@ impl<'w> Builder<'w> {
         let v = self.untagged(v)?;
         macro_rules! int {
             ($t:ty) => {{
-                let Value::Number(n) = v else {
-                    return Err(self.wrong(ft, v));
-                };
-                if n.is_f64() {
-                    return Err(self.wrong(ft, v));
-                }
-                let parsed = match n.as_i64() {
-                    Some(i) => <$t>::try_from(i).ok(),
-                    None => n.as_u64().and_then(|u| <$t>::try_from(u).ok()),
+                // An integer past 64 bits fits no field type.
+                let (parsed, written) = match (wide_integer(v), v) {
+                    (Some(digits), _) => (None, digits.to_string()),
+                    (None, Value::Number(n)) if !n.is_f64() => (
+                        match n.as_i64() {
+                            Some(i) => <$t>::try_from(i).ok(),
+                            None => n.as_u64().and_then(|u| <$t>::try_from(u).ok()),
+                        },
+                        n.to_string(),
+                    ),
+                    _ => return Err(self.wrong(ft, v)),
                 };
                 match parsed {
                     Some(x) => x.to_le_bytes().to_vec(),
                     None => {
                         return Err(DynamicError::YamlOutOfRange {
                             path: self.here(),
-                            value: n.to_string(),
+                            value: written,
                             expected: format!("{} ({} to {})", type_name(ft), <$t>::MIN, <$t>::MAX),
                         })
                     }
@@ -545,6 +555,10 @@ impl<'w> Builder<'w> {
     }
 
     fn float(&self, ft: &FieldType, v: &Value) -> Result<f64, DynamicError> {
+        // An integer is accepted for a float field, however wide.
+        if let Some(digits) = wide_integer(v) {
+            return digits.parse::<f64>().map_err(|_| self.wrong(ft, v));
+        }
         match v {
             Value::Number(n) => n.as_f64().ok_or_else(|| self.wrong(ft, v)),
             other => Err(self.wrong(ft, other)),
