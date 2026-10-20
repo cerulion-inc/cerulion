@@ -74,6 +74,7 @@ pub mod mdns_discovery;
 // The LOCAL ament harvest rung — a filesystem-only
 // `SchemaAcquirer` over the host's `$AMENT_PREFIX_PATH` ROS install.
 pub mod local_harvest;
+pub mod log_cmd;
 pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
