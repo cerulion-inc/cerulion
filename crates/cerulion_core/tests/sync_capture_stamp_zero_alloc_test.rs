@@ -182,6 +182,10 @@ fn fusion_graph(
     (config, factories)
 }
 
+/// A `capture_ns` that [`publish`] writes as `nanosec = 1_000_000_000`, a
+/// stamp no `builtin_interfaces/Time` can hold.
+const BAD_STAMP: u64 = u64::MAX;
+
 fn publish(
     publisher: &mut cerulion_core::CerulionPublisher,
     clock: &VirtualClock,
@@ -190,19 +194,29 @@ fn publish(
 ) {
     clock.set(wire_ns);
     let mut p = publisher.loan_proxy::<PoseStamped>().expect("loan");
+    let (sec, nanosec) = if capture_ns == BAD_STAMP {
+        (0, 1_000_000_000)
+    } else {
+        (
+            (capture_ns / 1_000_000_000) as i32,
+            (capture_ns % 1_000_000_000) as u32,
+        )
+    };
     p.pose.position.x = (capture_ns / MS) as f64;
     p.with_header(|h| {
         h.set_frame_id("base_link")?;
-        h.stamp.sec = (capture_ns / 1_000_000_000) as i32;
-        h.stamp.nanosec = (capture_ns % 1_000_000_000) as u32;
+        h.stamp.sec = sec;
+        h.stamp.nanosec = nanosec;
         Ok(())
     })
     .expect("write header");
 }
 
 /// Steps and counts allocations on the stepping thread across the measured
-/// steps; returns `(allocations, fires)`.
-fn measure(prefix: &str, capture: bool) -> (u64, usize) {
+/// steps; returns `(allocations, fires)`. `dirty` puts a backwards frame and
+/// an undecodable frame ahead of every good camera frame, so each step runs
+/// the discard loop (two discards, both counters, both latches).
+fn measure(prefix: &str, capture: bool, dirty: bool) -> (u64, usize) {
     let total = (WARM_STEPS + MEASURED_STEPS) as usize;
     let fires = Arc::new(Mutex::new(Vec::with_capacity(total + 1)));
     let (config, factories) = fusion_graph(prefix, Arc::clone(&fires), capture);
@@ -224,6 +238,12 @@ fn measure(prefix: &str, capture: bool) -> (u64, usize) {
         // Both clocks fuse: wire stamps 1 ms apart, capture stamps 2 ms apart,
         // each well inside the 10 ms window.
         let base = k * 20 * MS;
+        if dirty && k > 1 {
+            // 2 ms behind the previous good camera stamp (base - 25 ms):
+            // backwards within the 10 ms window, so dropped, never an epoch.
+            publish(&mut cam, &clock, base - 2 * MS, base - 27 * MS);
+            publish(&mut cam, &clock, base - MS, BAD_STAMP);
+        }
         publish(&mut cam, &clock, base, base - 5 * MS);
         publish(&mut lidar, &clock, base + MS, base - 3 * MS);
         clock.set(base + 2 * MS);
@@ -235,6 +255,13 @@ fn measure(prefix: &str, capture: bool) -> (u64, usize) {
             runtime.step(Duration::from_millis(1));
         }
     }
+    if dirty {
+        // Anti-tautology: the dirty run really took both discard arms.
+        let handle = runtime.node_handle("fuse").expect("node handle");
+        let steps = WARM_STEPS + MEASURED_STEPS - 1;
+        assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), steps);
+        assert_eq!(handle.sync_capture_decode_failures(TOPIC_CAM), steps);
+    }
     let fired = fires.lock().expect("fires sink poisoned").len();
     (allocations, fired)
 }
@@ -242,8 +269,8 @@ fn measure(prefix: &str, capture: bool) -> (u64, usize) {
 #[test]
 #[serial]
 fn capture_time_matching_adds_no_allocation_per_message() {
-    let (publish_allocs, publish_fires) = measure("capzapub", false);
-    let (capture_allocs, capture_fires) = measure("capzacap", true);
+    let (publish_allocs, publish_fires) = measure("capzapub", false, false);
+    let (capture_allocs, capture_fires) = measure("capzacap", true, false);
     let total = (WARM_STEPS + MEASURED_STEPS) as usize;
     assert_eq!(publish_fires, total, "every publish-time pair fuses");
     assert_eq!(capture_fires, total, "every capture-time pair fuses");
@@ -253,4 +280,110 @@ fn capture_time_matching_adds_no_allocation_per_message() {
          matching on the same stimulus ({capture_allocs} vs {publish_allocs} over \
          {MEASURED_STEPS} steps)"
     );
+}
+
+/// The discard loop on the real runtime: every step drops one backwards and
+/// one undecodable camera frame before the good one. The dirty run must
+/// allocate exactly as often as the clean capture-time run on the same good
+/// frames, so neither a discard, a counter bump nor a latched log line adds an
+/// allocation. (Both runs carry the same nonzero baseline the publish-time run
+/// has too; it comes from the step loop and the receive path outside the
+/// capture layer, which the pure-layer test below pins to zero by itself.)
+#[test]
+#[serial]
+fn the_capture_time_discard_loop_adds_no_allocation_per_message() {
+    let (clean_allocs, clean_fires) = measure("capzaclean", true, false);
+    let (dirty_allocs, dirty_fires) = measure("capzadirty", true, true);
+    let total = (WARM_STEPS + MEASURED_STEPS) as usize;
+    assert_eq!(clean_fires, total, "every clean pair fuses");
+    assert_eq!(
+        dirty_fires, total,
+        "the discarded frames never block a pair"
+    );
+    assert_eq!(
+        dirty_allocs, clean_allocs,
+        "discarding backwards and undecodable frames must not allocate \
+         ({dirty_allocs} vs {clean_allocs} over {MEASURED_STEPS} steps)"
+    );
+}
+
+/// The pure layer on its own: decoding a stamp and classifying and counting a
+/// head op allocate nothing. The comparison above cannot see an allocation
+/// both modes share; this pins the capture-time code to zero by itself.
+#[test]
+#[serial]
+fn the_capture_stamp_decode_and_head_op_allocate_nothing() {
+    use cerulion_core::scheduler::sync_stamp::{
+        capture_head_op, capture_stamp_ns, CaptureIo, HeaderStampLocation, StampDecodeError,
+        SyncFrameSlot,
+    };
+    use cerulion_core::scheduler::{SyncAlignSite, SyncHeadOp, SyncOpAnswer};
+
+    /// A 64-byte frame with `header.stamp` at fixed offset 0 after the
+    /// wire header.
+    fn frame(sec: i32, nanosec: u32) -> [u8; 64] {
+        let mut f = [0u8; 64];
+        let at = cerulion_core::wire::WireHeader::SIZE;
+        f[at..at + 4].copy_from_slice(&sec.to_le_bytes());
+        f[at + 4..at + 8].copy_from_slice(&nanosec.to_le_bytes());
+        f
+    }
+    const AT: HeaderStampLocation = HeaderStampLocation::Fixed { offset: 0 };
+
+    /// A fixed ring of frames: in order, backwards, undecodable, in order.
+    struct Ring {
+        frames: [[u8; 64]; 4],
+        head: usize,
+    }
+    impl CaptureIo for Ring {
+        fn op(&mut self, op: SyncHeadOp) -> SyncOpAnswer {
+            match op {
+                SyncHeadOp::Void => SyncOpAnswer::Nothing,
+                SyncHeadOp::ProbeNext => SyncOpAnswer::Present,
+                SyncHeadOp::PeekNext { .. } => SyncOpAnswer::Stamp(0),
+                _ => {
+                    self.head = (self.head + 1) % self.frames.len();
+                    SyncOpAnswer::Head(0)
+                }
+            }
+        }
+        fn stamp(&mut self, slot: SyncFrameSlot) -> Option<Result<u64, StampDecodeError>> {
+            let i = match slot {
+                SyncFrameSlot::Head => self.head,
+                SyncFrameSlot::Next => (self.head + 1) % self.frames.len(),
+            };
+            Some(capture_stamp_ns(&self.frames[i], AT))
+        }
+    }
+
+    let mut ring = Ring {
+        frames: [
+            frame(1, 0),
+            frame(0, 999_000_000),
+            frame(2, 1_000_000_000),
+            frame(3, 0),
+        ],
+        head: 3,
+    };
+    let mut hw = None;
+    let window = 2_000 * MS;
+    let site = SyncAlignSite::Boundary;
+    let ops = [
+        SyncHeadOp::FillBoundary,
+        SyncHeadOp::PeekNext { site },
+        SyncHeadOp::Advance { site },
+        SyncHeadOp::ProbeNext,
+        SyncHeadOp::Void,
+    ];
+    let mut drops = 0u64;
+    ALLOCATOR.enable();
+    for _ in 0..256 {
+        for op in ops {
+            let out = capture_head_op(op, window, &mut hw, &mut ring);
+            drops += u64::from(out.decode_failures + out.backwards_drops);
+        }
+    }
+    let allocations = ALLOCATOR.disable();
+    assert!(drops > 0, "the walk took the discard arms");
+    assert_eq!(allocations, 0, "the capture-time pure layer allocated");
 }

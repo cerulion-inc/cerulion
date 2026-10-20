@@ -31,6 +31,7 @@ use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::PoseStamped;
 use serial_test::serial;
+use tracing_test::traced_test;
 
 const TOPIC_CAM: &str = "/cap/cam";
 const TOPIC_LIDAR: &str = "/cap/lidar";
@@ -135,9 +136,14 @@ fn fusion_graph(
     (config, factories)
 }
 
+/// A capture stamp no `builtin_interfaces/Time` can hold (`nanosec` of one
+/// second), as a `capture_ms` value: [`publish`] writes it raw.
+const BAD_STAMP: u64 = u64::MAX;
+
 /// Publish one `PoseStamped` at WIRE time `wire_ms`, captured at `capture_ms`
 /// (written into `header.stamp`), tagged with `capture_ms` in
-/// `pose.position.x` so a fused set names its own frames.
+/// `pose.position.x` so a fused set names its own frames. [`BAD_STAMP`]
+/// writes `sec = 0, nanosec = 1_000_000_000`.
 fn publish(
     publisher: &mut cerulion_core::CerulionPublisher,
     clock: &VirtualClock,
@@ -147,14 +153,50 @@ fn publish(
     clock.set(wire_ms * MS);
     let mut p = publisher.loan_proxy::<PoseStamped>().expect("loan");
     p.pose.position.x = capture_ms as f64;
-    let ns = capture_ms * MS;
+    let (sec, nanosec) = if capture_ms == BAD_STAMP {
+        (0, 1_000_000_000)
+    } else {
+        let ns = capture_ms * MS;
+        ((ns / 1_000_000_000) as i32, (ns % 1_000_000_000) as u32)
+    };
     p.with_header(|h| {
         h.set_frame_id("base_link")?;
-        h.stamp.sec = (ns / 1_000_000_000) as i32;
-        h.stamp.nanosec = (ns % 1_000_000_000) as u32;
+        h.stamp.sec = sec;
+        h.stamp.nanosec = nanosec;
         Ok(())
     })
     .expect("write header");
+}
+
+/// Publishers on both topics of a built fusion graph.
+struct Feed {
+    cam: cerulion_core::CerulionPublisher,
+    lidar: cerulion_core::CerulionPublisher,
+}
+
+impl Feed {
+    fn new(runtime: &GraphRuntime) -> Self {
+        let mgr = runtime.test_transport().expect("test transport parked");
+        Self {
+            cam: mgr
+                .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(128), 0)
+                .expect("publisher on /cap/cam"),
+            lidar: mgr
+                .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(128), 0)
+                .expect("publisher on /cap/lidar"),
+        }
+    }
+
+    fn send(&mut self, clock: &VirtualClock, frames: &[(&str, u64, u64)]) {
+        for (topic, wire_ms, capture_ms) in frames {
+            let publisher = if *topic == TOPIC_CAM {
+                &mut self.cam
+            } else {
+                &mut self.lidar
+            };
+            publish(publisher, clock, *wire_ms, *capture_ms);
+        }
+    }
 }
 
 /// Build the graph, publish `frames` (`(topic, wire_ms, capture_ms)`) in
@@ -169,21 +211,9 @@ fn run(
     let clock = Arc::new(VirtualClock::new());
     let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 16)
         .expect("build capture fusion graph");
-    let mgr = runtime.test_transport().expect("test transport parked");
-    let mut cam = mgr
-        .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(128), 0)
-        .expect("publisher on /cap/cam");
-    let mut lidar = mgr
-        .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(128), 0)
-        .expect("publisher on /cap/lidar");
-    for (topic, wire_ms, capture_ms) in frames {
-        let publisher = if *topic == TOPIC_CAM {
-            &mut cam
-        } else {
-            &mut lidar
-        };
-        publish(publisher, &clock, *wire_ms, *capture_ms);
-    }
+    // The feed outlives the step: a dropped publisher takes its frames along.
+    let mut feed = Feed::new(&runtime);
+    feed.send(&clock, frames);
     clock.set(0);
     runtime.step(Duration::from_millis(1));
     let handle = runtime.node_handle("fuse").expect("node handle");
@@ -219,20 +249,162 @@ fn publish_time_matching_on_the_same_frames_fuses_nothing() {
     assert_eq!(fused, vec![]);
 }
 
+/// How many captured log lines contain `needle`.
+fn count_lines(lines: &[&str], needle: &str) -> usize {
+    lines.iter().filter(|l| l.contains(needle)).count()
+}
+
 #[test]
 #[serial]
+#[traced_test]
 fn a_camera_stamp_that_goes_backwards_is_dropped_counted_and_never_fused() {
+    // Two backwards frames, each discarded by a different head op: one regime,
+    // so one warning, a suppressed repeat, and a recovery line once the camera
+    // contributes an in-order head again.
     let frames = [
         (TOPIC_CAM, 101, 100),
         (TOPIC_LIDAR, 103, 100),
         (TOPIC_CAM, 104, 95),
         (TOPIC_CAM, 201, 200),
         (TOPIC_LIDAR, 203, 200),
+        (TOPIC_CAM, 204, 195),
+        (TOPIC_CAM, 301, 300),
+        (TOPIC_LIDAR, 303, 300),
+        (TOPIC_CAM, 401, 400),
+        (TOPIC_LIDAR, 403, 400),
     ];
     let (fused, handle) = run("capback", true, &frames);
-    assert_eq!(fused, vec![(100.0, 100.0), (200.0, 200.0)]);
-    assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), 1);
+    assert_eq!(
+        fused,
+        vec![
+            (100.0, 100.0),
+            (200.0, 200.0),
+            (300.0, 300.0),
+            (400.0, 400.0)
+        ]
+    );
+    assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), 2);
     assert_eq!(handle.sync_capture_backwards_drops(TOPIC_LIDAR), 0);
+    assert_eq!(handle.sync_capture_decode_failures(TOPIC_CAM), 0);
+    logs_assert(|lines: &[&str]| {
+        let loud = count_lines(lines, "older than one this input already contributed");
+        let recovered = count_lines(lines, "in order again on this input");
+        if (loud, recovered) == (1, 1) {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one warning and one recovery line, got {loud} and {recovered}"
+            ))
+        }
+    });
+}
+
+#[test]
+#[serial]
+#[traced_test]
+fn a_frame_whose_stamp_cannot_be_decoded_is_in_no_set_and_counted() {
+    // `nanosec = 1_000_000_000` is no valid time. Each bad frame is
+    // discarded by a different head op, the good frames around them still
+    // fuse, and the regime logs one warning and one recovery line.
+    let frames = [
+        (TOPIC_CAM, 101, 100),
+        (TOPIC_LIDAR, 103, 100),
+        (TOPIC_CAM, 104, BAD_STAMP),
+        (TOPIC_CAM, 201, 200),
+        (TOPIC_LIDAR, 203, 200),
+        (TOPIC_CAM, 204, BAD_STAMP),
+        (TOPIC_CAM, 301, 300),
+        (TOPIC_LIDAR, 303, 300),
+        (TOPIC_CAM, 401, 400),
+        (TOPIC_LIDAR, 403, 400),
+    ];
+    let (fused, handle) = run("capbad", true, &frames);
+    assert_eq!(
+        fused,
+        vec![
+            (100.0, 100.0),
+            (200.0, 200.0),
+            (300.0, 300.0),
+            (400.0, 400.0)
+        ]
+    );
+    assert_eq!(handle.sync_capture_decode_failures(TOPIC_CAM), 2);
+    assert_eq!(handle.sync_capture_decode_failures(TOPIC_LIDAR), 0);
+    assert_eq!(handle.sync_capture_backwards_drops(TOPIC_CAM), 0);
+    logs_assert(|lines: &[&str]| {
+        let loud = count_lines(lines, "could not be decoded");
+        let recovered = count_lines(lines, "decode again on this input");
+        if (loud, recovered) == (1, 1) {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one warning and one recovery line, got {loud} and {recovered}"
+            ))
+        }
+    });
+}
+
+/// After the camera's 100 ms frame arrived, and before the lidar's: the
+/// checkpoint both runs below cross. Then a backwards camera frame (95), a
+/// lidar frame (103) it would pair with, and an ordinary pair at 200.
+const BEFORE_CHECKPOINT: [(&str, u64, u64); 1] = [(TOPIC_CAM, 101, 100)];
+const AFTER_CHECKPOINT: [(&str, u64, u64); 5] = [
+    (TOPIC_CAM, 104, 95),
+    (TOPIC_LIDAR, 105, 100),
+    (TOPIC_LIDAR, 106, 103),
+    (TOPIC_CAM, 201, 200),
+    (TOPIC_LIDAR, 203, 200),
+];
+
+/// Build the capture fusion graph, optionally restore `restored` before the
+/// first step, then run one step per frame batch. Returns the fused sets and
+/// the node handle.
+fn run_batches(
+    prefix: &str,
+    restored: Option<std::collections::BTreeMap<String, u64>>,
+    batches: &[&[(&str, u64, u64)]],
+) -> (Vec<(f64, f64)>, cerulion_core::scheduler::NodeHandle) {
+    let sets: Sets = Arc::new(Mutex::new(Vec::new()));
+    let (config, factories) = fusion_graph(prefix, Arc::clone(&sets), true, None);
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 16)
+        .expect("build capture fusion graph");
+    if let Some(heads) = restored {
+        runtime.restore_sync_input_timestamps(&[("fuse".to_string(), heads)].into());
+    }
+    let mut feed = Feed::new(&runtime);
+    for batch in batches {
+        feed.send(&clock, batch);
+        clock.set(0);
+        runtime.step(Duration::from_millis(1));
+    }
+    let handle = runtime.node_handle("fuse").expect("node handle").clone();
+    let fused = sets.lock().expect("sets sink poisoned").clone();
+    (fused, handle)
+}
+
+#[test]
+#[serial]
+fn a_resumed_run_drops_the_same_backwards_frame_as_the_live_run() {
+    // Live: the camera's 100 is held at the checkpoint, so 95 is backwards
+    // and dropped, 103 finds no partner and 200 pairs with 200.
+    let (live, live_handle) =
+        run_batches("caplive", None, &[&BEFORE_CHECKPOINT, &AFTER_CHECKPOINT]);
+    assert_eq!(live, vec![(100.0, 100.0), (200.0, 200.0)]);
+    assert_eq!(live_handle.sync_capture_backwards_drops(TOPIC_CAM), 1);
+
+    // Resumed from the checkpoint: the camera's head is restored as a stamp
+    // (no frame behind it, so its set's body reads nothing). The restored
+    // stamp seeds the high-water, so 95 is dropped exactly as live; without
+    // the seed it would pair with 103 and add a set the live run never had.
+    let restored = [(TOPIC_CAM.to_string(), 100 * MS)].into();
+    let (resumed, resumed_handle) = run_batches("capresume", Some(restored), &[&AFTER_CHECKPOINT]);
+    assert_eq!(
+        resumed,
+        vec![(200.0, 200.0)],
+        "the live sets after the checkpoint"
+    );
+    assert_eq!(resumed_handle.sync_capture_backwards_drops(TOPIC_CAM), 1);
 }
 
 #[test]
