@@ -57,7 +57,9 @@ pub(crate) fn sin_quarter_turn(x: f64) -> f64 {
     odd_series(x, &SIN_COEFFS)
 }
 
-/// `atan(r)` for `r` in `[0, 1]`, accurate to a few ulps.
+/// `atan(r)` for `r` in `[0, 1]`, accurate to a few ulps. The half-angle
+/// steps keep that accuracy a few ulps above 1, where a SLERP ratio can
+/// round near a half turn.
 ///
 /// Two half-angle steps, `atan(x) = 2 atan(x / (1 + sqrt(1 + x²)))`, bring
 /// the argument down to `[0, tan(pi/16)]`, where the series converges fast.

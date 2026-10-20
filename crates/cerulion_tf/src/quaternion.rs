@@ -213,6 +213,8 @@ impl UnitQuaternion {
             b = [-b[0], -b[1], -b[2], -b[3]];
             std::mem::swap(&mut diff, &mut sum);
         }
+        // Within a few ulps of a half turn the sign test and the norms can
+        // disagree by rounding, so the ratio can land a few ulps above 1.
         let theta = 2.0 * atan_unit(diff / sum);
         let (wa, wb) = if theta < Self::SLERP_LERP_THRESHOLD {
             (1.0 - t, t)
