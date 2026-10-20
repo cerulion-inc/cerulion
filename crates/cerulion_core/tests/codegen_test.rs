@@ -2177,3 +2177,128 @@ fn test_i8_push_round_trip_via_int8_multi_array() {
         "i8 push round-trip must preserve negative values bit-exactly"
     );
 }
+
+/// Parse a `.msg` text in package `p` and generate its code.
+fn generate_from_msg(text: &str, name: &str) -> String {
+    generate_schema(&parse_rosmsg(text, name, Some("p")).expect("test .msg parses"))
+}
+
+/// Message constants become associated constants on the marker, with the
+/// field type's Rust type and the declared value.
+#[test]
+fn constants_are_emitted_as_associated_constants_on_the_marker() {
+    let code = generate_from_msg(
+        "uint8 PARAMETER_NOT_SET=0\nint64 NEG=-3\nfloat32 HALF=0.5\nbool ON=true\n\
+         string MODE=\"AUTO \\\"x\\\"\"\nint32 v\n",
+        "Consts",
+    );
+    let expected = "impl Consts {\n\
+        \x20   /// Constant `PARAMETER_NOT_SET` declared in the message.\n\
+        \x20   pub const PARAMETER_NOT_SET: u8 = 0;\n\
+        \x20   /// Constant `NEG` declared in the message.\n\
+        \x20   pub const NEG: i64 = -3;\n\
+        \x20   /// Constant `HALF` declared in the message.\n\
+        \x20   pub const HALF: f32 = 0.5;\n\
+        \x20   /// Constant `ON` declared in the message.\n\
+        \x20   pub const ON: bool = true;\n\
+        \x20   /// Constant `MODE` declared in the message.\n\
+        \x20   pub const MODE: &'static str = \"AUTO \\\"x\\\"\";\n\
+        }\n";
+    assert!(code.contains(expected), "constants block missing:\n{code}");
+}
+
+/// A message without constants gets no inherent impl on its marker.
+#[test]
+fn a_message_without_constants_has_no_inherent_marker_impl() {
+    let code = generate_from_msg("int32 v\n", "Plain");
+    assert!(!code.contains("impl Plain {"));
+}
+
+/// A constant that would shadow a `ShmMessage` trait item is refused at
+/// compile time, naming the constant.
+#[test]
+fn a_constant_named_like_a_trait_item_is_a_compile_error() {
+    let code = generate_from_msg("uint64 SCHEMA_HASH=1\nint32 v\n", "Clash");
+    assert!(code
+        .contains("compile_error!(\"schema `Clash`: constant name(s) `SCHEMA_HASH` are reserved"));
+    assert!(!code.contains("impl Clash {"));
+}
+
+/// String and primitive-array defaults land in the snapshot's manual
+/// `Default`; the fixed overlay of a variable schema keeps its derive when
+/// none of ITS fields has a non-zero default.
+#[test]
+fn string_and_array_defaults_reach_the_variable_snapshot_default() {
+    let code = generate_from_msg(
+        "string name \"robot \\\"one\\\"\"\nint32[] ids [1, -2]\nbool[] flags [true]\n\
+         float64[2] gains [1, 0.5]\nint32 plain\n",
+        "Defaults",
+    );
+    let snapshot_default = "impl Default for DefaultsSnapshot {\n\
+        \x20   fn default() -> Self {\n\
+        \x20       Self {\n\
+        \x20           name: ::std::string::String::from(\"robot \\\"one\\\"\"),\n\
+        \x20           ids: ::std::vec![1, -2],\n\
+        \x20           flags: ::std::vec![true],\n\
+        \x20           gains: [1.0, 0.5],\n\
+        \x20           plain: 0,\n\
+        \x20       }\n";
+    assert!(
+        code.contains(snapshot_default),
+        "snapshot default missing:\n{code}"
+    );
+    // `gains` is a fixed-section field with a non-zero default, so the
+    // overlay gets a manual impl too, with the SHM literal.
+    assert!(code.contains("impl Default for DefaultsFixedSection {"));
+    assert!(code.contains("            gains: [1.0, 0.5],\n            plain: 0,\n"));
+}
+
+#[test]
+fn a_string_only_default_leaves_the_fixed_overlay_derived() {
+    let code = generate_from_msg("string name \"x\"\nint32 plain\n", "OnlyStr");
+    assert!(code.contains("impl Default for OnlyStrSnapshot {"));
+    assert!(!code.contains("impl Default for OnlyStrFixedSection"));
+    assert!(code.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Default)]\npub struct OnlyStrFixedSection {"
+    ));
+}
+
+/// A `string[]` snapshot field holds the raw wire payload, so its default
+/// is the canonical encoding: u32 count, then per string a u32 length and
+/// its bytes, little-endian. Hand-assembled oracle for `["ab", ""]`.
+#[test]
+fn a_string_array_default_is_the_canonical_payload_bytes() {
+    let code = generate_from_msg("string[] names [\"ab\", \"\"]\n", "Names");
+    assert!(
+        code.contains("names: ::std::vec![2, 0, 0, 0, 2, 0, 0, 0, 97, 98, 0, 0, 0, 0],"),
+        "string[] default bytes missing:\n{code}"
+    );
+}
+
+/// A bool fixed-array default in a FIXED schema is stored as `u8` in the
+/// SHM overlay and as `bool` in the snapshot.
+#[test]
+fn a_fixed_bool_array_default_uses_u8_in_shm_and_bool_in_the_snapshot() {
+    let code = generate_from_msg("bool[2] mask [true, false]\n", "Mask");
+    assert!(code.contains("impl Default for MaskShm {"));
+    assert!(code.contains("            mask: [1u8, 0u8],\n"));
+    assert!(code.contains("impl Default for MaskSnapshot {"));
+    assert!(code.contains("            mask: [true, false],\n"));
+}
+
+/// Empty defaults equal the derive, so they keep the derived `Default`.
+#[test]
+fn empty_string_and_array_defaults_keep_the_derive() {
+    let code = generate_from_msg("string name \"\"\nint32[] ids []\n", "Empty");
+    assert!(!code.contains("impl Default for EmptySnapshot"));
+}
+
+/// Generating twice from the same text is byte-identical.
+#[test]
+fn constants_and_defaults_generate_deterministically() {
+    let text = "uint8 A=1\nstring S=\"s\"\nstring name \"x\"\nint32[] v [1, 2]\n";
+    assert_eq!(
+        generate_from_msg(text, "Det"),
+        generate_from_msg(text, "Det")
+    );
+}

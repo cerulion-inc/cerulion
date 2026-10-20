@@ -15,9 +15,14 @@
 //! Supported types: bool, int8, uint8, int16, uint16, int32, uint32,
 //! int64, uint64, float32, float64, string, pkg/MsgType, T[], T[N]
 
-use super::schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema};
+use super::schema::{ConstantDef, DefaultLiteral, FieldDef, FieldType, MessageSchema};
 
 /// Parse a ROS2 .msg file content into a MessageSchema.
+///
+/// Fields keep their default values (scalars, strings and arrays), and
+/// constant lines (`uint8 FOO=1`, `string NAME="x"`) land in
+/// [`MessageSchema::constants`]. Neither reaches the wire or the schema
+/// hash.
 ///
 /// # Arguments
 /// * `msg_content` - The content of the .msg file
@@ -36,7 +41,8 @@ pub fn parse_rosmsg(
         None => MessageSchema::new(msg_name),
     };
 
-    for (line_num, line) in msg_content.lines().enumerate() {
+    for (idx, line) in msg_content.lines().enumerate() {
+        let line_num = idx + 1;
         let line = line.trim();
 
         // Skip empty lines and comments
@@ -44,46 +50,147 @@ pub fn parse_rosmsg(
             continue;
         }
 
-        // Skip constant definitions (e.g., "uint8 CONSTANT=42",
-        // `string NAME="value"`). The '=' belongs to the NAME token —
-        // checking the whole line would also swallow bounded-type FIELDS
-        // like `string<=64 name` or `int32[<=8] ids`, whose '=' lives in
-        // the TYPE token.
-        let mut tokens = line.split_whitespace();
-        let _type_token = tokens.next();
-        if let Some(name_token) = tokens.next() {
-            if name_token.contains('=') {
-                continue;
+        match split_constant(line) {
+            Some((type_token, name, value)) => {
+                let constant = parse_constant(type_token, name, value)
+                    .map_err(|message| ParseError::InvalidLine { line_num, message })?;
+                if schema.constants.iter().any(|c| c.name == constant.name) {
+                    return Err(ParseError::InvalidLine {
+                        line_num,
+                        message: format!("duplicate constant {}", constant.name),
+                    });
+                }
+                schema.constants.push(constant);
             }
+            None => schema.add_field(parse_field_line(line, line_num)?),
         }
-        // `uint8 FOO = 1` (spaces around '='): name token is bare, the
-        // NEXT token starts with '='.
-        if let Some(third) = tokens.next() {
-            if third.starts_with('=') {
-                continue;
-            }
-        }
-
-        // Parse field: "type name" or "type name default"
-        let field = parse_field_line(line, line_num + 1)?;
-        schema.add_field(field);
     }
 
     Ok(schema)
 }
 
+/// Split the first whitespace-separated token off `line`.
+fn split_first_token(line: &str) -> (&str, &str) {
+    match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim_start()),
+        None => (line, ""),
+    }
+}
+
+/// `Some((type, name, value))` when `line` declares a constant: the name
+/// token is followed (after optional spaces) by `=`. The `=` of a bounded
+/// type (`string<=64 name`) lives in the TYPE token, so it never counts.
+fn split_constant(line: &str) -> Option<(&str, &str, &str)> {
+    let (type_token, rest) = split_first_token(line);
+    let name_end = rest
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(rest.len());
+    let value = rest[name_end..].trim_start().strip_prefix('=')?;
+    Some((type_token, &rest[..name_end], value))
+}
+
+/// Cut a trailing `# comment` that sits outside any quoted string, and
+/// trim the result.
+fn strip_comment(text: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '#' => return text[..i].trim(),
+                _ => {}
+            },
+        }
+    }
+    text.trim()
+}
+
+/// Which kind of value a literal belongs to, for the error text.
+#[derive(Clone, Copy)]
+enum ValueKind {
+    Default,
+    Constant,
+}
+
+impl ValueKind {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Constant => "constant",
+        }
+    }
+}
+
+fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantDef, String> {
+    let mut chars = name.chars();
+    let valid_name = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid_name {
+        return Err(format!("invalid constant name: {name}"));
+    }
+    let field_type = parse_ros_type(type_token)?;
+    if !is_scalar_or_string(&field_type) {
+        return Err(format!(
+            "constant {name}: type {type_token} is not a primitive type or a string"
+        ));
+    }
+    let value = strip_comment(value);
+    if value.is_empty() {
+        return Err(format!("constant {name} has no value"));
+    }
+    let value = parse_scalar(
+        &field_type,
+        type_token,
+        string_bound(type_token),
+        value,
+        ValueKind::Constant,
+    )?;
+    Ok(ConstantDef {
+        name: name.to_string(),
+        field_type,
+        value,
+    })
+}
+
+fn is_scalar_or_string(ft: &FieldType) -> bool {
+    matches!(
+        ft,
+        FieldType::Bool
+            | FieldType::I8
+            | FieldType::U8
+            | FieldType::I16
+            | FieldType::U16
+            | FieldType::I32
+            | FieldType::U32
+            | FieldType::I64
+            | FieldType::U64
+            | FieldType::F32
+            | FieldType::F64
+            | FieldType::String
+    )
+}
+
 fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError> {
-    // Split into parts: type, name, optional default
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
+    let (ros_type, rest) = split_first_token(line);
+    let (field_name, default_text) = split_first_token(rest);
+    if field_name.is_empty() {
         return Err(ParseError::InvalidLine {
             line_num,
             message: format!("expected 'type name', got: {line}"),
         });
     }
-
-    let ros_type = parts[0];
-    let field_name = parts[1];
 
     let field_type = parse_ros_type(ros_type).map_err(|e| ParseError::InvalidType {
         line_num,
@@ -92,73 +199,215 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
 
     let mut field = FieldDef::new(field_name, field_type);
 
-    // Capture a scalar default value (`float64 w 1`) for
-    // primitive numeric/bool fields. A third token starting with '#' is a
-    // trailing comment, not a default. Defaults on strings/arrays/nested
-    // types are not supported and are dropped (rosidl supports them; the
-    // wire format gains nothing from them since variable fields are
-    // always explicitly written).
-    if let Some(token) = parts.get(2) {
-        if !token.starts_with('#') {
-            if let Some(default) = parse_default_literal(&field.field_type, token, line_num)? {
-                field = field.with_default(default);
-            }
-        }
+    // Everything after the name, up to a comment, is the default value
+    // (`float64 w 1`, `string s "a b"`, `int32[] v [1, 2]`).
+    let default_text = strip_comment(default_text);
+    if !default_text.is_empty() {
+        let default = parse_default(&field.field_type, ros_type, default_text)
+            .map_err(|message| ParseError::InvalidLine { line_num, message })?;
+        field = field.with_default(default);
     }
 
     Ok(field)
 }
 
-/// Parse + validate a scalar default token for a primitive field type.
-/// Returns `Ok(None)` for field types that don't support defaults
-/// (strings, arrays, nested) — those are dropped, not errors.
-fn parse_default_literal(
-    ft: &FieldType,
-    token: &str,
-    line_num: usize,
-) -> Result<Option<DefaultLiteral>, ParseError> {
-    let invalid = |msg: String| ParseError::InvalidLine {
-        line_num,
-        message: msg,
+/// Parse + validate a field default against its type. `type_token` is the
+/// declared type text, read again for the `<=N` bounds the [`FieldType`]
+/// does not keep.
+fn parse_default(ft: &FieldType, type_token: &str, text: &str) -> Result<DefaultLiteral, String> {
+    let element_type = match ft {
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            element_type.as_ref()
+        }
+        _ => {
+            return parse_scalar(
+                ft,
+                type_token,
+                string_bound(type_token),
+                text,
+                ValueKind::Default,
+            )
+        }
     };
+    if matches!(element_type, FieldType::Nested { .. }) {
+        return Err("default values are not supported on message-type fields".to_string());
+    }
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .ok_or_else(|| format!("array default must be written [a, b, ...]: {text}"))?;
+    let element_token = &type_token[..type_token.find('[').unwrap_or(type_token.len())];
+    let bound = string_bound(element_token);
+    let items = split_array_items(inner)
+        .into_iter()
+        .map(|item| parse_scalar(element_type, element_token, bound, item, ValueKind::Default))
+        .collect::<Result<Vec<_>, _>>()?;
+    match ft {
+        FieldType::FixedArray { length, .. } if items.len() != *length => Err(format!(
+            "array default has {} elements, the type has {length}",
+            items.len()
+        )),
+        _ => match array_bound(type_token) {
+            Some(max) if items.len() > max => Err(format!(
+                "array default has {} elements, the bound is {max}",
+                items.len()
+            )),
+            _ => Ok(DefaultLiteral::Array(items)),
+        },
+    }
+}
+
+/// Split the inside of `[...]` at the commas outside quotes. An empty (or
+/// all-space) inside is zero items.
+fn split_array_items(inner: &str) -> Vec<&str> {
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in inner.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                ',' => {
+                    items.push(inner[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    items.push(inner[start..].trim());
+    items
+}
+
+/// `N` of a bounded array type `T[<=N]`.
+fn array_bound(type_token: &str) -> Option<usize> {
+    let open = type_token.find("[<=")?;
+    type_token[open + 3..].strip_suffix(']')?.parse().ok()
+}
+
+/// `N` of a bounded string type `string<=N` / `wstring<=N` (no array part).
+fn string_bound(type_token: &str) -> Option<usize> {
+    let base = &type_token[..type_token.find('[').unwrap_or(type_token.len())];
+    base.strip_prefix("string<=")
+        .or_else(|| base.strip_prefix("wstring<="))?
+        .parse()
+        .ok()
+}
+
+/// Inclusive value range of an integer field type, and its ROS name.
+fn int_range(ft: &FieldType) -> Option<(i128, i128, &'static str)> {
+    Some(match ft {
+        FieldType::I8 => (i8::MIN.into(), i8::MAX.into(), "int8"),
+        FieldType::U8 => (0, u8::MAX.into(), "uint8"),
+        FieldType::I16 => (i16::MIN.into(), i16::MAX.into(), "int16"),
+        FieldType::U16 => (0, u16::MAX.into(), "uint16"),
+        FieldType::I32 => (i32::MIN.into(), i32::MAX.into(), "int32"),
+        FieldType::U32 => (0, u32::MAX.into(), "uint32"),
+        FieldType::I64 => (i64::MIN.into(), i64::MAX.into(), "int64"),
+        FieldType::U64 => (0, u64::MAX.into(), "uint64"),
+        _ => return None,
+    })
+}
+
+/// Parse + validate one scalar or string value for a field type.
+fn parse_scalar(
+    ft: &FieldType,
+    type_token: &str,
+    bound: Option<usize>,
+    token: &str,
+    kind: ValueKind,
+) -> Result<DefaultLiteral, String> {
+    let what = kind.word();
+    if let Some((min, max, ros)) = int_range(ft) {
+        let v = token
+            .parse::<i128>()
+            .map_err(|_| format!("invalid integer {what}: {token}"))?;
+        if v < min || v > max {
+            return Err(format!("value {token} is out of range for {ros}"));
+        }
+        return Ok(DefaultLiteral::Int(v));
+    }
     match ft {
         // rosidl's value parser is case-insensitive for bool literals
         // ("True"/"False" Python-style appear in upstream .msg files).
         FieldType::Bool => match token.to_ascii_lowercase().as_str() {
-            "true" | "1" => Ok(Some(DefaultLiteral::Bool(true))),
-            "false" | "0" => Ok(Some(DefaultLiteral::Bool(false))),
-            _ => Err(invalid(format!("invalid bool default: {token}"))),
+            "true" | "1" => Ok(DefaultLiteral::Bool(true)),
+            "false" | "0" => Ok(DefaultLiteral::Bool(false)),
+            _ => Err(format!("invalid bool {what}: {token}")),
         },
-        FieldType::I8
-        | FieldType::U8
-        | FieldType::I16
-        | FieldType::U16
-        | FieldType::I32
-        | FieldType::U32
-        | FieldType::I64
-        | FieldType::U64 => token
-            .parse::<i128>()
-            .map(|v| Some(DefaultLiteral::Int(v)))
-            .map_err(|_| invalid(format!("invalid integer default: {token}"))),
         FieldType::F32 | FieldType::F64 => {
             let v = token
                 .parse::<f64>()
-                .map_err(|_| invalid(format!("invalid float default: {token}")))?;
+                .map_err(|_| format!("invalid float {what}: {token}"))?;
             // `f64::from_str` accepts "inf"/"NaN" (and saturates 1e999 to
             // inf) — but `{:?}` renders those as `inf`/`NaN`, which are
             // NOT valid Rust literals: the generated code would fail to
             // compile far from the .msg line. Reject here with the line
             // number instead.
             if !v.is_finite() {
-                return Err(invalid(format!(
-                    "non-finite float default: {token} (inf/NaN defaults are not supported)"
-                )));
+                return Err(format!(
+                    "non-finite float {what}: {token} (inf/NaN are not supported)"
+                ));
             }
-            Ok(Some(DefaultLiteral::Float(v)))
+            Ok(DefaultLiteral::Float(v))
         }
-        // Strings / arrays / nested: defaults unsupported, dropped.
-        _ => Ok(None),
+        FieldType::String => {
+            let s = parse_string_literal(token, kind)?;
+            if let Some(max) = bound {
+                if s.chars().count() > max {
+                    return Err(format!("string {what} is longer than its bound {max}"));
+                }
+            }
+            Ok(DefaultLiteral::Str(s))
+        }
+        FieldType::Nested { .. } => {
+            Err("default values are not supported on message-type fields".to_string())
+        }
+        _ => Err(format!("type {type_token} takes no {what} value")),
     }
+}
+
+/// A string value: `"..."` or `'...'` (with `\<quote>` and `\\`
+/// unescaped), or the bare text as written.
+fn parse_string_literal(token: &str, kind: ValueKind) -> Result<String, String> {
+    let Some(quote) = token.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return Ok(token.to_string());
+    };
+    let inner = token
+        .strip_prefix(quote)
+        .and_then(|t| t.strip_suffix(quote))
+        .filter(|_| token.len() >= 2)
+        .ok_or_else(|| format!("unterminated string {}: {token}", kind.word()))?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) if n == quote || n == '\\' => out.push(n),
+                Some(n) => {
+                    out.push(c);
+                    out.push(n);
+                }
+                None => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
@@ -587,7 +836,10 @@ uint32 commented # speed = 3
             schema.fields[1].default_literal,
             Some(DefaultLiteral::Float(0.0))
         );
-        assert!(schema.fields[1].default_literal.unwrap().is_zero());
+        assert!(schema.fields[1]
+            .default_literal
+            .as_ref()
+            .is_some_and(DefaultLiteral::is_zero));
         assert_eq!(
             schema.fields[2].default_literal,
             Some(DefaultLiteral::Int(-1))
@@ -644,15 +896,13 @@ uint32 commented # speed = 3
             Some(DefaultLiteral::Bool(false))
         );
 
-        // String/array defaults are unsupported and dropped (not errors).
-        let s = parse_rosmsg(
-            "string name hello
-",
-            "S",
-            None,
-        )
-        .unwrap();
-        assert_eq!(s.fields[0].default_literal, None);
+        // An unquoted string default is kept as written (rosidl reads it
+        // the same way).
+        let s = parse_rosmsg("string name hello\n", "S", None).unwrap();
+        assert_eq!(
+            s.fields[0].default_literal,
+            Some(DefaultLiteral::Str("hello".into()))
+        );
     }
 
     #[test]
@@ -685,5 +935,237 @@ geometry_msgs/Pose[] poses
             },
             _ => panic!("expected DynamicArray"),
         }
+    }
+}
+
+#[cfg(test)]
+mod constant_and_default_tests {
+    use super::*;
+    use crate::codegen::schema::ConstantDef;
+
+    fn one(text: &str) -> MessageSchema {
+        parse_rosmsg(text, "M", Some("p")).unwrap()
+    }
+
+    fn err(text: &str) -> String {
+        parse_rosmsg(text, "M", Some("p")).unwrap_err().to_string()
+    }
+
+    fn constant(name: &str, field_type: FieldType, value: DefaultLiteral) -> ConstantDef {
+        ConstantDef {
+            name: name.into(),
+            field_type,
+            value,
+        }
+    }
+
+    #[test]
+    fn constants_are_captured_in_declaration_order_and_are_not_fields() {
+        let s = one("uint8 PARAMETER_NOT_SET=0\n\
+             int32 SPACED = -7   # a comment\n\
+             float64 RATE=2.5\n\
+             bool ON=True\n\
+             byte RAW=255\n\
+             string MODE = \"AUTO # not a comment\"  # but this is\n\
+             string BARE=plain text\n\
+             uint64 BIG=18446744073709551615\n\
+             string name\n");
+        assert_eq!(s.fields.len(), 1);
+        assert_eq!(s.fields[0].name, "name");
+        assert_eq!(
+            s.constants,
+            vec![
+                constant("PARAMETER_NOT_SET", FieldType::U8, DefaultLiteral::Int(0)),
+                constant("SPACED", FieldType::I32, DefaultLiteral::Int(-7)),
+                constant("RATE", FieldType::F64, DefaultLiteral::Float(2.5)),
+                constant("ON", FieldType::Bool, DefaultLiteral::Bool(true)),
+                constant("RAW", FieldType::U8, DefaultLiteral::Int(255)),
+                constant(
+                    "MODE",
+                    FieldType::String,
+                    DefaultLiteral::Str("AUTO # not a comment".into())
+                ),
+                constant(
+                    "BARE",
+                    FieldType::String,
+                    DefaultLiteral::Str("plain text".into())
+                ),
+                constant(
+                    "BIG",
+                    FieldType::U64,
+                    DefaultLiteral::Int(18446744073709551615)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn constants_do_not_change_the_schema_hash() {
+        let with = one("uint8 A=1\nstring S=\"x\"\nint32 v\n");
+        let without = one("int32 v\n");
+        assert_eq!(with.schema_hash(), without.schema_hash());
+    }
+
+    #[test]
+    fn quoted_string_constants_unescape_their_quote_and_backslash() {
+        let s = one("string A='it\\'s'\nstring B=\"a\\\\b\"\nstring C=\"\"\n");
+        assert_eq!(s.constants[0].value, DefaultLiteral::Str("it's".into()));
+        assert_eq!(s.constants[1].value, DefaultLiteral::Str("a\\b".into()));
+        assert_eq!(s.constants[2].value, DefaultLiteral::Str(String::new()));
+    }
+
+    #[test]
+    fn bad_constants_are_errors_that_name_the_line() {
+        assert_eq!(
+            err("int32 a\nuint8 X=256\n"),
+            "line 2: value 256 is out of range for uint8"
+        );
+        assert_eq!(
+            err("int8 X=-129\n"),
+            "line 1: value -129 is out of range for int8"
+        );
+        assert_eq!(
+            err("uint8 X=-1\n"),
+            "line 1: value -1 is out of range for uint8"
+        );
+        assert_eq!(
+            err("uint8 X=one\n"),
+            "line 1: invalid integer constant: one"
+        );
+        assert_eq!(err("bool X=yes\n"), "line 1: invalid bool constant: yes");
+        assert_eq!(
+            err("float32 X=nan\n"),
+            "line 1: non-finite float constant: nan (inf/NaN are not supported)"
+        );
+        assert_eq!(err("uint8 X=\n"), "line 1: constant X has no value");
+        assert_eq!(
+            err("uint8 X=1\nuint8 X=2\n"),
+            "line 2: duplicate constant X"
+        );
+        assert_eq!(err("uint8 9X=1\n"), "line 1: invalid constant name: 9X");
+        assert_eq!(
+            err("uint8[] X=[1]\n"),
+            "line 1: constant X: type uint8[] is not a primitive type or a string"
+        );
+        assert_eq!(
+            err("geometry_msgs/Point X=1\n"),
+            "line 1: constant X: type geometry_msgs/Point is not a primitive type or a string"
+        );
+        assert_eq!(
+            err("string X=\"open\n"),
+            "line 1: unterminated string constant: \"open"
+        );
+    }
+
+    #[test]
+    fn string_defaults_are_kept_quoted_or_not() {
+        let s = one("string a \"hello world\"  # comment\n\
+             string b 'single'\n\
+             string<=5 c \"abcde\"\n\
+             string d \"\"\n");
+        let d: Vec<_> = s.fields.iter().map(|f| f.default_literal.clone()).collect();
+        assert_eq!(
+            d,
+            vec![
+                Some(DefaultLiteral::Str("hello world".into())),
+                Some(DefaultLiteral::Str("single".into())),
+                Some(DefaultLiteral::Str("abcde".into())),
+                Some(DefaultLiteral::Str(String::new())),
+            ]
+        );
+    }
+
+    #[test]
+    fn array_defaults_are_kept_element_by_element() {
+        let s = one("int32[] a [1, -2, 3]\n\
+             float64[3] b [1, 2.5, 0]\n\
+             bool[<=2] c [true, False]\n\
+             string[] d [\"x, y\", 'z', plain]\n\
+             uint8[] e []\n");
+        use DefaultLiteral::*;
+        let d: Vec<_> = s.fields.iter().map(|f| f.default_literal.clone()).collect();
+        assert_eq!(
+            d,
+            vec![
+                Some(Array(vec![Int(1), Int(-2), Int(3)])),
+                Some(Array(vec![Float(1.0), Float(2.5), Float(0.0)])),
+                Some(Array(vec![Bool(true), Bool(false)])),
+                Some(Array(vec![
+                    Str("x, y".into()),
+                    Str("z".into()),
+                    Str("plain".into())
+                ])),
+                Some(Array(vec![])),
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_do_not_change_the_schema_hash() {
+        let with = one("string a \"x\"\nint32[] b [1]\nfloat64 c 2\n");
+        let without = one("string a\nint32[] b\nfloat64 c\n");
+        assert_eq!(with.schema_hash(), without.schema_hash());
+    }
+
+    #[test]
+    fn a_zero_default_is_the_type_default_and_any_other_is_not() {
+        use DefaultLiteral::*;
+        assert!(Str(String::new()).is_zero());
+        assert!(!Str("a".into()).is_zero());
+        assert!(Array(vec![]).is_zero());
+        assert!(!Array(vec![Int(0)]).is_zero());
+    }
+
+    #[test]
+    fn bad_defaults_are_errors_that_name_the_line() {
+        assert_eq!(
+            err("int32[3] a [1, 2]\n"),
+            "line 1: array default has 2 elements, the type has 3"
+        );
+        assert_eq!(
+            err("int32[<=1] a [1, 2]\n"),
+            "line 1: array default has 2 elements, the bound is 1"
+        );
+        assert_eq!(
+            err("string<=2 a \"abc\"\n"),
+            "line 1: string default is longer than its bound 2"
+        );
+        assert_eq!(
+            err("string<=2[] a [\"abc\"]\n"),
+            "line 1: string default is longer than its bound 2"
+        );
+        assert_eq!(
+            err("int32[] a 1, 2\n"),
+            "line 1: array default must be written [a, b, ...]: 1, 2"
+        );
+        assert_eq!(
+            err("int32[] a [1, x]\n"),
+            "line 1: invalid integer default: x"
+        );
+        assert_eq!(err("int32[] a [1,]\n"), "line 1: invalid integer default: ");
+        assert_eq!(
+            err("uint8 a 300\n"),
+            "line 1: value 300 is out of range for uint8"
+        );
+        assert_eq!(
+            err("string a 'open\n"),
+            "line 1: unterminated string default: 'open"
+        );
+        assert_eq!(
+            err("p/Other a 1\n"),
+            "line 1: default values are not supported on message-type fields"
+        );
+        assert_eq!(
+            err("p/Other[] a []\n"),
+            "line 1: default values are not supported on message-type fields"
+        );
+    }
+
+    #[test]
+    fn two_parses_of_the_same_text_are_identical() {
+        let text = "uint8 A=1\nstring S=\"s\"\nint32[] v [1, 2]\nstring n \"x\"\n";
+        let a = one(text);
+        let b = one(text);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 }

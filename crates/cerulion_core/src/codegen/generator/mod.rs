@@ -42,7 +42,7 @@ pub(crate) use wire_impl::{
     in_repo_package, variable_schema_listed_tier, UNLISTED_SCHEMA_FALLBACK_BYTES,
 };
 
-use super::schema::{FieldType, MessageSchema};
+use super::schema::{FieldDef, FieldType, MessageSchema};
 
 /// Rust reserved keywords that need to be escaped with r# prefix.
 const RUST_KEYWORDS: &[&str] = &[
@@ -106,7 +106,7 @@ fn field_has_large_array(ft: &FieldType) -> bool {
 /// manual `Default` impl, so the parent can still `#[derive(Default)]` —
 /// deriving is preferred (clippy `derivable_impls` rejects a manual impl
 /// that derive could produce).
-fn has_direct_large_array(schema: &MessageSchema) -> bool {
+pub(super) fn has_direct_large_array(schema: &MessageSchema) -> bool {
     schema
         .fields
         .iter()
@@ -123,20 +123,23 @@ fn field_has_direct_large_array(ft: &FieldType) -> bool {
     }
 }
 
-/// True when any field carries a non-zero scalar default —
+/// True when any field carries a non-zero default:
 /// the generated `Default` impls must then be manual (derive would
-/// produce zeros). Zero-valued defaults (`float64 x 0`) keep the derive:
-/// a manual impl identical to the derive trips clippy `derivable_impls`.
+/// produce zeros). Zero-valued defaults (`float64 x 0`, `string s ""`) keep
+/// the derive: a manual impl identical to the derive trips clippy
+/// `derivable_impls`.
 fn has_nonzero_defaults(schema: &MessageSchema) -> bool {
-    schema
-        .fields
-        .iter()
-        .any(|f| f.default_literal.is_some_and(|d| !d.is_zero()))
+    schema.fields.iter().any(field_has_nonzero_default)
+}
+
+/// True when this one field carries a non-zero default.
+pub(super) fn field_has_nonzero_default(field: &FieldDef) -> bool {
+    field.default_literal.as_ref().is_some_and(|d| !d.is_zero())
 }
 
 /// True when the generated `Default` for this schema's data types must be
 /// a MANUAL impl: a direct `[T; N>32]` (no stdlib `Default` blanket past
-/// 32) or a non-zero scalar field default (derive would produce zeros).
+/// 32) or a non-zero field default (derive would produce zeros).
 fn needs_manual_default(schema: &MessageSchema) -> bool {
     has_direct_large_array(schema) || has_nonzero_defaults(schema)
 }

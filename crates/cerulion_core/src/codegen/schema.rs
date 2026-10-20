@@ -26,6 +26,22 @@ pub struct MessageSchema {
 
     /// Fields in declaration order
     pub fields: Vec<FieldDef>,
+
+    /// Constants in declaration order (`uint8 FOO=1`). They are not
+    /// fields: they never reach the wire and never feed `schema_hash`.
+    /// The generator exposes them as associated constants on the marker.
+    pub constants: Vec<ConstantDef>,
+}
+
+/// A constant declared in a message (`uint8 FOO=1`, `string NAME="x"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstantDef {
+    /// Constant name, as declared.
+    pub name: String,
+    /// Constant type: a primitive or `String`.
+    pub field_type: FieldType,
+    /// The validated value. Never `DefaultLiteral::Array`.
+    pub value: DefaultLiteral,
 }
 
 impl MessageSchema {
@@ -39,6 +55,7 @@ impl MessageSchema {
             package: None,
             description: None,
             fields: Vec::new(),
+            constants: Vec::new(),
         }
     }
 
@@ -53,6 +70,7 @@ impl MessageSchema {
             package: Some(package.into()),
             description: None,
             fields: Vec::new(),
+            constants: Vec::new(),
         }
     }
 
@@ -401,12 +419,11 @@ pub struct FieldDef {
     /// Optional description
     pub description: Option<String>,
 
-    /// Scalar default value from the .msg declaration (`float64 w 1`,
-    /// ROS2 IDL field defaults). Honored in the generated
-    /// `Default` impls so e.g. `QuaternionShm::default()` is the identity
-    /// quaternion (w=1), matching rosidl semantics. Only captured for
-    /// primitive numeric/bool field types — string/array defaults are
-    /// not supported and are dropped at parse time.
+    /// Default value from the .msg declaration (`float64 w 1`,
+    /// `string name "x"`, `int32[] ids [1, 2]`, ROS2 IDL field defaults).
+    /// Honored in the generated `Default` impls so e.g.
+    /// `QuaternionShm::default()` is the identity quaternion (w=1),
+    /// matching rosidl semantics. Message-type fields take no default.
     ///
     /// NOTE: defaults affect `Default` construction (snapshots,
     /// `<Name>Shm::default()` composition) only. `loan_proxy` still
@@ -415,15 +432,17 @@ pub struct FieldDef {
     pub default_literal: Option<DefaultLiteral>,
 }
 
-/// A validated scalar default value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A validated default (or constant) value.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DefaultLiteral {
     Bool(bool),
-    /// All integer field types; range errors surface as loud compile
-    /// errors in the generated code (literal out of range for the typed
-    /// field).
+    /// All integer field types; the parser checks the value fits the type.
     Int(i128),
     Float(f64),
+    /// A string value, unquoted and unescaped.
+    Str(String),
+    /// An array value: one scalar or `Str` element per array element.
+    Array(Vec<DefaultLiteral>),
 }
 
 impl DefaultLiteral {
@@ -435,26 +454,8 @@ impl DefaultLiteral {
             Self::Bool(b) => !*b,
             Self::Int(i) => *i == 0,
             Self::Float(f) => *f == 0.0,
-        }
-    }
-
-    /// Rust literal for a snapshot-typed field (`bool` stays `bool`).
-    pub fn snapshot_expr(&self) -> String {
-        match self {
-            Self::Bool(b) => b.to_string(),
-            Self::Int(i) => i.to_string(),
-            // `{:?}` keeps a decimal point (`1.0`, not `1`) so the
-            // literal is float-typed in the struct-init position.
-            Self::Float(f) => format!("{:?}", f),
-        }
-    }
-
-    /// Rust literal for an SHM-typed field (`bool` stored as `u8`).
-    pub fn shm_expr(&self) -> String {
-        match self {
-            Self::Bool(b) => if *b { "1u8" } else { "0u8" }.to_string(),
-            Self::Int(i) => i.to_string(),
-            Self::Float(f) => format!("{:?}", f),
+            Self::Str(s) => s.is_empty(),
+            Self::Array(items) => items.is_empty(),
         }
     }
 }
