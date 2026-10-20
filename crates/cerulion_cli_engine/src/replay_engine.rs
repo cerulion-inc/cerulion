@@ -8234,6 +8234,23 @@ fn apply_resume(
     // otherwise resume needing BOTH again and fire later than the trace it is
     // judged against. Empty for every bag without framework sections, where the call is a no-op.
     runtime.restore_sync_input_timestamps(&plan.sync_input_timestamps);
+    // A capture-time Sync node's high-water outlives its fired heads, so it
+    // rides its own table. Empty for every other node and every older bag.
+    let capture_high_water: BTreeMap<String, BTreeMap<String, u64>> = plan
+        .framework
+        .iter()
+        .filter(|(_, state)| !state.sync_capture_high_water.is_empty())
+        .map(|(node, state)| (node.clone(), state.sync_capture_high_water.clone()))
+        .collect();
+    runtime.restore_sync_capture_high_water(&capture_high_water);
+    // The epoch floor a capture clock restart set: what the restart's
+    // re-based inputs are tested against until one lands in band.
+    let epoch_floors: BTreeMap<String, u64> = plan
+        .framework
+        .iter()
+        .filter_map(|(node, state)| Some((node.clone(), state.sync_epoch_floor?)))
+        .collect();
+    runtime.restore_sync_epoch_floor(&epoch_floors);
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded
@@ -10191,6 +10208,10 @@ fn node_trigger_decl(
     // did nothing wrong. See `wired_trigger_input_names`.
     let trigger_inputs =
         cerulion_core::graph::runtime::wired_trigger_input_names(node_inputs, info.input_meta());
+    // A node that aligns on `header.stamp` is judged by no wire-stamp rule.
+    if info.sync_capture_stamps().is_some() {
+        return replay_rederive::TriggerDecl::SyncOnCaptureTime { trigger_inputs };
+    }
     match info.policy() {
         Some(MacroPolicy::Period { period_ms }) => replay_rederive::TriggerDecl::Period {
             interval_ns: period_ms.saturating_mul(1_000_000),
@@ -12545,6 +12566,12 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
+    // Where a re-executed node was STOPPED (fatal error or panic breaker),
+    // read after each step: no rule may predict its fires past that step,
+    // because the recording correctly holds none. The stop carries how many
+    // fires of the node the stopping step performed, so a recording that
+    // stopped at another fire of the same burst is still a finding.
+    let mut rederive_stops = replay_rederive::PassStops::none();
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
     // The fires the recording holds that a trace-driven pass did NOT perform,
@@ -12767,6 +12794,25 @@ fn run_rank_pass(
                 })?;
         }
         runtime.step(Duration::from_nanos(delta));
+        if !lockstep {
+            for decl in &verification.decls {
+                if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
+                {
+                    // The trace holds exactly this step's fires (it is
+                    // cleared below every step), the stopping fire included.
+                    let fires = runtime
+                        .trace()
+                        .iter()
+                        .filter(|e| *e.node_id == *decl.node_id)
+                        .count();
+                    rederive_stops.note(
+                        &decl.node_id,
+                        boundary.step,
+                        u32::try_from(fires).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+        }
         // The injection hook cannot return an error (its signature
         // is `Fn(&str, u32)`, and an unwind out of it would cross a node tick),
         // so a failed intra-step publish is LATCHED and read here — the
@@ -13377,6 +13423,7 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                 }),
+                &rederive_stops,
             );
             for sd in &report.stand_downs {
                 // The corrupt-recording stand-down
@@ -16487,6 +16534,67 @@ impl InjectionWindow {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod node_trigger_decl_tests {
+    use super::{node_trigger_decl, replay_rederive::TriggerDecl};
+    use cerulion_core::graph::config::InputDef;
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
+    use cerulion_core::scheduler::sync_stamp::HeaderStampLocation;
+
+    fn info(capture: bool) -> NodeInfo {
+        let meta = |name: &str| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: 4,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
+            .with_policy(MacroPolicy::Sync { window_ms: 10 });
+        if !capture {
+            return info;
+        }
+        let at = HeaderStampLocation::Fixed { offset: 0 };
+        info.with_sync_capture_stamps(
+            [("cam".to_string(), at), ("lidar".to_string(), at)]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn wired() -> Vec<InputDef> {
+        ["cam", "lidar"]
+            .into_iter()
+            .map(|n| InputDef {
+                name: n.to_string(),
+                source: format!("/{n}"),
+            })
+            .collect()
+    }
+
+    /// The same `sync_window_ms` node is judged by the wire-stamp Sync rule
+    /// on publish time, and declared capture-time (so the rule stands down)
+    /// once it aligns on `header.stamp`.
+    #[test]
+    fn a_capture_time_sync_node_is_declared_apart_from_a_publish_time_one() {
+        let both = vec!["cam".to_string(), "lidar".to_string()];
+        assert_eq!(
+            node_trigger_decl(&info(false), &wired(), None),
+            TriggerDecl::Sync {
+                window_ns: Some(10_000_000),
+                trigger_inputs: both.clone(),
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&info(true), &wired(), None),
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: both
+            }
+        );
     }
 }
 

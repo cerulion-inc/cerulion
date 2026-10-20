@@ -27,6 +27,7 @@
 //! INCLUDING the canonical leading slash, so the
 //! `{prefix}/{node}/{output}` body has 248 usable characters.
 
+pub mod accumulate;
 pub mod adaptive_sizer;
 pub mod bounded_view;
 pub mod bridge;
@@ -2477,6 +2478,11 @@ impl TransportManager {
         // hook-suppression section in `reg_channel.rs` and the invariant in
         // `state_carrier/hook.rs`.
         reg_channel::install_contained_panic_hook_suppressor();
+        // Raise the open-file soft limit before the iceoryx2 node exists:
+        // every port holds a file open, and a graph's start burst outgrows the
+        // usual 1024. Once per process (see `crate::fd_limit`).
+        #[cfg(unix)]
+        crate::fd_limit::raise_open_file_limit();
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
         // The node name is converted HERE, before `get_or_init`, and
         // not inside the closure. Two reasons:
@@ -2637,6 +2643,11 @@ impl TransportManager {
     ) -> TransportResult<Arc<Self>> {
         // Mirror of `init_singleton` — see the comment there.
         reg_channel::install_contained_panic_hook_suppressor();
+        // Raise the open-file soft limit before the iceoryx2 node exists:
+        // every port holds a file open, and a graph's start burst outgrows the
+        // usual 1024. Once per process (see `crate::fd_limit`).
+        #[cfg(unix)]
+        crate::fd_limit::raise_open_file_limit();
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
         crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 
@@ -2737,6 +2748,11 @@ impl TransportManager {
     ) -> TransportResult<Arc<Self>> {
         // Mirror of `init_singleton` — see the comment there.
         reg_channel::install_contained_panic_hook_suppressor();
+        // Raise the open-file soft limit before the iceoryx2 node exists:
+        // every port holds a file open, and a graph's start burst outgrows the
+        // usual 1024. Once per process (see `crate::fd_limit`).
+        #[cfg(unix)]
+        crate::fd_limit::raise_open_file_limit();
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
         crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 

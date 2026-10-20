@@ -33,6 +33,7 @@
 // `#[serial]` only protects against arbitrary interleaving; combining
 // is what protects against scheduling-induced reordering.
 
+use cerulion_core::error::NodeErrorKind;
 use cerulion_core::wire::MaxSliceLen;
 use serial_test::serial;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,9 +138,18 @@ fn cdylib_tick_lifecycle_codes_1_and_2() {
         "phase 1: tick error must include the rich NodeError message threaded \
          through cerulion_take_last_error; got:\n  {msg}"
     );
+    // The kind crosses typed, so the FFI wrapper's `tick failed: ` phase
+    // label is removed: the reason is the node's own `NodeError` text, the
+    // same text an in-process macro node reports.
+    assert_eq!(
+        err.node_error_kind(),
+        Some(NodeErrorKind::Logic),
+        "phase 1: the kind must cross the cdylib boundary typed; got {err:?}"
+    );
     assert!(
-        msg.contains("tick failed:"),
-        "phase 1: message must carry the cdylib's `tick failed:` prefix; got:\n  {msg}"
+        msg.contains("' error: Logic error: simulated failure") && !msg.contains("tick failed:"),
+        "phase 1: the reason must be the node's own message, without the \
+         `tick failed:` phase label; got:\n  {msg}"
     );
 
     // Second tick must produce a fresh rich error (consumption-then-
