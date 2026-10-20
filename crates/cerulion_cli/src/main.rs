@@ -106,34 +106,28 @@ fn main() -> ExitCode {
     // recorded or sent) without a key, without consent, for the internal
     // subprocess verbs, and on the run that prints the first-run notice.
     let command_run = telemetry::CommandRun::start(&matches);
-    // A registered verb family owns its own dispatch; every other verb is a
-    // `Commands` variant and takes the generic path.
-    let code = match families::find(families::FAMILIES, &matches) {
-        Some((family, sub)) => dispatch_family(family, sub, matches.get_flag("verbose")),
+    // A registered verb family owns its own dispatch, after the same logging
+    // setup, iceoryx2 bridge and login gate a `Commands` verb gets in
+    // [`dispatch`]; every other verb is a `Commands` variant and takes the
+    // generic path.
+    let verbose = matches.get_flag("verbose");
+    let family_code = families::route(
+        families::FAMILIES,
+        &matches,
+        |class| {
+            init_logging(verbose, class.is_quiet_default());
+            let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
+        },
+        login_gate,
+    );
+    let code = match family_code {
+        Some(code) => code,
         None => dispatch(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())),
     };
     if let Some(command_run) = command_run {
         command_run.finish(code);
     }
     code
-}
-
-/// The dispatch of a registered verb family: the same logging setup, iceoryx2
-/// bridge and login gate a `Commands` verb gets in [`dispatch`], then the
-/// family's own handler, whose exit code is the process's.
-fn dispatch_family(
-    family: &dyn families::VerbFamily,
-    matches: &clap::ArgMatches,
-    verbose: bool,
-) -> ExitCode {
-    init_logging(verbose, family.log_class(matches).is_quiet_default());
-    let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
-    if family.needs_identity(matches) {
-        if let Some(refused) = login_gate() {
-            return refused;
-        }
-    }
-    family.run(matches)
 }
 
 /// The first-need runtime login gate (see [`dispatch`] for the rules).

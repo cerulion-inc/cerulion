@@ -256,6 +256,29 @@ pub(crate) fn find<'a>(
         .map(|f| (*f, sub))
 }
 
+/// Run the registered family `matches` selected, the way `main` does: `setup`
+/// with the family's log class (logging and the iceoryx2 bridge), then `gate`
+/// when the family needs an identity, then the family's own handler.
+///
+/// `None` when the verb is a built-in `Commands` verb, with neither `setup` nor
+/// `gate` called. A gate that refuses returns its exit code and the family does
+/// not run.
+pub(crate) fn route(
+    families: &[&dyn VerbFamily],
+    matches: &ArgMatches,
+    setup: impl FnOnce(VerbLogClass),
+    gate: impl FnOnce() -> Option<ExitCode>,
+) -> Option<ExitCode> {
+    let (family, sub) = find(families, matches)?;
+    setup(family.log_class(sub));
+    if family.needs_identity(sub) {
+        if let Some(refused) = gate() {
+            return Some(refused);
+        }
+    }
+    Some(family.run(sub))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +523,83 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(&"gamma".to_string()));
+    }
+
+    /// What [`route`] did: the log class `setup` got, how often the gate ran,
+    /// and the exit code.
+    fn routed(
+        families: &[&dyn VerbFamily],
+        argv: &[&str],
+        refuse: Option<u8>,
+    ) -> (Option<VerbLogClass>, usize, Option<i64>) {
+        let matches = with(families).try_get_matches_from(argv).expect("parse");
+        let mut class = None;
+        let mut gate_runs = 0;
+        let code = route(
+            families,
+            &matches,
+            |c| class = Some(c),
+            || {
+                gate_runs += 1;
+                refuse.map(ExitCode::from)
+            },
+        );
+        (
+            class,
+            gate_runs,
+            code.map(crate::telemetry::exit_code_number),
+        )
+    }
+
+    #[test]
+    fn main_routes_a_registered_family_to_its_handler() {
+        let (class, gate_runs, code) =
+            routed(&[&DUMMY], &["cerulion", "dummy", "echo", "routed"], Some(7));
+        assert_eq!(class, Some(VerbLogClass::OneShot));
+        // The dummy needs no identity, so even a refusing gate is never asked.
+        assert_eq!(gate_runs, 0);
+        assert_eq!(code, Some(42));
+        assert!(DUMMY_RUNS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&"routed".to_string()));
+        let (class, _, code) = routed(&[&DUMMY], &["cerulion", "dummy", "wait"], None);
+        assert_eq!(class, Some(VerbLogClass::LongRunning));
+        assert_eq!(code, Some(43));
+    }
+
+    #[test]
+    fn main_runs_the_gate_before_a_family_that_needs_an_identity() {
+        let gated = Dummy {
+            gated: true,
+            ..dummy("dummy")
+        };
+        // The gate passes: the family runs.
+        let (class, gate_runs, code) = routed(&[&gated], &["cerulion", "dummy", "wait"], None);
+        assert_eq!(
+            (class, gate_runs, code),
+            (Some(VerbLogClass::LongRunning), 1, Some(43))
+        );
+        // The gate refuses: its code is the exit code and the family never runs.
+        let (class, gate_runs, code) = routed(
+            &[&gated],
+            &["cerulion", "dummy", "echo", "refused-word"],
+            Some(7),
+        );
+        assert_eq!(
+            (class, gate_runs, code),
+            (Some(VerbLogClass::OneShot), 1, Some(7))
+        );
+        assert!(!DUMMY_RUNS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&"refused-word".to_string()));
+    }
+
+    #[test]
+    fn main_leaves_a_built_in_verb_to_the_generic_dispatch() {
+        let (class, gate_runs, code) = routed(&[&DUMMY], &["cerulion", "graph", "list"], Some(7));
+        assert_eq!((class, gate_runs, code), (None, 0, None));
     }
 
     #[test]
