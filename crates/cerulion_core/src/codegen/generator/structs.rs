@@ -717,7 +717,9 @@ fn array_items_expr(items: &[ScalarLiteral], render: fn(&ScalarLiteral) -> Strin
 /// Rust expression for a default in a `<Name>Snapshot` field of type `ft`.
 ///
 /// A `string` becomes an owned `String`; a primitive or `string[N]` array
-/// becomes an array literal (`[String; N]` for `string[N]`), and a dynamic
+/// becomes an array literal (`[String; N]` for `string[N]`; the rest of
+/// a message with a `string[N]` field does not generate yet, with or
+/// without a default), and a dynamic
 /// primitive array a `Vec` literal. Only a `string[]` / `string[<=N]`
 /// snapshot field (a dynamic array of strings) holds the field's raw wire
 /// payload, so its default is the canonical encoding of the strings: a

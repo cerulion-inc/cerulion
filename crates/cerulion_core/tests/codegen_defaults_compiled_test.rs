@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, FrameWalker};
 use cerulion_core::testing::TestTransport;
+use cerulion_core::transport::publisher::CerulionPublisher;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 
 use codegen_fixture_msgs::codegen_fixture::{
@@ -57,6 +58,9 @@ fn a_fixed_snapshot_and_shm_default_hold_every_declared_default() {
     assert_eq!(d.gains, [0.5, -1.0]);
     assert_eq!(d.mask, [true, false]);
     assert_eq!(d.k, 7);
+    // `-0.0` compares equal to `0.0`, so read the sign bit.
+    assert_eq!(d.neg.map(f64::to_bits), [NEG_ZERO_F64; 2]);
+    assert_eq!(d.nz.to_bits(), NEG_ZERO_F32);
 
     // The SHM overlay stores `bool` as `u8`.
     let shm = DefaultsFixedShm::default();
@@ -64,7 +68,13 @@ fn a_fixed_snapshot_and_shm_default_hold_every_declared_default() {
     assert_eq!(shm.gains, [0.5, -1.0]);
     assert_eq!(shm.mask, [1u8, 0u8]);
     assert_eq!(shm.k, 7);
+    assert_eq!({ shm.neg }.map(f64::to_bits), [NEG_ZERO_F64; 2]);
+    assert_eq!({ shm.nz }.to_bits(), NEG_ZERO_F32);
 }
+
+/// The IEEE 754 bit patterns of `-0.0`: only the sign bit set.
+const NEG_ZERO_F64: u64 = 0x8000_0000_0000_0000;
+const NEG_ZERO_F32: u32 = 0x8000_0000;
 
 #[test]
 fn all_zero_defaults_equal_the_derived_default() {
@@ -93,28 +103,12 @@ fn two_default_snapshots_are_identical() {
 /// bytes read back as the two strings the `.msg` names.
 #[test]
 fn the_default_string_array_payload_decodes_through_the_frame_walker() {
-    let id = TOPIC_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let topic = format!("test/codegen/defaults_var/{id}");
-    let tt = TestTransport::with_buffer_size(4);
-    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(64 * 1024), 0);
-    let subscriber = tt.subscriber(&topic);
-    {
+    let frame = publish_default_frame(|publisher| {
         let mut proxy = publisher.loan_proxy::<DefaultsVar>().expect("loan_proxy");
         proxy
             .write_from_snapshot(&DefaultsVarSnapshot::default())
             .expect("write the default snapshot");
-    }
-    let mut frames: Vec<Vec<u8>> = Vec::new();
-    subscriber
-        .try_receive(|msg| {
-            let mut frame = vec![0u8; WireHeader::SIZE];
-            msg.header().write_to_buf(&mut frame);
-            frame.extend_from_slice(msg.payload());
-            frames.push(frame);
-        })
-        .expect("drain subscriber");
-    let frame = frames.pop().expect("one delivered frame");
-
+    });
     let schema = parse_rosmsg(DEFAULTS_VAR_MSG, "DefaultsVar", Some("codegen_fixture"))
         .expect("fixture parses");
     let (walker, warnings) = FrameWalker::new(vec![schema]);
@@ -132,4 +126,26 @@ fn the_default_string_array_payload_decodes_through_the_frame_walker() {
     assert_eq!(fv.field("s"), Some(&FrameValueKind::Str("hi")));
     assert_eq!(fv.field("bounded"), Some(&FrameValueKind::Str("bound")));
     assert_eq!(fv.field("plain"), Some(&FrameValueKind::U16(0)));
+}
+
+/// Publish once through `write` on a fresh topic and return the one
+/// delivered frame (header then payload).
+fn publish_default_frame(write: impl FnOnce(&mut CerulionPublisher)) -> Vec<u8> {
+    let id = TOPIC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let topic = format!("test/codegen/defaults/{id}");
+    let tt = TestTransport::with_buffer_size(4);
+    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(64 * 1024), 0);
+    let subscriber = tt.subscriber(&topic);
+    write(&mut publisher);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    subscriber
+        .try_receive(|msg| {
+            let mut frame = vec![0u8; WireHeader::SIZE];
+            msg.header().write_to_buf(&mut frame);
+            frame.extend_from_slice(msg.payload());
+            frames.push(frame);
+        })
+        .expect("drain subscriber");
+    assert_eq!(frames.len(), 1, "exactly one frame is delivered");
+    frames.pop().expect("one delivered frame")
 }

@@ -8,6 +8,12 @@
 #            -f crates/cerulion_core/src/codegen/rossrv_parser.rs -- --lib
 # Result:  161 mutants: 54 caught, 107 unviable (do not compile), 0 missed.
 #
+# Literal-syntax rework, re-run on the changed lines only (--in-diff, with
+# -f crates/cerulion_core/src/codegen/schema.rs added): 72 mutants, 30 caught,
+# 41 unviable, 1 missed (the array arm of holds_strings), which the string
+# array case in a_hash_in_bare_string_text_starts_a_comment_only_after_whitespace
+# now kills.
+#
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.

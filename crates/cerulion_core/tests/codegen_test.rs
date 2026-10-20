@@ -2248,9 +2248,44 @@ fn string_and_array_defaults_reach_the_variable_snapshot_default() {
         "snapshot default missing:\n{code}"
     );
     // `gains` is a fixed-section field with a non-zero default, so the
-    // overlay gets a manual impl too, with the SHM literal.
-    assert!(code.contains("impl Default for DefaultsFixedSection {"));
-    assert!(code.contains("            gains: [1.0, 0.5],\n            plain: 0,\n"));
+    // overlay gets a manual impl too, with the SHM literal. Read the body
+    // of THAT impl: the same lines also occur in the snapshot block.
+    assert_eq!(
+        impl_body(&code, "impl Default for DefaultsFixedSection {"),
+        "    fn default() -> Self {\n\
+        \x20       Self {\n\
+        \x20           gains: [1.0, 0.5],\n\
+        \x20           plain: 0,\n\
+        \x20       }\n\
+        \x20   }\n"
+    );
+}
+
+/// The body of the impl block that opens with `header`, up to its closing
+/// `}` at column 0.
+fn impl_body<'a>(code: &'a str, header: &str) -> &'a str {
+    let start = code
+        .find(header)
+        .unwrap_or_else(|| panic!("`{header}` missing:\n{code}"))
+        + header.len()
+        + 1;
+    let len = code[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("`{header}` never closes:\n{code}"))
+        + 1;
+    &code[start..start + len]
+}
+
+/// The `#[derive(...)]` attribute directly above the declaration `decl`.
+fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
+    let at = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` missing:\n{code}"));
+    let open = code[..at]
+        .rfind("#[derive(")
+        .unwrap_or_else(|| panic!("no derive above `{decl}`"));
+    let close = open + code[open..].find(")]").expect("derive closes") + 2;
+    &code[open..close]
 }
 
 #[test]
@@ -2291,6 +2326,10 @@ fn a_fixed_bool_array_default_uses_u8_in_shm_and_bool_in_the_snapshot() {
 fn empty_string_and_array_defaults_keep_the_derive() {
     let code = generate_from_msg("string name \"\"\nint32[] ids []\n", "Empty");
     assert!(!code.contains("impl Default for EmptySnapshot"));
+    assert!(
+        derive_above(&code, "pub struct EmptySnapshot {").contains("Default"),
+        "{code}"
+    );
 }
 
 /// A fixed array default of all zeros equals the derive too (the derive
@@ -2304,8 +2343,30 @@ fn an_all_zero_fixed_array_default_keeps_the_derive() {
     );
     assert!(!code.contains("impl Default for ZeroSnapshot"), "{code}");
     assert!(!code.contains("impl Default for ZeroShm"), "{code}");
+    for decl in ["pub struct ZeroSnapshot {", "pub struct ZeroShm {"] {
+        assert!(
+            derive_above(&code, decl).contains("Default"),
+            "{decl}:\n{code}"
+        );
+    }
     let code = generate_from_msg("int32[3] a [0, 0, 1]\n", "One");
     assert!(code.contains("impl Default for OneSnapshot"), "{code}");
+}
+
+/// `-0.0` is not the derived `+0.0`: a negative-zero default, scalar or
+/// in a fixed array, gets a manual impl that writes `-0.0`.
+#[test]
+fn a_negative_zero_default_is_not_the_derived_zero() {
+    let code = generate_from_msg("float64[2] g [-0.0, -0.0]\nfloat32 h -0.0\n", "NegZero");
+    assert!(code.contains("impl Default for NegZeroSnapshot"), "{code}");
+    assert!(
+        impl_body(&code, "impl Default for NegZeroShm {").contains("g: [-0.0, -0.0],\n"),
+        "{code}"
+    );
+    assert!(
+        impl_body(&code, "impl Default for NegZeroShm {").contains("h: -0.0,\n"),
+        "{code}"
+    );
 }
 
 /// Generating twice from the same text is byte-identical.
