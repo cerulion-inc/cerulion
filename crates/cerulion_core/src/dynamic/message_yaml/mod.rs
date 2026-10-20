@@ -27,6 +27,8 @@
 //! - An array cut short for display ends with `!truncated <n>` (the number
 //!   of elements left out). Input that carries the tag is refused.
 //! - Anchors, aliases and tags (other than the refusal above) are refused.
+//! - Output is capped at [`MAX_YAML_BYTES`]; a message whose YAML form is
+//!   longer is refused at the field being written.
 //!
 //! Every input error names the full field path (`pose.position.x`,
 //! `poses[2].position.x`, `(message)` for the root) and the expected type
@@ -51,6 +53,13 @@ pub const YAML_TRUNCATED_TAG: &str = "!truncated";
 /// refuses. Real ROS 2 types nest well under 10 levels; the bound keeps a
 /// self-referencing schema from recursing without end.
 pub const MAX_YAML_DEPTH: usize = 64;
+
+/// The most YAML [`message_to_yaml`] writes for one frame before it
+/// refuses (256 MiB). An unset nested field expands to its schema's zero
+/// values, so a few bytes of frame can name far more output than any
+/// terminal or file wants; the cap turns that into an error before the
+/// output fills memory.
+pub const MAX_YAML_BYTES: usize = 256 << 20;
 
 /// The display form of a field path: `(message)` for the root.
 fn shown(path: &str) -> String {

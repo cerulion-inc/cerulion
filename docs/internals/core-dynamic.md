@@ -222,8 +222,10 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
   of `x as f32` whose shortest form reads back to the parsed `f64` (two `f32` values
   round twice under a plain cast; bit pattern `363742205` is pinned).
-- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `string_fixed[n]` and fixed
-  array lengths are enforced; ROS `<=N` bounds are dropped by the `.msg` parser, so
+- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `MAX_YAML_BYTES` (256 MiB) on
+  encoder output, because an unset nested field expands to its schema's zero values and a
+  40-byte frame can name gigabytes (a zero-default fixed array is counted, never built);
+  `string_fixed[n]` and fixed array lengths are enforced; ROS `<=N` bounds are dropped by the `.msg` parser, so
   those fields read as unbounded.
 - Neither direction is a publish path (both allocate); the module is outside the
   hot-path allocation sweep.
@@ -233,7 +235,7 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 | input bytes / parse / anchor | `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
 | value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
-| encode | `YamlUnencodable` (plus `Walk` for a frame the walker refuses) |
+| encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 
 Tests use independent producers only: hand-written frames, and hand-written CDR bodies
 turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_round_trips_byte_exact`

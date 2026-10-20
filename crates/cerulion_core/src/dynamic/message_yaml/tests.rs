@@ -7,7 +7,7 @@
 //! test expects is written out by hand.
 
 use super::decode::f32_from_f64;
-use super::encode::{format_f32, format_f64, key, quote};
+use super::encode::{format_f32, format_f64, key, message_to_yaml_capped, quote};
 use super::scan::find_anchor_or_alias;
 use super::*;
 use crate::codegen::{
@@ -410,6 +410,85 @@ fn zero_default_of_an_unsupported_array_is_refused() {
         ),
         "inner.m: field type uint8[][2] has no YAML form"
     );
+}
+
+/// Schemas whose unset nested field expands to far more YAML than the
+/// frame holds: 2^31 zero-default leaves (two nested fixed arrays, a 2 GiB
+/// fixed section, under the 4 GiB wire bound) and 2^20 zero bytes, each
+/// behind one empty table entry.
+const HUGE_ZERO_YAML: &str = "schemas:\n  Leaf:\n    fields:\n      uint8 v: {}\n  Row:\n    fields:\n      Leaf[65536] leaves: {}\n  Inner:\n    fields:\n      string s: {}\n      Row[32768] rows: {}\n  Raw:\n    fields:\n      string s: {}\n      uint8[1048576] raw: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n  WrapRaw:\n    fields:\n      Raw inner: {}\n";
+
+/// A frame that leaves its one variable nested field unset.
+fn unset_nested_frame(set: &SchemaSet, name: &str) -> Vec<u8> {
+    // fixed 0; table: inner #0 at [0, 8), empty.
+    let mut frame = header(set.schema_hash(name).unwrap(), 40, 32, 1);
+    frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+    frame
+}
+
+/// A schema-sized zero default is shown lazily: truncation keeps the
+/// output small without first building a list of every element.
+#[test]
+fn huge_zero_default_arrays_truncate_without_materialising() {
+    let set = set_from_yaml(HUGE_ZERO_YAML);
+    let options = YamlEncodeOptions {
+        truncate_arrays: Some(2),
+    };
+    assert_eq!(
+        message_to_yaml_with(set.walker(), &unset_nested_frame(&set, "Wrap"), options).unwrap(),
+        "inner:\n  s: \"\"\n  rows:\n    - leaves:\n        - v: 0\n        - v: 0\n        - !truncated 65534\n    - leaves:\n        - v: 0\n        - v: 0\n        - !truncated 65534\n    - !truncated 32766\n"
+    );
+    assert_eq!(
+        message_to_yaml_with(set.walker(), &unset_nested_frame(&set, "WrapRaw"), options).unwrap(),
+        "inner:\n  s: \"\"\n  raw: [0, 0, !truncated 1048574]\n"
+    );
+}
+
+/// Output past the cap is refused at the field being written: block lines
+/// are counted as written, flow items as they are rendered.
+#[test]
+fn output_past_the_cap_is_refused_at_the_field_being_written() {
+    let set = set_from_yaml(HUGE_ZERO_YAML);
+    let none = YamlEncodeOptions::default();
+    // "inner:\n" (7) + "  s: \"\"\n" (9) + "  rows:\n" (8) +
+    // "    - leaves:\n" (14) = 38, then 15 bytes per "        - v: 0\n":
+    // leaves[0] ends at 53, leaves[1] at 68.
+    let err = message_to_yaml_capped(set.walker(), &unset_nested_frame(&set, "Wrap"), none, 60)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "inner.rows[0].leaves[1].v: the YAML form passes the 60-byte output cap"
+    );
+    assert!(matches!(
+        err,
+        DynamicError::YamlOutputTooLarge { max_bytes: 60, .. }
+    ));
+    // At exactly 53 bytes leaves[0] still fits.
+    let err = message_to_yaml_capped(set.walker(), &unset_nested_frame(&set, "Wrap"), none, 53)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "inner.rows[0].leaves[1].v: the YAML form passes the 53-byte output cap"
+    );
+    let err = message_to_yaml_capped(set.walker(), &unset_nested_frame(&set, "WrapRaw"), none, 64)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "inner.raw: the YAML form passes the 64-byte output cap"
+    );
+    // A message that fits is unchanged by the cap.
+    let probe = set_from_yaml(PROBE_YAML);
+    let frame = probe_frame(probe.schema_hash("Probe").unwrap());
+    assert_eq!(
+        message_to_yaml_capped(probe.walker(), &frame, none, PROBE_TEXT.len()).unwrap(),
+        PROBE_TEXT
+    );
+    assert!(message_to_yaml_capped(probe.walker(), &frame, none, PROBE_TEXT.len() - 1).is_err());
+}
+
+#[test]
+fn the_output_cap_is_256_mib() {
+    assert_eq!(MAX_YAML_BYTES, 268_435_456);
 }
 
 #[test]

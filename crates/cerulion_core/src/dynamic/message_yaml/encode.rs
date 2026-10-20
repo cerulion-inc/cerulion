@@ -3,7 +3,9 @@
 
 use std::fmt::Write as _;
 
-use super::{push_field, push_index, shown, type_name, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG};
+use super::{
+    push_field, push_index, shown, type_name, MAX_YAML_BYTES, MAX_YAML_DEPTH, YAML_TRUNCATED_TAG,
+};
 use crate::codegen::{FieldType, FrameValue, FrameValueKind, FrameWalker, MessageSchema, PrimType};
 use crate::dynamic::DynamicError;
 
@@ -35,6 +37,8 @@ pub struct YamlEncodeOptions {
 ///   `string_fixed[n]` outside a fixed array).
 /// - [`DynamicError::YamlTooDeep`]: the schema nests deeper than
 ///   [`super::MAX_YAML_DEPTH`].
+/// - [`DynamicError::YamlOutputTooLarge`]: the YAML would be longer than
+///   [`super::MAX_YAML_BYTES`].
 pub fn message_to_yaml(walker: &FrameWalker, frame: &[u8]) -> Result<String, DynamicError> {
     message_to_yaml_with(walker, frame, YamlEncodeOptions::default())
 }
@@ -51,11 +55,23 @@ pub fn message_to_yaml_with(
     frame: &[u8],
     options: YamlEncodeOptions,
 ) -> Result<String, DynamicError> {
+    message_to_yaml_capped(walker, frame, options, MAX_YAML_BYTES)
+}
+
+/// [`message_to_yaml_with`] with the output cap as a parameter, so tests
+/// can reach it with small messages.
+pub(super) fn message_to_yaml_capped(
+    walker: &FrameWalker,
+    frame: &[u8],
+    options: YamlEncodeOptions,
+    max_bytes: usize,
+) -> Result<String, DynamicError> {
     let value = walker.walk_by_hash(frame)?;
     let schema = schema_of(walker, &value.schema_name, "")?;
     let mut emitter = Emitter {
         walker,
         options,
+        max_bytes,
         out: String::new(),
         path: String::new(),
     };
@@ -83,6 +99,8 @@ fn schema_of<'w>(
 struct Emitter<'w> {
     walker: &'w FrameWalker,
     options: YamlEncodeOptions,
+    /// The longest output allowed, in bytes.
+    max_bytes: usize,
     out: String,
     /// The field path of the value being emitted (for error text).
     path: String,
@@ -94,6 +112,17 @@ impl<'w> Emitter<'w> {
             path: shown(&self.path),
             detail: detail.into(),
         }
+    }
+
+    /// Refuse once `extra` more bytes would take the output past the cap.
+    fn fits(&self, extra: usize) -> Result<(), DynamicError> {
+        if self.out.len().saturating_add(extra) > self.max_bytes {
+            return Err(DynamicError::YamlOutputTooLarge {
+                path: shown(&self.path),
+                max_bytes: self.max_bytes,
+            });
+        }
+        Ok(())
     }
 
     fn unsupported(&self, ft: &FieldType) -> DynamicError {
@@ -183,6 +212,7 @@ impl<'w> Emitter<'w> {
             }
             _ => {
                 let inline = self.inline(ft, kind)?;
+                self.fits(inline.len() + 2)?;
                 let _ = writeln!(self.out, " {inline}");
                 Ok(())
             }
@@ -227,43 +257,50 @@ impl<'w> Emitter<'w> {
             return Err(self.unsupported(ft));
         };
         let target = self.nested_schema(schema_name, package, parent)?;
-        let elements: Vec<Option<&FrameValue<'_>>> = match (kind, ft) {
-            (None, FieldType::FixedArray { length, .. }) => vec![None; *length],
-            (None, _) => Vec::new(),
+        // A zero-default fixed array is counted, never built: its length
+        // comes from the schema, not from the frame.
+        let (len, elements): (usize, Vec<&FrameValue<'_>>) = match (kind, ft) {
+            (None, FieldType::FixedArray { length, .. }) => (*length, Vec::new()),
+            (None, _) => (0, Vec::new()),
             (Some(FrameValueKind::Array(elems)), _)
             | (
                 Some(FrameValueKind::NestedArray {
                     elements: elems, ..
                 }),
                 _,
-            ) => elems
-                .iter()
-                .map(|e| match e {
-                    FrameValueKind::Nested(v) => Ok(Some(v.as_ref())),
-                    _ => Err(self.unencodable("array element is not a message")),
-                })
-                .collect::<Result<_, _>>()?,
+            ) => {
+                let values = elems
+                    .iter()
+                    .map(|e| match e {
+                        FrameValueKind::Nested(v) => Ok(v.as_ref()),
+                        _ => Err(self.unencodable("array element is not a message")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (values.len(), values)
+            }
             (Some(FrameValueKind::NestedArrayOpaque(_)), _) => {
                 return Err(self.unencodable("array bytes are not in the canonical element framing"))
             }
             (Some(_), _) => return Err(self.unencodable("decoded value is not an array")),
         };
-        if elements.is_empty() {
+        if len == 0 {
             self.out.push_str(" []\n");
             return Ok(());
         }
         self.out.push('\n');
-        let shown_count = self.shown_count(elements.len());
-        for (i, elem) in elements.iter().take(shown_count).enumerate() {
+        let shown_count = self.shown_count(len);
+        for i in 0..shown_count {
+            let elem = elements.get(i).copied();
             let mark = self.path.len();
             push_index(&mut self.path, i);
             if target.fields.is_empty() {
+                self.fits(indent + 5)?;
                 let _ = writeln!(self.out, "{:w$}- {{}}", "", w = indent + 2);
             } else {
                 // Render the element at indent + 4, then turn its first
                 // line's indent into `- ` at indent + 2.
                 let start = self.out.len();
-                self.mapping(target, *elem, indent + 4, depth + 1)?;
+                self.mapping(target, elem, indent + 4, depth + 1)?;
                 self.out.replace_range(
                     start..start + indent + 4,
                     &format!("{:w$}- ", "", w = indent + 2),
@@ -271,12 +308,12 @@ impl<'w> Emitter<'w> {
             }
             self.path.truncate(mark);
         }
-        if shown_count < elements.len() {
+        if shown_count < len {
             let _ = writeln!(
                 self.out,
                 "{:w$}- {YAML_TRUNCATED_TAG} {}",
                 "",
-                elements.len() - shown_count,
+                len - shown_count,
                 w = indent + 2
             );
         }
@@ -294,9 +331,14 @@ impl<'w> Emitter<'w> {
     ) -> Result<String, DynamicError> {
         let len = items.len();
         let shown_count = self.shown_count(len);
-        let mut parts = Vec::with_capacity(shown_count + 1);
+        // `[`, `]` and each `, ` count toward the cap with the items.
+        let mut parts = Vec::new();
+        let mut used = 2;
         for item in items.take(shown_count) {
-            parts.push(item?);
+            let item = item?;
+            used += item.len() + if parts.is_empty() { 0 } else { 2 };
+            self.fits(used)?;
+            parts.push(item);
         }
         if shown_count < len {
             parts.push(format!("{YAML_TRUNCATED_TAG} {}", len - shown_count));

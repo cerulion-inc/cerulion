@@ -471,6 +471,16 @@ pub enum DynamicError {
         path: String,
     },
 
+    /// The YAML form of a frame is longer than the encoder's output cap
+    /// ([`crate::dynamic::MAX_YAML_BYTES`]).
+    #[error("{path}: the YAML form passes the {max_bytes}-byte output cap")]
+    YamlOutputTooLarge {
+        /// The field path being written when the cap was passed.
+        path: String,
+        /// The cap, in bytes.
+        max_bytes: usize,
+    },
+
     /// A frame value has no YAML form.
     #[error("{path}: {detail}; the frame has no YAML form")]
     YamlUnencodable {
