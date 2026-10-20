@@ -8,6 +8,7 @@ that delegate to the native objects and add iteration / context-manager
 import numbers
 import threading
 import weakref
+from typing import Any, TypeVar, overload
 
 import numpy as np
 
@@ -31,8 +32,13 @@ from cerulion._typed import (
     _dynamic_descriptor,
     _fill_message,
     _plan_message,
+    _schema_arg,
+    _view,
+    _view_arguments,
     _wire_length,
 )
+
+M = TypeVar("M", bound=Message)
 
 _DEFAULT_NODE_NAME = "cerulion_py"
 DEFAULT_MAX_PAYLOAD_LEN = 1 << 20
@@ -63,26 +69,30 @@ class Session:
 
     def publisher(self, topic, schema_hash=None, *, schema=None, schemas=None,
                   max_payload_len=DEFAULT_MAX_PAYLOAD_LEN):
-        """Create a publisher on ``topic`` (str) with wire ``schema_hash``
-        (int). ``max_payload_len`` bounds every frame's body bytes."""
+        """Create a publisher on ``topic`` (str): typed with ``schema=`` (a
+        message class, or a schema name with ``schemas=``), or raw with a wire
+        ``schema_hash`` (int). ``max_payload_len`` bounds every frame's body
+        bytes."""
         if (schema_hash is None) == (schema is None):
             raise TypeError("exactly one of schema_hash or schema is required")
-        if schema is not None and schemas is None:
-            raise TypeError("typed publisher requires schemas")
         if schemas is not None and schema is None:
             raise TypeError("schemas requires schema")
         if schema is not None:
+            schemas, schema = _schema_arg(schema, schemas, "publisher()")
             schema_hash = schemas.schema_hash(schema)
         return Publisher(_native.Publisher(topic, schema_hash, max_payload_len),
                          schemas=schemas, schema=schema)
 
     def subscriber(self, topic, depth=1, *, schema=None, schemas=None):
         """Create a subscriber on ``topic`` (str) with queue ``depth``
-        (1..=16 - the core rejects anything else)."""
+        (1..=16 - the core rejects anything else), typed with ``schema=`` (a
+        message class, or a schema name with ``schemas=``)."""
         if depth is None:
             raise TypeError("depth must be an int, not None")
-        if (schema is None) != (schemas is None):
-            raise TypeError("schema and schemas must be provided together")
+        if schemas is not None and schema is None:
+            raise TypeError("schemas requires schema")
+        if schema is not None:
+            schemas, schema = _schema_arg(schema, schemas, "subscriber()")
         return Subscriber(_native.Subscriber(topic, depth), schemas=schemas, schema=schema)
 
     def __enter__(self):
@@ -230,7 +240,7 @@ class Publisher:
         for field, entry in zip(layout.variable_fields, entries):
             offset, byte_len = entry
             descriptors[field.name] = _dynamic_descriptor(field.field_type, offset, byte_len)
-        message = Message(memoryview(native), layout, self._schemas, descriptors, loan)
+        message = _view(memoryview(native), layout, self._schemas, descriptors, loan)
         return loan, message
 
     def publish_frame(self, frame_bytes, timestamp_ns=None):
@@ -466,14 +476,23 @@ class Frame:
                 message._detach()
         self._native.release()
 
-    def view(self, schemas=None, schema=None):
-        from cerulion._typed import Message
-        if schemas is None and schema is None:
+    @overload
+    def view(self, schema: "type[M]") -> "M": ...
+    @overload
+    def view(self, schema: "str | None" = None, *, schemas: "SchemaSet | None" = None) -> Any: ...
+    def view(self, schema=None, *extra, schemas=None):
+        """The typed view of this frame: as the subscriber's ``schema=``
+        when called bare, else as ``schema`` (a message class, or a schema
+        name with ``schemas=``)."""
+        _view_arguments(extra, "view()")
+        if schema is None:
+            if schemas is not None:
+                raise TypeError("schemas requires schema")
             if self._typed is None:
                 raise ValueError("frame has no typed schema binding")
             schemas, schema = self._typed
-        elif schemas is None or schema is None:
-            raise TypeError("schemas and schema must be provided together")
+        else:
+            schemas, schema = _schema_arg(schema, schemas, "view()")
         self._check_alive()
         key = (id(schemas), schemas._generation, schema)
         ref = self._messages.get(key)
@@ -482,7 +501,7 @@ class Frame:
             return cached
         descriptor = schemas._native.resolve_frame(self._native, schema)
         layout = schemas.layout(descriptor["schema"])
-        message = Message(
+        message = _view(
             self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
         )
         # Weak: a strong cache would cycle with ``Message._owner`` and pin

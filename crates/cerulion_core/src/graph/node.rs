@@ -19,6 +19,9 @@
 //! (`nodes/<type>/`), resolved at graph-load time, never carried by
 //! the node itself or its FFI export.
 
+use crate::scheduler::sync_stamp::{
+    capture_stamp_ns, HeaderStampLocation, StampDecodeError, SyncFrameSlot,
+};
 use crate::scheduler::{
     BackpressureEvent, ExpectWithinEvent, LivelinessEvent, PromiseWithinEvent, QosEventStore,
     SyncAlignSite, SyncHeadOp, SyncOpAnswer,
@@ -38,7 +41,7 @@ use crate::clock::Clock;
 // avoid a non-test "unused import" lint.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::clock::RealClock;
-use crate::error::{TransportError, TransportResult};
+use crate::error::{NodeErrorKind, TransportError, TransportResult};
 use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
@@ -439,6 +442,13 @@ pub struct NodeInfo {
     /// runtime consumes it through `NodeInfo::throttle_ms` to install the
     /// pre-fire time-gate.
     pub(crate) throttle_ms: Option<u64>,
+    /// Capture-time Sync matching: when `Some`, this Sync node aligns its
+    /// trigger inputs on each message's `header.stamp` instead of publish
+    /// time, and the map gives every trigger input's resolved stamp location,
+    /// keyed by input name. `None` keeps publish-time matching. Set through
+    /// [`Self::with_sync_capture_stamps`]; the graph build refuses a node whose
+    /// map misses a trigger input.
+    pub(crate) sync_capture: Option<IndexMap<String, HeaderStampLocation>>,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -633,6 +643,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -671,6 +682,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -714,6 +726,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -723,6 +736,31 @@ impl NodeInfo {
     pub fn with_policy(mut self, policy: MacroPolicy) -> Self {
         self.policy = Some(policy);
         self
+    }
+
+    /// Builder that switches a Sync node to capture-time matching: its
+    /// trigger inputs align on `header.stamp` (the time the data was
+    /// captured) instead of publish time. `locations` names every trigger
+    /// input with its stamp location, as
+    /// [`crate::graph::validation::resolve_capture_sync_stamps`] resolves them
+    /// from the schemas.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn with_sync_capture_stamps(
+        mut self,
+        locations: IndexMap<String, HeaderStampLocation>,
+    ) -> Self {
+        self.sync_capture = Some(locations);
+        self
+    }
+
+    /// The capture-time stamp locations, when this node matches its Sync
+    /// trigger on `header.stamp`. See [`Self::with_sync_capture_stamps`].
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
+        self.sync_capture.as_ref()
     }
 
     /// Builder that attaches a per-node
@@ -1429,6 +1467,14 @@ impl AnySubscriber {
         }
     }
 
+    /// The bytes of the frame a per-set Sync slot holds. See
+    /// `CerulionSubscriber::sync_frame`.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match self {
+            Self::Ipc(s) => s.sync_frame(slot),
+        }
+    }
+
     /// `Void`: serve a RESTORED (stamp-only, unbacked) head's read as
     /// "no frame", in place and WITHOUT draining. See
     /// `CerulionSubscriber::sync_void_head`.
@@ -2065,6 +2111,27 @@ impl NodeContext {
                 SyncOpAnswer::Nothing
             }
         }
+    }
+
+    /// Decode the capture stamp (`header.stamp`) of the frame a per-set Sync
+    /// slot of `input_name` holds, at `location`.
+    ///
+    /// The frame-access half of capture-time Sync matching: the align driver
+    /// performs a head op through [`Self::sync_head_op`], then reads the stamp
+    /// of the frame that op placed. A pure read of a frame already held: no
+    /// pop, no accounting. `None` for an unknown input or an empty slot, which
+    /// the driver reports as a failed op.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamp(
+        &self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        let frame = self.subscribers.get(input_name)?.sync_frame(slot)?;
+        Some(capture_stamp_ns(frame, location))
     }
 
     /// Take the edge-triggered [`BackpressureEvent`] for
@@ -3231,6 +3298,31 @@ pub trait NodeEntry: Send {
         false
     }
 
+    /// Decode the capture stamp of the frame a per-set Sync slot holds, for a
+    /// node that matches its Sync trigger on `header.stamp`. See
+    /// [`NodeContext::sync_capture_stamp`].
+    ///
+    /// Default `None`: an entry that does not declare
+    /// [`Self::supports_sync_capture_stamps`] is refused capture-time matching
+    /// at graph build, so this default is never asked.
+    #[doc(hidden)]
+    fn sync_capture_stamp(
+        &mut self,
+        _input_name: &str,
+        _slot: SyncFrameSlot,
+        _location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        None
+    }
+
+    /// Does [`Self::sync_capture_stamp`] really read the node's frames? Read
+    /// once at graph build: a node that opts in to capture-time matching
+    /// without it is refused with an error naming the node.
+    #[doc(hidden)]
+    fn supports_sync_capture_stamps(&self) -> bool {
+        false
+    }
+
     /// Does [`Self::snapshot_inputs`] REALLY freeze this
     /// node's non-trigger (latest-value) inputs, vs being the no-op default?
     ///
@@ -3547,6 +3639,23 @@ impl NodeEntry for ClosureNodeEntry {
     fn supports_sync_head_ops(&self) -> bool {
         self.unified_drain
     }
+
+    fn sync_capture_stamp(
+        &mut self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        self.context
+            .as_ref()?
+            .sync_capture_stamp(input_name, slot, location)
+    }
+
+    // The same condition as the head ops: the stamp is read off the slot the
+    // head ops fill, so one capability without the other cannot happen.
+    fn supports_sync_capture_stamps(&self) -> bool {
+        self.unified_drain
+    }
 }
 
 /// cdylib-loaded node for production use.
@@ -3622,6 +3731,12 @@ pub struct DylibNodeEntry {
     /// `take_last_error_fn`. The free MUST happen via the SAME cdylib
     /// (CString allocator pairing). Cdylib symbol: `cerulion_free_error`.
     free_error_fn: unsafe extern "C" fn(*mut std::ffi::c_char),
+    /// OPTIONAL: the typed kind of the last error as a `NodeErrorKind` wire
+    /// code (0 = none), taken by the read. Additive, no ABI bump: `None` for a
+    /// cdylib that does not export it, whose node errors stay the untyped
+    /// [`TransportError::NodeError`]. Cdylib symbol:
+    /// `cerulion_take_last_error_kind`.
+    take_last_error_kind_fn: Option<unsafe extern "C" fn() -> u32>,
     /// OPTIONAL cdylib snapshot FFI, resolved best-effort by `load` as a
     /// both-or-neither PAIR ([`SnapshotFns`]). `None` for an older cdylib
     /// that exports NEITHER symbol (back-compat — it still loads, since the
@@ -4178,6 +4293,16 @@ impl DylibNodeEntry {
             *sym
         };
 
+        // OPTIONAL typed error kind, resolved best-effort: an older cdylib does
+        // not export it and still loads (its errors stay untyped).
+        // Safety: same convention as the required symbol lookups.
+        let take_last_error_kind_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> u32>(b"cerulion_take_last_error_kind\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+
         // OPTIONAL snapshot symbols, resolved best-effort. An
         // older cdylib does NOT export them, and that MUST still load (the
         // ABI version is deliberately NOT bumped for these additive symbols);
@@ -4456,6 +4581,7 @@ impl DylibNodeEntry {
             shutdown_fn,
             take_last_error_fn,
             free_error_fn,
+            take_last_error_kind_fn,
             snapshot_ffi,
             snapshot_state: SnapshotState::Pending,
             state_ffi,
@@ -4492,6 +4618,29 @@ impl DylibNodeEntry {
     /// message instead of the upstream's "no detail provided" fallback.
     fn take_last_error(&self) -> Option<String> {
         take_last_error_via(self.take_last_error_fn, self.free_error_fn)
+    }
+
+    /// The error for a node-error return (FFI code 1 from tick / shutdown,
+    /// handle 0 from init): [`TransportError::NodeFailed`] with the typed kind
+    /// when the cdylib exports `cerulion_take_last_error_kind` and reports one,
+    /// else the untyped [`TransportError::NodeError`] older cdylibs produce.
+    /// Read AFTER [`Self::take_last_error`], the order the cdylib's two
+    /// thread-locals are written in.
+    fn node_failure(&self, reason: String) -> TransportError {
+        // Safety: the symbol was resolved by name + signature at load and the
+        // library outlives `self`; the export takes no arguments.
+        let code = self.take_last_error_kind_fn.map_or(0, |f| unsafe { f() });
+        match NodeErrorKind::from_code(code) {
+            Some(kind) => TransportError::NodeFailed {
+                node_id: self.diag_label.clone(),
+                kind,
+                reason,
+            },
+            None => TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason,
+            },
+        }
     }
 
     /// Parse the JSON string returned by `cerulion_node_info()` into `NodeInfo`.
@@ -5219,10 +5368,7 @@ impl NodeEntry for DylibNodeEntry {
             let detail = self.take_last_error().unwrap_or_else(|| {
                 "cerulion_node_init returned handle 0 (no detail provided)".to_string()
             });
-            return Err(TransportError::NodeError {
-                node_id: self.diag_label.clone(),
-                reason: format!("init failed: {}", detail),
-            });
+            return Err(self.node_failure(format!("init failed: {}", detail)));
         }
         self.handle = Some(handle);
         Ok(())
@@ -5260,6 +5406,11 @@ impl NodeEntry for DylibNodeEntry {
                     node_id: self.diag_label.clone(),
                     reason: detail,
                 });
+            }
+            // Code 1 is the node's own error: keep its kind. Code 4 (handle not
+            // found) and any unknown code are host-side faults with no kind.
+            if ret == 1 {
+                return Err(self.node_failure(detail));
             }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
@@ -5335,6 +5486,9 @@ impl NodeEntry for DylibNodeEntry {
                     ffi_error_description(ret),
                 )
             });
+            if ret == 1 {
+                return Err(self.node_failure(detail));
+            }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
                 reason: detail,
@@ -7902,6 +8056,7 @@ mod tests {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);
