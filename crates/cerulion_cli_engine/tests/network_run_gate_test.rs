@@ -70,8 +70,9 @@ fn block_with_ingress() -> NetworkBlock {
         mode: NetworkMode::Peer,
         connect: vec!["tcp/192.168.123.99:7447".to_string()],
         listen: vec!["tcp/0.0.0.0:7447".to_string()],
-        egress: vec!["/ng/n/out".to_string()],
+        egress: vec!["/ng/n/out".into()],
         ingress: vec!["/remote/cmd".to_string()],
+        tls: None,
     }
 }
 
@@ -81,8 +82,9 @@ fn egress_only_block() -> NetworkBlock {
         mode: NetworkMode::Peer,
         connect: vec![],
         listen: vec!["tcp/0.0.0.0:7447".to_string()],
-        egress: vec!["/ng/n/out".to_string()],
+        egress: vec!["/ng/n/out".into()],
         ingress: vec![],
+        tls: None,
     }
 }
 
@@ -555,8 +557,8 @@ network:
     let config = cerulion_core::graph::parse_graph_raw(&good).expect("the correct spelling parses");
     let net = config.network.as_ref().expect("block present");
     assert_eq!(
-        net.egress,
-        vec!["/ng/n/out".to_string()],
+        net.egress_topics().collect::<Vec<_>>(),
+        vec!["/ng/n/out"],
         "the declared egress topic must survive the parse"
     );
 }

@@ -345,8 +345,19 @@ fn dispatch(cli: Cli) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {}", render_user_error(&e));
-            ExitCode::FAILURE
+            ExitCode::from(cli_error_exit_code(&e))
         }
+    }
+}
+
+/// The process exit status for an error `run` returned: `EXIT_NODE_FATAL` (3)
+/// for a run that stopped a node on a fatal error, in process or in a worker
+/// group, and 1 for every other error.
+fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
+    use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
+    match err {
+        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        _ => 1,
     }
 }
 
@@ -1217,7 +1228,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         args.chunks(2)
                             .map(|pair| {
                                 let (schema, name) = parse_port_args(pair);
-                                Ok((resolve_and_report(&ws.schemas_dir, &schema)?, name))
+                                Ok((resolve_and_report(&ws.schemas_dir, &schema, !python)?, name))
                             })
                             .collect::<Result<Vec<(String, String)>, cerulion_cli_engine::error::CliError>>()
                     };
@@ -1227,7 +1238,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&trigger_input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, !python)?, name)]
                     };
                     let explicit_policy = match policy.as_deref() {
                         Some(spec) => Some(parse_policy_spec(spec)?),
@@ -1328,13 +1339,13 @@ fn run(cli: Cli) -> CliResult<()> {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, true)?, name)]
                     };
                     let trigger_inputs: Vec<(String, String)> = if trigger_input.is_empty() {
                         vec![]
                     } else {
                         let (schema, name) = parse_port_args(&trigger_input);
-                        vec![(resolve_and_report(&ws.schemas_dir, &schema)?, name)]
+                        vec![(resolve_and_report(&ws.schemas_dir, &schema, true)?, name)]
                     };
                     let explicit_policy = match policy.as_deref() {
                         Some(spec) => Some(parse_policy_spec(spec)?),
@@ -1402,7 +1413,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     if !output.is_empty() {
                         let (schema, name) = parse_port_args(&output);
                         // Same resolve-and-report as the input arms.
-                        let schema = resolve_and_report(&ws.schemas_dir, &schema)?;
+                        let schema = resolve_and_report(&ws.schemas_dir, &schema, true)?;
                         node_cmd::node_modify_add_port(
                             &ws.nodes_dir,
                             &node_type,
@@ -3961,12 +3972,12 @@ fn parse_port_args(args: &[String]) -> (String, String) {
 /// Bare names resolve via [`schema_cmd::resolve_port_schema`]
 /// (workspace YAML schemas win, then the workspace `.msg` store, then
 /// built-ins; a unique short name qualifies; ambiguous/unknown names are
-/// loud errors that propagate to the standard `Error:` handler). A name
-/// resolving to the `.msg` store — bare or qualified — is REFUSED via
-/// [`schema_cmd::refuse_store_port_scaffold`]: a store type has no
-/// generated Rust type, so the scaffolded import could never compile,
-/// and the refusal (naming the store type + the remedy) is the store
-/// hit's loud surface here. The engine re-refuses as the enforcement
+/// loud errors that propagate to the standard `Error:` handler). For a
+/// Rust port (`rust_port`), a name resolving to the `.msg` store, bare or
+/// qualified, goes through [`schema_cmd::refuse_store_port_scaffold`]: it is
+/// refused, with the config line to add, in a workspace that does not
+/// generate its store types into the message crate. A Python port reads the
+/// store through `cerulion.msgs`. The engine re-checks as the enforcement
 /// backstop. The presentation contract (the stderr-note option) for what
 /// proceeds:
 /// - a bare name resolved to a built-in prints a `note:` on EVERY
@@ -3979,10 +3990,12 @@ fn parse_port_args(args: &[String]) -> (String, String) {
 /// Returns the RESOLVED schema string to pass down to the engine,
 /// which re-resolves as the enforcement backstop (idempotent, so the
 /// double resolution is free and byte-identical).
-fn resolve_and_report(schemas_dir: &Path, raw: &str) -> CliResult<String> {
+fn resolve_and_report(schemas_dir: &Path, raw: &str, rust_port: bool) -> CliResult<String> {
     use cerulion_cli_engine::schema_cmd::PortSchemaProvenance;
     let resolved = schema_cmd::resolve_port_schema(schemas_dir, raw)?;
-    schema_cmd::refuse_store_port_scaffold(&resolved, raw)?;
+    if rust_port {
+        schema_cmd::refuse_store_port_scaffold(&resolved, raw, schemas_dir)?;
+    }
     match &resolved.provenance {
         PortSchemaProvenance::ResolvedBuiltin { qualified } => {
             eprintln!(
@@ -4216,7 +4229,7 @@ mod resolve_and_report_tests {
         // resolves to the one qualified built-in.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_and_report(tmp.path(), "Vector3").unwrap(),
+            resolve_and_report(tmp.path(), "Vector3", true).unwrap(),
             "geometry_msgs/Vector3"
         );
     }
@@ -4227,7 +4240,7 @@ mod resolve_and_report_tests {
         // shape `parse_port_args` canonicalizes to) round-trip.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_and_report(tmp.path(), "geometry_msgs/Vector3").unwrap(),
+            resolve_and_report(tmp.path(), "geometry_msgs/Vector3", true).unwrap(),
             "geometry_msgs/Vector3"
         );
     }
@@ -4238,7 +4251,7 @@ mod resolve_and_report_tests {
         // resolver's Validation error propagates untouched (the
         // standard `Error:` handler renders it).
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_and_report(tmp.path(), "Pose2D").unwrap_err();
+        let err = resolve_and_report(tmp.path(), "Pose2D", true).unwrap_err();
         assert!(
             matches!(err, cerulion_cli_engine::error::CliError::Validation(_)),
             "expected Validation error, got {err:?}"
@@ -4253,7 +4266,7 @@ mod resolve_and_report_tests {
     #[test]
     fn unknown_bare_name_propagates_schema_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = resolve_and_report(tmp.path(), "Vectorr3").unwrap_err();
+        let err = resolve_and_report(tmp.path(), "Vectorr3", true).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -5199,5 +5212,29 @@ mod is_resim_family_tests {
         assert!(!is_resim_family(&BagAction::Info {
             bag: PathBuf::from("/tmp/b.mcap"),
         }));
+    }
+}
+
+#[cfg(test)]
+mod cli_error_exit_code_tests {
+    use super::cli_error_exit_code;
+    use cerulion_cli_engine::error::CliError;
+
+    /// A run that stopped a node on a fatal error exits 3, in process or in
+    /// a worker group; every other error exits 1.
+    #[test]
+    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+        let in_process = CliError::NodeFatal {
+            nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
+        };
+        let worker = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string()],
+        };
+        assert_eq!(cli_error_exit_code(&in_process), 3);
+        assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::Validation("x".to_string())),
+            1
+        );
     }
 }

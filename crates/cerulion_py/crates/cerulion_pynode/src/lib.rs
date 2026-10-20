@@ -973,6 +973,19 @@ impl Host {
             install_host_module(py).map_err(python_error)?;
             Self::install_search_path(py, sys_path)?;
             Self::activate_node_dir(py, sys_path.first().copied(), first_instance)?;
+            // `cerulion.msgs` resolves the node's class imports against the
+            // node's own workspace, so it is bound before `node.py` runs; the
+            // first instance of the type reads a changed workspace afresh,
+            // a further one keeps the set its running sibling uses.
+            let workspace = node_workspace(&ctx, sys_path)?;
+            py.import("cerulion.msgs")
+                .and_then(|module| {
+                    module.call_method1(
+                        "_bind_workspace",
+                        (workspace.to_string_lossy().into_owned(), first_instance),
+                    )
+                })
+                .map_err(python_error)?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -990,7 +1003,6 @@ impl Host {
                 ));
             }
             let metadata = Self::metadata(info, &classes[0].1)?;
-            let workspace = node_workspace(&ctx, sys_path)?;
             let schemas = node_schemas(&workspace)?;
             let ctx_ptr = Arc::new(AtomicPtr::new((&mut *ctx) as *mut NodeContext));
             // Armed from here: Python can retain the HostCtx handed out below,

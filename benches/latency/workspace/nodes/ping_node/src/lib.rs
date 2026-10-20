@@ -66,13 +66,17 @@
 //!
 //! So the publish is gated on a WALL-clock slot grid: when
 //! `CER_BENCH_TARGET_RATE_HZ` > 0 (exported by run_workspace.sh on every
-//! quiescent/fixed100 size; 0 under backtoback = gate off), a tick whose
-//! `real_ns()` has not reached the next grid slot publishes NOTHING (no
-//! port write ⇒ no loan ⇒ no publish — the lazy-loan non-event),
-//! and a tick that arrives late consumes exactly one slot, SKIPPING
-//! missed slots rather than bursting (`slots_skipped`, printed in the
-//! RTT_DELIVERY line — the same grid-slot semantics as the native bins'
-//! `RateLimiter`). run_workspace.sh's fixed100 sustain verdict fails a
+//! quiescent/fixed100 size; 0 under backtoback = gate off), each tick is
+//! assigned to its NEAREST slot on a grid anchored at the first tick
+//! (`grid_slot`). A tick whose slot is already filled publishes NOTHING
+//! (no port write ⇒ no loan ⇒ no publish, the lazy-loan non-event), and
+//! a tick that lands one or more slots past the last one filled publishes
+//! once, SKIPPING the slots in between rather than bursting
+//! (`slots_skipped`, printed in the RTT_DELIVERY line, the workspace
+//! counterpart of the native bins' `RateLimiter` skip count). Nearest rather
+//! than at-or-before, because the tick source runs at the grid's own period
+//! and wakes with jitter: see `grid_slot`. run_workspace.sh's fixed100
+//! sustain verdict fails a
 //! rung whose skip count exceeds 1% of its slots, mirroring the native
 //! cannot-sustain observable: without it a run whose steps turn slower
 //! than the grid would under-pace silently and re-mint the false label.
@@ -83,6 +87,47 @@
 
 use cerulion_core::prelude::*;
 use native_ros2_messages::sensor_msgs::Image;
+
+/// Wall-grid slot decision for one tick (pure, so it is unit tested).
+///
+/// `anchor_ns` is the first tick's wall time (slot 0) and `last_slot` the
+/// slot the previous publish filled. The tick is assigned to its NEAREST
+/// grid slot, `round((now - anchor) / period)`. It publishes when that slot
+/// is later than `last_slot`, and every slot between the two is counted as
+/// skipped. Returns `None` for a tick that publishes nothing, or
+/// `Some((slot, skipped))`.
+///
+/// Nearest, not floor. Under fixed100 the tick source is the runtime's own
+/// `Period` trigger at the grid's period (10 ms for 100 Hz), so tick and slot
+/// differ only in phase, and each tick wakes late by a varying amount. With
+/// a floor (`now < anchor + k * period` publishes nothing) the first tick's
+/// wake lateness became the grid's phase: a later tick that woke earlier
+/// than the first one published nothing, and the next tick then found its
+/// slot passed and counted it as skipped. Wake jitter of tens of
+/// microseconds therefore counted as missed slots, enough for a run to
+/// cross the runner's 1% sustain line and be re-run at the next ladder
+/// rung. Nearest-slot assignment counts a tick
+/// against the grid only when it lands more than half a period from the
+/// first tick's phase.
+///
+/// Where the rate does not divide 1000 the tick period is the integer
+/// `period_ms` below the grid period, so some ticks find their slot filled
+/// and publish nothing; no slot is skipped. With a tick source much faster
+/// than the grid (the lockstep opt-out's logical period) the first publish
+/// after the anchor comes half a period early and every later one a period
+/// apart; the warmup samples absorb it.
+pub(crate) fn grid_slot(
+    anchor_ns: u64,
+    last_slot: u64,
+    now_ns: u64,
+    period_ns: u64,
+) -> Option<(u64, u64)> {
+    let slot = (now_ns.saturating_sub(anchor_ns) + period_ns / 2) / period_ns;
+    if slot <= last_slot {
+        return None;
+    }
+    Some((slot, slot - last_slot - 1))
+}
 
 #[cerulion_node(period_ms = 1)]
 pub struct PingNode {
@@ -108,7 +153,10 @@ pub struct PingNode {
     /// CER_BENCH_TARGET_RATE_HZ (0 = ungated, the backtoback shape).
     rate_hz: u64,
     period_ns: u64,
-    next_slot_ns: u64,
+    /// Wall time of the first tick (grid slot 0); 0 until it arrives.
+    anchor_ns: u64,
+    /// The grid slot the last publish filled (see [`grid_slot`]).
+    last_slot: u64,
     /// Grid slots the graph failed to reach in time (skip-forward, never
     /// burst) — the workspace twin of the native RateLimiter's
     /// slots_skipped cannot-sustain observable.
@@ -195,29 +243,27 @@ impl PingNode {
 
     fn tick(&mut self) -> Result<(), NodeError> {
         self.ticked = true;
-        // Wall-grid gate FIRST, before ANY port write: a tick before its
-        // slot publishes nothing (no port write ⇒ no loan ⇒ no publish —
+        // Wall-grid gate FIRST, before ANY port write: a tick whose slot is
+        // already filled publishes nothing (no port write ⇒ no loan ⇒ no publish,
         // the lazy-loan non-event). This read of real_ns() is
         // OUTSIDE the stamp→publish span (the stamp is re-read below), so
         // the G3 stamp-late discipline is untouched.
         if self.period_ns > 0 {
             let now = self.real_ns();
-            if self.next_slot_ns == 0 {
-                // Anchor the grid at the first fire.
-                self.next_slot_ns = now;
-            }
-            if now < self.next_slot_ns {
-                return Ok(());
-            }
-            // Consume exactly this slot; if the graph failed to reach one
-            // or more slots in time, SKIP them (never burst) and count —
-            // the cannot-sustain observable the runner's fixed100 verdict
-            // reads off the RTT_DELIVERY line.
-            self.next_slot_ns += self.period_ns;
-            if self.next_slot_ns <= now {
-                let missed = (now - self.next_slot_ns) / self.period_ns + 1;
-                self.slots_skipped += missed;
-                self.next_slot_ns += missed * self.period_ns;
+            if self.anchor_ns == 0 {
+                // Anchor the grid at the first fire, which publishes.
+                self.anchor_ns = now;
+            } else {
+                // A tick nearer the slot already filled than the next one
+                // publishes nothing; every slot it jumped past is counted
+                // as skipped (never burst). See `grid_slot`.
+                match grid_slot(self.anchor_ns, self.last_slot, now, self.period_ns) {
+                    None => return Ok(()),
+                    Some((slot, skipped)) => {
+                        self.last_slot = slot;
+                        self.slots_skipped += skipped;
+                    }
+                }
             }
         }
         // G3: all non-stamp work first — the first port write below
@@ -257,5 +303,97 @@ impl PingNode {
             self.leg, self.published, self.slots_skipped
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod grid_slot_tests {
+    use super::grid_slot;
+
+    const P: u64 = 10_000_000; // 100 Hz
+
+    /// A tick that wakes earlier than the anchor tick did still fills its
+    /// slot: the case the floor grid dropped and later counted as skipped.
+    #[test]
+    fn a_tick_waking_earlier_than_the_anchor_fills_its_slot() {
+        let anchor = 1_000_000_000 + 300_000; // first tick woke 300 us late
+        let now = 1_000_000_000 + P + 40_000; // second tick woke 40 us late
+        assert_eq!(grid_slot(anchor, 0, now, P), Some((1, 0)));
+    }
+
+    /// Ticks on the runtime's period, each with its own wake lateness
+    /// below half a period, publish once per slot and skip none.
+    #[test]
+    fn jittered_ticks_on_the_period_skip_no_slot() {
+        let epoch = 5_000_000_000u64;
+        let lateness = [300_000u64, 10_000, 4_000_000, 0, 250_000, 4_900_000, 1];
+        let anchor = epoch + lateness[0];
+        let mut last = 0;
+        for (k, j) in lateness.iter().enumerate().skip(1) {
+            let now = epoch + k as u64 * P + j;
+            let (slot, skipped) = grid_slot(anchor, last, now, P).expect("publishes");
+            assert_eq!((slot, skipped), (k as u64, 0), "tick {k}");
+            last = slot;
+        }
+    }
+
+    /// A stall longer than one and a half periods still counts the slots it
+    /// missed, and the catch-up ticks the runtime fires in the same step
+    /// publish nothing (no burst).
+    #[test]
+    fn a_stall_counts_its_missed_slots_and_never_bursts() {
+        let anchor = 0;
+        let now = 4 * P + 100_000; // ticks for slots 1..=3 never came
+        assert_eq!(grid_slot(anchor, 0, now, P), Some((4, 3)));
+        assert_eq!(grid_slot(anchor, 4, now + 1_000, P), None);
+    }
+
+    /// A tick source slower than the grid (here 2% slow) still counts its
+    /// deficit: about one skipped slot per fifty ticks, 2% of the window,
+    /// which is over the runner's 1% sustain line.
+    #[test]
+    fn a_slow_tick_source_counts_its_deficit() {
+        let tick = P + P / 50;
+        let mut last = 0;
+        let mut skipped_total = 0;
+        let ticks = 2_000u64;
+        for k in 1..=ticks {
+            if let Some((slot, skipped)) = grid_slot(0, last, k * tick, P) {
+                last = slot;
+                skipped_total += skipped;
+            }
+        }
+        assert_eq!(skipped_total, 40);
+        assert!(skipped_total * 100 > ticks);
+    }
+
+    /// A tick more than half a period late takes the later slot and counts
+    /// the one it missed; the next on-time tick then finds its slot filled
+    /// and publishes nothing.
+    #[test]
+    fn a_tick_more_than_half_a_period_late_counts_one_skip() {
+        assert_eq!(grid_slot(0, 0, P + P / 2 + 1, P), Some((2, 1)));
+        assert_eq!(grid_slot(0, 2, 2 * P + 30_000, P), None);
+        assert_eq!(grid_slot(0, 2, 3 * P + 30_000, P), Some((3, 0)));
+    }
+
+    /// A tick source faster than the grid (the lockstep opt-out's logical
+    /// period) publishes exactly once per slot.
+    #[test]
+    fn a_fast_tick_source_publishes_once_per_slot() {
+        let mut last = 0;
+        let mut published = 0;
+        let mut skipped_total = 0;
+        let mut now = 1_000;
+        while now < 100 * P {
+            if let Some((slot, skipped)) = grid_slot(0, last, now, P) {
+                last = slot;
+                published += 1;
+                skipped_total += skipped;
+            }
+            now += 1_087_000; // about 920 Hz
+        }
+        assert_eq!(skipped_total, 0);
+        assert_eq!(published, 100);
     }
 }
