@@ -46,13 +46,15 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
 - **Warnings are loud twice.** Every `LayoutResolver` warning (unresolved nested target,
   skipped workspace file, …) is `tracing::warn!`ed AND returned in the `Vec<String>`.
   A failed `add_*` leaves the set unchanged.
-- **Nested references bind on identity.** `resolve_fixed_nested`, `LayoutResolver` and
-  `FrameWalker` all bind a nested reference through one registry
+- **Nested references bind on identity.** `resolve_fixed_nested`, `LayoutResolver`,
+  `FrameWalker` and the capture-time `header.stamp` locator (`codegen/header_stamp.rs`)
+  all bind a nested reference through one registry
   (`codegen/nested_index.rs`) keyed on each schema's own `(package, name)`, never on
   its qualified-name text. A package-less YAML entry named `pkg/Type` keeps that text
   for name lookups (`layout(name)`, `walk`), where the later definition wins; a store
   schema's reference to `Type` still binds the store's `(Some("pkg"), "Type")`, the
-  definition the resolver inlined. A reference that does not bind is a typed error
+  definition the resolver inlined, and both twins stay reachable by their own
+  `schema_hash` (`walk_by_hash`, `layout_for_hash`). A reference that does not bind is a typed error
   (`LayoutError::UnresolvedNested`, `WalkError::NestedResolutionFailed`), never a panic.
 - `from_schemas` returns `Result` and preflights every build through three gates:
   declared fixed size, composed overflow via `composed_overflow_indices`, and

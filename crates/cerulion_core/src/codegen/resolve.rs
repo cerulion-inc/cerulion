@@ -193,7 +193,7 @@ impl Resolver {
             .bind(reference_pkg.as_deref(), name, parent_package.as_deref())
             .map_err(|miss| match (miss, reference_pkg) {
                 (Miss::Ambiguous { candidates }, _) => format!(
-                    "ambiguous unqualified reference '{name}' (defined in {candidates} packages) — qualify as pkg/{name}"
+                    "ambiguous unqualified reference '{name}' (defined in {candidates} packages); qualify as pkg/{name}"
                 ),
                 (Miss::Unknown, Some(pkg)) => format!("unknown schema '{pkg}/{name}'"),
                 (Miss::Unknown, None) => format!("unknown schema '{name}'"),
