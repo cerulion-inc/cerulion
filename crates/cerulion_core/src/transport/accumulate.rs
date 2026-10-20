@@ -386,7 +386,7 @@ impl AccumulatorSet {
             sub.mark_fifo_consume();
         }
         self.inputs.push(Accumulator {
-            name: name.to_string(),
+            name: name.to_string(), // hot-path-alloc-ok: registration, once per input at node init
             buffer,
             check: check_frame::<T>,
             armed: true,
@@ -409,7 +409,7 @@ impl AccumulatorSet {
         for name in names {
             match self.inputs.iter_mut().find(|a| a.name == *name) {
                 Some(acc) => match ctx.subscriber_mut(name) {
-                    Some(sub) => acc.collect(sub),
+                    Some(sub) => acc.gather_frames(sub),
                     None => {
                         debug_assert!(
                             false,
@@ -460,7 +460,7 @@ impl AccumulatorSet {
 }
 
 impl Accumulator {
-    fn collect(&mut self, sub: &mut AnySubscriber) {
+    fn gather_frames(&mut self, sub: &mut AnySubscriber) {
         self.buffer.begin_collect();
         let before = self.buffer.dropped_total();
         let mut newest_ts = 0u64;
