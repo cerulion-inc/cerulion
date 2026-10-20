@@ -225,6 +225,38 @@ fn each_probe_instance_keeps_its_own_once_and_throttle_state() {
     );
 }
 
+/// One once site and one throttle site, shared by every caller.
+fn log_both(p: &Probe) {
+    warn_once!(p, "once per instance");
+    warn_throttle!(p, Duration::from_secs(1), "throttle per instance");
+}
+
+#[test]
+fn a_cloned_runtime_is_a_new_instance_with_no_once_line_printed() {
+    let a = Probe::at(0);
+    let (_, cap) = capture(|| {
+        log_both(&a);
+        let clone = Probe {
+            __cer_rt: a.__cer_rt.clone(),
+            clock: a.clock.clone(),
+        };
+        // The clone did not print these lines, so it prints them now, at the
+        // same graph time, inside the original's throttle window.
+        log_both(&clone);
+        // The original keeps its own state: both suppressed.
+        log_both(&a);
+    });
+    assert_eq!(
+        cap.messages(),
+        vec![
+            "once per instance",
+            "throttle per instance",
+            "once per instance",
+            "throttle per instance",
+        ]
+    );
+}
+
 static EVALS: AtomicU64 = AtomicU64::new(0);
 
 fn counted(v: u64) -> u64 {
@@ -371,13 +403,15 @@ nodes:
 
 /// The (instance, tick_ns) of every throttled line, and the instances of
 /// every once line.
-fn run(steps: u64, pause_after: u64) -> (Vec<(u64, u64)>, Vec<u64>) {
+fn run(steps: u64, jump_after: u64) -> (Vec<(u64, u64)>, Vec<u64>) {
     let clock = Arc::new(VirtualClock::new());
     let mut rt = build(clock.clone());
     let (_, cap) = capture(|| {
         for i in 0..steps {
-            if i == pause_after {
-                // A pause: no step runs while graph time jumps 10 s ahead.
+            if i == jump_after {
+                // Graph time jumps 10 s ahead between two steps. (A real
+                // pause freezes the clock instead; `log_sites_pause_iox2_test`
+                // pins that seam.)
                 clock.set(clock.now_ns() + 10_000 * MS);
             }
             rt.step(Duration::from_millis(1));
@@ -416,14 +450,14 @@ fn run(steps: u64, pause_after: u64) -> (Vec<(u64, u64)>, Vec<u64>) {
 
 #[test]
 #[serial]
-fn a_node_throttles_on_its_graph_clock_and_logs_once_per_instance_across_a_pause() {
+fn a_node_throttles_on_its_graph_clock_and_logs_once_per_instance_across_a_graph_time_jump() {
     let (throttled, once) = run(1_000, 500);
     // One once line per instance, the first time each ticks, not again after
-    // the pause.
+    // the jump.
     assert_eq!(once, vec![0, 1]);
     // Per instance, every gap between emitted lines is a whole number of
     // periods of GRAPH time: exactly 100 ms while the node ticks every 1 ms,
-    // and the pause's 10 s jump in one step.
+    // and the 10 s jump in one step.
     for instance in [0, 1] {
         let times: Vec<u64> = throttled
             .iter()
@@ -431,8 +465,8 @@ fn a_node_throttles_on_its_graph_clock_and_logs_once_per_instance_across_a_pause
             .map(|(_, t)| *t)
             .collect();
         let gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
-        // 500 steps before the pause emit at 0, 100, .., 400 ms of ticking
-        // (5 lines); the first tick after the pause emits; then 4 more in the
+        // 500 steps before the jump emit at 0, 100, .., 400 ms of ticking
+        // (5 lines); the first tick after the jump emits; then 4 more in the
         // remaining 500 steps.
         assert_eq!(times.len(), 10, "instance {instance}: {times:?}");
         let mut want = vec![100 * MS; 4];
