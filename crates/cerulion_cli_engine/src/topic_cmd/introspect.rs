@@ -187,7 +187,8 @@ fn malformed_type(input: &str) -> CliError {
 /// What a typed listing knows about one topic's message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicType {
-    /// The type's `package/Type` name, already safe to print.
+    /// The type's name (`package/Type`, or a package-less workspace
+    /// schema's bare key), already safe to print.
     Named(String),
     /// The topic's schema hash names no built-in or workspace type.
     Unnamed(u64),
@@ -817,8 +818,8 @@ pub fn topic_find(
     })
 }
 
-/// `cerulion topic type <topic>`: the `package/Type` name of the topic's
-/// message type.
+/// `cerulion topic type <topic>`: the name of the topic's message type,
+/// `package/Type` or a package-less workspace schema's bare key.
 ///
 /// The topic is opened exactly as `topic info` opens it (a local producer
 /// directly; a remote robot's topic through the network daemon unless the
@@ -936,6 +937,12 @@ pub fn topic_bw_with_scope(
             });
             delivered += 1;
         });
+        // Count what reached the ring before any error path: a receive can
+        // deliver frames and then fail, and those frames are in the window.
+        if delivered > 0 {
+            arrived_this_report += delivered;
+            silence_since = Instant::now();
+        }
         let action = super::decide_wait_outcome(
             received.is_ok(),
             running.load(Ordering::Relaxed),
@@ -949,10 +956,6 @@ pub fn topic_bw_with_scope(
                     return Err(receive_failed_error(topic, &e));
                 }
             }
-        }
-        if delivered > 0 {
-            arrived_this_report += delivered;
-            silence_since = Instant::now();
         }
         if let Some(pause) =
             super::decide_observer_pacing(delivered, wait_started.elapsed(), wait, &mut idle_churn)

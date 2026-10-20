@@ -33,7 +33,8 @@ enum TopicIntrospectAction {
     ///
     /// Reads one message from a LOCAL topic or, if the name is not a local
     /// topic, a REMOTE robot's topic discovered on the LAN, and prints its
-    /// type as `package/Type`. Pass `--local` to read genuine local producers
+    /// type as `package/Type` (a workspace schema with no package prints its
+    /// bare name). Pass `--local` to read genuine local producers
     /// without remote discovery or demand.
     Type {
         /// Read genuine local shared-memory producers only.
