@@ -8062,6 +8062,33 @@ impl GraphRuntime {
                                     crate::scheduler::NodeDeathCause::CdylibPanicked,
                                 );
                             }
+                            // `NodeError::Fatal`: stop the node. One error line
+                            // names the node, the kind and the message; the
+                            // scheduler disables the node after this fire, so
+                            // this arm runs once per node and needs no flood
+                            // latch. The node will not execute again this run,
+                            // so it is a node death too (one capture, the
+                            // ledger's dedup, unarmed on replay).
+                            if let TransportError::NodeFailed { kind, reason, .. } = &err {
+                                if kind.is_fatal() {
+                                    record_first_reason(&fatal_record, reason);
+                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
+                                    latch_node_death(
+                                        &mut node_death_reported,
+                                        &node_death_for_callback,
+                                        &node_id_for_log,
+                                        crate::scheduler::NodeDeathCause::FatalError,
+                                    );
+                                    tracing::error!(
+                                        node_id = %node_id_for_log,
+                                        kind = %kind,
+                                        error = %reason,
+                                        "node returned a fatal error and is stopped; it will \
+                                         not fire again in this run"
+                                    );
+                                    return;
+                                }
+                            }
                             // Flood-latched failure logging:
                             // at most two `error!` lines per (node, reason)
                             // regime (observed pre-latch: ~2,660 identical
@@ -8079,24 +8106,6 @@ impl GraphRuntime {
                             // one. Avoiding it needs a cheaper regime key than the rendered
                             // message (a discriminant), which is a behavioural change to the
                             // latch rather than a rename. Recorded rather than claimed cold.
-                            // `NodeError::Fatal`: stop the node. One error line
-                            // names the node, the kind and the message; the
-                            // scheduler disables the node after this fire, so
-                            // this arm runs once per node and needs no latch.
-                            if let TransportError::NodeFailed { kind, reason, .. } = &err {
-                                if kind.is_fatal() {
-                                    record_first_reason(&fatal_record, reason);
-                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
-                                    tracing::error!(
-                                        node_id = %node_id_for_log,
-                                        kind = %kind,
-                                        error = %reason,
-                                        "node returned a fatal error and is stopped; it will \
-                                         not fire again in this run"
-                                    );
-                                    return;
-                                }
-                            }
                             let reason = err.to_string();
                             log_tick_failure(
                                 &node_id_for_log,

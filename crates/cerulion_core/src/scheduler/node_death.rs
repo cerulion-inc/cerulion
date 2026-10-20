@@ -77,12 +77,12 @@ pub const MAX_TRACKED_NODE_DEATHS: usize = 64;
 
 /// WHY a node stopped.
 ///
-/// Two variants rather than one because the two are observed at different sites
-/// and mean subtly different things to whoever reads the capture: one is the
-/// scheduler's own circuit breaker opening, the other is a node that panicked
-/// ONCE and can never run again. They mint the same `TriggerKind::PanicDisable`
-/// request — the remedy is identical and the regime key is the node — but the
-/// DETAIL says which was seen. (Backticks, not a link: see the module docs.)
+/// One variant per mechanism, because each is observed at a different site and
+/// means a different thing to whoever reads the capture: the scheduler's own
+/// circuit breaker opening, a node that panicked ONCE and can never run again,
+/// a cdylib that panicked behind the FFI, or a node that returned
+/// `NodeError::Fatal`. They mint the same `TriggerKind::PanicDisable` request
+/// (the regime key is the node) but the DETAIL says which was seen. (Backticks, not a link: see the module docs.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeDeathCause {
     /// The scheduler's circuit breaker opened: `MAX_CONSECUTIVE_PANICS`
@@ -122,6 +122,17 @@ pub enum NodeDeathCause {
     /// `consecutive_panics` resets to 0 on the callback's clean return and the
     /// circuit breaker never opens).
     CdylibPanicked,
+    /// The node returned `NodeError::Fatal` from `tick`, and the scheduler
+    /// stopped it after that fire.
+    ///
+    /// Not a panic, but the same fact for an operator: the node will not
+    /// execute again in this run. It mints the same capture as the other
+    /// causes; the DETAIL says it was a fatal error the node chose to return,
+    /// not a crash. Recorded in the runtime's tick callback on the fatal arm,
+    /// which runs once per node (the node never fires again). Like every
+    /// cause, an UNARMED ledger (every replay) records nothing, so Replay =
+    /// Live holds.
+    FatalError,
 }
 
 impl NodeDeathCause {
@@ -133,6 +144,7 @@ impl NodeDeathCause {
             Self::DisabledAfterPanics => "disabled_after_consecutive_panics",
             Self::EntryPoisoned => "entry_poisoned_after_panic",
             Self::CdylibPanicked => "cdylib_panicked",
+            Self::FatalError => "returned_fatal_error",
         }
     }
 
@@ -151,6 +163,10 @@ impl NodeDeathCause {
                 "this cdylib node panicked across the FFI boundary and its own node registry is \
                  poisoned — every later tick returns the poisoned code, so it will not execute \
                  again in this run"
+            }
+            Self::FatalError => {
+                "this node returned NodeError::Fatal and the scheduler stopped it — it will not \
+                 fire again in this run"
             }
         }
     }
@@ -408,6 +424,19 @@ mod tests {
             NodeDeathCause::EntryPoisoned.detail()
         );
         assert!(NodeDeathCause::EntryPoisoned.detail().contains("poisoned"));
+        // The fatal stop is its own word and sentence: no panic happened.
+        assert_eq!(NodeDeathCause::FatalError.as_wire(), "returned_fatal_error");
+        assert!(NodeDeathCause::FatalError
+            .detail()
+            .contains("NodeError::Fatal"));
+        for other in [
+            NodeDeathCause::DisabledAfterPanics,
+            NodeDeathCause::EntryPoisoned,
+            NodeDeathCause::CdylibPanicked,
+        ] {
+            assert_ne!(NodeDeathCause::FatalError.as_wire(), other.as_wire());
+            assert_ne!(NodeDeathCause::FatalError.detail(), other.detail());
+        }
         assert!(NodeDeathCause::DisabledAfterPanics
             .detail()
             .contains("disabled"));
