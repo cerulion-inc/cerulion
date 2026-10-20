@@ -69,10 +69,10 @@
 //! quiescent/fixed100 size; 0 under backtoback = gate off), each tick is
 //! assigned to its NEAREST slot on a grid anchored at the first tick
 //! (`grid_slot`). A tick whose slot is already filled publishes NOTHING
-//! (no port write ⇒ no loan ⇒ no publish — the lazy-loan non-event), and
+//! (no port write ⇒ no loan ⇒ no publish, the lazy-loan non-event), and
 //! a tick that lands one or more slots past the last one filled publishes
 //! once, SKIPPING the slots in between rather than bursting
-//! (`slots_skipped`, printed in the RTT_DELIVERY line — the workspace
+//! (`slots_skipped`, printed in the RTT_DELIVERY line, the workspace
 //! counterpart of the native bins' `RateLimiter` skip count). Nearest rather
 //! than at-or-before, because the tick source runs at the grid's own period
 //! and wakes with jitter: see `grid_slot`. run_workspace.sh's fixed100
@@ -244,7 +244,7 @@ impl PingNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         self.ticked = true;
         // Wall-grid gate FIRST, before ANY port write: a tick whose slot is
-        // already filled publishes nothing (no port write ⇒ no loan ⇒ no publish —
+        // already filled publishes nothing (no port write ⇒ no loan ⇒ no publish,
         // the lazy-loan non-event). This read of real_ns() is
         // OUTSIDE the stamp→publish span (the stamp is re-read below), so
         // the G3 stamp-late discipline is untouched.
