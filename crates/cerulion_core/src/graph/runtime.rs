@@ -748,9 +748,10 @@ pub fn compute_gateway_plan(
                 schema_hash,
             });
         }
+        let egress: Vec<String> = net.egress_topics().map(str::to_string).collect();
         Some(GatewayPlan {
-            egress_policy: GatewayEgressPolicy::AllowList(net.egress.clone()),
-            announce: net.egress.clone(),
+            egress_policy: GatewayEgressPolicy::AllowList(egress.clone()),
+            announce: egress,
             ingress,
         })
     } else if posture == crate::transport::NetworkPosture::PermissiveDefault {
