@@ -19,7 +19,7 @@ use cerulion_core::codegen::{
 use cerulion_core::dynamic::SchemaSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -820,34 +820,40 @@ fn collect_field_deps(
     }
 }
 
+/// The entries of `dir`, sorted. A directory or an entry that cannot be read
+/// fails the build: skipping it would drop its types from the corpus without
+/// a word.
+fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("failed to read an entry of {}: {}", dir.display(), e))
+                .path()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
 fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, String)>>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // This is a package directory
-                let package_name = path.file_name().unwrap().to_string_lossy().to_string();
-                let package_name = sanitize_package_name(&package_name);
-
-                if let Ok(msg_entries) = fs::read_dir(&path) {
-                    for msg_entry in msg_entries.flatten() {
-                        let msg_path = msg_entry.path();
-                        if msg_path.extension().is_some_and(|e| e == "msg") {
-                            let msg_name =
-                                msg_path.file_stem().unwrap().to_string_lossy().to_string();
-
-                            // Vendored inputs: an unreadable/non-UTF-8 .msg
-                            // must fail the build, not silently vanish.
-                            let content = fs::read_to_string(&msg_path).unwrap_or_else(|e| {
-                                panic!("failed to read {}: {}", msg_path.display(), e)
-                            });
-                            packages
-                                .entry(package_name.clone())
-                                .or_default()
-                                .push((msg_name, content));
-                        }
-                    }
-                }
+    for path in sorted_dir_paths(dir) {
+        if !path.is_dir() {
+            continue;
+        }
+        // This is a package directory
+        let package_name = sanitize_package_name(&path.file_name().unwrap().to_string_lossy());
+        for msg_path in sorted_dir_paths(&path) {
+            if msg_path.extension().is_some_and(|e| e == "msg") {
+                let msg_name = msg_path.file_stem().unwrap().to_string_lossy().to_string();
+                // Vendored inputs: an unreadable/non-UTF-8 .msg must fail the
+                // build, not silently vanish.
+                let content = fs::read_to_string(&msg_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {}", msg_path.display(), e));
+                packages
+                    .entry(package_name.clone())
+                    .or_default()
+                    .push((msg_name, content));
             }
         }
     }
@@ -857,22 +863,12 @@ fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, St
 /// sorted order. Like a `.msg`, an unreadable `.srv` fails the build.
 fn collect_srv_files(dir: &Path) -> Vec<(String, String, String, String)> {
     let mut out = Vec::new();
-    let mut pkg_dirs: Vec<_> = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    pkg_dirs.sort();
+    let pkg_dirs = sorted_dir_paths(dir).into_iter().filter(|p| p.is_dir());
     for pkg_dir in pkg_dirs {
         let package = sanitize_package_name(&pkg_dir.file_name().unwrap().to_string_lossy());
-        let mut files: Vec<_> = fs::read_dir(&pkg_dir)
-            .unwrap_or_else(|e| panic!("failed to read {}: {}", pkg_dir.display(), e))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "srv"))
-            .collect();
-        files.sort();
+        let files = sorted_dir_paths(&pkg_dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "srv"));
         for path in files {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             let text = fs::read_to_string(&path)
