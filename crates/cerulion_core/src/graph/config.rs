@@ -1705,6 +1705,8 @@ network:
         assert_eq!(block.egress, vec!["/a/x".to_string(), "/b/y".to_string()]);
         assert!(block.egress.iter().any(|t| t == "/b/y"));
         assert!(block.egress.iter().all(|t| t != "/c/z"));
+        let wanted = String::from("/b/y");
+        assert!(block.egress.iter().any(|t| *t == wanted));
 
         let bare = EgressTopic::new("/a/x");
         assert!(bare == *"/a/x" && *"/a/x" == bare);
