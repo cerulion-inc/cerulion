@@ -332,14 +332,11 @@ pub fn wan_gate(state: &AuthState, now_ns: u64) -> WanGate {
 
 /// The Cerulion config directory: `CERULION_HOME` verbatim when set (the test /
 /// deployment isolation knob), else `~/.cerulion`. `None` only when there is no
-/// home directory AND no override.
+/// home directory AND no override. Delegates to the one rule in
+/// [`cerulion_pairing::identity::config_dir`], which every `~/.cerulion` path
+/// of the CLI resolves through.
 pub fn cerulion_config_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CERULION_HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
-        }
-    }
-    Some(dirs::home_dir()?.join(".cerulion"))
+    cerulion_pairing::identity::config_dir()
 }
 
 /// `~/.cerulion/auth.json` (env-aware; `None` when no config dir resolves).
@@ -352,11 +349,12 @@ pub fn device_cert_path() -> Option<PathBuf> {
     Some(cerulion_config_dir()?.join("device.cert"))
 }
 
-/// `~/.cerulion/desk.key` — the 32-byte ed25519 device seed. Shared with the
-/// `cerulion connect`/`pair` desk identity (Studio ⊃ CLI: one device key per
+/// The machine identity layout under [`cerulion_config_dir`]: the one machine
+/// key (`identity/device.key`, also reachable as the legacy `desk.key`), shared
+/// by sign-in, `cerulion connect`/`pair` and the robot claim (one device key per
 /// machine).
-pub fn device_key_path() -> Option<PathBuf> {
-    Some(cerulion_config_dir()?.join("desk.key"))
+pub fn identity_layout() -> Option<cerulion_pairing::identity::IdentityLayout> {
+    cerulion_config_dir().map(cerulion_pairing::identity::IdentityLayout::at)
 }
 
 /// The current Unix time in nanoseconds (saturating; monotone-enough for TTL

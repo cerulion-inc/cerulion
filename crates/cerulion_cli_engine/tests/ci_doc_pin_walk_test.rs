@@ -3360,8 +3360,17 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_cli", "all", "unattributable"),
     // replay_cli_test copies a fixture source out of the crates tree by a
     // relative path chosen at run time: the manifest directory's parent joined
-    // with `src_rel`, handed to `std::fs::copy`.
+    // with `src_rel`, handed to `std::fs::copy`. config_home_test also walks
+    // every Rust source under the crates tree through its `collect_rs` helper.
     ("cerulion_cli", "all", "whole-tree"),
+    // config_home_test's ALLOWED table names one source each in five other
+    // crates by its path under the crates tree: the files that join the home
+    // directory with the dot-cerulion name themselves.
+    ("cerulion_cli", "cerulion_core", "crate-path"),
+    ("cerulion_cli", "cerulion_discovery", "crate-path"),
+    ("cerulion_cli", "cerulion_hygiene", "crate-path"),
+    ("cerulion_cli", "cerulion_telemetry", "crate-path"),
+    ("cerulion_cli", "cerulion_viz", "crate-path"),
     // ros2_run_e2e_test names the preload the launcher injects,
     // `libcerulion_heaphook.so`, which is the artifact cerulion_heaphook builds.
     ("cerulion_cli", "cerulion_heaphook", "dlopen"),
