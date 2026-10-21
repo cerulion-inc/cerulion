@@ -18,19 +18,20 @@ use std::fmt;
 /// belongs to the buffer that issued it: it carries that buffer's identity,
 /// so another buffer refuses it ([`crate::TfError::UnknownFrameId`]) even
 /// when it holds a frame in the same slot. The identity is a process-wide
-/// counter value taken at construction; it tells buffers apart and never
-/// changes what a lookup returns. Prints as `#n`, the slot; use
+/// 64-bit counter value taken at construction that never wraps, so no two
+/// buffers of one process share it; it never changes what a lookup
+/// returns. Prints as `#n`, the slot; use
 /// [`crate::TfBuffer::describe`] for the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameId {
-    buffer: u32,
+    buffer: u64,
     slot: u32,
 }
 
 impl FrameId {
     /// The handle of the frame table slot `index` of the buffer whose
     /// identity is `buffer`.
-    pub(crate) fn new(buffer: u32, index: usize) -> Self {
+    pub(crate) fn new(buffer: u64, index: usize) -> Self {
         // The frame table never holds more than `u32::MAX` slots: the
         // constructor refuses a larger capacity.
         Self {
@@ -40,7 +41,7 @@ impl FrameId {
     }
 
     /// The identity of the buffer that issued this handle.
-    pub(crate) fn buffer(self) -> u32 {
+    pub(crate) fn buffer(self) -> u64 {
         self.buffer
     }
 

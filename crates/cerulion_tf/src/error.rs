@@ -119,10 +119,11 @@ pub enum TfError {
         /// The newest stamp the edge holds, in nanoseconds.
         newest_ns: u64,
     },
-    /// The stamp is more than the buffer's retention past the newest sample
-    /// on the edge: accepted, it would expire the whole ring at once. A
-    /// single far-future stamp is refused this way and leaves the ring as it
-    /// was; the next insert at a later stamp within the retention of the
+    /// The stamp is more than the buffer's jump limit
+    /// ([`TfBuffer::jump_limit`]) past the newest sample on the edge:
+    /// accepted, one bad stamp would expire the whole ring at once. A single
+    /// far-future stamp is refused this way and leaves the ring as it was;
+    /// the next insert at a later stamp within the jump limit of the
     /// refused one confirms the jump, since two inserts that agree on the
     /// new time are a clock that moved forward. Returned for every such
     /// insert; the edge counts every one.
@@ -340,9 +341,9 @@ impl TfError {
                 newest_ns,
             } => write!(
                 f,
-                "transform `{}` to `{}` at {stamp_ns} ns is more than the retention window past \
-                 the newest stamp {newest_ns} ns and is refused; a later transform within the \
-                 retention of it confirms the jump",
+                "transform `{}` to `{}` at {stamp_ns} ns is more than the jump limit past the \
+                 newest stamp {newest_ns} ns and is refused; a later transform within the jump \
+                 limit of it confirms the jump",
                 n(parent),
                 n(child)
             ),

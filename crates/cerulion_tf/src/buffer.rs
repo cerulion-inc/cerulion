@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::edge_policy::extrapolate;
@@ -29,6 +29,11 @@ pub const DEFAULT_RETENTION: Duration = Duration::from_secs(10);
 /// The publish rate bound of [`TfBufferConfig::default`], in Hz: the
 /// fastest rate at which an edge keeps its whole retention window.
 pub const DEFAULT_MAX_RATE_HZ: u32 = 100;
+
+/// The jump limit of [`TfBufferConfig::new`]: how far past an edge's newest
+/// stamp a dynamic insert may land before it needs a second stamp to
+/// confirm it.
+pub const DEFAULT_JUMP_LIMIT: Duration = Duration::from_secs(60);
 
 /// The name bytes [`TfBufferConfig::new`] gives each frame, on average.
 pub const NAME_BYTES_PER_FRAME: usize = 64;
@@ -54,11 +59,18 @@ pub struct TfBufferConfig {
     /// has no length limit of its own; a new frame that does not fit in
     /// what is left is refused ([`TfError::NameBudgetFull`]).
     pub name_bytes: usize,
+    /// How far past an edge's newest stamp a dynamic insert may land without
+    /// a second stamp to confirm it; the buffer uses the larger of this and
+    /// [`Self::retention`]. It is apart from the retention so that an edge
+    /// that publishes less often than its window keeps updating; a stamp
+    /// past it is refused with [`TfError::StampTooFarAhead`] until the next
+    /// insert confirms the jump. `Duration::MAX` turns the check off.
+    pub jump_limit: Duration,
 }
 
 impl Default for TfBufferConfig {
-    /// 64 frames, 10 s of history at up to 100 Hz per edge, and 4096
-    /// bytes of frame ids.
+    /// 64 frames, 10 s of history at up to 100 Hz per edge, 4096 bytes of
+    /// frame ids, and a 60 s jump limit.
     fn default() -> Self {
         Self::new(
             NonZeroUsize::new(DEFAULT_FRAME_CAPACITY).expect("a nonzero default"),
@@ -71,8 +83,9 @@ impl Default for TfBufferConfig {
 impl TfBufferConfig {
     /// `frames` frames, `retention` of history per edge, rings that hold
     /// the whole window for an edge publishing at up to `max_rate_hz`
-    /// (`retention * max_rate_hz + 1` samples, rounded down), and
-    /// [`NAME_BYTES_PER_FRAME`] name bytes per frame.
+    /// (`retention * max_rate_hz + 1` samples, rounded down),
+    /// [`NAME_BYTES_PER_FRAME`] name bytes per frame, and the
+    /// [`DEFAULT_JUMP_LIMIT`].
     ///
     /// # Panics
     ///
@@ -92,6 +105,7 @@ impl TfBufferConfig {
                 .get()
                 .checked_mul(NAME_BYTES_PER_FRAME)
                 .expect("the name budget fits a usize"),
+            jump_limit: DEFAULT_JUMP_LIMIT,
         }
     }
 }
@@ -125,7 +139,7 @@ struct Frame {
     jump_refusals: u64,
     /// The stamp of the last insert refused as [`TfError::StampTooFarAhead`]
     /// when no insert was accepted after it: the next insert at a later
-    /// stamp within the retention of it confirms the jump.
+    /// stamp within the jump limit of it confirms the jump.
     pending_jump: Option<u64>,
 }
 
@@ -209,13 +223,16 @@ pub struct EdgeInfo<'a> {
 /// [`TfBufferConfig::retention`] before its newest stamp, sorted by stamp.
 /// An insert expires every sample older than `newest - retention` (counted
 /// in [`Self::expired`]), and refuses a stamp older than that with
-/// [`TfError::StampBeforeWindow`]. A stamp more than the retention past the
-/// newest sample would expire the whole ring at once, so one bad stamp could
-/// empty an edge and leave every later good sample before its window; it is
-/// refused with [`TfError::StampTooFarAhead`]. The next insert confirms the
-/// jump when its stamp is later than the refused one and within the
-/// retention of it: two inserts that agree on the new time are a clock that
-/// moved forward (a publisher that paused), and the edge moves to it. Both
+/// [`TfError::StampBeforeWindow`]. A stamp more than the jump limit past
+/// the newest sample (the larger of [`TfBufferConfig::jump_limit`] and the
+/// retention) would let one bad stamp empty an edge and leave every later
+/// good sample before its window; it is refused with
+/// [`TfError::StampTooFarAhead`]. The next insert confirms the jump when its
+/// stamp is later than the refused one and within the jump limit of it: two
+/// inserts that agree on the new time are a clock that moved forward (a
+/// publisher that paused), and the edge moves to it. The jump limit is apart
+/// from the retention, so an edge that publishes less often than its window
+/// keeps updating, each sample replacing the last. Both
 /// refusals return their error every time and count on the edge
 /// ([`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]).
 ///
@@ -259,12 +276,14 @@ pub struct EdgeInfo<'a> {
 #[derive(Debug)]
 pub struct TfBuffer {
     /// The identity every [`FrameId`] this buffer issues carries.
-    tag: u32,
+    tag: u64,
     /// `frames.len()` is the capacity; the first `names` slots are in use.
     frames: Vec<Frame>,
     names: NameTable,
     ring_capacity: usize,
     retention_ns: u64,
+    /// The larger of the jump limit and the retention, in nanoseconds.
+    jump_limit_ns: u64,
     epoch: u64,
     expired: u64,
     replacements: u64,
@@ -291,7 +310,8 @@ impl TfBuffer {
     ///
     /// # Panics
     ///
-    /// When `config.frames` exceeds `u32::MAX`.
+    /// When `config.frames` exceeds `u32::MAX`, or when the process has
+    /// built `u64::MAX` buffers and has no identity left to give.
     // hot-path-alloc-ok-fn: construction, once per node; it sizes the frame
     // table, the name table and every ring so that insert and lookup never
     // allocate.
@@ -319,11 +339,12 @@ impl TfBuffer {
             })
             .collect();
         Self {
-            tag: NEXT_TAG.fetch_add(1, Ordering::Relaxed),
+            tag: next_tag(),
             frames: table,
             names: NameTable::with_capacity(frames, config.name_bytes),
             ring_capacity,
-            retention_ns: u64::try_from(config.retention.as_nanos()).unwrap_or(u64::MAX),
+            retention_ns: nanos(config.retention),
+            jump_limit_ns: nanos(config.jump_limit.max(config.retention)),
             epoch: 0,
             expired: 0,
             replacements: 0,
@@ -343,6 +364,13 @@ impl TfBuffer {
     /// How far back from its newest sample a dynamic edge keeps history.
     pub fn retention(&self) -> Duration {
         Duration::from_nanos(self.retention_ns)
+    }
+
+    /// How far past an edge's newest stamp a dynamic insert may land
+    /// before it needs a second stamp to confirm it: the larger of
+    /// [`TfBufferConfig::jump_limit`] and the retention.
+    pub fn jump_limit(&self) -> Duration {
+        Duration::from_nanos(self.jump_limit_ns)
     }
 
     /// The bytes the buffer holds for all frame ids together.
@@ -452,6 +480,7 @@ impl TfBuffer {
         };
         let (parent, child) = (self.id(p), self.id(c));
         let retention_ns = self.retention_ns;
+        let jump_limit_ns = self.jump_limit_ns;
         let cap = self.ring_capacity;
         let frame = &mut self.frames[c];
         if let Some(newest_ns) = frame.samples.back().map(|s| s.stamp_ns) {
@@ -464,10 +493,10 @@ impl TfBuffer {
                     newest_ns,
                 });
             }
-            if stamp_ns.saturating_sub(newest_ns) > retention_ns {
+            if stamp_ns.saturating_sub(newest_ns) > jump_limit_ns {
                 let confirmed = frame
                     .pending_jump
-                    .is_some_and(|prev| prev < stamp_ns && stamp_ns - prev <= retention_ns);
+                    .is_some_and(|prev| prev < stamp_ns && stamp_ns - prev <= jump_limit_ns);
                 if !confirmed {
                     frame.pending_jump = Some(stamp_ns);
                     frame.jump_refusals += 1;
@@ -495,8 +524,9 @@ impl TfBuffer {
             Err(i) => i,
         };
         // The window ends at the newer of the ring's newest stamp and this
-        // one; the check above keeps this stamp inside it, so every expired
-        // sample sits before `i`.
+        // one, and this stamp is never before its start, so a sample that
+        // expires sits before `i` or is the whole ring when the stamp moves
+        // the window past every sample it holds.
         let newest = ring.back().map_or(stamp_ns, |s| s.stamp_ns.max(stamp_ns));
         let cutoff = newest.saturating_sub(retention_ns);
         while ring.front().is_some_and(|s| s.stamp_ns < cutoff) {
@@ -1054,9 +1084,32 @@ impl TfBuffer {
     }
 }
 
-/// The identity the next buffer takes. It wraps after `u32::MAX` buffers,
-/// so two buffers built that far apart in one process share one.
-static NEXT_TAG: AtomicU32 = AtomicU32::new(0);
+/// The identity the next buffer takes.
+static NEXT_TAG: AtomicU64 = AtomicU64::new(0);
+
+/// A buffer identity no other buffer in this process has taken.
+///
+/// # Panics
+///
+/// When `u64::MAX` identities are taken: the counter never wraps, so a
+/// stale [`FrameId`] can never match a later buffer.
+fn next_tag() -> u64 {
+    let mut tag = NEXT_TAG.load(Ordering::Relaxed);
+    loop {
+        let next = tag
+            .checked_add(1)
+            .expect("a process builds fewer than u64::MAX tf buffers");
+        match NEXT_TAG.compare_exchange_weak(tag, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return tag,
+            Err(now) => tag = now,
+        }
+    }
+}
+
+/// `duration` in nanoseconds, `u64::MAX` when it is longer.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Counts a refusal on `count` and returns `err` for the first one only;
 /// every later one is `Ok(())`, read back through the counter.

@@ -159,6 +159,7 @@ fn small_buffer() -> TfBuffer {
         retention: Duration::from_nanos(1_000),
         ring_capacity: NonZeroUsize::new(3).unwrap(),
         name_bytes: 128,
+        jump_limit: Duration::ZERO,
     })
 }
 

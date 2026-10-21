@@ -149,12 +149,16 @@ The rules:
   10 s before its newest stamp, the tf2 default, whatever its publish rate.
   An insert drops every sample older than that window (counted in
   `expired()`), and a stamp older than the window is refused
-  (`StampBeforeWindow`). A stamp more than the window past the newest sample
-  is refused too (`StampTooFarAhead`): accepted, one bad stamp would expire
-  the whole ring and leave every later good sample before the window. The
-  next insert confirms the jump when its stamp is later than the refused one
-  and within the window of it, so a publisher that paused and resumes loses
-  one sample, and a lone far-future stamp changes nothing. Both refusals come
+  (`StampBeforeWindow`). A stamp more than the jump limit past the newest
+  sample is refused too (`StampTooFarAhead`): accepted, one bad stamp would
+  expire the whole ring and leave every later good sample before the window.
+  The jump limit is `TfBufferConfig::jump_limit`, 60 s by default, or the
+  window when that is longer. It is apart from the window, so an edge that
+  publishes less often than its window still updates, each sample replacing
+  the last. The next insert confirms the jump when its stamp is later than
+  the refused one and within the jump limit of it, so a publisher that paused
+  for longer than that and resumes loses one sample, and a lone far-future
+  stamp changes nothing. `Duration::MAX` turns the check off. Both refusals come
   back every time and count in the edge's `window_refusals` and
   `jump_refusals`, read through `edge()`, so a stuck edge is observable. A
   sample at a stamp the ring already holds is a
@@ -294,7 +298,7 @@ registered is carried as a `FrameLabel`, its first 48 bytes.
 | `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
 | `SecondWriter { parent, child, writer, existing_writer }` | Another writer already feeds the edge. | Two broadcasters publish the same edge; keep one. |
 | `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
-| `StampTooFarAhead { parent, child, stamp_ns, newest_ns }` | The stamp is more than the window past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. |
+| `StampTooFarAhead { parent, child, stamp_ns, newest_ns }` | The stamp is more than the jump limit past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. |
 | `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with a larger frame capacity. |
 | `NameBudgetFull { frame, len, left, budget }` | The new frame's `len`-byte id does not fit in the `left` bytes of the name budget. | Build the buffer with a larger `name_bytes`. |
 

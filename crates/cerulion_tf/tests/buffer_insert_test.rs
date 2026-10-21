@@ -38,12 +38,20 @@ fn small(frames: usize, samples: usize) -> TfBuffer {
     })
 }
 
-/// A buffer of 8 frames and rings of 8 with a `retention_ns` window.
+/// A buffer of 8 frames and rings of 8 with a `retention_ns` window and a
+/// zero jump limit, so the jump limit is the window itself.
 fn windowed(retention_ns: u64) -> TfBuffer {
+    jumpy(retention_ns, 0)
+}
+
+/// A buffer of 8 frames and rings of 8 with a `retention_ns` window and a
+/// `jump_limit_ns` jump limit.
+fn jumpy(retention_ns: u64, jump_limit_ns: u64) -> TfBuffer {
     TfBuffer::with_config(TfBufferConfig {
         frames: nz(8),
         retention: Duration::from_nanos(retention_ns),
         ring_capacity: nz(8),
+        jump_limit: Duration::from_nanos(jump_limit_ns),
         ..TfBufferConfig::default()
     })
 }
@@ -90,6 +98,10 @@ fn a_config_from_a_rate_bound_sizes_the_ring_for_the_whole_window() {
     assert_eq!(TfBufferConfig::default(), {
         TfBufferConfig::new(nz(64), Duration::from_secs(10), rate(100))
     });
+    // The jump limit is apart from the window: 60 s whatever the window.
+    assert_eq!(c.jump_limit, Duration::from_secs(60));
+    assert_eq!(cerulion_tf::DEFAULT_JUMP_LIMIT, Duration::from_secs(60));
+    assert_eq!(TfBuffer::new().jump_limit(), Duration::from_secs(60));
 }
 
 #[test]
@@ -937,8 +949,8 @@ fn a_write_conflicting_with_the_edge_is_refused_without_changing_it() {
         .unwrap();
 }
 
-// The retention of `windowed(1_000)` is 1000 ns: a stamp more than 1000 ns
-// past the newest sample is too far ahead.
+// The jump limit of `windowed(1_000)` is its 1000 ns window: a stamp more
+// than 1000 ns past the newest sample is too far ahead.
 
 #[test]
 fn a_far_future_stamp_is_refused_and_evicts_nothing() {
@@ -1032,6 +1044,98 @@ fn a_second_agreeing_stamp_confirms_a_forward_jump() {
     // The new timeline goes on as normal.
     b.insert(W, "odom", "base", 1_000_020, tf(7.0)).unwrap();
     assert_eq!(b.lookup("odom", "base", 1_000_020).unwrap(), tf(7.0));
+}
+
+#[test]
+fn a_zero_window_keeps_the_newest_sample_of_every_insert() {
+    // Retention zero and the default 60 s jump limit: each sample expires
+    // the one before it and none is refused.
+    let mut b = jumpy(0, 60_000_000_000);
+    for (stamp, x) in [(100, 1.0), (200, 2.0), (300, 3.0)] {
+        b.insert(W, "odom", "base", stamp, tf(x)).unwrap();
+    }
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.oldest_ns, e.newest_ns, e.jump_refusals),
+        (1, Some(300), Some(300), 0)
+    );
+    assert_eq!(b.expired(), 2);
+    assert_eq!(b.lookup("odom", "base", 300).unwrap(), tf(3.0));
+}
+
+#[test]
+fn an_edge_slower_than_its_window_keeps_updating() {
+    // A 100 ms window and a sample every 200 ms: every sample lands and
+    // replaces the last, since the 60 s jump limit is apart from the window.
+    let mut b = TfBuffer::with_config(TfBufferConfig {
+        retention: Duration::from_millis(100),
+        ..TfBufferConfig::default()
+    });
+    for (stamp, x) in [
+        (200_000_000, 1.0),
+        (400_000_000, 2.0),
+        (600_000_000, 3.0),
+        (800_000_000, 4.0),
+    ] {
+        b.insert(W, "odom", "base", stamp, tf(x)).unwrap();
+    }
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.newest_ns, e.jump_refusals, e.window_refusals),
+        (1, Some(800_000_000), 0, 0)
+    );
+    assert_eq!(b.expired(), 3);
+    assert_eq!(b.lookup("odom", "base", 800_000_000).unwrap(), tf(4.0));
+}
+
+#[test]
+fn the_jump_limit_and_not_the_window_bounds_a_forward_stamp() {
+    // A 1000 ns window and a 10 000 ns jump limit.
+    let mut b = jumpy(1_000, 10_000);
+    assert_eq!(b.jump_limit(), Duration::from_nanos(10_000));
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    // 10 000 ns past the newest is inside the limit: accepted, and it
+    // expires the sample the window no longer holds.
+    b.insert(W, "odom", "base", 10_100, tf(2.0)).unwrap();
+    assert_eq!(b.expired(), 1);
+    // One past the limit is refused until a second stamp agrees with it.
+    assert!(matches!(
+        b.insert(W, "odom", "base", 20_101, tf(3.0)),
+        Err(TfError::StampTooFarAhead {
+            stamp_ns: 20_101,
+            newest_ns: 10_100,
+            ..
+        })
+    ));
+    b.insert(W, "odom", "base", 30_101, tf(4.0)).unwrap();
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.newest_ns, e.jump_refusals),
+        (1, Some(30_101), 1)
+    );
+}
+
+#[test]
+fn a_jump_limit_shorter_than_the_window_is_the_window() {
+    // A stamp the window still holds is never refused as a jump.
+    let mut b = jumpy(1_000, 10);
+    assert_eq!(b.jump_limit(), Duration::from_nanos(1_000));
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "odom", "base", 1_100, tf(2.0)).unwrap();
+    assert_eq!(edge(&b, "base").samples, 2);
+}
+
+#[test]
+fn a_jump_limit_of_duration_max_turns_the_check_off() {
+    let mut b = TfBuffer::with_config(TfBufferConfig {
+        jump_limit: Duration::MAX,
+        ..TfBufferConfig::default()
+    });
+    assert_eq!(b.jump_limit(), Duration::from_nanos(u64::MAX));
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "odom", "base", u64::MAX, tf(2.0)).unwrap();
+    let e = edge(&b, "base");
+    assert_eq!((e.samples, e.newest_ns), (1, Some(u64::MAX)));
 }
 
 #[test]
@@ -1171,9 +1275,9 @@ fn every_refusal_names_the_frames_involved() {
                 newest_ns: 300,
             },
             "",
-            "transform `odom` to `base` at 20000000301 ns is more than the retention window past \
-             the newest stamp 300 ns and is refused; a later transform within the retention of \
-             it confirms the jump",
+            "transform `odom` to `base` at 20000000301 ns is more than the jump limit past the \
+             newest stamp 300 ns and is refused; a later transform within the jump limit of it \
+             confirms the jump",
         ),
         (
             TfError::FrameTableFull {
