@@ -210,7 +210,7 @@ impl Drop for BgThreadDeathGuard {
         if !self.clean {
             tracing::error!(
                 thread = self.msg,
-                "a network background thread died unexpectedly - remote demand may no longer \
+                "a network background thread died unexpectedly: remote demand may no longer \
                  be discovered on links with broken liveliness propagation; restart \
                  the gateway"
             );
