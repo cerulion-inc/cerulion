@@ -2048,3 +2048,65 @@ fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
         "the latched catalog must see the restarted gateway's hash"
     );
 }
+
+/// A gateway restarted on the same manager with a smaller topic set withdraws
+/// the prior run's announce tokens: the manager outlives the first gateway, so
+/// without the withdrawal a remote `topic list` keeps listing topics the new
+/// run no longer serves. Hand oracle.
+#[test]
+fn a_restarted_gateway_withdraws_the_prior_runs_announcements() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_withdraw_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rctest".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let kept = format!("/rt/withdraw/kept/{}", unique_id());
+    let dropped = format!("/rt/withdraw/dropped/{}", unique_id());
+    let plan = |announce: Vec<String>| GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce,
+        ingress: vec![],
+    };
+    let first = GatewayRuntime::new(
+        Arc::clone(&manager),
+        plan(vec![kept.clone(), dropped.clone()]),
+    )
+    .expect("first gateway boot");
+    drop(first);
+
+    let _restarted = GatewayRuntime::new(Arc::clone(&manager), plan(vec![kept.clone()]))
+        .expect("restarted gateway boot");
+    let network = manager.network().expect("network");
+    assert_eq!(
+        network.announced_topics(),
+        {
+            let mut both = vec![kept.clone(), dropped.clone()];
+            both.sort();
+            both
+        },
+        "the restarted gateway does not withdraw on its own"
+    );
+
+    assert_eq!(
+        network.withdraw_announcements_except(std::slice::from_ref(&kept)),
+        1
+    );
+    assert_eq!(network.announced_topics(), vec![kept.clone()]);
+    assert_eq!(
+        network.withdraw_announcements_except(std::slice::from_ref(&kept)),
+        0,
+        "a second withdrawal finds nothing left to withdraw"
+    );
+    assert!(
+        network.has_identity_token(),
+        "the bare identity token is not an egress announcement and stays"
+    );
+}

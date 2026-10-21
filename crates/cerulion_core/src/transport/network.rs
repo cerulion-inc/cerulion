@@ -465,7 +465,7 @@ fn apply_demand_reconcile(
                     Ok(true) => tracing::info!(
                         topic = %canonical,
                         remove_confirm = REMOVE_CONFIRM,
-                        "network bridge disabled - demand absent across REMOVE_CONFIRM \
+                        "network bridge disabled: demand absent across REMOVE_CONFIRM \
                          consecutive reconcile passes"
                     ),
                     Ok(false) => {}
@@ -529,7 +529,7 @@ fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<St
             Err(e) => tracing::debug!(
                 error = %e,
                 "reconciler belt: could not snapshot the registered egress set \
-                 (bridge manager poisoned) - the belt keeps its last-known iteration set this pass"
+                 (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
             ),
         },
         // Unchanged (steady state) - the cheap path, no snapshot.
@@ -537,7 +537,7 @@ fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<St
         Err(e) => tracing::debug!(
             error = %e,
             "reconciler belt: could not read the registered egress count \
-             (bridge manager poisoned) - the belt keeps its last-known iteration set this pass"
+             (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
         ),
     }
 }
@@ -578,7 +578,7 @@ fn gather_with_latch(
             if gather_latch.consecutive_failures > 0 {
                 tracing::info!(
                     suppressed = gather_latch.consecutive_failures,
-                    "demand reconcile query recovered - the reconciler can query \
+                    "demand reconcile query recovered: the reconciler can query \
                      again; egress flags reconcile this pass"
                 );
                 gather_latch.consecutive_failures = 0;
@@ -590,7 +590,7 @@ fn gather_with_latch(
             if gather_latch.consecutive_failures == 1 {
                 tracing::warn!(
                     error = %e,
-                    "demand reconcile query FAILED - the demand reconciler cannot \
+                    "demand reconcile query FAILED: the demand reconciler cannot \
                      query, so egress flags are FROZEN this regime (no topic can start or \
                      stop egressing until the query recovers); repeats log at debug"
                 );
@@ -598,8 +598,8 @@ fn gather_with_latch(
                 tracing::debug!(
                     error = %e,
                     consecutive_failures = gather_latch.consecutive_failures,
-                    "demand reconcile query still failing - egress flags frozen \
-                     (repeat - see the first warning for this regime)"
+                    "demand reconcile query still failing: egress flags frozen \
+                     (repeat; see the first warning for this regime)"
                 );
             }
             None
@@ -962,7 +962,7 @@ impl DemandGetState {
         if latch.consecutive_failures == 1 {
             tracing::warn!(
                 error = %error,
-                "demand GET FAILED - the demander cannot query the producer's demand \
+                "demand GET FAILED: the demander cannot query the producer's demand \
                  queryable, so its ingress topics may never start egressing on the remote; \
                  repeats log at debug"
             );
@@ -970,7 +970,7 @@ impl DemandGetState {
             tracing::debug!(
                 error = %error,
                 consecutive_failures = latch.consecutive_failures,
-                "demand GET still failing (repeat - see the first warning for this regime)"
+                "demand GET still failing (repeat; see the first warning for this regime)"
             );
         }
     }
@@ -984,7 +984,7 @@ impl DemandGetState {
         if latch.consecutive_failures > 0 {
             tracing::info!(
                 suppressed = latch.consecutive_failures,
-                "demand GET recovered - the demander can query the producer again"
+                "demand GET recovered: the demander can query the producer again"
             );
             latch.consecutive_failures = 0;
         }
@@ -1214,14 +1214,14 @@ impl PermissiveShmProbe {
             tracing::debug!(
                 topic = %canonical,
                 detail = %detail,
-                "permissive SHM probe REFUSED (repeat - see the first warning; \
+                "permissive SHM probe REFUSED (repeat; see the first warning; \
                  loop_refusal_count keeps counting)"
             );
         } else {
             tracing::warn!(
                 topic = %canonical,
                 detail = %detail,
-                "permissive SHM probe REFUSED - this gateway must never serve \
+                "permissive SHM probe REFUSED: this gateway must never serve \
                  it to the network (repeats log at debug; loop_refusal_count keeps counting)"
             );
         }
@@ -1255,7 +1255,7 @@ impl PermissiveShmProbe {
             Ok(()) => {
                 tracing::info!(
                     topic = %canonical,
-                    "permissive SHM probe: deferred announce HEALED - the network announce \
+                    "permissive SHM probe: deferred announce HEALED; the network announce \
                      that failed on an earlier probe hit succeeded on this demand's re-attempt; \
                      remote discovery now lists this topic (the flag was grantable throughout)"
                 );
@@ -1267,7 +1267,7 @@ impl PermissiveShmProbe {
                     error = %e,
                     "permissive SHM probe: deferred announce re-attempt FAILED again \
                      (registered + demand-grantable; the flag is RETAINED and re-attempts on the \
-                     next demand - see the first serve warning; announce_deferred keeps counting)"
+                     next demand; see the first serve warning; announce_deferred keeps counting)"
                 );
             }
         }
@@ -1298,7 +1298,7 @@ impl PermissiveShmProbe {
         let Some(manager) = self.manager.upgrade() else {
             tracing::debug!(
                 topic = %topic,
-                "permissive SHM probe skipped - owning manager is gone (mid-Drop)"
+                "permissive SHM probe skipped: owning manager is gone (mid-Drop)"
             );
             return ProbeVerdict::ManagerGone;
         };
@@ -1363,7 +1363,7 @@ impl PermissiveShmProbe {
         {
             // Its local SHM service is this gateway's OWN re-injection - serving it
             // back out would echo-loop.
-            self.record_loop_refusal(&canonical, "network INGRESS topic - echo-loop");
+            self.record_loop_refusal(&canonical, "network INGRESS topic (echo-loop)");
             return ProbeVerdict::LoopRefused;
         }
 
@@ -1388,7 +1388,7 @@ impl PermissiveShmProbe {
                         topic = %canonical,
                         error = %e,
                         "permissive SHM probe: live service found but registration FAILED \
-                         (bridge manager poisoned) - not served"
+                         (bridge manager poisoned): not served"
                     );
                     return ProbeVerdict::Missing;
                 }
@@ -1407,7 +1407,7 @@ impl PermissiveShmProbe {
                         topic = %canonical,
                         error = %e,
                         "permissive SHM probe HIT registered + demand-grantable but its \
-                         network announce FAILED - remote discovery will not list it yet (a demand \
+                         network announce FAILED: remote discovery will not list it yet (a demand \
                          token still grants egress; the flag is RETAINED). Heals on the next demand: \
                          its AlreadyRegistered arm re-attempts the announce idempotently"
                     );
@@ -1418,7 +1418,7 @@ impl PermissiveShmProbe {
                 self.loop_flood_warned.store(false, Ordering::Relaxed);
                 tracing::info!(
                     topic = %canonical,
-                    "permissive SHM probe HIT - live local service registered + announced \
+                    "permissive SHM probe HIT: live local service registered + announced \
                      on demand (announce-on-first-serve)"
                 );
                 ProbeVerdict::Served
@@ -1431,14 +1431,14 @@ impl PermissiveShmProbe {
                 if !self.flood_warned.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         topic = %canonical,
-                        "permissive SHM probe MISS - remote demand for a topic with no \
+                        "permissive SHM probe MISS: remote demand for a topic with no \
                          live local SHM service; refused (nothing created). Repeats log at debug; \
                          miss_count keeps counting"
                     );
                 } else {
                     tracing::debug!(
                         topic = %canonical,
-                        "permissive SHM probe MISS (repeat - see the first warning)"
+                        "permissive SHM probe MISS (repeat; see the first warning)"
                     );
                 }
                 ProbeVerdict::Missing
@@ -1523,7 +1523,7 @@ fn handle_query(
         None => {
             tracing::debug!(
                 key = %query.key_expr().as_str(),
-                "query surface: unrecognized or malformed key - ignored"
+                "query surface: unrecognized or malformed key; ignored"
             );
         }
     }
@@ -1641,7 +1641,7 @@ fn catalog_serve_decision(
             robot = %robot,
             plane = "zenoh-lan",
             reason = %reason,
-            "catalog GET REFUSED by the demand-authorization gate - the \
+            "catalog GET REFUSED by the demand-authorization gate: the \
              demanding party is not authorized for this machine (account/pairing grant\
              ); enumerating nothing"
         );
@@ -1710,7 +1710,7 @@ fn schema_serve_decision(
             requested = %requested,
             plane = "zenoh-lan",
             reason = %reason,
-            "schema GET REFUSED by the demand-authorization gate - the \
+            "schema GET REFUSED by the demand-authorization gate: the \
              demanding party is not authorized for this machine (account/pairing grant\
              ); serving nothing"
         );
@@ -1814,7 +1814,7 @@ fn runs_serve_decision(
             robot = %robot,
             plane = "zenoh-lan",
             reason = %reason,
-            "runs GET REFUSED by the demand-authorization gate - the \
+            "runs GET REFUSED by the demand-authorization gate: the \
              demanding party is not authorized for this machine (account/pairing grant\
              ); serving no runs"
         );
@@ -1826,7 +1826,7 @@ fn runs_serve_decision(
             tracing::warn!(
                 robot = %robot,
                 error = %e,
-                "runs GET: the run registry could not be gathered - answering \
+                "runs GET: the run registry could not be gathered; answering \
                  'could not establish', never 'no runs'"
             );
             return cerulion_q::build_runs_reply(
@@ -1844,7 +1844,7 @@ fn runs_serve_decision(
             run_id = %cerulion_q::format_run_id(skip.run_id),
             run_dir = %skip.run_dir,
             reason = %skip.reason,
-            "runs GET: skipping a live run whose directory could not be read - \
+            "runs GET: skipping a live run whose directory could not be read; \
              an entry carrying an empty document would render desk-side as a graph with \
              no nodes"
         );
@@ -2147,7 +2147,7 @@ fn demand_grant_decision(
             topic = %canonical,
             plane = "zenoh-lan",
             reason = %reason,
-            "demand REFUSED by the demand-authorization gate - the demanding \
+            "demand REFUSED by the demand-authorization gate: the demanding \
              party is not authorized for this machine (account/pairing grant); \
              serving nothing"
         );
@@ -2179,7 +2179,7 @@ fn demand_grant_decision(
     if demand_put_targets_self_ingress(self_ingress, canonical) {
         tracing::debug!(
             topic = %canonical,
-            "demand GET for our own network-ingress topic - not an egress candidate (loop exclusion); refused without enable_bridge"
+            "demand GET for our own network-ingress topic: not an egress candidate (loop exclusion); refused without enable_bridge"
         );
         get_state.record_refusal();
         return ACK_REFUSED;
@@ -2249,7 +2249,7 @@ fn apply_live_put_demand(
             topic = %topic,
             plane = "zenoh-lan",
             reason = %reason,
-            "liveliness demand REFUSED by the demand-authorization gate - \
+            "liveliness demand REFUSED by the demand-authorization gate: \
              the demanding party is not authorized for this machine (account/pairing \
              grant); egress not enabled"
         );
@@ -2405,7 +2405,7 @@ fn run_get_expiry(
                 tracing::info!(
                     topic = %topic,
                     ttl_secs = DEMAND_TTL.as_secs(),
-                    "network bridge disabled - no demand GET within DEMAND_TTL and \
+                    "network bridge disabled: no demand GET within DEMAND_TTL and \
                      liveliness absent (both demand paths released this topic)"
                 );
             }
@@ -2475,7 +2475,7 @@ fn run_demand_get_pass_on_session(
         }
         Err(e) => tracing::debug!(
             error = %e,
-            "demand GET: announce identity harvest failed - using the wildcard selector"
+            "demand GET: announce identity harvest failed; using the wildcard selector"
         ),
     }
 
@@ -2715,7 +2715,7 @@ fn record_ingress_rejection(
         tracing::debug!(
             topic = %topic,
             reason = %rejection,
-            "ingress: dropped network frame (repeat - see the first warning for this class)"
+            "ingress: dropped network frame (repeat; see the first warning for this class)"
         );
     } else {
         tracing::warn!(
@@ -2752,23 +2752,23 @@ fn record_reinject_failure(
         (true, Some(e)) => tracing::debug!(
             topic = %topic,
             error = %e,
-            "ingress: re-injection into local iceoryx2 failed - validated frame dropped \
-             (repeat - see the first warning for this class)"
+            "ingress: re-injection into local iceoryx2 failed: validated frame dropped \
+             (repeat; see the first warning for this class)"
         ),
         (true, None) => tracing::debug!(
             topic = %topic,
-            "ingress: local publisher mutex poisoned - validated frame dropped \
-             (repeat - see the first error for this class)"
+            "ingress: local publisher mutex poisoned: validated frame dropped \
+             (repeat; see the first error for this class)"
         ),
         (false, Some(e)) => tracing::warn!(
             topic = %topic,
             error = %e,
-            "ingress: re-injection into local iceoryx2 failed - validated frame dropped \
+            "ingress: re-injection into local iceoryx2 failed: validated frame dropped \
              (reinject_failure_drops counts these; repeats log at debug)"
         ),
         (false, None) => tracing::error!(
             topic = %topic,
-            "ingress: local publisher mutex poisoned - validated frame dropped \
+            "ingress: local publisher mutex poisoned: validated frame dropped \
              (reinject_failure_drops counts these; repeats log at debug)"
         ),
     }
@@ -2947,7 +2947,7 @@ impl IngressInjector {
                         if self.warn.reset() {
                             tracing::info!(
                                 topic = %self.topic,
-                                "ingress: recovered - frames validating and re-injecting again"
+                                "ingress: recovered; frames validating and re-injecting again"
                             );
                         }
                         self.counters.frames.fetch_add(1, Ordering::Relaxed);
@@ -3755,8 +3755,8 @@ impl NetworkManager {
         let Some(entry) = removed else {
             return Err(TransportError::Internal {
                 reason: format!(
-                    "topic '{canonical}' has no registered network ingress bridge to unregister \
-                     - it was never registered, or it was already unregistered"
+                    "topic '{canonical}' has no registered network ingress bridge to unregister: \
+                     it was never registered, or it was already unregistered"
                 ),
             });
         };
@@ -3777,7 +3777,7 @@ impl NetworkManager {
 
         tracing::info!(
             topic = %canonical,
-            "network ingress bridge unregistered - subscriber + demand token undeclared, \
+            "network ingress bridge unregistered: subscriber + demand token undeclared, \
              injection publisher released"
         );
         Ok(())
@@ -3808,7 +3808,7 @@ impl NetworkManager {
             Some(robot) => Ok(robot),
             None => Err(TransportError::InvalidTransportConfig {
                 reason: "announcing on the network requires a robot identity, but this \
-                         NetworkConfig has none - set `NetworkConfig.robot_identity` \
+                         NetworkConfig has none; set `NetworkConfig.robot_identity` \
                          (both the gateway and `GraphConfig::network_transport_config` \
                          stamp it from the resolved hostname or the \
                          `CERULION_ROBOT_IDENTITY` override, never the graph prefix)"
@@ -3981,6 +3981,41 @@ impl NetworkManager {
             .contains_key(&canonical)
     }
 
+    /// Undeclare every retained egress-announce token whose topic is not in
+    /// `keep` (topics are canonicalized before the compare), and return how
+    /// many were withdrawn. The bare identity token stays.
+    ///
+    /// A host that restarts its gateway inside one process lifetime calls this
+    /// once the next run's gateway is up: the manager outlives the gateway, so
+    /// without it a remote `topic list` keeps listing the prior run's topics
+    /// after they leave the new run's set. Poison-recovering.
+    pub fn withdraw_announcements_except(&self, keep: &[String]) -> usize {
+        // hot-path-alloc-ok: gateway restart, never per frame.
+        let keep: HashSet<String> = keep
+            .iter()
+            .map(|topic| canonical_topic(topic).into_owned())
+            .collect();
+        let withdrawn: Vec<TopicToken> = {
+            let mut announced = self
+                .announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale: Vec<String> = announced
+                .keys()
+                .filter(|topic| !keep.contains(*topic))
+                .cloned()
+                .collect();
+            stale
+                .iter()
+                .filter_map(|topic| announced.remove(topic))
+                .collect()
+        };
+        // Dropped outside the lock: each drop undeclares its liveliness token.
+        let count = withdrawn.len();
+        drop(withdrawn);
+        count
+    }
+
     /// The canonical topic names currently announced on the network,
     /// SORTED for deterministic assertions (Principle #3). Poison-recovering.
     pub fn announced_topics(&self) -> Vec<String> {
@@ -4080,7 +4115,7 @@ impl NetworkManager {
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
-                                "failed to create liveliness subscriber - bridge disabled"
+                                "failed to create liveliness subscriber: bridge disabled"
                             );
                             // Fall back to just waiting for shutdown
                             let _ = rx.recv().await;
@@ -4115,7 +4150,7 @@ impl NetworkManager {
                                             tracing::warn!(
                                                 key = %key,
                                                 "liveliness key matched the namespace but is \
-                                                 not a canonical topic - ignored"
+                                                 not a canonical topic; ignored"
                                             );
                                         }
                                         if let Some(topic) = recovered {
@@ -4149,9 +4184,9 @@ impl NetworkManager {
                                                         // enable_bridge and warns.
                                                         let is_self_ingress = demand_put_targets_self_ingress(&self_ingress, topic);
                                                         if is_self_ingress {
-                                                            tracing::debug!(topic = %topic, "demand for our own network-ingress topic - not an egress candidate (loop exclusion); enable_bridge skipped");
+                                                            tracing::debug!(topic = %topic, "demand for our own network-ingress topic: not an egress candidate (loop exclusion); enable_bridge skipped");
                                                         } else if let Err(e) = apply_live_put_demand(&bridge_mgr, probe.as_deref(), demand_authorizer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().as_ref(), topic) {
-                                                            tracing::error!(topic = %topic, error = %e, "bridge manager poisoned - stopping liveliness watcher");
+                                                            tracing::error!(topic = %topic, error = %e, "bridge manager poisoned: stopping liveliness watcher");
                                                             break;
                                                         }
                                                     }
@@ -4159,10 +4194,10 @@ impl NetworkManager {
                                                         match bridge_mgr.disable_bridge(topic) {
                                                             // Caller-owned log on the true→false edge:
                                                             // a `Delete` is a real-time subscriber departure.
-                                                            Ok(true) => tracing::info!(topic = %topic, "network bridge disabled - remote subscriber left"),
+                                                            Ok(true) => tracing::info!(topic = %topic, "network bridge disabled: remote subscriber left"),
                                                             Ok(false) => {}
                                                             Err(e) => {
-                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned - stopping liveliness watcher");
+                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned: stopping liveliness watcher");
                                                                 break;
                                                             }
                                                         }
@@ -4172,7 +4207,7 @@ impl NetworkManager {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::error!(error = %e, "liveliness subscriber channel closed unexpectedly - network bridge state is now frozen");
+                                        tracing::error!(error = %e, "liveliness subscriber channel closed unexpectedly: network bridge state is now frozen");
                                         break;
                                     }
                                 }
@@ -4299,7 +4334,7 @@ impl NetworkManager {
         // the GET-expiry sweep of its runtime-granted topics.
         if announced.is_empty() && !start_when_empty {
             tracing::debug!(
-                "demand reconciler: no announced topics (non-permissive) - reconciler \
+                "demand reconciler: no announced topics (non-permissive); reconciler \
                  not started"
             );
             return Ok(());
@@ -4587,7 +4622,7 @@ impl NetworkManager {
                     reason: "demand-get state topics mutex poisoned".to_string(),
                 })?;
             if topics.is_empty() {
-                tracing::debug!("demand-get loop: no ingress topics - loop not started");
+                tracing::debug!("demand-get loop: no ingress topics; loop not started");
                 return Ok(());
             }
         }
@@ -5199,7 +5234,7 @@ mod tests {
         assert_eq!(
             mgr.ingress_demand_state.pass_count(),
             1,
-            "abort=false runs the pass exactly once (anti-tautology - the closure is honored)"
+            "abort=false runs the pass exactly once (anti-tautology: the closure is honored)"
         );
     }
 
@@ -5581,7 +5616,7 @@ mod tests {
             retry["period_init_ms"],
             serde_json::json!(0),
             "bounded_connect must set connect/retry.period_init_ms=0 (single \
-             inline attempt - reachable robots connect before the open returns)"
+             inline attempt; reachable robots connect before the open returns)"
         );
         assert_eq!(
             cfg.get_json("connect/exit_on_failure").ok().as_deref(),

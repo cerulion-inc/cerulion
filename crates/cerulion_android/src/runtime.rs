@@ -561,6 +561,12 @@ impl EmbeddedRuntime {
                             }
                             EmbedError::Network(error.to_string())
                         })?;
+                // The manager outlives the prior gateway and keeps its announce
+                // tokens: withdraw every topic the new run does not serve, or a
+                // remote `topic list` keeps listing the prior run's topics.
+                if let Some(network) = manager.network() {
+                    network.withdraw_announcements_except(&serving_clone.served_topics);
+                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let status = Arc::clone(&self.status);
