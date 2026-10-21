@@ -238,7 +238,15 @@ pub fn select_ros_prefixes<'a>(
 pub const CPP_SHIM_INCLUDE_PACKAGES: &[(&str, &str)] = &[
     (CPP_SHIM_INTROSPECTION_PACKAGE, "message_introspection.hpp"),
     ("rosidl_runtime_cpp", "message_initialization.hpp"),
+    (CPP_SHIM_BUFFER_PACKAGE, "buffer.hpp"),
 ];
+
+/// The package of [`CPP_SHIM_INCLUDE_PACKAGES`] that serves
+/// `rosidl::Buffer` (Lyrical and Rolling). The shim includes
+/// `rosidl_buffer/buffer.hpp` only on a build whose bindings carry the
+/// `is_rosidl_buffer` capability, and build.rs refuses a generated build of
+/// that era on which this package did not resolve.
+pub const CPP_SHIM_BUFFER_PACKAGE: &str = "rosidl_buffer";
 
 /// The ONE package of [`CPP_SHIM_INCLUDE_PACKAGES`] that gates the shim's
 /// `__has_include`: the header it names is the one the shim includes. Resolving
@@ -256,6 +264,8 @@ pub struct CppShimIncludes {
     /// Whether the package the shim's `__has_include` names resolved. This, not
     /// `dirs.is_empty()`, is what says the cross-check will be live.
     pub introspection_resolved: bool,
+    /// Whether [`CPP_SHIM_BUFFER_PACKAGE`] resolved.
+    pub buffer_resolved: bool,
 }
 
 /// The include directories that make the shim's C++ includes resolve, found by
@@ -297,6 +307,7 @@ pub fn cpp_shim_include_dirs(
 ) -> CppShimIncludes {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut introspection_resolved = false;
+    let mut buffer_resolved = false;
     for (pkg, header) in CPP_SHIM_INCLUDE_PACKAGES {
         let mut found = None;
         for root in roots {
@@ -314,6 +325,9 @@ pub fn cpp_shim_include_dirs(
             if *pkg == CPP_SHIM_INTROSPECTION_PACKAGE {
                 introspection_resolved = true;
             }
+            if *pkg == CPP_SHIM_BUFFER_PACKAGE {
+                buffer_resolved = true;
+            }
             if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -322,6 +336,7 @@ pub fn cpp_shim_include_dirs(
     CppShimIncludes {
         dirs,
         introspection_resolved,
+        buffer_resolved,
     }
 }
 
@@ -1237,6 +1252,37 @@ mod tests {
             (vec!["/q/include".to_string()], false),
             "a non-empty list without the gating package must not read as resolved"
         );
+    }
+
+    /// The `rosidl_buffer` package resolves from the merged Lyrical layout
+    /// (`<root>/rosidl_buffer/rosidl_buffer/buffer.hpp`), sets its own flag
+    /// and nothing else, and a pre-Lyrical tree leaves the flag false.
+    #[test]
+    fn the_shim_resolves_the_rosidl_buffer_package_only_where_it_is_installed() {
+        use std::path::{Path, PathBuf};
+        fn resolve(files: &[&str]) -> CppShimIncludes {
+            let owned: Vec<String> = files.iter().map(|s| (*s).to_string()).collect();
+            let mut probe = |p: &Path| owned.iter().any(|f| Path::new(f) == p);
+            cpp_shim_include_dirs(&[PathBuf::from("/l/include")], &mut probe)
+        }
+        let lyrical = resolve(&[
+            "/l/include/rosidl_typesupport_introspection_cpp/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+            "/l/include/rosidl_buffer/rosidl_buffer/buffer.hpp",
+        ]);
+        assert!(lyrical.introspection_resolved);
+        assert!(lyrical.buffer_resolved);
+        assert_eq!(
+            lyrical.dirs,
+            vec![
+                PathBuf::from("/l/include/rosidl_typesupport_introspection_cpp"),
+                PathBuf::from("/l/include/rosidl_buffer"),
+            ]
+        );
+        let jazzy = resolve(&[
+            "/l/include/rosidl_typesupport_introspection_cpp/rosidl_typesupport_introspection_cpp/message_introspection.hpp",
+        ]);
+        assert!(jazzy.introspection_resolved);
+        assert!(!jazzy.buffer_resolved);
     }
 
     // HAND-WRITTEN era fingerprints (deliberately NOT derived from the

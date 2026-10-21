@@ -152,7 +152,7 @@ pub struct GraphConfig {
     /// Under `cerulion graph run` on the real clock, an absent block (and a
     /// block whose `mode` is `disabled`) means the PERMISSIVE default: one
     /// gateway outside the graph process opens the machine's zenoh session and
-    /// announces every topic the graph produces. On the default Unix path that
+    /// announces the topics the graph produces when LAN access is open. On the default Unix path that
     /// gateway is hosted by `cerulion-netd`, which listens and advertises over
     /// mDNS only when `CERULION_NETD_LISTEN` is set; the per-run fallback
     /// gateway child listens on port 7683 (`CERULION_GATEWAY_PORT` overrides
@@ -311,7 +311,7 @@ pub enum NetworkMode {
     /// The block imposes NO restriction, exactly like an absent block. The
     /// default when `mode:` is omitted. Under `cerulion graph run` on the real
     /// clock that is the PERMISSIVE default (a gateway process, mDNS
-    /// discovery, every produced topic announced), NOT "no network": the local-only
+    /// discovery, produced topics announced when LAN access is open), NOT "no network": the local-only
     /// switch is `graph run --network off`. Declaring `egress`/`ingress` under
     /// this mode is a graph-load error.
     #[default]

@@ -373,8 +373,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
-        /// omitted, the paired desk key `~/.cerulion/desk.key` is used if it
-        /// exists (written by `cerulion pair`), else an EPHEMERAL key, which an
+        /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
+        /// named `~/.cerulion/desk.key`) is used if it exists (written by
+        /// `cerulion pair` or `cerulion login`), else an EPHEMERAL key, which an
         /// unpaired robot REFUSES, so pair the desk first with `cerulion pair`.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
@@ -407,9 +408,10 @@ pub enum Commands {
     ///
     /// The robot owner starts code pairing on the robot and shares a short code;
     /// you supply it here (`--code`, else typed at the prompt or piped on stdin).
-    /// The desk device key is created at `~/.cerulion/desk.key` on the first pair
-    /// (0600 permissions) and reused afterwards. An existing key is never
-    /// overwritten.
+    /// The desk device key is this machine's key,
+    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
+    /// created on the first pair or sign-in (0600 permissions) and reused
+    /// afterwards. An existing key is never overwritten.
     ///
     /// STDOUT carries deterministic, machine-parseable state lines:
     /// `pairing: robot=<name> eid=<hex>`, then on success
@@ -454,7 +456,8 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         label: Option<String>,
         /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
-        /// `~/.cerulion/desk.key` (created 0600 on the first pair, reused after).
+        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
+        /// the first pair or sign-in, reused after).
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         key_file: Option<PathBuf>,
         /// Self-hosted relay URL. Default: n0 public relays.
@@ -1518,9 +1521,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// announces every produced topic on the LAN, viewable by any peer
-        /// without pairing. Restrict exposure with a `network:` block, or pass
-        /// `off` for local-only.
+        /// can announce every produced topic when LAN access is open. Android
+        /// defaults to paired-only access, which withholds topic announcements.
+        /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
         /// Cap, in entries, on the in-memory fire trace. The trace is a BOUNDED
@@ -2365,7 +2368,7 @@ mod pair_dispatch_tests {
                 assert!(label.is_none(), "the label defaults to the desk hostname");
                 assert!(
                     key_file.is_none(),
-                    "the key file defaults to ~/.cerulion/desk.key"
+                    "the key file defaults to this machine's key"
                 );
                 assert!(relay_url.is_none());
                 assert!(!relay_disabled);

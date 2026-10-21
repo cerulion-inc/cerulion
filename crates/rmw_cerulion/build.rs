@@ -436,7 +436,15 @@ fn main() {
     // (C++11). Linux g++ defaults high enough to hide this, but macOS
     // clang rejects `noexcept` without an explicit -std. flag_if_supported
     // keeps it portable across compilers that spell the flag differently.
-    shim.cpp(true).flag_if_supported("-std=c++14");
+    // `rosidl/buffer.hpp` (Lyrical and Rolling) uses `if constexpr`, so a
+    // build whose bindings carry the Buffer member compiles the shim as
+    // C++17; every earlier era keeps C++14.
+    let buffer_era = observed_caps.contains(&"is_rosidl_buffer");
+    shim.cpp(true).flag_if_supported(if buffer_era {
+        "-std=c++17"
+    } else {
+        "-std=c++14"
+    });
     for dir in &include_dirs {
         shim.include(dir);
     }
@@ -494,7 +502,7 @@ fn main() {
             // ROS_DISTRO-with-no-headers panic above. This build produces a
             // deployable `.so` whose C++ mirror would then never be
             // cross-checked against the distro it claims, the release recipe
-            // (`tools/scripts/build_rmw_jazzy.sh`) runs no `cargo test`, so the
+            // (`tools/scripts/build_rmw.sh`) runs no `cargo test`, so the
             // backstop test never runs at release-build time, and a cargo
             // warning is swallowed by `-q`.
             panic!(
@@ -508,8 +516,30 @@ fn main() {
             );
         }
     }
-    if observed_caps.contains(&"is_rosidl_buffer") {
+    if buffer_era {
         shim.define("RMW_CERULION_HAS_IS_ROSIDL_BUFFER", None);
+        if generated {
+            // The shim reads and fills `rosidl::Buffer<uint8_t>` through the
+            // distro's own header. Without it the shim would not compile; say
+            // why here instead of in a C++ error.
+            if !cpp_includes.buffer_resolved {
+                panic!(
+                    "rmw_cerulion: these bindings carry the Lyrical `is_rosidl_buffer` member, \
+                     but no include directory serves {pkg}/buffer.hpp, which the compiled shim \
+                     needs to copy a non-CPU rosidl::Buffer to the CPU. Install the {pkg} \
+                     package of this distro.",
+                    pkg = era_check::CPP_SHIM_BUFFER_PACKAGE
+                );
+            }
+        } else {
+            // The vendored bindings are the rolling snapshot at ros2/rosidl
+            // e23a0f9; `shim/vendored/rosidl_buffer` holds that commit's
+            // three header-only `rosidl_buffer` headers (unchanged but for a
+            // `dash-ok` lint marker appended to three comment lines), so the
+            // shim and its tests build without a ROS install.
+            println!("cargo:rerun-if-changed=shim/vendored");
+            shim.include("shim/vendored");
+        }
     }
     if observed_caps.contains(&"fetch_function") {
         shim.define("RMW_CERULION_HAS_FETCH_FUNCTION", None);
