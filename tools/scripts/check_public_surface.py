@@ -655,6 +655,12 @@ def registered_nested_paths(mod_src, files):
 CLI_FACTORY_FN = "cli_command"
 CLI_FACTORY_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?fn " + CLI_FACTORY_FN + r"\(\) -> Command \{", re.M)
 NESTED_ATTACH_RE = re.compile(r"\bnested::attach\([^;]*\bnested::NESTED\b")
+# The factory's tail expression when it returns the attached command: the
+# attach result itself (optionally unwrapped), or a `match` on it whose `Ok`
+# arm returns the command it binds.
+NESTED_TAIL_RE = re.compile(r"(match\s+)?nested::attach\([^;{}]*\bnested::NESTED\s*\)(.*)", re.S)
+NESTED_UNWRAP_RE = re.compile(r"\s*(?:\.unwrap\(\)|\.expect\([^()]*\))?\s*")
+NESTED_OK_ARM_RE = re.compile(r"\{\s*Ok\((\w+)\)\s*=>\s*(\w+)\s*,")
 
 
 def fn_body(code, start):
@@ -665,6 +671,35 @@ def fn_body(code, start):
         depth += {"{": 1, "}": -1}.get(code[i], 0)
         i += 1
     return code[start:i]
+
+
+def tail_expr(body):
+    """The tail expression of a fn body from [`fn_body`]: the text after its
+    last statement-ending `;` at the body's own nesting level, closing `}`
+    dropped, trimmed. Empty when the body ends in a statement."""
+    depth, last = 0, -1
+    inner = body[:-1] if body.endswith("}") else body
+    for i, c in enumerate(inner):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            last = i
+    return inner[last + 1:].strip()
+
+
+def returns_attached(tail):
+    """Whether a factory tail expression returns the command `nested::attach`
+    built, not a value computed beside it."""
+    m = NESTED_TAIL_RE.fullmatch(tail)
+    if not m:
+        return False
+    rest = m.group(2)
+    if not m.group(1):
+        return NESTED_UNWRAP_RE.fullmatch(rest) is not None
+    arm = NESTED_OK_ARM_RE.match(rest.lstrip())
+    return arm is not None and arm.group(1) == arm.group(2)
 
 
 def check_nested_wiring(families_mod_src):
@@ -679,8 +714,13 @@ def check_nested_wiring(families_mod_src):
     factories = list(CLI_FACTORY_RE.finditer(code))
     if len(factories) != 1:
         raise CannotRun("%s: %d top-level `fn %s() -> Command` found, expected exactly one; whether the nested verbs are attached cannot be established" % (CLI_FAMILIES_MOD, len(factories), CLI_FACTORY_FN))
-    if not NESTED_ATTACH_RE.search(fn_body(code, factories[0].end())):
+    body = fn_body(code, factories[0].end())
+    if not NESTED_ATTACH_RE.search(body):
         raise CannotRun("%s: `%s` makes no `nested::attach(..., nested::NESTED)` call, but %s registers nested verbs: they are not attached to the command" % (CLI_FAMILIES_MOD, CLI_FACTORY_FN, CLI_NESTED_MOD))
+    # The attach must BE the returned command: a call whose result is dropped
+    # (or bound and then ignored) leaves the nested verbs out of the binary.
+    if not returns_attached(tail_expr(body)):
+        raise CannotRun("%s: `%s` does not return the command `nested::attach(..., nested::NESTED)` builds, but %s registers nested verbs: they are not attached to the command it returns" % (CLI_FAMILIES_MOD, CLI_FACTORY_FN, CLI_NESTED_MOD))
 
 
 def registered_module_paths(mod_src, files, mod_path, list_re, list_decl, list_name, exclude=()):
@@ -2332,11 +2372,14 @@ def self_test(out=sys.stdout):
              "    let cmd = build(Cli::command());\n"
              "    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n}\n")
     unwired = wired.replace("nested::attach(cmd, nested::NESTED)", "Ok::<_, String>(cmd)")
-    try:
-        check_nested_wiring(wired)
-        arm("nested-wired", True)
-    except CannotRun as e:
-        arm("nested-wired", False, str(e))
+    for name, mod_src in (("nested-wired", wired),
+                          ("nested-wired-expect", wired.replace("    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n",
+                                                                "    nested::attach(cmd, nested::NESTED).expect(\"nested verbs\")\n"))):
+        try:
+            check_nested_wiring(mod_src)
+            arm(name, True)
+        except CannotRun as e:
+            arm(name, False, str(e))
     for name, mod_src in (
             ("nested-wiring-no-module", wired.replace("mod nested;", "")),
             ("nested-wiring-no-attach", unwired),
@@ -2345,7 +2388,11 @@ def self_test(out=sys.stdout):
             ("nested-wiring-helper-attach", unwired + "\nfn helper(c: Command) -> Command {\n"
              "    nested::attach(c, nested::NESTED).unwrap()\n}\n"),
             ("nested-wiring-comment-attach", unwired.replace("Ok::<_, String>(cmd)", "/* nested::attach(cmd, nested::NESTED) */ Ok::<_, String>(cmd)")),
-            ("nested-wiring-no-factory", wired.replace("fn cli_command()", "fn other()"))):
+            ("nested-wiring-no-factory", wired.replace("fn cli_command()", "fn other()")),
+            ("nested-wiring-result-dropped", wired.replace("    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n",
+                                                           "    let _ = nested::attach(cmd.clone(), nested::NESTED);\n    cmd\n")),
+            ("nested-wiring-result-ignored-arm", wired.replace("Ok(cmd) => cmd,", "Ok(_attached) => Cli::command(),")),
+            ("nested-wiring-result-statement", wired.replace("        Err(e) => panic!(\"{e}\"),\n    }\n}", "        Err(e) => panic!(\"{e}\"),\n    };\n    Cli::command()\n}"))):
         try:
             check_nested_wiring(mod_src)
             arm(name, False, "the wiring was accepted")

@@ -137,8 +137,7 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
                 schemas_dir,
                 TopicScope::from_local(local),
             )?;
-            println!("{name}");
-            Ok(())
+            introspect::print_lines(&mut std::io::stdout().lock(), [name.as_str()])
         }
         TopicIntrospectAction::Find {
             local,
@@ -153,9 +152,12 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
                 connect,
                 listen,
             )?;
-            for topic in &found.topics {
-                println!("{topic}");
-            }
+            // `topic find ... | head -1` closes the pipe early: that ends
+            // the list, it is not a failure.
+            introspect::print_lines(
+                &mut std::io::stdout().lock(),
+                found.topics.iter().map(String::as_str),
+            )?;
             // The `topic list` rule: a failed remote query is one loud
             // stderr line, and the local result still stands.
             for note in [

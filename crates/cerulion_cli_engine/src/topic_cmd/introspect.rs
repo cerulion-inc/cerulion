@@ -639,7 +639,56 @@ pub enum TypeColumn {
 /// [`type_local_topics`]; hidden internal topics are not read) and a REMOTE
 /// row from the robots' catalogs, a mirror row from its origin robot's only
 /// ([`remote_topic_types`]); a row with no remote answer shows `[unknown]`.
+///
+/// A reader that closes the pipe early (`topic list | head -1`) ends the
+/// listing, not the command: see [`closed_pipe_is_done`].
 pub fn print_topic_list(
+    show_all: bool,
+    types: TypeColumn,
+    remote: Option<super::RemoteTopicsOptions>,
+    scan: bool,
+    schemas_dir: Option<&Path>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> CliResult<()> {
+    closed_pipe_is_done(write_topic_list(
+        show_all,
+        types,
+        remote,
+        scan,
+        schemas_dir,
+        out,
+        err,
+    ))
+}
+
+/// The output of a listing verb is data a reader may stop taking at any
+/// line, so a broken pipe is success (the reader has what it wanted); any
+/// other failure stands.
+pub fn closed_pipe_is_done(result: CliResult<()>) -> CliResult<()> {
+    match result {
+        Err(CliError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
+
+/// Write `lines` to `out`, one per line, flushed. A reader that closes the
+/// pipe early (`topic find ... | head -1`) ends the output: the rest is not
+/// written and the result is success. Any other failure is returned.
+pub fn print_lines<'a>(
+    out: &mut dyn Write,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> CliResult<()> {
+    for line in lines {
+        if write_report_line(out, line)? == Output::Closed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// [`print_topic_list`] before a closed pipe is mapped to success.
+fn write_topic_list(
     show_all: bool,
     types: TypeColumn,
     remote: Option<super::RemoteTopicsOptions>,
@@ -1462,6 +1511,63 @@ mod tests {
         let mut full = Failing(std::io::ErrorKind::PermissionDenied);
         let err = write_report_line(&mut full, "x").unwrap_err();
         assert!(matches!(err, CliError::Io(_)), "{err:?}");
+    }
+
+    /// Takes `room` bytes, then reports a closed pipe on every write.
+    struct ClosesAfter {
+        taken: Vec<u8>,
+        room: usize,
+    }
+    impl Write for ClosesAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.taken.len() + buf.len() > self.room {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.taken.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lines_are_printed_one_per_line() {
+        let mut out: Vec<u8> = Vec::new();
+        print_lines(&mut out, ["/a", "/b"]).unwrap();
+        assert_eq!(out, b"/a\n/b\n");
+    }
+
+    #[test]
+    fn a_reader_that_closes_early_ends_the_lines_without_an_error() {
+        // `head -1`: the first line fits, the pipe closes before the second.
+        let mut head = ClosesAfter {
+            taken: Vec::new(),
+            room: 3,
+        };
+        print_lines(&mut head, ["/a", "/b", "/c"]).unwrap();
+        assert_eq!(head.taken, b"/a\n");
+        let mut full = Failing(std::io::ErrorKind::PermissionDenied);
+        let err = print_lines(&mut full, ["/a"]).unwrap_err();
+        assert!(matches!(err, CliError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_closed_pipe_is_done_and_another_failure_stands() {
+        let closed = Err(CliError::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )));
+        assert!(closed_pipe_is_done(closed).is_ok());
+        let denied = Err(CliError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(matches!(closed_pipe_is_done(denied), Err(CliError::Io(_))));
+        let invalid = Err(CliError::Validation("bad".to_string()));
+        assert!(matches!(
+            closed_pipe_is_done(invalid),
+            Err(CliError::Validation(_))
+        ));
+        assert!(closed_pipe_is_done(Ok(())).is_ok());
     }
 
     #[test]
