@@ -44,7 +44,7 @@ one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accep
 
 | Crate | Side | License | In `default-members`? | Role |
 |---|---|---|---|---|
-| `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines ONLY; no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
+| `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines, plus the machine identity files (`identity`: config directory, machine key, high-water file); no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
 | `cerulion_link` | both | MIT OR Apache-2.0 | **no** (pulls iroh, ~390 crates) | thin iroh wrapper: endpoints, dial, framing, relay seam, ops-stream adapter; never depends on `cerulion_core` |
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
@@ -413,9 +413,29 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `cerulion_cli_engine::auth::atomic_write_secret`**: 0700 parent, per-process
   temp sibling, symlink-proof `create_new` at 0600, fsync, atomic rename. Its
   callers include the auth store, `robots.toml` (`pair_cmd`), and `peers.json`
-  (`peer_cache`). The desk-key write in `wireclient` implements the same
-  create-new-0600 discipline locally (it cannot link the engine).
-- Desk inventory (`~/.cerulion/`): `desk.key` (32-byte seed), `device.cert`
+  (`peer_cache`). The machine key has its own writer,
+  `cerulion_pairing::identity` (0700 directories; the key goes to a synced 0600
+  dot-named sibling hard-linked into place, so it never overwrites and is never
+  seen partly written),
+  which `cerulion login`, `cerulion pair` and `wireclient`'s `--key-file`
+  creation all call.
+- Every per-machine config file under `~/.cerulion` resolves from one rule,
+  `cerulion_pairing::identity::config_dir` (`CERULION_HOME` verbatim when set
+  and non-empty). The crates without `cerulion_pairing` (`cerulion_core` run
+  directories, `cerulion_discovery` peers, `cerulion_telemetry` consent) mirror
+  it; `crates/cerulion_cli/tests/config_home_test.rs` pins each path to it and
+  refuses shipped code with a `".cerulion"` literal within six lines after a
+  `home_dir` or `"HOME"` mention, outside its allowed list. Daemon
+  sockets (`cerulion_hygiene`) and the downloaded video decoder keep their own
+  location rules.
+- `cerulion connect` and `cerulion pair` hand `cerulion-connectd` the key's
+  legacy name `desk.key`: `connect` resolves `epochs/` next to its key file,
+  and `pair` recognizes the path as the machine key and loads it through the
+  identity layout.
+- Desk inventory (`~/.cerulion/`): `identity/device.key` (the 32-byte machine
+  seed; `desk.key` is a hard link to it or an equal copy, adopted byte for byte when it is the
+  only one present, and two different keys are refused), `identity/<team>/high_water`
+  (MAC'd clock, bundle generation and status sequence floors), `device.cert`
   (login-issued), `robots.toml` (name → eid pins), `epochs/<robot>.epoch`,
   `grants/`, `auth.json`, `peers.json` (LAN discovery; see
   `network-daemons.md`).

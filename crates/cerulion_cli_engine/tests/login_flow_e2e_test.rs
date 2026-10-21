@@ -231,8 +231,12 @@ fn device_code_login_writes_auth_json_and_caches_cert() {
         "the SignedDeviceCert must be cached"
     );
     assert!(
-        home.path().join("desk.key").exists(),
+        home.path().join("identity").join("device.key").exists(),
         "the device key must be created at login"
+    );
+    assert!(
+        home.path().join("desk.key").exists(),
+        "the legacy desk.key names the same key"
     );
 
     // The gate now proceeds (fires-once semantics: the NEXT run reads this).
@@ -2349,8 +2353,11 @@ fn a_login_carrying_an_anon_id_reports_only_a_real_account_switch() {
     );
     assert_eq!(again.state.account_id, first.state.account_id);
     // accountd binds a device key to one account, so the second account
-    // signs in with a fresh key; auth.json still names the first account.
+    // signs in with a fresh key; auth.json still names the first account. The
+    // machine key has two names (identity/device.key and the legacy desk.key);
+    // both go, or the key is adopted back from the one left.
     std::fs::remove_file(home.path().join("desk.key")).unwrap();
+    std::fs::remove_file(home.path().join("identity").join("device.key")).unwrap();
     let other = login_as(port, &email, "second@example.com", None);
     assert!(other.switched_account, "a different account is a switch");
     assert_ne!(other.state.account_id, first.state.account_id);
