@@ -1762,10 +1762,14 @@ level_assignments:              # optional; node id → DAG level index
 
 A real-clock live run is **network-viewable by default**:
 `graph run` (monolith OR multi-process), `node run`, and `ros2 attach` each
-spawn ONE network GATEWAY process that opens the robot's single zenoh
-session, listens on the well-known port **7683** (bind-probing upward on
-conflict; override with `CERULION_GATEWAY_PORT`), advertises itself over
-mDNS, and announces every produced topic; one loud breadcrumb prints at start. The
+route egress through ONE network gateway that opens the robot's single
+zenoh session and announces every produced topic; one loud breadcrumb prints
+at start. On the default Unix path that gateway is hosted by the machine's
+`cerulion-netd`, which listens and advertises itself over mDNS only when
+`CERULION_NETD_LISTEN` is set, so a stock robot is not found by a default
+desk. The per-run fallback gateway child listens on the well-known port
+**7683** (bind-probing upward on conflict; override with
+`CERULION_GATEWAY_PORT`) and advertises itself over mDNS. The
 optional top-level `network:` block below RESTRICTS this (a Strict
 allow-list with verbatim locators) rather than enabling it. Turn networking
 off for a run with `--network off` (or `CERULION_NETWORK=off`). See

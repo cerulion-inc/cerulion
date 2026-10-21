@@ -21,7 +21,9 @@ default + gateway, the discovery ladder, and pairing.
 - **Open by default.** A real-clock `graph run` (monolith OR multi-process),
   `node run`, or `ros2 attach` with NO `network:` block runs PERMISSIVE: one
   zenoh session announces every produced topic, and peers find each other
-  over mDNS (`_cerulion._tcp`). Zenoh multicast scouting is OFF by default
+  over mDNS (`_cerulion._tcp`) when the machine to be found listens (on the
+  default Unix path, `CERULION_NETD_LISTEN` set; see
+  [Making a robot discoverable](#making-a-robot-discoverable)). Zenoh multicast scouting is OFF by default
   (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
   loud breadcrumb prints at start:
 
@@ -939,7 +941,9 @@ Interpreting `connect_endpoints`:
 ## Two-machine quickstart (Go2: Mac ↔ robot)
 
 You do not NEED a `network:` block: a bare `cerulion graph run` on
-each side is already network-viewable. Add blocks to RESTRICT what crosses
+each side is network-viewable once the robot listens (set
+`CERULION_NETD_LISTEN=tcp/0.0.0.0:7683` on the robot; see
+[Making a robot discoverable](#making-a-robot-discoverable)). Add blocks to RESTRICT what crosses
 and to pin locators for a subnet mDNS can't bridge. The robot (Jetson
 Orin, `192.168.123.99`) LISTENS; the workstation (Mac) CONNECTS.
 

@@ -150,10 +150,13 @@ pub struct GraphConfig {
     /// networking; it does not switch it on.
     ///
     /// Under `cerulion graph run` on the real clock, an absent block (and a
-    /// block whose `mode` is `disabled`) means the PERMISSIVE default: the CLI
-    /// starts one separate gateway process that opens the machine's zenoh
-    /// session, listens on port 7683 (`CERULION_GATEWAY_PORT` overrides it),
-    /// advertises itself over mDNS and announces every topic the graph produces. An enabled
+    /// block whose `mode` is `disabled`) means the PERMISSIVE default: one
+    /// gateway outside the graph process opens the machine's zenoh session and
+    /// announces every topic the graph produces. On the default Unix path that
+    /// gateway is hosted by `cerulion-netd`, which listens and advertises over
+    /// mDNS only when `CERULION_NETD_LISTEN` is set; the per-run fallback
+    /// gateway child listens on port 7683 (`CERULION_GATEWAY_PORT` overrides
+    /// it) and advertises itself over mDNS. An enabled
     /// block (`mode: peer` or `client`) replaces that with a STRICT posture:
     /// the `connect` / `listen` locators used verbatim, no scouting, and only
     /// the listed `egress` and `ingress` topics crossing. No value of this

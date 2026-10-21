@@ -529,8 +529,8 @@ fn mdns(robot: &str, locator: &str) -> DiscoveredPeer {
     }
 }
 
-/// THE CER-1902 ACCEPTANCE AT THE FOLD: a desk with NO cache, NO env and
-/// multicast scouting off dials a robot that answered the boot browse.
+/// The acceptance at the fold: a desk with no cache, no env and multicast
+/// scouting off dials a robot that answered the boot browse.
 #[test]
 fn an_mdns_answer_is_dialled_with_no_cache_and_no_env() {
     let dir = TempDir::new();
