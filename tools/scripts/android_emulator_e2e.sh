@@ -346,7 +346,7 @@ paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=$paired_ticks output=$paired_echo"
 [[ "$paired_rc" != 0 && "$paired_rc" != 124 ]] ||
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
-grep -Fq 'refused to serve its topic catalog (not authorized)' <<<"$paired_echo" ||
+grep -Fq 'refused to serve its topic catalog to LAN peers (not authorized)' <<<"$paired_echo" ||
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
 pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
 device "am force-stop '$APP'"

@@ -750,7 +750,22 @@ fn workflow_gate_off_uncovered(text: &str) -> bool {
 /// rules.
 fn shell_sets_the_gate_off(text: &str) -> bool {
     let stripped = strip_hash_comments(text);
-    let lines: Vec<&str> = stripped.lines().collect();
+    // A launch inside a remote-shell payload (`device "..."`, `adb shell
+    // "..."`) runs on the other host: the local export never reaches it, so
+    // the payload must set the gate itself, and it never counts as a covered
+    // local launch.
+    if !stripped.lines().all(|l| {
+        split_remote_shell_payload(l)
+            .1
+            .is_none_or(remote_payload_sets_its_own_gate)
+    }) {
+        return false;
+    }
+    let host_only: Vec<String> = stripped
+        .lines()
+        .map(|l| split_remote_shell_payload(l).0)
+        .collect();
+    let lines: Vec<&str> = host_only.iter().map(String::as_str).collect();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
         if t == "os.environ[\"CERULION_LOGIN_GATE\"] = \"off\"" {
@@ -817,6 +832,61 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Splits a shell line into its local part and the double-quoted payload it
+/// hands to a remote shell (`device "..."` or `... shell "..."`), if any. The
+/// local part keeps everything but the payload text.
+fn split_remote_shell_payload(line: &str) -> (String, Option<&str>) {
+    for opener in ["device \"", "shell \""] {
+        let mut from = 0;
+        while let Some(rel) = line[from..].find(opener) {
+            let at = from + rel;
+            from = at + opener.len();
+            let starts_word = line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace() || c == '(' || c == '"');
+            if !starts_word {
+                continue;
+            }
+            let body = &line[from..];
+            let mut escaped = false;
+            let close = body.char_indices().find_map(|(i, c)| {
+                let hit = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                hit.then_some(i)
+            });
+            let end = close.unwrap_or(body.len());
+            let payload = &body[..end];
+            let local = format!("{}{}", &line[..from], &body[end..]);
+            return (local, Some(payload));
+        }
+    }
+    (line.to_string(), None)
+}
+
+/// True when every launch of the binary inside a remote-shell payload sets
+/// the gate to `off` for itself: an `export ... CERULION_LOGIN_GATE=off`
+/// earlier in the payload, or a `CERULION_LOGIN_GATE=off` prefix on the
+/// launch's own command.
+fn remote_payload_sets_its_own_gate(payload: &str) -> bool {
+    let mut exported_off = false;
+    for seg in payload.split(['|', ';', '&']) {
+        let sets_off = seg
+            .split_whitespace()
+            .any(|t| t.trim_matches(['"', '\'']) == "CERULION_LOGIN_GATE=off");
+        let overrides = shell_line_overrides_the_gate(seg);
+        if sets_off && seg.trim_start().starts_with("export ") {
+            exported_off = true;
+        } else if overrides {
+            exported_off = false;
+        }
+        if shell_line_launches_the_binary(seg) && !(exported_off || sets_off) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Python: an `os.environ` write covers only subprocess calls made AFTER it,
@@ -1061,6 +1131,42 @@ fn only_a_line_that_sets_the_gate_for_its_own_process_counts_as_turning_it_off()
             "{not_a_setting:?} does not set the gate off"
         );
     }
+}
+
+#[test]
+fn a_remote_shell_launch_needs_its_own_gate_setting_even_under_a_local_export() {
+    let sh = Path::new("run.sh");
+    let host = "export CERULION_LOGIN_GATE=off\n\"$HOST_CER\" topic list\n";
+    for carries_it in [
+        "device \"export HOME=/tmp CERULION_LOGIN_GATE=off; '$DEV_CER' topic list\"\n",
+        "out=\"$(device \"cd /d && export CERULION_LOGIN_GATE=off; timeout 8 '$DEV_CER' topic echo /t\" 2>&1)\"\n",
+        "adb shell \"CERULION_LOGIN_GATE=off '$DEV_CER' topic list\"\n",
+        "device \"chmod 755 '$DEV_CER'\"\n",
+    ] {
+        let text = format!("{host}{carries_it}");
+        assert!(
+            file_sets_the_gate_off(sh, &text),
+            "{carries_it:?} sets the gate for its own remote launch"
+        );
+    }
+    for misses_it in [
+        "device \"export HOME=/tmp; '$DEV_CER' topic list\"\n",
+        "out=\"$(device \"cd /d; timeout 8 '$DEV_CER' topic echo /t\" 2>&1)\"\n",
+        "adb shell \"'$DEV_CER' topic list\"\n",
+        "device \"export CERULION_LOGIN_GATE=off; unset CERULION_LOGIN_GATE; '$DEV_CER' topic list\"\n",
+    ] {
+        let text = format!("{host}{misses_it}");
+        assert!(
+            !file_sets_the_gate_off(sh, &text),
+            "{misses_it:?} launches on the remote host without the gate set there"
+        );
+    }
+    // A remote launch is not a covered local launch: with no local launch,
+    // the local export proves nothing.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ndevice \"export CERULION_LOGIN_GATE=off; '$DEV_CER' topic list\"\n"
+    ));
 }
 
 #[test]
