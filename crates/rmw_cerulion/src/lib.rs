@@ -62,6 +62,7 @@ pub mod ffi;
 pub mod heaphook;
 pub mod loan_refusal_latch;
 pub mod publish_reject_latch;
+pub mod rosidl_buffer;
 pub mod runtime;
 pub mod take_gate;
 #[cfg(feature = "test-seams")]

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# build_rmw_jazzy_container.sh: the container half of build_rmw_jazzy.sh.
+# build_rmw_container.sh: the container half of build_rmw.sh.
 #
-# Runs as root INSIDE a `ros:jazzy` container with the repository mounted
+# Runs as root INSIDE a `ros:<distro>` container with the repository mounted
 # read-only at /work and an output directory at /out. It installs the build
 # tools rmw_cerulion's build.rs needs (a C and C++ compiler for the std::string
 # shim, clang and libclang for bindgen), the pinned Rust toolchain, sources the
-# distro so build.rs bindgens against the REAL Jazzy headers, builds the
+# distro so build.rs bindgens against the distro's REAL headers, builds the
 # release cdylib into a container-private target directory, and copies the
 # library plus an evidence sidecar to /out.
 #
@@ -19,15 +19,18 @@
 # Env:
 #   CERULION_RMW_TOOLCHAIN   the Rust toolchain to install (required; the
 #                            workflow passes the version it pins elsewhere)
+#   CERULION_RMW_DISTRO      the ROS 2 distro under /opt/ros to build against
+#                            (required; build_rmw.sh passes its DISTRO)
 set -euo pipefail
 
 toolchain=${CERULION_RMW_TOOLCHAIN:?CERULION_RMW_TOOLCHAIN must name the Rust toolchain}
+distro=${CERULION_RMW_DISTRO:?CERULION_RMW_DISTRO must name the ROS 2 distro}
 repo=/work
 out=/out
 so_name=librmw_cerulion.so
 
 die() {
-    printf 'build_rmw_jazzy_container: %s\n' "$*" >&2
+    printf 'build_rmw_container: %s\n' "$*" >&2
     exit 1
 }
 
@@ -70,11 +73,11 @@ g++ --version | head -n 1
 
 # ROS setup scripts dereference unset variables; relax nounset across it.
 set +u
-# shellcheck disable=SC1091
-source /opt/ros/jazzy/setup.bash
+# shellcheck disable=SC1090,SC1091
+source "/opt/ros/$distro/setup.bash"
 set -u
-[ "${ROS_DISTRO:-}" = jazzy ] ||
-    die "expected ROS_DISTRO=jazzy after sourcing the distro, got '${ROS_DISTRO:-}'"
+[ "${ROS_DISTRO:-}" = "$distro" ] ||
+    die "expected ROS_DISTRO=$distro after sourcing the distro, got '${ROS_DISTRO:-}'"
 [ -n "${AMENT_PREFIX_PATH:-}" ] ||
     die "AMENT_PREFIX_PATH is empty after sourcing the distro; build.rs would not see the headers"
 printf 'ROS_DISTRO=%s\nAMENT_PREFIX_PATH=%s\n' "$ROS_DISTRO" "$AMENT_PREFIX_PATH" \
