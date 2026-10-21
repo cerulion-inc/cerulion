@@ -1313,6 +1313,7 @@ impl FakeDaemon {
                                                             id: 1,
                                                             registered_topics: 1,
                                                             gateway_started: true,
+                                                            lan_access: None,
                                                         },
                                                     );
                                                 let _ = writeln!(stream, "{}", resp.to_json_line());

@@ -457,6 +457,96 @@ pub fn query_announce_entries(
     Ok(entries)
 }
 
+/// Parsed `(robot, topic)` announce entries.
+pub type AnnounceEntries = Vec<(String, Option<String>)>;
+
+/// [`query_announce_entries`] variant that reports whether the liveliness GET
+/// saw its window elapse CLEANLY: `Ok(Some(entries))` only when the reply
+/// channel closed inside the wait deadline (the GET finalized - `Ok(None)` or
+/// disconnected) and no reply was an error. `Ok(None)` when the deadline
+/// expired before the channel closed, or a reply carried an error.
+///
+/// A `Some` snapshot is exactly THE REPLIES RECEIVED WITHIN THE WINDOW - the
+/// zenoh GET timeout ends the query inside the window, so a slower peer's
+/// announce can still be missing. It is a CLEAN view of the window, not a
+/// proof of every live token. A caller asserting absence therefore withdraws
+/// only after the token stays missing across THREE CONSECUTIVE clean
+/// windows, not on one.
+pub fn query_announce_entries_clean_window(
+    session: &zenoh::Session,
+    gather_window: Duration,
+) -> TransportResult<Option<AnnounceEntries>> {
+    let key = format!("{ANNOUNCE_PREFIX}/**");
+    // The GET carries its own zenoh timeout equal to the gather window: an
+    // unbounded liveliness GET stays open for the session default (far past
+    // any window), so its reply channel would never close here and every
+    // gather would read as partial. With the timeout the query finalizes
+    // inside the window and the channel closing below is what marks the
+    // snapshot complete.
+    let replies = session
+        .liveliness()
+        .get(&key)
+        .timeout(gather_window)
+        .wait()
+        .map_err(|e| TransportError::Receive {
+            topic: "*".to_string(),
+            reason: format!("announce liveliness query failed: {e}"),
+        })?;
+
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    let mut saw_error_reply = false;
+    // Wait up to the gather window plus slack for the finalized channel to
+    // drain: the zenoh timeout ends the query inside the window, but the
+    // close notification can arrive a little after.
+    let deadline = Instant::now() + gather_window + Duration::from_millis(250);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match replies.recv_timeout(remaining) {
+            Ok(Some(reply)) => match reply.into_result() {
+                Ok(sample) => {
+                    if let Some(entry) = parse_announce_key(sample.key_expr().as_str()) {
+                        entries.push(entry);
+                    }
+                }
+                // zenoh ends a timed GET with one error reply whose payload
+                // is "Timeout", then closes the channel: that is the window
+                // ending normally. Any other error reply spoils the snapshot.
+                Err(error) => {
+                    if !is_query_timeout_payload(&error.payload().to_bytes()) {
+                        saw_error_reply = true;
+                    }
+                }
+            },
+            // `Err(_)`: every sender dropped - the reply channel closed, so
+            // the GET finished. Only a closed channel marks the snapshot
+            // complete.
+            Err(_) => break,
+            // `Ok(None)`: the deadline elapsed before the channel closed
+            // (zenoh maps a recv timeout to None) - a partial view, not a
+            // snapshot.
+            Ok(None) => return Ok(None),
+        }
+    }
+
+    if saw_error_reply {
+        return Ok(None);
+    }
+    entries.sort();
+    entries.dedup();
+    Ok(Some(entries))
+}
+
+/// Whether a GET error reply's payload is zenoh's own query-timeout notice
+/// (the reply a timed GET delivers when its timeout fires, just before the
+/// reply channel closes). Exactly the bytes `Timeout`; a queryable's own
+/// error text is anything else.
+fn is_query_timeout_payload(payload: &[u8]) -> bool {
+    payload == b"Timeout"
+}
+
 /// GET a robot's full topic catalog over the `cerulion_q` query surface
 /// — an EXPLICIT-robot `cerulion_q/{robot}/catalog` GET (never a mid-key wildcard,
 /// which computes an empty route on a real link; the laptop always knows the
@@ -1332,6 +1422,38 @@ mod tests {
     #[test]
     fn test_liveliness_prefix() {
         assert_eq!(liveliness_prefix(), "cerulion_lv");
+    }
+
+    /// Empirical pin for the completed-gather contract: a liveliness GET
+    /// carrying `.timeout(window)` MUST close its reply channel at the zenoh
+    /// deadline - the completeness rule reads that close, never a quiet gap.
+    /// If zenoh stopped closing the channel on timeout, every gather would
+    /// read `None` (partial) and this test fails loudly.
+    #[test]
+    fn a_timed_liveliness_get_closes_its_reply_channel() {
+        let mut config = zenoh::Config::default();
+        config
+            .insert_json5("scouting/multicast/enabled", "false")
+            .unwrap();
+        let session = zenoh::open(config).wait().expect("session opens");
+        let gathered = query_announce_entries_clean_window(&session, Duration::from_millis(300))
+            .expect("liveliness GET");
+        assert!(
+            gathered.is_some(),
+            "the reply channel never closed after the zenoh timeout:              a completed gather cannot be distinguished from a partial one"
+        );
+    }
+
+    /// Only zenoh's exact query-timeout payload counts as the normal end of
+    /// a timed window; every other error payload (a refusal, an empty
+    /// payload, a different case) still marks the gather as erroneous.
+    #[test]
+    fn only_the_zenoh_timeout_payload_is_a_normal_completion() {
+        assert!(is_query_timeout_payload(b"Timeout"));
+        assert!(!is_query_timeout_payload(b"timeout"));
+        assert!(!is_query_timeout_payload(b"Timeout "));
+        assert!(!is_query_timeout_payload(b""));
+        assert!(!is_query_timeout_payload(b"query refused"));
     }
 
     /// The sample→event mapping, against a HAND-WRITTEN table. Every row

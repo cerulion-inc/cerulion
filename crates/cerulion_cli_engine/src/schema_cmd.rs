@@ -1013,7 +1013,7 @@ pub fn builtin_layout_resolver() -> (LayoutResolver, Vec<String>) {
 /// already parsed at build time to emit the types this crate links
 /// against. It panics loudly rather than silently degrade the registry
 /// if that codegen invariant is ever broken.
-pub(crate) fn parse_builtin_schemas() -> Vec<MessageSchema> {
+pub fn parse_builtin_schemas() -> Vec<MessageSchema> {
     let entries = native_ros2_messages::BUILTIN_MSGS;
     let mut schemas = Vec::with_capacity(entries.len());
     for &(package, name, text) in entries {
