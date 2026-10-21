@@ -72,11 +72,18 @@ under the ping side's label. `pair` passes one size to both.
 
 ```sh
 # listening machine (stays up until stdin closes or Ctrl-C)
-python3 crosshost.py serve --stack cerulion-tcp --size 1024 --listen-ip <listener-ip>
+python3 crosshost.py serve --stack cerulion-tcp --size 1024 --listen-ip <listener-ip> --expect 2100
 # dialing machine
 python3 crosshost.py ping --stack cerulion-tcp --size 1024 --peer <listener-ip> --out results/run1
+# close serve's stdin (Ctrl-D); once it printed SERVE_END, on the dialing machine:
+python3 crosshost.py accept --stack cerulion-tcp --size 1024 --out results/run1
 python3 crosshost.py summarize results/run1
 ```
+
+`ping` leaves a passing cell pending: only the listener's log shows its
+evictions and echo count, so a cell enters `ACCEPTED` through `accept` after
+`serve` printed `SERVE_END` (or `reject` after `SERVE_FAILED`). Ctrl-C stops
+`serve` without checking its side.
 
 For `cerulion-quic`, mint the listener's certificate with
 `crosshost.py cert --ip <listener-ip> --dir .certs` on the listening machine,
@@ -115,10 +122,9 @@ ROS 2 side of either machine in a container.
   and the graph shows a reader on the ping topic; the ping writer's own
   match to the pong is inferred from those, so an early ping can still be
   lost before it, which the warmup absorbs.
-- `PING_DONE` prints min/p50/p99/max for the cell and adds its `.bin` to
-  the run directory's `ACCEPTED` list, which is all `summarize` reads
-  (`pair` runs `ping --pending` and adds the cell only after both sides
-  passed). A cell fails instead, and its `.bin` is renamed `.rejected`, when the run
+- `PING_DONE` prints min/p50/p99/max for the cell and leaves its `.bin`
+  pending; `accept` adds it to the run directory's `ACCEPTED` list, which is
+  all `summarize` reads (`pair` runs `accept` only after both sides passed). A cell fails instead, and its `.bin` is renamed `.rejected`, when the run
   does not exit cleanly, the sample count is not `--samples`, a receipt or
   one of its counters is missing, the latency node received fewer than
   warmup + measured echoes, the ping sent more than 50 beyond what came

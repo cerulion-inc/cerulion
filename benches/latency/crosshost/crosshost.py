@@ -1023,8 +1023,6 @@ def cmd_ping(args):
     why = delivery_verdict(args.stack, receipts, args.samples + args.warmup, text)
     if why:
         return reject(why, 5)
-    if not args.pending:
-        set_accepted(out, bin_path.name, True)
     s = summarize_samples(samples)
     say(f"PING_DONE stack={args.stack} size={args.size} n={s['n']} "
         f"min_us={fmt_us(s['min'])} p50_us={fmt_us(s['p50'])} p99_us={fmt_us(s['p99'])} "
@@ -1047,7 +1045,7 @@ def cmd_reject(args):
 
 
 def cmd_accept(args):
-    """Add a cell that `ping --pending` left to ACCEPTED (the pair driver
+    """Add a cell that `ping` left pending to ACCEPTED (the pair driver
     calls this once both sides of the cell passed)."""
     _lock = hold_box_lock(args.box_lock)
     out = Path(args.out)
@@ -1124,7 +1122,7 @@ def cmd_pair(args):
                     remote(args.dial_ssh, args.dial_repo,
                            f"ping --stack {stack} --size {size} --peer {args.listen_ip} "
                            f"--port {args.port} --out {dial_out} --samples {args.samples} "
-                           f"--warmup {args.warmup} --rate {args.rate} --pending"
+                           f"--warmup {args.warmup} --rate {args.rate}"
                            f"{root_ca}{ros_d}{lock}"),
                     capture_output=True, text=True)
                 for line in (ping.stdout + ping.stderr).splitlines():
@@ -1213,8 +1211,6 @@ def main(argv=None):
             p.add_argument("--samples", type=int, default=2000, help="measured round trips")
             p.add_argument("--warmup", type=int, default=100)
             p.add_argument("--rate", type=int, default=100, help="pings per second")
-            p.add_argument("--pending", action="store_true",
-                           help="leave a passing cell out of ACCEPTED until `accept`")
             p.add_argument("--slack", type=float, default=90.0,
                            help="seconds allowed beyond (samples+warmup)/rate")
 
