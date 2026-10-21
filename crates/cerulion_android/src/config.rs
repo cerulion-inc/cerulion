@@ -208,6 +208,17 @@ mod tests {
         assert_eq!(paired.lan_access, LanAccessConfig::Paired);
     }
 
+    /// A config that only names a LAN-facing listen endpoint must still get
+    /// the paired posture: opening the listener never opens the topics.
+    #[test]
+    fn listen_only_config_defaults_to_paired() {
+        let parsed = EmbeddedConfig::parse(r#"{"listen": ["tcp/0.0.0.0:7683"]}"#).unwrap();
+        assert_eq!(parsed.listen, vec!["tcp/0.0.0.0:7683".to_string()]);
+        assert_eq!(parsed.lan_access, LanAccessConfig::Paired);
+        assert_eq!(LanAccess::from(parsed.lan_access), LanAccess::Paired);
+        assert!(parsed.mdns);
+    }
+
     #[test]
     fn rejects_an_unknown_lan_access_posture() {
         for raw in [
