@@ -4,6 +4,7 @@
 //! text. Every expected offset, size and value below is written by hand from
 //! the `#[repr(C)]` rules, never computed by the code under test.
 
+use super::cdr_codec::{CdrCodec, CdrEndianness};
 use super::frame_walker::{FrameValueKind, FrameWalker, WalkError};
 use super::layout::LayoutResolver;
 use super::schema::{FieldDef, FieldType, MessageSchema};
@@ -406,4 +407,56 @@ fn a_hidden_twin_past_the_wire_limit_is_refused() {
         }
         other => panic!("expected a wire-limit refusal, got {:?}", other.map(|_| ())),
     }
+}
+
+/// The SAME text with a later definition whose layout fails: `pkg/Big
+/// { uint8 a }`, then `pkg/Big { Leaf[N] arr }` with `N = usize::MAX / 4`
+/// (overflows). The later definition owns the name, so the name decodes
+/// nothing: the earlier layout must not stand in for it, in the walker, the
+/// codec or the resolver.
+#[test]
+fn a_name_whose_final_owner_has_no_layout_decodes_nothing() {
+    let huge = FieldType::FixedArray {
+        element_type: Box::new(nested("Leaf", None)),
+        length: usize::MAX / 4,
+    };
+    let set = vec![
+        packaged("pkg", "Leaf", &[("v", FieldType::F64)]),
+        packaged("pkg", "Big", &[("a", FieldType::U8)]),
+        packaged("pkg", "Big", &[("arr", huge)]),
+    ];
+    let (walker, _) = FrameWalker::new(set.clone());
+    assert!(!walker.knows("pkg/Big"));
+    assert!(walker.layout_for_name("pkg/Big").is_none());
+    assert!(walker.walk("pkg/Big", &frame(&[7])).is_err());
+    let (codec, _) = CdrCodec::new(set.clone());
+    assert!(!codec.knows("pkg/Big"));
+    assert!(codec.schema_hash("pkg/Big").is_none());
+    let (mut resolver, _) = LayoutResolver::new(set);
+    assert!(resolver.layout_of("pkg/Big").is_none());
+}
+
+/// The CDR codec binds nested references on identity too. In
+/// [`twin_set`], packaged `pkg2/Root { Leaf leaf; uint8 tag }` embeds the
+/// packaged `pkg2/Leaf { float64 v }`, while a later package-less schema
+/// NAMED `pkg2/Leaf { uint8 v }` owns that text. CDR body: `v = 1.5` (8
+/// bytes LE at 0), `tag = 7` at 8. Cerulion payload, by hand: leaf@0 (8
+/// bytes), tag@8, padded to 16. Decoding the twin's `uint8 v` instead would
+/// shift `tag` and leave bytes unread.
+#[test]
+fn the_cdr_codec_never_decodes_a_nested_field_with_its_text_twin() {
+    let (codec, _) = CdrCodec::new(twin_set());
+    let mut body = 1.5f64.to_le_bytes().to_vec();
+    body.push(7);
+    let frame = codec
+        .decode("pkg2/Root", CdrEndianness::Little, &body, 0, 0)
+        .expect("decodes with the packaged Leaf");
+    let mut payload = 1.5f64.to_le_bytes().to_vec();
+    payload.push(7);
+    payload.extend_from_slice(&[0; 7]);
+    assert_eq!(&frame[WireHeader::SIZE..], payload.as_slice());
+    assert_eq!(
+        codec.encode("pkg2/Root", CdrEndianness::Little, &frame),
+        Ok(body)
+    );
 }

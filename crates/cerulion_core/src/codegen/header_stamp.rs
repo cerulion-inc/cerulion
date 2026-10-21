@@ -10,7 +10,7 @@
 //! The location comes from the same [`LayoutResolver`] the generated writers
 //! and the frame walker use, so the offsets agree with what producers write.
 
-use super::layout::LayoutResolver;
+use super::layout::{LayoutError, LayoutResolver};
 use super::schema::FieldType;
 use crate::scheduler::sync_stamp::HeaderStampLocation;
 
@@ -65,6 +65,16 @@ pub enum HeaderStampSchemaError {
         /// The `stamp` field's type.
         found: String,
     },
+    /// A schema on the `header.stamp` path is in the set but has no wire
+    /// layout (for example its fixed section overflows), so no offset can
+    /// be read from it.
+    #[error("schema `{schema}`: a type on the `header.stamp` path has no wire layout: {error}")]
+    NoLayout {
+        /// The schema asked for.
+        schema: String,
+        /// Why the layout failed (it names the schema that failed).
+        error: LayoutError,
+    },
 }
 
 /// The index of the schema a nested reference in the `parent_idx`-th schema
@@ -104,7 +114,11 @@ pub fn header_stamp_location(
         schema: schema.to_string(),
     };
     let schema_idx = resolver.index_of(schema).ok_or_else(unknown)?;
-    let layout = resolver.layout_at(schema_idx).map_err(|_| unknown())?;
+    let no_layout = |error| HeaderStampSchemaError::NoLayout {
+        schema: schema.to_string(),
+        error,
+    };
+    let layout = resolver.layout_at(schema_idx).map_err(no_layout)?;
 
     // Where `header` sits in the parent: inline in the fixed section, or
     // behind an offset-table entry.
@@ -136,12 +150,7 @@ pub fn header_stamp_location(
     })?;
     // The qualified text is for messages only.
     let header_schema = resolver.schemas()[header_idx].qualified_name();
-    let header_layout = resolver.layout_at(header_idx).map_err(|_| {
-        HeaderStampSchemaError::UnknownHeaderSchema {
-            schema: schema.to_string(),
-            header_schema: header_schema.clone(),
-        }
-    })?;
+    let header_layout = resolver.layout_at(header_idx).map_err(no_layout)?;
     let stamp = header_layout
         .fixed_fields
         .iter()
@@ -156,7 +165,7 @@ pub fn header_stamp_location(
         found: stamp.field_type.canonical_str(),
     };
     let time_idx = nested_target(resolver, &stamp.field_type, header_idx).ok_or_else(not_time)?;
-    let time_layout = resolver.layout_at(time_idx).map_err(|_| not_time())?;
+    let time_layout = resolver.layout_at(time_idx).map_err(no_layout)?;
     let sec = time_layout.fixed_fields.iter().find(|f| f.name == "sec");
     let nanosec = time_layout
         .fixed_fields
@@ -432,6 +441,41 @@ mod tests {
                 index: 0,
                 stamp_offset: 0,
                 data_floor: 16
+            })
+        );
+    }
+
+    /// A schema that is in the set but whose fixed section overflows is
+    /// refused as having no layout, with the layout error kept, never as an
+    /// unknown schema. `demo/Big { Leaf[N] arr }` with `Leaf { float64 v }`
+    /// and `N = usize::MAX / 4`, so `8 * N` overflows.
+    #[test]
+    fn a_known_schema_without_a_layout_is_refused_with_its_layout_error() {
+        use crate::codegen::schema::FieldDef;
+
+        let mut leaf = MessageSchema::new_in_package("Leaf", "demo");
+        leaf.add_field(FieldDef::new("v", FieldType::F64));
+        let mut big = MessageSchema::new_in_package("Big", "demo");
+        big.add_field(FieldDef::new(
+            "arr",
+            FieldType::FixedArray {
+                element_type: Box::new(FieldType::Nested {
+                    schema_name: "Leaf".to_string(),
+                    package: None,
+                    fixed: None,
+                }),
+                length: usize::MAX / 4,
+            },
+        ));
+        let mut resolver = LayoutResolver::new(vec![leaf, big]).0;
+        assert_eq!(
+            header_stamp_location(&mut resolver, "demo/Big"),
+            Err(HeaderStampSchemaError::NoLayout {
+                schema: "demo/Big".into(),
+                error: LayoutError::FixedSectionOverflow {
+                    schema: "demo/Big".into(),
+                    field: "arr".into(),
+                },
             })
         );
     }

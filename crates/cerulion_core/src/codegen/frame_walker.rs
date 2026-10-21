@@ -550,7 +550,13 @@ impl FrameWalker {
             if slots.index.is_active(schema, idx) {
                 active.push(slot);
             }
-            layouts.insert(layout.qualified_name.clone(), slot);
+            // A name entry comes only from the final owner of the text (the
+            // index `LayoutResolver::layout_of` reads). When that owner's
+            // layout fails, the name decodes nothing: an earlier definition
+            // of the same text never stands in for it.
+            if resolver.index_of(&layout.qualified_name) == Some(idx) {
+                layouts.insert(layout.qualified_name.clone(), slot);
+            }
             slots.layouts.push(layout);
         }
         // Index `schema_hash → slot` once so hash-driven resolution is a map
