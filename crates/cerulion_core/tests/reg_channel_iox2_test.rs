@@ -2110,3 +2110,66 @@ fn a_restarted_gateway_withdraws_the_prior_runs_announcements() {
         "the bare identity token is not an egress announcement and stays"
     );
 }
+
+/// A gateway restarted on the same manager drives only the topics left
+/// registered: the manager keeps the prior run's bridge flags, so the host
+/// drops the ones the new run does not serve BEFORE the restart, or a
+/// prior-run topic whose demand flag is still on joins the new drive view and
+/// keeps egressing. Hand oracle.
+#[test]
+fn a_restarted_gateway_does_not_drive_the_prior_runs_unregistered_topics() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_unregister_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rctest".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let kept = format!("/rt/unregister/kept/{}", unique_id());
+    let dropped = format!("/rt/unregister/dropped/{}", unique_id());
+    let plan = |announce: Vec<String>| GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce,
+        ingress: vec![],
+    };
+    let first = GatewayRuntime::new(
+        Arc::clone(&manager),
+        plan(vec![kept.clone(), dropped.clone()]),
+    )
+    .expect("first gateway boot");
+    assert!(manager
+        .bridge_manager()
+        .enable_bridge(&dropped)
+        .expect("enable"));
+    drop(first);
+
+    assert_eq!(
+        manager
+            .bridge_manager()
+            .unregister_topics_except(std::slice::from_ref(&kept))
+            .expect("unregister"),
+        1
+    );
+    let restarted = GatewayRuntime::new(Arc::clone(&manager), plan(vec![kept.clone()]))
+        .expect("restarted gateway boot");
+
+    assert_eq!(restarted.egress_view_count(), 1);
+    assert_eq!(restarted.registered_topic_count().expect("count"), 1);
+    assert!(!manager
+        .bridge_manager()
+        .is_registered(&dropped)
+        .expect("registered"));
+    assert!(
+        !manager
+            .bridge_manager()
+            .enable_bridge(&dropped)
+            .expect("enable"),
+        "a remote demand cannot turn an unregistered topic back on"
+    );
+}

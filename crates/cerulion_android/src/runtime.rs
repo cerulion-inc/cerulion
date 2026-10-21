@@ -679,6 +679,16 @@ impl EmbeddedRuntime {
                 // Ownership starts here, not at the thread spawn: the
                 // constructor mutates the shared manager before it can fail.
                 resources.gateway_owned = true;
+                // The manager outlives the prior gateway and keeps its bridge
+                // flags: a new gateway drives EVERY registered flag, so drop
+                // the topics the new run does not serve, or a prior-run topic
+                // whose demand flag is still on keeps egressing. The prior
+                // gateway was stopped before this start, so no drive loop
+                // observes the removal.
+                manager
+                    .bridge_manager()
+                    .unregister_topics_except(&serving_clone.served_topics)
+                    .map_err(|error| EmbedError::Network(error.to_string()))?;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
@@ -868,7 +878,10 @@ impl EmbeddedRuntime {
             // write manager-wide state, so no other runtime may start a
             // gateway until they finish.
             let gateway_claim = self.resources.gateway_claim.take();
-            let _ = stop_resource_set(&mut self.resources, &self.status, true);
+            // The recorder is finalized here, and its thread is joined, so a
+            // later `stop()` cannot recover the totals: keep them in status.
+            let (summary, _) = stop_resource_set(&mut self.resources, &self.status, true);
+            lock_status(&self.status).recorder = summary;
             // Teardown of an owned gateway closes LAN access itself; its
             // write, not the applied one, is then the last write this start
             // made.

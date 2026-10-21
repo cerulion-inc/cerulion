@@ -70,6 +70,16 @@ fn a_graph_launch_refusal_fails_the_start_instead_of_reporting_running() {
         let status = runtime.status_handle();
         let status = status.lock().expect("status lock");
         assert_eq!(status.state, RuntimeState::Failed, "{status:?}");
+        // The teardown joined the recorder thread, so a later stop cannot
+        // recover its totals: the failed start keeps them in status.
+        let out_path = status
+            .recorder
+            .as_ref()
+            .and_then(|summary| summary.out_path.as_deref());
+        assert!(
+            out_path.is_some_and(|path| path.ends_with(&format!("{attempt}.mcap"))),
+            "the failed start must keep its recorder totals, got: {status:?}"
+        );
         drop(status);
         // The recorder was live when the graph refused: the failed start's
         // teardown stopped it and finalized its bag.
