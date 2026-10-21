@@ -61,7 +61,7 @@ default + gateway, the discovery ladder, and pairing.
   connect phase hard-bounded at 1 s, and the demand/announce reply gathers
   (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
   LOCAL list has already printed by then. `--local` (also spelled
-  `--no-network`) or `CERULION_NETWORK=off` skips the remote query; the
+  `--no-network`), `CERULION_NETWORK=off` or `CERULION_NETD_NETWORK=off` skips the remote query; the
   environment parser preserves its fail-closed behavior for other nonempty values; extra `--connect`/`--listen` locators reach peers the ladder can't
   find.
 - **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
@@ -158,6 +158,12 @@ Selection wins over explicit list locators and `--scan`. The
 flag: trimmed, case-insensitive `off` suppresses networking; unset or
 whitespace-only has no effect; every other nonempty value warns and fails
 closed. No run or inspection flag enables networking over this kill-switch.
+The inspection verbs and `schema info` also stay local under the network
+daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
+parse), opening no discovery session of their own. `cerulion viz --robot`
+refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
+`CERULION_VIZD_NETWORK=off`, and `cerulion pair` refuses under
+`CERULION_NETWORK`.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and

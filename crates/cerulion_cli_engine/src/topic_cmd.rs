@@ -405,7 +405,7 @@ fn ensure_topic_available(
     // rule: one data source = one topic, obtained over the network once).
     let killed = scope.local_only();
     // Read once, so every refusal below names the kill-switch state this call saw.
-    let env_kill = crate::graph_cmd::network_env_kill();
+    let env_kill = crate::graph_cmd::query_network_kill();
     let transport = cerulion_core::TransportManager::get_or_init()?;
 
     // Classify: a topic LISTED locally that is NOT a netd mirror is a
@@ -964,7 +964,7 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
 fn local_lease_refusal_message(
     error: &cerulion_core::TransportError,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (_, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -980,30 +980,31 @@ fn local_lease_refusal_message(
 /// Pure over its inputs: the caller reads the kill-switch state once.
 fn scope_selection_and_remedy(
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
-) -> (String, &'static str) {
+    env: &crate::graph_cmd::QueryNetworkKill,
+) -> (String, String) {
     match scope {
         TopicScope::Local => (
             "--local".to_string(),
-            "remove --local and unset CERULION_NETWORK",
+            format!("remove --local and {}", env.unset_remedy()),
         ),
-        TopicScope::Automatic => (environment_selection_label(env), "unset CERULION_NETWORK"),
+        TopicScope::Automatic => (
+            environment_selection_label(env),
+            env.unset_remedy().to_string(),
+        ),
     }
 }
 
 /// The label for a local-only refusal the environment kill-switch caused: the
 /// accepted `off`, or the unrecognized value that failed closed, named as such so
-/// the refusal states what actually engaged the switch. `Unset` cannot reach a
-/// local-only refusal (nothing engaged the switch); it names the accepted value.
-fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String {
-    match env {
-        crate::graph_cmd::NetworkEnvKill::Off | crate::graph_cmd::NetworkEnvKill::Unset => {
-            "CERULION_NETWORK=off".to_string()
-        }
-        crate::graph_cmd::NetworkEnvKill::Unrecognized(value) => format!(
-            "CERULION_NETWORK={} (an unrecognized value, which fails closed to local-only)",
-            sanitize_display(value.trim())
-        ),
+/// the refusal states what actually engaged the switch, joined with
+/// `CERULION_NETD_NETWORK=off` when that switch is engaged too. Nothing engaged
+/// cannot reach a local-only refusal; it names `CERULION_NETWORK=off`.
+fn environment_selection_label(env: &crate::graph_cmd::QueryNetworkKill) -> String {
+    match (env.network.refusal_label(), env.netd_off) {
+        (Some(network), true) => format!("{network} and CERULION_NETD_NETWORK=off"),
+        (Some(network), false) => network,
+        (None, true) => "CERULION_NETD_NETWORK=off".to_string(),
+        (None, false) => "CERULION_NETWORK=off".to_string(),
     }
 }
 
@@ -1012,7 +1013,7 @@ fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String
 fn unknown_origin_mirror_message(
     topic: &str,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -1027,12 +1028,13 @@ fn scope_unavailable_message(
     mirror_robot: Option<&str>,
     has_slashed_twin: bool,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     let short_remedy = match scope {
-        TopicScope::Local => remedy,
-        TopicScope::Automatic => "unset it",
+        TopicScope::Local => remedy.clone(),
+        TopicScope::Automatic if env.both_engaged() => "unset both".to_string(),
+        TopicScope::Automatic => "unset it".to_string(),
     };
     match mirror_robot {
         Some(robot) => {
@@ -2168,8 +2170,8 @@ pub fn fetch_remote_schema(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             requested = %requested,
-            "remote schema fetch suppressed by the CERULION_NETWORK kill-switch \
-             — LOCAL-ONLY (no remote attempt)"
+            "remote schema fetch suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         // NOT a cold start: the user asked for local-only, so the local "not found"
         // IS the correct answer.
@@ -2850,8 +2852,8 @@ fn resolve_remote_topic_schema_with_opts(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             topic = %topic,
-            "remote schema resolve for `topic echo` suppressed by the CERULION_NETWORK \
-             kill-switch — LOCAL-ONLY (no remote attempt)"
+            "remote schema resolve for `topic echo` suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         return SchemaResolve::NoProducer;
     }
@@ -4847,7 +4849,10 @@ mod tests {
             mirror_robot,
             has_slashed_twin,
             TopicScope::Automatic,
-            &crate::graph_cmd::NetworkEnvKill::Off,
+            &crate::graph_cmd::QueryNetworkKill {
+                network: crate::graph_cmd::NetworkEnvKill::Off,
+                netd_off: false,
+            },
         )
     }
 
@@ -4873,7 +4878,10 @@ mod tests {
             topic: "/cam".to_string(),
             reason: "a live network mirror owns this topic".to_string(),
         };
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = local_lease_refusal_message(&error, TopicScope::Local, &off);
         assert!(flagged.starts_with("Local observation of topic '/cam' could not hold its source: a live network mirror owns this topic; "), "{flagged}");
         assert!(
@@ -4898,24 +4906,91 @@ mod tests {
     /// never `off` for a value the user did not set.
     #[test]
     fn environment_selection_label_preserves_an_unrecognized_value() {
-        use crate::graph_cmd::NetworkEnvKill;
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let network = |network| QueryNetworkKill {
+            network,
+            netd_off: false,
+        };
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Off),
+            environment_selection_label(&network(NetworkEnvKill::Off)),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unset),
+            environment_selection_label(&QueryNetworkKill::UNSET),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unrecognized(" typo ".to_string())),
+            environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+                " typo ".to_string()
+            ))),
             "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)"
         );
-        let hostile =
-            environment_selection_label(&NetworkEnvKill::Unrecognized("on\u{1b}[2J".to_string()));
+        let hostile = environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+            "on\u{1b}[2J".to_string(),
+        )));
         assert!(
             hostile.starts_with("CERULION_NETWORK=on\u{fffd}[2J ("),
             "{hostile}"
+        );
+    }
+
+    /// The netd daemon's switch is named on its own when it alone engaged the
+    /// local scope, and beside `CERULION_NETWORK` when both did; each remedy
+    /// unsets exactly the engaged variables.
+    #[test]
+    fn netd_network_switch_is_named_in_the_label_and_the_remedy() {
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let netd = QueryNetworkKill {
+            network: NetworkEnvKill::Unset,
+            netd_off: true,
+        };
+        assert_eq!(
+            environment_selection_label(&netd),
+            "CERULION_NETD_NETWORK=off"
+        );
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &netd);
+        assert_eq!(
+            missing,
+            "topic '/cam' not found locally, and remote discovery is disabled by \
+             CERULION_NETD_NETWORK=off; unset it to search robots on the LAN (a matching \
+             remote topic is then demanded automatically via cerulion-netd)"
+        );
+        let mirror = unknown_origin_mirror_message("/cam", TopicScope::Automatic, &netd);
+        assert!(
+            mirror.contains(
+                "; CERULION_NETD_NETWORK=off forbids demanding it from cerulion-netd; \
+                 unset CERULION_NETD_NETWORK to resolve"
+            ),
+            "{mirror}"
+        );
+        let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &netd);
+        assert!(
+            flagged.contains("; remove --local and unset CERULION_NETD_NETWORK to resolve"),
+            "{flagged}"
+        );
+        let both = QueryNetworkKill {
+            network: NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: true,
+        };
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &both);
+        assert!(
+            missing.contains(
+                "disabled by CERULION_NETWORK=on (an unrecognized value, which fails closed to \
+                 local-only) and CERULION_NETD_NETWORK=off; unset both to search"
+            ),
+            "{missing}"
+        );
+        let lease = local_lease_refusal_message(
+            &cerulion_core::TransportError::LocalObservationLease {
+                topic: "/cam".to_string(),
+                reason: "a live network mirror owns this topic".to_string(),
+            },
+            TopicScope::Automatic,
+            &both,
+        );
+        assert!(
+            lease.contains("; unset CERULION_NETWORK and CERULION_NETD_NETWORK to demand"),
+            "{lease}"
         );
     }
 
@@ -4923,7 +4998,10 @@ mod tests {
     /// remedy: `--local` only when the flag was passed, the environment switch otherwise.
     #[test]
     fn unknown_origin_mirror_refusal_names_the_active_selection() {
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &off);
         assert!(
             flagged.starts_with("topic '/cam' exists locally as a network mirror with origin unavailable; --local forbids demanding it from cerulion-netd; remove --local and unset CERULION_NETWORK to resolve"),
@@ -4935,7 +5013,10 @@ mod tests {
             "{environment}"
         );
         assert!(!environment.contains("--local"), "{environment}");
-        let unrecognized = crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string());
+        let unrecognized = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: false,
+        };
         let failed_closed =
             unknown_origin_mirror_message("/cam", TopicScope::Automatic, &unrecognized);
         assert!(
