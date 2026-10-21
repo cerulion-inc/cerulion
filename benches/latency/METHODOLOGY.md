@@ -1280,7 +1280,7 @@ ros/rmw/dds/iceoryx package versions to `_logs/<cell>_versions.txt`
 (`CER_BENCH_DUMP_VERSIONS=1`, set by `bench.py`), and the run manifest
 (`run.json`) records the docker image IDs, so which CycloneDDS /
 Fast DDS / rmw_zenoh was actually benched is recoverable from any
-committed run. The native zenoh crate is exact-pinned `=1.7.2` with
+committed run. The native zenoh crate is exact-pinned `=1.10.1` with
 the rationale in `native/Cargo.toml` and the README line inventory.
 Version anchors from the 2026-08-13 evidence snapshot (not a current-version claim): jazzy =
 Fast DDS 2.14.x / CycloneDDS 0.10.5 / rmw_zenoh 0.2.10; lyrical =
