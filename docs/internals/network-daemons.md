@@ -133,6 +133,9 @@ remove them before committing.
   posture. `graph run` uses this value for its permissive-egress breadcrumb, so
   a netd process with a different environment is reported accurately. Older
   responses omit the optional value and are reported as UNKNOWN, not open: `graph run` warns about the older daemon rather than emitting the permissive-egress breadcrumb.
+  A run that requires `paired` keeps the netd registration only when netd
+  reports `paired`; an `open` or UNKNOWN report releases it, and the run falls
+  back to its own gateway child, which enforces `paired`.
 - The standalone `graph run-gateway` child hosts the plane for an explicit
   `network:` block (the Strict posture, whose verbatim locators and egress
   allow-list the shared permissive session cannot represent), on non-Unix hosts,

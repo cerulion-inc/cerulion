@@ -116,7 +116,9 @@ peer carries no paired identity.
 `CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
 `paired`. The netd egress response includes the shared gateway's posture, so
 `graph run` reports the posture of the process serving the run rather than
-assuming its own environment matches netd.
+assuming its own environment matches netd. A run that requires `paired` shares
+netd only when netd reports `paired`; when netd reports `open` or reports no
+posture, the run uses its own gateway, which enforces `paired`.
 
 ## The decision matrix
 

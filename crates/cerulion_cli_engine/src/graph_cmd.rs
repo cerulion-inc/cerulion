@@ -4836,19 +4836,24 @@ fn register_egress_with_netd(
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
     let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
-    // Fail closed on a posture netd cannot report: an older daemon may serve
-    // its LAN openly while this run requires paired. Dropping the client
-    // releases the registration, and the caller falls back to a per-run
-    // gateway child, which enforces this run's own posture.
+    // Fail closed unless netd reports paired when this run requires paired:
+    // a netd that reports open serves its LAN openly, and one that reports
+    // nothing (an older daemon) may. Dropping the client releases the
+    // registration, and the caller falls back to a per-run gateway child,
+    // which enforces this run's own posture.
     let requested = cerulion_core::LanAccess::from_env();
     if !netd_posture_acceptable(resp.lan_access, requested) {
         drop(client);
-        return Err(cerulion_netd::ClientError::Protocol(
-            "cerulion-netd did not report its LAN access posture (an older daemon) and this \
-             run requires paired access, so the run uses its own gateway; restart \
-             cerulion-netd to share its session"
-                .to_string(),
-        ));
+        let reported = match resp.lan_access {
+            Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+            Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+            None => "did not report its LAN access posture (an older daemon)",
+        };
+        return Err(cerulion_netd::ClientError::Protocol(format!(
+            "cerulion-netd {reported} and this run requires paired access, so the run \
+             uses its own gateway; restart cerulion-netd with paired access to share its \
+             session"
+        )));
     }
     tracing::info!(
         graph = %graph_name,
@@ -4872,14 +4877,17 @@ fn register_egress_with_netd(
 }
 
 /// Whether a run that requires `requested` LAN access may ride a netd
-/// that reported `reported`. A netd that reports no posture (an older
-/// daemon) may be serving its LAN openly, so a paired run refuses it.
+/// that reported `reported`. A paired run rides only a netd that reports
+/// paired: one that reports open serves its LAN openly, and one that
+/// reports no posture (an older daemon) may. An open run accepts any netd,
+/// because a paired netd is only stricter.
 #[cfg(unix)]
 fn netd_posture_acceptable(
     reported: Option<cerulion_core::LanAccess>,
     requested: cerulion_core::LanAccess,
 ) -> bool {
-    !(reported.is_none() && requested == cerulion_core::LanAccess::Paired)
+    requested == cerulion_core::LanAccess::Open
+        || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
 /// Establish the network-egress overlay for a real-clock live run. `None`
@@ -21802,18 +21810,18 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 mod tests {
     use super::*;
 
-    /// A paired run refuses a netd that reports no LAN posture; every
-    /// reported posture, and an open run, is accepted. Hand oracle over all
-    /// six (reported, requested) pairs.
+    /// A paired run rides only a netd that reports paired: an open or an
+    /// unknown posture is refused. An open run accepts every netd. Hand
+    /// oracle over all six (reported, requested) pairs.
     #[cfg(unix)]
     #[test]
-    fn netd_posture_acceptable_refuses_only_an_unknown_posture_for_a_paired_run() {
+    fn netd_posture_acceptable_requires_a_reported_paired_netd_for_a_paired_run() {
         use cerulion_core::LanAccess::{Open, Paired};
         assert!(!netd_posture_acceptable(None, Paired));
-        assert!(netd_posture_acceptable(None, Open));
+        assert!(!netd_posture_acceptable(Some(Open), Paired));
         assert!(netd_posture_acceptable(Some(Paired), Paired));
+        assert!(netd_posture_acceptable(None, Open));
         assert!(netd_posture_acceptable(Some(Paired), Open));
-        assert!(netd_posture_acceptable(Some(Open), Paired));
         assert!(netd_posture_acceptable(Some(Open), Open));
     }
 
