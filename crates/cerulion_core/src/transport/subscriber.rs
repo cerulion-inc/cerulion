@@ -2860,6 +2860,19 @@ impl CerulionSubscriber {
     where
         F: FnMut(ReceivedMessage<'_>),
     {
+        self.try_receive_one_with_origin(|message, _origin| callback(message))
+    }
+
+    /// [`Self::try_receive_one`], with the callback also handed the frame's
+    /// origin: the iceoryx2 `UniquePublisherId` of the publisher port that
+    /// committed it, as the raw `u128` [`OwnedInboundSample::origin`] returns.
+    /// The id is sample metadata read from the sample's own header; it is the
+    /// key [`super::publisher_directory::PublisherDirectory`] resolves to the
+    /// port's name.
+    pub fn try_receive_one_with_origin<F>(&self, mut callback: F) -> TransportResult<bool>
+    where
+        F: FnMut(ReceivedMessage<'_>, u128),
+    {
         // Same misuse warn as `try_receive`:
         // shared latch, one warn per input across all four queue-draining
         // read paths.
@@ -2917,7 +2930,7 @@ impl CerulionSubscriber {
                 continue;
             }
             let payload = &raw[WireHeader::SIZE..total_size];
-            callback(ReceivedMessage::new(header, payload));
+            callback(ReceivedMessage::new(header, payload), sample.origin().value());
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
             self.record_service_cursor_from(&header);

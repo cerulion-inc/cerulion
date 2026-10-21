@@ -52,6 +52,7 @@ pub mod notify_delivery_latch;
 pub mod output_discard_latch;
 pub mod output_proxy;
 pub mod publisher;
+pub mod publisher_directory;
 pub mod reg_channel;
 pub mod run_artifacts;
 pub mod run_registry;
@@ -3155,8 +3156,84 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            None,
             &map_err,
         )
+    }
+
+    /// [`Self::create_publisher_with_topic_config`] with the iceoryx2
+    /// publisher port created under `port_name`. Every process attached to the
+    /// topic reads the name in the data service's dynamic config, keyed by the
+    /// port's publisher id, which is the id a received sample carries as its
+    /// origin ([`publisher_directory::PublisherDirectory`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::create_publisher_with_topic_config`], and
+    /// `PublisherCreation` when `port_name` is not a valid iceoryx2 port name
+    /// (empty, or longer than [`publisher_directory::max_port_name_len`]
+    /// bytes).
+    #[must_use = "publisher creation result must be checked"]
+    pub fn create_named_publisher_with_topic_config(
+        &self,
+        topic: &str,
+        max_slice_len: MaxSliceLen,
+        history_size: usize,
+        topic_config: TopicServiceConfig,
+        port_name: &str,
+    ) -> TransportResult<CerulionPublisher> {
+        let topic_owned = topic.to_string();
+        let map_err = move |reason: String| TransportError::PublisherCreation {
+            topic: topic_owned.clone(),
+            reason,
+        };
+        let name = publisher_directory::port_name(port_name).map_err(&map_err)?;
+        let (data_service, event_service) =
+            self.open_topic_services(topic, &map_err, topic_config)?;
+        self.finish_publisher(
+            topic,
+            &data_service,
+            event_service,
+            max_slice_len,
+            history_size,
+            topic_config,
+            Some(&name),
+            &map_err,
+        )
+    }
+
+    /// The publisher directory of `topic`'s data service: the port name of each
+    /// publisher attached to it, in every process, by publisher id
+    /// ([`publisher_directory::PublisherDirectory`]). Opens the existing data
+    /// service (`.open()`, never a create); this process's node already holds
+    /// the service when it has a port on the topic, so the open takes no
+    /// further node slot in the service.
+    ///
+    /// # Errors
+    ///
+    /// `SubscriberCreation` when the topic name is invalid or the data service
+    /// does not exist or cannot be opened.
+    pub fn open_publisher_directory(
+        &self,
+        topic: &str,
+    ) -> TransportResult<publisher_directory::PublisherDirectory> {
+        let topic_owned = topic.to_string();
+        let map_err = move |reason: String| TransportError::SubscriberCreation {
+            topic: topic_owned.clone(),
+            reason,
+        };
+        validate_topic_name(topic).map_err(&map_err)?;
+        let data_service_name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{}", e)))?;
+        let data_service = self
+            .node
+            .service_builder(&data_service_name)
+            .publish_subscribe::<[u8]>()
+            .open()
+            .map_err(|e| map_err(format!("{e}{}", publish_subscribe_open_env_hint(&e))))?;
+        Ok(publisher_directory::PublisherDirectory::new(data_service))
     }
 
     /// The publisher-port tail shared by
@@ -3188,6 +3265,9 @@ impl TransportManager {
         max_slice_len: MaxSliceLen,
         history_size: usize,
         topic_config: TopicServiceConfig,
+        // The iceoryx2 port name the publisher is created under, or `None`
+        // for an unnamed port.
+        port_name: Option<&iceoryx2::port::port_name::PortName>,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionPublisher> {
         // Cross-graph same-topic guard: iceoryx2's port cap
@@ -3271,6 +3351,9 @@ impl TransportManager {
             // slice-ceiling slot per unit in this publisher's demand-paged
             // pool (see the field doc).
             publisher_builder = publisher_builder.max_loaned_samples(max_loaned);
+        }
+        if let Some(name) = port_name {
+            publisher_builder = publisher_builder.name(name);
         }
         let publisher = publisher_builder.create().map_err(|e| {
             use iceoryx2::port::publisher::PublisherCreateError;
@@ -3502,6 +3585,7 @@ impl TransportManager {
             max_slice_len,
             history_size,
             topic_config,
+            None,
             &map_err,
         )
     }
@@ -3643,6 +3727,7 @@ impl TransportManager {
             max_slice_len,
             0, // history_size — ingress retains no late-joiner history
             topic_config,
+            None,
             &map_err,
         )?;
         // A raw-INGRESS publisher wakes its FOREIGN consumers from

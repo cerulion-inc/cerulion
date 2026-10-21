@@ -607,11 +607,17 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // degraded-open behavior governs and a resulting warn is then GENUINE
         // (the create-side-floor precedent: create provisions the
         // ceiling, a later open merely tolerates it).
-        let publisher = match rt.transport.create_publisher_with_topic_config(
+        // The entity gid (`crate::gid`), minted before the port so the port
+        // is created under the name that carries it: a subscription in any
+        // process reads the name back from the sample's origin id and reports
+        // this gid as the message's publisher gid.
+        let gid = crate::gid::mint_gid();
+        let publisher = match rt.transport.create_named_publisher_with_topic_config(
             &topic,
             slice_len,
             history,
             topic_config,
+            &crate::gid::publisher_port_name(&gid),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -673,12 +679,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // end of this function defends (see `register_dynamic_egress`).
         #[cfg(feature = "test-seams")]
         crate::test_seams::maybe_panic_after_publisher_transport_create();
-
-        // Deterministic gid: entity counter + schema hash (never random).
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         let can_loan = bridge.can_loan();
@@ -2329,14 +2329,25 @@ pub unsafe extern "C" fn rmw_create_subscription(
             );
         }
 
-        // Deterministic gid: entity counter + schema hash (never random) —
-        // mirrors the publisher; the endpoint id reported by
-        // rmw_get_subscriptions_info_by_topic and the registry deregister
-        // key. Read the bridge BEFORE it moves into `data`.
-        let entity = runtime::next_entity_id();
-        let mut gid = [0u8; 16];
-        gid[..8].copy_from_slice(&entity.to_le_bytes());
-        gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
+        // The entity gid (`crate::gid`): the endpoint id
+        // rmw_get_subscriptions_info_by_topic reports and the registry
+        // deregister key.
+        let gid = crate::gid::mint_gid();
+        // The publisher gid each take reports is read from the topic's
+        // publisher directory. Without one every take reports the all-zero
+        // gid, which matches no publisher.
+        let publisher_directory = match rt.transport.open_publisher_directory(&topic) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic,
+                    error = %e,
+                    "the topic's publisher directory did not open, so this \
+                     subscription's takes report an all-zero publisher gid"
+                );
+                None
+            }
+        };
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         // Adopt-take hot path: the
@@ -2372,6 +2383,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 // the first adopted take grows neither (see above).
                 adopt_ranges: Vec::with_capacity(forgeable_members),
                 adopt_registered: Vec::with_capacity(forgeable_members),
+                publisher_gids: crate::gid::PublisherGidResolver::new(publisher_directory),
             }),
             gid,
             decode_failures: std::sync::Mutex::new(
@@ -2553,7 +2565,7 @@ unsafe fn take_impl(
     let expected_hash = data.bridge.schema_hash();
 
     // A poisoned lock means wedged: never re-enter torn iceoryx2 state.
-    let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
+    let Some(mut inner) = runtime::lock_unpoisoned(&data.inner) else {
         tracing::error!("entity wedged by an earlier panic; failing call");
         return RMW_RET_ERROR;
     };
@@ -2591,11 +2603,11 @@ unsafe fn take_impl(
     }
     let mut result = RMW_RET_OK;
     let mut took = false;
-    let mut info_out: Option<(u64, u64)> = None;
+    let mut info_out: Option<(u64, u64, u128)> = None;
     // ONE message per call (the rmw take contract): try_receive_one,
     // never the drain-everything path — extra drained frames would be
     // silently lost (Principle #6).
-    let receive = inner.subscriber.try_receive_one(|msg| {
+    let receive = inner.subscriber.try_receive_one_with_origin(|msg, origin| {
         let header = msg.header();
         // The DECISION lives in `take_gate` — one pure
         // function, one legal mutation target, shared by all three take
@@ -2656,7 +2668,7 @@ unsafe fn take_impl(
         }
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             crate::decode_failure_latch::report_decode_success(
                 &data.decode_failures,
                 crate::decode_failure_latch::DecodeSite::Subscription,
@@ -2676,6 +2688,10 @@ unsafe fn take_impl(
             );
         }
     });
+    let publisher_gid = match info_out {
+        Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
+        _ => [0u8; 16],
+    };
     drop(inner);
 
     match receive {
@@ -2689,7 +2705,7 @@ unsafe fn take_impl(
         *taken = true;
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -2697,7 +2713,7 @@ unsafe fn take_impl(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, &publisher_gid);
             info.from_intra_process = false;
             *message_info = info;
         }
@@ -3005,6 +3021,7 @@ unsafe fn take_adopted(
         // Empty queue — `taken` stays false.
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -3548,6 +3565,11 @@ unsafe fn take_adopted(
         // with nothing adoptable in it.
         _ => adopt.stats.fallbacks.fetch_add(1, Ordering::Relaxed),
     };
+    let publisher_gid = if message_info.is_null() {
+        [0u8; 16]
+    } else {
+        inner.publisher_gids.resolve(origin)
+    };
     drop(inner);
     *taken = true;
     if !message_info.is_null() {
@@ -3559,7 +3581,7 @@ unsafe fn take_adopted(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, &publisher_gid);
         info.from_intra_process = false;
         *message_info = info;
     }
@@ -3780,6 +3802,7 @@ unsafe fn take_loaned_impl(
         }
         return RMW_RET_OK;
     };
+    let origin = owned.origin();
     // `owned.wire_header()` returns the header the read entry stored when it took
     // the frame: `try_receive_one_owned` serves a frame only through
     // `OwnedInboundSample::with_header`, handing it the header its own loop
@@ -4022,6 +4045,7 @@ unsafe fn take_loaned_impl(
     *loaned_message = loaned_ptr;
     *taken = true;
     if !message_info.is_null() {
+        let publisher_gid = inner.publisher_gids.resolve(origin);
         // Identical fill to `take_impl`.
         let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
         info.source_timestamp = ts as i64;
@@ -4030,7 +4054,7 @@ unsafe fn take_loaned_impl(
             Err(_) => 0,
         };
         super::stamp_sequence_numbers(&mut info, seq);
-        info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+        super::stamp_publisher_gid(&mut info, &publisher_gid);
         info.from_intra_process = false;
         *message_info = info;
     }
