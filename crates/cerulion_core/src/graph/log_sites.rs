@@ -223,11 +223,59 @@ impl LogSiteTable {
     /// entry: the restored one that holds `id`, or a free one. `None` when
     /// [`LOG_SITE_SLOTS`] other sites have claimed entries.
     ///
+    /// A claim counts itself before it takes an entry, and a claim that loses
+    /// a race gives its count back. A full count can therefore hold a claim
+    /// that is still in flight: the first call of a site on another thread
+    /// that will give its count back, or the first call of this same site
+    /// that has not published its id yet. So a full count is checked against
+    /// the claimed entries, which only ever grow, and while fewer than
+    /// [`LOG_SITE_SLOTS`] are claimed the lookup waits for the claim in
+    /// flight and tries again. Once [`LOG_SITE_SLOTS`] are claimed, one more
+    /// lookup finds the site if a racing first call of it was among them. A
+    /// site is past the limit only when [`LOG_SITE_SLOTS`] other sites hold
+    /// claimed entries.
+    fn word(&self, id: u64) -> Option<&AtomicU64> {
+        let mut spins: u32 = 0;
+        loop {
+            if let Some(word) = self.probe(id) {
+                return Some(word);
+            }
+            if self.claimed_entries() >= LOG_SITE_SLOTS {
+                // The limit is reached, but a racing first call of this same
+                // site may be one of the claims that reached it: look again,
+                // now that every claimed entry's id is visible.
+                return self.probe(id);
+            }
+            // A claim in flight takes a few atomic steps to settle; give its
+            // thread the core if it was preempted in the middle of them.
+            if spins < 64 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Claimed entries. Each one holds a count no claim gives back, and an
+    /// entry never stops being claimed while the table is shared, so this
+    /// never reads more than the true number. 128 loads, on the overflow
+    /// path only.
+    fn claimed_entries(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.claimed.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// One lookup of [`Self::word`]. `None` when the count is full, which may
+    /// still hold a claim in flight.
+    ///
     /// Open addressing with linear probing from `id % TABLE_ENTRIES`. An
     /// entry, once it holds an id, keeps it for the life of the table (only
     /// [`Self::restore`], which holds the table exclusively, rewrites ids),
     /// so a probe that passes an entry never has to look at it again.
-    fn word(&self, id: u64) -> Option<&AtomicU64> {
+    fn probe(&self, id: u64) -> Option<&AtomicU64> {
         let start = (id % TABLE_ENTRIES as u64) as usize;
         for step in 0..TABLE_ENTRIES {
             let entry = &self.entries[(start + step) % TABLE_ENTRIES];
@@ -267,9 +315,9 @@ impl LogSiteTable {
                 }
             }
         }
-        // Unreachable: at most `LOG_SITE_SLOTS` restored entries plus
-        // `LOG_SITE_SLOTS` claimed ones fill `TABLE_ENTRIES`, and a claim is
-        // counted before it takes an entry.
+        // Only while a claim is in flight: at most `LOG_SITE_SLOTS` restored
+        // entries plus `LOG_SITE_SLOTS` claimed ones fill `TABLE_ENTRIES`,
+        // and a claim is counted before it takes an entry.
         None
     }
 
@@ -998,6 +1046,77 @@ mod tests {
             1,
             "the race took one entry, not one per racer"
         );
+    }
+
+    /// Claim `n` distinct sites (ids `0x100 + k`) on `table`.
+    fn claim_sites(table: &super::LogSiteTable, n: usize) {
+        for k in 0..n as u64 {
+            table.word(0x100 + k).expect("room below the limit");
+        }
+    }
+
+    /// With 63 sites claimed, another thread holds a count it will give back
+    /// (a first call that lost its entry to a racer). A first call at the
+    /// 64th site meanwhile must not read the full count as overflow: it waits
+    /// for the claim in flight, then gets its own entry.
+    #[test]
+    fn a_claim_in_flight_never_reads_as_overflow() {
+        let table = super::LogSiteTable::default();
+        claim_sites(&table, super::LOG_SITE_SLOTS - 1);
+        assert!(
+            table.try_count(),
+            "the in-flight claim takes the last count"
+        );
+        std::thread::scope(|s| {
+            let late = s.spawn(|| table.word(0x9999).is_some());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !late.is_finished(),
+                "the 64th site waits instead of reporting overflow"
+            );
+            table.uncount();
+            assert!(
+                late.join().unwrap(),
+                "the 64th site gets an entry once the claim in flight settles"
+            );
+        });
+        assert!(table.word(0x8888).is_none(), "the 65th site has none");
+    }
+
+    /// With 63 sites claimed, many threads make the first call at the 64th
+    /// site at the same moment, over many rounds: every racer gets the one
+    /// entry the site took, none sees overflow, and the 65th site gets none.
+    #[test]
+    fn concurrent_first_calls_at_the_last_free_site_all_get_its_entry() {
+        use std::sync::Barrier;
+
+        const RACERS: usize = 8;
+        for round in 0..200u64 {
+            let table = super::LogSiteTable::default();
+            claim_sites(&table, super::LOG_SITE_SLOTS - 1);
+            let barrier = Barrier::new(RACERS);
+            let id = 0x10_0000 + round;
+            let words: Vec<Option<usize>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..RACERS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            table.word(id).map(|w| std::ptr::from_ref(w) as usize)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(
+                words.iter().all(|w| w.is_some() && *w == words[0]),
+                "round {round}: every racer gets the 64th site's one entry"
+            );
+            assert_eq!(table.used(), super::LOG_SITE_SLOTS, "round {round}");
+            assert!(
+                table.word(id + 0x1000).is_none(),
+                "round {round}: 65th site"
+            );
+        }
     }
 
     /// Sites whose ids all start their probe at entry 0 still each get an
