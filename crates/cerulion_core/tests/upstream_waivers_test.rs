@@ -39,7 +39,7 @@
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole: 22, all of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 23, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
 //!
 //! A process-per-arm runner shortens that list, it does not empty it. The process
@@ -290,12 +290,14 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 22 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Three of the 22,
-/// `ros2_graph_e2e_test`, `network_gateway_e2e_test` and `mp_supervisor_box_test`,
-/// are in the set BY THE RULE rather than by measurement: no run has observed them
-/// failing. Of those three, every arm of `mp_supervisor_box_test` is `#[ignore]`d, so
-/// it runs nothing under `cargo test` on any platform; the other two carry no
+/// THE COVERAGE THIS COSTS, stated once: 23 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Four of the 23,
+/// `ros2_graph_e2e_test`, `network_gateway_e2e_test`, `mp_supervisor_box_test` and
+/// `mp_live_determinism_box_test`, are in the set BY THE RULE rather than by
+/// measurement: no run has observed them failing. Of those four, every arm of
+/// `mp_supervisor_box_test` is `#[ignore]`d, and every arm of
+/// `mp_live_determinism_box_test` but one pure check of its verdict function, so
+/// neither loads a plugin under `cargo test` on any platform; the other two carry no
 /// platform `cfg` and no `ignore`, so why they have not been observed failing is not
 /// established here. The cure is an upstream release carrying the fix, or the pinned
 /// fork carrying a patch for it; nothing in this repository can shorten the list.
@@ -334,6 +336,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_cli/tests/mp_execution_mode_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/mp_live_determinism_box_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
