@@ -116,9 +116,10 @@ peer carries no paired identity.
 `CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
 `paired`. The netd egress response includes the shared gateway's posture, so
 `graph run` reports the posture of the process serving the run rather than
-assuming its own environment matches netd. A run that requires `paired` shares
-netd only when netd reports `paired`; when netd reports `open` or reports no
-posture, the run uses its own gateway, which enforces `paired`.
+assuming its own environment matches netd. A run that requires `paired` asks netd
+for its posture before it registers any topic, and shares netd only when netd
+reports `paired`; when netd reports `open` or reports no posture, the run
+registers nothing with netd and uses its own gateway, which enforces `paired`.
 
 ## The decision matrix
 
@@ -987,8 +988,12 @@ status reply):
 
 ```
 {"hello":"cerulion-netd","protocol":6}
-{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"]}
+{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
+
+`lan_access` is the shared gateway's LAN posture (`open` or `paired`). A daemon
+without a network session, or an older daemon, omits it, and the omission means
+unknown, never open.
 
 Interpreting `connect_endpoints`:
 

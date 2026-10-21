@@ -4835,25 +4835,26 @@ fn register_egress_with_netd(
     ix_config_json: Option<&str>,
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
-    let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
-    // Fail closed unless netd reports paired when this run requires paired:
-    // a netd that reports open serves its LAN openly, and one that reports
-    // nothing (an older daemon) may. Dropping the client releases the
-    // registration, and the caller falls back to a per-run gateway child,
+    // Check netd's posture BEFORE registering: a registration's topics and
+    // schemas stay served on the shared gateway after release, so refusing an
+    // open netd after registering would not close the LAN access. A paired run
+    // rides only a netd that reports paired; otherwise dropping the client
+    // registers nothing and the caller falls back to a per-run gateway child,
     // which enforces this run's own posture.
     let requested = cerulion_core::LanAccess::from_env();
+    if requested == cerulion_core::LanAccess::Paired {
+        let reported = client.lan_access()?;
+        if !netd_posture_acceptable(reported, requested) {
+            drop(client);
+            return Err(netd_posture_refusal(reported));
+        }
+    }
+    let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
+    // The register response reports the posture too, so the check never
+    // rests on the probe alone.
     if !netd_posture_acceptable(resp.lan_access, requested) {
         drop(client);
-        let reported = match resp.lan_access {
-            Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
-            Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
-            None => "did not report its LAN access posture (an older daemon)",
-        };
-        return Err(cerulion_netd::ClientError::Protocol(format!(
-            "cerulion-netd {reported} and this run requires paired access, so the run \
-             uses its own gateway; restart cerulion-netd with paired access to share its \
-             session"
-        )));
+        return Err(netd_posture_refusal(resp.lan_access));
     }
     tracing::info!(
         graph = %graph_name,
@@ -4874,6 +4875,21 @@ fn register_egress_with_netd(
     // NO reconnect: recovery is not this watch's job.
     let watch = spawn_netd_liveness_watch(client.control_fd(), graph_name.to_string());
     Ok(NetdEgressGuard { watch, client })
+}
+
+/// The error that sends a paired run to its own gateway because netd
+/// `reported` a posture other than paired.
+#[cfg(unix)]
+fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_netd::ClientError {
+    let reported = match reported {
+        Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+        Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+        None => "did not report its LAN access posture (an older daemon)",
+    };
+    cerulion_netd::ClientError::Protocol(format!(
+        "cerulion-netd {reported} and this run requires paired access, so the run uses its \
+         own gateway; restart cerulion-netd with paired access to share its session"
+    ))
 }
 
 /// Whether a run that requires `requested` LAN access may ride a netd
