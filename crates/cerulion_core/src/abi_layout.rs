@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 26;
+const EXPECTED_ABI: u32 = 27;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -634,10 +634,28 @@ static EXPECTED: &[Expected] = &[
     },
     Expected {
         name: "ReadOutcomeStage",
-        fields: &["input_idx", "role", "capacity", "armed", "pending", "inner"],
+        // Re-snapshot: `records_every_consult: AtomicBool` joins the field set
+        // (the consult rule a replay adopts from the bag's trace format), and
+        // the field ORDER moves with it (MEASURED via `dump_measured_table`,
+        // never hand computed): the new byte takes offset rank 5 and `role`
+        // moves from rank 5 to 6, while the other five fields keep the ranks
+        // they had. The order is this row's whole numeric claim, since a row
+        // that embeds a `std::sync::Mutex` pins no absolute offset. The VERSION
+        // that carries this field is the one the `PlanInner` row below states:
+        // the gate's own struct is pinned by OFFSET and gains the rule byte in
+        // the same change, and one version describes one shipped layout.
+        fields: &[
+            "input_idx",
+            "role",
+            "capacity",
+            "armed",
+            "records_every_consult",
+            "pending",
+            "inner",
+        ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 5, 1, 4, 2, 0],
+            ranks: &[3, 6, 1, 4, 5, 2, 0],
         },
     },
     Expected {
@@ -751,22 +769,32 @@ static EXPECTED: &[Expected] = &[
             "violations_dropped",
             "mismatches",
             "unusable",
+            "rule",
         ],
         // Re-snapshot (MEASURED via `dump_measured_table`, never hand
-        // computed): `unplanned_consults: u64` grows the struct 104 -> 112 bytes
-        // and moves the two bools and `admitted_this_step` in the tail;
-        // `lifetime_held` is renamed `refused_consults` in the field list, which
-        // is a NAME change with no layout effect.
+        // computed): `rule: ConsultRule` (one byte) lands in the tail padding
+        // after the two bools, so the size stays 112 and no other field moves.
+        // Earlier in this family: `unplanned_consults: u64` grew the struct
+        // 104 -> 112 bytes and moved the two bools and `admitted_this_step` in
+        // the tail; `lifetime_held` was renamed `refused_consults`, a NAME
+        // change with no layout effect.
         //
-        // The ABI VERSION is unchanged at 23, on the rule the
-        // `StagedReadOutcome` entry states: the version already moved for this
-        // struct family in this release, and a later change to a struct in the
-        // same family is a re-snapshot rather than a second bump. Host and
-        // cdylib are built together from one tree.
+        // The ABI VERSION is 27. Version 26 describes a different layout move,
+        // the macOS doorbell mapping that re-packs `CerulionPublisher`, and one
+        // number cannot describe two: a cdylib exports one version and a host
+        // compares one number, so a core that writes the rule byte and a library
+        // built against the doorbell packing would both read 26 and load each
+        // other. 27 is one above the highest number any shipped layout holds.
+        // This struct is pinned by OFFSET, so a host and a cdylib built from
+        // different trees read the rule byte at different places, and the rule
+        // decides whether a consult the step's plan holds no position for is a
+        // counted number or a replay divergence. The re-snapshot rule the
+        // `StagedReadOutcome` entry states covers a second change to a FIELD SET
+        // inside one release, not a field added to a pinned offset list.
         layout: Layout::Pinned {
             size: 112,
             align: 8,
-            offsets: &[48, 108, 0, 56, 104, 64, 72, 80, 24, 88, 96, 109],
+            offsets: &[48, 108, 0, 56, 104, 64, 72, 80, 24, 88, 96, 109, 110],
         },
     },
     Expected {
@@ -807,6 +835,15 @@ static EXPECTED: &[Expected] = &[
     },
     Expected {
         name: "GateBlocker",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 1,
+            align: 1,
+            offsets: &[],
+        },
+    },
+    Expected {
+        name: "ConsultRule",
         fields: &[],
         layout: Layout::Pinned {
             size: 1,
@@ -958,6 +995,7 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
     ("DueShape", EnumPayload::NothingFirstParty),
     ("ReplayReadViolationKind", EnumPayload::NothingFirstParty),
     ("GateBlocker", EnumPayload::NothingFirstParty),
+    ("ConsultRule", EnumPayload::NothingFirstParty),
     ("HistoryDepth", EnumPayload::NothingFirstParty),
 ];
 

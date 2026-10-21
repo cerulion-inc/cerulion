@@ -31,6 +31,7 @@ use once_cell::sync::OnceCell;
 use zenoh::Wait;
 
 use super::bridge::TopicBridgeManager;
+use super::carrier::{EgressQos, EgressReliability, NetworkTls};
 use super::cerulion_q::{self, CatalogEntry, CatalogProvenance, QueryVerb, SchemaDoc};
 use super::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
@@ -183,6 +184,15 @@ pub struct NetworkConfig {
     /// `None` (the default) is fine for sessions that never announce
     /// (discovery queries, ingress-only bridges).
     pub robot_identity: Option<String>,
+    /// Certificate files for `quic/` locators, set as zenoh's
+    /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
+    /// `None` (the default) sets none of them.
+    pub tls: Option<NetworkTls>,
+    /// Per-topic egress put policy. A topic listed with
+    /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
+    /// by [`NetworkManager::publish_to_network`]; every other topic is put
+    /// reliable. Empty (the default) puts every topic reliable.
+    pub egress_qos: Vec<EgressQos>,
 }
 
 impl Default for NetworkConfig {
@@ -195,6 +205,8 @@ impl Default for NetworkConfig {
             gossip_scouting: false,
             bounded_connect: false,
             robot_identity: None,
+            tls: None,
+            egress_qos: Vec::new(),
         }
     }
 }
@@ -248,7 +260,7 @@ impl Drop for BgThreadDeathGuard {
         if !self.clean {
             tracing::error!(
                 thread = self.msg,
-                "a network background thread died unexpectedly - remote demand may no longer \
+                "a network background thread died unexpectedly: remote demand may no longer \
                  be discovered on links with broken liveliness propagation; restart \
                  the gateway"
             );
@@ -2611,6 +2623,9 @@ struct IngressCounters {
     /// two validation buckets: this is LOCAL transport pressure / a code bug,
     /// not a malformed or mis-schemed remote.
     reinject_failure_drops: AtomicU64,
+    /// Frames the zenoh receive callback refused, unvalidated, because LAN
+    /// access is [`LanAccess::Paired`].
+    lan_refused_drops: AtomicU64,
 }
 
 /// Snapshot of a bridged topic's ingress counters (Principle #3).
@@ -2619,10 +2634,10 @@ struct IngressCounters {
 ///
 /// # Accounting contract
 ///
-/// `frames` counts frames validated AND re-injected (successes). The THREE
+/// `frames` counts frames validated AND re-injected (successes). The FOUR
 /// drop buckets - `schema_mismatch_drops` + `decode_errors` +
-/// `reinject_failure_drops` - sum to the total loss: every received frame
-/// lands in exactly one of the four counters.
+/// `reinject_failure_drops` + `lan_refused_drops` - sum to the total loss:
+/// every received frame lands in exactly one of the five counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IngressStats {
     /// Frames validated AND re-injected into local iceoryx2 (successes only).
@@ -2638,6 +2653,12 @@ pub struct IngressStats {
     /// a poisoned publisher mutex). Local transport pressure / code-bug
     /// signal - investigate THIS machine, not the remote publisher.
     pub reinject_failure_drops: u64,
+    /// Frames from the zenoh LAN plane refused, never validated or
+    /// re-injected, because LAN access is [`LanAccess::Paired`]. Counts only
+    /// frames that reached the receive callback: while paired the data
+    /// subscriber is normally undeclared, so this covers the window around a
+    /// close.
+    pub lan_refused_drops: u64,
 }
 
 /// First-warn-then-debug rejection-log latch, one per bridged topic
@@ -2985,7 +3006,20 @@ impl IngressInjector {
             schema_mismatch_drops: self.counters.schema_mismatch_drops.load(Ordering::Relaxed),
             decode_errors: self.counters.decode_errors.load(Ordering::Relaxed),
             reinject_failure_drops: self.counters.reinject_failure_drops.load(Ordering::Relaxed),
+            lan_refused_drops: self.counters.lan_refused_drops.load(Ordering::Relaxed),
         }
+    }
+
+    /// Count a LAN frame refused because LAN access is paired. The frame is
+    /// neither validated nor re-injected.
+    fn record_lan_refusal(&self) {
+        self.counters
+            .lan_refused_drops
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::trace!(
+            topic = %self.topic,
+            "ingress: LAN frame refused, LAN access is paired"
+        );
     }
 
     /// Testing-only: arm the underlying publisher's fire-once `publish_raw`
@@ -3007,21 +3041,34 @@ impl IngressInjector {
 /// and the shared [`IngressInjector`] the callback re-injects through and
 /// [`NetworkManager::ingress_stats`] reads counters from. The injector (and its
 /// re-injection publisher) lives INSIDE the subscriber's callback closure via
-/// an `Arc` clone (kept alive by `_sub`); this entry holds the other `Arc`.
+/// an `Arc` clone (kept alive by `subscriber`); this entry holds the other `Arc`.
 struct IngressEntry {
-    /// Zenoh subscriber handle - its Drop undeclares the subscription.
-    _sub: zenoh::pubsub::Subscriber<()>,
+    /// Zenoh subscriber handle - its Drop undeclares the subscription. `None`
+    /// while LAN access is paired (unless the test seam
+    /// [`NetworkManager::set_retain_ingress_subscriber_for_test`] keeps it).
+    subscriber: Option<zenoh::pubsub::Subscriber<()>>,
     /// Liveliness DEMAND token advertising a live subscriber for this topic to
     /// remote egress publishers (its Drop undeclares the token → remote bridge
     /// off on a healthy link). `None` only under the test seam
     /// [`NetworkManager::set_suppress_ingress_token_for_test`] (proving the
     /// queryable-inversion GET path alone drives egress). Production always
     /// declares it - it is the belt-and-suspenders healthy-link demand path
-    /// alongside the demand GET.
-    _token: Option<TopicToken>,
+    /// alongside the demand GET. Also `None` while LAN access is paired.
+    token: Option<TopicToken>,
+    /// True while LAN access is paired: the demand token is withheld and the
+    /// data subscriber undeclared. Reopening access redeclares both.
+    suspended: bool,
     /// Shared with the receive callback; its [`IngressInjector::stats`] backs
     /// [`NetworkManager::ingress_stats`].
     injector: Arc<IngressInjector>,
+}
+
+/// Zenoh declarations taken out of an [`IngressEntry`] by a posture change,
+/// dropped by the caller outside every lock. Field order is drop order: the
+/// demand token is withdrawn before the data subscriber is undeclared.
+struct IngressHandles {
+    _token: Option<TopicToken>,
+    _subscriber: Option<zenoh::pubsub::Subscriber<()>>,
 }
 
 /// Manages the zenoh session and background network task lifecycle.
@@ -3032,6 +3079,9 @@ struct IngressEntry {
 /// and stopped when the last one is removed.
 pub struct NetworkManager {
     config: NetworkConfig,
+    /// Canonical topics put with zenoh's best-effort marker, derived once from
+    /// `config.egress_qos` so a put reads a set rather than the list.
+    best_effort_topics: HashSet<String>,
     session: OnceCell<zenoh::Session>,
     task: Mutex<TaskState>,
     /// Canonical-topic-keyed registry of active network→local ingress
@@ -3131,7 +3181,24 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
-    lan_paired: AtomicBool,
+    /// True while LAN access is [`LanAccess::Paired`]. Shared with every
+    /// ingress receive callback, which refuses frames while it is set.
+    lan_paired: Arc<AtomicBool>,
+    /// Ingress receive callbacks hold a READ guard from their `lan_paired`
+    /// check through re-injection; closing LAN access takes the WRITE guard
+    /// after storing `lan_paired`, so no LAN frame is re-injected after
+    /// [`Self::set_lan_access`] returns with [`LanAccess::Paired`].
+    ingress_gate: Arc<std::sync::RwLock<()>>,
+    /// Serializes an ingress registration's posture read and declarations
+    /// against a posture change suspending or redeclaring the registered
+    /// entries, so no entry keeps the declarations of a posture it missed.
+    /// Taken after `announce_gate` on the posture path; never by a zenoh
+    /// callback.
+    ingress_posture: Mutex<()>,
+    /// TEST SEAM: keep ingress data subscribers declared while paired (see
+    /// [`Self::set_retain_ingress_subscriber_for_test`]). Always `false` in
+    /// production.
+    retain_ingress_subscriber: AtomicBool,
     /// Serializes egress-topic announces against a paired switch.
     /// [`Self::announce_egress_topic`] holds a READ guard from its posture
     /// check through token declaration and insertion into `announced`;
@@ -3193,6 +3260,10 @@ pub struct NetworkManager {
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
     demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
+    /// Counts posture writes; bumped only while `demand_authorizer_parts` is
+    /// held, so a write token names exactly one [`Self::set_lan_access`]
+    /// call even when two calls store the same [`LanAccess`] value.
+    lan_access_generation: AtomicU64,
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
@@ -3218,8 +3289,15 @@ impl NetworkManager {
     pub fn new(config: NetworkConfig) -> Self {
         let lan_access = LanAccess::from_env();
         let inner_authorizer: Arc<dyn DemandAuthorizer> = Arc::new(AllowAllAuthorizer);
+        let best_effort_topics = config
+            .egress_qos
+            .iter()
+            .filter(|q| q.reliability == EgressReliability::BestEffort)
+            .map(|q| canonical_topic(&q.topic).into_owned())
+            .collect();
         Self {
             config,
+            best_effort_topics,
             session: OnceCell::new(),
             task: Mutex::new(TaskState {
                 handle: None,
@@ -3237,7 +3315,10 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
-            lan_paired: AtomicBool::new(lan_access == LanAccess::Paired),
+            lan_paired: Arc::new(AtomicBool::new(lan_access == LanAccess::Paired)),
+            ingress_gate: Arc::new(std::sync::RwLock::new(())),
+            ingress_posture: Mutex::new(()),
+            retain_ingress_subscriber: AtomicBool::new(false),
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
             before_announce_gate_write: Mutex::new(None),
@@ -3246,6 +3327,7 @@ impl NetworkManager {
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
+            lan_access_generation: AtomicU64::new(0),
             lan_bridges: Mutex::new(None),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
                 lan_access,
@@ -3298,7 +3380,31 @@ impl NetworkManager {
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
-        let bridges = {
+        self.set_lan_access_tracked(access);
+    }
+
+    /// [`Self::set_lan_access`], returning a token that names this write.
+    /// Pass the token to [`Self::set_lan_access_if_current`] to change the
+    /// posture again only while no other write has happened since.
+    pub fn set_lan_access_tracked(&self, access: LanAccess) -> u64 {
+        match self.apply_lan_access(access, None) {
+            Some(write) => write,
+            None => unreachable!("an unconditional posture write always applies"),
+        }
+    }
+
+    /// Set the posture only while the last write is still the one `write`
+    /// names (a token from [`Self::set_lan_access_tracked`] or this method).
+    /// Returns the new write's token, or `None` (posture untouched) when any
+    /// other write happened since - even one that stored the same value.
+    /// The check and the write are one atomic step against every other
+    /// posture write.
+    pub fn set_lan_access_if_current(&self, write: u64, access: LanAccess) -> Option<u64> {
+        self.apply_lan_access(access, Some(write))
+    }
+
+    fn apply_lan_access(&self, access: LanAccess, expected: Option<u64>) -> Option<u64> {
+        let (bridges, write, released) = {
             // Test seam: the announce/demand race tests place the closer
             // HERE - proven to be at the write lock's threshold, so the
             // 100 ms blocked check measures the gate, not a spawn delay.
@@ -3324,6 +3430,12 @@ impl NetworkManager {
                 .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = self.lan_access_generation.load(Ordering::SeqCst);
+            if expected.is_some_and(|expected| expected != current) {
+                return None;
+            }
+            let write = current.wrapping_add(1);
+            self.lan_access_generation.store(write, Ordering::SeqCst);
             parts.0 = access;
             self.lan_paired
                 .store(access == LanAccess::Paired, Ordering::SeqCst);
@@ -3352,16 +3464,29 @@ impl NetworkManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clear();
             }
-            bridges
+            // Ingress declarations change under the announce gate only, so a
+            // zenoh declaration never runs under the authorizer parts lock.
+            drop(parts);
+            let released = self.apply_ingress_posture(access == LanAccess::Paired);
+            (bridges, write, released)
         };
-        // Every lock above is released before this wait: a gateway pass that
+        drop(released);
+        // Every lock above is released before these waits: a gateway pass that
         // loaded `true` just before the close still holds the shared guard until
         // its batch is forwarded, so the exclusive take blocks until it drains.
+        // An ingress callback that read `lan_paired` before the store holds the
+        // ingress gate until its frame is re-injected.
         if access == LanAccess::Paired {
             if let Some(bridges) = &bridges {
                 bridges.wait_for_egress_passes();
             }
+            drop(
+                self.ingress_gate
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
         }
+        Some(write)
     }
 
     /// The LAN posture applied in front of the installed demand authorizer.
@@ -3594,12 +3719,49 @@ impl NetworkManager {
     /// This is called by publishers bridging local messages to remote
     /// subscribers, and by tests exercising the ingress path.
     ///
+    /// The put's reliability is the topic's entry in
+    /// [`NetworkConfig::egress_qos`] (reliable when absent); see
+    /// [`Self::publish_to_network_with`].
+    ///
     /// # Errors
     ///
     /// - `TransportError::Publish` if the frame is smaller than the 32-byte
     ///   wire header (cannot be a valid Cerulion frame) or the zenoh put fails
     /// - `TransportError::SessionCreation` if the session cannot be opened
     pub fn publish_to_network(&self, topic: &str, frame: Vec<u8>) -> TransportResult<()> {
+        self.publish_to_network_with(topic, frame, self.egress_reliability(topic))
+    }
+
+    /// The topic's put reliability as [`Self::publish_to_network`] resolves it
+    /// from [`NetworkConfig::egress_qos`].
+    pub fn egress_reliability(&self, topic: &str) -> EgressReliability {
+        if self
+            .best_effort_topics
+            .contains(canonical_topic(topic).as_ref())
+        {
+            EgressReliability::BestEffort
+        } else {
+            EgressReliability::Reliable
+        }
+    }
+
+    /// [`Self::publish_to_network`] with an explicit put reliability.
+    ///
+    /// `BestEffort` sets zenoh's best-effort marker on the put
+    /// (`PublicationBuilder::reliability`, a zenoh `unstable` call). zenoh
+    /// selects a best-effort link for the frame when the peer connection has
+    /// one (a `mixed_rel` QUIC endpoint's datagram link) and the reliable link
+    /// otherwise; the marker itself retransmits nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_to_network`].
+    pub fn publish_to_network_with(
+        &self,
+        topic: &str,
+        frame: Vec<u8>,
+        reliability: EgressReliability,
+    ) -> TransportResult<()> {
         // Minimal outbound validation: a frame smaller than the wire header
         // cannot be a valid Cerulion frame. Matches the size shape the deleted
         // prost `from_wire_frame` enforced.
@@ -3617,15 +3779,25 @@ impl NetworkManager {
         let key = Self::data_key(topic);
         let size_bytes = frame.len();
 
+        let zenoh_reliability = match reliability {
+            EgressReliability::Reliable => zenoh::qos::Reliability::Reliable,
+            EgressReliability::BestEffort => zenoh::qos::Reliability::BestEffort,
+        };
         session
             .put(&key, frame)
+            .reliability(zenoh_reliability)
             .wait()
             .map_err(|e| TransportError::Publish {
                 topic: topic.to_string(),
                 reason: format!("zenoh put failed: {e}"),
             })?;
 
-        tracing::trace!(topic = %topic, size_bytes, "published raw wire frame to network");
+        tracing::trace!(
+            topic = %topic,
+            size_bytes,
+            ?reliability,
+            "published raw wire frame to network"
+        );
         Ok(())
     }
 
@@ -3719,56 +3891,31 @@ impl NetworkManager {
         }
 
         let session = self.session()?;
-        let data_key = Self::data_key(&canonical);
 
-        // The validate → publish_raw → count → warn logic lives in
-        // the shared `IngressInjector` (one implementation for the zenoh path
-        // AND the zenoh-free desk / `cerulion_remoted` re-inject seam). The
-        // injector owns the injection publisher (behind its own Mutex); an `Arc`
-        // clone lives inside the callback (kept alive by the subscriber handle),
-        // and the entry keeps the other `Arc` for `ingress_stats`.
-        let cb_injector = Arc::clone(&injector);
-
-        let subscriber = session
-            .declare_subscriber(&data_key)
-            .callback(move |sample| {
-                // Re-inject VERBATIM into local iceoryx2 (Principle #7). The
-                // return value is observed via `ingress_stats`; a rejected /
-                // reinject-failed frame is counted + rate-latch-logged inside
-                // `reinject_raw`, never a panic on the zenoh thread.
-                let bytes = sample.payload().to_bytes();
-                cb_injector.reinject_raw(&bytes);
-            })
-            .wait()
-            .map_err(|e| TransportError::Receive {
-                topic: canonical.clone(),
-                reason: format!("zenoh ingress subscriber creation failed: {e}"),
-            })?;
-
-        // Declare the liveliness DEMAND token AFTER the data subscriber (ordering
-        // is load-bearing): the token advertises "a live subscriber exists for
-        // this topic" to remote egress publishers (discovery.rs), and zenoh
-        // propagates declarations in order per session - so by the time a
-        // remote's bridge flag flips on, this side's data-subscriber interest
-        // has already propagated and the remote's FIRST bridged frame routes
-        // here (no first-frame loss window). Dropped with the entry → remote
-        // bridge disables.
-        //
-        // Queryable inversion: this token is now the healthy-link
-        // BELT alongside the demand GET (the gateway's [`Self::start_demand_get_loop`]
-        // pulls the same egress ON via the producer's queryable - the direction
-        // that survives a strict connect-only link where this DIALER declaration
-        // never forwards). It is SUPPRESSED only under the test seam
-        // (`suppress_ingress_token`), which isolates the GET path in the decisive
-        // e2e; production always declares it.
-        let token = if self.suppress_ingress_token.load(Ordering::Relaxed) {
+        // Held from the posture read through the insert: a concurrent posture
+        // change either sees this entry and adjusts it, or finishes first and
+        // its posture is the one read here.
+        let _posture = self
+            .ingress_posture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let paired = self.lan_paired.load(Ordering::SeqCst);
+        // Under `Paired` no LAN frame may reach local iceoryx2, so neither the
+        // data subscriber nor the demand token is declared; opening access
+        // declares both (`apply_ingress_posture`).
+        let subscriber = if paired && !self.retain_ingress_subscriber.load(Ordering::Relaxed) {
+            None
+        } else {
+            Some(self.declare_ingress_subscriber(session, &canonical, &injector)?)
+        };
+        let token = if paired {
             tracing::debug!(
                 topic = %canonical,
-                "test seam: ingress demand token declaration suppressed"
+                "ingress registered suspended: LAN access is paired"
             );
             None
         } else {
-            Some(TopicToken::declare(session, &canonical)?)
+            self.declare_ingress_token(session, &canonical)?
         };
 
         let mut ingress = self.ingress.lock().map_err(|_| TransportError::Internal {
@@ -3788,12 +3935,185 @@ impl NetworkManager {
         ingress.insert(
             canonical,
             IngressEntry {
-                _sub: subscriber,
-                _token: token,
+                subscriber,
+                token,
+                suspended: paired,
                 injector,
             },
         );
         Ok(())
+    }
+
+    /// Declare the zenoh data subscriber that feeds `injector`. The callback
+    /// refuses and counts every frame while LAN access is paired.
+    fn declare_ingress_subscriber(
+        &self,
+        session: &zenoh::Session,
+        canonical: &str,
+        injector: &Arc<IngressInjector>,
+    ) -> TransportResult<zenoh::pubsub::Subscriber<()>> {
+        // The validate → publish_raw → count → warn logic lives in
+        // the shared `IngressInjector` (one implementation for the zenoh path
+        // AND the zenoh-free desk / `cerulion_remoted` re-inject seam). The
+        // injector owns the injection publisher (behind its own Mutex); an `Arc`
+        // clone lives inside the callback (kept alive by the subscriber handle),
+        // and the entry keeps the other `Arc` for `ingress_stats`.
+        let cb_injector = Arc::clone(injector);
+        let lan_paired = Arc::clone(&self.lan_paired);
+        let gate = Arc::clone(&self.ingress_gate);
+        session
+            .declare_subscriber(Self::data_key(canonical))
+            .callback(move |sample| {
+                // Held through the re-injection, so closing LAN access (which
+                // takes the write guard after storing `lan_paired`) waits out
+                // a frame that passed the check below.
+                let _pass = gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lan_paired.load(Ordering::SeqCst) {
+                    cb_injector.record_lan_refusal();
+                    return;
+                }
+                // Re-inject VERBATIM into local iceoryx2 (Principle #7). The
+                // return value is observed via `ingress_stats`; a rejected /
+                // reinject-failed frame is counted + rate-latch-logged inside
+                // `reinject_raw`, never a panic on the zenoh thread.
+                let bytes = sample.payload().to_bytes();
+                cb_injector.reinject_raw(&bytes);
+            })
+            .wait()
+            .map_err(|e| TransportError::Receive {
+                topic: canonical.to_string(),
+                reason: format!("zenoh ingress subscriber creation failed: {e}"),
+            })
+    }
+
+    /// Declare the liveliness DEMAND token for an ingress topic, AFTER its
+    /// data subscriber (ordering is load-bearing): the token advertises "a
+    /// live subscriber exists for this topic" to remote egress publishers
+    /// (discovery.rs), and zenoh propagates declarations in order per session,
+    /// so by the time a remote's bridge flag flips on, this side's
+    /// data-subscriber interest has already propagated and the remote's FIRST
+    /// bridged frame routes here (no first-frame loss window).
+    ///
+    /// Queryable inversion: this token is the healthy-link BELT alongside the
+    /// demand GET (the gateway's [`Self::start_demand_get_loop`] pulls the same
+    /// egress ON via the producer's queryable - the direction that survives a
+    /// strict connect-only link where this DIALER declaration never forwards).
+    /// It is SUPPRESSED only under the test seam (`suppress_ingress_token`),
+    /// which isolates the GET path in the decisive e2e; production always
+    /// declares it.
+    fn declare_ingress_token(
+        &self,
+        session: &zenoh::Session,
+        canonical: &str,
+    ) -> TransportResult<Option<TopicToken>> {
+        if self.suppress_ingress_token.load(Ordering::Relaxed) {
+            tracing::debug!(
+                topic = %canonical,
+                "test seam: ingress demand token declaration suppressed"
+            );
+            return Ok(None);
+        }
+        TopicToken::declare(session, canonical).map(Some)
+    }
+
+    /// Suspend (`paired`) or redeclare every registered ingress entry's data
+    /// subscriber and demand token. Runs under `ingress_posture`, so a
+    /// concurrent registration either is adjusted here or reads the new
+    /// posture itself. Redeclaration runs outside the registry lock (zenoh
+    /// callbacks read it). Returns the handles taken out, for the caller to
+    /// drop outside every lock.
+    fn apply_ingress_posture(&self, paired: bool) -> Vec<IngressHandles> {
+        let _posture = self
+            .ingress_posture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retain_subscriber = self.retain_ingress_subscriber.load(Ordering::Relaxed);
+        let mut released = Vec::new();
+        let to_resume: Vec<(String, Arc<IngressInjector>, bool)> = {
+            let mut ingress = self
+                .ingress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if paired {
+                for entry in ingress.values_mut().filter(|entry| !entry.suspended) {
+                    entry.suspended = true;
+                    released.push(IngressHandles {
+                        _token: entry.token.take(),
+                        _subscriber: if retain_subscriber {
+                            None
+                        } else {
+                            entry.subscriber.take()
+                        },
+                    });
+                }
+                return released;
+            }
+            ingress
+                .iter()
+                .filter(|(_, entry)| entry.suspended)
+                .map(|(topic, entry)| {
+                    (
+                        topic.clone(),
+                        Arc::clone(&entry.injector),
+                        entry.subscriber.is_none(),
+                    )
+                })
+                .collect()
+        };
+        let Some(session) = self.session.get() else {
+            return released;
+        };
+        for (topic, injector, needs_subscriber) in to_resume {
+            let subscriber = if needs_subscriber {
+                match self.declare_ingress_subscriber(session, &topic, &injector) {
+                    Ok(subscriber) => Some(subscriber),
+                    Err(e) => {
+                        tracing::warn!(
+                            topic = %topic,
+                            error = %e,
+                            "ingress stays suspended after opening LAN access: \
+                             data subscriber declaration failed"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let token = match self.declare_ingress_token(session, &topic) {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!(
+                        topic = %topic,
+                        error = %e,
+                        "ingress demand token declaration failed after opening LAN access; \
+                         the demand GET path still requests the topic"
+                    );
+                    None
+                }
+            };
+            let mut ingress = self
+                .ingress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match ingress.get_mut(&topic) {
+                Some(entry) if entry.suspended && Arc::ptr_eq(&entry.injector, &injector) => {
+                    if subscriber.is_some() {
+                        entry.subscriber = subscriber;
+                    }
+                    entry.token = token;
+                    entry.suspended = false;
+                }
+                // Unregistered while the declarations ran: drop them.
+                _ => released.push(IngressHandles {
+                    _token: token,
+                    _subscriber: subscriber,
+                }),
+            }
+        }
+        released
     }
 
     /// Tear down the network→local INGRESS bridge for
@@ -3801,9 +4121,9 @@ impl NetworkManager {
     ///
     /// Removes the topic's `IngressEntry` from the registry and drops it, which:
     ///
-    /// - **undeclares the zenoh data subscriber** (`_sub` Drop) - no more remote
+    /// - **undeclares the zenoh data subscriber** (`subscriber` Drop) - no more remote
     ///   frames re-inject for this topic;
-    /// - **undeclares the liveliness DEMAND token** (`_token` Drop) - a remote
+    /// - **undeclares the liveliness DEMAND token** (`token` Drop) - a remote
     ///   egress publisher sees this side's subscriber-interest go away and (on a
     ///   healthy link) disables its bridge, so the frame stops crossing the network;
     /// - **releases the egress-suppressed local injection publisher** (the
@@ -4661,6 +4981,7 @@ impl NetworkManager {
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.snapshot_topics),
+            Arc::clone(&catalog.hashes),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -4971,6 +5292,17 @@ impl NetworkManager {
             .store(suppress, Ordering::Relaxed);
     }
 
+    /// TEST SEAM: keep each ingress entry's zenoh data subscriber declared
+    /// while LAN access is paired (the demand token is still withheld), so a
+    /// test can drive LAN frames into the receive callback and prove its
+    /// posture check refuses and counts every one. Set it before registering
+    /// ingress or changing the posture.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_retain_ingress_subscriber_for_test(&self, retain: bool) {
+        self.retain_ingress_subscriber
+            .store(retain, Ordering::Relaxed);
+    }
+
     /// TEST SEAM: arm fire-once fault injection on
     /// [`Self::announce_egress_topic`] (see [`Self::fail_next_announce_egress`]).
     /// The NEXT announce call returns `TransportError::Publish` and disarms the
@@ -5157,8 +5489,93 @@ impl NetworkManager {
             .insert_json5("listen/endpoints", &listen_json)
             .map_err(|e| map_err("listen/endpoints", e))?;
 
+        if let Some(tls) = &self.config.tls {
+            apply_tls(&mut config, tls)?;
+        }
+
         Ok(config)
     }
+}
+
+/// Set zenoh's `transport/link/tls/*` keys from `tls`. Each file is read here
+/// and must hold a PEM block (`-----BEGIN `), so a wrong, unreadable or non-PEM
+/// path fails the session open naming it, rather than a QUIC listener that
+/// fails inside zenoh or a connect that zenoh retries in the background. Whether
+/// the PEM is the right certificate or key is zenoh's check, at handshake, with
+/// one exception read here: a listener certificate marked CA:TRUE (see
+/// [`refuse_ca_listener_certificate`]).
+fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
+    let refuse = |path: &std::path::Path, key: &str, why: String| TransportError::SessionCreation {
+        reason: format!("tls file '{}' for {key} {why}", path.display()),
+    };
+    for (key, path) in tls.file_keys() {
+        if !path.is_absolute() {
+            return Err(refuse(path, key, "is not an absolute path".to_string()));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|e| refuse(path, key, format!("cannot be read: {e}")))?;
+        if !bytes.windows(11).any(|w| w == b"-----BEGIN ") {
+            return Err(refuse(
+                path,
+                key,
+                "holds no PEM block (-----BEGIN ...)".to_string(),
+            ));
+        }
+        if key == "transport/link/tls/listen_certificate" {
+            refuse_ca_listener_certificate(&bytes).map_err(|why| refuse(path, key, why))?;
+        }
+        let Some(utf8) = path.to_str() else {
+            return Err(TransportError::SessionCreation {
+                reason: format!("tls file '{}' for {key} is not valid UTF-8", path.display()),
+            });
+        };
+        let json = serde_json::to_string(utf8).map_err(|e| TransportError::SessionCreation {
+            reason: format!("failed to serialize {key}: {e}"),
+        })?;
+        config
+            .insert_json5(key, &json)
+            .map_err(|e| TransportError::SessionCreation {
+                reason: format!("failed to set {key}: {e}"),
+            })?;
+    }
+    // Pinned on rather than left to zenoh's default: the client also trusts the
+    // public Web PKI roots, so without the name check any publicly issued
+    // certificate for any name would be accepted.
+    config
+        .insert_json5("transport/link/tls/verify_name_on_connect", "true")
+        .map_err(|e| TransportError::SessionCreation {
+            reason: format!("failed to set transport/link/tls/verify_name_on_connect: {e}"),
+        })?;
+    Ok(())
+}
+
+/// A `quic/` listener's certificate (the first CERTIFICATE block of the file)
+/// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
+/// which rejects a CA certificate presented as the end entity
+/// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
+/// listener's log while the connector retries. `openssl req -x509` writes
+/// `CA:TRUE` unless told otherwise, so the error names the flag that fixes it.
+fn refuse_ca_listener_certificate(pem: &[u8]) -> Result<(), String> {
+    let block = x509_parser::pem::Pem::iter_from_buffer(pem)
+        .filter_map(Result::ok)
+        .find(|p| p.label == "CERTIFICATE")
+        .ok_or_else(|| "holds no CERTIFICATE PEM block".to_string())?;
+    let cert = block
+        .parse_x509()
+        .map_err(|e| format!("holds a CERTIFICATE block that does not parse: {e}"))?;
+    let is_ca = cert
+        .basic_constraints()
+        .map_err(|e| format!("has an unreadable basicConstraints extension: {e}"))?
+        .is_some_and(|bc| bc.value.ca);
+    if is_ca {
+        return Err(
+            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
+                    listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
+                    e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl Drop for NetworkManager {
@@ -5713,6 +6130,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             snapshot_topics,
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         let serving = |topic: &str| crate::transport::gateway::SchemaServing {
@@ -5778,6 +6196,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             snapshot_topics,
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         let serving = crate::transport::gateway::SchemaServing {

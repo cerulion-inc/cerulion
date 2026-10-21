@@ -19,9 +19,12 @@
 //! (`nodes/<type>/`), resolved at graph-load time, never carried by
 //! the node itself or its FFI export.
 
+use crate::scheduler::sync_stamp::{
+    capture_stamp_ns, HeaderStampLocation, StampDecodeError, SyncFrameSlot,
+};
 use crate::scheduler::{
     BackpressureEvent, ExpectWithinEvent, LivelinessEvent, PromiseWithinEvent, QosEventStore,
-    SyncHeadOp, SyncOpAnswer,
+    SyncAlignSite, SyncHeadOp, SyncOpAnswer,
 };
 use crate::wire::MaxSliceLen;
 use std::ffi::CStr;
@@ -38,7 +41,7 @@ use crate::clock::Clock;
 // avoid a non-test "unused import" lint.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::clock::RealClock;
-use crate::error::{TransportError, TransportResult};
+use crate::error::{NodeErrorKind, TransportError, TransportResult};
 use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
@@ -439,6 +442,13 @@ pub struct NodeInfo {
     /// runtime consumes it through `NodeInfo::throttle_ms` to install the
     /// pre-fire time-gate.
     pub(crate) throttle_ms: Option<u64>,
+    /// Capture-time Sync matching: when `Some`, this Sync node aligns its
+    /// trigger inputs on each message's `header.stamp` instead of publish
+    /// time, and the map gives every trigger input's resolved stamp location,
+    /// keyed by input name. `None` keeps publish-time matching. Set through
+    /// [`Self::with_sync_capture_stamps`]; the graph build refuses a node whose
+    /// map misses a trigger input.
+    pub(crate) sync_capture: Option<IndexMap<String, HeaderStampLocation>>,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -633,6 +643,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -671,6 +682,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -714,6 +726,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         }
     }
 
@@ -723,6 +736,31 @@ impl NodeInfo {
     pub fn with_policy(mut self, policy: MacroPolicy) -> Self {
         self.policy = Some(policy);
         self
+    }
+
+    /// Builder that switches a Sync node to capture-time matching: its
+    /// trigger inputs align on `header.stamp` (the time the data was
+    /// captured) instead of publish time. `locations` names every trigger
+    /// input with its stamp location, as
+    /// [`crate::graph::validation::resolve_capture_sync_stamps`] resolves them
+    /// from the schemas.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn with_sync_capture_stamps(
+        mut self,
+        locations: IndexMap<String, HeaderStampLocation>,
+    ) -> Self {
+        self.sync_capture = Some(locations);
+        self
+    }
+
+    /// The capture-time stamp locations, when this node matches its Sync
+    /// trigger on `header.stamp`. See [`Self::with_sync_capture_stamps`].
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
+        self.sync_capture.as_ref()
     }
 
     /// Builder that attaches a per-node
@@ -1408,18 +1446,32 @@ impl AnySubscriber {
     /// and report its wire stamp (idempotent — a second peek returns the
     /// RETAINED stamp and pops nothing). See
     /// `CerulionSubscriber::sync_peek_next_stamp`.
-    pub(crate) fn sync_peek_next_stamp(&mut self) -> TransportResult<Option<u64>> {
+    pub(crate) fn sync_peek_next_stamp(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         match self {
-            Self::Ipc(s) => s.sync_peek_next_stamp(),
+            Self::Ipc(s) => s.sync_peek_next_stamp(site),
         }
     }
 
     /// `Advance` / `DiscardTie`: DROP this input's head and refill
     /// from the staged next (or, failing that, from the queue), reporting the
     /// new head's stamp. See `CerulionSubscriber::sync_discard_head`.
-    pub(crate) fn sync_discard_head(&mut self) -> TransportResult<Option<u64>> {
+    pub(crate) fn sync_discard_head(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> TransportResult<Option<u64>> {
         match self {
-            Self::Ipc(s) => s.sync_discard_head(),
+            Self::Ipc(s) => s.sync_discard_head(site),
+        }
+    }
+
+    /// The bytes of the frame a per-set Sync slot holds. See
+    /// `CerulionSubscriber::sync_frame`.
+    pub(crate) fn sync_frame(&self, slot: SyncFrameSlot) -> Option<&[u8]> {
+        match self {
+            Self::Ipc(s) => s.sync_frame(slot),
         }
     }
 
@@ -2020,8 +2072,8 @@ impl NodeContext {
                     }
                 }
             }
-            SyncHeadOp::PeekNext => {
-                let outcome = sub.sync_peek_next_stamp();
+            SyncHeadOp::PeekNext { site } => {
+                let outcome = sub.sync_peek_next_stamp(site);
                 match outcome {
                     Ok(Some(ts)) => SyncOpAnswer::Stamp(ts),
                     Ok(None) => SyncOpAnswer::Nothing,
@@ -2036,8 +2088,8 @@ impl NodeContext {
                     }
                 }
             }
-            SyncHeadOp::Advance => {
-                let outcome = sub.sync_discard_head();
+            SyncHeadOp::Advance { site } => {
+                let outcome = sub.sync_discard_head(site);
                 match outcome {
                     Ok(Some(ts)) => SyncOpAnswer::Head(ts),
                     Ok(None) => SyncOpAnswer::Nothing,
@@ -2059,6 +2111,27 @@ impl NodeContext {
                 SyncOpAnswer::Nothing
             }
         }
+    }
+
+    /// Decode the capture stamp (`header.stamp`) of the frame a per-set Sync
+    /// slot of `input_name` holds, at `location`.
+    ///
+    /// The frame-access half of capture-time Sync matching: the align driver
+    /// performs a head op through [`Self::sync_head_op`], then reads the stamp
+    /// of the frame that op placed. A pure read of a frame already held: no
+    /// pop, no accounting. `None` for an unknown input or an empty slot, which
+    /// the driver reports as a failed op.
+    ///
+    /// Hidden: capture-time matching has no user-facing opt-in yet.
+    #[doc(hidden)]
+    pub fn sync_capture_stamp(
+        &self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        let frame = self.subscribers.get(input_name)?.sync_frame(slot)?;
+        Some(capture_stamp_ns(frame, location))
     }
 
     /// Take the edge-triggered [`BackpressureEvent`] for
@@ -2455,19 +2528,37 @@ pub const EXTERNAL_SOURCE_KIND_ERROR: i32 = -1;
 // ONLY the four ops with no existing entry point cross this symbol: the two
 // FILL ops ride `cerulion_node_{drain,refill}_trigger_input`, which already
 // exist and already carry the boundary-vs-refill distinction the fills need.
+// Those four ops spell SIX codes, because the two CONSUMING descent ops carry
+// that same distinction themselves: the align site decides whether an empty
+// answer stages a read-log record, and a `u32` op code is the only field this
+// symbol has to say it in.
 // ---------------------------------------------------------------------------
 
 /// [`SyncHeadOp::ProbeNext`] — the NON-CONSUMING "has a second frame arrived?"
 /// probe.
 pub const SYNC_HEAD_OP_PROBE_NEXT: u32 = 0;
 /// [`SyncHeadOp::PeekNext`] — pop the next frame into the staged slot and
-/// report its stamp.
+/// report its stamp. The BOUNDARY align pass's.
 pub const SYNC_HEAD_OP_PEEK_NEXT: u32 = 1;
 /// [`SyncHeadOp::Advance`] — drop the head and refill from the staged next (or
-/// the queue).
+/// the queue). The BOUNDARY align pass's.
 pub const SYNC_HEAD_OP_ADVANCE: u32 = 2;
 /// [`SyncHeadOp::Void`] — serve a restored (unbacked) head's read as "no frame".
 pub const SYNC_HEAD_OP_VOID: u32 = 3;
+/// [`SyncHeadOp::PeekNext`] from a POST-FIRE REFILL align pass.
+///
+/// A separate code rather than a flag beside the op, because the op code is the
+/// whole of what this symbol carries about which read is being asked for, and
+/// the align site decides whether an EMPTY answer stages a read-log record (a
+/// refill pass runs only on the recording side, so a record there would hold a
+/// position no replay can fill). An older cdylib knows codes 0 to 3 only and
+/// answers "unknown op code", which the host reads as `Failed`: loud, and
+/// unreachable in practice because the ABI version gate refuses a cdylib built
+/// against a different `CERULION_ABI_VERSION`.
+pub const SYNC_HEAD_OP_PEEK_NEXT_REFILL: u32 = 4;
+/// [`SyncHeadOp::Advance`] from a POST-FIRE REFILL align pass. See
+/// [`SYNC_HEAD_OP_PEEK_NEXT_REFILL`] for why the site rides a code of its own.
+pub const SYNC_HEAD_OP_ADVANCE_REFILL: u32 = 5;
 
 /// [`SyncOpAnswer::Nothing`] — the stamp slot is UNTOUCHED.
 pub const SYNC_OP_ANSWER_NOTHING: i32 = 0;
@@ -2864,6 +2955,52 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
     });
 }
 
+/// Decide a cdylib load from its `cerulion_node_platform_check` export.
+///
+/// `check` is the resolved export, `None` when the cdylib does not export it.
+/// A missing export is refused on Android only, where the host cannot
+/// otherwise know whether the cdylib's own iceoryx2 copy has shared-memory
+/// support. A nonzero return is refused everywhere, with the cdylib's
+/// `LAST_ERROR` as the reason when it set one.
+fn check_cdylib_platform(
+    node_id: &str,
+    check: Option<unsafe extern "C" fn() -> i32>,
+    take_last_error: impl FnOnce() -> Option<String>,
+) -> TransportResult<()> {
+    let Some(check) = check else {
+        if cfg!(target_os = "android") {
+            return Err(TransportError::NodeError {
+                node_id: node_id.to_owned(),
+                reason: "missing symbol cerulion_node_platform_check: on Android a node \
+                         library must export it so its own iceoryx2 copy can be probed for \
+                         shared-memory support. Build the node with `#[cerulion_node]`, or \
+                         copy the export from the `cerulion node create --raw-ffi` template \
+                         (see docs/android.md)"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    };
+    // SAFETY: resolved by name and signature; a present symbol is trusted to
+    // match the ABI, exactly as every other lookup in `DylibNodeEntry::load`.
+    let ret = unsafe { check() };
+    if ret == 0 {
+        return Ok(());
+    }
+    Err(TransportError::NodeError {
+        node_id: node_id.to_owned(),
+        reason: take_last_error().unwrap_or_else(|| {
+            format!(
+                "cerulion_node_platform_check returned {ret} ({}, no detail provided)",
+                ffi_error_description(ret),
+            )
+        }),
+    })
+}
+
+/// The platform check behind a cdylib's `cerulion_node_platform_check`
+/// export. It runs inside the cdylib, so it probes the cdylib's own
+/// iceoryx2 copy. No-op off Android.
 #[doc(hidden)]
 pub fn cdylib_platform_check() -> Result<(), String> {
     crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| match error {
@@ -3215,6 +3352,31 @@ pub trait NodeEntry: Send {
         false
     }
 
+    /// Decode the capture stamp of the frame a per-set Sync slot holds, for a
+    /// node that matches its Sync trigger on `header.stamp`. See
+    /// [`NodeContext::sync_capture_stamp`].
+    ///
+    /// Default `None`: an entry that does not declare
+    /// [`Self::supports_sync_capture_stamps`] is refused capture-time matching
+    /// at graph build, so this default is never asked.
+    #[doc(hidden)]
+    fn sync_capture_stamp(
+        &mut self,
+        _input_name: &str,
+        _slot: SyncFrameSlot,
+        _location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        None
+    }
+
+    /// Does [`Self::sync_capture_stamp`] really read the node's frames? Read
+    /// once at graph build: a node that opts in to capture-time matching
+    /// without it is refused with an error naming the node.
+    #[doc(hidden)]
+    fn supports_sync_capture_stamps(&self) -> bool {
+        false
+    }
+
     /// Does [`Self::snapshot_inputs`] REALLY freeze this
     /// node's non-trigger (latest-value) inputs, vs being the no-op default?
     ///
@@ -3531,6 +3693,23 @@ impl NodeEntry for ClosureNodeEntry {
     fn supports_sync_head_ops(&self) -> bool {
         self.unified_drain
     }
+
+    fn sync_capture_stamp(
+        &mut self,
+        input_name: &str,
+        slot: SyncFrameSlot,
+        location: HeaderStampLocation,
+    ) -> Option<Result<u64, StampDecodeError>> {
+        self.context
+            .as_ref()?
+            .sync_capture_stamp(input_name, slot, location)
+    }
+
+    // The same condition as the head ops: the stamp is read off the slot the
+    // head ops fill, so one capability without the other cannot happen.
+    fn supports_sync_capture_stamps(&self) -> bool {
+        self.unified_drain
+    }
 }
 
 /// cdylib-loaded node for production use.
@@ -3558,6 +3737,7 @@ impl NodeEntry for ClosureNodeEntry {
 /// - `cerulion_node_shutdown(handle: u64) -> i32` — Clean shutdown for the given handle
 /// - `cerulion_take_last_error() -> *mut c_char`: Pulls the most recent error message off the cdylib's per-thread buffer; null if no error.
 /// - `cerulion_free_error(*mut c_char)` — Pairs with `cerulion_take_last_error`; allocator-paired free.
+/// - `cerulion_node_platform_check() -> i32`: Probes the cdylib's own iceoryx2 copy for platform support (0 = supported; nonzero sets `LAST_ERROR`). Required on Android, optional elsewhere.
 ///
 /// `cerulion_node_info()` carries no `node_type` field — the node
 /// type is the folder name and is resolved by the loader, not by
@@ -3609,6 +3789,12 @@ pub struct DylibNodeEntry {
     /// `take_last_error_fn`. The free MUST happen via the SAME cdylib
     /// (CString allocator pairing). Cdylib symbol: `cerulion_free_error`.
     free_error_fn: unsafe extern "C" fn(*mut std::ffi::c_char),
+    /// OPTIONAL: the typed kind of the last error as a `NodeErrorKind` wire
+    /// code (0 = none), taken by the read. Additive, no ABI bump: `None` for a
+    /// cdylib that does not export it, whose node errors stay the untyped
+    /// [`TransportError::NodeError`]. Cdylib symbol:
+    /// `cerulion_take_last_error_kind`.
+    take_last_error_kind_fn: Option<unsafe extern "C" fn() -> u32>,
     /// OPTIONAL cdylib snapshot FFI, resolved best-effort by `load` as a
     /// both-or-neither PAIR ([`SnapshotFns`]). `None` for an older cdylib
     /// that exports NEITHER symbol (back-compat — it still loads, since the
@@ -4122,10 +4308,10 @@ impl DylibNodeEntry {
             *sym
         };
 
-        // The Android stock-iceoryx2 guard runs HERE, in the host-side load
-        // path every cdylib crosses, not only inside the macro-generated
-        // `cerulion_node_init`: a raw-FFI node has no generated init and would
-        // otherwise reach the transport unguarded.
+        // The Android stock-iceoryx2 guard on the HOST's own transport copy.
+        // It does not prove anything about the cdylib's separately linked
+        // iceoryx2 copy: that one is probed through the cdylib's own
+        // `cerulion_node_platform_check` export further below.
         crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| {
             TransportError::NodeError {
                 node_id: path_str.clone(),
@@ -4204,6 +4390,35 @@ impl DylibNodeEntry {
                 })?;
             *sym
         };
+
+        // OPTIONAL typed error kind, resolved best-effort: an older cdylib does
+        // not export it and still loads (its errors stay untyped).
+        // Safety: same convention as the required symbol lookups.
+        let take_last_error_kind_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> u32>(b"cerulion_take_last_error_kind\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+
+        // The cdylib's OWN platform probe. The host check above probes the
+        // host's iceoryx2 copy only; a cdylib links its own `cerulion_core`
+        // and `iceoryx2`, so only a call into the cdylib can tell whether ITS
+        // copy has Android shared-memory support. On Android the export is
+        // REQUIRED (every Android build is new, so no old cdylib is refused):
+        // a hand-written raw-FFI node without it is refused here at load
+        // instead of reaching an unsupported transport. Off Android it is
+        // optional and, when present, a no-op that returns 0.
+        // Safety: same convention as the required symbol lookups.
+        let platform_check_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> i32>(b"cerulion_node_platform_check\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        check_cdylib_platform(&path_str, platform_check_fn, || {
+            take_last_error_via(take_last_error_fn, free_error_fn)
+        })?;
 
         // OPTIONAL snapshot symbols, resolved best-effort. An
         // older cdylib does NOT export them, and that MUST still load (the
@@ -4483,6 +4698,7 @@ impl DylibNodeEntry {
             shutdown_fn,
             take_last_error_fn,
             free_error_fn,
+            take_last_error_kind_fn,
             snapshot_ffi,
             snapshot_state: SnapshotState::Pending,
             state_ffi,
@@ -4519,6 +4735,29 @@ impl DylibNodeEntry {
     /// message instead of the upstream's "no detail provided" fallback.
     fn take_last_error(&self) -> Option<String> {
         take_last_error_via(self.take_last_error_fn, self.free_error_fn)
+    }
+
+    /// The error for a node-error return (FFI code 1 from tick / shutdown,
+    /// handle 0 from init): [`TransportError::NodeFailed`] with the typed kind
+    /// when the cdylib exports `cerulion_take_last_error_kind` and reports one,
+    /// else the untyped [`TransportError::NodeError`] older cdylibs produce.
+    /// Read AFTER [`Self::take_last_error`], the order the cdylib's two
+    /// thread-locals are written in.
+    fn node_failure(&self, reason: String) -> TransportError {
+        // Safety: the symbol was resolved by name + signature at load and the
+        // library outlives `self`; the export takes no arguments.
+        let code = self.take_last_error_kind_fn.map_or(0, |f| unsafe { f() });
+        match NodeErrorKind::from_code(code) {
+            Some(kind) => TransportError::NodeFailed {
+                node_id: self.diag_label.clone(),
+                kind,
+                reason,
+            },
+            None => TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason,
+            },
+        }
     }
 
     /// Parse the JSON string returned by `cerulion_node_info()` into `NodeInfo`.
@@ -5246,10 +5485,7 @@ impl NodeEntry for DylibNodeEntry {
             let detail = self.take_last_error().unwrap_or_else(|| {
                 "cerulion_node_init returned handle 0 (no detail provided)".to_string()
             });
-            return Err(TransportError::NodeError {
-                node_id: self.diag_label.clone(),
-                reason: format!("init failed: {}", detail),
-            });
+            return Err(self.node_failure(format!("init failed: {}", detail)));
         }
         self.handle = Some(handle);
         Ok(())
@@ -5287,6 +5523,11 @@ impl NodeEntry for DylibNodeEntry {
                     node_id: self.diag_label.clone(),
                     reason: detail,
                 });
+            }
+            // Code 1 is the node's own error: keep its kind. Code 4 (handle not
+            // found) and any unknown code are host-side faults with no kind.
+            if ret == 1 {
+                return Err(self.node_failure(detail));
             }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
@@ -5362,6 +5603,9 @@ impl NodeEntry for DylibNodeEntry {
                     ffi_error_description(ret),
                 )
             });
+            if ret == 1 {
+                return Err(self.node_failure(detail));
+            }
             return Err(TransportError::NodeError {
                 node_id: self.diag_label.clone(),
                 reason: detail,
@@ -5971,8 +6215,18 @@ impl NodeEntry for DylibNodeEntry {
                 return sync_fill_answer(popped, latest_ts);
             }
             SyncHeadOp::ProbeNext => SYNC_HEAD_OP_PROBE_NEXT,
-            SyncHeadOp::PeekNext => SYNC_HEAD_OP_PEEK_NEXT,
-            SyncHeadOp::Advance => SYNC_HEAD_OP_ADVANCE,
+            SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Boundary,
+            } => SYNC_HEAD_OP_PEEK_NEXT,
+            SyncHeadOp::PeekNext {
+                site: SyncAlignSite::Refill,
+            } => SYNC_HEAD_OP_PEEK_NEXT_REFILL,
+            SyncHeadOp::Advance {
+                site: SyncAlignSite::Boundary,
+            } => SYNC_HEAD_OP_ADVANCE,
+            SyncHeadOp::Advance {
+                site: SyncAlignSite::Refill,
+            } => SYNC_HEAD_OP_ADVANCE_REFILL,
             SyncHeadOp::Void => SYNC_HEAD_OP_VOID,
         };
         let Some(sync_fn) = self.sync_head_op_ffi else {
@@ -6654,14 +6908,51 @@ mod tests {
 
     #[test]
     fn every_load_path_shares_the_android_shm_guard() {
-        // `DylibNodeEntry::load` calls `refuse_unsupported_android_shm` before
-        // any init symbol, so a raw-FFI cdylib - which has no generated init
-        // and never reaches `cdylib_platform_check` - refuses the same way a
-        // macro node does. The guard is Android-only, so on a host the shared
-        // decision is simply permissive; the pin here is the call existing in
-        // the load path (see `load` above).
+        // `DylibNodeEntry::load` probes the host's own iceoryx2 copy before
+        // any init symbol. The guard is Android-only, so on a host the shared
+        // decision is simply permissive.
         crate::transport::refuse_unsupported_android_shm("test node")
             .expect("non-Android hosts never refuse");
+    }
+
+    extern "C" fn platform_check_ok() -> i32 {
+        0
+    }
+
+    extern "C" fn platform_check_refuses() -> i32 {
+        -1
+    }
+
+    #[test]
+    fn cdylib_platform_check_export_decides_the_load() {
+        let no_detail = || None;
+        check_cdylib_platform("n", Some(platform_check_ok), no_detail)
+            .expect("a passing export loads");
+
+        let missing = check_cdylib_platform("n", None, no_detail);
+        if cfg!(target_os = "android") {
+            let reason = missing
+                .expect_err("Android requires the export")
+                .to_string();
+            assert!(reason.contains("cerulion_node_platform_check"), "{reason}");
+        } else {
+            missing.expect("the export is optional off Android");
+        }
+
+        let refused = check_cdylib_platform("n", Some(platform_check_refuses), || {
+            Some("node library: no shared memory".to_owned())
+        })
+        .expect_err("a nonzero return refuses the load")
+        .to_string();
+        assert!(refused.contains("no shared memory"), "{refused}");
+
+        let undetailed = check_cdylib_platform("n", Some(platform_check_refuses), no_detail)
+            .expect_err("a nonzero return refuses the load")
+            .to_string();
+        assert!(
+            undetailed.contains("cerulion_node_platform_check returned -1"),
+            "{undetailed}"
+        );
     }
 
     #[test]
@@ -7931,6 +8222,7 @@ mod tests {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            sync_capture: None,
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);

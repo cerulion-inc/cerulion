@@ -320,10 +320,11 @@ pub unsafe extern "C" fn cerulion_node_sync_head_op(
     out_kind: *mut i32,
 ) -> i32 {
     use cerulion_core::graph::node::{
-        SYNC_HEAD_OP_ADVANCE, SYNC_HEAD_OP_PEEK_NEXT, SYNC_HEAD_OP_PROBE_NEXT, SYNC_HEAD_OP_VOID,
+        SYNC_HEAD_OP_ADVANCE, SYNC_HEAD_OP_ADVANCE_REFILL, SYNC_HEAD_OP_PEEK_NEXT,
+        SYNC_HEAD_OP_PEEK_NEXT_REFILL, SYNC_HEAD_OP_PROBE_NEXT, SYNC_HEAD_OP_VOID,
         SYNC_OP_ANSWER_HEAD, SYNC_OP_ANSWER_NOTHING, SYNC_OP_ANSWER_PRESENT, SYNC_OP_ANSWER_STAMP,
     };
-    use cerulion_core::{SyncHeadOp, SyncOpAnswer};
+    use cerulion_core::{SyncAlignSite, SyncHeadOp, SyncOpAnswer};
 
     HEAD_OP_CALLS.fetch_add(1, Ordering::Relaxed);
     let name = match unsafe { borrow_name(name_ptr, name_len) } {
@@ -347,8 +348,18 @@ pub unsafe extern "C" fn cerulion_node_sync_head_op(
     }
     let head_op = match op {
         SYNC_HEAD_OP_PROBE_NEXT => SyncHeadOp::ProbeNext,
-        SYNC_HEAD_OP_PEEK_NEXT => SyncHeadOp::PeekNext,
-        SYNC_HEAD_OP_ADVANCE => SyncHeadOp::Advance,
+        SYNC_HEAD_OP_PEEK_NEXT => SyncHeadOp::PeekNext {
+            site: SyncAlignSite::Boundary,
+        },
+        SYNC_HEAD_OP_PEEK_NEXT_REFILL => SyncHeadOp::PeekNext {
+            site: SyncAlignSite::Refill,
+        },
+        SYNC_HEAD_OP_ADVANCE => SyncHeadOp::Advance {
+            site: SyncAlignSite::Boundary,
+        },
+        SYNC_HEAD_OP_ADVANCE_REFILL => SyncHeadOp::Advance {
+            site: SyncAlignSite::Refill,
+        },
         SYNC_HEAD_OP_VOID => SyncHeadOp::Void,
         _ => {
             set_last_error("cerulion_node_sync_head_op: unknown op code");

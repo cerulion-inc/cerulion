@@ -157,28 +157,136 @@ fn python_str_literal(value: &str) -> String {
     serde_json::Value::String(value.to_string()).to_string()
 }
 
-/// Generate the starter Python implementation for a node.
+/// Python keywords: a schema leaf or package spelled as one cannot be an
+/// imported name, so its port keeps the quoted-name form.
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
+
+fn python_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !PYTHON_KEYWORDS.contains(&name)
+}
+
+/// The import lines and the per-schema class expression a scaffolded
+/// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
+/// `-` is `_`, the module spelling), a package-less `Name` is `Name` from
+/// `cerulion.msgs`. A leaf that two packages share, that the scaffold itself
+/// binds (`cerulion`, `Node`), or that a port of the node is named (a class-body
+/// assignment rebinds the name for every later port), is reached through its
+/// module (`pkg.Name`). A schema no import can name (a keyword, a name with several
+/// `/`) keeps the quoted-name form, the escape hatch `cerulion.input` takes.
+fn python_message_refs(
+    schemas: &[&str],
+    ports: &std::collections::BTreeSet<&str>,
+) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut parts: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
+    let mut quoted: BTreeMap<String, String> = BTreeMap::new();
+    for &schema in schemas {
+        let (package, leaf) = match schema.rsplit_once('/') {
+            Some((package, leaf)) => (Some(package.replace('-', "_")), leaf),
+            None => (None, schema),
+        };
+        let importable = python_name(leaf)
+            && package
+                .as_deref()
+                .is_none_or(|module| python_name(module) && module != "cerulion");
+        if importable {
+            parts.insert(schema.to_string(), (package, leaf.to_string()));
+        } else {
+            quoted.insert(schema.to_string(), python_str_literal(schema));
+        }
+    }
+    let mut owners: BTreeMap<&str, BTreeSet<&Option<String>>> = BTreeMap::new();
+    for (package, leaf) in parts.values() {
+        owners.entry(leaf.as_str()).or_default().insert(package);
+    }
+    let mut by_module: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+    let mut modules: BTreeSet<&str> = BTreeSet::new();
+    let mut refs = quoted;
+    for (schema, (package, leaf)) in &parts {
+        let shared = owners[leaf.as_str()].len() > 1
+            || leaf == "cerulion"
+            || leaf == "Node"
+            || ports.contains(leaf.as_str());
+        if shared {
+            let module = package.as_deref().unwrap_or("msgs");
+            modules.insert(module);
+            refs.insert(schema.clone(), format!("{module}.{leaf}"));
+        } else {
+            by_module
+                .entry(package.as_deref())
+                .or_default()
+                .insert(leaf);
+            refs.insert(schema.clone(), leaf.clone());
+        }
+    }
+    let mut imports = Vec::new();
+    for (module, leaves) in &by_module {
+        let names = leaves.iter().copied().collect::<Vec<_>>().join(", ");
+        match module {
+            Some(module) => imports.push(format!("from cerulion.msgs.{module} import {names}")),
+            None => imports.push(format!("from cerulion.msgs import {names}")),
+        }
+    }
+    let packaged: Vec<&str> = modules.iter().copied().filter(|m| *m != "msgs").collect();
+    if !packaged.is_empty() {
+        imports.push(format!("from cerulion.msgs import {}", packaged.join(", ")));
+    }
+    if modules.contains("msgs") {
+        imports.push("from cerulion import msgs".to_string());
+    }
+    imports.sort();
+    (imports, refs)
+}
+
+/// Generate the starter Python implementation for a node: bare
+/// `import cerulion`, one import per message class, and ports typed by the
+/// class.
 pub fn generate_python_node_py(
     inputs: &[(String, String)],
     outputs: &[(String, String)],
     policy: &str,
     triggers: &[String],
 ) -> String {
-    let mut result = format!("import cerulion as cer\n\n\n@cer.node({policy})\nclass Node:\n");
+    let schemas: Vec<&str> = inputs
+        .iter()
+        .chain(outputs)
+        .map(|(_, schema)| schema.as_str())
+        .collect();
+    let ports: std::collections::BTreeSet<&str> = inputs
+        .iter()
+        .chain(outputs)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let (imports, refs) = python_message_refs(&schemas, &ports);
+    let mut result = String::from("import cerulion\n");
+    for line in &imports {
+        result.push_str(line);
+        result.push('\n');
+    }
+    result.push_str(&format!("\n\n@cerulion.node({policy})\nclass Node:\n"));
     for (name, schema) in inputs {
         let trigger_suffix = if triggers.contains(name) {
             ", trigger=True"
         } else {
             ""
         };
-        let schema = python_str_literal(schema);
         result.push_str(&format!(
-            "    {name} = cer.input({schema}{trigger_suffix})\n"
+            "    {name} = cerulion.input({}{trigger_suffix})\n",
+            refs[schema]
         ));
     }
     for (name, schema) in outputs {
-        let schema = python_str_literal(schema);
-        result.push_str(&format!("    {name} = cer.output({schema})\n"));
+        result.push_str(&format!("    {name} = cerulion.output({})\n", refs[schema]));
     }
     result.push_str("\n    def tick(self):\n");
     match (inputs.first(), outputs.first()) {
@@ -588,6 +696,29 @@ fn __cer_set_last_error(msg: ::std::string::String) {
     src.push_str("::cerulion_core::rustc_fingerprint_cstr()\n");
     src.push_str("}\n\n");
 
+    // Platform check. The host loader calls it at load, before init, so the
+    // probe runs against THIS cdylib's own `cerulion_core` and `iceoryx2`
+    // copy: the host's probe proves nothing about a separately linked
+    // library. Required on Android, where a stock-iceoryx2 build has no
+    // `shm_open`; off Android it is a no-op that returns 0.
+    src.push_str(
+        r#"// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
+// build of this library is refused at load on Android (see docs/android.md).
+// A raw-FFI library without this export does not load on Android.
+#[no_mangle]
+pub extern "C" fn cerulion_node_platform_check() -> i32 {
+    match ::cerulion_core::graph::node::cdylib_platform_check() {
+        ::std::result::Result::Ok(()) => 0,
+        ::std::result::Result::Err(error) => {
+            __cer_set_last_error(::std::format!("node library: {error}"));
+            1
+        }
+    }
+}
+
+"#,
+    );
+
     // Node info function with marker comments
     src.push_str(&generate_info_fn(metadata));
     src.push('\n');
@@ -645,30 +776,6 @@ pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
         ));
         return 0;
     }}
-    // KEEP THIS, and keep it BEFORE `Box::from_raw`. This cdylib statically
-    // links its OWN copy of `cerulion_core` and `iceoryx2`: the host-side
-    // loader probes the HOST's PAL, which proves nothing about this library.
-    // On Android a stock-iceoryx2 build has no `shm_open`, so the first named
-    // object would panic at runtime instead of failing init cleanly; this
-    // call is the same guard `#[cerulion_node]` generated init runs inside
-    // `cerulion_core`, here probing THIS library's PAL. Off Android it is a
-    // no-op. A hand-written raw-FFI library that does not use this template
-    // must make the same call itself.
-    if let ::std::result::Result::Err(error) =
-        ::cerulion_core::transport::refuse_unsupported_android_shm("node library")
-    {{
-        __cer_set_last_error(::std::format!("cerulion_node_init: {{error}}"));
-        // The host transferred ownership of the boxed `NodeContext` with
-        // `ctx_ptr`, so the refusal must reclaim it or every failed load
-        // leaks one.
-        unsafe {{
-            drop(::std::boxed::Box::from_raw(
-                ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext,
-            ));
-        }}
-        return 0;
-    }}
-
     // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
     // this cdylib. Ownership transferred with it — the runtime will not free
     // it — so pairing with `Box::from_raw` is required to avoid leaking one
@@ -1701,19 +1808,22 @@ pub fn schema_to_ident(schema: &str) -> &str {
 /// (the canonical slash form, per `docs/user-api.md`).
 /// Maps `sensor_msgs::Image` → `native_ros2_messages::sensor_msgs::Image`
 /// (legacy colon form, accepted for backward compatibility).
-/// Unqualified types (`MyType`) pass through unchanged.
+/// An unqualified name (`MyType`, a package-less workspace YAML schema)
+/// maps to the crate root, `native_ros2_messages::MyType`, where a workspace
+/// that generates its messages puts it.
 ///
 /// Defends against malformed input by filtering empty path segments
-/// (`/Foo`, `Foo/`, `""`, `"//"`). When filtering leaves zero or
-/// one segment the input is treated as unqualified and the user's
-/// literal string passes through unchanged — the resulting compile
-/// error then points back at the typo's source rather than at
-/// CLI-emitted garbage like `native_ros2_messages::::Foo`.
+/// (`/Foo`, `Foo/`, `""`, `"//"`): such input passes through unchanged, and the
+/// resulting compile error then points back at the typo's source rather than
+/// at CLI-emitted garbage like `native_ros2_messages::::Foo`.
 pub fn schema_to_import(schema: &str) -> String {
     // Normalise both separator forms to `/` so the segment split
     // and empty-segment filter work uniformly.
     let normalised = schema.replace("::", "/");
     let segments: Vec<&str> = normalised.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() == 1 && segments[0] == schema {
+        return format!("native_ros2_messages::{schema}");
+    }
     if segments.len() <= 1 {
         // Unqualified or a single non-empty segment after filtering
         // (e.g. just `MyType`, or `/Foo` → just `Foo`). Pass the
@@ -1723,7 +1833,11 @@ pub fn schema_to_import(schema: &str) -> String {
         // CLI-emitted garbage.
         return schema.to_string();
     }
-    format!("native_ros2_messages::{}", segments.join("::"))
+    // A package's `-` is `_` in its module name, as the message crate
+    // generates it (`my-pkg/Node` is `native_ros2_messages::my_pkg::Node`).
+    let (leaf, packages) = segments.split_last().expect("two or more segments");
+    let modules: Vec<String> = packages.iter().map(|p| p.replace('-', "_")).collect();
+    format!("native_ros2_messages::{}::{leaf}", modules.join("::"))
 }
 
 #[cfg(test)]
@@ -2151,8 +2265,8 @@ mod tests {
         //   6. cerulion_node_pump_history: NODES mutex poisoned
         //   7. cerulion_node_shutdown:     NODES mutex poisoned
         //   8. cerulion_node_shutdown:     missing handle
-        //   9. cerulion_node_init:         unsupported SHM refusal
-        //                                (refuse_unsupported_android_shm)
+        //   9. cerulion_node_platform_check: unsupported SHM refusal
+        //                                (cdylib_platform_check)
         //
         // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
         // CODE occurrences in the generated source.
@@ -2619,7 +2733,7 @@ mod tests {
             schema_to_import("sensor_msgs::Image"),
             "native_ros2_messages::sensor_msgs::Image"
         );
-        assert_eq!(schema_to_import("MyType"), "MyType");
+        assert_eq!(schema_to_import("MyType"), "native_ros2_messages::MyType");
     }
 
     // ─── slash-form schema canonicalization ───────────────────────
@@ -2743,10 +2857,19 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_to_import_spells_a_dashed_package_as_its_module() {
+        assert_eq!(
+            schema_to_import("my-pkg/Node"),
+            "native_ros2_messages::my_pkg::Node"
+        );
+    }
+
+    #[test]
     fn test_schema_to_import_unqualified() {
-        // No separator in either form → unchanged. Used for
-        // tier-3 in-workspace schemas defined in `schemas/`.
-        assert_eq!(schema_to_import("MyType"), "MyType");
+        // No separator: a package-less workspace YAML schema, generated at
+        // the message crate's root in a workspace that generates its
+        // messages.
+        assert_eq!(schema_to_import("MyType"), "native_ros2_messages::MyType");
     }
 
     #[test]

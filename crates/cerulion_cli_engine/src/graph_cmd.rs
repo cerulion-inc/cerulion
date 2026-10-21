@@ -3924,6 +3924,10 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         // hostname or the `CERULION_ROBOT_IDENTITY` override, never the graph
         // prefix) — this CLI-side base config never announces itself.
         robot_identity: None,
+        // The permissive default listens on tcp/ only and puts every topic
+        // reliable.
+        tls: None,
+        egress_qos: Vec::new(),
     })
 }
 
@@ -3987,6 +3991,14 @@ struct GatewayNetworkParams {
     listen_endpoints: Vec<String>,
     multicast_scouting: bool,
     gossip_scouting: bool,
+    /// `quic/` certificate files (`#[serde(default)]`: a handoff without the
+    /// field boots with none).
+    #[serde(default)]
+    tls: Option<cerulion_core::NetworkTls>,
+    /// Per-topic egress put policy (`#[serde(default)]`: a handoff without the
+    /// field puts every topic reliable).
+    #[serde(default)]
+    egress_qos: Vec<cerulion_core::EgressQos>,
 }
 
 impl From<&cerulion_core::NetworkConfig> for GatewayNetworkParams {
@@ -3997,6 +4009,8 @@ impl From<&cerulion_core::NetworkConfig> for GatewayNetworkParams {
             listen_endpoints: c.listen_endpoints.clone(),
             multicast_scouting: c.multicast_scouting,
             gossip_scouting: c.gossip_scouting,
+            tls: c.tls.clone(),
+            egress_qos: c.egress_qos.clone(),
         }
     }
 }
@@ -4014,6 +4028,8 @@ impl From<&GatewayNetworkParams> for cerulion_core::NetworkConfig {
             // Stamped by the gateway child from `handoff.robot` right after
             // this rebuild — the handoff carries identity exactly once.
             robot_identity: None,
+            tls: p.tls.clone(),
+            egress_qos: p.egress_qos.clone(),
         }
     }
 }
@@ -5053,6 +5069,132 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     Ok(())
 }
 
+/// Raises this process's open-file soft limit and refuses `config` when its
+/// estimated start-up need is above the limit in force afterwards. An
+/// unreadable limit refuses nothing (the raise has already warned).
+#[cfg(unix)]
+fn refuse_if_open_file_limit_too_low(config: &GraphConfig) -> CliResult<()> {
+    let limit = cerulion_core::fd_limit::raise_open_file_limit().limit();
+    open_file_limit_verdict(config, limit, cerulion_core::fd_limit::select_ceiling())
+}
+
+/// The pure half of [`refuse_if_open_file_limit_too_low`].
+#[cfg(unix)]
+fn open_file_limit_verdict(
+    config: &GraphConfig,
+    limit: Option<cerulion_core::fd_limit::OpenFileLimit>,
+    select_ceiling: Option<u64>,
+) -> CliResult<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let ports = cerulion_core::fd_limit::GraphPorts {
+        nodes: config.nodes.len(),
+        outputs: config.nodes.iter().map(|n| n.outputs.len()).sum(),
+        inputs: config.nodes.iter().map(|n| n.inputs.len()).sum(),
+    };
+    match cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling) {
+        Some(shortfall) => Err(CliError::Validation(format!(
+            "graph '{}': {shortfall}",
+            config.identity()
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_file_limit_verdict_tests {
+    use super::*;
+    use cerulion_core::fd_limit::OpenFileLimit;
+    use cerulion_core::graph::config::InputDef;
+
+    /// `chains` source -> sink pairs: two nodes, one output and one input
+    /// per chain.
+    fn graph_of(chains: usize) -> GraphConfig {
+        let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            fuse: None,
+            ros2: None,
+            id,
+            node_type: "n".to_string(),
+            inputs,
+            outputs,
+        };
+        let mut nodes = Vec::new();
+        for i in 0..chains {
+            nodes.push(node(
+                format!("src{i}"),
+                vec![],
+                vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "u8".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            ));
+            nodes.push(node(
+                format!("sink{i}"),
+                vec![InputDef {
+                    name: "in".to_string(),
+                    source: format!("src{i}/out"),
+                }],
+                vec![],
+            ));
+        }
+        GraphConfig {
+            level_assignments: None,
+            network: None,
+            process_groups: Default::default(),
+            process_group_order: Default::default(),
+            multi_publisher_topics: Vec::new(),
+            name: None,
+            identity: "fd_budget".to_string(),
+            prefix: "fdb".to_string(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
+        let limit = OpenFileLimit {
+            soft: 1024,
+            hard: 1024,
+        };
+        // 64 + 40 x 15 + 40 x 23 = 1584 files.
+        let err = open_file_limit_verdict(&graph_of(40), Some(limit), None)
+            .expect_err("40 chains need about 1584 files");
+        let CliError::Validation(text) = err else {
+            panic!("expected a Validation refusal, got {err:?}");
+        };
+        assert!(
+            text.starts_with(
+                "graph 'fd_budget': this graph has 80 nodes with 40 output and 40 input ports, \
+                 and starting it opens about 1584 files in this process"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("RLIMIT_NOFILE) is 1024 with a hard limit of 1024"),
+            "{text}"
+        );
+        assert!(text.contains("`ulimit -Hn 1584`"), "{text}");
+    }
+
+    #[test]
+    fn the_same_graph_under_the_raised_limit_runs() {
+        let limit = OpenFileLimit {
+            soft: 524_288,
+            hard: 524_288,
+        };
+        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None).is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_limit_refuses_nothing() {
+        assert!(open_file_limit_verdict(&graph_of(10_000), None, None).is_ok());
+    }
+}
+
 /// Every output's non-empty `schema:` put through the ONE lookup the report's
 /// producer check and `schema info` use (`port_schema_exists` →
 /// `workspace_lookup`), on every path that EXECUTES a graph — `graph run`
@@ -5478,6 +5620,15 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+
+    // This process holds every topic of the graph while it starts, a set of
+    // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
+    // now (the transport constructors would on their own, later) and refuse,
+    // before any side effect, a graph that needs more than this process may
+    // hold; past the limit iceoryx2 fails with port-creation errors that never
+    // name it.
+    #[cfg(unix)]
+    refuse_if_open_file_limit_too_low(&config)?;
 
     if record.is_some() {
         validate_record_flags(time_source, skip_validate)?;
@@ -6110,6 +6261,9 @@ pub fn graph_run(
     let env_us = std::env::var(CPU_DMA_LOCK_US_ENV).ok();
     let auto_cap = cerulion_core::dma_lock::deepest_nonflushing_cap_us();
 
+    // Nodes stopped by `NodeError::Fatal`, harvested from the runtime just
+    // before it shuts down; folded into the run's verdict (exit 3) below.
+    let fatal_nodes: Vec<(String, String)>;
     match time_source {
         TimeSource::Virtual => {
             // DETERMINISTIC path (replay / bench): VirtualClock + 1 ms poll loop.
@@ -6173,6 +6327,7 @@ pub fn graph_run(
                 graph_run_step(&mut runtime, false);
             }
             tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
         TimeSource::Real | TimeSource::External => {
@@ -6564,12 +6719,13 @@ pub fn graph_run(
                 gw.forward_shutdown(graph_name);
             }
             tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
     }
     // Both monolith arms end here: stop the `ros2:` children gracefully and
-    // fold a `--peer-loss fail` death into the verdict.
-    ros2_children.finish(Ok(()))
+    // fold a `--peer-loss fail` death and any fatal node into the verdict.
+    ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
 }
 
 /// Run ONE worker process of a multi-process deployment from
@@ -7767,6 +7923,13 @@ pub fn graph_run_worker(
         dump_worker_trace(&mut runtime, &dir, &plan.group);
     }
 
+    // Nodes this rank stopped on `NodeError::Fatal`, harvested before the
+    // runtime shuts down. A clean exit with any of them returns
+    // `CliError::NodeFatal`, so this worker exits `EXIT_NODE_FATAL` (3) and its
+    // `Error:` line names each node; the supervisor reads the 3 as "clean exit,
+    // a node stopped fatally" and the deployment exits 3 too. A poisoned
+    // cohort's exit 2 below wins: that run did not end cleanly.
+    let fatal_nodes = runtime.node_fatal_errors();
     runtime.shutdown();
     if barrier_failed {
         tracing::error!(
@@ -7784,7 +7947,7 @@ pub fn graph_run_worker(
         #[allow(clippy::disallowed_methods)]
         std::process::exit(2);
     }
-    Ok(())
+    crate::error::node_fatal_verdict(fatal_nodes)
 }
 
 /// OPEN the shared cross-process barrier the supervisor OWNS, with a BOUNDED
@@ -8669,7 +8832,61 @@ struct DeathSweep {
     /// MUST run the clean-exit → Draining transition for it (warn + Draining + arm
     /// the drain deadline + SIGINT the remaining workers) — exactly what the main
     /// `Exited(0)`-in-Normal arm would have done had it observed the exit itself.
+    /// An `EXIT_NODE_FATAL` exit is clean too (see [`classify_worker_exit`]).
     clean_exit_group: Option<String>,
+    /// Every group the sweep saw exit `EXIT_NODE_FATAL`: clean exits whose
+    /// worker stopped a node on a fatal error. The caller adds them to its
+    /// fatal ledger, which turns the deployment's verdict into exit 3.
+    node_fatal_groups: Vec<String>,
+}
+
+/// How the supervisor reads one worker's exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExit {
+    /// Exit 0: the worker shut down cleanly.
+    Clean,
+    /// Exit [`crate::error::EXIT_NODE_FATAL`]: the worker shut down cleanly
+    /// and at least one of its nodes stopped on `NodeError::Fatal`. A worker
+    /// only exits with it after its live loop ended normally, so it is not a
+    /// death: the deployment is not degraded, its verdict becomes exit 3.
+    NodeFatal,
+    /// Any other status (a nonzero code, a signal): the worker died.
+    Died,
+}
+
+impl WorkerExit {
+    /// Whether the worker shut down cleanly (with or without a fatal node).
+    fn is_clean(self) -> bool {
+        matches!(self, Self::Clean | Self::NodeFatal)
+    }
+}
+
+/// Classify a worker's exit status (pure; pinned by
+/// `classify_worker_exit_reads_0_and_3_as_clean_and_the_rest_as_death`).
+fn classify_worker_exit(status: &std::process::ExitStatus) -> WorkerExit {
+    if status.success() {
+        WorkerExit::Clean
+    } else if status.code() == Some(i32::from(crate::error::EXIT_NODE_FATAL)) {
+        WorkerExit::NodeFatal
+    } else {
+        WorkerExit::Died
+    }
+}
+
+/// SIGKILL and reap every un-reaped worker at the drain deadline, and return
+/// the groups whose reap collected `EXIT_NODE_FATAL`: a worker that exited 3
+/// between the last JOIN poll and the kill still stopped a node on a fatal
+/// error, so it still turns the deployment's verdict into exit 3.
+fn kill_stragglers(guards: &mut [ChildGuard]) -> Vec<String> {
+    let mut node_fatal_groups = Vec::new();
+    for g in guards.iter_mut() {
+        if let Some(status) = g.kill_and_reap_status() {
+            if classify_worker_exit(&status) == WorkerExit::NodeFatal {
+                node_fatal_groups.push(g.group.clone());
+            }
+        }
+    }
+    node_fatal_groups
 }
 
 /// When a worker death is being processed under
@@ -8684,13 +8901,17 @@ struct DeathSweep {
 fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
     let mut deaths = Vec::new();
     let mut clean_exit_group = None;
+    let mut node_fatal_groups = Vec::new();
     for g in guards.iter_mut() {
         if g.reaped() {
             continue;
         }
         match g.try_status() {
             ChildPoll::Running => {}
-            ChildPoll::Exited(status) if status.success() => {
+            ChildPoll::Exited(status) if classify_worker_exit(&status).is_clean() => {
+                if classify_worker_exit(&status) == WorkerExit::NodeFatal {
+                    node_fatal_groups.push(g.group.clone());
+                }
                 // Consumed a clean-exit event mid-sweep — surface it so the caller
                 // runs the Draining transition (at most one is possible per pass in
                 // practice; keep the first, later ones are harmless drained exits).
@@ -8711,6 +8932,7 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
     DeathSweep {
         deaths,
         clean_exit_group,
+        node_fatal_groups,
     }
 }
 
@@ -8934,12 +9156,21 @@ impl ChildGuard {
 
     /// SIGKILL + reap the child now (idempotent).
     pub(crate) fn kill_and_reap(&mut self) {
+        let _ = self.kill_and_reap_status();
+    }
+
+    /// SIGKILL + reap the child now and return the status the reap collected:
+    /// the child's OWN exit when it had already exited before the kill (the
+    /// kill of an exited, unreaped child changes nothing), else the kill.
+    /// `None` when it was already reaped or the wait failed.
+    pub(crate) fn kill_and_reap_status(&mut self) -> Option<std::process::ExitStatus> {
         if self.reaped {
-            return;
+            return None;
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait().ok();
         self.reaped = true;
+        status
     }
 
     /// Send SIGINT to the child (best-effort) so it exits 0 gracefully, and,
@@ -11588,6 +11819,9 @@ fn graph_run_supervisor(
     let drop_stall_grace = drop_stall_grace_from_env();
     let total_workers = guards.len();
     let mut crashed_groups: Vec<String> = Vec::new();
+    // The groups whose worker exited `EXIT_NODE_FATAL`: a clean exit after a
+    // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
+    let mut node_fatal_groups: Vec<String> = Vec::new();
     loop {
         // Ctrl-C → enter Draining AND SIGINT every remaining worker.
         // Sending NOTHING here would assume the workers "received the same
@@ -11644,7 +11878,11 @@ fn graph_run_supervisor(
                 // Never stored as an event — the poll loop counts Running as alive.
                 ChildPoll::Running => {}
                 ChildPoll::Exited(status) if normal => {
-                    if status.success() {
+                    let exit = classify_worker_exit(&status);
+                    if exit == WorkerExit::NodeFatal {
+                        node_fatal_groups.push(group.clone());
+                    }
+                    if exit.is_clean() {
                         // A CLEAN worker exit = graph shutdown. Flip to Draining AND
                         // SIGINT every remaining un-reaped worker so it self-drops
                         // from the barrier cohort and exits 0 gracefully. Without the
@@ -11785,6 +12023,7 @@ fn graph_run_supervisor(
                                     worker_iox2_config.as_ref(),
                                 );
                                 crashed_groups.extend(batch.into_iter().map(|(g, _)| g));
+                                node_fatal_groups.extend(sweep.node_fatal_groups);
                                 if let Some(clean_group) = sweep.clean_exit_group {
                                     // The sweep consumed a CLEAN exit event — run
                                     // the clean-exit → Draining transition it would
@@ -11805,7 +12044,11 @@ fn graph_run_supervisor(
                     }
                 }
                 ChildPoll::Exited(status) => {
-                    if status.success() {
+                    let exit = classify_worker_exit(&status);
+                    if exit == WorkerExit::NodeFatal {
+                        node_fatal_groups.push(group.clone());
+                    }
+                    if exit.is_clean() {
                         tracing::debug!(group = %group, "worker drained (clean exit)");
                     } else {
                         // Draining: workers self-drop + exit 0 on a clean
@@ -11927,6 +12170,7 @@ fn graph_run_supervisor(
                                 worker_iox2_config.as_ref(),
                             );
                             crashed_groups.extend(batch.into_iter().map(|(g, _)| g));
+                            node_fatal_groups.extend(sweep.node_fatal_groups);
                             if let Some(clean_group) = sweep.clean_exit_group {
                                 // Sweep-consumed clean exit → run the Draining
                                 // transition (same as the Exited(0) arm).
@@ -11984,9 +12228,7 @@ fn graph_run_supervisor(
             if Instant::now() >= dl {
                 let stragglers = guards.iter().filter(|g| !g.reaped()).count();
                 tracing::warn!(graph = %config.identity(), stragglers, "drain deadline elapsed — killing straggler worker(s)");
-                for g in guards.iter_mut() {
-                    g.kill_and_reap();
-                }
+                node_fatal_groups.extend(kill_stragglers(&mut guards));
                 break;
             }
         }
@@ -12069,7 +12311,17 @@ fn graph_run_supervisor(
     } else {
         tracing::debug!(graph = %config.identity(), "multi-process deployment stopped");
     }
-    Ok(())
+    // A worker that stopped a node on a fatal error exited 3, and so does the
+    // deployment. Checked last: a failure that already returned above (a
+    // `--peer-loss fail` death, every worker crashed, a recording failure)
+    // wins; a degraded `continue` run still exits 3.
+    if node_fatal_groups.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::WorkerNodeFatal {
+            groups: node_fatal_groups,
+        })
+    }
 }
 
 /// Formerly `virtual_external_inert_warning`: build the STARTUP
@@ -15694,20 +15946,29 @@ pub fn render_recorder_json(
         // (per-bag, not the read gate). v2 = "a FIRE
         // record's `reserved` may carry the discard bit (bit 31)"; v3 adds
         // kind-6 READ-OUTCOME records; v4 marks a free-run recording (or any
-        // stream a v3 reader cannot decode); v5 marks a stream
-        // whose kind-6 records carry READ-SITE ROLES, which is every bag this
+        // stream a v3 reader cannot decode); v5 marks a stream whose kind-6
+        // records carry READ-SITE ROLES; v6 marks a stream whose kind-6 aux
+        // words carry a RUN COUNT; v7 marks a stream in which every gated
+        // consult a replay also makes wrote a record, which is every bag this
         // binary writes. A replaying binary that supports a LOWER version
-        // refuses this bag with a clear "recorded by a newer Cerulion —
-        // upgrade to replay" message (rather than mis-decoding it). An absent
-        // field = v1 (back-compat).
+        // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
+        // to replay" message (rather than mis-decoding it). An absent field =
+        // v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
-            // Whether THIS run folds identical runs. Read from the
-            // one switch, so a `CERULION_READ_LOG_FOLD=off` run stamps 5 and a
-            // bag never claims an encoding it did not use.
+            // Whether THIS run folds identical runs, read from the one switch.
+            // `stamp_trace_format` tests the consult term first, so the stamp
+            // is 7 with folding on or off; this term decides the stamp on the
+            // ladder below 7, which is the arm an older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
+            // Whether THIS binary records every gated consult a replay also
+            // makes: it does, at every consult that found its queue empty but
+            // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
+            // replay never runs, so no replay re-derives those consults), so
+            // every bag it writes stamps 7.
+            crate::replay_engine::recorder_stamps_consult_records(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -20572,6 +20833,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // note (the counters live in-cdylib, where the host cannot read them) —
     // never silently nothing.
     runtime.log_publisher_reconciliation_stats();
+    // Nodes stopped by `NodeError::Fatal`: reported (exit 3) only after the
+    // bag is finalized, so a fatal run still leaves its recording.
+    let fatal_nodes = runtime.node_fatal_errors();
 
     // ---- (9) Ordered teardown: STOP the graph FIRST (publishers drop), THEN
     // signal bagd (SIGTERM → clean final-drain + finalize), THEN bounded-wait.
@@ -20593,7 +20857,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // was already logged above.
     run_result?;
 
-    bagd_result
+    bagd_result?;
+    crate::error::node_fatal_verdict(fatal_nodes)
 }
 
 /// Report the recorder's exit outcome LOUDLY:
@@ -20934,10 +21199,15 @@ pub fn resolve_recorded_topics(
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
+    // Every graph-produced topic, selected or not: the external-consumer
+    // classification below is about who PRODUCES a topic, not what this
+    // recording selects.
+    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
+            produced.insert(topic.clone());
             // The selection applies BEFORE the metadata lookup: a names-only
             // output the recording does not select must not fail startup.
             if selected.is_some_and(|set| !set.contains(&topic)) {
@@ -21070,19 +21340,7 @@ pub fn resolve_recorded_topics(
     // consumed∧¬produced classification `replay_engine::classify_topics`
     // applies at replay time.
     {
-        let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
-        for node_def in &config.nodes {
-            for input in &node_def.inputs {
-                let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
-                if out.contains_key(&topic) {
-                    continue; // graph-produced — recorded, nothing to flag.
-                }
-                let consumers = unrecorded.entry(topic).or_default();
-                if !consumers.contains(&node_def.id) {
-                    consumers.push(node_def.id.clone());
-                }
-            }
-        }
+        let unrecorded = external_consumers(config, &produced);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -21095,6 +21353,31 @@ pub fn resolve_recorded_topics(
         }
     }
     Ok(out.into_values().collect())
+}
+
+/// The topics a graph consumes but does not produce, each with its consumer
+/// node ids (deduped, config order). A graph-produced topic is never external,
+/// even when a recording's topic selection leaves it out of the bag: replay
+/// re-runs its producer and regenerates it.
+#[cfg(unix)]
+fn external_consumers(
+    config: &GraphConfig,
+    produced: &std::collections::HashSet<String>,
+) -> indexmap::IndexMap<String, Vec<String>> {
+    let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
+    for node_def in &config.nodes {
+        for input in &node_def.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if produced.contains(&topic) {
+                continue; // graph-produced - replay regenerates it.
+            }
+            let consumers = unrecorded.entry(topic).or_default();
+            if !consumers.contains(&node_def.id) {
+                consumers.push(node_def.id.clone());
+            }
+        }
+    }
+    unrecorded
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -22757,6 +23040,43 @@ nodes:
         assert!(lean.schema_hashes.is_empty());
     }
 
+    /// The `quic/` certificate files and the per-topic egress reliability ride
+    /// the handoff into the gateway child's `NetworkConfig`, and a handoff
+    /// written without either field rebuilds with none.
+    #[test]
+    fn gateway_handoff_carries_tls_and_egress_qos_into_the_child_config() {
+        let tls = cerulion_core::NetworkTls {
+            root_ca: Some("/etc/cerulion/peers.pem".into()),
+            certificate: Some("/etc/cerulion/me.pem".into()),
+            private_key: Some("/etc/cerulion/me.key".into()),
+        };
+        let qos = vec![cerulion_core::EgressQos {
+            topic: "/r/scan".to_string(),
+            reliability: cerulion_core::EgressReliability::BestEffort,
+        }];
+        let cfg = cerulion_core::NetworkConfig {
+            listen_endpoints: vec!["quic/0.0.0.0:7447?mixed_rel=1".to_string()],
+            tls: Some(tls.clone()),
+            egress_qos: qos.clone(),
+            ..cerulion_core::NetworkConfig::default()
+        };
+        let json = serde_json::to_string(&GatewayNetworkParams::from(&cfg)).expect("serialize");
+        let back: GatewayNetworkParams = serde_json::from_str(&json).expect("round-trip");
+        let rebuilt = cerulion_core::NetworkConfig::from(&back);
+        assert_eq!(rebuilt.tls, Some(tls));
+        assert_eq!(rebuilt.egress_qos, qos);
+        assert_eq!(rebuilt.listen_endpoints, cfg.listen_endpoints);
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("tls").expect("tls present");
+        obj.remove("egress_qos").expect("egress_qos present");
+        let old: GatewayNetworkParams = serde_json::from_value(value).expect("old handoff");
+        let rebuilt = cerulion_core::NetworkConfig::from(&old);
+        assert!(rebuilt.tls.is_none());
+        assert!(rebuilt.egress_qos.is_empty());
+    }
+
     // The `--record` config guards (pure
     // seam — no workspace). Recording is live-clock only; `process_groups:`
     // graphs are recordable (the deployment dispatch
@@ -23599,6 +23919,33 @@ nodes:
     /// `pkg13::Type` graph backed by `schemas/pkg13/msg/Type.msg` records
     /// the REAL size (and the normalized provenance spelling). Removing
     /// core's deserializer normalization fails it.
+    /// A recording that selects a subset of outputs must not reclassify an
+    /// unselected graph-produced topic as external: replay re-runs its
+    /// producer. Only a topic no node produces is external.
+    #[cfg(unix)]
+    #[test]
+    fn an_unselected_produced_topic_is_not_an_external_consumer() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let produced: std::collections::HashSet<String> = config
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.outputs.iter().map(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                })
+            })
+            .collect();
+        let external = external_consumers(&config, &produced);
+        assert_eq!(
+            external.into_iter().collect::<Vec<_>>(),
+            vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn r13_a_coloned_graph_spelling_records_the_real_wire_size() {
@@ -26067,14 +26414,17 @@ nodes:
                 CoordinationMode::Lockstep,
                 crate::replay_engine::recorder_stream_needs_v4(),
                 crate::replay_engine::recorder_stamps_read_site_roles(),
-                cerulion_core::read_outcome::fold_enabled()
+                cerulion_core::read_outcome::fold_enabled(),
+                crate::replay_engine::recorder_stamps_consult_records()
             )
         );
         assert_eq!(
-            v["trace_format"], 6,
-            "C3: every bag this binary writes carries read-site roles AND \
-             folds runs, and folding is the stronger claim — a reader below 6 masks \
-             the run count away and would silently under-count reads"
+            v["trace_format"], 7,
+            "every bag this binary writes carries read-site roles, folds runs \
+             AND records an empty consult a replay also makes, and the consult \
+             record is the strongest claim: a reader below 7 convicts the empty \
+             drain's NoFrame record as an impossible shape and plans no position \
+             for it"
         );
     }
 
@@ -26083,23 +26433,24 @@ nodes:
     /// reader must refuse a free-run bag rather than apply the lockstep
     /// contract to a stream built to violate it).
     ///
-    /// The role term
-    /// overrides the free-run arm, so this renderer stamps **5**, and folding
-    /// raises it to the 6 asserted here. The test NAME
-    /// is part of the oracle — it states the number the renderer stamps.
+    /// Each later term overrides the free-run arm in turn: the role term takes
+    /// it to 5, folding to 6, and the consult record to the 7 asserted here.
+    /// The test NAME is part of the oracle: it states the number the renderer
+    /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_six() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_seven() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value =
             serde_json::from_slice(&render_recorder_json(now, CoordinationMode::FreeRun))
                 .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
-        // 5, not 4 — the role term overrides the free-run arm.
-        // And 6, not 5 — folding overrides both
-        // (`stamp_trace_format`'s hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 6);
+        // 5, not 4: the role term overrides the free-run arm. 6, not 5:
+        // folding overrides both. 7, not 6: the consult record is tested
+        // first of all (`stamp_trace_format`'s hand table pins the whole
+        // matrix).
+        assert_eq!(v["trace_format"], 7);
     }
 
     /// The ONE resolution point, and the rule it decides: a
@@ -30963,6 +31314,123 @@ nodes:
             guards.iter().all(|g| g.reaped()),
             "both guards must end reaped by the sweep"
         );
+    }
+
+    /// A real child's exit status, for the worker-exit classification below.
+    #[cfg(unix)]
+    fn exit_status_of(script: &str) -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .status()
+            .expect("run trivial child")
+    }
+
+    /// The supervisor's reading of a worker exit: 0 is a clean exit, 3
+    /// (`EXIT_NODE_FATAL`) is a clean exit with a fatally stopped node, and
+    /// every other code or a signal is a death. 2 is the barrier-poison exit
+    /// and 1 is a worker error: both stay deaths.
+    #[cfg(unix)]
+    #[test]
+    fn classify_worker_exit_reads_0_and_3_as_clean_and_the_rest_as_death() {
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("exit 0")),
+            WorkerExit::Clean
+        );
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("exit 3")),
+            WorkerExit::NodeFatal
+        );
+        for code in ["1", "2", "4", "7", "101"] {
+            assert_eq!(
+                classify_worker_exit(&exit_status_of(&format!("exit {code}"))),
+                WorkerExit::Died,
+                "exit {code}"
+            );
+        }
+        assert_eq!(
+            classify_worker_exit(&exit_status_of("kill -9 $$")),
+            WorkerExit::Died,
+            "a signal death has no code"
+        );
+        assert!(WorkerExit::Clean.is_clean());
+        assert!(WorkerExit::NodeFatal.is_clean());
+        assert!(!WorkerExit::Died.is_clean());
+    }
+
+    /// The death sweep reads an exit-3 worker as a CLEAN exit (it can run
+    /// the Draining transition) AND reports its group as node-fatal, never as
+    /// a death: a fatal node does not degrade the deployment.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_reads_a_node_fatal_exit_as_clean_and_reports_its_group() {
+        let spawn = |code: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .expect("spawn trivial child")
+        };
+        let mut guards = vec![
+            ChildGuard::new(spawn("3"), "g_fatal".to_string()),
+            ChildGuard::new(spawn("7"), "g_dead".to_string()),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut deaths: Vec<(String, String)> = Vec::new();
+        let mut clean: Option<String> = None;
+        let mut fatal: Vec<String> = Vec::new();
+        while guards.iter().any(|g| !g.reaped()) {
+            assert!(Instant::now() < deadline, "trivial children did not exit");
+            let sweep = sweep_additional_deaths(&mut guards);
+            deaths.extend(sweep.deaths);
+            fatal.extend(sweep.node_fatal_groups);
+            if clean.is_none() {
+                clean = sweep.clean_exit_group;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            deaths.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
+            vec!["g_dead"]
+        );
+        assert_eq!(clean.as_deref(), Some("g_fatal"));
+        assert_eq!(fatal, vec!["g_fatal".to_string()]);
+    }
+
+    /// The drain-deadline kill still reads an exit 3 the JOIN loop never
+    /// polled: a worker that exited 3 before the kill is node-fatal; one that
+    /// exited 0, one killed while running, and one already reaped are not.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_kill_classifies_an_unpolled_exit_3() {
+        let spawn = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("spawn trivial child")
+        };
+        let mut guards = vec![
+            ChildGuard::new(spawn("exit 3"), "g_fatal".to_string()),
+            ChildGuard::new(spawn("exit 0"), "g_clean".to_string()),
+            ChildGuard::new(spawn("exec sleep 30"), "g_running".to_string()),
+            ChildGuard::new(spawn("exit 3"), "g_reaped".to_string()),
+        ];
+        // The two short children have exited but stay unreaped, the race the
+        // deadline kill must classify; the reaped one was seen by the loop.
+        for g in &guards[..2] {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `waitid` on this test's OWN child pid with a zeroed
+            // out-param; WNOWAIT leaves the child unreaped for the guard.
+            unsafe {
+                waitid_retrying_eintr(
+                    g.child.id() as libc::pid_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            }
+            .unwrap_or_else(|e| panic!("waitid: {e}"));
+        }
+        guards[3].kill_and_reap();
+        assert_eq!(kill_stragglers(&mut guards), vec!["g_fatal".to_string()]);
+        assert!(guards.iter().all(ChildGuard::reaped));
     }
 
     #[test]
@@ -39158,8 +39626,8 @@ mod worker_tests {
             // No cross-group provisioning union (every case fails before
             // the build reaches topic pre-create).
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             // Not recording (every case fails before the ring seam).
@@ -40309,8 +40777,8 @@ mod supervisor_tests {
             // writes the resolved mode over it).
             execution_mode: crate::multiprocess::ExecutionMode::Lockstep,
             topic_requirements: std::collections::BTreeMap::new(),
-            sibling_topics: std::collections::BTreeSet::new(),
-            sibling_consumed_topics: std::collections::BTreeSet::new(),
+            sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
+            sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,

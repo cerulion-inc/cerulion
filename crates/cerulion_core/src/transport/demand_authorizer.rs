@@ -186,7 +186,8 @@ pub const LAN_ACCESS_ENV: &str = "CERULION_LAN_ACCESS";
 pub enum LanAccess {
     /// Every LAN peer may enumerate and demand topics.
     Open,
-    /// LAN demands, catalog, schema and run queries are refused.
+    /// LAN demands, catalog, schema and run queries are refused, and LAN ingress
+    /// delivers nothing.
     Paired,
 }
 

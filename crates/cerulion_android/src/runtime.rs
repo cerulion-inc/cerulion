@@ -16,7 +16,7 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
 };
 use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
 use cerulion_core::transport::{
@@ -38,6 +38,35 @@ type ProcessTransportIdentity = (Vec<String>, String);
 
 static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
     OnceLock::new();
+
+/// Set while one runtime owns the process network gateway.
+static GATEWAY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// One runtime's hold on the process network gateway. The gateway's bridge
+/// grants, LAN posture and serving snapshot all live on the process-wide
+/// manager, so a second gateway runtime would share them and its stop would
+/// revoke the first runtime's grants: only one runtime may own the gateway
+/// at a time. Dropping the claim releases it.
+struct GatewayClaim(());
+
+impl GatewayClaim {
+    fn acquire() -> Result<Self, EmbedError> {
+        GATEWAY_CLAIMED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(()))
+            .map_err(|_| {
+                EmbedError::BadState(
+                    "another embedded runtime owns the network gateway in this process; stop it before starting one with listen endpoints".to_string(),
+                )
+            })
+    }
+}
+
+impl Drop for GatewayClaim {
+    fn drop(&mut self) {
+        GATEWAY_CLAIMED.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -149,6 +178,17 @@ struct Resources {
     graph_thread: Option<JoinHandle<Result<(), String>>>,
     gateway_exit: Option<Arc<AtomicBool>>,
     gateway_thread: Option<JoinHandle<Result<(), String>>>,
+    /// Set just before this start builds its gateway: construction registers
+    /// bridge topics and installs egress posture on the shared manager before
+    /// it can fail, so ownership must be known before `gateway_thread` exists
+    /// for teardown to revoke what a half-built gateway left behind.
+    gateway_owned: bool,
+    /// This runtime's hold on the process gateway, taken before a gateway
+    /// start touches any manager-wide state and released after its teardown.
+    gateway_claim: Option<GatewayClaim>,
+    /// The token of the posture write this runtime's teardown made, so a
+    /// failed start's rollback can tell its own write from a newer caller's.
+    lan_access_write: Option<u64>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
 }
@@ -518,11 +558,18 @@ impl EmbeddedRuntime {
         // failed run cannot leave LAN access open on the process-wide
         // surface.
         let mut prior_lan_access = None;
+        // The token of this start's posture write: the rollback restores the
+        // prior posture only while this write is still the last one.
+        let mut applied_lan_write = None;
+        let mut gateway_claim = None;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
             (!config.listen.is_empty()).then(|| LanAccess::from(config.lan_access));
         if !config.listen.is_empty() {
+            // Claimed before the serving snapshot or posture changes: a
+            // refused start must leave the owning runtime's state untouched.
+            gateway_claim = Some(GatewayClaim::acquire()?);
             if let Some(live) = manager
                 .network()
                 .and_then(|network| network.query_surface_serving_handles())
@@ -552,7 +599,9 @@ impl EmbeddedRuntime {
             }
             if let Some(network) = manager.network() {
                 prior_lan_access = Some(network.lan_access());
-                network.set_lan_access(applied_lan_access.unwrap_or(LanAccess::Paired));
+                applied_lan_write = Some(
+                    network.set_lan_access_tracked(applied_lan_access.unwrap_or(LanAccess::Paired)),
+                );
             }
         }
 
@@ -561,6 +610,7 @@ impl EmbeddedRuntime {
         // reachable to the teardown path, not orphaned in a dropped local.
         self.resources = Resources {
             manager: Some(Arc::clone(&manager)),
+            gateway_claim,
             ..Resources::default()
         };
         let resources = &mut self.resources;
@@ -592,12 +642,13 @@ impl EmbeddedRuntime {
                 None
             };
 
-            // Workers bump this as their closure's first line; the starter
-            // waits for every spawned worker to begin before reporting
+            // One readiness flag per spawned worker, set only once that
+            // worker's fallible startup checks have passed. The starter waits
+            // until every worker is ready or has exited before reporting
             // success, so a worker that failed during startup has already
             // recorded Failed before we check `status.state` below.
-            let workers_began = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut workers_expected = 0usize;
+            let mut gateway_ready: Option<Arc<AtomicBool>> = None;
+            let mut graph_ready: Option<Arc<AtomicBool>> = None;
             if !config.listen.is_empty() {
                 let mut announce = graph_topics;
                 for publish in &resolved_publish {
@@ -625,6 +676,9 @@ impl EmbeddedRuntime {
                 {
                     live.replace(&serving_clone);
                 }
+                // Ownership starts here, not at the thread spawn: the
+                // constructor mutates the shared manager before it can fail.
+                resources.gateway_owned = true;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
@@ -641,13 +695,17 @@ impl EmbeddedRuntime {
                     beacon,
                     status: Arc::clone(&status),
                 };
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
+                let ready = Arc::new(AtomicBool::new(false));
+                let thread_ready = Arc::clone(&ready);
                 resources.gateway_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-gateway".to_string())
                         .spawn(move || {
-                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
+                            // The gateway's fallible setup (session, topic
+                            // registration) ran in its synchronous
+                            // constructor above; `run` is the drive loop, so
+                            // entering it is ready.
+                            thread_ready.store(true, Ordering::Release);
                             let mut gateway = gateway;
                             // A panic must not leave the status reporting
                             // Running: record it as a worker failure the same
@@ -666,6 +724,7 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Network(error.to_string()))?,
                 );
                 resources.gateway_exit = Some(exit);
+                gateway_ready = Some(ready);
             }
 
             let bagd_plan = Self::prepare_recorder(
@@ -679,12 +738,9 @@ impl EmbeddedRuntime {
                 let thread_shutdown = Arc::clone(&shutdown);
                 let recorder_manager = Arc::clone(&manager);
                 let status = Arc::clone(&self.status);
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
                 let spawn = thread::Builder::new()
                     .name("cerulion-bagd".to_string())
                     .spawn(move || {
-                        began.fetch_add(1, std::sync::atomic::Ordering::Release);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             run_bagd(recorder_manager, bagd_config, thread_shutdown)
                                 .map_err(|error| error.to_string())
@@ -715,23 +771,28 @@ impl EmbeddedRuntime {
                 let running = Arc::new(AtomicBool::new(true));
                 let thread_running = Arc::clone(&running);
                 let status = Arc::clone(&self.status);
-                let began = Arc::clone(&workers_began);
-                workers_expected += 1;
+                let ready = Arc::new(AtomicBool::new(false));
+                let thread_ready = Arc::clone(&ready);
                 resources.graph_thread = Some(
                     thread::Builder::new()
                         .name("cerulion-graph".to_string())
                         .spawn(move || {
-                            began.fetch_add(1, std::sync::atomic::Ordering::Release);
                             // A panic unwinds past `run_live`'s own exit
                             // bookkeeping, so surface it as a worker error:
                             // `record_graph_exit` then marks the runtime
                             // Failed instead of leaving it Running.
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    graph_runtime
-                                        .run_live(&thread_running)
-                                        .map_err(|error| error.to_string())
+                                    // The launch checks (external sources,
+                                    // the inert-node refusal) run on this
+                                    // thread BEFORE it reports ready, so a
+                                    // refusal fails the start instead of
+                                    // landing after start returned Ok.
+                                    graph_runtime.prepare_live()?;
+                                    thread_ready.store(true, Ordering::Release);
+                                    graph_runtime.run_live(&thread_running)
                                 }))
+                                .map(|result| result.map_err(|error| error.to_string()))
                                 .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
                             record_graph_exit(&status, &thread_running, &result);
                             result
@@ -739,6 +800,7 @@ impl EmbeddedRuntime {
                         .map_err(|error| EmbedError::Graph(error.to_string()))?,
                 );
                 resources.graph_running = Some(running);
+                graph_ready = Some(ready);
             }
 
             {
@@ -753,37 +815,25 @@ impl EmbeddedRuntime {
             // The startup barrier runs WITHOUT the status lock held: a
             // worker's error path takes that same lock, and waiting here
             // while holding it would deadlock the failure we are waiting
-            // to see. Every spawned worker must report in (or exit) before
-            // start returns success.
+            // to see. Every spawned worker must be ready (past its startup
+            // checks) or have exited before start returns success. The
+            // recorder needs no flag: `wait_recorder_ready` above already
+            // waited for its ready marker.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let began = workers_began.load(std::sync::atomic::Ordering::Acquire);
                 // A worker that already exited finished past its error
-                // recording, so it counts as reported for this barrier.
-                let exited = usize::from(
-                    resources
-                        .gateway_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                ) + usize::from(
-                    resources
-                        .recorder_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                ) + usize::from(
-                    resources
-                        .graph_thread
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished()),
-                );
-                if began + exited >= workers_expected {
+                // recording, so it counts as settled for this barrier. Each
+                // worker is counted once: ready OR exited, never both.
+                if worker_settled(gateway_ready.as_deref(), resources.gateway_thread.as_ref())
+                    && worker_settled(graph_ready.as_deref(), resources.graph_thread.as_ref())
+                {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     set_thread_error(
                         &self.status,
                         codes::SPAWN,
-                        "a worker never entered its run loop within the startup barrier",
+                        "a worker did not finish its startup checks within the startup barrier",
                     );
                     let status = lock_status(&self.status);
                     return Err(recorded_failure(&status));
@@ -808,12 +858,20 @@ impl EmbeddedRuntime {
             Ok(())
         })();
         if let Err(error) = result {
+            // The claim outlives the teardown: the rollbacks below still
+            // write manager-wide state, so no other runtime may start a
+            // gateway until they finish.
+            let gateway_claim = self.resources.gateway_claim.take();
             let _ = stop_resource_set(&mut self.resources, &self.status, true);
+            // Teardown of an owned gateway closes LAN access itself; its
+            // write, not the applied one, is then the last write this start
+            // made.
+            let own_lan_write = self.resources.lan_access_write.take().or(applied_lan_write);
             // Roll the serving snapshot back to the pre-start state: the
             // failed start must not leave the query surface cataloging this
             // run's topics.
             if let Some((prior, live)) = prior_serving {
-                live.restore_snapshot(prior);
+                live.restore(prior);
             } else if first_surface {
                 // The surface this start created survives the failure (the
                 // declaration latch keeps it). Roll it back to serving
@@ -823,21 +881,18 @@ impl EmbeddedRuntime {
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
                 {
-                    live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                    live.serve_nothing();
                 }
             }
             // Roll the posture back too: `set_lan_access` ran before the
             // components that can fail, so without this a failed start
             // leaves the process-wide query surface serving LAN peers.
-            if let Some(prior) = prior_lan_access {
+            if let (Some(prior), Some(write)) = (prior_lan_access, own_lan_write) {
                 if let Some(network) = manager.network() {
-                    restore_prior_lan_access(
-                        network,
-                        prior,
-                        applied_lan_access.unwrap_or(LanAccess::Paired),
-                    );
+                    restore_prior_lan_access(network, prior, write);
                 }
             }
+            drop(gateway_claim);
             return Err(error);
         }
         Ok(())
@@ -1130,6 +1185,8 @@ impl Resources {
             || self.graph_thread.is_some()
             || self.gateway_exit.is_some()
             || self.gateway_thread.is_some()
+            || self.gateway_owned
+            || self.gateway_claim.is_some()
             || self.recorder_shutdown.is_some()
             || self.recorder_thread.is_some()
     }
@@ -1304,10 +1361,11 @@ fn stop_resource_set(
     starting_failure: bool,
 ) -> (Option<RecorderSummary>, Option<EmbedError>) {
     // Only a runtime that created the gateway may close LAN access on
-    // shutdown: `gateway_thread` is set exactly when this start spawned the
-    // gateway worker, so a local-only runtime sharing the manager's network
-    // leaves the owner's posture and gateway alone.
-    let owned_gateway = resources.gateway_thread.is_some();
+    // shutdown: `gateway_owned` is set exactly when this start began building
+    // the gateway (even if construction then failed), so a local-only runtime
+    // sharing the manager's network leaves the owner's posture and gateway
+    // alone.
+    let owned_gateway = std::mem::take(&mut resources.gateway_owned);
     if owned_gateway {
         if let Some(network) = resources
             .manager
@@ -1318,7 +1376,7 @@ fn stop_resource_set(
             // an open gateway serving LAN peers. Process-global demand workers
             // outlive this runtime; the closed posture revokes grants until the next
             // start applies its configured posture.
-            network.set_lan_access(LanAccess::Paired);
+            resources.lan_access_write = Some(network.set_lan_access_tracked(LanAccess::Paired));
         }
     }
     let mut first_error = None;
@@ -1386,6 +1444,9 @@ fn stop_resource_set(
             }
         }
     }
+    // Every manager-wide grant this runtime owned is revoked: another
+    // runtime may now own the gateway.
+    resources.gateway_claim = None;
     lock_status(status).mdns_advertised = false;
     if !starting_failure {
         summary = stop_recorder(resources, &mut first_error);
@@ -1439,6 +1500,18 @@ fn stop_recorder(
     }
 }
 
+/// Whether a spawned worker is past the startup barrier: it reported ready
+/// (its startup checks passed) or it already exited (so any failure is
+/// recorded). A worker that was never spawned (`ready` is `None`) is settled.
+fn worker_settled(
+    ready: Option<&AtomicBool>,
+    thread: Option<&JoinHandle<Result<(), String>>>,
+) -> bool {
+    ready.is_none_or(|ready| {
+        ready.load(Ordering::Acquire) || thread.is_some_and(JoinHandle::is_finished)
+    })
+}
+
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
     status.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -1447,14 +1520,14 @@ fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
 }
 
-/// Roll a failed start's LAN posture back to `prior`, but only while the
-/// live posture is still the value this start applied: a different value
-/// means another caller or runtime took the posture over after the
-/// snapshot, and restoring `prior` would overwrite its newer setting.
-fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, applied: LanAccess) {
-    if network.lan_access() == applied {
-        network.set_lan_access(prior);
-    }
+/// Roll a failed start's LAN posture back to `prior`, but only while this
+/// start's own write (`write`) is still the last posture write: any newer
+/// write - even one that stored the same value, such as a caller closing
+/// access while teardown also closed it - belongs to another caller, and
+/// restoring `prior` would overwrite it. The check and the restore are one
+/// atomic step.
+fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, write: u64) {
+    let _ = network.set_lan_access_if_current(write, prior);
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
@@ -1720,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prior_posture_rollback_leaves_a_newer_posture_alone() {
+    fn a_prior_posture_rollback_leaves_any_newer_write_alone() {
         let manager = TransportManager::init_for_test(
             TransportConfig {
                 node_name: "rollback_guard_test".to_string(),
@@ -1734,20 +1807,75 @@ mod tests {
         )
         .expect("init test manager");
         let network = manager.network().expect("network");
-        network.set_lan_access(LanAccess::Paired);
 
-        // A posture that still matches the applied value rolls back.
-        restore_prior_lan_access(network, LanAccess::Open, LanAccess::Paired);
+        // This start's own write is still the last one: the prior posture
+        // comes back.
+        let write = network.set_lan_access_tracked(LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Open, write);
         assert_eq!(network.lan_access(), LanAccess::Open);
 
-        // A posture changed by another caller since the snapshot is kept.
+        // Another caller closed access after teardown's own close: the value
+        // is the same, but the write is not this start's, so it stays.
+        let teardown_write = network.set_lan_access_tracked(LanAccess::Paired);
+        network.set_lan_access(LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Open, teardown_write);
+        assert_eq!(
+            network.lan_access(),
+            LanAccess::Paired,
+            "the rollback must not reopen access a newer caller closed"
+        );
+
+        // A different value set after the snapshot is kept too.
+        let write = network.set_lan_access_tracked(LanAccess::Paired);
         network.set_lan_access(LanAccess::Open);
-        restore_prior_lan_access(network, LanAccess::Paired, LanAccess::Paired);
+        restore_prior_lan_access(network, LanAccess::Paired, write);
         assert_eq!(
             network.lan_access(),
             LanAccess::Open,
             "the rollback must not overwrite a posture set after the snapshot"
         );
+    }
+
+    #[test]
+    fn a_half_built_gateway_teardown_revokes_its_bridges_and_posture() {
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "half_built_gateway_test".to_string(),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init test manager");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Open);
+        // What a gateway constructor leaves behind when it fails after
+        // registering its announce topics: an enabled flag, no thread.
+        let flag = manager
+            .bridge_manager()
+            .register_topic("/half_built/topic")
+            .expect("register bridge");
+        flag.store(true, Ordering::Relaxed);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let mut resources = Resources {
+            manager: Some(Arc::clone(&manager)),
+            gateway_owned: true,
+            ..Resources::default()
+        };
+        let _ = stop_resource_set(&mut resources, &status, true);
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        assert!(
+            resources.lan_access_write.is_some(),
+            "the teardown close must hand its write token to the rollback"
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a failed gateway construction must not leave its bridge enabled"
+        );
+        assert!(!resources.has_any());
     }
 
     #[test]
@@ -1762,6 +1890,9 @@ mod tests {
             })),
             gateway_exit: None,
             gateway_thread: None,
+            gateway_owned: false,
+            gateway_claim: None,
+            lan_access_write: None,
             recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
             recorder_thread: Some(std::thread::spawn(|| {
                 Ok(BagdSummary {

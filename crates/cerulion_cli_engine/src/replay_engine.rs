@@ -373,7 +373,8 @@ pub struct ReplayOutcome {
     /// Present, it carries BOTH halves of the read-log judgement: the redundant
     /// per-edge verifier's divergences (a recorded read the re-derivation
     /// disagrees with) and the ENFORCEMENT's unmet reads (a recorded read the
-    /// re-execution never produced). Either makes the replayed schedule
+    /// re-execution never produced and, on a `trace_format` 7 recording, a
+    /// consult the recording holds no read for). Either makes the replayed schedule
     /// different from the recorded one, so it clears [`Self::passed`] and the CLI
     /// maps it to the same exit as [`Self::trace_divergence`].
     ///
@@ -1319,7 +1320,10 @@ pub struct RecorderInfo {
     /// version 2 means "a FIRE record's `reserved` may carry
     /// `cerulion_core::trace_ring::TRACE_DISCARD_BIT` in bit 31"; version 3
     /// means "kind-6 READ-OUTCOME records
-    /// (`RECORD_TYPE_READ_OUTCOME`) may appear in the trace". A binary REFUSES a
+    /// (`RECORD_TYPE_READ_OUTCOME`) may appear in the trace"; versions 4 to 6
+    /// are listed at [`SUPPORTED_TRACE_FORMAT`]; version 7 means "every gated
+    /// consult wrote a kind-6 record, an empty drain's `NoFrame` included". A
+    /// binary REFUSES a
     /// bag whose `trace_format` EXCEEDS the version it supports
     /// ([`SUPPORTED_TRACE_FORMAT`]) with a plain "recorded by a newer Cerulion
     /// — upgrade to replay" message (rather than silently mis-decoding a future
@@ -1471,11 +1475,13 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the ROLE term and stamps 5, because
-///   [`recorder_stamps_read_site_roles`] is unconditionally true and this
-///   function returns before the ladder is consulted. The ladder below is the
-///   `stamps_roles == false` fallback, i.e. the rule that produced the bags
-///   recorded without read-site roles, and NO bag written today reaches it.
+///   this binary writes takes the CONSULT term and stamps 7, because
+///   [`recorder_stamps_consult_records`] is unconditionally true and this
+///   function returns before the ladder is consulted. The ladder below (the
+///   fold term at 6, the role term at 5, then the mode and stream arms) is the
+///   `records_consults == false` fallback, i.e. the rules that produced the
+///   bags recorded before each term existed, and NO bag written today reaches
+///   it.
 ///
 /// Under that fallback the stamp is 4 in exactly two cases — (a) a FREE-RUN
 /// bag would stamp 4, because a format-3 reader would silently apply the
@@ -1487,14 +1493,32 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// NEVER-UNDER-CLAIM: a bag carrying a record kind >= 7 must stamp >= 4. That
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
-/// such a stream would stamp 4 too. The role term stamps 5, which is >= 4, so
-/// the claim survives the term that now precedes it.
+/// such a stream would stamp 4 too. Every term above those arms stamps 5, 6 or
+/// 7, each >= 4, so the claim survives all three.
 pub fn stamp_trace_format(
     coordination: CoordinationMode,
     stream_needs_v4: bool,
     stamps_roles: bool,
     folds_runs: bool,
+    records_consults: bool,
 ) -> u32 {
+    if records_consults {
+        // A stream in which EVERY gated consult wrote a record holds a
+        // `NoFrame` record under the `Drain` role at each empty drain. A
+        // format 6 reader convicts that pairing as a shape no recorder writes
+        // (`replay_rederive::unproducible_read_shape`), and its read gate plans
+        // one position per RECORDED read, so it holds a frame back at the
+        // consult the recording's empty drain occupies. Both misreads are
+        // silent, so a recorder that records every consult stamps 7 and a
+        // format 6 reader refuses the bag instead.
+        //
+        // Ordered ABOVE the folding arm, and it is not a claim that the bag
+        // folds: a fold-off stream's run words are structurally zero, which a
+        // format 7 reader decodes as one occurrence each, so 7 stands whether
+        // this run folded or not. A recorder that records every consult does
+        // stamp roles, so 7 carries the role term with it.
+        return 7;
+    }
     if folds_runs {
         // A folded record's aux word carries a RUN COUNT in its
         // high 32 bits, which a format-5 reader masks away
@@ -1548,6 +1572,27 @@ pub fn recorder_stamps_read_site_roles() -> bool {
     true
 }
 
+/// Does THIS binary's recorder write a kind-6 record at every gated consult a
+/// REPLAY ALSO MAKES, an empty drain included?
+///
+/// `true`, unconditionally: the subscriber stages a `NoFrame` record at each
+/// consult that found its queue empty, under the CALL SITE's role and under
+/// every coordination mode, so every bag this binary writes carries them. The
+/// EMPTY consults a POST-FIRE REFILL pass makes are the exception and stage
+/// nothing, because that pass runs on the recording side only and a record
+/// there would hold a position no replay can fill: `drain_for_trigger` under
+/// `TriggerDrainSite::Refill` (the Data burst's hook, and the Sync align pass's
+/// own fill), and the per-set Sync matcher's `sync_peek_next_stamp` /
+/// `sync_discard_head` under `SyncAlignSite::Refill`. Every other site records,
+/// each under its own role: the unified BOUNDARY drain, the Separate/Sync
+/// trigger drain, and the accumulate-all tick-body `try_receive`, the last two
+/// through `drain_samples`. A `fn` like its two siblings
+/// [`recorder_stream_needs_v4`] and [`recorder_stamps_read_site_roles`]: every
+/// stamping site reads the answer through this one call.
+pub fn recorder_stamps_consult_records() -> bool {
+    true
+}
+
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
 /// to carry read-site roles.
 ///
@@ -1570,6 +1615,74 @@ pub fn recorder_roles_stamped(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= ROLE_STAMPED_MIN_TRACE_FORMAT)
 }
 
+/// The lowest `trace_format` whose kind-6 stream holds a record for every
+/// gated consult A REPLAY OF THE BAG ALSO MAKES, so that a consult the replay
+/// makes past the recorded ones is a schedule the recording did not take and
+/// not a count to report.
+///
+/// The qualifier is the recorder's own site rule, not a hedge: a between-fires
+/// refill's empty answer is the probe that ended a burst whose length the live
+/// run discovered, and a plan-driven replay fires the recorded count and asks
+/// no consult there, so that one consult stages nothing on either side (see
+/// `CerulionSubscriber::drain_for_trigger`). Every consult that remains is one
+/// both sides make.
+///
+/// Below this format an empty drain wrote no record at all, so a reader must
+/// take the counted arm BY THE FORMAT: the `NoFrame` records a format 7
+/// recorder writes under the `Drain` role are a shape no earlier recorder
+/// produced, and a reader that keyed on the records alone would convict every
+/// format 7 bag's empty drains.
+pub const EVERY_CONSULT_MIN_TRACE_FORMAT: u32 = 7;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(EVERY_CONSULT_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's kind-6 stream hold a record at every gated consult a replay
+/// of it also makes?
+///
+/// An ABSENT `recorder.json` and an absent attachment both answer `false`:
+/// the counted arm, where an over-run of the read plan is a reported number.
+/// This is the TRUST question (may a consult past the plan be charged as a
+/// divergence, may a `Drain` role on a `NoFrame` be read as the empty drain's
+/// own record); the staging shape the replay reproduces is the DECODE question
+/// beside it, [`replay_stages_every_consult`], and the two part on exactly the
+/// attachment-less bag.
+pub fn recorder_records_every_consult(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= EVERY_CONSULT_MIN_TRACE_FORMAT)
+}
+
+/// Does the REPLAY stage a record at a gated consult that found its queue
+/// empty, the shape the recording's own staging took?
+///
+/// A declared `trace_format` below [`EVERY_CONSULT_MIN_TRACE_FORMAT`] names a
+/// recorder that wrote nothing at an empty consult, so the replay writes
+/// nothing there either and the redundant verifier compares the two logs
+/// position for position (a replayed position with no recorded partner is a
+/// divergence in that compare).
+///
+/// An ABSENT attachment makes no claim, so the answer comes from the RECORD
+/// STREAM rather than from the missing one: the caller answers
+/// `stream_records_consults` by walking that bag's own kind-6 records
+/// (`trace_holds_empty_drain_record`, crate private) for a zero-pop `NoFrame`
+/// under the `Drain` role, the shape no recorder below format 7 wrote. Reading the modern shape into every attachment-less bag was the
+/// alternative, and it is wrong in the direction that matters: an archived
+/// attachment-less bag carrying kind-6 records would then be replayed against a
+/// staging that writes a record at every empty consult the recording never
+/// wrote, and the compare would report a divergence on a byte-identical replay.
+/// A DECODE question, resolved once beside
+/// [`recorder_records_every_consult`] (the TRUST question, which stays
+/// attachment-only: a bag that never claimed format 7 does not get its consults
+/// charged as divergences) and handed to the runtime through
+/// `GraphRuntime::set_read_log_records_every_consult`.
+pub fn replay_stages_every_consult(
+    recorder: Option<&RecorderInfo>,
+    stream_records_consults: bool,
+) -> bool {
+    recorder.map_or(stream_records_consults, |r| {
+        r.trace_format >= EVERY_CONSULT_MIN_TRACE_FORMAT
+    })
+}
+
 /// The highest scheduler-trace format version this binary can replay.
 /// Bumped to 2 by the discard-marker feature (a FIRE record's `reserved` may
 /// carry `cerulion_core::trace_ring::TRACE_DISCARD_BIT`); bumped to 3 by
@@ -1589,15 +1702,26 @@ pub fn recorder_roles_stamped(recorder: Option<&RecorderInfo>) -> bool {
 /// readable: on them those bits are structurally zero, which decodes to
 /// `Unstamped` and takes the pre-roles arm at every consumer.
 ///
+/// Bumped to 6 by run-length folding (a kind-6 record's aux word carries a RUN
+/// COUNT in its high 32 bits, which a format-5 reader masks away). Bumped to 7
+/// by the every-consult record: a gated consult that finds its queue empty
+/// writes a `NoFrame` record (popped 0, the call site's role) wherever a replay
+/// of the bag makes that consult too, so a format 7 read plan holds one position
+/// per consult and a consult past it is a divergence. The one empty consult that
+/// still stages nothing is a between-fires refill, the probe that ended a burst
+/// (see `CerulionSubscriber::drain_for_trigger`). Formats 5 and 6 stay fully
+/// readable: their empty drains wrote nothing, and the reader takes the counted
+/// arm by the format ([`EVERY_CONSULT_MIN_TRACE_FORMAT`]).
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
-/// constant). Role stamping narrowed the VISIBLE distance between them to zero
-/// for the bags this binary writes — every one of them stamps 5, because every
-/// one carries roles — but the two remain separate functions serving separate
-/// questions, and the READ gate still admits 2/3/4 while the WRITE stamp never
-/// emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 6;
+/// constant). The never-under-claim stamp narrowed the VISIBLE distance between
+/// them to zero for the bags this binary writes (every one of them stamps 7,
+/// because every one records every consult), but the two remain separate
+/// functions serving separate questions, and the READ gate still admits 1 to 6
+/// while the WRITE stamp never emits them.
+pub const SUPPORTED_TRACE_FORMAT: u32 = 7;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -2046,7 +2170,9 @@ pub struct ReadLogVerdict {
     /// The redundant per-edge verifier's retained first divergence per edge,
     /// carried verbatim so the exit-6 artifact is self-contained.
     pub edges: Vec<ReadLogEdgeDivergence>,
-    /// The enforcement half: a recorded read the re-execution did not reproduce.
+    /// The enforcement half: a recorded read the re-execution did not
+    /// reproduce, or, on a `trace_format` 7 recording, a consult the recording
+    /// holds no read for.
     pub unmet: Vec<UnmetReadReport>,
     /// Every unmet read the gate observed, retained or not (one is retained per
     /// stage, so a stage that diverged at many steps contributes one entry and
@@ -2057,7 +2183,8 @@ pub struct ReadLogVerdict {
     pub detail: String,
 }
 
-/// A recorded read the re-execution did not reproduce.
+/// A recorded read the re-execution did not reproduce, or, on a `trace_format`
+/// 7 recording, a consult the recording holds no read for.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnmetReadReport {
     /// The consuming node.
@@ -2071,8 +2198,10 @@ pub struct UnmetReadReport {
     /// The sequence the recording's read served, where the divergence names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u32>,
-    /// `never_arrived`, `popped_shortfall` or `sequence_mismatch`, the core's
-    /// own token.
+    /// `never_arrived`, `popped_shortfall`, `sequence_mismatch` or
+    /// `unplanned_consult`, the core's own token. The fourth is minted only
+    /// under `ConsultRule::Recorded`, which a `trace_format` 7 recording
+    /// selects.
     pub cause: String,
     /// What the replay's own read served, where the kind names a sequence.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2146,9 +2275,11 @@ pub enum ReadLogEnforcement {
         /// it is not named for frames.
         consults_refused: u64,
         /// Consults the installed plan held no position for (no install for the
-        /// step, or past the step's last recorded read). A HARNESS fault
-        /// reported beside the verdict, never part of it. Serialized only when
-        /// nonzero.
+        /// step, or past the step's last recorded read) on a trace format 1 to
+        /// 6 recording, whose empty drains wrote no record. Reported beside the
+        /// verdict, never part of it. Structurally zero at format 7, where the
+        /// same consult is an `unplanned_consult` divergence. Serialized only
+        /// when nonzero.
         #[serde(skip_serializing_if = "is_zero_u64")]
         unplanned_consults: u64,
         /// Trace-driven refills that found their queue empty because the gate
@@ -3555,9 +3686,26 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // `false` on every archived bag, which is what keeps the pre-roles arm
     // live at every consumer below.
     let roles_stamped = recorder_roles_stamped(recorder.as_ref());
+    // And whether every gated consult of this bag left a record, the ONE seam
+    // the read gate's rule and the shape predicate branch on. `false` on every
+    // archived bag and on an absent attachment: the counted arm.
+    let consults_recorded = recorder_records_every_consult(recorder.as_ref());
     // …and, separately, how wide its kind field is. ABSENT is NOT the archived
     // arm here (see `KindFieldWidth`), which is why this is not `!roles_stamped`.
     let kind_width = kind_field_width(recorder.as_ref());
+    // The staging shape the replay reproduces at an empty consult: the decode
+    // question beside the trust question above, which is why it is not
+    // `consults_recorded`. A bag with an attachment is read at its declared
+    // format; a bag with NONE claims nothing, so the shape comes from its own
+    // record stream (one early-exiting walk, taken ONLY for that bag) rather
+    // than from a guess about which recorder wrote it.
+    let stages_every_consult = replay_stages_every_consult(
+        recorder.as_ref(),
+        match recorder.as_ref() {
+            Some(_) => false,
+            None => trace_holds_empty_drain_record(&trace, kind_width)?,
+        },
+    );
 
     // 0. Does this recording begin mid-run, and if so what
     //    must happen before the first step? `None` — a recording that begins at
@@ -3947,6 +4095,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 is_last_pass: pass_idx == last_pass,
                 coordination,
                 roles_stamped,
+                consults_recorded,
+                stages_every_consult,
                 kind_width,
                 catchup_onset,
                 trace: &trace,
@@ -7685,6 +7835,22 @@ struct PassInputs<'a> {
     /// contracts. `false` for every archived bag, which is what keeps the
     /// pre-roles arm live.
     roles_stamped: bool,
+    /// Does this bag's kind-6 stream hold a record at EVERY gated consult
+    /// (`trace_format >= EVERY_CONSULT_MIN_TRACE_FORMAT`)?
+    ///
+    /// Resolved ONCE beside `roles_stamped`. `false` on every archived bag:
+    /// the counted arm, under which an empty drain wrote no record and a
+    /// consult past the plan is a reported number.
+    consults_recorded: bool,
+    /// Does the replay's staging write a record at an empty consult, the
+    /// shape this bag's recorder wrote (`replay_stages_every_consult`)?
+    ///
+    /// A SECOND term beside `consults_recorded` rather than a re-derivation of
+    /// it: the two answer different questions (what the recorder wrote, what
+    /// the reader may charge) and are resolved from different evidence on the
+    /// bag with no recorder attachment, which is charged nothing either way and
+    /// stages whatever its own record stream shows its recorder wrote.
+    stages_every_consult: bool,
     /// How wide this bag's kind-6 kind field is.
     ///
     /// A SECOND term beside `roles_stamped` rather than a re-derivation of it,
@@ -8068,6 +8234,23 @@ fn apply_resume(
     // otherwise resume needing BOTH again and fire later than the trace it is
     // judged against. Empty for every bag without framework sections, where the call is a no-op.
     runtime.restore_sync_input_timestamps(&plan.sync_input_timestamps);
+    // A capture-time Sync node's high-water outlives its fired heads, so it
+    // rides its own table. Empty for every other node and every older bag.
+    let capture_high_water: BTreeMap<String, BTreeMap<String, u64>> = plan
+        .framework
+        .iter()
+        .filter(|(_, state)| !state.sync_capture_high_water.is_empty())
+        .map(|(node, state)| (node.clone(), state.sync_capture_high_water.clone()))
+        .collect();
+    runtime.restore_sync_capture_high_water(&capture_high_water);
+    // The epoch floor a capture clock restart set: what the restart's
+    // re-based inputs are tested against until one lands in band.
+    let epoch_floors: BTreeMap<String, u64> = plan
+        .framework
+        .iter()
+        .filter_map(|(node, state)| Some((node.clone(), state.sync_epoch_floor?)))
+        .collect();
+    runtime.restore_sync_epoch_floor(&epoch_floors);
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded
@@ -10025,6 +10208,10 @@ fn node_trigger_decl(
     // did nothing wrong. See `wired_trigger_input_names`.
     let trigger_inputs =
         cerulion_core::graph::runtime::wired_trigger_input_names(node_inputs, info.input_meta());
+    // A node that aligns on `header.stamp` is judged by no wire-stamp rule.
+    if info.sync_capture_stamps().is_some() {
+        return replay_rederive::TriggerDecl::SyncOnCaptureTime { trigger_inputs };
+    }
     match info.policy() {
         Some(MacroPolicy::Period { period_ms }) => replay_rederive::TriggerDecl::Period {
             interval_ns: period_ms.saturating_mul(1_000_000),
@@ -12126,6 +12313,16 @@ fn run_rank_pass(
     // what an injector is CONSTRUCTED with, and a topic that stood down must get
     // the wall-window injector, not a steered one nobody could justify.
     // LOCKSTEP plans nothing (see `PassVerification::inert`).
+    // The rule every gate of this pass arms under, read off the bag's trace
+    // format: a format 7 recording holds a record at every consult, so a
+    // consult the plan has no position for is a schedule the recording did not
+    // take; below 7 an empty consult wrote nothing, so the same over-run is a
+    // reported count.
+    let consult_rule = if pass.consults_recorded {
+        cerulion_core::read_outcome::ConsultRule::Recorded
+    } else {
+        cerulion_core::read_outcome::ConsultRule::Counted
+    };
     let mut verification = if lockstep {
         PassVerification::inert()
     } else {
@@ -12138,7 +12335,7 @@ fn run_rank_pass(
             pass.node_infos,
             &inject_topics,
             &enforce_topics,
-            &runtime.replay_read_enforceable(),
+            &runtime.replay_read_enforceable_under(consult_rule),
             pass.bag_side.get(&plan.rank()),
             pass.roles_stamped,
             pass.kind_width,
@@ -12163,7 +12360,7 @@ fn run_rank_pass(
         // wiring cannot GATE refuses nothing in either half: it takes today's
         // drain and the report names it, which is the only answer those two edge
         // classes have until they are gated.
-        for cap in runtime.replay_read_enforceable() {
+        for cap in runtime.replay_read_enforceable_under(consult_rule) {
             if cap.enforceable || !keys.contains(&cap.key) {
                 continue;
             }
@@ -12172,7 +12369,7 @@ fn run_rank_pass(
             });
             return Err(read_log_edge_not_gateable(&cap.key, &reason));
         }
-        if let Err(reason) = runtime.arm_replay_read_plan(&keys) {
+        if let Err(reason) = runtime.arm_replay_read_plan(&keys, consult_rule) {
             return Err(match reason {
                 // Both name a key the engine derived from THIS runtime's own
                 // stage table, so a miss or a repeat is an engine bug rather
@@ -12342,6 +12539,8 @@ fn run_rank_pass(
         runtime,
         pass.kind_width,
         pass.roles_stamped,
+        pass.consults_recorded,
+        pass.stages_every_consult,
     )?;
     // ONE streaming pass over the mapped trace PER RANK, held across the whole
     // loop (each per-step pull advances its rank's cursor monotonically —
@@ -12367,6 +12566,12 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
+    // Where a re-executed node was STOPPED (fatal error or panic breaker),
+    // read after each step: no rule may predict its fires past that step,
+    // because the recording correctly holds none. The stop carries how many
+    // fires of the node the stopping step performed, so a recording that
+    // stopped at another fire of the same burst is still a finding.
+    let mut rederive_stops = replay_rederive::PassStops::none();
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
     // The fires the recording holds that a trace-driven pass did NOT perform,
@@ -12589,6 +12794,25 @@ fn run_rank_pass(
                 })?;
         }
         runtime.step(Duration::from_nanos(delta));
+        if !lockstep {
+            for decl in &verification.decls {
+                if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
+                {
+                    // The trace holds exactly this step's fires (it is
+                    // cleared below every step), the stopping fire included.
+                    let fires = runtime
+                        .trace()
+                        .iter()
+                        .filter(|e| *e.node_id == *decl.node_id)
+                        .count();
+                    rederive_stops.note(
+                        &decl.node_id,
+                        boundary.step,
+                        u32::try_from(fires).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+        }
         // The injection hook cannot return an error (its signature
         // is `Fn(&str, u32)`, and an unwind out of it would cross a node tick),
         // so a failed intra-step publish is LATCHED and read here — the
@@ -12992,6 +13216,20 @@ fn run_rank_pass(
                             render_seq_opt(expected)
                         ),
                     ),
+                    cerulion_core::read_outcome::ReplayReadViolationKind::UnplannedConsult {
+                        consult,
+                        planned,
+                    } => (
+                        v.kind.code(),
+                        None,
+                        None,
+                        format!(
+                            "at step {} the replay's consult number {consult} of this stage's \
+                             read gate found no recorded read: the recording holds {planned} \
+                             read(s) there",
+                            v.step
+                        ),
+                    ),
                 };
                 UnmetReadReport {
                     node_id: v.key.node.clone(),
@@ -13024,21 +13262,25 @@ fn run_rank_pass(
                  class)"
             );
         }
-        // A consult the installed plan held no position for is the plan and the
-        // drain disagreeing about how many reads one step holds. Reported beside
-        // the verdict and never inside it: the frames it withheld surface as
-        // ordinary divergences, and naming the number is what keeps a cursor
-        // over-run from reading as the enforcement working.
+        // A consult the installed plan held no position for is, on a trace
+        // format 6 or lower recording, the plan and the drain disagreeing
+        // about how many reads one step holds. Reported beside the verdict and
+        // never inside it: the frames it withheld surface as ordinary
+        // divergences, and naming the number is what keeps a cursor over-run
+        // from reading as the enforcement working. Structurally zero on a
+        // format 7 recording, whose gates mint `unplanned_consult` divergences
+        // for the same consults.
         let unplanned = runtime.replay_read_unplanned_consults();
         if unplanned > 0 {
             tracing::warn!(
                 rank = plan.rank(),
                 unplanned,
-                "replay: read-gate consult(s) found no position in the installed plan (no \
-                 install for the step, or past the step's last recorded read), so each one \
-                 withheld. The recording writes NO record for a drain that found its queue \
-                 empty, so a step whose recorded read was not its first consult spends its \
-                 admissions at earlier consults: report-only, never a replay verdict"
+                "replay: (a trace format 6 or lower recording) read-gate consult(s) found no \
+                 position in the installed plan (no install for the step, or past the step's \
+                 last recorded read), so each one withheld. A recording below trace format 7 \
+                 writes NO record for a drain that found its queue empty, so a step whose \
+                 recorded read was not its first consult spends its admissions at earlier \
+                 consults: report-only, never a replay verdict"
             );
         }
         // The refill empties the GATE caused, summed over the rank's nodes. The
@@ -13162,10 +13404,14 @@ fn run_rank_pass(
                 &verification.decls,
                 &rederive_steps,
                 &verification.block_edges,
-                // The ONE bool -> `RoleTrust` conversion. The flag stays a bool
-                // at the pass boundary because the injection steering reads it
-                // too; below this line the trust is a named two-state.
-                replay_rederive::RoleTrust::from_stamped(pass.roles_stamped),
+                // The ONE conversion of the two bag terms to `RoleTrust`. They
+                // stay bools at the pass boundary because the injection
+                // steering reads the role term too; below this line the trust
+                // is a named type.
+                replay_rederive::RoleTrust::from_stamped(
+                    pass.roles_stamped,
+                    pass.consults_recorded,
+                ),
                 // What THIS pass restored. A one-rank free-run bag beginning
                 // mid-run resumes (the pass-loop block above applied its plan),
                 // and its Sync heads are UNBACKED (real stamps with no kind-6
@@ -13177,6 +13423,7 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                 }),
+                &rederive_stops,
             );
             for sd in &report.stand_downs {
                 // The corrupt-recording stand-down
@@ -16287,6 +16534,67 @@ impl InjectionWindow {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod node_trigger_decl_tests {
+    use super::{node_trigger_decl, replay_rederive::TriggerDecl};
+    use cerulion_core::graph::config::InputDef;
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
+    use cerulion_core::scheduler::sync_stamp::HeaderStampLocation;
+
+    fn info(capture: bool) -> NodeInfo {
+        let meta = |name: &str| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: 4,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
+            .with_policy(MacroPolicy::Sync { window_ms: 10 });
+        if !capture {
+            return info;
+        }
+        let at = HeaderStampLocation::Fixed { offset: 0 };
+        info.with_sync_capture_stamps(
+            [("cam".to_string(), at), ("lidar".to_string(), at)]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn wired() -> Vec<InputDef> {
+        ["cam", "lidar"]
+            .into_iter()
+            .map(|n| InputDef {
+                name: n.to_string(),
+                source: format!("/{n}"),
+            })
+            .collect()
+    }
+
+    /// The same `sync_window_ms` node is judged by the wire-stamp Sync rule
+    /// on publish time, and declared capture-time (so the rule stands down)
+    /// once it aligns on `header.stamp`.
+    #[test]
+    fn a_capture_time_sync_node_is_declared_apart_from_a_publish_time_one() {
+        let both = vec!["cam".to_string(), "lidar".to_string()];
+        assert_eq!(
+            node_trigger_decl(&info(false), &wired(), None),
+            TriggerDecl::Sync {
+                window_ns: Some(10_000_000),
+                trigger_inputs: both.clone(),
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&info(true), &wired(), None),
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: both
+            }
+        );
     }
 }
 
@@ -20937,6 +21245,41 @@ fn trace_has_read_outcomes(trace: &RecordedTrace) -> Result<bool, ReplayError> {
     Ok(false)
 }
 
+/// Does the bag's scheduler trace hold the shape only a format 7 recorder
+/// writes: a zero-pop `NoFrame` under the `Drain` role, the record an empty
+/// drain leaves?
+///
+/// The answer for a bag with NO `recorder.json`, which claims no format at all
+/// (see [`replay_stages_every_consult`]). Every earlier recorder returned from
+/// an empty drain without staging anything, and the `NoFrame` records those
+/// builds DID write at an empty read carry the `Body` role (`try_view`,
+/// `snapshot_latest`), so the pairing is the format's own fingerprint. One
+/// early-exiting streaming pass in the shape of [`trace_has_read_outcomes`],
+/// advise-behind so a large bag never pins its pages.
+fn trace_holds_empty_drain_record(
+    trace: &RecordedTrace,
+    width: KindFieldWidth,
+) -> Result<bool, ReplayError> {
+    let mut iter = trace.reader.trace_records().map_err(trace_rewalk_error)?;
+    let mut advise = cerulion_bag::AdviseCursor::new();
+    while let Some(item) = iter.next() {
+        let rec = item.map_err(trace_rewalk_error)?;
+        if rec.record_type == RECORD_TYPE_READ_OUTCOME {
+            let (_, kind, role) = decode_read_outcome_meta(rec.global_level, width);
+            if kind == READ_OUTCOME_NONE
+                && role == ReadSiteRole::Drain
+                && unpack_read_outcome_popped(rec.duration_ns) == 0
+            {
+                return Ok(true);
+            }
+        }
+        trace
+            .reader
+            .advise_evict_behind_scoped(&mut advise, iter.file_frontier());
+    }
+    Ok(false)
+}
+
 /// The rank manifests' additive `inputs` tables (node id →
 /// ordered input names), merged across ranks. `Err(reason)` — the caller
 /// warns (carrying the reason: the message must name what
@@ -21668,6 +22011,15 @@ impl<'a> ReadLogVerifier<'a> {
         // ([`KindFieldWidth`]), so deriving one here would make this verifier
         // read a bag under a contract no other consumer applies.
         roles_stamped: bool,
+        // Whether every gated consult of this bag wrote a record, threaded
+        // from `PassInputs::consults_recorded` into the trust the compare
+        // reads through `RoleTrust`.
+        consults_recorded: bool,
+        // Whether the replay's staging writes a record at an empty consult,
+        // threaded from `PassInputs::stages_every_consult` to the runtime's
+        // stages beside the sink install: the two logs the compare below pairs
+        // position for position must be staged under one rule.
+        stages_every_consult: bool,
     ) -> Result<Self, ReplayError> {
         // Ragged-tail scoping, derived even for the inert/disabled states so the
         // field's meaning does not depend on which state we land in (it is
@@ -21963,6 +22315,10 @@ impl<'a> ReadLogVerifier<'a> {
             (None, None) => RecordedStageCapacities::default(),
         };
         runtime.enable_read_outcome_memory_sink_with_recorded_capacities(&adopted);
+        // The staging shape at an empty consult, adopted from the bag beside
+        // the rims: a bag declared below trace format 7 wrote nothing there,
+        // so the replay writes nothing there either.
+        runtime.set_read_log_records_every_consult(stages_every_consult);
         let replayed_inputs = runtime.read_log_input_names().clone();
         // Resolved ONCE: the manifest tables do not
         // change for the life of the verifier, and the answer is consulted once
@@ -21980,7 +22336,10 @@ impl<'a> ReadLogVerifier<'a> {
                     Some(rank) => RankedReadOutcomeCursors::single_rank(trace, rank, width)?,
                     None => RankedReadOutcomeCursors::new(trace, rank_count, width)?,
                 },
-                role_trust: replay_rederive::RoleTrust::from_stamped(roles_stamped),
+                role_trust: replay_rederive::RoleTrust::from_stamped(
+                    roles_stamped,
+                    consults_recorded,
+                ),
                 recorded_inputs,
                 ambiguous_recorded_inputs,
                 producer_tokens,
@@ -22655,6 +23014,20 @@ impl ActiveReadLog<'_> {
                         continue;
                     }
                 }
+                // NOTHING IS EXCUSED INSIDE THIS LOOP, at any trace format.
+                // The recorder's own site rule is what makes that affordable: a
+                // consult whose answer a replay cannot reproduce stages no
+                // record at all (the Data and per-set Sync bursts' terminal
+                // refill probe, which `Scheduler::tick_replay_burst` never
+                // asks; see the `FrozenSlot::Empty` arm of
+                // `CerulionSubscriber::drain_for_trigger`), so every EMPTY
+                // consult record a format 7 bag holds names a consult the
+                // replay also makes; the one record with no replayed partner is
+                // a per-set Sync refill pass's own pop, which this loop reports
+                // as the divergence it is. The ONE exclusion in this compare
+                // is the ragged tail's SURPLUS REPLAYED positions, taken off
+                // `rep_view` above and recorded in the tolerance note; a
+                // RECORDED position is never dropped.
                 // First divergence on this edge: retain it, warn ONCE (per
                 // EDGE — flood discipline: a per-record
                 // warn floods a broken edge at read rate), close the edge.
@@ -24978,40 +25351,44 @@ mod recorder_info_version_tests {
     }
 
     #[test]
-    fn supported_trace_format_is_five() {
+    fn supported_trace_format_is_pinned() {
         // The READ GATE: the highest format this binary can replay. v2 was the
         // discard-marker format, v3 added kind-6 READ-OUTCOME records, v4
-        // marks a free-run recording, v5 marks a
-        // stream whose kind-6 records carry READ-SITE ROLES, and v6
-        // marks a stream whose kind-6 aux words carry a RUN COUNT in their
-        // high 32 bits — bits a v5 reader masks away, which would silently
-        // under-count reads. A recorder.json stamped v6 is NOT newer than this
-        // binary, and the absent-field back-compat default stays v1
+        // marks a free-run recording, v5 marks a stream whose kind-6 records
+        // carry READ-SITE ROLES, v6 marks a stream whose kind-6 aux words carry
+        // a RUN COUNT in their high 32 bits (bits a v5 reader masks away, which
+        // would silently under-count reads), and v7 marks a stream in which
+        // EVERY gated consult wrote a record (an empty drain's `NoFrame`
+        // included, which a v6 reader convicts as an impossible shape and
+        // plans no position for). A recorder.json stamped v7 is NOT newer than
+        // this binary, and the absent-field back-compat default stays v1
         // (`trace_format_v1`). A bump must move this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 6);
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 7);
         assert_eq!(trace_format_v1(), 1);
-        // The trust gate is the format the roles arrived in, and
-        // it can never sit above what this binary reads.
-        // (the `<=` relationship is a module-level `const _: () = assert!(..)`,
-        // so it fails at COMPILE time rather than here.)
+        // The two trust gates are the formats the roles and the consult
+        // records arrived in, and neither can sit above what this binary
+        // reads (the `<=` relationships are module-level
+        // `const _: () = assert!(..)`s, so they fail at COMPILE time rather
+        // than here).
         assert_eq!(ROLE_STAMPED_MIN_TRACE_FORMAT, 5);
+        assert_eq!(EVERY_CONSULT_MIN_TRACE_FORMAT, 7);
     }
 
     /// The decoupling pin.
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
-    /// Under the never-under-claim stamp EVERY bag this binary writes carries
-    /// roles and therefore stamps 5, so the write stamp EQUALS the read gate
-    /// and that inequality is unsatisfiable — the DEMONSTRATION retires with
+    /// Under the never-under-claim stamp EVERY bag this binary writes records
+    /// its consults and therefore stamps 7, so the write stamp EQUALS the read
+    /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
     /// stated in `stamp_trace_format`'s own docs.
     ///
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 2/3/4, which the write stamp never
-    /// emits. The decoupling is therefore alive in both directions — the READ
-    /// side reads four formats the WRITE side never produces.
+    /// the gate still admits formats 1 to 6, which the write stamp never
+    /// emits. The decoupling is therefore alive in both directions, the READ
+    /// side reading six formats the WRITE side never produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -25019,20 +25396,21 @@ mod recorder_info_version_tests {
             recorder_stream_needs_v4(),
             recorder_stamps_read_site_roles(),
             true,
+            recorder_stamps_consult_records(),
         );
         assert_eq!(
-            stamp, 6,
-            "a folding recorder stamps 6 — the run count in the aux \
-             word's high bits is invisible to a format-5 reader, which would \
-             silently under-count"
+            stamp, 7,
+            "a recorder that records every consult stamps 7: the empty drain's \
+             NoFrame record is a shape a format-6 reader convicts and plans no \
+             position for"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: four formats this binary
+        // The gate is strictly WIDER than the stamp: six formats this binary
         // reads and never writes.
-        for archived in [1u32, 2, 3, 4] {
+        for archived in [1u32, 2, 3, 4, 5, 6] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -25048,6 +25426,9 @@ mod recorder_info_version_tests {
     /// The role term doubled it: EIGHT rows, one per `(mode, stream_needs_v4,
     /// stamps_roles)`, so the role term is pinned as an OVERRIDE above both
     /// pre-existing arms and the pre-roles table survives intact underneath it.
+    /// Every row then carries three more expected values: `folds_runs` alone is
+    /// 6, and `records_consults` is 7 with folding on or off, the consult term
+    /// being the strongest claim.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -25067,18 +25448,28 @@ mod recorder_info_version_tests {
         ];
         for (mode, needs_v4, roles, expected) in cases {
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false),
+                stamp_trace_format(mode, needs_v4, roles, false, false),
                 expected,
-                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false)"
+                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
             );
-            // Folding is the STRONGEST claim — it dominates every
-            // other axis, because a folded aux word is unreadable to anything
-            // below 6 whatever the coordination mode or the role bits say.
+            // Folding dominates every axis below it: a folded aux word is
+            // unreadable to anything below 6 whatever the coordination mode or
+            // the role bits say.
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true),
+                stamp_trace_format(mode, needs_v4, roles, true, false),
                 6,
-                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true)"
+                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
             );
+            // The consult record is the STRONGEST claim: a stream holding a
+            // record at every consult is misread by anything below 7 whatever
+            // else is true of it, folding included.
+            for folds in [false, true] {
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true),
+                    7,
+                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
+                );
+            }
         }
     }
 
@@ -25154,8 +25545,15 @@ mod recorder_info_version_tests {
         for coordination in [CoordinationMode::Lockstep, CoordinationMode::FreeRun] {
             for stream_needs_v4 in [false, true] {
                 for stamps_roles in [false, true] {
-                    let folded =
-                        stamp_trace_format(coordination, stream_needs_v4, stamps_roles, true);
+                    // `records_consults` false: this arm is about folding, and
+                    // the consult term would stamp 7 over every row.
+                    let folded = stamp_trace_format(
+                        coordination,
+                        stream_needs_v4,
+                        stamps_roles,
+                        true,
+                        false,
+                    );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
                         "a recorder that FOLDS must stamp above a format-5 reader's \
@@ -25173,10 +25571,10 @@ mod recorder_info_version_tests {
         // format-5 reader's range, so the arm above is about folding rather than
         // about the bump having happened.
         assert!(
-            stamp_trace_format(CoordinationMode::Lockstep, false, true, false)
+            stamp_trace_format(CoordinationMode::Lockstep, false, true, false, false)
                 <= PRE_FOLD_SUPPORTED,
-            "a non-folding lockstep recorder stamps 5, which is what makes \
-             `CERULION_READ_LOG_FOLD=off` readable by an older binary"
+            "a non-folding lockstep recorder that records no consult stamps 5, \
+             inside a format-5 reader's range"
         );
     }
 
@@ -25334,6 +25732,86 @@ mod recorder_info_version_tests {
         assert!(
             !recorder_roles_stamped(None),
             "no recorder.json at all ⇒ the pre-roles arm, never a guess"
+        );
+    }
+
+    /// The consult gate is a floor at 7, and it feeds the same never-under-claim
+    /// stamp the role gate does.
+    ///
+    /// `recorder_stamps_consult_records` is deliberately unconditional (see its
+    /// doc), so this pins the CONSEQUENCE: every bag this binary writes is one
+    /// whose empty drains a reader may trust to have recorded, every archived
+    /// bag (formats 1 to 6) is one it must read as counted, and an absent
+    /// attachment is counted too. The replay STAGING shape is pinned beside it:
+    /// silent at an empty consult for a declared 1 to 6, a record there for a
+    /// declared 7 or above, and for no attachment at all whatever that bag's own
+    /// record stream shows.
+    #[test]
+    fn the_consult_gate_believes_only_a_format_seven_bag() {
+        assert!(recorder_stamps_consult_records());
+
+        fn info(trace_format: u32) -> RecorderInfo {
+            serde_json::from_str(&format!(
+                r#"{{"arch":"x86_64","os":"linux","cerulion_version":"0.0.1",
+                     "recorded_at_ns":7,"trace_format":{trace_format}}}"#
+            ))
+            .expect("valid recorder.json")
+        }
+        for counted in [1u32, 2, 3, 4, 5, 6] {
+            assert!(
+                !recorder_records_every_consult(Some(&info(counted))),
+                "a format-{counted} bag's empty drains wrote no record"
+            );
+        }
+        assert!(recorder_records_every_consult(Some(&info(7))));
+        assert!(
+            recorder_records_every_consult(Some(&info(8))),
+            "a FUTURE format still records every consult (the gate is a floor)"
+        );
+        assert!(
+            !recorder_records_every_consult(None),
+            "no recorder.json at all is the counted arm, never a guess"
+        );
+        // The two gates nest: every bag that records its consults also stamps
+        // roles, and the format-6 bag is the one that separates them.
+        assert!(
+            recorder_roles_stamped(Some(&info(6)))
+                && !recorder_records_every_consult(Some(&info(6)))
+        );
+        assert!(
+            recorder_roles_stamped(Some(&info(7)))
+                && recorder_records_every_consult(Some(&info(7)))
+        );
+
+        // The staging shape: the decode question beside the trust question,
+        // and the two part on the attachment-less bag. A DECLARED format is
+        // read off the attachment and the stream term is not consulted, which
+        // the `true` passed on every declared leg below pins: were it read, a
+        // format-6 leg would answer `true` here.
+        for silenced in [1u32, 2, 3, 4, 5, 6] {
+            assert!(
+                !replay_stages_every_consult(Some(&info(silenced)), true),
+                "a format-{silenced} recorder wrote nothing at an empty consult, so its \
+                 replay stages nothing there"
+            );
+        }
+        assert!(replay_stages_every_consult(Some(&info(7)), false));
+        assert!(replay_stages_every_consult(Some(&info(8)), false));
+        // …and the attachment-less bag answers from its own RECORD STREAM: the
+        // shape only a format 7 recorder writes (a zero-pop `NoFrame` under the
+        // `Drain` role, which `trace_holds_empty_drain_record` looks for) is
+        // present, or it is not. The trust gate above answered `false` for this
+        // bag either way: an unclaimed bag never has its consults charged.
+        assert!(
+            replay_stages_every_consult(None, true),
+            "no attachment and the stream holds the empty-drain record: the modern \
+             staging shape"
+        );
+        assert!(
+            !replay_stages_every_consult(None, false),
+            "no attachment and no empty-drain record in the stream: the archived \
+             staging shape, so a byte-identical replay of such a bag stages nothing \
+             the recording does not hold"
         );
     }
 

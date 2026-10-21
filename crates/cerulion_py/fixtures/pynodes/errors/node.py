@@ -2,23 +2,24 @@ import os
 import threading
 import time
 
-import cerulion as cer
+import cerulion
+from cerulion.msgs import Probe
 
 if os.environ.get("CERULION_PYNODE_CASE") == "import_error":
     raise ImportError("fixture import failure")
 
 if os.environ.get("CERULION_PYNODE_CASE") == "missing_tick":
-    @cer.node(period_ms=10)
+    @cerulion.node(period_ms=10)
     class Errors:
-        inp = cer.input("Probe")
-        out = cer.output("Probe")
-        out2 = cer.output("Probe")
+        inp = cerulion.input(Probe)
+        out = cerulion.output(Probe)
+        out2 = cerulion.output(Probe)
 else:
-    @cer.node(period_ms=10)
+    @cerulion.node(period_ms=10)
     class Errors:
-        inp = cer.input("Probe")
-        out = cer.output("Probe")
-        out2 = cer.output("Probe")
+        inp = cerulion.input(Probe)
+        out = cerulion.output(Probe)
+        out2 = cerulion.output(Probe)
 
         def init(self, ctx):
             if os.environ.get("CERULION_PYNODE_CASE") == "import_foreign_helpers":

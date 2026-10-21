@@ -34,12 +34,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
+use cerulion_core::transport::network::{IngressStats, NetworkConfig, NetworkManager};
 use cerulion_core::transport::{
     PublisherProvisioning, TopicServiceConfig, TransportConfig, TransportManager,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
-use cerulion_core::CerulionSubscriber;
+use cerulion_core::{CerulionSubscriber, LanAccess};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -958,4 +958,146 @@ fn self_ingress_demand_is_not_refused_but_foreign_is() {
         "the desk's OWN ingress demand echo must NOT be egress-refused — the watch \
          skips enable_bridge for a self-ingress topic (no wrong-audience WARN)"
     );
+}
+
+/// Drain every frame queued on `sub`; returns how many arrived.
+fn drain(sub: &CerulionSubscriber) -> usize {
+    let mut total = 0;
+    loop {
+        let mut got = 0;
+        sub.try_receive(|_| got += 1).expect("try_receive");
+        if got == 0 {
+            return total;
+        }
+        total += got;
+    }
+}
+
+/// Wait until `cond` holds on the topic's ingress counters (or timeout).
+fn wait_for_stats(
+    mgr: &NetworkManager,
+    topic: &str,
+    timeout: Duration,
+    cond: impl Fn(&IngressStats) -> bool,
+) -> IngressStats {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stats = mgr.ingress_stats(topic).expect("stats");
+        if cond(&stats) || Instant::now() > deadline {
+            return stats;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Under `LanAccess::Paired` a LAN put on an ingress topic is never
+/// re-injected; opening access delivers it; switching back to paired while a
+/// LAN peer keeps publishing stops delivery before `set_lan_access` returns.
+#[test]
+fn test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery() {
+    let (transport, topic) = setup("lan_paired");
+    let hash = 0x1357_9BDF_2468_ACE0u64;
+    let subscriber = transport.create_subscriber(&topic).expect("subscriber");
+    let ingress_pub = transport
+        .create_ingress_publisher(&topic, MaxSliceLen::const_new(64))
+        .expect("ingress publisher");
+    let mgr = Arc::new(NetworkManager::new(NetworkConfig::default()));
+    mgr.set_lan_access(LanAccess::Paired);
+    mgr.register_ingress(&topic, hash, ingress_pub)
+        .expect("register ingress");
+
+    for seq in 0..5 {
+        mgr.publish_to_network(&topic, make_wire_frame(hash, seq, 1, b"cmd"))
+            .expect("put");
+    }
+    assert!(
+        poll_one(&subscriber, Duration::from_millis(500)).is_none(),
+        "a paired gateway must re-inject no LAN frame"
+    );
+    assert_eq!(mgr.ingress_stats(&topic).expect("stats").frames, 0);
+
+    mgr.set_lan_access(LanAccess::Open);
+    mgr.publish_to_network(&topic, make_wire_frame(hash, 100, 2, b"cmd"))
+        .expect("put");
+    let (header, payload) =
+        poll_one(&subscriber, Duration::from_secs(3)).expect("open access delivers");
+    assert_eq!(header.sequence, 100);
+    assert_eq!(payload, b"cmd");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let publisher = {
+        let mgr = Arc::clone(&mgr);
+        let stop = Arc::clone(&stop);
+        let topic = topic.clone();
+        std::thread::spawn(move || {
+            let mut seq = 200u32;
+            while !stop.load(Ordering::Relaxed) {
+                mgr.publish_to_network(&topic, make_wire_frame(hash, seq, 3, b"cmd"))
+                    .expect("put");
+                seq += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let flowing = wait_for_stats(&mgr, &topic, Duration::from_secs(3), |s| s.frames >= 6);
+    assert!(flowing.frames >= 6, "the LAN peer's frames flow while open");
+
+    mgr.set_lan_access(LanAccess::Paired);
+    let at_close = mgr.ingress_stats(&topic).expect("stats").frames;
+    drain(&subscriber);
+    std::thread::sleep(Duration::from_millis(300));
+    let after = mgr.ingress_stats(&topic).expect("stats");
+    stop.store(true, Ordering::Relaxed);
+    publisher.join().expect("publisher thread");
+
+    assert_eq!(
+        after.frames, at_close,
+        "no LAN frame is re-injected after closing returns"
+    );
+    assert_eq!(drain(&subscriber), 0, "nothing delivered after the close");
+}
+
+/// The receive callback's own posture check: with the data subscriber kept
+/// declared under `Paired` (test seam), every LAN frame reaches the callback
+/// and is refused and counted; reopening delivers again.
+#[test]
+fn test_paired_receive_callback_refuses_and_counts_every_lan_frame() {
+    let (transport, topic) = setup("lan_refused");
+    let hash = 0x0F1E_2D3C_4B5A_6978u64;
+    let subscriber = transport.create_subscriber(&topic).expect("subscriber");
+    let ingress_pub = transport
+        .create_ingress_publisher(&topic, MaxSliceLen::const_new(64))
+        .expect("ingress publisher");
+    let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_retain_ingress_subscriber_for_test(true);
+    mgr.set_lan_access(LanAccess::Paired);
+    mgr.register_ingress(&topic, hash, ingress_pub)
+        .expect("register ingress");
+
+    for seq in 0..5 {
+        mgr.publish_to_network(&topic, make_wire_frame(hash, seq, 1, b"cmd"))
+            .expect("put");
+    }
+    let stats = wait_for_stats(&mgr, &topic, Duration::from_secs(3), |s| {
+        s.lan_refused_drops >= 5
+    });
+    assert_eq!(
+        stats,
+        IngressStats {
+            frames: 0,
+            schema_mismatch_drops: 0,
+            decode_errors: 0,
+            reinject_failure_drops: 0,
+            lan_refused_drops: 5,
+        }
+    );
+    assert!(poll_one(&subscriber, Duration::from_millis(200)).is_none());
+
+    mgr.set_lan_access(LanAccess::Open);
+    mgr.publish_to_network(&topic, make_wire_frame(hash, 9, 2, b"cmd"))
+        .expect("put");
+    let (header, _) = poll_one(&subscriber, Duration::from_secs(3)).expect("open delivers");
+    assert_eq!(header.sequence, 9);
+    let stats = mgr.ingress_stats(&topic).expect("stats");
+    assert_eq!((stats.frames, stats.lan_refused_drops), (1, 5));
 }

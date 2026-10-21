@@ -272,12 +272,13 @@ pub struct CrossProcessWiring<'a> {
     /// build does not report a correct cross-group edge as a possible typo
     /// (see `ValidationOptions::sibling_topics`). `None` on every
     /// single-process build, where the local graph is the whole graph.
-    pub(crate) sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
-    /// The absolute topics THIS worker produces that a SIBLING group consumes, so
-    /// the build knows which of its own publishes can reach a consumer in another
-    /// process. `None` on every single-process build, where no publish leaves the
-    /// process and so no producer doorbell is armed.
-    pub(crate) sibling_consumed_topics: Option<&'a std::collections::BTreeSet<String>>,
+    pub(crate) sibling_topics: Option<&'a super::SiblingProducedTopics>,
+    /// The absolute topics THIS worker produces that a SIBLING group consumes:
+    /// the plan's own statement of which of this worker's outputs a sibling
+    /// group reads, which the build reports as `producer_doorbells_planned` on
+    /// the wait policy line. `None` on a single-process build, which holds that
+    /// count at 0 and leaves the arming alone.
+    pub(crate) sibling_consumed_topics: Option<&'a super::SiblingConsumedTopics>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -325,12 +326,12 @@ impl<'a> CrossProcessWiring<'a> {
 
     /// Name the topics THIS worker produces that a sibling group CONSUMES, the
     /// outbound direction. Chained onto one of the constructors above rather than
-    /// added to their signatures: unlike its inbound mirror it changes how the
-    /// build is WIRED, because it decides which of this worker's publishers arm a
-    /// doorbell at all.
+    /// added to their signatures: it carries a REPORTED set, not a wiring
+    /// decision. Arming is gated on the doorbell policy alone; what this set
+    /// reaches is the `producer_doorbells_planned` count on the wait policy line.
     pub fn with_sibling_consumed_topics(
         mut self,
-        topics: &'a std::collections::BTreeSet<String>,
+        topics: &'a super::SiblingConsumedTopics,
     ) -> Self {
         self.sibling_consumed_topics = Some(topics);
         self
@@ -340,7 +341,7 @@ impl<'a> CrossProcessWiring<'a> {
     /// direction. Chained onto one of the constructors above rather than added to
     /// their signatures: it changes which warnings a build emits, never how it is
     /// wired.
-    pub fn with_sibling_topics(mut self, topics: &'a std::collections::BTreeSet<String>) -> Self {
+    pub fn with_sibling_topics(mut self, topics: &'a super::SiblingProducedTopics) -> Self {
         self.sibling_topics = Some(topics);
         self
     }
@@ -747,9 +748,10 @@ pub fn compute_gateway_plan(
                 schema_hash,
             });
         }
+        let egress: Vec<String> = net.egress_topics().map(str::to_string).collect();
         Some(GatewayPlan {
-            egress_policy: GatewayEgressPolicy::AllowList(net.egress.clone()),
-            announce: net.egress.clone(),
+            egress_policy: GatewayEgressPolicy::AllowList(egress.clone()),
+            announce: egress,
             ingress,
         })
     } else if posture == crate::transport::NetworkPosture::PermissiveDefault {
@@ -3025,6 +3027,11 @@ pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
+    /// Per capture-time Sync node, its trigger topics and the per-input
+    /// capture states its sync ops share. Read only by
+    /// [`Self::restore_sync_input_timestamps`], which seeds each input's
+    /// high-water from its restored head.
+    sync_capture_ports: IndexMap<String, super::sync_capture::NodeCapturePorts>,
     /// Exit-3 widening: per-node PANIC-CLASS failure records (first
     /// reason wins), one per node in graph order. Written by the node's tick
     /// callback — at the in-process catch site (reason recorded, panic
@@ -3034,6 +3041,10 @@ pub struct GraphRuntime {
     /// engine's exit-3 detection seam). Deterministic tick `Err`s never
     /// land here.
     tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
+    /// Per-node FATAL records (first message wins), one per node in graph
+    /// order. Written by the node's tick callback when the tick returned a
+    /// `NodeErrorKind::Fatal` error; read via [`GraphRuntime::node_fatal_errors`].
+    fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
     /// Keep a runtime-side handle to every
     /// node so we can call `shutdown()` on them. Entries moved into
     /// the scheduler's tick callback alone would be unreachable from
@@ -3333,10 +3344,17 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
-    /// How many of this graph's own publishers armed a doorbell, which is how many
-    /// of its output topics a sibling group consumes. 0 on a single-process run,
-    /// where no publish leaves the process. Recorded once at build.
+    /// How many of this graph's own publishers armed a doorbell, which under an
+    /// active policy is every topic it publishes: a ring reaches whoever is
+    /// blocked on the page, and this build cannot name those consumers. Recorded
+    /// once at build.
     producer_doorbells_armed: usize,
+    /// How many of the armed topics the supervisor's plan named as read by a
+    /// SIBLING group, which is the set that used to gate the arming. Reported
+    /// beside [`Self::producer_doorbells_armed`] so an operator reads the planned
+    /// cross-process edges against what armed; 0 on a single-process run, which
+    /// has no siblings, and never a gate. Recorded once at build.
+    producer_doorbells_planned: usize,
     /// Count of [`Self::monitor_wait_block`] ENTRIES — incremented once
     /// per call, BEFORE its park loop. The observable test seam pinning the
     /// park-entry ROUTING: an empty-`sources` (pure-Period) graph under an active
@@ -4990,6 +5008,8 @@ impl GraphRuntime {
         // site / on the structural FFI variant, read post-run via
         // [`GraphRuntime::node_tick_panics`] (the replay engine's exit-3 seam).
         let mut tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
+        let mut fatal_stops: IndexMap<String, Arc<std::sync::atomic::AtomicBool>> = IndexMap::new();
         // The ONE node-death ledger, minted BEFORE the node
         // loop so the same instance reaches all three of its readers — every
         // `ScheduledNode`, every tick callback, and this runtime. UNARMED, so
@@ -5046,6 +5066,7 @@ impl GraphRuntime {
         // node keeps legacy latest-per-set and is reported LOUDLY once at build
         // (never a silent semantics fork — two Sync semantics must be visible).
         let mut supports_sync_head_ops: HashMap<String, bool> = HashMap::new();
+        let mut supports_sync_capture_stamps: HashMap<String, bool> = HashMap::new();
         for (id, entry) in &node_factories {
             entry_infos.insert(id.clone(), entry.info()?);
             performs_input_snapshot.insert(id.clone(), entry.performs_input_snapshot());
@@ -5053,7 +5074,17 @@ impl GraphRuntime {
             unifies_trigger_drain.insert(id.clone(), entry.unifies_trigger_drain());
             refills_trigger_input.insert(id.clone(), entry.refills_trigger_input());
             supports_sync_head_ops.insert(id.clone(), entry.supports_sync_head_ops());
+            supports_sync_capture_stamps.insert(id.clone(), entry.supports_sync_capture_stamps());
         }
+        // Per capture-time Sync node: its stamp locations and window, filled by
+        // the per-node validation below and consumed where the sync ops are
+        // installed. `IndexMap` so the install walk is declaration-ordered.
+        let mut sync_capture_specs: IndexMap<String, super::sync_capture::CaptureSpec> =
+            IndexMap::new();
+        // Per capture-time Sync node: its trigger topics and the per-port
+        // states the sync ops closure shares, kept so a restore can seed them.
+        let mut sync_capture_ports: IndexMap<String, super::sync_capture::NodeCapturePorts> =
+            IndexMap::new();
 
         // Build the static GraphTopology (topic → producer +
         // consumers/policy/depth) and validate the cross-node contract
@@ -5691,7 +5722,9 @@ impl GraphRuntime {
                                  (cross-graph topics provision a graph-independent \
                                  ceiling; every unit of it commits SHM on EVERY \
                                  publisher's pool) — use a shallower depth or an \
-                                 unlisted single-writer topic",
+                                 unlisted single-writer topic (an \
+                                 `#[input(accumulate, cap = N)]` input's cap is its \
+                                 depth, so its cap is held to the same ceiling)",
                                 flow.topic,
                                 max_depth,
                                 crate::transport::MULTI_TOPIC_BUFFER_CEILING
@@ -6689,8 +6722,10 @@ impl GraphRuntime {
         let mut notify_elision_armed_count: usize = 0;
 
         // How many producer doorbells this build arms, for the wait policy line: a
-        // reader sees at a glance whether this process rings anything at all.
+        // reader sees at a glance whether this process rings anything at all, and
+        // how many of those topics a sibling group was planned to read.
         let mut producer_doorbells_armed: usize = 0;
+        let mut producer_doorbells_planned: usize = 0;
         for node_def in &config.nodes {
             let mut entry = node_factories.swap_remove(&node_def.id).ok_or_else(|| {
                 TransportError::GraphError {
@@ -6783,6 +6818,17 @@ impl GraphRuntime {
                 macro_policy,
                 Some(MacroPolicy::Sync { .. }) | Some(MacroPolicy::UnboundedSync)
             ) && node_per_set_capable;
+            // Capture-time (`header.stamp`) matching: refuse a node that opted
+            // in but cannot do it, BEFORE any transport resource is allocated.
+            if let Some(spec) = super::sync_capture::validate_sync_capture(
+                &node_def.id,
+                entry_info,
+                &node_trigger_names,
+                node_per_set_sync,
+                supports_sync_capture_stamps.get(&node_def.id) == Some(&true),
+            )? {
+                sync_capture_specs.insert(node_def.id.clone(), spec);
+            }
             // The node's per-window fire bound, and the input names
             // whose reads are step-FROZEN. Together they decide each stage's
             // `FireBurstBound` — see `read_stage_burst_bound`.
@@ -6939,28 +6985,68 @@ impl GraphRuntime {
                     output.name.clone(),
                     undelivered_anchor,
                 ));
-                // Under an active doorbell policy, open this producer's
-                // OWNED SHM doorbell so each `notify_sent_sample` rings the line a
+                // Under an active doorbell policy, open this producer's SHM
+                // doorbell: the line each `notify_sent_sample` rings and a
                 // consumer parks on. Keyed by the publisher's resolved topic +
-                // `policy.ns()` so the consumer registry maps the same page.
+                // `policy.ns()`, the key the consumer registry maps.
                 //
-                // Only for a topic a SIBLING group consumes. A doorbell ring wakes
-                // a consumer blocked on the page, and only a consumer in another
-                // process can be blocked while this one publishes, so a topic no
-                // sibling reads would pay the ring's atomic and its backend read
-                // for a wake nobody can receive. `None` wiring is the
-                // single-process build, where no publish leaves the process.
-                let topic_crosses = cross_process
+                // EVERY topic this graph publishes, while the policy permits a
+                // doorbell. A ring reaches whoever is blocked on the page, and who
+                // that is cannot be read off this graph's own plan: a graph running
+                // beside another one, an `rmw_cerulion` wait set and a tool that
+                // subscribes are all consumers this build never hears about, and a
+                // gate keyed to the plan leaves each of them waiting out its
+                // recheck period on every hop. What arming costs a publish whose
+                // page nobody blocks on is one atomic on the ring counter and one
+                // cached backend read; the kernel wake itself stays behind the
+                // page's `parked` claim, so a topic with no blocked consumer
+                // reaches no syscall.
+                //
+                // `sibling_consumed_topics` is no longer the gate. It is still the
+                // supervisor's statement of which of this worker's outputs a
+                // sibling group was planned to read, and the count below reports
+                // both numbers so an operator can see the planned set against what
+                // armed.
+                //
+                // TWO ownership variants, selected by
+                // `topic_is_writable_from_outside` over the topic config this
+                // build resolved. Of that predicate's two terms, the
+                // `multi_publisher_topics:` opt-in is the one a PRODUCED topic
+                // can satisfy: its sibling term is `External` provisioning,
+                // which `topic_configs` carries for a topic with no in-graph
+                // producer. `enable_doorbell_shared` opens the page
+                // UNOWNED and its handle unmaps without unlinking on drop;
+                // `enable_doorbell` opens it OWNED and its handle unmaps and
+                // `shm_unlink`s the derived `cer_db_*` name (doorbell.rs Drop,
+                // under `owns_name`). Where a publisher outside this graph also
+                // writes the topic, the owned variant turns this graph's exit
+                // into an unlink under that publisher: it keeps ringing the old
+                // inode, a consumer opening afterwards takes `shm_open(O_CREAT)`
+                // onto a fresh one, and the registry's `reopen` seam is reached
+                // from a producer-reconnect liveliness transition the survivor
+                // does not make. The counting above covers both variants.
+                let planned_by_a_sibling = cross_process
                     .sibling_consumed_topics
                     .is_some_and(|t| t.contains(&topic));
-                if policy.doorbell() && topic_crosses {
+                if policy.doorbell() {
                     producer_doorbells_armed += 1;
+                    if planned_by_a_sibling {
+                        producer_doorbells_planned += 1;
+                    }
                     debug_assert!(
                         !policy.ns().is_empty(),
                         "an active doorbell policy must carry a non-empty ns (the \
                          CLI resolver sets default_namespace())"
                     );
-                    publisher.enable_doorbell(policy.ns());
+                    if topic_is_writable_from_outside(
+                        &config,
+                        &topic,
+                        topic_config_of(&topic).publisher_provisioning,
+                    ) {
+                        publisher.enable_doorbell_shared(policy.ns());
+                    } else {
+                        publisher.enable_doorbell(policy.ns());
+                    }
                 }
                 // Notify elision: count THIS publisher's own
                 // event-service listener (`finish_publisher` mints exactly one —
@@ -7960,6 +8046,13 @@ impl GraphRuntime {
             let panic_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             tick_panic_records.insert(node_def.id.clone(), Arc::clone(&panic_record));
             let mut failure_latch = TickFailureLatch::new();
+            // This node's fatal record + the flag the scheduler reads after the
+            // fire (it disables the node). Shared once at build; the callback
+            // touches them only on a FATAL return.
+            let fatal_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            fatal_records.insert(node_def.id.clone(), Arc::clone(&fatal_record));
+            let fatal_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fatal_stops.insert(node_def.id.clone(), Arc::clone(&fatal_stop));
             // SITE (b): this node's half of the shared
             // ledger, plus a closure-OWNED latch so the poison arm reports the
             // TRANSITION rather than the state. The latch is a plain `bool`
@@ -7986,7 +8079,7 @@ impl GraphRuntime {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
                     match result {
                         Err(payload) => {
-                            record_first_tick_panic(
+                            record_first_reason(
                                 &panic_record,
                                 &panic_payload_msg(payload.as_ref()),
                             );
@@ -8017,7 +8110,7 @@ impl GraphRuntime {
                             // never recorded as a panic, no matter what its
                             // message says.
                             if let TransportError::NodeTickPanicked { reason, .. } = &err {
-                                record_first_tick_panic(&panic_record, reason);
+                                record_first_reason(&panic_record, reason);
                                 // The SHIPPING node shape, and
                                 // until now it was recorded by NEITHER mint site.
                                 // A cdylib catches its own panic behind the FFI
@@ -8043,6 +8136,33 @@ impl GraphRuntime {
                                     &node_id_for_log,
                                     crate::scheduler::NodeDeathCause::CdylibPanicked,
                                 );
+                            }
+                            // `NodeError::Fatal`: stop the node. One error line
+                            // names the node, the kind and the message; the
+                            // scheduler disables the node after this fire, so
+                            // this arm runs once per node and needs no flood
+                            // latch. The node will not execute again this run,
+                            // so it is a node death too (one capture, the
+                            // ledger's dedup, unarmed on replay).
+                            if let TransportError::NodeFailed { kind, reason, .. } = &err {
+                                if kind.is_fatal() {
+                                    record_first_reason(&fatal_record, reason);
+                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
+                                    latch_node_death(
+                                        &mut node_death_reported,
+                                        &node_death_for_callback,
+                                        &node_id_for_log,
+                                        crate::scheduler::NodeDeathCause::FatalError,
+                                    );
+                                    tracing::error!(
+                                        node_id = %node_id_for_log,
+                                        kind = %kind,
+                                        error = %reason,
+                                        "node returned a fatal error and is stopped; it will \
+                                         not fire again in this run"
+                                    );
+                                    return;
+                                }
                             }
                             // Flood-latched failure logging:
                             // at most two `error!` lines per (node, reason)
@@ -8179,6 +8299,9 @@ impl GraphRuntime {
             // causes stay two records and the recorder's gate is what coalesces
             // them into one capture.
             scheduler.set_node_death_ledger(&node_def.id, Arc::clone(&node_death))?;
+            if let Some(flag) = fatal_stops.get(&node_def.id) {
+                scheduler.set_node_fatal_stop(&node_def.id, Arc::clone(flag))?;
+            }
             // Register this node's read-outcome stages (the
             // SAME Arcs wired into its subscribers above) so the level-end
             // merge can drain them, and record the input-name table the
@@ -8723,8 +8846,44 @@ impl GraphRuntime {
                 // spelling. `k` is a node's trigger count (2-3 in practice), so
                 // the scan is cheaper than a map and allocates nothing.
                 let ports: Vec<(String, Arc<str>)> = pairs;
+                // Capture-time matching: one state per port, aligned with
+                // `ports`, plus the node's counters. `None` keeps the
+                // publish-time path below byte-for-byte as it was. The states
+                // are shared with the runtime so a restore can seed them.
+                let capture = match sync_capture_specs.get(node_id.as_ref()) {
+                    Some(spec) => {
+                        // `validate_sync_capture` already gave every trigger
+                        // input a location, so a miss is a wiring desync: the
+                        // port answers FAILED (never a wrong set), see below.
+                        let states: Arc<[Option<super::sync_capture::CapturePort>]> = ports
+                            .iter()
+                            .map(|(_, port)| {
+                                let location = spec.by_input.get(port.as_ref());
+                                debug_assert!(
+                                    location.is_some(),
+                                    "capture node '{node_id}' has no stamp location for \
+                                     '{port}' after validation"
+                                );
+                                location.map(|l| {
+                                    super::sync_capture::CapturePort::new(*l, spec.window_ns)
+                                })
+                            })
+                            .collect();
+                        let counters =
+                            scheduler.sync_counters(node_id.as_ref()).ok_or_else(|| {
+                                TransportError::NodeNotFound {
+                                    node_id: node_id.to_string(),
+                                }
+                            })?;
+                        let topics = ports.iter().map(|(t, _)| t.clone()).collect();
+                        sync_capture_ports
+                            .insert(node_id.to_string(), (topics, Arc::clone(&states)));
+                        Some((states, counters))
+                    }
+                    None => None,
+                };
                 scheduler.set_sync_ops(node_id.as_ref(), &inputs, move |topic, op| {
-                    let Some((_, port)) = ports.iter().find(|(t, _)| t == topic) else {
+                    let Some(port_idx) = ports.iter().position(|(t, _)| t == topic) else {
                         debug_assert!(
                             false,
                             "sync op for topic '{topic}' has no port on node '{diag_node}' —                              binding/ops wiring desync"
@@ -8736,8 +8895,23 @@ impl GraphRuntime {
                         );
                         return crate::SyncOpAnswer::Failed;
                     };
+                    let port = &ports[port_idx].1;
                     match node_arc.lock() {
-                        Ok(mut guard) => guard.sync_head_op(port, op),
+                        Ok(mut guard) => match &capture {
+                            // A port with no stamp location answers FAILED
+                            // inside `capture_op` (a wiring desync).
+                            Some((states, counters)) => super::sync_capture::capture_op(
+                                &diag_node,
+                                topic,
+                                port,
+                                states,
+                                port_idx,
+                                counters,
+                                guard.as_mut(),
+                                op,
+                            ),
+                            None => guard.sync_head_op(port, op),
+                        },
                         Err(_) => {
                             // FAIL-CLOSED: a poisoned node lock reports FAILED,
                             // which R-Fail maps to the DESCENT-DISABLING answer
@@ -8902,9 +9076,11 @@ impl GraphRuntime {
             config,
             scheduler,
             handles,
+            sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
             tick_panic_records,
+            fatal_records,
             nodes,
             data_trigger_bindings,
             sync_input_bindings,
@@ -8954,6 +9130,7 @@ impl GraphRuntime {
             doorbell_registry,
             doorbell_armed_topic,
             producer_doorbells_armed,
+            producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
             park_entries: std::sync::atomic::AtomicU64::new(0),
             // Park wake-cause counters (record-only) — all start at 0.
@@ -9207,12 +9384,12 @@ impl GraphRuntime {
     }
 
     /// Like [`Self::build_for_test_with_policy`] but with the CROSS-PROCESS wiring
-    /// a worker receives, so an arm can reach the producer-side doorbell gate with
-    /// its outbound set NON-EMPTY.
+    /// a worker receives, so an arm can reach the build with a NON-EMPTY outbound
+    /// set.
     ///
-    /// Every other test build passes `CrossProcessWiring::none()`, where the
-    /// outbound set is absent and the gate declines for every topic, so the gate's
-    /// own decision is unreachable from them.
+    /// Every other test build passes `CrossProcessWiring::none()`, where the set
+    /// is absent and the planned count is zero for every topic, so the difference
+    /// between what arms and what the plan named is unreachable from them.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn build_for_test_with_policy_and_wiring(
         config: GraphConfig,
@@ -10301,6 +10478,11 @@ impl GraphRuntime {
                 // It is not an error here — the empty section and the absent one
                 // are the same claim, and `is_empty()` routes both to the v1 header.
                 let mut state = self.scheduler.node_framework_state(id).unwrap_or_default();
+                // The capture-time Sync half: the runtime-held high-water
+                // marks and the scheduler's epoch floor. The same helper fills
+                // the read seam, so an anchor and `node_framework_state` can
+                // never state different Sync state for one boundary.
+                self.fill_capture_sync_state(id, &mut state);
                 // The section is the CARRIER's composite, and this is
                 // the half the scheduler does not hold — the transport's own
                 // per-input SERVICE CURSORS. Read here, at the same instant the
@@ -11247,17 +11429,28 @@ impl GraphRuntime {
     /// (the in-process doorbell listener). Empty until
     /// [`Self::collect_external_sources`] has run (`run_live` entry), so a graph
     /// with no external nodes contributes nothing (byte-identical live loop).
+    ///
+    /// A binding whose node is DISABLED (a `NodeError::Fatal` stop or the panic
+    /// breaker) is left out: the node will not fire, so nothing drains its
+    /// source, and a level-ready fd (`POLLHUP`/`POLLERR` on a dead camera)
+    /// would wake every wait and spin the loop. The binding itself is kept, so
+    /// a `Scheduler::reset_node` that re-enables the node restores the wake on
+    /// the next wait.
     fn external_wake_sources(&self) -> impl Iterator<Item = (waitset::WaitSource<'_>, Arc<str>)> {
-        self.external_bindings.iter().map(|b| {
-            let source = match &b.kind {
-                ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
-                ExternalBindingKind::Notified(bell) => {
-                    waitset::WaitSource::Listener(&bell.listener)
-                }
-            };
-            (source, Arc::clone(&b.node_id))
-        })
+        let scheduler = &self.scheduler;
+        self.external_bindings
+            .iter()
+            .filter(move |b| !scheduler.is_node_disabled(&b.node_id))
+            .map(|b| {
+                let source = match &b.kind {
+                    ExternalBindingKind::DeviceFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::DoorbellFd(dev) => waitset::WaitSource::Fd(&dev.fd),
+                    ExternalBindingKind::Notified(bell) => {
+                        waitset::WaitSource::Listener(&bell.listener)
+                    }
+                };
+                (source, Arc::clone(&b.node_id))
+            })
     }
 
     /// Query every `external`-policy node's [`ExternalSource`] ONCE and
@@ -12177,8 +12370,15 @@ impl GraphRuntime {
         // disjoint fields, so `retain_mut` keeps unbinds (device POLLNVAL; doorbell
         // EOF/EBADF) alloc-free (no per-sweep take/rebuild Vec).
         let scheduler = &mut self.scheduler;
-        self.external_bindings
-            .retain_mut(|binding| match binding.probe_ready() {
+        self.external_bindings.retain_mut(|binding| {
+            // A disabled node is not probed: it will not fire, so a mark is
+            // meaningless, and a doorbell left undrained cannot wake the loop
+            // because `external_wake_sources` leaves it out too. The binding
+            // stays for a `Scheduler::reset_node` that re-enables the node.
+            if scheduler.is_node_disabled(&binding.node_id) {
+                return true;
+            }
+            match binding.probe_ready() {
                 ExternalReady::Ready => {
                     binding.mark(scheduler);
                     marked = true;
@@ -12189,7 +12389,8 @@ impl GraphRuntime {
                 // the probe). The node goes inert; unbinding also protects the next
                 // reactor attach cycle.
                 ExternalReady::Unbind => false,
-            });
+            }
+        });
         marked
     }
 
@@ -12826,10 +13027,18 @@ impl GraphRuntime {
     }
 
     /// Test seam: how many of this graph's own publishers armed a doorbell, which
-    /// is the producer-side gate's decision.
+    /// under an active policy is every topic it publishes.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn producer_doorbells_armed_for_test(&self) -> usize {
         self.producer_doorbells_armed
+    }
+
+    /// Test seam: how many of the armed topics the plan named as read by a sibling
+    /// group. An arm asserting the arming no longer reads this, which is the
+    /// point: the set is reported, never consulted.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn producer_doorbells_planned_for_test(&self) -> usize {
+        self.producer_doorbells_planned
     }
 
     /// Test seam over [`Self::armed_primary_topic`].
@@ -13944,6 +14153,65 @@ impl GraphRuntime {
             .get_or_init(|| matches!(std::env::var("CERULION_MW_SINGLE_PARK").as_deref(), Ok("1")))
     }
 
+    /// Run [`Self::run_live`]'s fallible launch setup without entering the
+    /// loop: collect the external ingress wake sources (refusing a graph with
+    /// an external node that is provably inert at launch,
+    /// [`TransportError::ExternalNodesInertAtLaunch`]) and build the WaitSet
+    /// reactor when the loop needs one ([`TransportError::LiveReactorBuild`]).
+    ///
+    /// An embedding host calls this on the thread that will run the loop and
+    /// reports the graph ready only after it returns `Ok`, so a launch failure
+    /// surfaces as a start failure instead of after start reported success.
+    /// `run_live` runs the same setup first, so calling this is optional.
+    /// Idempotent, with the same sticky refusal: the `run_live` that follows
+    /// reuses the collected bindings and the parked reactor. (A cross-process
+    /// rank's armed gating epoch is placed by `run_live` itself, at its clock
+    /// anchor; its refusals are made earlier, when the epoch is armed.)
+    pub fn prepare_live(&mut self) -> TransportResult<()> {
+        self.collect_external_sources()?;
+        if self.reactor.is_none() && self.live_loop_needs_reactor() {
+            self.reactor = Some(self.build_live_reactor()?);
+        }
+        Ok(())
+    }
+
+    /// Whether the live loop idles on the WaitSet reactor. A parked run idles
+    /// in `monitor_wait_block` instead (the `park_active()` branch in
+    /// `live_step` PRECEDES the WaitSet branch), and so does a barrier
+    /// participant or a run with credit edges, so those need no reactor.
+    fn live_loop_needs_reactor(&self) -> bool {
+        !(self.park_active() || self.barrier_participant.is_some() || self.has_credit_edges())
+    }
+
+    /// Build the live loop's WaitSet reactor, sized for data-trigger + sync +
+    /// external attachments (a `DeviceFd` / `Notified` doorbell each attaches
+    /// one WaitSet source).
+    fn build_live_reactor(&self) -> TransportResult<waitset::WaitSetReactor> {
+        waitset::WaitSetReactor::new(
+            (self.data_trigger_bindings.len()
+                + self.sync_input_bindings.len()
+                + self.external_bindings.len())
+            .max(1),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "run_live: cannot build WaitSet reactor; aborting live loop"
+            );
+            // Propagate the failure. Returning `Ok(())` from `run_live` (a
+            // bare `()` meaning "ran") would let `cerulion graph run` exit 0
+            // for a live run that never executed a single step - a false
+            // success. So the underlying iceoryx2 `WaitSetCreateError` is
+            // surfaced and the CLI exits non-zero.
+            TransportError::LiveReactorBuild {
+                // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
+                // arm, which aborts the live loop
+                graph: self.config.identity().to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+
     /// The production event-driven live loop.
     ///
     /// Drives the graph from real iceoryx2 wakeups instead of fixed-`delta`
@@ -14060,43 +14328,8 @@ impl GraphRuntime {
         // reused regardless (harmless if the park is active — it just sits idle).
         let mut reactor: Option<waitset::WaitSetReactor> = match self.reactor.take() {
             Some(r) => Some(r),
-            // A barrier participant idles in `monitor_wait_block`
-            // even when the park is off (see `live_step`), so it needs no
-            // reactor either.
-            None if self.park_active()
-                || self.barrier_participant.is_some()
-                || self.has_credit_edges() =>
-            {
-                None
-            }
-            // Size for data-trigger + sync + external
-            // attachments (a `DeviceFd` / `Notified` doorbell each attaches one
-            // WaitSet source).
-            None => match waitset::WaitSetReactor::new(
-                (self.data_trigger_bindings.len()
-                    + self.sync_input_bindings.len()
-                    + self.external_bindings.len())
-                .max(1),
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "run_live: cannot build WaitSet reactor; aborting live loop"
-                    );
-                    // Propagate the failure. Returning
-                    // `Ok(())` here (a bare `()` meaning "ran") would let
-                    // `cerulion graph run` exit 0 for a live run that never executed
-                    // a single step — a false success. So the underlying iceoryx2
-                    // `WaitSetCreateError` is surfaced and the CLI exits non-zero.
-                    return Err(TransportError::LiveReactorBuild {
-                        // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
-                        // arm, which aborts the live loop
-                        graph: self.config.identity().to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            None if !self.live_loop_needs_reactor() => None,
+            None => Some(self.build_live_reactor()?),
         };
 
         // Worker-visible wait-policy line (once per run_live entry, after
@@ -14126,6 +14359,7 @@ impl GraphRuntime {
                     .map_or_else(|| "none".to_string(), |r| r.len().to_string())
             ),
             producer_doorbells = self.producer_doorbells_armed,
+            producer_doorbells_planned = self.producer_doorbells_planned,
             data_wake = self.data_wake_rung(),
             barrier = self.barrier_participant.is_some(),
             credit_edges = self.credit_park_edges.len(),
@@ -15398,6 +15632,25 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// Every node stopped by a `NodeError::Fatal` from its tick during this
+    /// runtime's life, in graph order: `(node_id, the fatal error's message)`.
+    ///
+    /// A fatal node is not fired again after the step it returned the error,
+    /// so it publishes nothing more; the rest of the graph keeps running.
+    /// `cerulion graph run` reads this at the end of a run to exit with its
+    /// fatal-node status.
+    // hot-path-alloc-ok-fn: cold: teardown/report harvest, once per graph
+    pub fn node_fatal_errors(&self) -> Vec<(String, String)> {
+        self.fatal_records
+            .iter()
+            .filter_map(|(id, rec)| {
+                rec.lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|reason| (id.clone(), reason.clone())))
+            })
+            .collect()
+    }
+
     /// Signal that data has arrived for a specific node.
     pub fn signal_data(&mut self, node_id: &str) -> TransportResult<()> {
         self.scheduler.signal_data(node_id)
@@ -15716,6 +15969,22 @@ impl GraphRuntime {
                 Some(rim) => stage.arm_at_recorded_capacity(*rim),
                 None => stage.arm(),
             }
+        }
+    }
+
+    /// Adopt the RECORDING's consult rule on every wired stage: does a consult
+    /// that found its queue empty stage a `NoFrame` record? A recorder at trace
+    /// format 7 does, and a replay of such a bag keeps the stages' creation
+    /// value; a bag declared below format 7 holds no record at its empty
+    /// consults, and a staging that wrote one would hand the redundant read
+    /// log verifier a replayed position with no recorded partner at every
+    /// quiet step. Called once per replay, before the first step, beside
+    /// [`Self::enable_read_outcome_memory_sink_with_recorded_capacities`];
+    /// a recording run never calls it.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn set_read_log_records_every_consult(&self, every: bool) {
+        for (_node, stage) in &self.read_outcome_stages {
+            stage.adopt_consult_records(every);
         }
     }
 
@@ -16195,6 +16464,14 @@ impl GraphRuntime {
         self.scheduler.is_replay_driven()
     }
 
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
+    /// reads it after each step to learn where a re-executed node stopped.
+    pub fn is_node_stopped(&self, node_id: &str) -> bool {
+        self.scheduler.is_node_disabled(node_id)
+    }
+
     /// The planned fires the last step did NOT perform — see
     /// [`crate::scheduler::Scheduler::unconsumed_replay_fires`]. Read after
     /// [`Self::step`]; a non-empty answer is a fire-schedule divergence with a
@@ -16269,7 +16546,8 @@ impl GraphRuntime {
     // the quota install. After each step: the violation readback.
     // ======================================================================
 
-    /// Every wired stage, with whether it can be GATED and why not.
+    /// Every wired stage, with whether it can be GATED under `rule` and why
+    /// not.
     ///
     /// Read before THIS runtime's first step, so a refusal built on it lands
     /// before the rank this runtime replays has executed anything: enforcing
@@ -16281,18 +16559,27 @@ impl GraphRuntime {
     /// first step. A row that says a stage cannot be GATED is not a refusal in
     /// either half: that stage takes today's drain and the report names it.
     ///
+    /// `rule` is the bag's, the same value `arm_replay_read_plan` passes: each
+    /// stage answers its wiring refusal under the rule it is given, so one call
+    /// with the bag's rule and the other with a different one would be two
+    /// censuses. Both blockers refuse under either rule in this build.
+    ///
     /// The core answers on WIRING facts only. It cannot see a bag, so no
     /// coverage, a truncated stream, a dropped record and every unenforceable
     /// record shape are the engine planner's refusals, not these.
     // hot-path-alloc-ok-fn: cold: once per replay, before the first step
-    pub fn replay_read_enforceable(&self) -> Vec<crate::read_outcome::ReadEdgeCapability> {
+    pub fn replay_read_enforceable_under(
+        &self,
+        rule: crate::read_outcome::ConsultRule,
+    ) -> Vec<crate::read_outcome::ReadEdgeCapability> {
         self.replay_read_plans
             .iter()
-            .map(|(_node, plan)| plan.capability())
+            .map(|(_node, plan)| plan.capability_under(rule))
             .collect()
     }
 
-    /// Arm exactly these stages, ONCE, before step 0 and after the census.
+    /// Arm exactly these stages, ONCE, before step 0 and after the census,
+    /// under the bag's consult rule.
     ///
     /// An unarmed stage is UNGATED for the whole run and takes today's drain
     /// byte for byte; an armed stage a per-step install omits has a ZERO quota
@@ -16308,6 +16595,7 @@ impl GraphRuntime {
     pub fn arm_replay_read_plan(
         &mut self,
         keys: &[crate::read_outcome::StageKey],
+        rule: crate::read_outcome::ConsultRule,
     ) -> Result<(), crate::read_outcome::ReadPlanRefusal> {
         // Resolve and REFUSE the whole list before arming anything: a partial
         // arm would leave some edges gated and some live under one call that
@@ -16329,13 +16617,13 @@ impl GraphRuntime {
                     key.clone(),
                 ));
             };
-            if let Some(reason) = plan.capability().reason {
+            if let Some(reason) = plan.capability_under(rule).reason {
                 return Err(reason);
             }
             resolved.push(plan);
         }
         for plan in resolved {
-            plan.arm()?;
+            plan.arm(rule)?;
         }
         // DERIVED from the stages themselves, in both this call and
         // `clear_replay_read_plan`: the flag and the per-stage `armed` bits are
@@ -16475,9 +16763,10 @@ impl GraphRuntime {
     }
 
     /// Consults the installed plan held no position for, summed over the armed
-    /// stages: an armed stage with no install for the step, and a consult past
-    /// the step's last recorded read. A harness fault the engine reports beside
-    /// the verdict.
+    /// stages, under [`crate::read_outcome::ConsultRule::Counted`]: an armed
+    /// stage with no install for the step, and a consult past a non-empty step
+    /// plan's last recorded read. Reported beside the verdict; structurally
+    /// zero under `Recorded`, where the same consult is a retained divergence.
     pub fn replay_read_unplanned_consults(&self) -> u64 {
         self.replay_read_plans
             .iter()
@@ -16642,13 +16931,54 @@ impl GraphRuntime {
     /// Read ONE node's framework section off the live
     /// scheduler — the capture seam a carrier calls at a due step boundary.
     ///
-    /// See [`crate::scheduler::Scheduler::node_framework_state`]. `None` for a
-    /// node this graph does not contain.
+    /// See [`crate::scheduler::Scheduler::node_framework_state`], plus the
+    /// capture high-water marks of a capture-time Sync node
+    /// ([`crate::state_restore::NodeFrameworkState::sync_capture_high_water`]),
+    /// which the runtime holds and the scheduler does not. `None` for a node
+    /// this graph does not contain.
     pub fn node_framework_state(
         &self,
         node_id: &str,
     ) -> Option<crate::state_restore::NodeFrameworkState> {
-        self.scheduler.node_framework_state(node_id)
+        let mut state = self.scheduler.node_framework_state(node_id)?;
+        self.fill_capture_sync_state(node_id, &mut state);
+        Some(state)
+    }
+
+    /// Write the capture-time Sync half of `node_id`'s framework section into
+    /// `state`: the per-topic capture high-water marks the runtime holds and
+    /// the epoch floor the scheduler holds. Both the Flashback anchor
+    /// assembly and [`Self::node_framework_state`] call it, so the two cannot
+    /// drift apart.
+    ///
+    /// Only a capture-time node states either: it is the node whose restore
+    /// seams read them back. Every other node keeps an empty table and no
+    /// floor, so its section bytes are unchanged.
+    // hot-path-alloc-ok-fn: cold: the Flashback ANCHOR cadence, never per frame
+    fn fill_capture_sync_state(
+        &self,
+        node_id: &str,
+        state: &mut crate::state_restore::NodeFrameworkState,
+    ) {
+        if self.sync_capture_ports.contains_key(node_id) {
+            state.sync_capture_high_water = self.sync_capture_high_water(node_id);
+            state.sync_epoch_floor = self.scheduler.sync_epoch_floor(node_id);
+        }
+    }
+
+    /// Per trigger topic, the capture high-water of capture-time Sync node
+    /// `node_id`. Empty for any other node, and for an input that has not
+    /// contributed a head yet.
+    // hot-path-alloc-ok-fn: cold: the Flashback ANCHOR cadence, never per frame
+    fn sync_capture_high_water(&self, node_id: &str) -> std::collections::BTreeMap<String, u64> {
+        let Some((topics, states)) = self.sync_capture_ports.get(node_id) else {
+            return std::collections::BTreeMap::new();
+        };
+        topics
+            .iter()
+            .zip(states.iter())
+            .filter_map(|(topic, state)| Some((topic.clone(), state.as_ref()?.high_water()?)))
+            .collect()
     }
 
     /// Restore `Sync` nodes' per-input arrival timestamps from
@@ -16657,11 +16987,89 @@ impl GraphRuntime {
     /// See [`crate::scheduler::Scheduler::restore_sync_input_timestamps`].
     /// Called before the first [`Self::step`], and never on a from-start replay
     /// or any live path.
+    ///
+    /// A capture-time Sync node also seeds each restored input's capture
+    /// high-water from the restored head, so a frame the live run dropped as
+    /// backwards is dropped on the resumed run too. A head that had already
+    /// FIRED is not in this map; its stamp comes back through
+    /// [`Self::restore_sync_capture_high_water`].
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
     pub fn restore_sync_input_timestamps(
         &mut self,
         per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
     ) {
         self.scheduler.restore_sync_input_timestamps(per_node);
+        self.restore_capture_and_epoch_high_water(per_node);
+    }
+
+    /// Restore capture-time Sync nodes' per-input capture high-water marks
+    /// from a recording's framework sections
+    /// ([`crate::state_restore::NodeFrameworkState::sync_capture_high_water`]),
+    /// keyed node, then trigger topic.
+    ///
+    /// The high-water outlives the head that set it: after a fire the head
+    /// leaves the section's head map, but a later frame older than it (within
+    /// the window) is still backwards on the live run. Restoring it makes the
+    /// resumed run drop the same frame. A node or topic the map does not name
+    /// is left alone, and a value only ever raises what
+    /// [`Self::restore_sync_input_timestamps`] seeded. Called before the first
+    /// [`Self::step`], like every other restore seam.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub fn restore_sync_capture_high_water(
+        &mut self,
+        per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    ) {
+        self.restore_capture_and_epoch_high_water(per_node);
+    }
+
+    /// Restore capture-time Sync nodes' epoch floors from a recording's
+    /// framework sections
+    /// ([`crate::state_restore::NodeFrameworkState::sync_epoch_floor`]),
+    /// keyed by node.
+    ///
+    /// A capture clock restart re-bases every other input and tests its next
+    /// frames against this floor. A run resumed before such an input lands a
+    /// frame within a window of the floor would otherwise accept the
+    /// old-epoch straggler the live run discards, and then lose the set the
+    /// live run fires. A node that is not capture-time is left alone: only
+    /// capture-time nodes state a floor. Called before the first
+    /// [`Self::step`], like every other restore seam.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub fn restore_sync_epoch_floor(&mut self, per_node: &std::collections::BTreeMap<String, u64>) {
+        for (node_id, floor) in per_node {
+            if self.sync_capture_ports.contains_key(node_id) {
+                self.scheduler.restore_sync_epoch_floor(node_id, *floor);
+            }
+        }
+    }
+
+    /// Raise each capture-time trigger input's capture high-water AND the
+    /// scheduler's wire-stamp epoch high-water for it to the recorded stamp.
+    ///
+    /// On a capture-time node the scheduler's epoch reset runs on capture
+    /// stamps, so its high-water is the same number as the capture layer's.
+    /// Restoring only the capture side would let the two disagree on a clock
+    /// restart right after the resume: the capture layer accepts the frame as
+    /// a new epoch, but the scheduler, with no high-water, fills it as an
+    /// ordinary head, keeps the held old-epoch partner the live run voided,
+    /// and discards the new frame as unmatchable.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    fn restore_capture_and_epoch_high_water(
+        &mut self,
+        per_node: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    ) {
+        for (node_id, (topics, states)) in &self.sync_capture_ports {
+            let Some(recorded) = per_node.get(node_id) else {
+                continue;
+            };
+            for (topic, state) in topics.iter().zip(states.iter()) {
+                if let (Some(ts), Some(state)) = (recorded.get(topic), state) {
+                    state.restore_high_water(*ts);
+                    self.scheduler
+                        .restore_sync_stamp_high_water(node_id, topic, *ts);
+                }
+            }
+        }
     }
 
     /// The nodes in `executed` that declare no restorable
@@ -17034,12 +17442,11 @@ fn panic_payload_msg(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a PANIC-CLASS tick failure into the node's shared record —
-/// FIRST reason wins (the later poisoned-dead failure collapses into the
-/// originating panic; one record per node).
-// hot-path-alloc-ok-fn: cold: renders a CAUGHT PANIC payload — the branch runs only when a node
-// callback unwound
-fn record_first_tick_panic(record: &Mutex<Option<String>>, reason: &str) {
+/// Record a node's PANIC-CLASS tick failure, or its FATAL error, into its
+/// shared record: FIRST reason wins (the later poisoned-dead failure collapses
+/// into the originating panic; one record per node).
+// hot-path-alloc-ok-fn: cold: runs only when a node callback unwound or returned a fatal error
+fn record_first_reason(record: &Mutex<Option<String>>, reason: &str) {
     if let Ok(mut slot) = record.lock() {
         if slot.is_none() {
             *slot = Some(reason.to_string());
@@ -19771,6 +20178,8 @@ mod tests {
             pending_data_count: 0,
             sync_input_timestamps: long_names,
             input_service: None,
+            sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         };
         let short_bytes = anchor_framing_bytes(std::slice::from_ref(&short));
         let wide_bytes = anchor_framing_bytes(std::slice::from_ref(&wide));

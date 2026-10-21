@@ -759,26 +759,34 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 6 by default, or 5 when it was recorded with
-`CERULION_READ_LOG_FOLD=off`.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 6; a
+`recorder.json` stamps 7.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 7; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Two encodings set the number. Every kind-6 record carries a
+in it. Three encodings set the number. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
-record, and reading that count is what `trace_format` 6 means. Folding is on by
-default, so a bag this binary writes is a format-6 bag whether it is lockstep
-or free-run; `CERULION_READ_LOG_FOLD=off` turns folding off, and a bag recorded
-that way stamps 5, so a bag never claims an encoding it did not use. A bag
+record, and reading that count is what `trace_format` 6 means. The recorder
+also writes a kind-6 record at every gated consult a replay of the bag also
+makes, an empty boundary drain's `none` record included, and reading a `drain`
+role on a `none` record as that empty consult is what `trace_format` 7 means.
+(The one empty consult it does not record is a burst's between-fires refill,
+whose empty answer ends a burst a replay does not re-derive.) Every bag this
+binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
+fold-off stream's run words are structurally zero, which a format-7 reader
+decodes as one occurrence each). A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
 
 Nothing REFUSES an older stamp. A format-5 bag replays with every record read
 as one occurrence (the run count's half of the word is structurally zero
-there). A format <= 4 bag replays with every
+there). A bag stamped below 7 replays with its recorder's SILENCE at an empty
+consult adopted: the replay stages no record there either, so the two logs hold
+the same positions, and a consult its read gate holds no position for is the
+reported `unplanned_consults` count rather than a divergence. A format <= 4 bag
+replays with every
 read-site rule on its pre-roles arm (the bits were never written, so
 `read_site_role` decodes `Unstamped` and the KIND is the site vocabulary). What
 the raised stamp costs is a bag this build writes being unreadable by a binary that

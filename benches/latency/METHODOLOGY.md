@@ -227,12 +227,18 @@ The workspace legs pace in TWO layers. The ping node's
 `#[cerulion_node(period_ms = N)]` attribute (sed-rewritten per size,
 `PERIOD_MS = 1000 / rate` integer division) is only the **tick
 source**; the **pacing authority is a wall-clock slot grid** inside the
-ping node (`CER_BENCH_TARGET_RATE_HZ`, ns-resolution, the same
-grid-slot semantics as the native `RateLimiter` and the ROS 2 timers:
-a tick before its slot publishes nothing, a late tick consumes exactly
-one slot and SKIPS missed slots rather than bursting, with the skip
-count printed as `slots_skipped=` on the ping's RTT_DELIVERY line and
-gated by the fixed100 sustain verdict at 1 % of the window's slots).
+ping node (`CER_BENCH_TARGET_RATE_HZ`, ns-resolution). The grid is
+anchored at the first tick and each tick is assigned to its NEAREST
+slot: a tick whose slot is already filled publishes nothing, and a tick
+that lands past the next slot publishes once and SKIPS the slots in
+between rather than bursting, so `slots_skipped` equals the slots
+through the last one filled, minus the publishes. The count is printed as `slots_skipped=`
+on the ping's RTT_DELIVERY line and gated by the fixed100 sustain
+verdict at 1 % of the window's slots. Nearest, not at-or-before:
+under fixed100 the tick source runs at the grid's own period, so a
+floor rule made the first tick's wake lateness the grid's phase and
+counted every later tick that woke earlier than it as a missed slot
+(the cells that fell to the 50 Hz rung on wake jitter alone).
 
 <!-- Benchmark provenance: the remeasured split rows came from 2026-08-14-fixed100. -->
 
@@ -1274,7 +1280,7 @@ ros/rmw/dds/iceoryx package versions to `_logs/<cell>_versions.txt`
 (`CER_BENCH_DUMP_VERSIONS=1`, set by `bench.py`), and the run manifest
 (`run.json`) records the docker image IDs, so which CycloneDDS /
 Fast DDS / rmw_zenoh was actually benched is recoverable from any
-committed run. The native zenoh crate is exact-pinned `=1.7.2` with
+committed run. The native zenoh crate is exact-pinned `=1.10.1` with
 the rationale in `native/Cargo.toml` and the README line inventory.
 Version anchors from the 2026-08-13 evidence snapshot (not a current-version claim): jazzy =
 Fast DDS 2.14.x / CycloneDDS 0.10.5 / rmw_zenoh 0.2.10; lyrical =

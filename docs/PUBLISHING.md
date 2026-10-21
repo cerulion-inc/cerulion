@@ -144,6 +144,12 @@ Run from the workspace root, in order:
       prerequisites are available.
 - [ ] Test fixtures (`crates/test_fixtures/*`) and `crates/cerulion_core/fuzz` all carry
       `publish = false`: they must never reach crates.io.
+- [ ] The shipped programs: every release archive, the Debian package and the
+      Homebrew formula carry `cerulion`, `cerulion-netd`, `cerulion-connectd`
+      and `cerulion-remoted`. `./tools/scripts/install.sh --self-test`,
+      `./tools/scripts/test_render_homebrew_formula.sh` and, on Linux,
+      `./tools/scripts/test_build_deb.sh` check the three lists; the install
+      smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
       access for all eighteen publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
@@ -301,7 +307,12 @@ build, on either archive shape.
 transaction against a hand-written rustup fixture, and CI runs it beside the
 installer self-test.
 
-After every binary is activated and verified, `install.sh` writes the PATH setup
+After every binary is activated and verified, `install.sh` links the
+programs (`cerulion`, `cerulion-netd`, `cerulion-connectd` and, when the
+archive carries it, `cerulion-remoted`) into `~/.local/bin` (and into `/usr/local/bin` when that directory is
+on the PATH, writable without sudo, reachable by every account from the install
+directory, and neither `~/.local/bin` nor another `cerulion` is on the PATH), never replacing
+a name that is not already its own link, then writes the PATH setup
 that makes the install one command: `<cerulion home>/env` and a fish twin, each
 prepending the install directory, and Cargo's `bin` when that run provisioned
 Rust, guarded so a second source adds nothing; then one marked, idempotent line
@@ -311,8 +322,19 @@ symlink out of the home directory is left alone. `--no-modify-path` and
 `CERULION_NO_MODIFY_PATH` skip the whole step, and so does an unset `HOME`; then
 the PATH to set by hand is printed instead. The step runs last and its failures
 are warnings, so a PATH that could not be written never fails an install whose
-binaries are already in place. The self-test covers the first write, the second
-run, both opt-outs, a symlinked profile, an unset `HOME` and fish.
+binaries are already in place. The last line printed says whether `cerulion`
+(and Cargo, when the archive set Rust up) already resolves on the PATH the
+installer inherited, and names `. <cerulion home>/env` when it does not.
+`--uninstall` removes the programs, the links that point at them and, when the
+env file names that install, the marked profile lines and then the env files;
+it refuses a directory without the marker and leaves the rest of the cerulion
+home alone.
+The self-test covers the first write, the second run, both opt-outs, a
+symlinked profile, an unset `HOME`, fish, a shell that already searches
+`~/.local/bin`, a foreign `cerulion` there, the system bin directory and its
+three guards, an archive without `cerulion-remoted` (no file and no link for
+it, a downgrade that removes both, a failed downgrade that restores the
+file, and an interrupted one that restores the file and the link), and `--uninstall` including a refused directory and a second copy.
 
 ## The Homebrew formula
 
@@ -352,7 +374,7 @@ with contents read and write and pull requests read and write. The job keeps
 the branch push and the pull request are the token's two jobs, and the tap's
 `main` keeps its protection.
 
-The rendered formula installs the three binaries, plus the ROS 2 Jazzy rmw and
+The rendered formula installs the four binaries, plus the ROS 2 Jazzy rmw and
 the heap hook on Linux, generates shell completions, and carries the release's
 own `install_rust.sh` and `rustc-version.txt` in `libexec` behind a
 `cerulion-install-rust` command. Homebrew runs installs with `HOME` pointing at

@@ -1417,7 +1417,7 @@ fn the_held_head_slot_debt_moves_the_mapped_page_both_ways_and_the_release_rings
     // A second frame leaves the queue for the staged slot — the deepest the
     // matcher ever holds.
     assert!(
-        sub.sync_peek_next_stamp_for_test()
+        sub.sync_peek_next_stamp_for_test(cerulion_core::SyncAlignSite::Boundary)
             .expect("the peek pops without error")
             .is_some(),
         "a queued frame is there to stage"
@@ -1432,7 +1432,7 @@ fn the_held_head_slot_debt_moves_the_mapped_page_both_ways_and_the_release_rings
     // debt falls and the word is DEBITED — and that direction must RING.
     let seq_before_release = peer.wake_seq_snapshot();
     assert!(
-        sub.sync_discard_head_for_test()
+        sub.sync_discard_head_for_test(cerulion_core::SyncAlignSite::Boundary)
             .expect("the advance never errors")
             .is_some(),
         "the staged frame becomes the new head"

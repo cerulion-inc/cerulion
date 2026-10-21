@@ -1193,7 +1193,8 @@ fn an_armed_epoch_stepped_past_or_dropped_unspent_warns_once_at_each_site() {
 /// through one of the two free-run ctors, optionally naming that topic as
 /// sibling-produced.
 fn build_watcher(prefix: &str, deterministic: bool, name_the_sibling: bool) {
-    let siblings = std::collections::BTreeSet::from([format!("/{prefix}/ext")]);
+    let siblings: cerulion_core::graph::SiblingProducedTopics =
+        [format!("/{prefix}/ext")].into_iter().collect();
     let mut wiring = CrossProcessWiring::requirements_only(None);
     if name_the_sibling {
         wiring = wiring.with_sibling_topics(&siblings);

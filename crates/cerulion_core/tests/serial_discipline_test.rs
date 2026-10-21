@@ -188,6 +188,16 @@ const FENCE_GROUP: &str = "default-namespace";
 /// directions — see the exclusions recorded in `.config/nextest.toml`.
 const FENCE_INVENTORY: &[(&str, &str)] = &[
     (
+        "accumulate_set_iox2_test",
+        "default-namespace manager: creates a publisher and subscriber on the shared root \
+         to drive the accumulate collect directly",
+    ),
+    (
+        "accumulate_zero_alloc_test",
+        "default-namespace manager: builds its graph with `GraphRuntime::build` on the shared \
+         root; also a process-global counting allocator",
+    ),
+    (
         "adaptive_sizing_iceoryx2_test",
         "default-namespace manager: probes pool sizing on the shared root",
     ),
@@ -481,7 +491,7 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "local_transport_test.rs",
         "loader_refuses_a_matching_local_transport_cdylib",
         "unix-by-hand",
-        "needs a fixture built WITH cerulion_core/local-transport (the CI lane builds it but does not run this arm)",
+        "needs a fixture built WITH cerulion_core/local-transport; the Local transport CI lane builds it and runs this arm with --ignored --exact",
     ),
     (
         "local_transport_test.rs",
@@ -514,10 +524,22 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; the parent reads the level this cdylib's own iceoryx2-log static reports",
     ),
     (
+        "open_file_limit_raise_test.rs",
+        "child_reports_its_open_file_limit_around_a_transport_build",
+        "child",
+        "self-re-exec entry point; the parent lowers the soft open-file limit before exec and reads the limits the child prints around its transport build",
+    ),
+    (
         "cdylib_iox2_log_level_test.rs",
         "subprocess_child_raw_ffi_level_probe",
         "child",
         "self-re-exec entry point for the raw-FFI half of the same contract",
+    ),
+    (
+        "cdylib_shm_fd_handoff_iox2_test.rs",
+        "subprocess_child_shm_fd_handoff",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` in a fresh process, since its descriptor table is the subject",
     ),
     (
         "cdylib_tracing_stopgap_test.rs",

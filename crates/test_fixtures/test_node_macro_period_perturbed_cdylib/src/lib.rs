@@ -6,7 +6,9 @@
 //!
 //! The node SHAPE is byte-for-byte identical to the original fixture: the same
 //! `#[cerulion_node(period_ms = 50)]` trigger, the same `PeriodNode` type name,
-//! the same single `cmd: Vector3` output port + schema. Only the tick's
+//! the same single `cmd: Vector3` output port + schema, and the same
+//! `request_shutdown` reconstruct field (a state field is part of the state
+//! shape hash, so the twin must carry it too). Only the tick's
 //! published payload constant differs (`cmd.x = 1000.0` vs the original's
 //! `0.0`). So a bag recorded with the ORIGINAL node replays byte-EXACT against
 //! the original candidate (exit 0) but diverges on the payload — never the
@@ -28,15 +30,26 @@ use native_ros2_messages::geometry_msgs::Vector3;
 struct PeriodNode {
     #[output]
     cmd: Vector3,
+    /// Mirrors the original fixture's field so the two state shapes match.
+    #[cerulion(reconstruct)]
+    request_shutdown: bool,
 }
 
 #[cerulion_node_impl]
 impl PeriodNode {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        self.request_shutdown = ctx.env_opt("CER_PERIOD_REQUEST_SHUTDOWN").is_some();
+        Ok(())
+    }
+
     fn tick(&mut self) -> Result<(), NodeError> {
         // The ONLY delta vs test_node_macro_period_cdylib (which writes 0.0):
         // a different published constant → different payload bytes, identical
         // fire schedule.
         self.cmd.x = 1000.0;
+        if self.request_shutdown {
+            self.request_shutdown();
+        }
         Ok(())
     }
 }

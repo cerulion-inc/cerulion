@@ -170,16 +170,24 @@ impl Host {
             // A stop accepted while the lifecycle was Starting must not be
             // dropped with the flag: consume `stop_requested` and land in the
             // stopped state, tearing down any surviving component first.
+            // As in the start worker, the flag read and the lifecycle write
+            // are one critical section, and a deferred stop holds the
+            // lifecycle at Stopping until its teardown finishes, so a
+            // concurrent retry cannot start a run this stop then tears down.
             let deferred = {
                 let mut lifecycle = lock_lifecycle(&self.lifecycle);
-                let deferred = matches!(
-                    *lifecycle,
+                match *lifecycle {
                     Lifecycle::Starting {
-                        stop_requested: true
+                        stop_requested: true,
+                    } => {
+                        *lifecycle = Lifecycle::Stopping;
+                        true
                     }
-                );
-                *lifecycle = Lifecycle::Idle;
-                deferred
+                    _ => {
+                        *lifecycle = Lifecycle::Idle;
+                        false
+                    }
+                }
             };
             if deferred
                 && matches!(
@@ -196,6 +204,9 @@ impl Host {
                     Ok(Err(error)) => set_status_error(&self.status, &error),
                     Err(payload) => set_panic_status_with(&self.status, &*payload),
                 }
+            }
+            if deferred {
+                *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             }
             return error.code();
         }
@@ -240,30 +251,55 @@ impl Host {
         codes::OK
     }
 
-    fn publish(&self, topic: &str, json: &str) -> i32 {
-        // The check and the runtime try_lock run under the lifecycle guard so
-        // a stop cannot be accepted in between; then the guard drops before
-        // the publish itself, so a Java stop() is never made to wait out a
-        // publish. Once this call holds the runtime lock, a stop accepted
-        // afterwards just waits on that lock in its worker: the publish is
-        // ordered before the stop and teardown cannot interleave.
-        let mut runtime = {
-            let lifecycle = match self.lifecycle.try_lock() {
-                Ok(lifecycle) => lifecycle,
-                Err(TryLockError::WouldBlock) => return codes::BUSY,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            };
-            if !matches!(*lifecycle, Lifecycle::Idle) {
-                return codes::BUSY;
-            }
-            match self.runtime.try_lock() {
-                Ok(runtime) => runtime,
-                Err(TryLockError::WouldBlock) => return codes::BUSY,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            }
+    /// Take the runtime lock for an app publish. The lifecycle check and the
+    /// runtime try_lock run under the lifecycle guard so a stop cannot be
+    /// accepted in between; then the guard drops before the publish itself,
+    /// so a Java stop() is never made to wait out a publish. Once the caller
+    /// holds the returned runtime lock, a stop accepted afterwards just waits
+    /// on that lock in its worker: the publish is ordered before the stop and
+    /// teardown cannot interleave.
+    fn publish_runtime(&self) -> Result<MutexGuard<'_, EmbeddedRuntime>, i32> {
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        if !matches!(*lifecycle, Lifecycle::Idle) {
+            return Err(codes::BUSY);
+        }
+        match self.runtime.try_lock() {
+            Ok(runtime) => Ok(runtime),
+            Err(TryLockError::WouldBlock) => Err(codes::BUSY),
+            Err(TryLockError::Poisoned(error)) => Ok(error.into_inner()),
+        }
+    }
+
+    /// Publish a message that `prepare` produces from the topic's JSON length
+    /// limit. The limit lookup, `prepare` and the publish all run under ONE
+    /// runtime lock, so the limit `prepare` checks against is the limit of
+    /// the run that publishes: a stop or restart cannot land between the
+    /// check and the publish. `prepare` runs only when the publish itself
+    /// could proceed (BUSY, BAD_STATE and the unknown-topic code are
+    /// returned first), and its `Err(code)` is returned as is.
+    fn publish_prepared(
+        &self,
+        topic: &str,
+        prepare: impl FnOnce(usize) -> Result<String, i32>,
+    ) -> i32 {
+        let mut runtime = match self.publish_runtime() {
+            Ok(runtime) => runtime,
+            Err(code) => return code,
+        };
+        let limit = match runtime.publish_json_limit(topic) {
+            Ok(limit) => limit,
+            Err(error) => return error.code(),
+        };
+        let json = match prepare(limit) {
+            Ok(json) => json,
+            Err(code) => return code,
         };
         runtime
-            .publish(topic, json)
+            .publish(topic, &json)
             .map(|_| codes::OK)
             .unwrap_or_else(|error| error.code())
     }
@@ -357,51 +393,17 @@ pub(crate) fn start(config_json: &str) -> i32 {
     )
 }
 
-/// The publish-JSON length limit for `topic`, for the JNI pre-conversion
-/// check. `Err(code)` when the publish itself would refuse with `code`
-/// The limit for the JNI pre-copy check is EXACTLY the publish's own
-/// verdict: BUSY while a lifecycle transition is in flight or the runtime
-/// lock is held, BAD_STATE on a non-running runtime, the unknown-topic code
-/// for an unknown topic, NOT_INITIALIZED before `init`, and the real limit
-/// only when the publish itself would proceed. JNI therefore never copies a
-/// JSON string it could not have published.
-pub(crate) fn publish_json_limit(topic: &str) -> Result<usize, i32> {
-    let host = match HOST.get() {
-        Some(host) => host,
-        // Publish would report NOT_INITIALIZED; so does this.
-        None => return Err(codes::NOT_INITIALIZED),
-    };
-    publish_json_limit_on(host, topic)
-}
-
-fn publish_json_limit_on(host: &Host, topic: &str) -> Result<usize, i32> {
-    let lifecycle = match host.lifecycle.try_lock() {
-        Ok(lifecycle) => lifecycle,
-        Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-    };
-    // A start/stop in flight is BUSY to the publish itself; report that
-    // refusal instead of answering a limit a stopped runtime would
-    // reject (or skipping the check and copying an unknown-topic call).
-    // The guard stays held through the runtime lookup: dropping it here
-    // would let a transition land between the check and the answer.
-    if !matches!(*lifecycle, Lifecycle::Idle) {
-        return Err(codes::BUSY);
-    }
-    let runtime = match host.runtime.try_lock() {
-        Ok(runtime) => runtime,
-        Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-    };
-    runtime
-        .publish_json_limit(topic)
-        .map_err(|error| error.code())
-}
-
-pub(crate) fn publish(topic: &str, json: &str) -> i32 {
+/// Publish the message `prepare` builds from the topic's JSON length limit,
+/// with the limit and the publish bound to the same runtime (see
+/// `Host::publish_prepared`). The JNI layer uses it to refuse an oversized
+/// Java string before copying it.
+pub(crate) fn publish_prepared(
+    topic: &str,
+    prepare: impl FnOnce(usize) -> Result<String, i32>,
+) -> i32 {
     guarded_code(
         || match HOST.get() {
-            Some(host) => host.publish(topic, json),
+            Some(host) => host.publish_prepared(topic, prepare),
             None => codes::NOT_INITIALIZED,
         },
         panic_code,
@@ -591,7 +593,7 @@ mod tests {
     fn publish_reports_busy_without_waiting() {
         let host = test_host();
         let _runtime = host.runtime.lock().expect("runtime lock");
-        assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+        assert_eq!(publish_on(&host, "/topic", "{}"), codes::BUSY);
     }
 
     #[test]
@@ -608,13 +610,19 @@ mod tests {
             Lifecycle::Stopping,
         ] {
             *lock_lifecycle(&host.lifecycle) = lifecycle;
-            assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+            assert_eq!(publish_on(&host, "/topic", "{}"), codes::BUSY);
         }
         *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
     }
 
+    /// A plain publish through the JNI entry point's path: the message
+    /// needs no length check.
+    fn publish_on(host: &Host, topic: &str, json: &str) -> i32 {
+        host.publish_prepared(topic, |_| Ok(json.to_string()))
+    }
+
     #[test]
-    fn publish_json_limit_preserves_the_non_running_error() {
+    fn publish_prepared_preserves_the_non_running_error() {
         // The JNI pre-check must surface the same refusal the publish would:
         // on a non-running runtime that is BAD_STATE, never ENCODE or an
         // OK that skips the check.
@@ -626,50 +634,49 @@ mod tests {
             .publish_json_limit("/topic")
             .expect_err("a stopped runtime refuses the limit");
         assert_eq!(error.code(), codes::BAD_STATE);
-        assert_eq!(host.publish("/topic", "{}"), codes::BAD_STATE);
+        assert_eq!(publish_on(&host, "/topic", "{}"), codes::BAD_STATE);
     }
 
     #[test]
-    fn publish_json_limit_reports_the_publish_codes() {
-        // NOT_INITIALIZED before init - the publish reports it too. (Only
-        // checked when no earlier test installed the singleton.)
+    fn publish_prepared_refuses_before_preparing_the_message() {
+        // NOT_INITIALIZED before init. (Only checked when no earlier test
+        // installed the singleton.)
         if HOST.get().is_none() {
             assert_eq!(
-                publish_json_limit("/topic"),
-                Err(codes::NOT_INITIALIZED),
+                publish_prepared("/topic", |_| unreachable!("no host")),
+                codes::NOT_INITIALIZED,
                 "uninitialized"
             );
         }
         let host = test_host();
+        let refuse = |_: usize| -> Result<String, i32> {
+            unreachable!("a refused publish must not prepare (copy) the message")
+        };
 
-        // BAD_STATE on a stopped runtime - same code as publish.
-        assert_eq!(
-            publish_json_limit_on(&host, "/topic"),
-            Err(codes::BAD_STATE)
-        );
+        // BAD_STATE on a stopped runtime.
+        assert_eq!(host.publish_prepared("/topic", refuse), codes::BAD_STATE);
 
         // BUSY while a lifecycle transition is in flight.
         *host.lifecycle.lock().expect("lifecycle") = Lifecycle::Starting {
             stop_requested: false,
         };
-        assert_eq!(publish_json_limit_on(&host, "/topic"), Err(codes::BUSY));
+        assert_eq!(host.publish_prepared("/topic", refuse), codes::BUSY);
         *host.lifecycle.lock().expect("lifecycle") = Lifecycle::Idle;
 
         // BUSY while a thread holds the runtime lock.
         {
             let _runtime = host.runtime.lock().expect("runtime lock");
-            assert_eq!(publish_json_limit_on(&host, "/topic"), Err(codes::BUSY));
+            assert_eq!(host.publish_prepared("/topic", refuse), codes::BUSY);
         }
 
-        // UNKNOWN_TOPIC on a running runtime - exactly what publish returns
-        // for a topic with no publisher.
+        // UNKNOWN_TOPIC on a running runtime for a topic with no publisher.
         host.runtime
             .lock()
             .expect("runtime lock")
             .mark_running_for_test();
         assert_eq!(
-            publish_json_limit_on(&host, "/missing"),
-            Err(codes::UNKNOWN_TOPIC),
+            host.publish_prepared("/missing", refuse),
+            codes::UNKNOWN_TOPIC,
             "unknown topic"
         );
     }
@@ -677,7 +684,7 @@ mod tests {
     #[test]
     fn publish_does_not_leak_the_lifecycle_guard() {
         let host = test_host();
-        let _code = host.publish("/topic", "{}");
+        let _code = publish_on(&host, "/topic", "{}");
         assert!(host.lifecycle.try_lock().is_ok());
     }
 
@@ -687,7 +694,7 @@ mod tests {
         *lock_lifecycle(&host.lifecycle) = Lifecycle::Starting {
             stop_requested: false,
         };
-        assert_eq!(host.publish("/topic", "{}"), codes::BUSY);
+        assert_eq!(publish_on(&host, "/topic", "{}"), codes::BUSY);
     }
 
     #[test]
@@ -781,6 +788,33 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+
+        // The JNI publish path: the limit check and the publish must see the
+        // same run, so no stop or restart may take the runtime while the
+        // message is prepared against the limit. Pinned as: the runtime lock
+        // is held inside `prepare`, which sees the active publisher's limit.
+        let mut seen_limit = None;
+        let code = host.publish_prepared("/host_test/heartbeat", |limit| {
+            assert!(
+                matches!(host.runtime.try_lock(), Err(TryLockError::WouldBlock)),
+                "the runtime must stay locked between the limit check and the publish"
+            );
+            seen_limit = Some(limit);
+            Ok(r#"{"data":"x"}"#.to_string())
+        });
+        assert_eq!(code, codes::OK);
+        assert!(seen_limit.is_some_and(|limit| limit > 0));
+        // An Err from `prepare` is returned as is, without publishing.
+        assert_eq!(
+            host.publish_prepared("/host_test/heartbeat", |_| Err(codes::ENCODE)),
+            codes::ENCODE
+        );
+        assert_eq!(
+            lock_status(&host.status)
+                .published
+                .get("/host_test/heartbeat"),
+            Some(&1)
+        );
         assert_eq!(host.stop(), codes::OK);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
