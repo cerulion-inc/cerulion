@@ -5494,7 +5494,10 @@ impl NetworkManager {
     /// `set_lan_access` immediately before the announce gate's write lock is
     /// taken. Test-only.
     #[doc(hidden)]
-    pub fn set_before_announce_gate_write_for_test(&self, hook: Option<TestHook>) {
+    pub fn set_before_announce_gate_write_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
         *self
             .before_announce_gate_write
             .lock()
@@ -5505,7 +5508,7 @@ impl NetworkManager {
     /// retains its token, while the announce gate's read guard is still held.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
-    pub fn set_after_announce_insert_for_test(&self, hook: Option<TestHook>) {
+    pub fn set_after_announce_insert_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self
             .after_announce_insert
             .lock()
