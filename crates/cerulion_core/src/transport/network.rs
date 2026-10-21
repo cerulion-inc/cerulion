@@ -1702,7 +1702,9 @@ fn log_lan_refusal(
 ) -> RegimeDecision {
     let decision = authorizer
         .lan_refusal_latches()
-        .map_or(RegimeDecision::Loud, |latches| latches.on_refusal(request));
+        .map_or(RegimeDecision::Loud, |latches| {
+            latches.on_refusal(request, resource)
+        });
     match decision {
         RegimeDecision::Loud => tracing::warn!(
             request,
@@ -1711,7 +1713,7 @@ fn log_lan_refusal(
             reason = %reason,
             "LAN request REFUSED by the demand-authorization gate: the demanding party is \
              not authorized for this machine (account/pairing grant); serving nothing. \
-             Repeated refusals are counted, not logged, until a request is authorized"
+             Repeated refusals are counted, not logged, until the refused resource is authorized"
         ),
         RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
             request,
@@ -1733,15 +1735,18 @@ fn log_lan_refusal(
     decision
 }
 
-/// Record a LAN `request` the gate authorized: closes an open refusal
-/// regime of that kind, logging one recovery line when it counted repeats.
-fn note_lan_authorized(authorizer: &dyn DemandAuthorizer, request: &'static str) {
+/// Record a LAN `request` for `resource` the gate authorized: closes an
+/// open refusal regime of that kind when its latest refusal named the same
+/// resource, logging one recovery line when it counted repeats. An
+/// authorization for another resource leaves that regime open.
+fn note_lan_authorized(authorizer: &dyn DemandAuthorizer, request: &'static str, resource: &str) {
     if let Some(suppressed) = authorizer
         .lan_refusal_latches()
-        .and_then(|latches| latches.on_authorized(request))
+        .and_then(|latches| latches.on_authorized(request, resource))
     {
         tracing::info!(
             request,
+            resource = %resource,
             suppressed,
             "LAN requests are authorized again after refused requests"
         );
@@ -1772,7 +1777,7 @@ fn catalog_serve_decision(
         log_lan_refusal(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE, &reason);
         return cerulion_q::CatalogReply::refused(robot, reason);
     }
-    note_lan_authorized(authorizer, "catalog GET");
+    note_lan_authorized(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE);
     build_catalog_reply_from_bridge(bridge_mgr, catalog, robot)
 }
 
@@ -1834,7 +1839,7 @@ fn schema_serve_decision(
         log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
     }
-    note_lan_authorized(authorizer, "schema GET");
+    note_lan_authorized(authorizer, "schema GET", requested);
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
     // so a schema GET never mixes the old and new maps mid-closure.
     let _snapshot_guard = schema
@@ -1932,7 +1937,7 @@ fn runs_serve_decision(
         log_lan_refusal(authorizer, "runs GET", RUNS_QUERY_RESOURCE, &reason);
         return cerulion_q::RunsReply::refused(robot, reason);
     }
-    note_lan_authorized(authorizer, "runs GET");
+    note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
     let gather = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
         Ok(gather) => gather,
         Err(e) => {
@@ -2249,7 +2254,7 @@ fn demand_grant_decision(
         get_state.record_refusal();
         return ACK_REFUSED;
     }
-    note_lan_authorized(authorizer, "demand");
+    note_lan_authorized(authorizer, "demand", canonical);
     // Permissive SHM probe FIRST - OUTSIDE the `last_get` critical
     // section (the SHM open + zenoh announce must not extend the FINDING-1 lock
     // scope). A demand for an UNregistered topic under AllowAll egress that is LIVE
@@ -2344,7 +2349,7 @@ fn apply_live_put_demand(
         log_lan_refusal(authorizer, "liveliness demand", topic, &reason);
         return Ok(false);
     }
-    note_lan_authorized(authorizer, "liveliness demand");
+    note_lan_authorized(authorizer, "liveliness demand", topic);
     // Same permissive SHM probe as the queryable path - a live unregistered
     // AllowAll topic is registered + announced here so the enable below flips its
     // (now-existing) egress flag. Self-gating (see `PermissiveShmProbe::try_serve`).
@@ -6421,12 +6426,55 @@ mod tests {
             log_lan_refusal(&paired, "schema GET", "std_msgs/String", "paired"),
             RegimeDecision::Loud
         );
-        assert_eq!(latches.on_authorized("catalog GET"), Some(8));
+        assert_eq!(latches.on_authorized("catalog GET", "catalog"), Some(8));
         // An authorizer without latches logs every refusal loudly.
         assert_eq!(
             log_lan_refusal(&AllowAllAuthorizer, "demand", "/t", "denied"),
             RegimeDecision::Loud
         );
+    }
+
+    /// Under an open posture a topic-selective inner authorizer denies one
+    /// topic and allows another. An authorized demand for the allowed topic
+    /// must not close the denied topic's regime: the next refusal stays a
+    /// counted repeat and no recovery is reported. Only an authorized
+    /// demand for the refused topic closes it. Hand oracle: refuse /denied
+    /// (Loud), allow /allowed (None), refuse /denied (Suppressed 1), allow
+    /// /denied (Some(1)), refuse /denied (Loud again).
+    #[test]
+    fn an_authorized_other_topic_does_not_close_a_denied_topics_refusal_regime() {
+        struct DenyOne;
+        impl DemandAuthorizer for DenyOne {
+            fn authorize_demand(&self, _subject: &DemandSubject, topic: &str) -> DemandDecision {
+                if topic == "/denied" {
+                    DemandDecision::deny("not granted")
+                } else {
+                    DemandDecision::Allow
+                }
+            }
+        }
+        let open = LanAccessAuthorizer::new(LanAccess::Open, Arc::new(DenyOne));
+        let lan = DemandSubject::Lan { locator: None };
+        assert!(!open.authorize_demand(&lan, "/denied").is_allowed());
+        assert!(open.authorize_demand(&lan, "/allowed").is_allowed());
+        let latches = open.lan_refusal_latches().expect("open keeps latches");
+
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.on_authorized("demand", "/allowed"), None);
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latches.on_authorized("demand", "/allowed"), None);
+        assert_eq!(latches.on_authorized("demand", "/denied"), Some(1));
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.total_refusals("demand"), 3);
     }
 
     #[test]

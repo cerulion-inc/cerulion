@@ -170,32 +170,59 @@ pub trait DemandAuthorizer: Send + Sync {
 /// per kind of LAN request ("demand", "catalog GET", ...), so repeated
 /// refusals of one kind log one loud line while a first refusal of another
 /// kind is still loud.
+///
+/// Each kind also remembers the resource its latest refusal named. Only an
+/// authorized request for THAT resource closes the regime: an inner
+/// authorizer may deny one topic and allow another, and an allowed topic
+/// must not re-arm the loud path for the denied one or log a false
+/// recovery. The state stays bounded: one latch and one resource name per
+/// request kind, never one per topic.
 #[derive(Debug, Default)]
 pub struct LanRefusalLatches {
-    latches: std::sync::Mutex<
-        std::collections::BTreeMap<&'static str, super::failure_regime_latch::FailureRegimeLatch>,
-    >,
+    latches: std::sync::Mutex<std::collections::BTreeMap<&'static str, RefusalRegime>>,
+}
+
+/// One request kind's refusal latch and the resource its latest refusal
+/// named.
+#[derive(Debug, Default)]
+struct RefusalRegime {
+    latch: super::failure_regime_latch::FailureRegimeLatch,
+    refused_resource: String,
 }
 
 impl LanRefusalLatches {
-    /// Record one refused `request` and return how to log it.
-    pub fn on_refusal(&self, request: &'static str) -> super::failure_regime_latch::RegimeDecision {
-        self.latches
+    /// Record one refused `request` for `resource` and return how to log it.
+    pub fn on_refusal(
+        &self,
+        request: &'static str,
+        resource: &str,
+    ) -> super::failure_regime_latch::RegimeDecision {
+        let mut latches = self
+            .latches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(request)
-            .or_default()
-            .on_failure()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let regime = latches.entry(request).or_default();
+        if regime.refused_resource != resource {
+            regime.refused_resource.clear();
+            // hot-path-alloc-ok: a refused LAN request is a control-plane
+            // reply, never the per-frame publish/receive path.
+            regime.refused_resource.push_str(resource);
+        }
+        regime.latch.on_failure()
     }
 
-    /// Record one authorized `request`. Returns `Some(suppressed)` when it
-    /// closed a refusal regime that counted repeats (log recovery once).
-    pub fn on_authorized(&self, request: &'static str) -> Option<u64> {
+    /// Record one authorized `request` for `resource`. It closes the
+    /// regime only when `resource` is the one the latest refusal named, and
+    /// returns `Some(suppressed)` when that closed regime counted repeats
+    /// (log recovery once). An authorization for any other resource leaves
+    /// the regime open and returns `None`.
+    pub fn on_authorized(&self, request: &'static str, resource: &str) -> Option<u64> {
         self.latches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(request)
-            .and_then(super::failure_regime_latch::FailureRegimeLatch::on_success)
+            .filter(|regime| regime.refused_resource == resource)
+            .and_then(|regime| regime.latch.on_success())
     }
 
     /// Every refusal of `request` recorded so far.
@@ -204,10 +231,7 @@ impl LanRefusalLatches {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(request)
-            .map_or(
-                0,
-                super::failure_regime_latch::FailureRegimeLatch::total_failures,
-            )
+            .map_or(0, |regime| regime.latch.total_failures())
     }
 }
 
