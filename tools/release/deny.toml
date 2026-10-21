@@ -353,7 +353,11 @@ unknown-git = "deny"
 # The fork applies the socket permission with chmod after the bind instead. The
 # whole family is pinned to the one revision, because patching a single member
 # leaves the fork's copy of the shared containers beside the published one.
-# PRUNE this the moment an iceoryx2 release carries the fix.
+# The same revision makes the macOS shared-memory descriptor table recover when
+# a descriptor is closed through another linked copy of iceoryx2 (a node cdylib
+# dropping host-built ports), which 0.10.0 answers with ENFILE on the next
+# `shm_open` of that number.
+# PRUNE this the moment an iceoryx2 release carries BOTH fixes.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",

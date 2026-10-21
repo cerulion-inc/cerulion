@@ -423,10 +423,6 @@ const NOT_AN_INVOCATION: &[(&str, &str)] = &[
         "a sentence inside a multi-line message string",
     ),
     (
-        "tools/scripts/build_deb.sh",
-        "a sentence inside the package description text",
-    ),
-    (
         "tools/scripts/check_public_surface.py",
         "the public-surface gate's own fixture page, which exists to be scanned",
     ),

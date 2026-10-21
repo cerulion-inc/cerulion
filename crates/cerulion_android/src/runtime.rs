@@ -16,7 +16,7 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
 };
 use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
 use cerulion_core::transport::{
@@ -871,7 +871,7 @@ impl EmbeddedRuntime {
             // failed start must not leave the query surface cataloging this
             // run's topics.
             if let Some((prior, live)) = prior_serving {
-                live.restore_snapshot(prior);
+                live.restore(prior);
             } else if first_surface {
                 // The surface this start created survives the failure (the
                 // declaration latch keeps it). Roll it back to serving
@@ -881,7 +881,7 @@ impl EmbeddedRuntime {
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
                 {
-                    live.restore_snapshot((SchemaServing::default(), Some(HashSet::new())));
+                    live.serve_nothing();
                 }
             }
             // Roll the posture back too: `set_lan_access` ran before the

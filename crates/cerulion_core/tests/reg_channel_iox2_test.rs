@@ -1999,3 +1999,52 @@ fn a_leaked_singleton_manager_leaves_its_slot_stale_past_process_exit() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A gateway rebuilt on a manager whose query surface an EARLIER gateway
+/// latched records runtime hashes into the map that latched catalog reads:
+/// the surface outlives the first gateway, so a fresh per-construction map
+/// would leave restarted runtime topics cataloguing a stale or missing
+/// `schema_hash`. Hand oracle.
+#[test]
+fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_restart_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rctest".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root.clone(),
+    )
+    .expect("init gateway manager");
+    let plan = || GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let first = GatewayRuntime::new(Arc::clone(&manager), plan()).expect("first gateway boot");
+    let latched = manager
+        .network()
+        .and_then(|network| network.query_surface_serving_handles())
+        .expect("the first gateway latches the query surface");
+    drop(first);
+
+    let mut restarted =
+        GatewayRuntime::new(Arc::clone(&manager), plan()).expect("restarted gateway boot");
+    let worker = worker_manager("restart", &root);
+    let topic = format!("/rt/restart/{}", unique_id());
+    worker
+        .register_dynamic_egress_topic(&topic, 0xE1)
+        .expect("register");
+    settle(&worker, &mut restarted, 3);
+
+    assert_eq!(restarted.runtime_topic_schema_hash(&topic), Some(0xE1));
+    assert_eq!(
+        latched.runtime_hash_for_test(&topic),
+        Some(0xE1),
+        "the latched catalog must see the restarted gateway's hash"
+    );
+}
