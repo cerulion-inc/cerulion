@@ -155,11 +155,14 @@ The rules:
   The jump limit is `TfBufferConfig::jump_limit`, 60 s by default, or the
   window when that is longer. It is apart from the window, so an edge that
   publishes less often than its window still updates, each sample replacing
-  the last. The next insert confirms the jump when its stamp is later than
-  the refused one and within the jump limit of it, so a publisher that paused
-  for longer than that and resumes loses one sample, and a lone far-future
-  stamp changes nothing. `Duration::MAX` turns the check off. Both refusals come
-  back every time and count in the edge's `window_refusals` and
+  the last, as long as each gap is within the jump limit. The next insert
+  confirms a refused jump when its stamp is later than the refused one and
+  within the jump limit of it, so a publisher that paused for longer than
+  that and resumes loses one sample, and a lone far-future stamp changes
+  nothing. An edge whose every gap is longer than the jump limit never
+  updates: each sample is refused and no later one confirms it, so raise
+  `jump_limit` to at least the longest gap for such an edge. `Duration::MAX`
+  turns the check off. Both refusals come back every time and count in the edge's `window_refusals` and
   `jump_refusals`, read through `edge()`, so a stuck edge is observable. A
   sample at a stamp the ring already holds is a
   no-op when the transform is the same and replaces it when it differs

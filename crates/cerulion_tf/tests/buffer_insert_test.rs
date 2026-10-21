@@ -1089,6 +1089,33 @@ fn an_edge_slower_than_its_window_keeps_updating() {
 }
 
 #[test]
+fn an_edge_whose_every_gap_exceeds_the_jump_limit_never_updates() {
+    // A 1000 ns window, a 10 000 ns jump limit and a steady 15 000 ns gap:
+    // each stamp is past the limit from the newest sample, and each next
+    // stamp is 15 000 ns past the refused one, so none confirms the jump.
+    let mut b = jumpy(1_000, 10_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    for stamp in [15_100, 30_100, 45_100, 60_100] {
+        assert!(matches!(
+            b.insert(W, "odom", "base", stamp, tf(2.0)),
+            Err(TfError::StampTooFarAhead { newest_ns: 100, .. })
+        ));
+    }
+    let e = edge(&b, "base");
+    assert_eq!((e.samples, e.newest_ns, e.jump_refusals), (1, Some(100), 4));
+    // Raising the jump limit above the gap lets the same feed update.
+    let mut b = jumpy(1_000, 15_000);
+    for (stamp, x) in [(100, 1.0), (15_100, 2.0), (30_100, 3.0)] {
+        b.insert(W, "odom", "base", stamp, tf(x)).unwrap();
+    }
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.newest_ns, e.jump_refusals),
+        (1, Some(30_100), 0)
+    );
+}
+
+#[test]
 fn the_jump_limit_and_not_the_window_bounds_a_forward_stamp() {
     // A 1000 ns window and a 10 000 ns jump limit.
     let mut b = jumpy(1_000, 10_000);

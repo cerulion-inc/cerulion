@@ -62,9 +62,11 @@ pub struct TfBufferConfig {
     /// How far past an edge's newest stamp a dynamic insert may land without
     /// a second stamp to confirm it; the buffer uses the larger of this and
     /// [`Self::retention`]. It is apart from the retention so that an edge
-    /// that publishes less often than its window keeps updating; a stamp
-    /// past it is refused with [`TfError::StampTooFarAhead`] until the next
-    /// insert confirms the jump. `Duration::MAX` turns the check off.
+    /// that publishes less often than its window keeps updating while each
+    /// gap is within it; a stamp past it is refused with
+    /// [`TfError::StampTooFarAhead`] until a later insert within the limit
+    /// of the refused stamp confirms the jump. Set it to at least the longest
+    /// gap an edge publishes with, or `Duration::MAX` to turn the check off.
     pub jump_limit: Duration,
 }
 
@@ -232,7 +234,10 @@ pub struct EdgeInfo<'a> {
 /// inserts that agree on the new time are a clock that moved forward (a
 /// publisher that paused), and the edge moves to it. The jump limit is apart
 /// from the retention, so an edge that publishes less often than its window
-/// keeps updating, each sample replacing the last. Both
+/// keeps updating, each sample replacing the last, as long as each gap is
+/// within the jump limit. An edge whose every gap is longer than the jump
+/// limit never updates, since no later sample confirms a refused one; raise
+/// [`TfBufferConfig::jump_limit`] to at least its longest gap. Both
 /// refusals return their error every time and count on the edge
 /// ([`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]).
 ///
