@@ -4177,7 +4177,7 @@ pub fn topic_echo_with_scope(
     let mut consecutive_wait_errors: u32 = 0;
 
     // A REMOTE topic already carries the walker seeded during the
-    // ingress resolve — reuse it (no second discovery). A LOCAL topic in automatic
+    // ingress resolve, reuse it (no second discovery). A LOCAL topic in automatic
     // scope gets a ONE-TIME best-effort remote resolve as the FALLBACK for a frame
     // carrying a type the desk never compiled (learn the type from a robot's
     // catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk writes).
@@ -4185,7 +4185,7 @@ pub fn topic_echo_with_scope(
     // cannot name, the same lazy rung `topic info` uses, never before the loop:
     // the resolve can take seconds (a netd round trip, or the discovery ladder
     // when netd is unreachable), and frames the desk can decode are displayed
-    // without waiting for it. A failed resolve is a `None` walker — the local
+    // without waiting for it. A failed resolve is a `None` walker, the local
     // path is unchanged.
     //
     // WHERE this observer's frames are supposed to come from, captured
