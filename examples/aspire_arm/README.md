@@ -25,21 +25,29 @@ arm_sim node ──► /rcp/results  (the answer to each call)
   exist. Arguments are checked against each tool's schema before anything is
   published, and each call writes a hash-chained receipt to disk before it
   reaches the graph.
-- **[ASPIRE](https://github.com/NVlabs/ASPIRE)**'s `cerulion` embodiment is the
-  agent side. Its `EnvironmentAdapter` spawns `cerulion-rcpd --stdio` and turns
-  each control period into one `arm.step` call.
+- **The agent side** is a program you supply that speaks MCP to
+  `cerulion-rcpd --stdio` and turns each control period into one `arm.step`
+  call. `run_demo.sh` is written for a `cerulion` embodiment of
+  [ASPIRE](https://github.com/NVlabs/ASPIRE) (an `EnvironmentAdapter` plus an
+  `examples/cerulion/pick_cube.py` skill program). That embodiment is not yet
+  published, and upstream ASPIRE does not ship it.
 
 ## Run it
 
-You need `cerulion` and `cerulion-rcpd` on PATH, and an ASPIRE checkout with the
-`cerulion` embodiment installed in a Python 3.12 environment:
+What runs from this repository alone: the plant tests
+(`cargo test -p arm_sim --lib` in this directory), and the by-hand graph
+run plus `bag play` below with any MCP client of your own in terminal 2.
+
+`run_demo.sh` needs `cerulion` and `cerulion-rcpd` on PATH, and an ASPIRE
+checkout with the unpublished `cerulion` embodiment installed in a Python 3.12
+environment; without it the script exits 2:
 
 ```bash
 ASPIRE_DIR=~/src/ASPIRE ASPIRE_PYTHON=~/src/ASPIRE/.venv/bin/python ./run_demo.sh
 ```
 
 `run_demo.sh` builds `arm_sim`, starts `cerulion graph run aspire_arm --record`,
-runs ASPIRE's `examples/cerulion/pick_cube.py`, stops the graph, checks the
+runs the embodiment's `examples/cerulion/pick_cube.py`, stops the graph, checks the
 receipt chain with `cerulion-rcpd --verify-receipts`, and replays the bag:
 
 ```bash
@@ -52,7 +60,7 @@ cerulion bag play runs/<ts>/recordings/aspire_arm_<ts>.mcap --resim all --verify
 cerulion node build arm_sim --release
 cerulion graph validate aspire_arm
 cerulion graph run aspire_arm --release --record      # terminal 1; Ctrl+C stops it
-# terminal 2, from the ASPIRE checkout:
+# terminal 2: your MCP client, or, from an ASPIRE checkout with the cerulion embodiment:
 python -m cap_harness.cli run --benchmark cerulion --suite cerulion --task-id 0 \
   --program examples/cerulion/pick_cube.py \
   --rcpd-manifest <this directory>/rcp.yaml --rcpd-receipts /tmp/rcp/receipts.jsonl \
@@ -62,7 +70,7 @@ cerulion-rcpd --verify-receipts /tmp/rcp/receipts.jsonl
 cerulion bag play recordings/aspire_arm_<ts>.mcap --resim all --verify
 ```
 
-Start the ASPIRE program only after the recording has opened (the run prints
+Start the agent program only after the recording has opened (the run prints
 the bag path); a call published before that is not in the bag.
 
 The replay re-injects the recorded `/rcp/calls` frames into a fresh `arm_sim`

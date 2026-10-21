@@ -11,7 +11,10 @@
 #      nor cerulion-rcpd nor any model running.
 #
 # Needs `cerulion` and `cerulion-rcpd` on PATH, and an ASPIRE checkout that has
-# the `cerulion` embodiment installed into ASPIRE_PYTHON's environment.
+# the `cerulion` embodiment installed into ASPIRE_PYTHON's environment. That
+# embodiment is not yet published and upstream ASPIRE does not ship it; without
+# it this script exits 2. README.md gives the path that runs from this
+# repository alone.
 #
 #   ASPIRE_DIR=~/src/ASPIRE ASPIRE_PYTHON=~/src/ASPIRE/.venv/bin/python ./run_demo.sh
 #
@@ -39,7 +42,7 @@ case "$ASPIRE_PYTHON" in
   */*) ASPIRE_PYTHON="$(cd "$(dirname "$ASPIRE_PYTHON")" && pwd)/$(basename "$ASPIRE_PYTHON")" ;;
 esac
 "$ASPIRE_PYTHON" -c 'import cap_harness.cerulion' 2>/dev/null \
-  || die 2 "$ASPIRE_PYTHON cannot import cap_harness.cerulion"
+  || die 2 "$ASPIRE_PYTHON cannot import cap_harness.cerulion (the cerulion embodiment is not in upstream ASPIRE; see README.md)"
 SEED="${SEED:-0}"
 PROGRAM="${PROGRAM:-examples/cerulion/pick_cube.py}"
 OUT="${OUT:-$WS/runs/$(date -u +%Y%m%dT%H%M%SZ)}"

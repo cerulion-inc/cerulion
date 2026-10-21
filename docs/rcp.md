@@ -7,9 +7,10 @@ log, a mutating call before it reaches the robot. Every call that passes the
 checks is published into the graph as a frame on a topic, so a recorded run
 holds every call that reached the robot; refused calls are in the receipt log
 only.
-[`examples/aspire_arm`](../examples/aspire_arm/README.md) runs an
-[ASPIRE](https://github.com/NVlabs/ASPIRE) skill program against a simulated arm
-this way and replays the recording with no agent.
+[`examples/aspire_arm`](../examples/aspire_arm/README.md) is a simulated arm an
+agent drives this way, with a recording that replays with no agent. Its demo
+script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
+not yet published; the plant and the replay run from this repository alone.
 
 ## Run it
 
