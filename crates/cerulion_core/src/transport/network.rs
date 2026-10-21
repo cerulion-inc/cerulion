@@ -6334,6 +6334,63 @@ mod tests {
         );
     }
 
+    /// The catalog lists the bridge registry, not the served set: a
+    /// schema-less topic registered before a later merge that names an
+    /// explicit `served_topics` list stays listed (as `Runtime`, unnamed).
+    /// Hand oracle: `/schemaless/a` registered first, then an explicit merge
+    /// serving only `/explicit/b`.
+    #[test]
+    fn a_schema_less_topic_registered_earlier_stays_listed_after_an_explicit_merge() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        let bridge = TopicBridgeManager::new();
+        bridge
+            .register_topic("/schemaless/a")
+            .expect("register a schema-less topic");
+        let catalog = CatalogSource {
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            producer_probe: None,
+            liveness: None,
+            liveness_clock: None,
+            snapshot_lock: Arc::new(Mutex::new(())),
+        };
+        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&catalog.snapshot_lock),
+            Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
+        );
+        handles.merge(&crate::transport::gateway::SchemaServing {
+            topic_schemas: vec![crate::transport::gateway::TopicSchema {
+                topic: "/explicit/b".to_string(),
+                schema_name: "std_msgs/String".to_string(),
+            }],
+            served_topics: vec!["/explicit/b".to_string()],
+            ..Default::default()
+        });
+        bridge.register_topic("/explicit/b").expect("register b");
+
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
+        let listed: Vec<(&str, Option<&str>)> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.schema_name.as_deref()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("/explicit/b", Some("std_msgs/String")),
+                ("/schemaless/a", None)
+            ]
+        );
+    }
+
     /// A paired machine refuses every LAN request: N refusals of one kind
     /// log ONE loud warn and count every refusal, the decade re-announces,
     /// a first refusal of another kind is loud again, and an authorized
