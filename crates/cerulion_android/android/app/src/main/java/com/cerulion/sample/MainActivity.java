@@ -177,6 +177,12 @@ public final class MainActivity extends Activity {
                         .put("topic", "/app/heartbeat")
                         .put("schema", "std_msgs/String")));
         File graph = new File(getFilesDir(), "graph.yaml");
+        // An absent graph.yaml means a publisher-only run; a path that exists
+        // but is not a regular file is a broken setup, so fail loudly instead
+        // of silently running without the intended graph.
+        if (graph.exists() && !graph.isFile()) {
+            throw new IOException(graph + " exists but is not a regular file");
+        }
         if (graph.isFile()) {
             config.put(
                     "graph_yaml",

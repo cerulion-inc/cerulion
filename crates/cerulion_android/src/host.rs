@@ -170,16 +170,24 @@ impl Host {
             // A stop accepted while the lifecycle was Starting must not be
             // dropped with the flag: consume `stop_requested` and land in the
             // stopped state, tearing down any surviving component first.
+            // As in the start worker, the flag read and the lifecycle write
+            // are one critical section, and a deferred stop holds the
+            // lifecycle at Stopping until its teardown finishes, so a
+            // concurrent retry cannot start a run this stop then tears down.
             let deferred = {
                 let mut lifecycle = lock_lifecycle(&self.lifecycle);
-                let deferred = matches!(
-                    *lifecycle,
+                match *lifecycle {
                     Lifecycle::Starting {
-                        stop_requested: true
+                        stop_requested: true,
+                    } => {
+                        *lifecycle = Lifecycle::Stopping;
+                        true
                     }
-                );
-                *lifecycle = Lifecycle::Idle;
-                deferred
+                    _ => {
+                        *lifecycle = Lifecycle::Idle;
+                        false
+                    }
+                }
             };
             if deferred
                 && matches!(
@@ -196,6 +204,9 @@ impl Host {
                     Ok(Err(error)) => set_status_error(&self.status, &error),
                     Err(payload) => set_panic_status_with(&self.status, &*payload),
                 }
+            }
+            if deferred {
+                *lock_lifecycle(&self.lifecycle) = Lifecycle::Idle;
             }
             return error.code();
         }

@@ -543,15 +543,24 @@ impl EmbeddedRuntime {
                 // gateway: install the new snapshot BEFORE construction
                 // registers topics and exposes the restarted gateway, or the
                 // latched callback keeps filtering through the prior snapshot.
-                if let Some(live) = manager
+                // Keep the replaced state: if construction fails, put it back,
+                // or the latched surface would describe a run that never
+                // started.
+                let replaced = manager
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
-                {
-                    live.replace(&serving_clone);
-                }
+                    .map(|live| {
+                        let prior = live.replace(&serving_clone);
+                        (live, prior)
+                    });
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
-                        .map_err(|error| EmbedError::Network(error.to_string()))?;
+                        .map_err(|error| {
+                            if let Some((live, prior)) = replaced {
+                                live.restore(prior);
+                            }
+                            EmbedError::Network(error.to_string())
+                        })?;
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let status = Arc::clone(&self.status);

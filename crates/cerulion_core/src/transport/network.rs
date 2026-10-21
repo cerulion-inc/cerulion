@@ -4421,6 +4421,7 @@ impl NetworkManager {
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.snapshot_topics),
+            Arc::clone(&catalog.hashes),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5344,6 +5345,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             snapshot_topics,
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         let serving = |topic: &str| crate::transport::gateway::SchemaServing {
@@ -5409,6 +5411,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             snapshot_topics,
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         let serving = crate::transport::gateway::SchemaServing {
