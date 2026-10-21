@@ -543,9 +543,8 @@ fn apply_demand_reconcile(
 
 /// The belt feed: refresh `topics` (the reconciler belt's
 /// live iteration set) from the bridge manager's registered-topic snapshot (THE
-/// source of truth for which topics may egress), using the SAME monotonic-count
-/// dirty-check discipline [`crate::transport::gateway::GatewayRuntime::drive_once`]
-/// uses.
+/// source of truth for which topics may egress), re-snapshotting only when the
+/// registered membership changed (see the cost discipline below).
 ///
 /// # Why the belt needs this
 ///
@@ -561,15 +560,16 @@ fn apply_demand_reconcile(
 ///
 /// # Cost discipline
 ///
-/// The bridge `bridges` map is ADD-ONLY (`register_topic` inserts; nothing
-/// removes a key), so `registered_topic_count()` is MONOTONIC and a bare count
-/// read (one uncontended mutex lock, no alloc) is a reliable "a new egress topic
-/// registered" dirty-check. The per-pass steady-state cost is exactly that one
-/// count read; only a GROWN count takes the full (locked, allocating) snapshot +
-/// rebuilds `topics`. The seed at thread spawn IS the boot announce set (whose
-/// length equals the registered count at boot - both derived from the same
-/// snapshot), so the dirty-check is stable from the first pass and never
-/// re-snapshots spuriously.
+/// The per-pass steady-state cost is one
+/// [`TopicBridgeManager::registered_set_is`] check (one mutex lock and one
+/// hash lookup per topic, no allocation). Only a CHANGED membership takes the
+/// full (locked, allocating) snapshot and rebuilds `topics`. A count check
+/// alone is not enough: a host that restarts its gateway inside one process
+/// (`TopicBridgeManager::unregister_topics_except`) can drop `/a` and then
+/// register `/b`, and this thread outlives that gateway, so a same-count swap
+/// must re-snapshot too. The seed at thread spawn IS the boot announce set
+/// (canonical, deduplicated), so the check is stable from the first pass and
+/// never re-snapshots spuriously.
 ///
 /// Robust: a poisoned bridge mutex leaves `topics` UNCHANGED (the belt keeps its
 /// last-known set + logs at `debug!` - never wedges, never silently drops a
@@ -577,10 +577,13 @@ fn apply_demand_reconcile(
 /// `topics` needs no re-canonicalization ([`apply_demand_reconcile`] canonicalizes
 /// each entry again anyway, a no-op on an already-canonical name).
 fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<String>) {
-    match bridge_mgr.registered_topic_count() {
-        // Grew since the last pass - a runtime registration. Re-snapshot the live
-        // registered set (canonical + sorted) into `topics`.
-        Ok(count) if count > topics.len() => match bridge_mgr.registered_topics() {
+    match bridge_mgr.registered_set_is(topics) {
+        // Unchanged (steady state) - the cheap path, no snapshot.
+        Ok(true) => {}
+        // The membership changed - a runtime registration, or a host restart
+        // that retired the prior run's topics. Re-snapshot the live registered
+        // set (canonical + sorted) into `topics`.
+        Ok(false) => match bridge_mgr.registered_topics() {
             Ok(registered) => {
                 topics.clear();
                 topics.extend(registered.into_iter().map(|(topic, _)| topic));
@@ -591,11 +594,9 @@ fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<St
                  (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
             ),
         },
-        // Unchanged (steady state) - the cheap path, no snapshot.
-        Ok(_) => {}
         Err(e) => tracing::debug!(
             error = %e,
-            "reconciler belt: could not read the registered egress count \
+            "reconciler belt: could not read the registered egress set \
              (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
         ),
     }
@@ -1932,8 +1933,8 @@ fn runs_serve_decision(
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
-/// runtime-registration control channel into `hashes`, and `boot_topics` is fixed
-/// at boot - while the query-surface callback (on the zenoh callback thread) reads
+/// runtime-registration control channel into `hashes`, and `boot_topics` is set
+/// at boot (and by a host restart's `SchemaServingHandles::replace`) - while the query-surface callback (on the zenoh callback thread) reads
 /// them + the live bridge manager to answer a catalog GET. Cheap to clone (three
 /// `Arc`s).
 #[derive(Clone)]
@@ -1944,8 +1945,9 @@ pub struct CatalogSource {
     /// `schema_hash: None`.
     pub hashes: Arc<Mutex<HashMap<String, u64>>>,
     /// Canonical boot-plan announce topics - provenance `Boot`; every other
-    /// registered topic is provenance `Runtime`.
-    pub boot_topics: Arc<HashSet<String>>,
+    /// registered topic is provenance `Runtime`. A host restart's
+    /// `SchemaServingHandles::replace` swaps it for the next run's set.
+    pub boot_topics: Arc<Mutex<HashSet<String>>>,
     /// Canonical topic → its qualified schema NAME (`pkg/Type`),
     /// resolved by the CLI from the graph's node OUTPUTS and handed to the gateway
     /// in its plan. A topic absent here falls through to [`Self::hash_names`]
@@ -2091,7 +2093,9 @@ fn build_catalog_reply_from_bridge(
     robot: &str,
 ) -> cerulion_q::CatalogReply {
     // Held for the WHOLE build: a `SchemaServingHandles::replace` in flight
-    // must not interleave its new snapshot set with the old topic/hash maps.
+    // must not interleave its new snapshot set with the old topic/hash maps,
+    // and a host restart's `replace_then` retires the prior run's bridge
+    // topics under this same lock, so the registry read below is of one run.
     let _snapshot_guard = catalog
         .snapshot_lock
         .lock()
@@ -2113,6 +2117,10 @@ fn build_catalog_reply_from_bridge(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let hash_names = catalog
         .hash_names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let boot_topics = catalog
+        .boot_topics
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Upgrade the WEAK manager handle ONCE for the whole sweep (a live
@@ -2146,7 +2154,7 @@ fn build_catalog_reply_from_bridge(
             .get(&topic)
             .cloned()
             .or_else(|| schema_hash.and_then(|h| hash_names.get(&h).cloned()));
-        let provenance = if catalog.boot_topics.contains(&topic) {
+        let provenance = if boot_topics.contains(&topic) {
             CatalogProvenance::Boot
         } else {
             CatalogProvenance::Runtime
@@ -4890,10 +4898,14 @@ impl NetworkManager {
         state.shutdown_tx = Some(tx);
 
         // Canonicalize once so the thread compares against canonical demand keys.
-        let announced: Vec<String> = announced
+        // Deduplicated too, so the belt's membership check matches the
+        // registered set from the first pass.
+        let mut announced: Vec<String> = announced
             .iter()
             .map(|t| canonical_topic(t).into_owned())
             .collect();
+        announced.sort();
+        announced.dedup();
         let topic_count = announced.len();
 
         let handle = std::thread::Builder::new()
@@ -5070,6 +5082,7 @@ impl NetworkManager {
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -6093,7 +6106,7 @@ mod tests {
                 ("/rt/widget".to_string(), WIDGET_HASH),
                 ("/rt/unknown".to_string(), 0xDEAD_BEEF_u64),
             ]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             // No explicit topic→name binding for either runtime topic.
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             // The reverse map names the widget hash; the unknown hash is absent.
@@ -6143,7 +6156,7 @@ mod tests {
                 "/g/cam/image".to_string(),
                 HASH,
             )]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::from([(
                 "/g/cam/image".to_string(),
                 "sensor_msgs/Image".to_string(),
@@ -6183,7 +6196,7 @@ mod tests {
         let snapshot_lock = Arc::new(Mutex::new(()));
         let catalog = CatalogSource {
             hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             hash_names: Arc::new(Mutex::new(HashMap::new())),
             producer_probe: None,
@@ -6197,6 +6210,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
 
         // The restart: the next run serves /run_two/cam only.
@@ -6210,12 +6224,117 @@ mod tests {
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
         assert_eq!(topics, ["/run_two/cam"]);
+        // The restarted run's served topic is a boot topic of that run.
+        assert_eq!(reply.entries[0].provenance, CatalogProvenance::Boot);
 
-        // A runtime registration after the restart lists alongside it.
+        // A runtime registration after the restart lists alongside it, and
+        // only it is labelled `Runtime`.
         bridge.register_topic("/host/late").expect("register late");
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(topics, HashSet::from(["/run_two/cam", "/host/late"]));
+        let provenance: HashMap<&str, CatalogProvenance> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.provenance))
+            .collect();
+        assert_eq!(
+            provenance,
+            HashMap::from([
+                ("/run_two/cam", CatalogProvenance::Boot),
+                ("/host/late", CatalogProvenance::Runtime),
+            ])
+        );
+    }
+
+    /// The belt's iteration set must follow a host restart that keeps the
+    /// registered count: the reconciler thread outlives the prior gateway, so
+    /// a run serving `/a` replaced by one serving `/b` must re-snapshot, or
+    /// `/b` is never re-affirmed by the belt. Hand oracle: the set is `[/b]`
+    /// after the swap, and an unchanged set in a different order is left as is.
+    #[test]
+    fn the_belt_set_follows_a_same_count_restart_swap() {
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/a").expect("register a");
+        let mut topics = vec!["/a".to_string()];
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/a"]);
+
+        bridge
+            .unregister_topics_except(&[])
+            .expect("retire the prior run");
+        bridge.register_topic("/b").expect("register b");
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/b"]);
+
+        bridge.register_topic("/c").expect("register c");
+        let mut unsorted = vec!["/c".to_string(), "/b".to_string()];
+        refresh_reconcile_topics(&bridge, &mut unsorted);
+        assert_eq!(
+            unsorted,
+            ["/c", "/b"],
+            "an unchanged set is not re-snapshotted"
+        );
+    }
+
+    /// A catalog GET must see one generation during a host restart: the
+    /// bridge retirement runs inside `replace_then`'s snapshot critical
+    /// section, so a reader cannot pair the new boot set with a prior-run
+    /// bridge entry (which it would list as `Runtime`). Hand oracle: while
+    /// retirement runs, the catalog's snapshot lock is held; the reply after
+    /// it lists only the new run's topic, as `Boot`.
+    #[test]
+    fn a_catalog_reader_cannot_see_the_new_snapshot_before_the_retirement() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/run_one/cam").expect("register old");
+        bridge.register_topic("/run_two/cam").expect("register new");
+        let snapshot_lock = Arc::new(Mutex::new(()));
+        let catalog = CatalogSource {
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            producer_probe: None,
+            liveness: None,
+            liveness_clock: None,
+            snapshot_lock: Arc::clone(&snapshot_lock),
+        };
+        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_lock,
+            Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
+        );
+
+        let (_prior, dropped) = handles.replace_then(
+            &crate::transport::gateway::SchemaServing {
+                served_topics: vec!["/run_two/cam".to_string()],
+                ..Default::default()
+            },
+            || {
+                assert!(
+                    matches!(
+                        catalog.snapshot_lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "a catalog reader must be locked out until the retirement ends"
+                );
+                bridge
+                    .unregister_topics_except(&["/run_two/cam".to_string()])
+                    .expect("unregister")
+            },
+        );
+        assert_eq!(dropped, 1);
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
+        let provenance: Vec<(&str, CatalogProvenance)> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.provenance))
+            .collect();
+        assert_eq!(provenance, [("/run_two/cam", CatalogProvenance::Boot)]);
     }
 
     #[test]

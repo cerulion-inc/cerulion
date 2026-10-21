@@ -253,7 +253,7 @@ fn remote_discovery_catalog_get_enriches_with_catalog_only_topics() {
     )])));
     let catalog = CatalogSource {
         hashes,
-        boot_topics: Arc::new(HashSet::new()),
+        boot_topics: Arc::new(Mutex::new(HashSet::new())),
         topic_schemas: Arc::new(Mutex::new(HashMap::new())),
         hash_names: Arc::new(Mutex::new(HashMap::new())),
         producer_probe: None,
@@ -344,7 +344,7 @@ fn remote_discovery_catalog_union_preserves_announce_only_topics() {
     bridge.register_topic("/uni/a").expect("register /uni/a");
     let catalog = CatalogSource {
         hashes: Arc::new(Mutex::new(HashMap::new())),
-        boot_topics: Arc::new(HashSet::new()),
+        boot_topics: Arc::new(Mutex::new(HashSet::new())),
         topic_schemas: Arc::new(Mutex::new(HashMap::new())),
         hash_names: Arc::new(Mutex::new(HashMap::new())),
         producer_probe: None,
@@ -906,7 +906,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
             Arc::new(GetDemandState::default()),
             cerulion_core::transport::network::CatalogSource {
                 hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                boot_topics: Arc::new(std::collections::HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 topic_schemas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 hash_names: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 producer_probe: None,
@@ -1059,7 +1059,7 @@ fn catalog_verb_carries_per_topic_schema_name() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1156,7 +1156,7 @@ fn schema_verb_serves_package_less_yaml_type() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1278,7 +1278,7 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1395,7 +1395,7 @@ fn fetch_remote_schema_success_and_unreachable() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1600,7 +1600,7 @@ fn resolve_remote_walker_for_topic_decodes_named_topic_and_degrades_on_unknown()
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1748,7 +1748,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -1929,7 +1929,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
@@ -2118,7 +2118,7 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes,
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(hash_names)),
                 producer_probe: None,

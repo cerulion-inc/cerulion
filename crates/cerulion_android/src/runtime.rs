@@ -39,32 +39,37 @@ type ProcessTransportIdentity = (Vec<String>, String);
 static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
     OnceLock::new();
 
-/// Set while one runtime owns the process network gateway.
-static GATEWAY_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// Set while one [`EmbeddedRuntime`] in this process owns the network
+/// gateway. See [`GatewayLease`].
+static GATEWAY_OWNED: AtomicBool = AtomicBool::new(false);
 
-/// One runtime's hold on the process network gateway. The gateway's bridge
-/// grants, LAN posture and serving snapshot all live on the process-wide
-/// manager, so a second gateway runtime would share them and its stop would
-/// revoke the first runtime's grants: only one runtime may own the gateway
-/// at a time. Dropping the claim releases it.
-struct GatewayClaim(());
+/// Exclusive ownership of the gateway on the process-wide transport manager.
+///
+/// Every runtime with the same identity shares one manager, and its
+/// announcements and bridge flags carry no owner. A start retires the prior
+/// run's topics, and a failed start retracts all of them. Both are correct
+/// only when no other runtime has a live gateway on that manager, so a second
+/// runtime with listen endpoints is refused while one holds this lease. The
+/// lease is released when its gateway stops (or, on a failed start, after
+/// the cleanup).
+struct GatewayLease(());
 
-impl GatewayClaim {
+impl GatewayLease {
     fn acquire() -> Result<Self, EmbedError> {
-        GATEWAY_CLAIMED
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        GATEWAY_OWNED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self(()))
             .map_err(|_| {
                 EmbedError::BadState(
-                    "another embedded runtime owns the network gateway in this process; stop it before starting one with listen endpoints".to_string(),
+                    "another embedded runtime in this process owns the network gateway; stop it before starting a runtime with listen endpoints".to_string(),
                 )
             })
     }
 }
 
-impl Drop for GatewayClaim {
+impl Drop for GatewayLease {
     fn drop(&mut self) {
-        GATEWAY_CLAIMED.store(false, Ordering::SeqCst);
+        GATEWAY_OWNED.store(false, Ordering::Release);
     }
 }
 
@@ -183,14 +188,14 @@ struct Resources {
     /// it can fail, so ownership must be known before `gateway_thread` exists
     /// for teardown to revoke what a half-built gateway left behind.
     gateway_owned: bool,
-    /// This runtime's hold on the process gateway, taken before a gateway
-    /// start touches any manager-wide state and released after its teardown.
-    gateway_claim: Option<GatewayClaim>,
     /// The token of the posture write this runtime's teardown made, so a
     /// failed start's rollback can tell its own write from a newer caller's.
     lan_access_write: Option<u64>,
     recorder_shutdown: Option<Arc<AtomicBool>>,
     recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
+    /// This runtime's hold on the process gateway, taken before a gateway
+    /// start touches any manager-wide state and released after its teardown.
+    gateway_lease: Option<GatewayLease>,
 }
 
 /// The gateway thread's mDNS beacon; dropping it withdraws the beacon and
@@ -561,7 +566,7 @@ impl EmbeddedRuntime {
         // The token of this start's posture write: the rollback restores the
         // prior posture only while this write is still the last one.
         let mut applied_lan_write = None;
-        let mut gateway_claim = None;
+        let mut gateway_lease = None;
         // The applied posture exists only on a gateway start; a listen-less
         // start reports no LAN access of its own.
         let applied_lan_access =
@@ -569,7 +574,7 @@ impl EmbeddedRuntime {
         if !config.listen.is_empty() {
             // Claimed before the serving snapshot or posture changes: a
             // refused start must leave the owning runtime's state untouched.
-            gateway_claim = Some(GatewayClaim::acquire()?);
+            gateway_lease = Some(GatewayLease::acquire()?);
             if let Some(live) = manager
                 .network()
                 .and_then(|network| network.query_surface_serving_handles())
@@ -609,7 +614,7 @@ impl EmbeddedRuntime {
         // reachable to the teardown path, not orphaned in a dropped local.
         self.resources = Resources {
             manager: Some(Arc::clone(&manager)),
-            gateway_claim,
+            gateway_lease,
             ..Resources::default()
         };
         let resources = &mut self.resources;
@@ -670,19 +675,34 @@ impl EmbeddedRuntime {
                 // gateway: install the new schema serving BEFORE construction
                 // registers topics and exposes the restarted gateway, or the
                 // latched callback keeps naming topics from the prior run.
-                if let Some(live) = manager
+                //
+                // The prior run's announcements and bridge flags are retired
+                // BEFORE the fallible gateway construction, so a failed start
+                // never leaves a prior-run topic announced without its flag.
+                // The flags are dropped inside the replace's snapshot critical
+                // section: a catalog GET lists the bridge registry under that
+                // lock, so it never pairs the new boot set with a prior-run
+                // bridge entry. The state `replace_then` hands back is not
+                // kept: `prior_serving` already holds the pre-start snapshot.
+                //
+                // Ownership starts here, not at the thread spawn: the
+                // retirement and the constructor mutate the shared manager
+                // before either can fail.
+                resources.gateway_owned = true;
+                let served = &serving_clone.served_topics;
+                withdraw_prior_run_announcements(&manager, served);
+                match manager
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
                 {
-                    live.replace(&serving_clone);
+                    Some(live) => {
+                        let (_, retired) = live.replace_then(&serving_clone, || {
+                            unregister_prior_run_flags(&manager, served)
+                        });
+                        retired?;
+                    }
+                    None => unregister_prior_run_flags(&manager, served)?,
                 }
-                // Ownership starts here, not at the thread spawn: the
-                // constructor mutates the shared manager before it can fail.
-                resources.gateway_owned = true;
-                // Retire the prior run's announcements and bridge flags BEFORE
-                // the fallible gateway construction, so a failed start never
-                // leaves a prior-run topic announced without its flag.
-                retire_prior_run_topics(&manager, &serving_clone.served_topics)?;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
@@ -865,7 +885,7 @@ impl EmbeddedRuntime {
             // The claim outlives the teardown: the rollbacks below still
             // write manager-wide state, so no other runtime may start a
             // gateway until they finish.
-            let gateway_claim = self.resources.gateway_claim.take();
+            let gateway_lease = self.resources.gateway_lease.take();
             // The recorder is finalized here, and its thread is joined, so a
             // later `stop()` cannot recover the totals: keep them in status.
             let (summary, _) = stop_resource_set(&mut self.resources, &self.status, true);
@@ -908,7 +928,7 @@ impl EmbeddedRuntime {
                     restore_prior_lan_access(network, prior, write);
                 }
             }
-            drop(gateway_claim);
+            drop(gateway_lease);
             return Err(error);
         }
         Ok(())
@@ -1202,9 +1222,9 @@ impl Resources {
             || self.gateway_exit.is_some()
             || self.gateway_thread.is_some()
             || self.gateway_owned
-            || self.gateway_claim.is_some()
             || self.recorder_shutdown.is_some()
             || self.recorder_thread.is_some()
+            || self.gateway_lease.is_some()
     }
 }
 
@@ -1228,21 +1248,37 @@ fn retire_prior_run_topics(
     manager: &TransportManager,
     served: &[String],
 ) -> Result<(), EmbedError> {
+    withdraw_prior_run_announcements(manager, served);
+    unregister_prior_run_flags(manager, served)
+}
+
+/// The announcement half of [`retire_prior_run_topics`].
+fn withdraw_prior_run_announcements(manager: &TransportManager, served: &[String]) {
     if let Some(network) = manager.network() {
         network.withdraw_announcements_except(served);
     }
+}
+
+/// The bridge-flag half of [`retire_prior_run_topics`]. It takes only the
+/// bridge registry lock, so it can run inside the schema serving's snapshot
+/// critical section.
+fn unregister_prior_run_flags(
+    manager: &TransportManager,
+    served: &[String],
+) -> Result<(), EmbedError> {
     manager
         .bridge_manager()
         .unregister_topics_except(served)
-        .map_err(|error| EmbedError::Network(error.to_string()))?;
-    Ok(())
+        .map(drop)
+        .map_err(|error| EmbedError::Network(error.to_string()))
 }
 
 /// Retracts every announcement and bridge flag a failed start left on the
 /// process-wide manager. Call it only after the start's gateway thread is
-/// joined: with no gateway driving the manager, every egress topic on it
-/// belongs to the failed run (the prior run was retired before this start's
-/// gateway was built). The bare identity token stays. A cleanup error is
+/// joined and while the start still holds its [`GatewayLease`]: with no
+/// gateway driving the manager and no other runtime able to start one, every
+/// egress topic on it belongs to the failed run (the prior run was retired
+/// before this start's gateway was built). The bare identity token stays. A cleanup error is
 /// logged and dropped so the start's own error reaches the caller.
 fn retire_failed_start_topics(manager: &TransportManager) {
     if let Err(error) = retire_prior_run_topics(manager, &[]) {
@@ -1498,8 +1534,9 @@ fn stop_resource_set(
         }
     }
     // Every manager-wide grant this runtime owned is revoked: another
-    // runtime may now own the gateway.
-    resources.gateway_claim = None;
+    // runtime may now own the gateway. A failed start took its lease out
+    // first and keeps it until its own cleanup has retracted its topics.
+    resources.gateway_lease = None;
     lock_status(status).mdns_advertised = false;
     if !starting_failure {
         summary = stop_recorder(resources, &mut first_error);
@@ -2023,7 +2060,7 @@ mod tests {
             gateway_exit: None,
             gateway_thread: None,
             gateway_owned: false,
-            gateway_claim: None,
+            gateway_lease: None,
             lan_access_write: None,
             recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
             recorder_thread: Some(std::thread::spawn(|| {

@@ -546,6 +546,21 @@ impl TopicBridgeManager {
         Ok(bridges.len())
     }
 
+    /// Whether the registered egress set is exactly `topics` (canonical,
+    /// without duplicates), in any order. One lock and one lookup per topic,
+    /// with no allocation: the demand reconciler's belt runs it every pass to
+    /// find a membership change that keeps the count, such as a host restart
+    /// that unregisters `/a` and then registers `/b`.
+    pub fn registered_set_is(&self, topics: &[String]) -> TransportResult<bool> {
+        let bridges = self.bridges.lock().map_err(|_| TransportError::Internal {
+            reason: "bridge manager mutex poisoned".to_string(),
+        })?;
+        Ok(bridges.len() == topics.len()
+            && topics
+                .iter()
+                .all(|topic| bridges.contains_key(topic.as_str())))
+    }
+
     /// A snapshot of every registered egress topic + its shared flag,
     /// SORTED by canonical topic name for deterministic iteration (Principle #3).
     /// This map is THE source of truth for which topics may egress — the gateway
