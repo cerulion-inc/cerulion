@@ -6,12 +6,20 @@ frames, and the tf buffer that answers `lookup(parent, child, time)`.
 - A rigid `Transform` (translation plus unit quaternion) composes, inverts,
   applies to points and vectors, and interpolates (linear translation, SLERP
   rotation) between two stamps.
-- A `TfBuffer` holds a frame tree with a bounded, stamp-sorted ring per edge
-  and static edges that never expire. `lookup` walks the chain between two
-  frames through their common ancestor and interpolates on every dynamic
-  edge; `lookup_latest` does the same at the newest time the whole chain has.
-- Lookups never extrapolate and never block: a time outside an edge's ring,
-  an unknown frame or two frames in separate trees is a typed `TfError` that
+- A `TfBuffer` holds a frame tree with a stamp-sorted window of history per
+  edge (10 s by default, whatever the publish rate) and static edges that
+  never expire. `lookup` walks the chain between two frames through their
+  common ancestor and interpolates on every dynamic edge; `lookup_latest`
+  does the same at the newest time the whole chain answers.
+- Frame ids are interned into `FrameId` handles with no length limit of
+  their own; `lookup_ids` skips the string work on every tick.
+- One writer per edge: a second broadcaster of an edge is a typed error,
+  reported once and counted after.
+- Past an edge's newest sample, a per-edge `EdgePolicy` decides: nothing
+  (the default), the newest sample held, or the last motion continued, each
+  within a bound. `begin_epoch` starts a new timeline after a clock reset or
+  a bag loop. Lookups never block: a time outside what an edge answers, an
+  unknown frame or two frames in separate trees is a typed `TfError` that
   names the frames involved.
 - Conventions follow REP-103 and `geometry_msgs/TransformStamped`: quaternions
   are `(x, y, z, w)`, a transform is `T_parent_child`, and

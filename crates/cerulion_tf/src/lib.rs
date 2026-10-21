@@ -13,12 +13,15 @@
 //!
 //! A node holds one [`TfBuffer`], feeds it every transform it receives
 //! ([`TfBuffer::insert`] for `/tf`, [`TfBuffer::insert_static`] for
-//! `/tf_static`) and reads it with [`TfBuffer::lookup`] or
-//! [`TfBuffer::lookup_latest`]. The buffer keeps one parent per frame and a
-//! bounded ring of samples per edge, refuses a malformed transform before
-//! writing anything, and returns a [`TfError`] that names the frames
-//! involved when a lookup cannot be answered. It never extrapolates and it
-//! never blocks. The type docs state every rule.
+//! `/tf_static`), each with the [`WriterId`] of the node that published it,
+//! and reads it with [`TfBuffer::lookup`] or [`TfBuffer::lookup_latest`].
+//! The buffer keeps one parent and one writer per frame, interns frame ids
+//! into [`FrameId`] handles, keeps a fixed window of history per edge
+//! ([`TfBufferConfig::retention`], 10 s by default), refuses a malformed
+//! transform before writing anything, and returns a [`TfError`] that names
+//! the frames involved when a lookup cannot be answered. Past an edge's
+//! newest sample it answers only what the edge's [`EdgePolicy`] allows, and
+//! it never blocks. The type docs state every rule.
 //!
 //! # Conventions
 //!
@@ -71,15 +74,21 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod buffer;
+mod edge_policy;
 mod error;
 mod exact;
-mod frame_name;
+mod frame_id;
 mod kernels;
+mod names;
 mod quaternion;
 mod transform;
 
-pub use buffer::{EdgeInfo, TfBuffer, DEFAULT_FRAME_CAPACITY, DEFAULT_SAMPLES_PER_EDGE};
-pub use error::TfError;
-pub use frame_name::{FrameName, MAX_FRAME_ID_LEN};
+pub use buffer::{
+    EdgeInfo, TfBuffer, TfBufferConfig, DEFAULT_FRAME_CAPACITY, DEFAULT_MAX_RATE_HZ,
+    DEFAULT_NAME_BYTES, DEFAULT_RETENTION, NAME_BYTES_PER_FRAME,
+};
+pub use edge_policy::EdgePolicy;
+pub use error::{Describe, TfError};
+pub use frame_id::{FrameId, FrameLabel, WriterId, FRAME_LABEL_BYTES};
 pub use quaternion::UnitQuaternion;
 pub use transform::Transform;

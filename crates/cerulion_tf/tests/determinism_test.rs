@@ -19,7 +19,10 @@
 //! fraction formed from the stamps and the composition along the chain are
 //! all under the same bit pin.
 
-use cerulion_tf::{TfBuffer, Transform, UnitQuaternion};
+use cerulion_tf::{EdgePolicy, TfBuffer, Transform, UnitQuaternion, WriterId};
+
+/// The one writer of every edge in this file.
+const W: WriterId = WriterId::new(1);
 use std::f64::consts::FRAC_1_SQRT_2;
 
 const N: usize = 47;
@@ -140,10 +143,12 @@ fn buffer_program() -> [f64; M] {
     let z90 = q(0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2);
 
     let mut buf = TfBuffer::new();
-    buf.insert("map", "odom", 0, a).unwrap();
-    buf.insert("map", "odom", 1_000, b).unwrap();
-    buf.insert("odom", "base", 0, Transform::IDENTITY).unwrap();
+    buf.insert(W, "map", "odom", 0, a).unwrap();
+    buf.insert(W, "map", "odom", 1_000, b).unwrap();
+    buf.insert(W, "odom", "base", 0, Transform::IDENTITY)
+        .unwrap();
     buf.insert(
+        W,
         "odom",
         "base",
         1_000,
@@ -151,12 +156,14 @@ fn buffer_program() -> [f64; M] {
     )
     .unwrap();
     buf.insert_static(
+        W,
         "base",
         "lidar",
         Transform::new([0.17, 0.0, 0.11], z90).unwrap(),
     )
     .unwrap();
     buf.insert_static(
+        W,
         "base",
         "camera",
         Transform::new([0.27, 0.0, 0.05], UnitQuaternion::IDENTITY).unwrap(),
@@ -193,6 +200,65 @@ fn two_runs_give_identical_bits() {
 #[test]
 fn two_buffer_runs_give_identical_bits() {
     assert_eq!(buffer_bits(buffer_program()), buffer_bits(buffer_program()));
+}
+
+/// The edge policies past the newest sample, after an epoch: a turning
+/// edge extrapolated by a fraction and by whole steps, and a held slow
+/// edge read through the chain at the fast edge's newest stamp.
+fn policy_program() -> [u64; 21] {
+    let q = |x, y, z, w| UnitQuaternion::new(x, y, z, w).unwrap();
+    let mut buf = TfBuffer::new();
+    buf.set_edge_policy("map", "odom", EdgePolicy::HoldLast { max_age_ns: 900 })
+        .unwrap();
+    buf.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 10_000 })
+        .unwrap();
+    // A first timeline, then a reset to a second one.
+    buf.insert(W, "odom", "base", 50_000, Transform::IDENTITY)
+        .unwrap();
+    buf.begin_epoch();
+    buf.insert(
+        W,
+        "map",
+        "odom",
+        0,
+        Transform::new([0.5, 0.25, 0.0], q(0.0, 0.0, 0.1, 0.99)).unwrap(),
+    )
+    .unwrap();
+    buf.insert(
+        W,
+        "odom",
+        "base",
+        0,
+        Transform::new([0.0, 0.0, 0.0], q(0.0, 0.1, 0.0, 0.99)).unwrap(),
+    )
+    .unwrap();
+    buf.insert(
+        W,
+        "odom",
+        "base",
+        300,
+        Transform::new([1.25, -0.5, 0.1], q(0.2, 0.1, 0.3, 0.9)).unwrap(),
+    )
+    .unwrap();
+    let reads = [
+        buf.lookup("odom", "base", 437).unwrap(),
+        buf.lookup("odom", "base", 2_000).unwrap(),
+        buf.lookup_latest("map", "base").unwrap(),
+    ];
+    let mut out = [0u64; 21];
+    let mut k = 0;
+    for t in &reads {
+        for x in t.translation().into_iter().chain(t.rotation().to_array()) {
+            out[k] = x.to_bits();
+            k += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn two_policy_runs_give_identical_bits() {
+    assert_eq!(policy_program(), policy_program());
 }
 
 /// The bits `buffer_program` produced, committed as the regression pin.

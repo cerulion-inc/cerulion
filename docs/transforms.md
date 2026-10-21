@@ -85,7 +85,7 @@ turns child axes into parent axes.
 ## The buffer
 
 `cerulion_tf::TfBuffer` is a plain field of the node. It holds a frame tree
-with a bounded ring of stamped samples per edge, and static edges beside it.
+with a time window of stamped samples per edge, and static edges beside it.
 
 The node's `Cargo.toml` adds the crate beside the two the scaffold writes:
 
@@ -105,18 +105,19 @@ root `Cargo.toml` under `[workspace.dependencies]`, with `<checkout>` a
 `cerulion` source checkout of the same version as the CLI.
 
 ```rust
-use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion};
+use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion, WriterId};
 
 let mut buffer = TfBuffer::new();
+let writer = WriterId::new(1);
 
 // A dynamic transform: odom -> base_link at 1 000 000 000 ns, 2 m along +x.
 let rotation = UnitQuaternion::new(0.0, 0.0, 0.0, 1.0)?;
 let transform = Transform::new([2.0, 0.0, 0.0], rotation)?;
-buffer.insert("odom", "base_link", 1_000_000_000, transform)?;
+buffer.insert(writer, "odom", "base_link", 1_000_000_000, transform)?;
 
 // A static transform: the lidar mount, 0.25 m forward and 0.5 m up.
 let mount = Transform::new([0.25, 0.0, 0.5], UnitQuaternion::IDENTITY)?;
-buffer.insert_static("base_link", "lidar", mount)?;
+buffer.insert_static(writer, "base_link", "lidar", mount)?;
 
 // The lidar in odom, at the stamp of the sample above.
 let odom_lidar = buffer.lookup("odom", "lidar", 1_000_000_000)?;
@@ -136,32 +137,59 @@ The rules:
 - **One parent per frame.** A transform naming a child that already has a
   different parent is refused (`SecondParent`); so is a self edge and an edge
   that would make a frame its own ancestor (`Cycle`). The tree stays a tree.
-- **Bounded rings.** Each dynamic edge keeps its samples sorted by stamp on a
-  ring of fixed capacity. A sample at a stamp the ring already holds replaces
-  it (tf2 ignores the repeat; here a corrected re-send wins). When the ring
-  is full, the oldest sample is evicted to make room, and a sample older than
-  everything on a full ring is dropped on arrival; that insert still returns
-  `Ok(())`, so compare `evictions()` before and after to see the drop. Every
-  dropped sample counts in `evictions()`, including the dynamic samples a
-  static insert clears. The defaults are 64 frames and 64 samples per edge;
-  `TfBuffer::with_capacity` sets both, and that constructor is the only place
-  the buffer allocates. `insert` and `lookup` never touch the heap, so they
-  belong inside a tick.
+- **One writer per edge.** Every insert names a `WriterId`, any value that
+  tells the publishing nodes apart. An edge keeps the first writer that fed
+  it, and a transform for that edge from another writer is refused
+  (`SecondWriter`), so two broadcasters of one edge are an error rather than
+  samples interleaved on one ring. An accumulate input does not say which
+  node published each frame, so a feed of a whole `/tf` input passes one
+  `WriterId` for all of it, and the check then guards the edges the node
+  feeds from separate inputs or writes itself.
+- **A window of history.** Each dynamic edge keeps the samples of the last
+  10 s before its newest stamp, the tf2 default, whatever its publish rate.
+  An insert drops every sample older than that window (counted in
+  `expired()`), and a stamp older than the window is refused
+  (`StampBeforeWindow`). A sample at a stamp the ring already holds is a
+  no-op when the transform is the same and replaces it when it differs
+  (counted in `replacements()`).
+- **Rings sized up front.** Each ring holds enough samples for the window at
+  up to 100 Hz (1001 samples). An edge that publishes faster fills its ring
+  before its window: the oldest sample makes room and each one counts in the
+  edge's `overflows`, read through `edge()`, so a short window is never
+  silent. Size the buffer for a faster edge with
+  `TfBuffer::with_config(TfBufferConfig::new(frames, retention, max_rate_hz))`.
+  That constructor is the only place the buffer allocates. `insert` and
+  `lookup` never touch the heap, so they belong inside a tick.
 - **Static wins.** A static edge holds at every time. A dynamic transform
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
-- **Frame ids** are at most 36 bytes, counted after their leading `/`s are
-  removed: `/odom`, `//odom` and `odom` name one frame, so a frame name read
-  back from `edge()` or from an error names the same frame when passed back.
-  A longer id is refused (`FrameIdTooLong`, naming its first 36 bytes); the
-  empty id, and an id of only `/`s, is refused (`EmptyFrameId`). A namespaced camera frame can be too
-  long: `robot_0/camera_aligned_depth_to_color_frame` is 43 bytes. Rename
-  such a frame before publishing it.
+- **Loud once, counted after.** `EdgeIsStatic` and `SecondWriter` come back
+  the first time on an edge. Every later refusal on that edge returns
+  `Ok(())` and counts in the edge's `static_refusals` or
+  `second_writer_refusals`, so a node that logs each insert error reports
+  the conflict once, and the running total stays readable from `edge()`.
+- **Frame ids** have no length limit of their own. The buffer interns each
+  id once, in a name table sized at construction (64 bytes per frame on
+  average, 4096 bytes for the default 64 frames), and names a frame by its
+  `FrameId` everywhere else. Leading `/`s are removed first: `/odom`,
+  `//odom` and `odom` name one frame, so a frame name read back from `edge()`
+  names the same frame when passed back. The empty id, and an id of only
+  `/`s, is refused (`EmptyFrameId`).
 - **Capacity.** A transform naming a frame the buffer has no room for is
-  refused (`FrameTableFull`), and names the frame.
+  refused (`FrameTableFull`), and so is one whose new id does not fit in what
+  is left of the name budget (`NameBudgetFull`); both name the frame.
 
 Every refusal happens before the buffer changes: a refused insert leaves it
-exactly as it was.
+exactly as it was, apart from the refusal counters above.
+
+### Time jumps
+
+A bag that loops or a simulator that resets moves time backwards. Call
+`buffer.begin_epoch()` at that point: it clears every dynamic ring, keeps
+every frame, edge, writer, policy and static transform, and counts the epoch
+in `epoch()`. The new timeline then fills the rings from empty. Without it,
+the first stamps of the new timeline are older than the window and come back
+as `StampBeforeWindow`, so a missed reset is an error, never a frozen tree.
 
 ## Lookup
 
@@ -174,18 +202,41 @@ each dynamic edge the sample at `time` is an exact hit, returned bit for bit,
 or the interpolation between the two samples that bracket it: linear in
 translation, shortest-arc SLERP in rotation.
 
-`lookup_latest(parent, child)` resolves at the newest time every dynamic edge
-on the chain has a sample for, through the same code path. A chain of static
-edges only has no time and resolves directly.
+`lookup_latest(parent, child)` resolves at the newest time every
+interpolated edge on the chain has a sample for, through the same code path.
+A chain of static edges only has no time and resolves directly. With the
+default window, a 1 Hz `map` to `odom` edge and a 100 Hz or 1 kHz `odom` to
+`base_link` edge resolve at the slow edge's newest stamp.
+
+A node that looks up the same frames on every tick resolves them once with
+`buffer.frame_id("map")` and calls `lookup_ids(map, lidar, time)` and
+`lookup_latest_ids`, which skip the string work.
 
 Time is a plain stamp: `lookup(parent, child, 0)` asks for 0 ns, which is out
 of range on an edge whose oldest sample is later. For the ROS meaning of
 `Time(0)`, the latest transform available, call `lookup_latest`.
 
-**Lookups never extrapolate.** One nanosecond before an edge's oldest sample
-or after its newest is an error, never a guessed transform. **Lookups never
-block.** There is no listener thread and no timeout: an error is a fact about
-the buffer at this fire, and the node asks again on its next fire.
+### Past the newest sample: edge policies
+
+By default a lookup one nanosecond after an edge's newest sample is
+`NotYetAvailable`, never a guessed transform. An edge can answer further with
+`buffer.set_edge_policy(parent, child, policy)`:
+
+| Policy | Past the newest sample |
+|---|---|
+| `EdgePolicy::Interpolate` (default) | Nothing: `NotYetAvailable`. |
+| `EdgePolicy::HoldLast { max_age_ns }` | The newest sample, for up to `max_age_ns`. For a slow edge such as `map` to `odom`. |
+| `EdgePolicy::Extrapolate { max_ns }` | The motion between the two newest samples, continued for up to `max_ns`. For an edge that publishes behind the data it is used with. |
+
+A policy can be set before the edge's first sample: the edge is declared with
+an empty ring. An edge with another policy does not hold `lookup_latest`
+back, so with `HoldLast` on `map` to `odom` the chain to `base_link`
+resolves at the fast edge's newest stamp. A time before an edge's oldest
+sample is `OutOfRange` under every policy.
+
+**Lookups never block.** There is no listener thread and no timeout: an
+error is a fact about the buffer at this fire, and the node asks again on its
+next fire.
 
 ```rust
 match self.buffer.lookup("map", "lidar", stamp_ns) {
@@ -196,7 +247,7 @@ match self.buffer.lookup("map", "lidar", stamp_ns) {
     Err(TfError::NotYetAvailable { .. }) => {
         // The transform for this stamp has not arrived; try next fire.
     }
-    Err(err) => tracing::warn!(error = %err, "tf lookup refused"),
+    Err(err) => tracing::warn!(error = %self.buffer.describe(&err), "tf lookup refused"),
 }
 ```
 
@@ -205,33 +256,42 @@ match self.buffer.lookup("map", "lidar", stamp_ns) {
 `TfError` is the crate's one error type: the math refusals of
 `UnitQuaternion::new` and `Transform::new` and the buffer refusals are
 variants of the same enum, so a feed function that builds a transform and
-inserts it uses `?` on both. Every variant that involves a frame names it in
-its text; `EmptyFrameId` and the math variants have no frame to name.
+inserts it uses `?` on both. A frame the buffer has registered is named in
+an error by its `FrameId`, which prints as `#n` on its own;
+`buffer.describe(&err)` prints the error with the frame names, and
+`buffer.frame_name(id)` gives one name. A frame id the buffer has not
+registered is carried as a `FrameLabel`, its first 48 bytes.
 
 | Variant | When | What to do |
 |---|---|---|
 | `UnknownFrame { frame }` | No inserted transform has named `frame`. | Check the frame id; wait for the publisher. |
+| `UnknownFrameId { frame }` | `lookup_ids` got a handle this buffer never issued. | Resolve the handle from the same buffer. |
 | `NoPath { parent, child }` | Both frames are known but no chain of edges joins them. | A broadcaster is missing an edge. |
-| `NotYetAvailable { parent, child, requested_ns, newest_ns }` | `requested_ns` is newer than the newest sample on the edge `parent` to `child`. | Ask again on the next fire. |
-| `OutOfRange { parent, child, requested_ns, oldest_ns, newest_ns }` | `requested_ns` is older than the oldest sample on that edge: evicted, or never buffered. | Waiting does not help; a larger ring or a fresher stamp does. |
-| `ChainMath { parent, child }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain is far too large. |
+| `EdgeEmpty { parent, child }` | A dynamic edge on the chain has no sample since it was declared or since the last epoch. | Ask again on the next fire. |
+| `NotYetAvailable { parent, child, requested_ns, newest_ns }` | `requested_ns` is past the newest sample on the edge `parent` to `child`, further than its policy reaches. | Ask again on the next fire, or set an edge policy. |
+| `OutOfRange { parent, child, requested_ns, oldest_ns, newest_ns }` | `requested_ns` is older than the oldest sample on that edge: it left the window, or was never buffered. | Waiting does not help; a longer retention or a fresher stamp does. |
+| `ChainMath { parent, child }` | Composing the chain between `parent` and `child` overflowed `f64`. | The input data is wrong: a translation along the chain, or an extrapolated edge, is far too large. |
 | `NonFiniteQuaternion`, `DegenerateQuaternion { norm }`, `NonFiniteTranslation` | `UnitQuaternion::new` or `Transform::new` refused a value in the feed, carried through `?`. | The input data is wrong. |
-| `EmptyFrameId`, `FrameIdTooLong { prefix, len }` | The frame id is empty (or only `/`s), or over 36 bytes. | Fix the publisher's frame ids. |
+| `EmptyFrameId` | The frame id is empty (or only `/`s). | Fix the publisher's frame ids. |
 | `SelfEdge { frame }` | Parent and child are the same frame. | Fix the publisher. |
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |
-| `EdgeIsStatic { parent, child }` | A dynamic transform arrived for a static edge. | Publish the edge on one topic only. |
+| `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
+| `SecondWriter { parent, child, writer, existing_writer }` | Another writer already feeds the edge. | Two broadcasters publish the same edge; keep one. |
+| `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
 | `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with a larger frame capacity. |
+| `NameBudgetFull { frame, len, budget }` | The new frame's id does not fit in the rest of the name budget. | Build the buffer with a larger `name_bytes`. |
 
-Errors are plain values with the frame ids inline: building one allocates
-nothing, so a lookup that fails on every fire costs no more than one that
-succeeds.
+Errors are plain `Copy` values: building one allocates nothing, so a lookup
+that fails on every fire costs no more than one that succeeds.
 
 ## Determinism
 
 A lookup reads only recorded frames, and the math is a fixed sequence of
 correctly rounded IEEE-754 operations with no platform math library and no
-fused multiply-add. The walk over the tree is fixed by the tree, and the
+fused multiply-add. The walk over the tree is fixed by the tree, the name
+index is an unseeded hash, an extrapolated edge composes its steps in a
+fixed order, and the
 interpolation fraction is formed from the stamp differences, so a stamp in
 2023 wall-clock nanoseconds interpolates exactly like a stamp near zero. Two
 runs over the same frames give bit-identical transforms, on every machine, so
@@ -249,8 +309,7 @@ Frames follow REP-103: right-handed, metres, radians.
 - Declaring static transforms in graph YAML, a command-line view of the frame
   tree, a robot state publisher from URDF, and a Python tf lookup API are not
   supported; a node publishes its transforms and holds its own buffer.
-- Extrapolation of any kind, and a blocking lookup with a timeout.
+- A blocking lookup with a timeout.
 - Re-parenting a frame at runtime.
-- Frame ids over 36 bytes, such as a namespaced RealSense frame
-  (`robot_0/camera_aligned_depth_to_color_frame`, 43 bytes); rename the
-  frame.
+- Telling the publishers of one accumulate input apart: a `/tf` feed passes
+  one `WriterId` for the whole input.
