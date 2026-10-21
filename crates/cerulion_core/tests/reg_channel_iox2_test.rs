@@ -2049,6 +2049,88 @@ fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
     );
 }
 
+/// A gateway rebuilt on a manager whose query surface an EARLIER gateway
+/// latched serves ITS schema names, hash names and docs through that
+/// surface, even after the first run's teardown emptied it
+/// (`serve_nothing`): the surface keeps reading its own maps, so the
+/// restarted construction must fill those, not fresh ones. Hand oracle.
+#[test]
+fn a_restarted_gateway_serves_its_schemas_through_the_latched_surface() {
+    use cerulion_core::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use cerulion_core::transport::gateway::{SchemaHashName, SchemaServing, TopicSchema};
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_serving_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rcserve".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let serving = |topic: &str, schema: &str, hash: u64| SchemaServing {
+        topic_schemas: vec![TopicSchema {
+            topic: topic.to_string(),
+            schema_name: schema.to_string(),
+        }],
+        schema_docs: vec![SchemaDoc {
+            qualified: schema.to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "float64 x\n".to_string(),
+            deps: Vec::new(),
+        }],
+        schema_hashes: vec![SchemaHashName {
+            schema_hash: hash,
+            qualified: schema.to_string(),
+        }],
+        served_topics: vec![topic.to_string()],
+    };
+    let first_topic = format!("/rt/serving/first/{}", unique_id());
+    let next_topic = format!("/rt/serving/next/{}", unique_id());
+    let first = GatewayRuntime::new_embedded(
+        Arc::clone(&manager),
+        serving(&first_topic, "first_pkg/First", 0xA1),
+    )
+    .expect("first gateway boot");
+    let latched = manager
+        .network()
+        .and_then(|network| network.query_surface_serving_handles())
+        .expect("the first gateway latches the query surface");
+    drop(first);
+    latched.serve_nothing();
+
+    let restarted = GatewayRuntime::new_embedded(
+        Arc::clone(&manager),
+        serving(&next_topic, "next_pkg/Next", 0xB2),
+    )
+    .expect("restarted gateway boot");
+
+    assert_eq!(
+        latched.served_topics_for_test(),
+        (Vec::<String>::new(), vec![next_topic.clone()]),
+        "the latched surface must carry the restarted run's bindings, and an \
+         embedded construction announces no boot topic"
+    );
+    let schema = restarted.schema_serve_for_test("rcserve", "next_pkg/Next");
+    assert!(schema.error.is_none(), "{:?}", schema.error);
+    assert_eq!(
+        schema
+            .docs
+            .iter()
+            .map(|doc| doc.qualified.as_str())
+            .collect::<Vec<_>>(),
+        ["next_pkg/Next"]
+    );
+    let missing = restarted.schema_serve_for_test("rcserve", "first_pkg/First");
+    assert!(
+        missing.docs.is_empty(),
+        "the first run's schema must not be served after its teardown"
+    );
+}
+
 /// A gateway restarted on the same manager with a smaller topic set withdraws
 /// the prior run's announce tokens: the manager outlives the first gateway, so
 /// without the withdrawal a remote `topic list` keeps listing topics the new
