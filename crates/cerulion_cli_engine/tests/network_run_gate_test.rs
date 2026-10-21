@@ -73,6 +73,7 @@ fn block_with_ingress() -> NetworkBlock {
         egress: vec!["/ng/n/out".into()],
         ingress: vec!["/remote/cmd".to_string()],
         tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 
@@ -85,6 +86,7 @@ fn egress_only_block() -> NetworkBlock {
         egress: vec!["/ng/n/out".into()],
         ingress: vec![],
         tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 

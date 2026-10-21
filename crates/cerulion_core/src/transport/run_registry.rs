@@ -1338,6 +1338,7 @@ fn build_registry_node(
         role.try_into().map_err(|e| TransportError::Internal {
             reason: format!("run registry: invalid node name '{role}': {e:?}"),
         })?;
+    super::refuse_unsupported_android_shm(role)?;
     iceoryx2::prelude::NodeBuilder::new()
         .name(&node_name)
         .config(&config)
