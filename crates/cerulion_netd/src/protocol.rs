@@ -580,8 +580,8 @@ pub struct EgressReleaseResponse {
 /// # Why the protocol has to carry this
 ///
 /// netd's session is LAZY: the FIRST query on a freshly-spawned daemon opens it,
-/// and a just-opened scouting session has not yet completed the multicast scout →
-/// TCP connect → session establishment → liveliness/queryable exchange that makes a
+/// and a just-opened session has not yet completed the TCP connect to its
+/// folded peers → session establishment → liveliness/queryable exchange that makes a
 /// robot's announce tokens (and its `catalog` queryable) visible. Before the discovery marker the
 /// resulting empty gather was indistinguishable on the wire from "the LAN was
 /// reached and nobody has this topic", so the desk rendered a TERMINAL "not found"

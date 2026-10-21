@@ -11,6 +11,15 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   singleton (`get_or_init()`). Tests get isolation via per-test SHM roots
   (`init_for_test` / `build_for_test` / `generate_isolated_config()`), not via a second
   node.
+- The opt-in `local-transport` feature selects
+  `iceoryx2::service::local_threadsafe::Service` and `TransportKind::InProcess`;
+  without it, the runtime keeps `ipc_threadsafe::Service` and
+  `TransportKind::CrossProcess`. Local transport is for threads in one process:
+  explicit cross-process initialization, detached pre-creation for other
+  processes, non-empty process groups, and cdylibs with a different transport
+  kind are refused. Cross-process cdylibs export `CERULION_ABI_VERSION`
+  unchanged; in-process cdylibs encode their transport id above bit 16, so a
+  host can refuse a transport mismatch during the ABI check.
 - ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
   mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
   cleaner deliberately does not hold the transport, so

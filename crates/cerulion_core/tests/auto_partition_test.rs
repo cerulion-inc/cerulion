@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Process groups split a graph across processes, which local-transport refuses.
 //! The pure cost-aware auto-partitioner.
 //!
 //! Process-per-node BASELINE + validated GREEDY FUSION. Every test ties the
