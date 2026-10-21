@@ -487,6 +487,10 @@ impl EmbeddedRuntime {
             ..Resources::default()
         };
         let resources = &mut self.resources;
+        // The query-surface snapshot this start replaced, held for the WHOLE
+        // startup: any failure after the replace puts it back, or the latched
+        // surface would describe a run that never started.
+        let mut replaced_serving = None;
         let result = (|| {
             Self::create_publishers(
                 &resolved_publish,
@@ -543,24 +547,28 @@ impl EmbeddedRuntime {
                 // gateway: install the new snapshot BEFORE construction
                 // registers topics and exposes the restarted gateway, or the
                 // latched callback keeps filtering through the prior snapshot.
-                // Keep the replaced state: if construction fails, put it back,
-                // or the latched surface would describe a run that never
-                // started.
-                let replaced = manager
+                // The replaced state is kept in `replaced_serving` and put back
+                // on every startup failure below.
+                replaced_serving = manager
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
                     .map(|live| {
                         let prior = live.replace(&serving_clone);
                         (live, prior)
                     });
+                // The manager outlives the prior gateway and keeps its bridge
+                // flags: a new gateway drives EVERY registered flag, so drop
+                // the topics the new run does not serve, or a prior-run topic
+                // whose demand flag is still on keeps egressing. The prior
+                // gateway was stopped before this start, so no drive loop
+                // observes the removal.
+                manager
+                    .bridge_manager()
+                    .unregister_topics_except(&serving_clone.served_topics)
+                    .map_err(|error| EmbedError::Network(error.to_string()))?;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
-                        .map_err(|error| {
-                            if let Some((live, prior)) = replaced {
-                                live.restore(prior);
-                            }
-                            EmbedError::Network(error.to_string())
-                        })?;
+                        .map_err(|error| EmbedError::Network(error.to_string()))?;
                 // The manager outlives the prior gateway and keeps its announce
                 // tokens: withdraw every topic the new run does not serve, or a
                 // remote `topic list` keeps listing the prior run's topics.
@@ -731,7 +739,13 @@ impl EmbeddedRuntime {
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = stop_resource_set(&mut self.resources, &self.status, true);
+            // The recorder is finalized here, and its thread is joined, so a
+            // later `stop()` cannot recover the totals: keep them in status.
+            let (summary, _) = stop_resource_set(&mut self.resources, &self.status, true);
+            lock_status(&self.status).recorder = summary;
+            if let Some((live, prior)) = replaced_serving {
+                live.restore(prior);
+            }
             return Err(error);
         }
         Ok(())

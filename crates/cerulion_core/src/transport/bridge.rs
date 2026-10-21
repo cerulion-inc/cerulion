@@ -430,11 +430,42 @@ impl TopicBridgeManager {
         Ok(false)
     }
 
+    /// Drop every registered egress bridge flag whose canonical topic is not
+    /// in `keep`, and return how many were dropped.
+    ///
+    /// A host that restarts its gateway inside one process lifetime calls this
+    /// BEFORE it builds the next run's gateway: the manager outlives the prior
+    /// gateway, and a new gateway builds its drive view from EVERY registered
+    /// flag, so a prior-run topic left registered (with its demand flag still
+    /// on) would keep egressing after the new run stopped serving it. Call it
+    /// only while no gateway drives this manager: a live gateway relies on the
+    /// registered count only growing (see [`Self::registered_topic_count`]).
+    pub fn unregister_topics_except(&self, keep: &[String]) -> TransportResult<usize> {
+        let keep: HashSet<String> = keep
+            .iter()
+            .map(|t| crate::transport::network::canonical_topic(t).into_owned())
+            .collect();
+        let mut bridges = self.bridges.lock().map_err(|_| TransportError::Internal {
+            reason: "bridge manager mutex poisoned".to_string(),
+        })?;
+        let before = bridges.len();
+        bridges.retain(|topic, flag| {
+            let kept = keep.contains(topic);
+            if !kept {
+                // A clone of this flag held elsewhere must read "no demand".
+                flag.store(false, Ordering::Relaxed);
+            }
+            kept
+        });
+        Ok(before - bridges.len())
+    }
+
     /// The number of registered egress bridge flags (Principle #3:
-    /// observable state). The `bridges` map is ADD-ONLY — [`Self::register_topic`]
-    /// inserts, and no path ever removes a key ([`Self::enable_bridge`] /
-    /// [`Self::disable_bridge`] only flip existing flags) — so this count is
-    /// MONOTONIC. The gateway's [`crate::transport::gateway::GatewayRuntime`] uses
+    /// observable state). While a gateway drives this manager the `bridges`
+    /// map is ADD-ONLY — [`Self::register_topic`] inserts, and only
+    /// [`Self::unregister_topics_except`] (a between-runs call) removes a key
+    /// ([`Self::enable_bridge`] / [`Self::disable_bridge`] only flip existing
+    /// flags) — so this count is MONOTONIC for a gateway's lifetime. The gateway's [`crate::transport::gateway::GatewayRuntime`] uses
     /// that monotonicity as a cheap dirty-check: a count change is a reliable
     /// "a new egress topic was registered" signal driving its per-pass tap
     /// reconciliation, without snapshotting the whole map every pass.
@@ -548,6 +579,25 @@ impl TopicBridgeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unregister_topics_except_drops_and_clears_stale_flags() {
+        let mgr = TopicBridgeManager::new();
+        mgr.set_egress_allow_all().unwrap();
+        let stale = mgr.register_topic("old/topic").unwrap();
+        mgr.register_topic("kept").unwrap();
+        assert!(mgr.enable_bridge("old/topic").unwrap());
+        assert!(mgr.enable_bridge("/kept").unwrap());
+
+        let dropped = mgr.unregister_topics_except(&["kept".to_string()]).unwrap();
+
+        assert_eq!(dropped, 1);
+        assert!(!stale.load(Ordering::Relaxed));
+        assert!(!mgr.is_registered("old/topic").unwrap());
+        assert!(!mgr.enable_bridge("old/topic").unwrap());
+        assert!(mgr.is_enabled("kept").unwrap());
+        assert_eq!(mgr.registered_topic_count().unwrap(), 1);
+    }
 
     #[test]
     fn test_register_topic_returns_bridge_flag() {
