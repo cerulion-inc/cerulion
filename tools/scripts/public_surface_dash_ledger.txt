@@ -197,7 +197,7 @@
 20 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs
 20 crates/cerulion_netd/src/daemon.rs
-6 crates/cerulion_netd/src/discovery_fold.rs
+2 crates/cerulion_netd/src/discovery_fold.rs
 9 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
 11 crates/cerulion_netd/src/iroh_plane.rs
