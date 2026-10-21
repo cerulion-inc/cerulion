@@ -741,9 +741,10 @@ fn workflow_gate_off_uncovered(text: &str) -> bool {
 /// reaches every later command-position launch of the binary without its
 /// own gate override: it runs unconditionally (outside any skippable block,
 /// and - when it sits in a function body - only from an unconditional
-/// top-level call of that function). A top-level re-export can restore
-/// coverage after a later assignment or `unset`; a per-command override
-/// applies only to its own command segment. YAML/TOML syntaxes (`KEY: "off"`,
+/// top-level call of that function). Only a standalone unconditional
+/// top-level re-export can restore coverage after a later assignment or
+/// `unset`; a per-command override applies only to its own command segment.
+/// YAML/TOML syntaxes (`KEY: "off"`,
 /// `KEY = "off"` without export...) are not shell settings and never count
 /// here. Python files use the `os.environ` form and its own reachability
 /// rules.
@@ -785,15 +786,15 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
         let mut covered = true;
         let mut saw_covered = false;
         for (k, line) in lines.iter().enumerate().skip(effective_at + 1) {
+            if line.trim() == "export CERULION_LOGIN_GATE=off"
+                && shell_block_depth(&lines[..k]) == 0
+                && shell_enclosing_functions(&lines[..k]).is_empty()
+            {
+                covered = true;
+                continue;
+            }
             for seg in line.split(['|', ';', '&']) {
                 if seg.trim().is_empty() {
-                    continue;
-                }
-                if seg.trim() == "export CERULION_LOGIN_GATE=off"
-                    && shell_block_depth(&lines[..k]) == 0
-                    && shell_enclosing_functions(&lines[..k]).is_empty()
-                {
-                    covered = true;
                     continue;
                 }
                 let overrides = shell_line_overrides_the_gate(seg);
@@ -1201,6 +1202,18 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
     assert!(file_sets_the_gate_off(
         sh,
         "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nexport CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nfalse && export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\ntrue || export CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nif [ -n \"$X\" ]; then export CERULION_LOGIN_GATE=off; fi\ncerulion topic list\n"
     ));
     assert!(file_sets_the_gate_off(
         sh,
