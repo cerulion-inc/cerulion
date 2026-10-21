@@ -702,6 +702,23 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         // The user stopped us. Say that and nothing else — the
         // observation was cut short, so it supports no claim about `topic` at all.
         RemoteResolve::Cancelled => CliError::Validation(cancelled_message(topic)),
+        RemoteResolve::CatalogRefused { robot, reason } => CliError::Validation(format!(
+            "robot '{}' refused to serve its topic catalog to LAN peers (not authorized), so \
+             '{topic}' was not searched there{}; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key",
+            sanitize_refusal_reason(&robot),
+            reason
+                .as_deref()
+                .map(|reason| {
+                    format!(
+                        ": the robot's authorizer reported '{}'",
+                        sanitize_refusal_reason(reason)
+                    )
+                })
+                .unwrap_or_default(),
+        )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
             "topic '{topic}' is announced by robot '{}' but could not be demanded: {} \
              — add the type's `.msg` under `schemas/` (or update the robot to serve its \
@@ -1566,15 +1583,17 @@ pub fn query_remote_topics_with_candidates(
             // robot lost to a panicked worker costs its rows and nothing else. The
             // gather has already named it at ERROR. The two sites below DO claim an
             // absence and read `is_complete()` accordingly.
-            cerulion_core::transport::discovery::query_robot_catalogs(
+            let catalogs = cerulion_core::transport::discovery::query_robot_catalogs(
                 session,
                 &robots,
                 CATALOG_GATHER_WINDOW,
             )
-            .replies
-            .into_iter()
-            .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
-            .collect()
+            .replies;
+            warn_on_catalog_refusals(&catalogs);
+            catalogs
+                .into_iter()
+                .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
+                .collect()
         }
         // A failed announce gather yields no robot identities — the demand-space
         // topics still carry the run; the announce error is surfaced on unwrap.
@@ -2306,6 +2325,7 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         // A cancelled resolve degrades to hex exactly like the others —
         // this seam renders no claim, so it has nothing to say about the wait.
         | SchemaResolve::Cancelled
+        | SchemaResolve::CatalogRefused { .. }
         | SchemaResolve::SchemaUnavailable { .. } => None,
     }
 }
@@ -2359,6 +2379,11 @@ pub enum RemoteResolve {
     /// A robot catalogs the topic, but its schema could not be resolved (not
     /// served / an empty reply / no wire layout). `cause` states why.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched.
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
 }
 
 /// Production remote resolve of `topic`'s ingress target —
@@ -2425,6 +2450,9 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
         // would re-create the exact false-absence claim this issue removed.
         SchemaResolve::DiscoveryNotConverged => RemoteResolve::DiscoveryNotConverged,
         SchemaResolve::Cancelled => RemoteResolve::Cancelled,
+        SchemaResolve::CatalogRefused { robot, reason } => {
+            RemoteResolve::CatalogRefused { robot, reason }
+        }
         SchemaResolve::SchemaUnavailable { robot, cause } => {
             RemoteResolve::SchemaUnavailable { robot, cause }
         }
@@ -2485,6 +2513,56 @@ enum SchemaResolve {
     Cancelled,
     /// A robot catalogs the topic but did not serve its schema.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched. The
+    /// authorizer's own reason travels with it so the refusal text can say
+    /// WHY instead of prescribing the wrong remedy.
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogTarget {
+    Found {
+        robot: String,
+        qualified: String,
+    },
+    Refused {
+        robot: String,
+        reason: Option<String>,
+    },
+    Missing,
+}
+
+fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> CatalogTarget {
+    if let Some((robot, qualified)) = catalogs.iter().find_map(|catalog| {
+        catalog.entries.iter().find_map(|entry| {
+            if entry.topic == topic {
+                entry
+                    .schema_name
+                    .as_ref()
+                    .map(|name| (catalog.robot.clone(), name.clone()))
+            } else {
+                None
+            }
+        })
+    }) {
+        return CatalogTarget::Found { robot, qualified };
+    }
+    match refused_catalog_robot(catalogs) {
+        Some((robot, reason)) => CatalogTarget::Refused { robot, reason },
+        None => CatalogTarget::Missing,
+    }
+}
+
+fn refused_catalog_robot(
+    catalogs: &[cerulion_core::CatalogReply],
+) -> Option<(String, Option<String>)> {
+    catalogs
+        .iter()
+        .find(|catalog| catalog.error.is_some())
+        .map(|catalog| (catalog.robot.clone(), catalog.error.clone()))
 }
 
 /// Whether to route this catalog/schema query through the shared
@@ -2506,9 +2584,8 @@ fn warn_on_catalog_refusals(catalogs: &[cerulion_core::CatalogReply]) {
         if let Some(reason) = &cat.error {
             tracing::warn!(
                 robot = %sanitize_display(&cat.robot),
-                reason = %reason,
-                "cerulion-netd: robot refused to serve its topic catalog (not authorized) — its \
-                 topics will not resolve"
+                reason = %sanitize_refusal_reason(reason),
+                "robot refused to serve its topic catalog (not authorized); its topics will not resolve"
             );
         }
     }
@@ -2593,22 +2670,14 @@ fn netd_resolve_topic_schema(
     let catalogs = gather.catalogs;
     warn_on_catalog_refusals(&catalogs);
     // Find the catalog entry for THIS topic that carries a qualified schema name.
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot, reason } => {
+            return Some(SchemaResolve::CatalogRefused { robot, reason });
+        }
         // Nothing matched. WHICH kind of nothing depends on whether netd had
         // completed a discovery pass — see `classify_unmatched_catalog`.
-        None => return Some(classify_unmatched_catalog(topic, gather.discovery)),
+        CatalogTarget::Missing => return Some(classify_unmatched_catalog(topic, gather.discovery)),
     };
     // LOCAL-FIRST: a catalog-named built-in / workspace type resolves from the
     // desk's own corpus with NO schema fetch (the wire fetch stays the fallback for a
@@ -2849,20 +2918,13 @@ fn resolve_remote_topic_schema_with_opts(
     // draw — the same demotion the netd plane applies at its own seam.
     let read_nothing_conclusive = gathered.replies.is_empty() || !gathered.is_complete();
     let catalogs = gathered.replies;
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
-        None => {
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot, reason } => {
+            mgr.close();
+            return SchemaResolve::CatalogRefused { robot, reason };
+        }
+        CatalogTarget::Missing => {
             mgr.close();
             // Nothing matched — but WHICH nothing? `catalogs` is what we
             // actually READ, so an empty one means we read nobody's catalog and have
@@ -3067,6 +3129,43 @@ pub(crate) fn sanitize_display(s: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// A remote authorizer's refusal reason is untrusted remote text: control
+/// characters (ESC, CR, LF, ...) and the Unicode line and paragraph
+/// separators become `?` so the error cannot inject terminal sequences or
+/// extra lines, and the text truncates at 200 chars
+/// with a `…` marker.
+pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut out = String::with_capacity(s.len().min(LIMIT));
+    let mut chars = s.chars();
+    for _ in 0..LIMIT {
+        match chars.next() {
+            // C0/C1 controls, the Unicode line and paragraph separators,
+            // and the bidi/format controls that reorder or hide text in a
+            // terminal all become `?`: a hostile LAN peer cannot smuggle
+            // terminal sequences, line breaks, or right-to-left overrides
+            // into a logged or printed refusal.
+            Some(
+                '\u{0000}'..='\u{001F}'
+                | '\u{007F}'..='\u{009F}'
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}',
+            ) => out.push('?'),
+            Some(other) => out.push(other),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Render the `ROBOTS` section of `topic list` — the presence-derived
@@ -5961,6 +6060,50 @@ mod tests {
         assert_eq!(sanitize_display(""), "");
     }
 
+    /// `sanitize_refusal_reason` neutralizes a remote authorizer's text for
+    /// terminal display: control characters become `?` and the text truncates
+    /// at 200 chars with `…`.
+    #[test]
+    fn sanitize_refusal_reason_replaces_controls_and_truncates() {
+        // An ANSI escape plus a newline can neither inject a CSI sequence
+        // nor forge a second error line.
+        assert_eq!(sanitize_refusal_reason("\u{1b}[2J\nnope"), "?[2J?nope");
+        assert_eq!(sanitize_refusal_reason("a\rb"), "a?b");
+        // Bidi/format controls and C1 controls are neutralized the same way:
+        // a remote reason cannot reorder or hide the text around it.
+        assert_eq!(sanitize_refusal_reason("a\u{202E}b"), "a?b");
+        // U+061C (Arabic Letter Mark) reorders surrounding text the same way.
+        assert_eq!(sanitize_refusal_reason("a\u{061C}b"), "a?b");
+        assert_eq!(sanitize_refusal_reason("\u{2066}hid"), "?hid");
+        assert_eq!(sanitize_refusal_reason("\u{200F}x"), "?x");
+        assert_eq!(sanitize_refusal_reason("a\u{0085}b"), "a?b");
+        assert_eq!(sanitize_refusal_reason("ok"), "ok");
+        // Exactly 200 chars is not truncated; 201 is, with the marker.
+        let exact: String = std::iter::repeat_n('x', 200).collect();
+        assert_eq!(sanitize_refusal_reason(&exact), exact);
+        let long: String = std::iter::repeat_n('x', 201).collect();
+        assert_eq!(sanitize_refusal_reason(&long), format!("{exact}\u{2026}"));
+    }
+
+    /// U+2028 LINE SEPARATOR cannot forge a second line in a displayed or
+    /// logged refusal.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_line_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2028}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
+    /// U+2029 PARAGRAPH SEPARATOR cannot forge a second line either.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_paragraph_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2029}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
     /// A hostile LAN-supplied robot name — from
     /// EITHER the announce-key robot chunk OR the mDNS TXT record — cannot
     /// inject terminal escapes into the rendered ROBOTS section, and the mDNS
@@ -8314,6 +8457,92 @@ mod tests {
             !m.contains("not found locally or on any discovered robot") && !m.contains("UNKNOWN"),
             "an internal routing bug must not masquerade as a discovery verdict: {m}"
         );
+    }
+
+    #[test]
+    fn refused_catalog_robot_returns_none_or_the_first_refusal() {
+        let unrefused = [cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "available",
+            [],
+        )];
+        assert_eq!(refused_catalog_robot(&unrefused), None);
+
+        let mixed = [
+            cerulion_core::transport::cerulion_q::build_catalog_reply("available", []),
+            cerulion_core::CatalogReply::refused("first", "not authorized"),
+            cerulion_core::CatalogReply::refused("second", "not authorized"),
+        ];
+        assert_eq!(
+            refused_catalog_robot(&mixed),
+            Some(("first".to_string(), Some("not authorized".to_string()))),
+            "catalog order chooses the first refusal"
+        );
+    }
+
+    #[test]
+    fn a_catalog_match_wins_over_refusals_and_an_unmatched_refusal_is_preserved() {
+        let refused = [cerulion_core::CatalogReply::refused(
+            "restricted",
+            "not authorized",
+        )];
+        assert_eq!(
+            catalog_target(&refused, "/camera"),
+            CatalogTarget::Refused {
+                robot: "restricted".to_string(),
+                reason: Some("not authorized".to_string()),
+            }
+        );
+
+        let found = cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "producer",
+            [cerulion_core::transport::cerulion_q::CatalogEntry {
+                topic: "/camera".to_string(),
+                schema_hash: None,
+                schema_name: Some("camera_msgs/Frame".to_string()),
+                provenance: cerulion_core::transport::cerulion_q::CatalogProvenance::Boot,
+                producer_count: None,
+                liveness: None,
+            }],
+        );
+        assert_eq!(
+            catalog_target(&[refused[0].clone(), found], "/camera"),
+            CatalogTarget::Found {
+                robot: "producer".to_string(),
+                qualified: "camera_msgs/Frame".to_string(),
+            },
+            "a target in any catalog wins over another robot's refusal"
+        );
+    }
+
+    #[test]
+    fn catalog_refusal_error_explains_lan_identity_and_sanitizes_robot() {
+        let message = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "robot".to_string(),
+                reason: Some("policy: paired peers only".to_string()),
+            },
+        )
+        .to_string();
+        assert_eq!(
+            message,
+            "robot 'robot' refused to serve its topic catalog to LAN peers (not authorized), \
+             so '/camera' was not searched there: the robot's authorizer reported 'policy: paired \
+             peers only'; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key"
+        );
+
+        let sanitized = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "ro\x1b[31mbot".to_string(),
+                reason: None,
+            },
+        )
+        .to_string();
+        assert!(!sanitized.contains('\x1b'), "{sanitized:?}");
     }
 
     /// The TRANSIENT path's classifier. Same rule as the netd
