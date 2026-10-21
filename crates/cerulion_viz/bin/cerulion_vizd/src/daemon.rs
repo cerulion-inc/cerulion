@@ -2349,7 +2349,7 @@ impl Ctx {
     fn robot_network(&self) -> Result<&NetworkManager, String> {
         self.manager.network().ok_or_else(|| {
             "cerulion-vizd is not network-configured, so it cannot reach a remote robot — run \
-             the daemon with its network default (scouting ON), i.e. WITHOUT \
+             the daemon with its network default, i.e. WITHOUT \
              CERULION_VIZD_NETWORK=off"
                 .to_string()
         })
@@ -4045,7 +4045,7 @@ impl Ctx {
                 format!(
                     "remote viz for '{topic}' from robot '{robot}' needs a network-configured \
                      daemon, but this cerulion-vizd is LOCAL-ONLY (CERULION_VIZD_NETWORK=off) — \
-                     restart it with its network default (scouting ON) to enable the remote arm"
+                     restart it with its network default to enable the remote arm"
                 ),
                 Some(topic),
             );
@@ -6403,7 +6403,7 @@ fn catalog_no_answer_error(robot: &str, topic: &str) -> String {
     format!(
         "robot '{robot}' did not answer a schema catalog (is it reachable, and is its gateway \
          serving schemas? try naming the type explicitly as '{topic}=pkg/Type', or add --connect \
-         <locator> if scouting can't reach it)"
+         <locator> (CERULION_VIZD_CONNECT) if discovery can't reach it)"
     )
 }
 

@@ -3037,7 +3037,7 @@ fn permissive_probe_refuses_an_ingress_topic_naming_the_loop() {
     // is fresh and only a HIT re-arms it), so the WARN token is required — the
     // debug repeat carries the same phrase and must not satisfy this.
     logs_assert(|lines: &[&str]| {
-        logged_at(lines, "WARN", "network INGRESS topic - echo-loop")
+        logged_at(lines, "WARN", "network INGRESS topic (echo-loop)")
             .map_err(|e| format!("the loop refusal names the ingress/echo-loop hazard — {e}"))
     });
 }
@@ -3188,7 +3188,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
             let loud = lines
                 .iter()
                 .filter(|l| {
-                    line_level(l) == Some(level) && (l.contains("(repeat - see the first warning)"))
+                    line_level(l) == Some(level) && (l.contains("(repeat; see the first warning)"))
                 })
                 .count();
             if loud != 0 {
@@ -3205,7 +3205,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
         // Counted AT DEBUG, not by text: a repeat re-emitted at `trace!` is
         // still one line, and the loud sweep above permits TRACE.
         let suppressed =
-            count_at_exclusively(lines, "DEBUG", &["(repeat - see the first warning)"])?;
+            count_at_exclusively(lines, "DEBUG", &["(repeat; see the first warning)"])?;
         if warns != 1 {
             return Err(format!("expected exactly 1 MISS warn, got {warns}"));
         }

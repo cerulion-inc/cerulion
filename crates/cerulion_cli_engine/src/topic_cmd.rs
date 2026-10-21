@@ -1081,19 +1081,23 @@ pub const CATALOG_GATHER_WINDOW: Duration = Duration::from_millis(250);
 /// map 1:1 onto zenoh locator strings and onto
 /// `NetworkConfig::{connect,listen}_endpoints`.
 ///
-/// `scouting` maps onto BOTH `multicast_scouting` and `gossip_scouting`. The
-/// struct DEFAULT (via `Default`/field init) keeps scouting OFF so engine
-/// unit + live tests stay hermetic (an isolated session discovers only what
-/// its explicit locators reach); the CLI dispatch (`topic list`) flips it ON
-/// — that's where the automagic default lives, NOT in this struct.
+/// `scouting` selects the AUTOMAGIC path: the discovery ladder (mDNS, cache,
+/// hostname) runs, the session has gossip scouting on, and zenoh multicast
+/// scouting follows
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off).
+/// `false` keeps engine unit + live tests hermetic (an isolated session
+/// discovers only what its explicit locators reach); the CLI dispatch
+/// (`topic list`) sets it, that's where the automagic default lives, NOT in
+/// this struct.
 pub struct RemoteTopicsOptions {
     /// Remote locators to connect to (e.g. `tcp/192.168.123.99:7683` — a
     /// permissive robot's gateway listens on the well-known 7683).
     pub connect: Vec<String>,
     /// Local locators to listen on (e.g. `tcp/0.0.0.0:7447`).
     pub listen: Vec<String>,
-    /// Enable multicast + gossip scouting (LAN auto-discovery). The CLI-path
-    /// default is `true` (automagic); tests keep it `false` for hermeticity.
+    /// The automagic path: ladder + gossip, multicast per
+    /// `CERULION_MULTICAST_SCOUTING`. The CLI-path default is `true`; tests keep
+    /// it `false` for hermeticity.
     pub scouting: bool,
 }
 
@@ -1108,17 +1112,18 @@ impl RemoteTopicsOptions {
 }
 
 /// Build the automagic `topic list` discovery
-/// options — THE one place the CLI-path scouting-ON default lives. The binary
+/// options, THE one place the CLI-path automagic default lives. The binary
 /// dispatch (`cerulion topic list`) is a thin passthrough to this fn, so the
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
-/// regression flipping scouting off would silently disable zero-flag discovery.
+/// regression flipping `scouting` off would silently disable zero-flag
+/// discovery (no ladder, no netd query plane).
 ///
 /// - `no_network == true` (`--local` or `--no-network`), or the environment
 ///   kill-switch, yields `None`: skip the remote query entirely.
-/// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
-///   on the LAN are discoverable with zero flags) and any `--connect` /
-///   `--listen` locators carried ADDITIVELY (they extend the scouting
-///   session; they never replace it).
+/// - otherwise ⇒ `Some` with `scouting` set (the ladder finds unpaired robots
+///   on the LAN with zero flags) and any `--connect` / `--listen` locators
+///   carried ADDITIVELY (they extend the discovered set; they never replace
+///   it).
 pub fn remote_discovery_options(
     no_network: bool,
     connect: Vec<String>,
@@ -1372,8 +1377,13 @@ pub fn query_remote_topics_with_scan(
 ) -> CliResult<RemoteDiscovery> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
+    // This machine's own netd and gateway processes answer the browse under its
+    // identity on its own addresses; they are not remote robots.
     let ladder_peers = if opts.scouting {
-        crate::discovery_ladder::discover_peers(scan)
+        cerulion_discovery::ladder::drop_this_hosts_gateways(
+            crate::discovery_ladder::discover_peers(scan),
+            &cerulion_core::graph::robot_identity_from_env(),
+        )
     } else {
         Vec::new()
     };
@@ -2185,7 +2195,7 @@ pub fn fetch_remote_schema(
     // "no robot serves this type" is a claim with no evidence behind it (and it is
     // reached exactly when netd is broken, which is when the desk is most likely to
     // get it wrong).
-    let mgr = match open_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
+    let mgr = match open_fallback_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(requested = %requested, error = %e,
@@ -2297,11 +2307,11 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         None,
         // This seam makes NO absence claim (every failure
         // collapses to `None` below and the caller degrades to hex), and
-        // `topic_echo` calls it UNCONDITIONALLY for every LOCAL topic — so
-        // inheriting the first-contact wait stalled `cerulion topic echo
-        // /my/local/topic` for the full ceiling, printed a counter, and closed
-        // with "nothing on the network answered", all before the first frame of a
-        // topic that was streaming in local SHM the whole time.
+        // `topic_echo` calls it for a LOCAL topic's first undecodable frame, so
+        // inheriting the first-contact wait would stall `cerulion topic echo
+        // /my/local/topic` for the full ceiling, print a counter, and close
+        // with "nothing on the network answered", on a topic that is streaming
+        // in local SHM the whole time.
         ResolveWait::no_wait(),
     ) {
         SchemaResolve::Found { robot, walker, .. } => Some((robot, walker)),
@@ -2865,7 +2875,7 @@ fn resolve_remote_topic_schema_with_opts(
     // user as PROOF the topic does not exist. Nothing was searched in any of them, so
     // they report non-convergence (and say why, loudly). This needs no grace and adds
     // no wait — it is pure classification.
-    let mgr = match open_discovery_session(connect, listen, scouting) {
+    let mgr = match open_fallback_discovery_session(connect, listen, scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(topic = %topic, error = %e,
@@ -2972,6 +2982,67 @@ fn resolve_remote_topic_schema_with_opts(
     }
 }
 
+/// The `NetworkConfig` of a CLI discovery session. Pure. `scouting` (the
+/// automagic path) turns gossip on; `multicast` (the caller's read of
+/// `CERULION_MULTICAST_SCOUTING`) turns multicast scouting on only together
+/// with `scouting`. The connect phase is always bounded.
+fn discovery_session_config(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+    multicast: bool,
+) -> cerulion_core::transport::network::NetworkConfig {
+    cerulion_core::transport::network::NetworkConfig {
+        connect_endpoints: connect.to_vec(),
+        listen_endpoints: listen.to_vec(),
+        multicast_scouting: scouting && multicast,
+        gossip_scouting: scouting,
+        bounded_connect: true,
+        ..cerulion_core::transport::network::NetworkConfig::default()
+    }
+}
+
+/// Open the transient session a schema fallback (netd not applicable or
+/// unreachable) searches. With `scouting` set, the discovery ladder runs first
+/// and its candidates that accept a TCP connect within
+/// [`crate::discovery_ladder::LADDER_PROBE_TIMEOUT`] are appended to `connect`,
+/// because a session with multicast scouting off reaches only its connect
+/// endpoints. `connect` itself is kept verbatim. If the open fails with ladder
+/// candidates folded in, it is retried once with `connect` alone.
+fn open_fallback_discovery_session(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+) -> CliResult<cerulion_core::transport::network::NetworkManager> {
+    if !scouting {
+        return open_discovery_session(connect, listen, false);
+    }
+    let ladder_peers = cerulion_discovery::ladder::drop_this_hosts_gateways(
+        crate::discovery_ladder::discover_peers(false),
+        &cerulion_core::graph::robot_identity_from_env(),
+    );
+    let ladder_locators: Vec<String> = ladder_peers.iter().map(|p| p.locator.clone()).collect();
+    let mut reachable = crate::discovery_ladder::probe_reachable_locators(
+        &ladder_locators,
+        crate::discovery_ladder::LADDER_PROBE_TIMEOUT,
+    );
+    reachable.extend(connect.iter().cloned());
+    let plan = crate::discovery_ladder::plan_connect_set(connect, &ladder_peers, &reachable);
+    match open_discovery_session(&plan.connect, listen, true) {
+        Ok(mgr) => Ok(mgr),
+        Err(first_err) if !plan.folded_ladder.is_empty() => {
+            tracing::warn!(
+                error = %first_err,
+                dropped = ?plan.folded_ladder,
+                "a discovered candidate poisoned the fallback discovery session open; retrying \
+                 with the given locators only"
+            );
+            open_discovery_session(connect, listen, true)
+        }
+        Err(first_err) => Err(first_err),
+    }
+}
+
 /// Open ONE bounded-connect discovery session over `connect`/`listen`
 /// (the EPHEMERAL `topic list` session — the one place `bounded_connect` opts
 /// in, so a black-hole locator can't stall the open past the 1 s bound). A
@@ -2984,18 +3055,11 @@ fn open_discovery_session(
     listen: &[String],
     scouting: bool,
 ) -> CliResult<cerulion_core::transport::network::NetworkManager> {
-    use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-    let config = NetworkConfig {
-        connect_endpoints: connect.to_vec(),
-        listen_endpoints: listen.to_vec(),
-        // Scouting is caller-controlled — ON for the automagic CLI
-        // path, OFF for hermetic tests (reaches exactly the named locators).
-        multicast_scouting: scouting,
-        gossip_scouting: scouting,
-        bounded_connect: true,
-        ..NetworkConfig::default()
-    };
-    let mgr = NetworkManager::new(config);
+    use cerulion_core::transport::network::NetworkManager;
+    let multicast = scouting && cerulion_core::transport::network::multicast_scouting_from_env();
+    let mgr = NetworkManager::new(discovery_session_config(
+        connect, listen, scouting, multicast,
+    ));
     mgr.session().map_err(|e| {
         CliError::Validation(format!(
             "failed to open the zenoh discovery session: {e} — check the \
@@ -4208,11 +4272,16 @@ pub fn topic_echo_with_scope(
     let mut consecutive_wait_errors: u32 = 0;
 
     // A REMOTE topic already carries the walker seeded during the
-    // ingress resolve — reuse it (no second discovery). A LOCAL topic keeps the
-    // earlier behavior: a ONE-TIME best-effort remote resolve as the FALLBACK for
-    // a frame carrying a type the desk never compiled (learn the type from a
-    // robot's catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk
-    // writes). A failed resolve is a `None` walker — the local path is unchanged.
+    // ingress resolve, reuse it (no second discovery). A LOCAL topic in automatic
+    // scope gets a ONE-TIME best-effort remote resolve as the FALLBACK for a frame
+    // carrying a type the desk never compiled (learn the type from a robot's
+    // catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk writes).
+    // That resolve runs on the FIRST frame whose schema hash the local walker
+    // cannot name, the same lazy rung `topic info` uses, never before the loop:
+    // the resolve can take seconds (a netd round trip, or the discovery ladder
+    // when netd is unreachable), and frames the desk can decode are displayed
+    // without waiting for it. A failed resolve is a `None` walker, the local
+    // path is unchanged.
     //
     // WHERE this observer's frames are supposed to come from, captured
     // before `source` is consumed below — it is the whole point of the silence
@@ -4221,10 +4290,11 @@ pub fn topic_echo_with_scope(
     // nothing").
     let source_desc = observer_source_description(&source);
 
-    let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
+    let mut remote_walker_pending =
+        matches!(source, TopicSource::Local) && scope != TopicScope::Local;
+    let mut remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
-        TopicSource::Local if scope == TopicScope::Local => None,
-        TopicSource::Local => resolve_remote_walker_for_topic(topic),
+        TopicSource::Local => None,
     };
     // The remote-fallback breadcrumb is emitted
     // LAZILY — only on the FIRST frame that ACTUALLY decodes via the remote
@@ -4324,6 +4394,14 @@ pub fn topic_echo_with_scope(
                     // fallback, hash-only hex otherwise. The one-time remote
                     // breadcrumb is emitted LAZILY inside — only when a frame
                     // ACTUALLY decodes remotely (factual, not predictive).
+                    if remote_walker_pending
+                        && local_walker
+                            .schema_name_for_hash(header.schema_hash)
+                            .is_none()
+                    {
+                        remote_walker_pending = false;
+                        remote_walker = resolve_remote_walker_for_topic(topic);
+                    }
                     write_custom_decode(
                         writer,
                         topic,
@@ -6628,6 +6706,22 @@ mod tests {
         );
         assert!(opts.connect.is_empty() && opts.listen.is_empty());
         assert!(!opts.has_endpoints());
+    }
+
+    /// A CLI discovery session runs gossip on the automagic path and adds
+    /// multicast scouting only when the switch is also on.
+    #[test]
+    fn discovery_session_config_is_multicast_off_unless_both_flags() {
+        let c = vec!["tcp/10.0.0.1:7683".to_string()];
+        let auto = discovery_session_config(&c, &[], true, false);
+        assert!(auto.gossip_scouting && !auto.multicast_scouting);
+        assert!(auto.bounded_connect);
+        assert_eq!(auto.connect_endpoints, c);
+        let opted_in = discovery_session_config(&c, &[], true, true);
+        assert!(opted_in.gossip_scouting && opted_in.multicast_scouting);
+        // Hermetic sessions never scout, whatever the switch says.
+        let hermetic = discovery_session_config(&c, &[], false, true);
+        assert!(!hermetic.gossip_scouting && !hermetic.multicast_scouting);
     }
 
     /// `--no-network` skips the remote query

@@ -138,13 +138,15 @@ remove them before committing.
   allow-list the shared permissive session cannot represent), on non-Unix hosts,
   and when netd registration fails. On the permissive default path netd hosts the
   plane and no child is spawned.
-- **Peer fold at boot**: before `TransportManager::init`, `fold_cached_peers` adds
-  connect endpoints from the same sources the CLI's discovery ladder trusts (the
-  cached peer file, env/config/hostname convention), pre-filtered by the bounded
-  TCP reachability probe, so a desk reaches a robot it has seen before with no
-  environment variable, even where multicast scouting is degraded. Dialling a
-  cached locator is load-bearing, not just faster: a scouting-only session's query
-  plane can converge while its data plane carries nothing.
+- **Peer fold at boot**: before `TransportManager::init`, `fold_discovered_peers`
+  adds connect endpoints from the explicit `CERULION_NETD_CONNECT` locators, one
+  800 ms `_cerulion._tcp` browse (`cerulion_mdns::browse_rung`) and the cached peer
+  file, the discovered rows pre-filtered by the bounded TCP reachability probe,
+  so a desk reaches a listening LAN robot with no environment variable. The
+  session runs with zenoh multicast scouting OFF (`CERULION_MULTICAST_SCOUTING=on`
+  re-enables it), so these connect endpoints are how it finds peers. Dialling a
+  discovered locator is load-bearing, not just faster: a scouting-only session's
+  query plane can converge while its data plane carries nothing.
 - **Beacon**: the `_cerulion._tcp` beacon is raised when the embedded egress
   gateway boots: the instant the machine becomes a producer and the session's
   listener is bound, so the advertised SRV port is a port something really listens
@@ -321,12 +323,12 @@ wrong.
   genuinely shared across planes is `cerulion_core`'s
   `IngressInjector::reinject_raw` primitive. Links `cerulion_link` (→ iroh)
   unconditionally, so it is EXCLUDED from `default-members`.
-- **`cerulion_mdns`**: the leaf crate owning the ADVERTISE half of the
-  `_cerulion._tcp` beacon: the service type, the TXT vocabulary,
-  `srv_port_from_listen_endpoints`, `MdnsAdvertiseGuard`. `CERULION_SERVICE_TYPE`
-  is defined once here and imported by the browser, so the one string that must
-  match on both sides cannot drift. The BROWSE half stays in
-  `cerulion_cli_engine::mdns_discovery` (netd never browses). It is a crate
+- **`cerulion_mdns`**: the leaf crate owning the `_cerulion._tcp` beacon: the
+  service type, the TXT vocabulary, `srv_port_from_listen_endpoints`,
+  `MdnsAdvertiseGuard`, and the bounded browse `browse_rung` that netd's boot
+  fold and the CLI ladder both call. `CERULION_SERVICE_TYPE` is defined once
+  here. The `eid=` reader (`resolve_robot_eid`) stays in
+  `cerulion_cli_engine::mdns_discovery`. It is a crate
   because BOTH netd and the fallback `graph run-gateway` child advertise, and the
   engine already depends on netd; importing the beacon from the engine would be
   cyclic, and `cerulion_discovery` is pinned mdns-sd-free.
