@@ -1259,7 +1259,7 @@ new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `f
 3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
    for a family.
 
-`families::route` tries the families first, then the nested sets, with the same
+`families::route` tries the nested sets first, then the families, with the same
 logging, bridge and login-gate order. A set hands over its verbs and never sees the
 parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
 refuses, when the command is built, a parent that is not a verb, a verb with no name
