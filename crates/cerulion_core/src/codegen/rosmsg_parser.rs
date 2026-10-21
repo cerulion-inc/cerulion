@@ -113,7 +113,7 @@ impl QuoteScan {
     }
 
     /// Feed one character. Returns true when `c` is outside every quoted
-    /// string, so the caller may treat it as syntax (`#`, `,`).
+    /// string, so the caller may treat it as syntax (the `,` between items).
     fn outside(&mut self, c: char) -> bool {
         if let Some(q) = self.quote {
             if self.escaped {
