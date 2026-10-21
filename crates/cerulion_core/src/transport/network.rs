@@ -2093,9 +2093,7 @@ fn build_catalog_reply_from_bridge(
     robot: &str,
 ) -> cerulion_q::CatalogReply {
     // Held for the WHOLE build: a `SchemaServingHandles::replace` in flight
-    // must not interleave its new snapshot set with the old topic/hash maps,
-    // and a host restart's `replace_then` retires the prior run's bridge
-    // topics under this same lock, so the registry read below is of one run.
+    // must not interleave its new snapshot set with the old topic/hash maps.
     let _snapshot_guard = catalog
         .snapshot_lock
         .lock()
@@ -3322,10 +3320,6 @@ pub struct NetworkManager {
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
     demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
-    /// Counts posture writes; bumped only while `demand_authorizer_parts` is
-    /// held, so a write token names exactly one [`Self::set_lan_access`]
-    /// call even when two calls store the same [`LanAccess`] value.
-    lan_access_generation: AtomicU64,
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
@@ -3389,7 +3383,6 @@ impl NetworkManager {
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
-            lan_access_generation: AtomicU64::new(0),
             lan_bridges: Mutex::new(None),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
                 lan_access,
@@ -3434,7 +3427,10 @@ impl NetworkManager {
 
     /// Set the LAN posture applied in front of the installed demand authorizer.
     /// Set it before the gateway boots: opening access later does not replay topic
-    /// announces withheld while paired. Switching to [`LanAccess::Paired`] withdraws
+    /// announces withheld while paired. A host that builds its gateway while
+    /// paired and opens access afterwards replays those announces itself (the
+    /// embedded Android runtime announces every registered topic when its start
+    /// commits). Switching to [`LanAccess::Paired`] withdraws
     /// every retained egress-topic announce token and disables every LAN egress
     /// bridge. The bridge manager refuses LAN enables until access is opened again;
     /// reopening permits demands but does not replay withheld announces.
@@ -3442,31 +3438,11 @@ impl NetworkManager {
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
-        self.set_lan_access_tracked(access);
+        self.apply_lan_access(access);
     }
 
-    /// [`Self::set_lan_access`], returning a token that names this write.
-    /// Pass the token to [`Self::set_lan_access_if_current`] to change the
-    /// posture again only while no other write has happened since.
-    pub fn set_lan_access_tracked(&self, access: LanAccess) -> u64 {
-        match self.apply_lan_access(access, None) {
-            Some(write) => write,
-            None => unreachable!("an unconditional posture write always applies"),
-        }
-    }
-
-    /// Set the posture only while the last write is still the one `write`
-    /// names (a token from [`Self::set_lan_access_tracked`] or this method).
-    /// Returns the new write's token, or `None` (posture untouched) when any
-    /// other write happened since - even one that stored the same value.
-    /// The check and the write are one atomic step against every other
-    /// posture write.
-    pub fn set_lan_access_if_current(&self, write: u64, access: LanAccess) -> Option<u64> {
-        self.apply_lan_access(access, Some(write))
-    }
-
-    fn apply_lan_access(&self, access: LanAccess, expected: Option<u64>) -> Option<u64> {
-        let (bridges, write, released) = {
+    fn apply_lan_access(&self, access: LanAccess) {
+        let (bridges, released) = {
             // Test seam: the announce/demand race tests place the closer
             // HERE - proven to be at the write lock's threshold, so the
             // 100 ms blocked check measures the gate, not a spawn delay.
@@ -3492,12 +3468,6 @@ impl NetworkManager {
                 .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let current = self.lan_access_generation.load(Ordering::SeqCst);
-            if expected.is_some_and(|expected| expected != current) {
-                return None;
-            }
-            let write = current.wrapping_add(1);
-            self.lan_access_generation.store(write, Ordering::SeqCst);
             parts.0 = access;
             self.lan_paired
                 .store(access == LanAccess::Paired, Ordering::SeqCst);
@@ -3530,7 +3500,7 @@ impl NetworkManager {
             // zenoh declaration never runs under the authorizer parts lock.
             drop(parts);
             let released = self.apply_ingress_posture(access == LanAccess::Paired);
-            (bridges, write, released)
+            (bridges, released)
         };
         drop(released);
         // Every lock above is released before these waits: a gateway pass that
@@ -3548,7 +3518,6 @@ impl NetworkManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
         }
-        Some(write)
     }
 
     /// The LAN posture applied in front of the installed demand authorizer.
@@ -6273,68 +6242,6 @@ mod tests {
             ["/c", "/b"],
             "an unchanged set is not re-snapshotted"
         );
-    }
-
-    /// A catalog GET must see one generation during a host restart: the
-    /// bridge retirement runs inside `replace_then`'s snapshot critical
-    /// section, so a reader cannot pair the new boot set with a prior-run
-    /// bridge entry (which it would list as `Runtime`). Hand oracle: while
-    /// retirement runs, the catalog's snapshot lock is held; the reply after
-    /// it lists only the new run's topic, as `Boot`.
-    #[test]
-    fn a_catalog_reader_cannot_see_the_new_snapshot_before_the_retirement() {
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        use std::sync::{Arc, Mutex};
-
-        let bridge = TopicBridgeManager::new();
-        bridge.register_topic("/run_one/cam").expect("register old");
-        bridge.register_topic("/run_two/cam").expect("register new");
-        let snapshot_lock = Arc::new(Mutex::new(()));
-        let catalog = CatalogSource {
-            hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(Mutex::new(HashSet::new())),
-            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
-            hash_names: Arc::new(Mutex::new(HashMap::new())),
-            producer_probe: None,
-            liveness: None,
-            liveness_clock: None,
-            snapshot_lock: Arc::clone(&snapshot_lock),
-        };
-        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
-            Arc::clone(&catalog.topic_schemas),
-            Arc::clone(&catalog.hash_names),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            snapshot_lock,
-            Arc::clone(&catalog.hashes),
-            Arc::clone(&catalog.boot_topics),
-        );
-
-        let (_prior, dropped) = handles.replace_then(
-            &crate::transport::gateway::SchemaServing {
-                served_topics: vec!["/run_two/cam".to_string()],
-                ..Default::default()
-            },
-            || {
-                assert!(
-                    matches!(
-                        catalog.snapshot_lock.try_lock(),
-                        Err(std::sync::TryLockError::WouldBlock)
-                    ),
-                    "a catalog reader must be locked out until the retirement ends"
-                );
-                bridge
-                    .unregister_topics_except(&["/run_two/cam".to_string()])
-                    .expect("unregister")
-            },
-        );
-        assert_eq!(dropped, 1);
-        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let provenance: Vec<(&str, CatalogProvenance)> = reply
-            .entries
-            .iter()
-            .map(|e| (e.topic.as_str(), e.provenance))
-            .collect();
-        assert_eq!(provenance, [("/run_two/cam", CatalogProvenance::Boot)]);
     }
 
     #[test]

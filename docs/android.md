@@ -188,6 +188,7 @@ The JSON passed to `start` can look like this:
 ```json
 {
   "listen": ["tcp/0.0.0.0:7683"],
+  "lan_access": "paired",
   "record": {"file": "app.mcap"},
   "publish": [
     {
@@ -285,8 +286,10 @@ refused too: no host on the network can publish into the app's topics. The robot
 still appear in discovery, but topic announce tokens are withheld so the LAN
 does not learn topic names; `topic list` warns that the robot refused to serve
 its catalog. The posture stays in front of every installed demand authorizer.
-Choose the posture at runtime startup with the app's `lan_access` key; opening
-access after a paired start does not replay withheld announcements. A LAN peer
+Choose the posture at runtime startup with the app's `lan_access` key. A start
+keeps access paired while it builds the gateway and opens the configured posture
+only once every component is ready; an `open` start announces its topics at that
+moment. A LAN peer
 carries no paired identity, and an app does not host the paired remote plane (see
 [Remote plane](remote_plane.md)), so under `paired` the app's topic data stays
 on the device. For local development on
@@ -305,8 +308,10 @@ new runtime and reads the latest intent extras.
 Release builds ignore the `lan_access` extra, log a warning, and keep the
 paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
 `paired`.
-Stopping the runtime closes LAN access and revokes every registered bridge
-grant, so demand workers cannot restore grants from an earlier open run.
+Stopping the runtime, or a start that fails, closes LAN access, withdraws every
+topic announcement, drops every registered bridge grant and empties the served
+catalog and schemas, so demand workers cannot restore grants from an earlier
+open run and no LAN peer sees the topics of a run that is not running.
 
 The Android emulator's network sits behind NAT and does not pass multicast to
 the host, so test discovery from the device itself or from a physical device
