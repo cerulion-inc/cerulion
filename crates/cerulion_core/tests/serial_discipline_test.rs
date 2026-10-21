@@ -536,6 +536,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point for the raw-FFI half of the same contract",
     ),
     (
+        "cdylib_shm_fd_handoff_iox2_test.rs",
+        "subprocess_child_shm_fd_handoff",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` in a fresh process, since its descriptor table is the subject",
+    ),
+    (
         "cdylib_tracing_stopgap_test.rs",
         "subprocess_child_discard_probe",
         "child",
