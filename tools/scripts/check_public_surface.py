@@ -240,11 +240,12 @@ def in_docs_set(rel):
 # ---------------------------------------------------------------------------
 
 
-def lex_rust(src):
+def lex_rust(src, keep_strings=False):
     """Return (code_view, literals). `code_view` is `src` with every comment and
     every string body blanked to spaces (same length, newlines kept) so brace
     counting, pattern search and line numbers stay exact; `literals` is a list
-    of (line, body) for every string literal outside comments."""
+    of (line, body) for every string literal outside comments. With
+    `keep_strings`, only the comments are blanked."""
     n = len(src)
     out = list(src)
     literals = []
@@ -293,7 +294,8 @@ def lex_rust(src):
             body = src[start:end]
             literals.append((line, body))
             line += body.count("\n")
-            blank(start, end)
+            if not keep_strings:
+                blank(start, end)
             i = end + 1 + len(hashes)
             continue
         if c == '"' or (c == "b" and i + 1 < n and src[i + 1] == '"'):
@@ -306,7 +308,8 @@ def lex_rust(src):
                     line += 1
                 i += 1
             literals.append((line - src.count("\n", start, i), src[start:i]))
-            blank(start, i)
+            if not keep_strings:
+                blank(start, i)
             i += 1
             continue
         if c == "'":
@@ -314,7 +317,8 @@ def lex_rust(src):
             if i + 2 < n and (src[i + 2] == "'" or src[i + 1] == "\\"):
                 j = src.find("'", i + 2 if src[i + 1] != "\\" else i + 3)
                 if j > 0:
-                    blank(i + 1, j)
+                    if not keep_strings:
+                        blank(i + 1, j)
                     i = j + 1
                     continue
             i += 1
@@ -552,10 +556,18 @@ FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#
 NESTED_PARENT_RE = re.compile(r'^const PARENT: &str = "([a-z][a-z0-9-]*)";$', re.M)
 
 
+def without_comments(src):
+    """`src` with every Rust comment removed and string literals kept, each
+    line's trailing blanks trimmed, so a declaration inside a comment is never
+    read as code."""
+    return "\n".join(line.rstrip() for line in lex_rust(src, keep_strings=True)[0].split("\n"))
+
+
 def module_verbs(path, fsrc):
     """The verbs of one family or nested-verb module: the subtree of the one
-    `Subcommand` enum no other enum in the module nests."""
-    fam = parse_enums(FAMILY_ENUM_RE.finditer(fsrc))
+    `Subcommand` enum no other enum in the module nests. Comments are not
+    code, so an enum inside one is never a verb."""
+    fam = parse_enums(FAMILY_ENUM_RE.finditer(without_comments(fsrc)))
     nested = {d["sub"] for variants in fam.values() for d in variants.values()}
     roots = [e for e in fam if e not in nested]
     if not roots:
@@ -585,9 +597,12 @@ def parse_cli_tree(src, family_srcs=(), nested_srcs=()):
             tree[verb] = node
     for path, fsrc in nested_srcs:
         # A nested verb set's verbs join the subtree of the verb it names.
-        parent = NESTED_PARENT_RE.search(fsrc)
-        if not parent:
-            raise CannotRun("%s: a nested verb set declares no `const PARENT: &str = \"<verb>\";`, so its parent verb cannot be established" % path)
+        # Exactly one declaration, read outside comments: a commented-out
+        # parent is not the one the binary uses.
+        parents = list(NESTED_PARENT_RE.finditer(without_comments(fsrc)))
+        if len(parents) != 1:
+            raise CannotRun("%s: a nested verb set declares %d `const PARENT: &str = \"<verb>\";` lines, expected exactly one, so its parent verb cannot be established" % (path, len(parents)))
+        parent = parents[0]
         if parent.group(1) not in tree:
             raise CannotRun("%s: nested verbs are added under `%s`, which is not a verb" % (path, parent.group(1)))
         target = tree[parent.group(1)]
@@ -2266,9 +2281,15 @@ def self_test(out=sys.stdout):
     nested_src = 'const PARENT: &str = "graph";\n\n#[derive(Subcommand)]\nenum GraphExtra {\n    Inspect {\n        name: String,\n    },\n}\n'
     tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", nested_src)])
     arm("verb-tree-nested", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    # A parent or an enum inside a comment is not code: the real declaration decides.
+    commented = '/*\nconst PARENT: &str = "nope";\n*/\n// const PARENT: &str = "nope";\n/*\n#[derive(Subcommand)]\nenum Ghost {\n    Haunt,\n}\n*/\n' + nested_src
+    tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", commented)])
+    arm("verb-tree-nested-commented-decoys", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
     for label, bad in (("verb-tree-nested-duplicate", nested_src.replace("Inspect {", "Run {")),
                        ("verb-tree-nested-unknown-parent", nested_src.replace('"graph"', '"nope"')),
-                       ("verb-tree-nested-no-parent", nested_src.replace('const PARENT: &str = "graph";', ""))):
+                       ("verb-tree-nested-no-parent", nested_src.replace('const PARENT: &str = "graph";', "")),
+                       ("verb-tree-nested-two-parents", 'const PARENT: &str = "schema";\n' + nested_src),
+                       ("verb-tree-nested-only-commented-parent", nested_src.replace('const PARENT: &str = "graph";', '/*\nconst PARENT: &str = "graph";\n*/'))):
         try:
             parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", bad)])
             arm(label, False, "accepted")

@@ -2609,9 +2609,9 @@ fn discover_workspace() -> CliResult<CerulionWorkspace> {
 }
 
 /// The workspace for a verb that also works outside one: `None` when the
-/// current directory is in no workspace, and any other discovery failure (an
-/// unreadable directory or `Cargo.toml`) returned, so the verb never quietly
-/// drops the workspace types it was asked to name.
+/// current directory is in no workspace, and any other discovery failure (a
+/// workspace `Cargo.toml` that cannot be read) returned, so the verb never
+/// quietly drops the workspace types it was asked to name.
 fn discover_optional_workspace() -> CliResult<Option<CerulionWorkspace>> {
     match discover_workspace() {
         Ok(ws) => Ok(Some(ws)),

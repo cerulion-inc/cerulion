@@ -18,7 +18,8 @@ use cerulion_cli_engine::topic_cmd::introspect::{
     topic_bw_with_scope, topic_type_with_scope, type_local_topics, InternalTopics, TopicType,
 };
 use cerulion_cli_engine::topic_cmd::{
-    local_walker_from_workspace, TopicInfo, TopicScope, STD_MSGS_STRING_SCHEMA_HASH,
+    local_walker_from_workspace, observer_pacing_engaged_count, TopicInfo, TopicScope,
+    STD_MSGS_STRING_SCHEMA_HASH,
 };
 use cerulion_core::{PubSubEvent, WireHeader};
 use serial_test::serial;
@@ -294,10 +295,21 @@ fn topic_type_waits_past_an_event_that_carried_no_sample() {
     let _net = EnvGuard::set("CERULION_NETWORK", "off");
     let topic = unique_topic("type_early");
     let writer = RawTopicWriter::new(&topic, true);
+    let paced_before = observer_pacing_engaged_count();
     let ty = type_while(&topic, || {
-        // The first wait returns early with nothing; the frame comes later.
-        writer.ring_without_a_sample();
-        std::thread::sleep(Duration::from_millis(200));
+        // Ring events with no sample until the probe has taken a run of
+        // early, empty returns and kept waiting: its pacing floor engages
+        // only after that run, so the count moving is the handshake. Only
+        // then does the frame come.
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while observer_pacing_engaged_count() == paced_before {
+            assert!(
+                Instant::now() < deadline,
+                "the probe never waited past an event with no sample"
+            );
+            writer.ring_without_a_sample();
+            std::thread::sleep(Duration::from_millis(1));
+        }
         writer.publish(&build_string_frame(0, 1_000, "late"));
     });
     assert_eq!(ty.as_deref(), Ok("std_msgs/String"));

@@ -737,27 +737,31 @@ pub fn discovered_robots(disc: &super::RemoteDiscovery) -> Vec<String> {
 /// else `None`.
 ///
 /// Each robot in `discovered` (every robot discovery found, an mDNS-only
-/// peer the catalog gather does not ask included) must have answered with a
+/// peer the catalog gather does not ask included) must have served a
 /// catalog in `gather`: a robot never asked, one whose request timed out or
-/// got no decodable answer, and one whose worker panicked in this binary say
-/// nothing about their topics. The note names
-/// each one so the result is never silently short.
+/// got no decodable answer, one that refused to serve its catalog (a reply
+/// carrying an error, which holds no entries), and one whose worker panicked
+/// in this binary say nothing about their topics. The note names each one so
+/// the result is never silently short.
 pub fn unsearched_robots_note<'a>(
     discovered: impl IntoIterator<Item = &'a str>,
     gather: &'a super::CatalogGather,
 ) -> Option<String> {
+    let (served, refused): (Vec<_>, Vec<_>) =
+        gather.replies.iter().partition(|c| c.error.is_none());
     let answered: std::collections::BTreeSet<&str> =
-        gather.replies.iter().map(|c| c.robot.as_str()).collect();
+        served.iter().map(|c| c.robot.as_str()).collect();
     let unsearched: std::collections::BTreeSet<String> = discovered
         .into_iter()
         .chain(gather.panicked.iter().map(String::as_str))
+        .chain(refused.iter().map(|c| c.robot.as_str()))
         .filter(|robot| !answered.contains(robot))
         .map(super::sanitize_display)
         .collect();
     (!unsearched.is_empty()).then(|| {
         format!(
-            "remote: {} robot(s) not searched: no catalog answer from {}, so their topics of \
-             this type are not listed\n",
+            "remote: {} robot(s) not searched: no catalog from {}, so their topics of this \
+             type are not listed\n",
             unsearched.len(),
             unsearched.into_iter().collect::<Vec<_>>().join(", ")
         )
@@ -828,7 +832,11 @@ pub fn topic_find(
 /// The topic is opened exactly as `topic info` opens it (a local producer
 /// directly; a remote robot's topic through the network daemon unless the
 /// scope is local) and its first frame's schema hash is named by the same
-/// ladder: the local walker, then the remote one. A missing topic is the
+/// ladder: the local walker, then the remote one. For a local topic the remote
+/// step is the `topic echo` schema lookup ([`super::resolve_remote_walker_for_topic`]),
+/// run only when the local walker cannot name the hash and the scope is not
+/// local, so it can add that lookup's round trip (a few seconds against a cold
+/// daemon) after the one-second frame wait. A missing topic is the
 /// `topic info` not-found error. A topic that sends no frame in the wait
 /// ([`silent_topic_error`]), whose receive keeps failing
 /// ([`receive_failed_error`]) or whose hash no known type names
@@ -1691,8 +1699,8 @@ mod tests {
         assert_eq!(
             unsearched_robots_note(robots.iter().map(String::as_str), &gather).as_deref(),
             Some(
-                "remote: 1 robot(s) not searched: no catalog answer from spot, so their topics \
-                 of this type are not listed\n"
+                "remote: 1 robot(s) not searched: no catalog from spot, so their topics of \
+                 this type are not listed\n"
             )
         );
     }
@@ -1713,12 +1721,35 @@ mod tests {
         assert_eq!(
             unsearched_robots_note(["spot", "go2", "spot", "orin"], &gather).as_deref(),
             Some(
-                "remote: 2 robot(s) not searched: no catalog answer from orin, spot, so their \
-                 topics of this type are not listed\n"
+                "remote: 2 robot(s) not searched: no catalog from orin, spot, so their topics \
+                 of this type are not listed\n"
             )
         );
         let note = unsearched_robots_note(["a\u{1b}[2J"], &answered(&[])).unwrap();
         assert!(!note.contains('\u{1b}'), "{note:?}");
+    }
+
+    #[test]
+    fn a_robot_that_refused_its_catalog_is_named_as_not_searched() {
+        let mut refused = catalog("spot", vec![]);
+        refused.error = Some("not paired".to_string());
+        let gather = super::super::CatalogGather {
+            replies: vec![catalog("go2", vec![]), refused],
+            panicked: Vec::new(),
+        };
+        let expected = Some(
+            "remote: 1 robot(s) not searched: no catalog from spot, so their topics of this \
+             type are not listed\n",
+        );
+        // Discovered or not, a refusal is no catalog: its topics were not searched.
+        assert_eq!(
+            unsearched_robots_note(["go2", "spot"], &gather).as_deref(),
+            expected
+        );
+        assert_eq!(
+            unsearched_robots_note(["go2"], &gather).as_deref(),
+            expected
+        );
     }
 
     #[test]
