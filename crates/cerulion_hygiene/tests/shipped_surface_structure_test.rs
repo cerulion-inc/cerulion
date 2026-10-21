@@ -738,11 +738,12 @@ fn workflow_gate_off_uncovered(text: &str) -> bool {
 }
 
 /// Shell files: an `export CERULION_LOGIN_GATE=off` counts only when it
-/// reaches the environment of a later command-position launch of the
-/// binary: it runs unconditionally (outside any skippable block, and - when
-/// it sits in a function body - only from an unconditional top-level call of
-/// that function), and no later assignment, `unset`, or per-command prefix
-/// changes the gate before that launch. YAML/TOML syntaxes (`KEY: "off"`,
+/// reaches every later command-position launch of the binary without its
+/// own gate override: it runs unconditionally (outside any skippable block,
+/// and - when it sits in a function body - only from an unconditional
+/// top-level call of that function). A top-level re-export can restore
+/// coverage after a later assignment or `unset`; a per-command override
+/// applies only to its own launch. YAML/TOML syntaxes (`KEY: "off"`,
 /// `KEY = "off"` without export...) are not shell settings and never count
 /// here. Python files use the `os.environ` form and its own reachability
 /// rules.
@@ -781,20 +782,32 @@ fn shell_sets_the_gate_off(text: &str) -> bool {
             // A nested function definition: too indirect to prove.
             _ => continue,
         };
-        for l in &lines[effective_at + 1..] {
-            let overrides = shell_line_overrides_the_gate(l);
-            if shell_line_launches_the_binary(l) {
-                if !overrides {
-                    return true;
-                }
-                // This launch carries its own non-off gate; keep looking.
+        let mut covered = true;
+        let mut saw_covered = false;
+        for (k, l) in lines.iter().enumerate().skip(effective_at + 1) {
+            if l.trim_start() == "export CERULION_LOGIN_GATE=off"
+                && shell_block_depth(&lines[..k]) == 0
+                && shell_enclosing_functions(&lines[..k]).is_empty()
+            {
+                covered = true;
                 continue;
             }
-            if overrides {
-                // A later assignment or `unset` replaces the exported
-                // value for every launch after it.
-                break;
+            let overrides = shell_line_overrides_the_gate(l);
+            if shell_line_launches_the_binary(l) {
+                if overrides {
+                    continue;
+                }
+                if covered {
+                    saw_covered = true;
+                } else {
+                    return false;
+                }
+            } else if overrides {
+                covered = false;
             }
+        }
+        if saw_covered {
+            return true;
         }
     }
     false
@@ -1173,8 +1186,21 @@ fn a_gate_setting_counts_only_inside_the_env_scope_that_reaches_the_binary() {
         sh,
         "export CERULION_LOGIN_GATE=off\nws_bound_launch \"$CERULION\" ros2 migrate\n"
     ));
-    // Shell: a later assignment, unset, or per-command prefix overrides the
-    // exported value for the launch it reaches.
+    // Shell: a covered launch is not enough if a later launch comes after an
+    // assignment or unset; a top-level re-export restores coverage, and an
+    // inline override applies only to its own launch.
+    assert!(!file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nunset CERULION_LOGIN_GATE\nexport CERULION_LOGIN_GATE=off\ncerulion topic list\n"
+    ));
+    assert!(file_sets_the_gate_off(
+        sh,
+        "export CERULION_LOGIN_GATE=off\ncerulion topic list\nCERULION_LOGIN_GATE=on cerulion topic list\ncerulion topic list\n"
+    ));
     for overridden in [
         "export CERULION_LOGIN_GATE=off\nexport CERULION_LOGIN_GATE=on\ncerulion topic list\n",
         "export CERULION_LOGIN_GATE=off\nCERULION_LOGIN_GATE=on\ncerulion topic list\n",
