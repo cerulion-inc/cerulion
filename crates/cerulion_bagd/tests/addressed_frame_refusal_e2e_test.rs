@@ -58,10 +58,15 @@ fn an_addressed_frame_is_refused_counted_and_never_recorded() {
         let shutdown = shutdown.clone();
         move || run_bagd(mgr_clone, cfg, shutdown)
     });
-    assert!(wait_for_file(&ready, RECORDER_READY_DEADLINE), "ready-file never appeared");
+    assert!(
+        wait_for_file(&ready, RECORDER_READY_DEADLINE),
+        "ready-file never appeared"
+    );
     settle();
 
-    publisher.publish_raw(&addressed_frame()).expect("publish addressed frame");
+    publisher
+        .publish_raw(&addressed_frame())
+        .expect("publish addressed frame");
     let natives: Vec<Vec<u8>> = (0..2u32)
         .map(|i| image_gap_frame(Image::SCHEMA_HASH, i, 1_000 + i as u64))
         .collect();
@@ -72,7 +77,10 @@ fn an_addressed_frame_is_refused_counted_and_never_recorded() {
     settle();
     shutdown.store(true, Ordering::Relaxed);
     let summary = handle.join().expect("join").expect("run_bagd Ok");
-    assert_eq!(summary.addressed_refused, 1, "the addressed frame is counted");
+    assert_eq!(
+        summary.addressed_refused, 1,
+        "the addressed frame is counted"
+    );
     assert_eq!(summary.messages, 2, "only the native frames are recorded");
 
     let reader = BagReader::open(&out).expect("open bag");
@@ -91,8 +99,14 @@ fn an_addressed_frame_is_refused_counted_and_never_recorded() {
         .into_iter()
         .find(|c| c.topic == topic)
         .expect("a channel for the topic");
-    let d = chan.descriptor.expect("a cerulion channel carries a descriptor");
-    assert_eq!(d.schema_hash, Image::SCHEMA_HASH, "the channel keeps the topic's hash");
+    let d = chan
+        .descriptor
+        .expect("a cerulion channel carries a descriptor");
+    assert_eq!(
+        d.schema_hash,
+        Image::SCHEMA_HASH,
+        "the channel keeps the topic's hash"
+    );
 
     cleanup(&out);
     let _ = std::fs::remove_file(&ready);

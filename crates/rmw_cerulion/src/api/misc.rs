@@ -448,6 +448,13 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
             let mut passed_over = false;
             let receive = inner.subscriber.try_receive_one(|msg| {
                 let header = msg.header();
+                // An addressed frame is never returned as a serialized
+                // message to a subscription that is not buffer-aware.
+                if header.is_rmw_addressed() && !super::pubsub::buffer_half_takes(data, header) {
+                    crate::buffer_backends::note_skipped();
+                    passed_over = true;
+                    return;
+                }
                 #[cfg(cerulion_has_buffer_backends)]
                 {
                     use super::pubsub::AddressedAsNative;
@@ -464,7 +471,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                         }
                     }
                 }
-                // Reassemble the full frame (header + payload) — "cerulion"
+                // Reassemble the full frame (header + payload): "cerulion"
                 // serialization format IS the wire frame.
                 let mut buf =
                     vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];

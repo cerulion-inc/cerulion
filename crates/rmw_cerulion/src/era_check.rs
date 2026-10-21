@@ -260,8 +260,14 @@ pub const CPP_SHIM_INTROSPECTION_PACKAGE: &str = "rosidl_typesupport_introspecti
 /// and Rolling install of rmw_fastrtps_cpp.
 pub const BUFFER_BACKEND_INCLUDE_PACKAGES: &[(&str, &str)] = &[
     ("rosidl_buffer_backend", "buffer_backend.hpp"),
-    ("rosidl_buffer_backend_registry", "buffer_backend_registry.hpp"),
-    ("rosidl_typesupport_fastrtps_cpp", "buffer_serialization.hpp"),
+    (
+        "rosidl_buffer_backend_registry",
+        "buffer_backend_registry.hpp",
+    ),
+    (
+        "rosidl_typesupport_fastrtps_cpp",
+        "buffer_serialization.hpp",
+    ),
     ("fastcdr", "Cdr.h"),
 ];
 
@@ -1066,7 +1072,10 @@ mod tests {
             PathBuf::from("/p/includefastcdr/fastcdr/Cdr.h"),
         ];
         let mut probe = |p: &std::path::Path| present.iter().any(|x| x == p);
-        let roots = vec![PathBuf::from("/p/include"), PathBuf::from("/p/includefastcdr")];
+        let roots = vec![
+            PathBuf::from("/p/include"),
+            PathBuf::from("/p/includefastcdr"),
+        ];
         let found = resolve_package_includes(&roots, BUFFER_BACKEND_INCLUDE_PACKAGES, &mut probe);
         assert_eq!(found.missing, vec!["rosidl_buffer_backend_registry"]);
         assert_eq!(

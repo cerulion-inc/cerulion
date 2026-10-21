@@ -10348,6 +10348,7 @@ mod tests {
             frozen_burst_markers: 0,
             dropped_unwritten: 0,
             headerless: 0,
+            addressed_refused: 0,
             status_unavailable: false,
             frames_lost: 0,
             record_health: cerulion_bagd::RecordHealth {

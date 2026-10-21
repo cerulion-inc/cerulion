@@ -531,8 +531,7 @@ unsafe fn plan_buffer_subscription(
 ) -> Option<(*const c_void, String)> {
     let callbacks = buffer_type_callbacks(type_support, bridge)?;
     let requested = (*options).acceptable_buffer_backends;
-    let requested =
-        (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+    let requested = (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
     let installed = crate::buffer_backends::installed_backends();
     let mut accepted = crate::buffer_backends::accepted_backends(requested, &installed);
     // A backend's metadata travels in the port name only when it is empty
@@ -601,6 +600,23 @@ fn make_buffer_subscription(
     _subscriber: &cerulion_core::transport::subscriber::CerulionSubscriber,
 ) -> crate::buffer_backends::BufferSubscription {
     unreachable!("no buffer plan exists on a build without hosted backends")
+}
+
+/// Whether this subscription's buffer-aware half decodes the addressed frame
+/// with `header` (its type's addressed-frame hash). False on a build without
+/// hosted backends and for a subscription that is not buffer-aware.
+#[allow(unused_variables)]
+pub(crate) fn buffer_half_takes(data: &SubscriptionData, header: &WireHeader) -> bool {
+    #[cfg(cerulion_has_buffer_backends)]
+    {
+        data.buffer
+            .as_ref()
+            .is_some_and(|bs| bs.frame_hash == header.schema_hash)
+    }
+    #[cfg(not(cerulion_has_buffer_backends))]
+    {
+        false
+    }
 }
 
 /// The transport's default subscriber queue depth (the queue an rmw
@@ -2980,15 +2996,22 @@ unsafe fn take_impl(
     // own is queued.
     let mut skips_left = rt_subscriber_buffer_size();
     let receive = loop {
-    let mut not_mine = false;
-    // ONE message per call (the rmw take contract): try_receive_one,
-    // never the drain-everything path — extra drained frames would be
-    // silently lost (Principle #6).
-    let receive = inner.subscriber.try_receive_one(|msg| {
+        let mut not_mine = false;
+        // ONE message per call (the rmw take contract): try_receive_one,
+        // never the drain-everything path: extra drained frames would be
+        // silently lost (Principle #6).
+        let receive = inner.subscriber.try_receive_one(|msg| {
         let header = msg.header();
-        // An addressed frame (`crate::buffer_backends`) for a buffer-aware
-        // subscription: decoded through the backends, or skipped when it
-        // names another subscriber port.
+        // An addressed frame (`crate::buffer_backends`) is never decoded as
+        // the native type: a subscription that is not buffer-aware passes over
+        // it (counted in `skipped_frames`), whatever this build hosts.
+        if header.is_rmw_addressed() && !buffer_half_takes(data, header) {
+            crate::buffer_backends::note_skipped();
+            not_mine = true;
+            return;
+        }
+        // An addressed frame for a buffer-aware subscription: decoded through
+        // the backends, or passed over when it names another subscriber port.
         #[cfg(cerulion_has_buffer_backends)]
         if let Some(bs) = data.buffer.as_ref() {
             if header.schema_hash == bs.frame_hash {
@@ -3004,8 +3027,12 @@ unsafe fn take_impl(
                         );
                     }
                     TakeOutcome::NotMine => not_mine = true,
-                    TakeOutcome::Lost => report_lost_buffer_sample(&data.topic),
+                    TakeOutcome::Lost => {
+                        report_lost_buffer_sample(&data.topic);
+                        not_mine = true;
+                    }
                     TakeOutcome::Failed(reason) => {
+                        not_mine = true;
                         tracing::debug!(topic = %data.topic, reason = %reason, "addressed frame undecodable");
                         crate::decode_failure_latch::report_decode_failure(
                             &data.decode_failures,
@@ -3098,11 +3125,11 @@ unsafe fn take_impl(
             );
         }
     });
-    if matches!(receive, Ok(true)) && not_mine && skips_left > 0 {
-        skips_left -= 1;
-        continue;
-    }
-    break receive;
+        if matches!(receive, Ok(true)) && not_mine && skips_left > 0 {
+            skips_left -= 1;
+            continue;
+        }
+        break receive;
     };
     drop(inner);
 
@@ -3176,7 +3203,9 @@ pub(crate) unsafe fn addressed_as_native(
     };
     let out = match bs.take(payload, scratch) {
         TakeOutcome::Delivered => {
-            let _copies = crate::rosidl_buffer::PublishScope::open(&data.topic);
+            // The flatten copies a device Buffer to host memory and counts it
+            // in `host_copies`; the per-topic publish warning is not raised for
+            // a copy a take makes.
             match data
                 .bridge
                 .flatten(scratch, header.sequence, header.timestamp_ns)
@@ -3555,6 +3584,14 @@ unsafe fn take_adopted(
         tracing::error!(topic = %data.topic, "adopted take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
+    // An addressed frame (`crate::buffer_backends`) is passed over, never
+    // decoded as the native type (an adopting subscription is never
+    // buffer-aware).
+    if header.is_rmw_addressed() {
+        drop(owned);
+        crate::buffer_backends::note_skipped();
+        return RMW_RET_OK;
+    }
     // The pure gate (see `take_gate`), not a fourth
     // hand-spelled comparison.
     if crate::take_gate::schema_hash_verdict(header.schema_hash, expected_hash).is_mismatch() {
@@ -4332,6 +4369,17 @@ unsafe fn take_loaned_impl(
         tracing::error!(topic = %data.topic, "loaned take: frame carries no parsed header; dropping frame");
         return RMW_RET_ERROR;
     };
+    // An addressed frame (`crate::buffer_backends`) is passed over, never
+    // decoded as the native type (a loaning subscription is never
+    // buffer-aware).
+    if header.is_rmw_addressed() {
+        if let Some(s) = shadow.take() {
+            inner.shadows.release(s);
+        }
+        drop(owned);
+        crate::buffer_backends::note_skipped();
+        return RMW_RET_OK;
+    }
     // The pure gate (see `take_gate`).
     if crate::take_gate::schema_hash_verdict(header.schema_hash, expected_hash).is_mismatch() {
         // Same regime latch as `take_impl` — a hash mismatch is a type SKEW

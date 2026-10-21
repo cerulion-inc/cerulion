@@ -55,9 +55,10 @@
 //!
 //! An addressed frame ([`encode_frame_prefix`]) carries its own schema hash
 //! ([`buffer_frame_hash`]) and the header mark
-//! [`cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK`]: the rmw take paths of a
-//! subscription that is not buffer-aware refuse it at their schema-hash gate,
-//! and the bagd tap and the gateway refuse it by its mark and count it. The CDR inside is the CDR
+//! [`cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK`]: the take paths of a
+//! subscription that is not buffer-aware pass over it by its mark (counted in
+//! `skipped_frames`), and the bagd tap and the gateway refuse it by its mark and
+//! count it. The CDR inside is the CDR
 //! rmw_fastrtps_cpp and rmw_zenoh_cpp put on their wire for the same message
 //! and backend (the S2 golden fixtures pin it).
 //!
@@ -160,7 +161,12 @@ pub fn counters() -> Vec<(&'static str, u64)> {
 pub fn counters_line() -> String {
     counters()
         .iter()
-        .map(|(n, v)| format!("{}={v}", n.trim_start_matches("rmw_cerulion.rosidl_buffer.")))
+        .map(|(n, v)| {
+            format!(
+                "{}={v}",
+                n.trim_start_matches("rmw_cerulion.rosidl_buffer.")
+            )
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -362,9 +368,7 @@ pub fn parse_frame(payload: &[u8]) -> Result<ParsedFrame<'_>, &'static str> {
     let mut publisher_gid = [0u8; 16];
     publisher_gid.copy_from_slice(&payload[8..24]);
     let start = frame_prefix_len(n);
-    let end = start
-        .checked_add(cdr_len)
-        .ok_or("CDR length overflows")?;
+    let end = start.checked_add(cdr_len).ok_or("CDR length overflows")?;
     if payload.len() < end {
         return Err("CDR runs past the frame");
     }
@@ -556,7 +560,6 @@ pub(crate) fn note_lost_sample() {
 pub(crate) fn note_descriptor_take() {
     DESCRIPTOR_TAKES.fetch_add(1, Ordering::Relaxed);
 }
-#[cfg_attr(not(cerulion_has_buffer_backends), allow(dead_code))]
 pub(crate) fn note_skipped() {
     SKIPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
 }
@@ -694,6 +697,7 @@ pub struct BufferPublisher {
     view: cerulion_core::transport::TopicSubscriberView,
     verdicts: PeerVerdicts,
     ports: Vec<(u128, String)>,
+    port_ids: Vec<u128>,
     live: Vec<(u128, PeerVerdict)>,
     scratch: Vec<u8>,
     outputs: Vec<Vec<u8>>,
@@ -750,8 +754,7 @@ impl BufferPublisher {
         let gid = buffer_gid(pid_namespace_id(), std::process::id(), entity);
         let topic_type = std::ffi::CString::new(topic_type).map_err(|e| e.to_string())?;
         // SAFETY: gid is 16 bytes; topic_type is NUL-terminated.
-        if unsafe { ffi::rmw_cerulion_bb_on_creating(gid.as_ptr(), 1, topic_type.as_ptr()) } != 0
-        {
+        if unsafe { ffi::rmw_cerulion_bb_on_creating(gid.as_ptr(), 1, topic_type.as_ptr()) } != 0 {
             return Err(ffi::last_error());
         }
         Ok(Self {
@@ -762,6 +765,7 @@ impl BufferPublisher {
             view,
             verdicts: PeerVerdicts::default(),
             ports: Vec::new(),
+            port_ids: Vec::new(),
             live: Vec::new(),
             scratch: vec![0u8; 64 * 1024],
             outputs: Vec::new(),
@@ -789,7 +793,11 @@ impl BufferPublisher {
                 let gid = peer.gid();
                 // SAFETY: gid is 16 bytes; both strings are NUL-terminated.
                 let r = unsafe {
-                    ffi::rmw_cerulion_bb_on_discovering(gid.as_ptr(), topic_type.as_ptr(), csv.as_ptr())
+                    ffi::rmw_cerulion_bb_on_discovering(
+                        gid.as_ptr(),
+                        topic_type.as_ptr(),
+                        csv.as_ptr(),
+                    )
                 };
                 if r == 2 {
                     tracing::warn!(
@@ -927,7 +935,12 @@ impl BufferPublisher {
             let recipients: Vec<u128> = members.iter().map(|i| accelerated[*i].0).collect();
             frames.push((
                 FRAME_KIND_ENDPOINT_CDR,
-                self.build_frame(FRAME_KIND_ENDPOINT_CDR, &recipients, &outputs[first], timestamp_ns)?,
+                self.build_frame(
+                    FRAME_KIND_ENDPOINT_CDR,
+                    &recipients,
+                    &outputs[first],
+                    timestamp_ns,
+                )?,
             ));
         }
         if let Some(cdr) = cpu_cdr {
@@ -958,9 +971,15 @@ impl BufferPublisher {
     /// Whether the data service's subscriber ports are still exactly the ones
     /// [`Self::route_now`] read.
     fn ports_unchanged(&mut self) -> bool {
-        let mut now: Vec<u128> = Vec::with_capacity(self.live.len());
-        self.view.for_each_subscriber(|id, _| now.push(id));
-        now.len() == self.live.len() && now.iter().zip(&self.live).all(|(a, (b, _))| a == b)
+        self.port_ids.clear();
+        let ids = &mut self.port_ids;
+        self.view.for_each_subscriber(|id, _| ids.push(id));
+        self.port_ids.len() == self.live.len()
+            && self
+                .port_ids
+                .iter()
+                .zip(&self.live)
+                .all(|(a, (b, _))| a == b)
     }
 
     /// One addressed frame: wire header (sequence 0, stamped at send), prefix,
@@ -1096,7 +1115,11 @@ impl BufferSubscription {
     ///
     /// # Safety
     /// `msg` is a live, initialized C++ message of this endpoint's type.
-    pub(crate) unsafe fn take(&self, payload: &[u8], msg: *mut std::os::raw::c_void) -> TakeOutcome {
+    pub(crate) unsafe fn take(
+        &self,
+        payload: &[u8],
+        msg: *mut std::os::raw::c_void,
+    ) -> TakeOutcome {
         let frame = match parse_frame(payload) {
             Ok(f) => f,
             Err(e) => return TakeOutcome::Failed(e.to_owned()),
@@ -1157,7 +1180,13 @@ mod tests {
         let name = encode_port_name(&cpu_only, 64).unwrap();
         assert_eq!(name, "rbuf1;effffffc;1f3a;7;");
         assert_eq!(parse_port_name(&name), Some(cpu_only));
-        for other in ["", "rbuf2;1;1;1;cuda", "rbuf1;1;zz;1;", "rbuf1;1;1;1", "rbuf1;1;1;1;a;b"] {
+        for other in [
+            "",
+            "rbuf2;1;1;1;cuda",
+            "rbuf1;1;zz;1;",
+            "rbuf1;1;1;1",
+            "rbuf1;1;1;1;a;b",
+        ] {
             assert_eq!(parse_port_name(other), None, "{other:?}");
         }
         let long = AwarePeer {
@@ -1221,8 +1250,14 @@ mod tests {
     #[test]
     fn any_subscriber_that_is_not_buffer_aware_forces_the_native_frame() {
         assert_eq!(route(&[]), Route::Nobody);
-        assert_eq!(route(&[(1, aware(true)), (2, PeerVerdict::NotAware)]), Route::Native);
-        assert_eq!(route(&[(1, aware(false)), (2, aware(false))]), Route::Native);
+        assert_eq!(
+            route(&[(1, aware(true)), (2, PeerVerdict::NotAware)]),
+            Route::Native
+        );
+        assert_eq!(
+            route(&[(1, aware(false)), (2, aware(false))]),
+            Route::Native
+        );
         assert_eq!(
             route(&[(1, aware(true)), (2, aware(false)), (3, aware(true))]),
             Route::Addressed {
@@ -1244,7 +1279,10 @@ mod tests {
         assert_eq!(v.verdict(1, "", t0, &mut yes), PeerVerdict::NotAware);
         assert!(matches!(
             v.verdict(2, "rbuf1;1;1;2;cuda", t0, &mut yes),
-            PeerVerdict::Aware { accelerated: true, .. }
+            PeerVerdict::Aware {
+                accelerated: true,
+                ..
+            }
         ));
         let _ = v.verdict(2, "rbuf1;1;1;2;cuda", t0, &mut yes);
         assert_eq!(asked, 1);
@@ -1289,7 +1327,10 @@ mod tests {
         assert!(accepted_backends(Some(b""), &installed).is_empty());
         assert!(accepted_backends(Some(b"cpu"), &installed).is_empty());
         assert_eq!(accepted_backends(Some(b"any"), &installed), installed);
-        assert_eq!(accepted_backends(Some(b" cuda ,x"), &installed), vec!["cuda"]);
+        assert_eq!(
+            accepted_backends(Some(b" cuda ,x"), &installed),
+            vec!["cuda"]
+        );
         assert!(accepted_backends(Some(b"\xff"), &installed).is_empty());
     }
 

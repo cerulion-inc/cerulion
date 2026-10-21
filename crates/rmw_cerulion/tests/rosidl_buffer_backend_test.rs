@@ -127,7 +127,12 @@ static INSTALL: Once = Once::new();
 /// Install the fixture backend as `cuda`, once per process.
 fn install() {
     INSTALL.call_once(|| unsafe {
-        assert_eq!(rmw_cerulion_bb_install_fixture_backend(c"cuda".as_ptr()), 0, "{}", bb::last_error());
+        assert_eq!(
+            rmw_cerulion_bb_install_fixture_backend(c"cuda".as_ptr()),
+            0,
+            "{}",
+            bb::last_error()
+        );
         assert!(buffer_backends::installed_backends().contains(&"cuda".to_owned()));
     });
 }
@@ -170,9 +175,7 @@ unsafe fn resolve(ts: *const rosidl_message_type_support_t, id: &CStr) -> *const
 }
 
 fn introspection(ts: *const rosidl_message_type_support_t) -> &'static CppMessageMembers {
-    unsafe {
-        &*(resolve(ts, c"rosidl_typesupport_introspection_cpp") as *const CppMessageMembers)
-    }
+    unsafe { &*(resolve(ts, c"rosidl_typesupport_introspection_cpp") as *const CppMessageMembers) }
 }
 
 fn fastrtps_callbacks(ts: *const rosidl_message_type_support_t) -> *const c_void {
@@ -220,7 +223,11 @@ impl Image {
         p
     }
     unsafe fn set_string(&mut self, path: &[&str], v: &str) {
-        rmw_cerulion_cppstring_assign(self.at(path) as *mut c_void, v.as_ptr() as *const c_char, v.len());
+        rmw_cerulion_cppstring_assign(
+            self.at(path) as *mut c_void,
+            v.as_ptr() as *const c_char,
+            v.len(),
+        );
     }
     unsafe fn string(&mut self, path: &[&str]) -> String {
         let mut d = std::ptr::null();
@@ -318,8 +325,16 @@ fn the_endpoint_aware_cdr_is_the_captured_wire_byte_for_byte() {
         let gid = buffer_backends::buffer_gid(0, 1, 1);
         let created = counter("descriptors_created");
         let aware = serialize(cb, img.ptr(), Some(&gid));
-        assert_eq!(aware, fixture("image_cuda_descriptor.ddscdr.cdr"), "rmw_zenoh_cpp wire");
-        assert_eq!(aware, fixture("image_cuda_descriptor.xcdr1.cdr"), "rmw_fastrtps_cpp wire");
+        assert_eq!(
+            aware,
+            fixture("image_cuda_descriptor.ddscdr.cdr"),
+            "rmw_zenoh_cpp wire"
+        );
+        assert_eq!(
+            aware,
+            fixture("image_cuda_descriptor.xcdr1.cdr"),
+            "rmw_fastrtps_cpp wire"
+        );
         assert_eq!(&aware[44..48], &[0xff; 4], "marker word 1 at 44");
         assert_eq!(&aware[48..52], b"2SOR", "marker word 2 at 48");
         assert_eq!(counter("descriptors_created"), created + 1);
@@ -333,7 +348,10 @@ fn the_endpoint_aware_cdr_is_the_captured_wire_byte_for_byte() {
         assert_eq!(counter("descriptors_refused"), refused + 1);
 
         // The plain serialization writes the bytes too (the captured CPU form).
-        assert_eq!(serialize(cb, img.ptr(), None), fixture("image_cuda_plain.xcdr1.cdr"));
+        assert_eq!(
+            serialize(cb, img.ptr(), None),
+            fixture("image_cuda_plain.xcdr1.cdr")
+        );
     }
 }
 
@@ -435,12 +453,18 @@ unsafe fn sub_data(s: *const ffi::rmw_subscription_t) -> &'static SubscriptionDa
 }
 
 /// Take until a message is delivered or the queue stays empty for 2 s.
-unsafe fn take(s: *const ffi::rmw_subscription_t, ts: *const rosidl_message_type_support_t) -> Option<Image> {
+unsafe fn take(
+    s: *const ffi::rmw_subscription_t,
+    ts: *const rosidl_message_type_support_t,
+) -> Option<Image> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         let mut img = Image::new(ts);
         let mut taken = false;
-        assert_eq!(rmw_take(s, img.ptr(), &mut taken, std::ptr::null_mut()), RMW_RET_OK);
+        assert_eq!(
+            rmw_take(s, img.ptr(), &mut taken, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
         if taken {
             return Some(img);
         }
@@ -465,7 +489,9 @@ unsafe fn publish_device(
 }
 
 fn pattern(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+        .collect()
 }
 
 #[test]
@@ -479,9 +505,15 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
         let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos(), &pub_opts);
         assert!(!publisher.is_null());
-        assert!(!(*publisher).can_loan_messages, "a buffer-aware publisher serves no borrow");
+        assert!(
+            !(*publisher).can_loan_messages,
+            "a buffer-aware publisher serves no borrow"
+        );
         let pdata = &*((*publisher).data as *const PublisherData);
-        assert!(pdata.inner.lock().expect("lock").buffer.is_some(), "publisher is buffer-aware");
+        assert!(
+            pdata.inner.lock().expect("lock").buffer.is_some(),
+            "publisher is buffer-aware"
+        );
 
         // No subscriber: nothing is sent, nothing copied.
         let unsent = counter("unsent_no_subscriber");
@@ -492,16 +524,30 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
         let gpu = subscribe(node, ts, &topic, Some(c"cuda"));
         assert!(sub_data(gpu).buffer.is_some());
         assert!(!(*gpu).can_loan_messages);
-        let before = (counter("descriptor_frames"), counter("host_copies"), counter("descriptors_refused"), counter("cpu_group_frames"));
+        let before = (
+            counter("descriptor_frames"),
+            counter("host_copies"),
+            counter("descriptors_refused"),
+            counter("cpu_group_frames"),
+        );
         let bytes = pattern(4096, 1);
         publish_device(publisher, ts, &bytes, 101);
         let mut got = take(gpu, ts).expect("descriptor frame delivered");
         let (backend, size, dev, uid) = got.data();
         assert_eq!((backend.as_str(), size, uid), ("cuda", 4096, 101));
-        assert_eq!(dev.as_deref(), Some(&bytes[..]), "byte-exact through the descriptor");
+        assert_eq!(
+            dev.as_deref(),
+            Some(&bytes[..]),
+            "byte-exact through the descriptor"
+        );
         assert_eq!(got.string(&["encoding"]), "rgb8");
         assert_eq!(
-            (counter("descriptor_frames"), counter("host_copies"), counter("descriptors_refused"), counter("cpu_group_frames")),
+            (
+                counter("descriptor_frames"),
+                counter("host_copies"),
+                counter("descriptors_refused"),
+                counter("cpu_group_frames")
+            ),
             (before.0 + 1, before.1, before.2, before.3),
             "zero host copies on the descriptor path"
         );
@@ -519,7 +565,10 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
         let (b, size, dev, _) = c.data();
         assert_eq!((b.as_str(), size, dev), ("cpu", 512, None));
         assert_eq!(counter("cpu_group_frames"), groups + 1);
-        assert!(take_none(gpu, ts) && take_none(cpu, ts), "one delivery per subscription");
+        assert!(
+            take_none(gpu, ts) && take_none(cpu, ts),
+            "one delivery per subscription"
+        );
 
         // A second GPU subscription the backend declines (its verdict is
         // asked at the first publish it sees): it joins the CPU group, and the
@@ -547,13 +596,19 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
         let lost = counter("lost_samples");
         publish_device(publisher, ts, &pattern(64, 4), 104);
         rmw_cerulion_bb_fixture_forget(104);
-        assert!(take(gpu, ts).is_none(), "a stale descriptor is not delivered");
+        assert!(
+            take(gpu, ts).is_none(),
+            "a stale descriptor is not delivered"
+        );
         assert_eq!(counter("lost_samples"), lost + 1);
 
         // A subscriber that is not buffer-aware (a native reader): native
         // frames, the Buffer copied to host memory, to everyone.
         let rt = rmw_cerulion::runtime::runtime().expect("runtime");
-        let native = rt.transport.create_subscriber(topic.to_str().unwrap()).expect("native reader");
+        let native = rt
+            .transport
+            .create_subscriber(topic.to_str().unwrap())
+            .expect("native reader");
         let copies = counter("host_copies");
         let natives = counter("native_frames");
         let bytes = pattern(256, 5);
@@ -616,33 +671,60 @@ fn a_serialized_take_gets_the_native_frame_and_a_cpu_message_goes_native() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut taken = false;
         while !taken && std::time::Instant::now() < deadline {
-            assert_eq!(rmw_take_serialized_message(gpu, &mut ser, &mut taken, std::ptr::null_mut()), RMW_RET_OK);
+            assert_eq!(
+                rmw_take_serialized_message(gpu, &mut ser, &mut taken, std::ptr::null_mut()),
+                RMW_RET_OK
+            );
         }
         assert!(taken, "the serialized take received the frame");
         let frame = std::slice::from_raw_parts(ser.buffer, ser.buffer_length);
         let header = cerulion_core::wire::WireHeader::read_from_buf(frame).expect("header");
-        assert_eq!(header.schema_hash, native_hash, "a serialized message is the native frame");
-        assert!(frame.windows(bytes.len()).any(|w| w == &bytes[..]), "the Buffer's bytes are in it");
+        assert_eq!(
+            header.schema_hash, native_hash,
+            "a serialized message is the native frame"
+        );
+        assert!(
+            frame.windows(bytes.len()).any(|w| w == &bytes[..]),
+            "the Buffer's bytes are in it"
+        );
         assert_eq!(counter("host_copies"), copies + 1);
         (ser.allocator.deallocate.unwrap())(ser.buffer as *mut c_void, std::ptr::null_mut());
 
         // A message whose Buffer is on the CPU goes out native even to an
         // accelerated subscription: no descriptor frame, no host copy.
-        let (frames, natives, copies) = (counter("descriptor_frames"), counter("native_frames"), counter("host_copies"));
+        let (frames, natives, copies) = (
+            counter("descriptor_frames"),
+            counter("native_frames"),
+            counter("host_copies"),
+        );
         let mut img = Image::new(ts);
         img.fill_fixture_fields();
         let data = img.at(&["data"]) as *mut c_void;
         // A default-constructed Buffer is a CPU Buffer; fill it through the R0 shim.
         extern "C" {
-            fn rmw_cerulion_buffer_u8_assign(buf: *mut c_void, data: *const u8, len: usize) -> c_int;
+            fn rmw_cerulion_buffer_u8_assign(
+                buf: *mut c_void,
+                data: *const u8,
+                len: usize,
+            ) -> c_int;
         }
         let cpu_bytes = pattern(128, 11);
-        assert_ne!(rmw_cerulion_buffer_u8_assign(data, cpu_bytes.as_ptr(), cpu_bytes.len()), 2);
-        assert_eq!(rmw_publish(publisher, img.ptr(), std::ptr::null_mut()), RMW_RET_OK);
+        assert_ne!(
+            rmw_cerulion_buffer_u8_assign(data, cpu_bytes.as_ptr(), cpu_bytes.len()),
+            2
+        );
+        assert_eq!(
+            rmw_publish(publisher, img.ptr(), std::ptr::null_mut()),
+            RMW_RET_OK
+        );
         let (b, size, _, _) = take(gpu, ts).expect("cpu message delivered").data();
         assert_eq!((b.as_str(), size), ("cpu", 128));
         assert_eq!(
-            (counter("descriptor_frames"), counter("native_frames"), counter("host_copies")),
+            (
+                counter("descriptor_frames"),
+                counter("native_frames"),
+                counter("host_copies")
+            ),
             (frames, natives + 1, copies),
         );
         assert_eq!(rmw_destroy_subscription(node, gpu), RMW_RET_OK);
@@ -675,11 +757,112 @@ fn a_volatile_publisher_on_a_service_with_history_is_not_buffer_aware() {
     }
 }
 
-unsafe fn take_none(s: *const ffi::rmw_subscription_t, ts: *const rosidl_message_type_support_t) -> bool {
+fn string_ts() -> *const rosidl_message_type_support_t {
+    unsafe {
+        let lib = dlopen(
+            c"libstd_msgs__rosidl_typesupport_cpp.so".as_ptr(),
+            RTLD_NOW | RTLD_GLOBAL,
+        );
+        assert!(!lib.is_null(), "std_msgs C++ type support not loadable");
+        let sym = dlsym(
+            lib,
+            c"rosidl_typesupport_cpp__get_message_type_support_handle__std_msgs__msg__String"
+                .as_ptr(),
+        );
+        assert!(!sym.is_null());
+        let get: unsafe extern "C" fn() -> *const rosidl_message_type_support_t =
+            std::mem::transmute(sym);
+        get()
+    }
+}
+
+#[test]
+#[serial]
+fn a_subscription_that_is_not_buffer_aware_passes_over_an_addressed_frame() {
+    install();
+    let ts = string_ts();
+    unsafe {
+        let node = setup_node("bb_pass");
+        let topic = CString::new(format!("/bb_pass/{}", std::process::id())).expect("topic");
+        let sub = subscribe(node, ts, &topic, None);
+        assert!(
+            sub_data(sub).buffer.is_none(),
+            "a type with no Buffer is not buffer-aware"
+        );
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let mut raw = rt
+            .transport
+            .create_publisher_simple(
+                topic.to_str().unwrap(),
+                cerulion_core::wire::MaxSliceLen::try_new(4096).unwrap(),
+            )
+            .expect("raw publisher");
+        let mut frame = vec![0u8; cerulion_core::wire::WireHeader::SIZE + 40];
+        let header = cerulion_core::wire::WireHeader {
+            schema_hash: sub_data(sub).bridge.schema_hash() ^ 0x55,
+            total_size: frame.len() as u32,
+            offset_table_offset: cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK,
+            offset_table_count: 0,
+            sequence: 1,
+            timestamp_ns: 1,
+        };
+        header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
+        let mismatches = || {
+            cerulion_core::transport::failure_regime_latch::lock_regime_latch(
+                &sub_data(sub).hash_mismatches,
+            )
+            .total_failures()
+        };
+        let before = (counter("skipped_frames"), mismatches());
+
+        raw.publish_raw(&frame).expect("publish");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut msg = vec![0u64; 64];
+        (introspection(ts).init_function.unwrap())(msg.as_mut_ptr() as *mut c_void, 0);
+        let mut taken = true;
+        assert_eq!(
+            rmw_take(
+                sub,
+                msg.as_mut_ptr() as *mut c_void,
+                &mut taken,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        assert!(!taken, "an addressed frame is not taken as the native type");
+
+        raw.publish_raw(&frame).expect("publish");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut ser: ffi::rmw_serialized_message_t = std::mem::zeroed();
+        ser.allocator = malloc_allocator();
+        let mut taken = true;
+        assert_eq!(
+            rmw_take_serialized_message(sub, &mut ser, &mut taken, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
+        assert!(!taken, "nor returned as a serialized message");
+        assert_eq!(
+            (counter("skipped_frames"), mismatches()),
+            (before.0 + 2, before.1),
+            "passed over and counted, never reported as a type skew"
+        );
+        (introspection(ts).fini_function.unwrap())(msg.as_mut_ptr() as *mut c_void);
+        drop(raw);
+        assert_eq!(rmw_destroy_subscription(node, sub), RMW_RET_OK);
+    }
+}
+
+unsafe fn take_none(
+    s: *const ffi::rmw_subscription_t,
+    ts: *const rosidl_message_type_support_t,
+) -> bool {
     std::thread::sleep(std::time::Duration::from_millis(50));
     let mut img = Image::new(ts);
     let mut taken = false;
-    assert_eq!(rmw_take(s, img.ptr(), &mut taken, std::ptr::null_mut()), RMW_RET_OK);
+    assert_eq!(
+        rmw_take(s, img.ptr(), &mut taken, std::ptr::null_mut()),
+        RMW_RET_OK
+    );
     !taken
 }
 

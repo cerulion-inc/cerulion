@@ -394,9 +394,12 @@ impl CppBridgedMessage {
     /// on this process's C++ runtime). `None` only on allocation failure.
     ///
     /// # Safety
-    /// [`Self::can_loan_take`] must hold with a nonzero
-    /// [`Self::forged_sequence_count`] (which guarantees an `init_function`
-    /// and a `fini_function`).
+    /// The type support must carry an `init_function` and a `fini_function`:
+    /// rosidl_typesupport_introspection_cpp generates both for every message,
+    /// and a nonzero [`Self::forged_sequence_count`] under
+    /// [`Self::can_loan_take`] guarantees them. The serialized take of an
+    /// addressed frame (`api::pubsub::addressed_as_native`) uses one as a
+    /// scratch message on that first ground.
     pub unsafe fn new_shadow(&self) -> Option<*mut c_void> {
         let layout = shadow_layout(self.c_size);
         // hot-path-alloc-ok: shadows are built at most once per borrow-budget

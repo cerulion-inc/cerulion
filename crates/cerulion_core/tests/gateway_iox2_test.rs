@@ -310,11 +310,21 @@ fn an_addressed_frame_is_refused_and_counted_never_forwarded() {
         timestamp_ns: 5,
     };
     header.write_to_buf(&mut addressed[..WireHeader::SIZE]);
-    pubs[0].publish_raw(&addressed).expect("publish addressed frame");
+    pubs[0]
+        .publish_raw(&addressed)
+        .expect("publish addressed frame");
     publish_one(&mut pubs[0], &clock, 10, (1.0, 2.0, 3.0));
     let _ = drive_until(&mut gateway, 1, &topic);
-    assert_eq!(gateway.forwarded_count(&topic), 1, "the native frame is forwarded");
-    assert_eq!(gateway.addressed_refused_count(), 1, "the addressed frame is counted");
+    assert_eq!(
+        gateway.forwarded_count(&topic),
+        1,
+        "the native frame is forwarded"
+    );
+    assert_eq!(
+        gateway.addressed_refused_count(),
+        1,
+        "the addressed frame is counted"
+    );
 }
 
 /// (b) A demand token attaches the tap and forwards; dropping it detaches the

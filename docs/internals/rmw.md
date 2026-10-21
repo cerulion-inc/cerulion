@@ -1089,14 +1089,19 @@ and rmw_zenoh_cpp write for the same message (pinned byte-for-byte against the S
 `tests/rosidl_buffer_backend_test.rs`). The header also carries `offset_table_count` 0 with
 `offset_table_offset` = `cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK` (`R B U F`), a value no
 native frame has. A reader that is not buffer-aware and attaches between the second port read
-and the send still receives the addressed frame: the rmw take paths refuse it at their
-schema-hash gate, and the bagd tap and the gateway's egress refuse it by its mark and count it
+and the send still receives the addressed frame: the rmw take paths pass over it by its mark, and
+the bagd tap and the gateway's egress refuse it by its mark and count it
 (`BagdSummary::addressed_refused`, `GatewayRuntime::addressed_refused_count`), so a recording
-never holds one and an attach-mode channel never learns its hash.
+never holds one and an attach-mode channel never learns its hash. The refused frame spent one of
+its publisher's sequence numbers, so the recorder's gap observer counts the next native frame as
+one lost.
 
 **Take.** A buffer-aware subscription matches the frame's schema hash before its native gate.
 A frame that does not name its port is passed over (`skipped_frames`) and the take receives the
-next one, up to the queue depth, so `taken = false` means no frame of its own is queued. Every
+next one, up to the queue depth; a lost or undecodable frame of its own is passed over the same
+way. Every take path of a subscription that is not buffer-aware passes over an addressed frame by
+its mark (`skipped_frames`), on every build, so it is never decoded or returned as the native
+type. Every
 subscriber's queue holds every addressed frame of a publish (one per distinct serialization plus
 one plain-CDR frame), so with mixed recipients a queue holds fewer messages of its own. One that
 does is decoded with `cdr_deserialize_with_endpoint` and the publisher's buffer gid; a

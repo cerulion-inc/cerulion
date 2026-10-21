@@ -226,7 +226,10 @@ impl TopicSubscriberView {
         self.data_service
             .dynamic_config()
             .list_subscribers(|details| {
-                f(details.subscriber_id.value(), details.subscriber_name.as_str());
+                f(
+                    details.subscriber_id.value(),
+                    details.subscriber_name.as_str(),
+                );
                 iceoryx2::prelude::CallbackProgression::Continue
             });
     }
