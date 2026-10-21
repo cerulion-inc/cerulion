@@ -320,6 +320,63 @@ pub enum PairingError {
         held: u64,
         offered: u64,
     },
+    // ---- machine identity on disk (`identity`) -----------------------------
+    /// Neither `CERULION_HOME` nor a home directory resolves, so there is no
+    /// place for the machine identity.
+    #[error("no home directory to hold the machine identity; set CERULION_HOME to a directory")]
+    NoConfigDir,
+    /// A team directory name is not one DNS label (1 to 63 of `a-z`, `0-9`,
+    /// `-`, not starting or ending with `-`).
+    #[error(
+        "invalid team name {0:?}: use 1 to 63 lowercase letters, digits or '-', not starting \
+         or ending with '-'"
+    )]
+    InvalidTeamName(String),
+    /// A machine key file exists but is not exactly 32 bytes. It is never
+    /// regenerated in place, because robots may already trust the key it held.
+    #[error(
+        "the machine key {path} is {len} bytes, not 32; restore it from a backup, or delete it \
+         to create a new key (robots paired with the old key must then be paired again)"
+    )]
+    MachineKeyMalformed {
+        /// The file that holds the wrong number of bytes.
+        path: std::path::PathBuf,
+        /// Its length in bytes.
+        len: usize,
+    },
+    /// The canonical machine key and the legacy `desk.key` both exist and hold
+    /// different keys. Neither is chosen or modified.
+    #[error(
+        "{canonical} and {legacy} hold different machine keys; keep the one your robots are \
+         paired with, move the other one out of the way, and run the command again"
+    )]
+    MachineKeyConflict {
+        /// `<config>/identity/device.key`.
+        canonical: std::path::PathBuf,
+        /// `<config>/desk.key`.
+        legacy: std::path::PathBuf,
+    },
+    /// A file operation on the machine identity failed.
+    #[error("{op} {path}: {source}")]
+    IdentityIo {
+        /// What was being done (`reading`, `creating`, ...).
+        op: &'static str,
+        /// The path it was done to.
+        path: std::path::PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The high-water file's MAC does not verify under this machine's key.
+    #[error(
+        "the identity high-water file failed its integrity check (edited, or copied from another \
+         machine); delete it only if this machine's clock and team state are known good"
+    )]
+    HighWaterTampered,
+    /// The high-water file has the wrong length or magic after its MAC verified,
+    /// or before a MAC could be checked.
+    #[error("the identity high-water file is malformed: {0}")]
+    HighWaterCorrupt(&'static str),
 }
 
 pub(crate) fn ser_err(e: postcard::Error) -> PairingError {

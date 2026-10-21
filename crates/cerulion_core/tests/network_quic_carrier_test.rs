@@ -7,6 +7,9 @@
 //! - a frame put through `publish_to_network` arrives, and a topic listed
 //!   `best_effort` in `NetworkConfig::egress_qos` arrives carrying zenoh's
 //!   best-effort marker while an unlisted topic arrives reliable;
+//! - a producer built from a graph `network:` block puts each egress topic
+//!   with the marker its own `reliability` names, else the block's
+//!   `default_reliability`, in both directions;
 //! - a self-signed end-entity certificate is accepted as its own trust anchor
 //!   for both ECDSA P-256 and Ed25519 keys;
 //! - a connector whose `root_ca` is a DIFFERENT certificate receives nothing;
@@ -19,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use cerulion_core::graph::NetworkBlock;
 use cerulion_core::{
     EgressQos, EgressReliability, NetworkConfig, NetworkManager, NetworkTls, WireHeader,
 };
@@ -153,6 +157,55 @@ fn quic_mixed_rel_delivers_with_ecdsa_self_signed_anchor() {
 #[test]
 fn quic_mixed_rel_delivers_with_ed25519_self_signed_anchor() {
     delivers_with_self_signed_anchor(&rcgen::PKCS_ED25519);
+}
+
+/// The producer's `NetworkConfig` comes from a parsed graph `network:` block:
+/// under each `default_reliability`, a bare egress topic arrives with the
+/// default's marker, and a topic with its own `reliability` arrives with that
+/// marker whatever the default says.
+#[test]
+fn quic_mixed_rel_puts_each_topic_at_its_effective_reliability() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = self_signed(dir.path(), "robot", &rcgen::PKCS_ECDSA_P256_SHA256);
+    for (default, opposite) in [("best_effort", "reliable"), ("reliable", "best_effort")] {
+        let port = free_udp_port();
+        let yaml = format!(
+            "mode: peer\n\
+             listen:\n  - quic/127.0.0.1:{port}?mixed_rel=1\n\
+             default_reliability: {default}\n\
+             egress:\n  - /q/bare\n  - topic: /q/own\n    reliability: {opposite}\n\
+             tls:\n  certificate: {}\n  private_key: {}\n",
+            cert.display(),
+            key.display()
+        );
+        let block: NetworkBlock = serde_yaml::from_str(&yaml).unwrap();
+        let p = Pair {
+            producer: NetworkManager::new(block.to_network_config().expect("peer mode")),
+            consumer: NetworkManager::new(NetworkConfig {
+                connect_endpoints: vec![format!("quic/127.0.0.1:{port}?mixed_rel=1")],
+                tls: Some(NetworkTls {
+                    root_ca: Some(cert.clone()),
+                    ..NetworkTls::default()
+                }),
+                ..NetworkConfig::default()
+            }),
+        };
+        p.producer.session().expect("a quic/ listener opens");
+        let marker = |r: &str| match r {
+            "best_effort" => Reliability::BestEffort,
+            _ => Reliability::Reliable,
+        };
+        assert_eq!(
+            deliver_one(&p, "/q/bare", Duration::from_secs(10)),
+            Some(marker(default)),
+            "default {default}: a bare topic arrives at the default"
+        );
+        assert_eq!(
+            deliver_one(&p, "/q/own", Duration::from_secs(10)),
+            Some(marker(opposite)),
+            "default {default}: a topic's own reliability ({opposite}) wins"
+        );
+    }
 }
 
 #[test]
