@@ -360,6 +360,10 @@ pub struct SchemaServingHandles {
     /// into this same map (see [`GatewayRuntime::new_with_schema_serving`]),
     /// and `replace` clears it so a prior run's hashes never leak forward.
     runtime_hashes: Arc<Mutex<HashMap<String, u64>>>,
+    /// Canonical boot-plan topics the catalog labels provenance `Boot`.
+    /// `replace` sets it to the next run's `served_topics`, so a restarted
+    /// run's announced topics are not labelled `Runtime`.
+    boot_topics: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A copy of every live map [`SchemaServingHandles::replace`] overwrites,
@@ -371,6 +375,7 @@ pub struct SchemaServingState {
     hash_names: HashMap<u64, String>,
     docs: std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>,
     runtime_hashes: HashMap<String, u64>,
+    boot_topics: HashSet<String>,
 }
 
 impl SchemaServingHandles {
@@ -386,6 +391,7 @@ impl SchemaServingHandles {
         docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
         snapshot_lock: Arc<Mutex<()>>,
         runtime_hashes: Arc<Mutex<HashMap<String, u64>>>,
+        boot_topics: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
             topic_schemas,
@@ -393,6 +399,7 @@ impl SchemaServingHandles {
             docs,
             snapshot_lock,
             runtime_hashes,
+            boot_topics,
         }
     }
 
@@ -469,6 +476,8 @@ impl SchemaServingHandles {
     /// preventing a reader from observing a mixed snapshot. Canonical duplicate
     /// topics and duplicate keys within `serving` are first-wins. The runtime
     /// hash map is cleared: the next run's gateway records its own hashes.
+    /// The boot-topic set becomes the canonical `serving.served_topics`, so
+    /// the catalog labels the next run's announced topics `Boot`.
     ///
     /// Returns the replaced state, so a caller whose run then fails to start
     /// can [`restore`](Self::restore) it.
@@ -495,7 +504,19 @@ impl SchemaServingHandles {
             .docs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut boot = self
+            .boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        let prior_boot_topics = std::mem::replace(
+            &mut *boot,
+            serving
+                .served_topics
+                .iter()
+                .map(|topic| canonical_topic(topic).into_owned())
+                .collect(),
+        );
         let prior_runtime_hashes = std::mem::take(&mut *rh);
         let prior_topic_schemas = std::mem::take(&mut *ts);
         let prior_hash_names = std::mem::take(&mut *hn);
@@ -512,12 +533,13 @@ impl SchemaServingHandles {
             docs.entry(doc.qualified.clone())
                 .or_insert_with(|| doc.clone());
         }
-        drop((rh, ts, hn, docs));
+        drop((rh, ts, hn, docs, boot));
         SchemaServingState {
             topic_schemas: prior_topic_schemas,
             hash_names: prior_hash_names,
             docs: prior_docs,
             runtime_hashes: prior_runtime_hashes,
+            boot_topics: prior_boot_topics,
         }
     }
 
@@ -546,6 +568,10 @@ impl SchemaServingHandles {
             .docs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = prior.docs;
+        *self
+            .boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = prior.boot_topics;
     }
 }
 
@@ -1075,7 +1101,8 @@ impl GatewayRuntime {
                 || Arc::new(Mutex::new(HashMap::new())),
                 |latched| latched.runtime_hashes(),
             );
-        let catalog_boot_topics: Arc<HashSet<String>> = Arc::new(boot_topics.clone());
+        let catalog_boot_topics: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(boot_topics.clone()));
         // Materialize the CLI-handed schema serving into the
         // sources the query-surface callback reads. `topic_schemas` is
         // canonical-topic-keyed (mirrors the announce/hash keying); `schema_docs`
@@ -1129,6 +1156,7 @@ impl GatewayRuntime {
             snapshot_lock: Arc::clone(&catalog_snapshot_lock),
             docs: Arc::clone(&schema_source.docs),
             runtime_hashes: Arc::clone(&reg_hashes),
+            boot_topics: Arc::clone(&catalog_boot_topics),
         };
         // The catalog source the query surface reads. The gateway retains a
         // CLONE (below, test-gated) so the `catalog_serve_for_test` seam runs the
@@ -2737,6 +2765,9 @@ mod schema_serving_handles_tests {
             )]))),
             Arc::new(Mutex::new(())),
             Arc::new(Mutex::new(HashMap::from([("/chatter".to_string(), 7)]))),
+            Arc::new(Mutex::new(std::collections::HashSet::from([
+                "/retired".to_string()
+            ]))),
         );
         let new_doc = SchemaDoc {
             qualified: "new_msgs/New".to_string(),
@@ -2772,10 +2803,15 @@ mod schema_serving_handles_tests {
                     qualified: "ignored_msgs/Duplicate".to_string(),
                 },
             ],
-            served_topics: vec![],
+            served_topics: vec!["chatter".to_string()],
         };
 
         let prior = handles.replace(&serving);
+        // The boot set is the next run's canonical served topics.
+        assert_eq!(
+            *handles.boot_topics.lock().unwrap(),
+            std::collections::HashSet::from(["/chatter".to_string()])
+        );
 
         {
             let topics = handles
@@ -2815,6 +2851,10 @@ mod schema_serving_handles_tests {
 
         // `restore` puts the replaced run back exactly (a failed restart).
         handles.restore(prior);
+        assert_eq!(
+            *handles.boot_topics.lock().unwrap(),
+            std::collections::HashSet::from(["/retired".to_string()])
+        );
         assert_eq!(
             handles
                 .topic_schemas

@@ -1862,8 +1862,8 @@ fn runs_serve_decision(
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
-/// runtime-registration control channel into `hashes`, and `boot_topics` is fixed
-/// at boot - while the query-surface callback (on the zenoh callback thread) reads
+/// runtime-registration control channel into `hashes`, and `boot_topics` is set
+/// at boot (and by a host restart's `SchemaServingHandles::replace`) - while the query-surface callback (on the zenoh callback thread) reads
 /// them + the live bridge manager to answer a catalog GET. Cheap to clone (three
 /// `Arc`s).
 #[derive(Clone)]
@@ -1874,8 +1874,9 @@ pub struct CatalogSource {
     /// `schema_hash: None`.
     pub hashes: Arc<Mutex<HashMap<String, u64>>>,
     /// Canonical boot-plan announce topics - provenance `Boot`; every other
-    /// registered topic is provenance `Runtime`.
-    pub boot_topics: Arc<HashSet<String>>,
+    /// registered topic is provenance `Runtime`. A host restart's
+    /// `SchemaServingHandles::replace` swaps it for the next run's set.
+    pub boot_topics: Arc<Mutex<HashSet<String>>>,
     /// Canonical topic → its qualified schema NAME (`pkg/Type`),
     /// resolved by the CLI from the graph's node OUTPUTS and handed to the gateway
     /// in its plan. A topic absent here falls through to [`Self::hash_names`]
@@ -2045,6 +2046,10 @@ fn build_catalog_reply_from_bridge(
         .hash_names
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let boot_topics = catalog
+        .boot_topics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Upgrade the WEAK manager handle ONCE for the whole sweep (a live
     // gateway upgrade always succeeds - the manager owns this query surface). `None`
     // on a probe-less serve path (a test seam) ⇒ every `producer_count: None` (the
@@ -2076,7 +2081,7 @@ fn build_catalog_reply_from_bridge(
             .get(&topic)
             .cloned()
             .or_else(|| schema_hash.and_then(|h| hash_names.get(&h).cloned()));
-        let provenance = if catalog.boot_topics.contains(&topic) {
+        let provenance = if boot_topics.contains(&topic) {
             CatalogProvenance::Boot
         } else {
             CatalogProvenance::Runtime
@@ -4510,6 +4515,7 @@ impl NetworkManager {
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
             Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5308,7 +5314,7 @@ mod tests {
                 ("/rt/widget".to_string(), WIDGET_HASH),
                 ("/rt/unknown".to_string(), 0xDEAD_BEEF_u64),
             ]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             // No explicit topic→name binding for either runtime topic.
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             // The reverse map names the widget hash; the unknown hash is absent.
@@ -5358,7 +5364,7 @@ mod tests {
                 "/g/cam/image".to_string(),
                 HASH,
             )]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::from([(
                 "/g/cam/image".to_string(),
                 "sensor_msgs/Image".to_string(),
@@ -5398,7 +5404,7 @@ mod tests {
         let snapshot_lock = Arc::new(Mutex::new(()));
         let catalog = CatalogSource {
             hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             hash_names: Arc::new(Mutex::new(HashMap::new())),
             producer_probe: None,
@@ -5412,6 +5418,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock,
             Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
 
         // The restart: the next run serves /run_two/cam only.
@@ -5425,12 +5432,25 @@ mod tests {
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
         assert_eq!(topics, ["/run_two/cam"]);
+        // The restarted run's served topic is a boot topic of that run.
+        assert_eq!(reply.entries[0].provenance, CatalogProvenance::Boot);
 
-        // A runtime registration after the restart lists alongside it.
+        // A runtime registration after the restart lists alongside it, and
+        // only it is labelled `Runtime`.
         bridge.register_topic("/host/late").expect("register late");
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(topics, HashSet::from(["/run_two/cam", "/host/late"]));
+        let provenance: HashMap<&str, CatalogProvenance> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.provenance))
+            .collect();
+        assert_eq!(
+            provenance,
+            HashMap::from([
+                ("/run_two/cam", CatalogProvenance::Boot),
+                ("/host/late", CatalogProvenance::Runtime),
+            ])
+        );
     }
 
     #[test]
