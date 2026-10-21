@@ -922,6 +922,28 @@ pub fn topic_type_with_scope(
     }
 }
 
+/// Add `frame` to the bandwidth `ring` of at most `window` frames.
+///
+/// A frame stamped before the ring's newest frame AND no later than its
+/// oldest frame is a publisher clock reset (a `bag play --loop` pass that
+/// starts again, or a restarted sim clock): the ring is cleared first, so a
+/// figure never mixes frames from both sides of the reset. A frame that is
+/// only a little out of order (later than the oldest frame) is kept, and a
+/// silent gap never clears the ring, because its stamps still go forward.
+/// The check reads the two ends of the ring only, so it is constant time
+/// and never allocates.
+pub fn push_bw_frame(ring: &mut VecDeque<BwFrame>, window: usize, frame: BwFrame) {
+    if let (Some(oldest), Some(newest)) = (ring.front(), ring.back()) {
+        if frame.timestamp_ns < newest.timestamp_ns && frame.timestamp_ns <= oldest.timestamp_ns {
+            ring.clear();
+        }
+    }
+    if ring.len() == window {
+        ring.pop_front();
+    }
+    ring.push_back(frame);
+}
+
 /// The line `topic bw` prints at the end of one report interval, given the
 /// frames in `ring` and how many of them arrived in this interval.
 ///
@@ -956,7 +978,8 @@ pub fn bw_report_line(
 /// retry and pacing rules. Each frame adds its wire stamp and payload size to
 /// a ring allocated once before the loop, so the receive callback never
 /// allocates. A second with no new frame prints a silence line instead of
-/// repeating the last figure, and keeps the window (see [`bw_report_line`]).
+/// repeating the last figure, and keeps the window (see [`bw_report_line`]);
+/// a publisher clock reset clears it (see [`push_bw_frame`]).
 /// A closed output (a reader that left the pipe) ends the command cleanly;
 /// any other write failure is returned.
 pub fn topic_bw_with_scope(
@@ -989,13 +1012,14 @@ pub fn topic_bw_with_scope(
         let wait_started = Instant::now();
         let mut delivered = 0usize;
         let received = subscriber.wait_for_message(wait, |msg| {
-            if ring.len() == window {
-                ring.pop_front();
-            }
-            ring.push_back(BwFrame {
-                timestamp_ns: msg.header().timestamp_ns,
-                size_bytes: msg.payload().len() as u64,
-            });
+            push_bw_frame(
+                &mut ring,
+                window,
+                BwFrame {
+                    timestamp_ns: msg.header().timestamp_ns,
+                    size_bytes: msg.payload().len() as u64,
+                },
+            );
             delivered += 1;
         });
         // Count what reached the ring before any error path: a receive can
@@ -1466,6 +1490,72 @@ mod tests {
             bw_report_line(&mut ring, 1, Duration::ZERO, "local SHM"),
             "bandwidth: 167 B/s, mean: 500 B, min: 500 B, max: 500 B, window: 2"
         );
+    }
+
+    fn pushed(window: usize, frames: &[BwFrame]) -> VecDeque<BwFrame> {
+        let mut ring = VecDeque::with_capacity(window);
+        for f in frames {
+            push_bw_frame(&mut ring, window, *f);
+        }
+        ring
+    }
+
+    #[test]
+    fn a_looped_replay_measures_one_pass_not_both() {
+        // Two passes of 100-byte frames stamped 0, 1, 2 s: the second pass
+        // restarts the clock, so only its frames are in the window. 200 bytes
+        // after 0 s over 2 s is 100 B/s (both passes together would be 200).
+        let pass = [frame(0, 100), frame(SEC, 100), frame(2 * SEC, 100)];
+        let mut frames = pass.to_vec();
+        frames.extend(pass);
+        let mut ring = pushed(100, &frames);
+        assert_eq!(ring, pass);
+        assert_eq!(
+            bw_report_line(&mut ring, 3, Duration::ZERO, "local SHM"),
+            "bandwidth: 100 B/s, mean: 100 B, min: 100 B, max: 100 B, window: 3"
+        );
+    }
+
+    #[test]
+    fn a_reset_behind_a_full_window_clears_it() {
+        // Window of 2 holds the frames at 5 s and 6 s; a frame at 1 s is
+        // behind both, so it starts a new window alone.
+        let ring = pushed(
+            2,
+            &[
+                frame(4 * SEC, 1),
+                frame(5 * SEC, 1),
+                frame(6 * SEC, 1),
+                frame(SEC, 1),
+            ],
+        );
+        assert_eq!(ring, [frame(SEC, 1)]);
+    }
+
+    #[test]
+    fn a_frame_only_a_little_out_of_order_stays_in_the_window() {
+        // 1.5 s arrives after 2 s but is later than the oldest frame (0 s).
+        let frames = [frame(0, 10), frame(2 * SEC, 10), frame(3 * SEC / 2, 10)];
+        assert_eq!(pushed(100, &frames), frames);
+    }
+
+    #[test]
+    fn frames_on_one_stamp_are_not_a_reset() {
+        let frames = [frame(SEC, 10), frame(SEC, 10), frame(SEC, 10)];
+        assert_eq!(pushed(100, &frames), frames);
+    }
+
+    #[test]
+    fn a_full_window_drops_its_oldest_frame() {
+        let ring = pushed(2, &[frame(0, 1), frame(SEC, 2), frame(2 * SEC, 3)]);
+        assert_eq!(ring, [frame(SEC, 2), frame(2 * SEC, 3)]);
+    }
+
+    #[test]
+    fn a_silent_gap_keeps_the_window() {
+        // Stamps go forward across a 60 s gap, so nothing is cleared.
+        let frames = [frame(0, 10), frame(SEC, 10), frame(61 * SEC, 10)];
+        assert_eq!(pushed(100, &frames), frames);
     }
 
     #[test]
