@@ -205,7 +205,7 @@ zenoh = { version = "1.10.1", default-features = false, features = [
 ] }
 # Reads a `quic/` listener's certificate at session open to refuse a CA:TRUE
 # certificate, which webpki rejects as an end entity at handshake time
-# (`apply_tls` in transport/network.rs). The version zenoh-link-commons already uses.
+# (`check_tls_files` in transport/carrier.rs). The version zenoh-link-commons already uses.
 x509-parser = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 # Stable get_or_try_init (std::sync::OnceLock version is nightly-only)

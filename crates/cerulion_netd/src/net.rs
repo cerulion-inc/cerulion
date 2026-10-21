@@ -76,10 +76,20 @@ pub const TLS_CERTIFICATE_ENV: &str = "CERULION_NETD_TLS_CERTIFICATE";
 /// `transport/link/tls/listen_private_key`).
 pub const TLS_PRIVATE_KEY_ENV: &str = "CERULION_NETD_TLS_PRIVATE_KEY";
 
+/// The environment variable each carrier setting comes from, quoted in the
+/// start-up refusals of [`check_env_network_config`].
+pub const ENV_SETTING_NAMES: cerulion_core::CarrierSettingNames =
+    cerulion_core::CarrierSettingNames {
+        listen: LISTEN_ENV,
+        connect: CONNECT_ENV,
+        root_ca: TLS_ROOT_CA_ENV,
+        certificate: TLS_CERTIFICATE_ENV,
+        private_key: TLS_PRIVATE_KEY_ENV,
+    };
+
 /// Build netd's `quic/` certificate settings from the three env values: `None`
-/// when all are unset or empty, else the set ones.
-/// A wrong path surfaces when the session opens, naming the path. Pure,
-/// oracle-tested.
+/// when all are unset or empty, else the set ones. Pure, oracle-tested; the
+/// rules are applied by [`check_env_network_config`].
 pub fn tls_from_values(
     root_ca: Option<&str>,
     certificate: Option<&str>,
@@ -96,6 +106,32 @@ pub fn tls_from_values(
         private_key: path(private_key),
     };
     (tls.root_ca.is_some() || tls.certificate.is_some() || tls.private_key.is_some()).then_some(tls)
+}
+
+/// Apply the graph-load carrier rules to netd's env-derived config, naming the
+/// environment variables: every locator classifies and none is datagram only,
+/// the TLS variables are set exactly when a `quic/` locator reads them
+/// ([`TLS_ROOT_CA_ENV`] for a `quic/` connect, [`TLS_CERTIFICATE_ENV`] and
+/// [`TLS_PRIVATE_KEY_ENV`] together for a `quic/` listen), and each named file
+/// is an absolute path to a readable PEM file, with a listener certificate not
+/// marked `CA:TRUE`. netd egress carries every topic reliable, so no
+/// best-effort rule applies.
+///
+/// # Errors
+///
+/// The first refusal, as a human-readable message.
+pub fn check_env_network_config(cfg: &NetworkConfig) -> Result<(), String> {
+    cerulion_core::check_carrier_settings(
+        &cfg.listen_endpoints,
+        &cfg.connect_endpoints,
+        cfg.tls.as_ref(),
+        None,
+        &ENV_SETTING_NAMES,
+    )?;
+    if let Some(tls) = &cfg.tls {
+        cerulion_core::check_tls_files(tls, &ENV_SETTING_NAMES)?;
+    }
+    Ok(())
 }
 
 /// Parse a `CONNECT`/`LISTEN` env value into a locator list: split on commas AND
@@ -183,7 +219,11 @@ pub fn classify_network_switch(value: Option<&str>) -> NetworkSwitch {
 /// LOUDLY — never a silent "I thought I disabled it". A configured-but-unused
 /// manager opens no session (the lazy-session invariant), so a never-demanded netd
 /// is byte-identical to a local-only one at runtime.
-pub fn network_config_from_env() -> Option<NetworkConfig> {
+///
+/// # Errors
+///
+/// A [`check_env_network_config`] refusal of the locator and TLS variables.
+pub fn network_config_from_env() -> Result<Option<NetworkConfig>, String> {
     let raw = std::env::var(NETWORK_ENV).ok();
     match classify_network_switch(raw.as_deref()) {
         NetworkSwitch::Off => {
@@ -191,7 +231,7 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
                 "cerulion-netd: {NETWORK_ENV}={NETWORK_OFF} — LOCAL-ONLY (no zenoh session ever; \
                  a remote demand will surface the not-network-configured residual)"
             );
-            return None;
+            return Ok(None);
         }
         NetworkSwitch::OnMistyped => {
             tracing::warn!(
@@ -234,7 +274,8 @@ pub fn network_config_from_env() -> Option<NetworkConfig> {
     // (cerulion_core::graph::robot_identity_from_env — the same one the LAN gateway +
     // the remote wire plane use), so the desk never self-attributes under two names.
     cfg.robot_identity = Some(cerulion_core::graph::robot_identity_from_env());
-    Some(cfg)
+    check_env_network_config(&cfg)?;
+    Ok(Some(cfg))
 }
 
 #[cfg(test)]
@@ -394,7 +435,7 @@ mod tests {
         {
             let _g = EnvVarGuard::set(NETWORK_ENV, NETWORK_OFF);
             assert!(
-                network_config_from_env().is_none(),
+                network_config_from_env().unwrap().is_none(),
                 "CERULION_NETD_NETWORK=off yields a network-less (None) config"
             );
         }
@@ -404,7 +445,9 @@ mod tests {
         // (b) a mistyped "off" (e.g. "OFF") keeps networking ON (Some).
         {
             let _g = EnvVarGuard::set(NETWORK_ENV, "OFF");
-            let cfg = network_config_from_env().expect("a mistyped off keeps networking ON");
+            let cfg = network_config_from_env()
+                .unwrap()
+                .expect("a mistyped off keeps networking ON");
             assert!(
                 cfg.gossip_scouting && !cfg.multicast_scouting,
                 "a mistyped off keeps the networked default (gossip on, multicast off)"
@@ -416,7 +459,9 @@ mod tests {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             let _gc = EnvVarGuard::set(CONNECT_ENV, "tcp/10.0.0.1:7683,tcp/10.0.0.2:7447");
             let _gl = EnvVarGuard::set(LISTEN_ENV, "tcp/0.0.0.0:7447");
-            let cfg = network_config_from_env().expect("default is network-configured");
+            let cfg = network_config_from_env()
+                .unwrap()
+                .expect("default is network-configured");
             assert_eq!(
                 cfg.connect_endpoints,
                 vec![
@@ -441,7 +486,9 @@ mod tests {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             let _gc = EnvVarGuard::unset(CONNECT_ENV);
             let _gl = EnvVarGuard::unset(LISTEN_ENV);
-            let cfg = network_config_from_env().expect("unset default is network-configured");
+            let cfg = network_config_from_env()
+                .unwrap()
+                .expect("unset default is network-configured");
             assert!(cfg.connect_endpoints.is_empty() && cfg.listen_endpoints.is_empty());
             assert!(!cfg.multicast_scouting && cfg.gossip_scouting);
             // The production env config carries this machine's identity
@@ -458,7 +505,7 @@ mod tests {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             let _gi =
                 EnvVarGuard::set(cerulion_core::graph::ROBOT_IDENTITY_ENV, "desk-override-42");
-            let cfg = network_config_from_env().expect("configured");
+            let cfg = network_config_from_env().unwrap().expect("configured");
             assert_eq!(cfg.robot_identity.as_deref(), Some("desk-override-42"));
         }
 
@@ -467,17 +514,117 @@ mod tests {
             let _gn = EnvVarGuard::unset(NETWORK_ENV);
             {
                 let _g = EnvVarGuard::set(MULTICAST_SCOUTING_ENV, "on");
-                let cfg = network_config_from_env().expect("configured");
+                let cfg = network_config_from_env().unwrap().expect("configured");
                 assert!(cfg.multicast_scouting && cfg.gossip_scouting);
             }
             for value in ["off", "", "true", "1"] {
                 let _g = EnvVarGuard::set(MULTICAST_SCOUTING_ENV, value);
-                let cfg = network_config_from_env().expect("configured");
+                let cfg = network_config_from_env().unwrap().expect("configured");
                 assert!(
                     !cfg.multicast_scouting,
                     "{MULTICAST_SCOUTING_ENV}={value:?} leaves multicast scouting off"
                 );
             }
+        }
+
+        // (g) quic/ locators: the graph-load carrier rules apply to the env,
+        // each refusal naming the variable to fix.
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("peers.pem");
+        std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let pem = pem.to_str().unwrap();
+        let missing = dir.path().join("missing.pem");
+        let missing = missing.to_str().unwrap();
+        for (connect, listen, root_ca, cert, key, needle) in [
+            (
+                "quic/10.0.0.2:7447?mixed_rel=1",
+                "",
+                "",
+                "",
+                "",
+                "CERULION_NETD_CONNECT has a quic/ locator but no CERULION_NETD_TLS_ROOT_CA",
+            ),
+            (
+                "",
+                "quic/0.0.0.0:7447",
+                "",
+                "",
+                "",
+                "CERULION_NETD_LISTEN has a quic/ locator but no CERULION_NETD_TLS_CERTIFICATE",
+            ),
+            (
+                "tcp/10.0.0.2:7447",
+                "",
+                pem,
+                "",
+                "",
+                "CERULION_NETD_TLS_ROOT_CA is set but no CERULION_NETD_CONNECT locator is quic/",
+            ),
+            (
+                "",
+                "quic/0.0.0.0:7447",
+                "",
+                pem,
+                "",
+                "one of CERULION_NETD_TLS_CERTIFICATE / CERULION_NETD_TLS_PRIVATE_KEY is set \
+                 without the other",
+            ),
+            (
+                "quic/10.0.0.2:7447",
+                "",
+                "certs/peers.pem",
+                "",
+                "",
+                "CERULION_NETD_TLS_ROOT_CA 'certs/peers.pem' is not an absolute path",
+            ),
+            ("quic/10.0.0.2:7447", "", missing, "", "", "cannot be read"),
+            (
+                "",
+                "udp/0.0.0.0:7684",
+                "",
+                "",
+                "",
+                "CERULION_NETD_LISTEN: locator 'udp/0.0.0.0:7684' is a datagram-only link",
+            ),
+            (
+                "quic/10.0.0.2:7447?rel=0",
+                "",
+                pem,
+                "",
+                "",
+                "CERULION_NETD_CONNECT: locator 'quic/10.0.0.2:7447?rel=0' is a datagram-only link",
+            ),
+        ] {
+            let _gn = EnvVarGuard::unset(NETWORK_ENV);
+            let _gc = EnvVarGuard::set(CONNECT_ENV, connect);
+            let _gl = EnvVarGuard::set(LISTEN_ENV, listen);
+            let _gr = EnvVarGuard::set(TLS_ROOT_CA_ENV, root_ca);
+            let _gt = EnvVarGuard::set(TLS_CERTIFICATE_ENV, cert);
+            let _gk = EnvVarGuard::set(TLS_PRIVATE_KEY_ENV, key);
+            let err = network_config_from_env().expect_err(needle);
+            assert!(err.contains(needle), "want '{needle}' in: {err}");
+        }
+        // A quic/ connect with a readable root_ca starts, carrying the file.
+        {
+            let _gn = EnvVarGuard::unset(NETWORK_ENV);
+            let _gc = EnvVarGuard::set(CONNECT_ENV, "quic/10.0.0.2:7447?mixed_rel=1");
+            let _gl = EnvVarGuard::unset(LISTEN_ENV);
+            let _gr = EnvVarGuard::set(TLS_ROOT_CA_ENV, pem);
+            let _gt = EnvVarGuard::unset(TLS_CERTIFICATE_ENV);
+            let _gk = EnvVarGuard::unset(TLS_PRIVATE_KEY_ENV);
+            let cfg = network_config_from_env()
+                .expect("a quic/ connect with its root_ca is accepted")
+                .expect("network on");
+            assert_eq!(
+                cfg.tls.and_then(|t| t.root_ca),
+                Some(std::path::PathBuf::from(pem))
+            );
+        }
+        // The kill switch wins over a setting that would be refused.
+        {
+            let _gn = EnvVarGuard::set(NETWORK_ENV, NETWORK_OFF);
+            let _gl = EnvVarGuard::set(LISTEN_ENV, "udp/0.0.0.0:7684");
+            assert!(matches!(network_config_from_env(), Ok(None)));
         }
     }
 }

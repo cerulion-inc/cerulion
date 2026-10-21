@@ -4878,39 +4878,19 @@ impl NetworkManager {
     }
 }
 
-/// Set zenoh's `transport/link/tls/*` keys from `tls`. Each file is read here
-/// and must hold a PEM block (`-----BEGIN `), so a wrong, unreadable or non-PEM
-/// path fails the session open naming it, rather than a QUIC listener that
-/// fails inside zenoh or a connect that zenoh retries in the background. Whether
-/// the PEM is the right certificate or key is zenoh's check, at handshake, with
-/// one exception read here: a listener certificate marked CA:TRUE (see
-/// [`refuse_ca_listener_certificate`]).
+/// Set zenoh's `transport/link/tls/*` keys from `tls`, after
+/// [`check_tls_files`](super::carrier::check_tls_files) has read each file: a
+/// wrong, unreadable or non-PEM path, or a listener certificate marked
+/// `CA:TRUE`, fails the session open naming the `tls.*` setting and the path,
+/// rather than a QUIC listener that fails inside zenoh or a connect that zenoh
+/// retries in the background.
 fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()> {
-    let refuse = |path: &std::path::Path, key: &str, why: String| TransportError::SessionCreation {
-        reason: format!("tls file '{}' for {key} {why}", path.display()),
-    };
+    super::carrier::check_tls_files(tls, &super::carrier::CarrierSettingNames::GRAPH)
+        .map_err(|reason| TransportError::SessionCreation { reason })?;
     for (key, path) in tls.file_keys() {
-        if !path.is_absolute() {
-            return Err(refuse(path, key, "is not an absolute path".to_string()));
-        }
-        let bytes =
-            std::fs::read(path).map_err(|e| refuse(path, key, format!("cannot be read: {e}")))?;
-        if !bytes.windows(11).any(|w| w == b"-----BEGIN ") {
-            return Err(refuse(
-                path,
-                key,
-                "holds no PEM block (-----BEGIN ...)".to_string(),
-            ));
-        }
-        if key == "transport/link/tls/listen_certificate" {
-            refuse_ca_listener_certificate(&bytes).map_err(|why| refuse(path, key, why))?;
-        }
-        let Some(utf8) = path.to_str() else {
-            return Err(TransportError::SessionCreation {
-                reason: format!("tls file '{}' for {key} is not valid UTF-8", path.display()),
-            });
-        };
-        let json = serde_json::to_string(utf8).map_err(|e| TransportError::SessionCreation {
+        // `check_tls_files` has refused a path that is not UTF-8.
+        let utf8 = path.to_string_lossy();
+        let json = serde_json::to_string(&utf8).map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to serialize {key}: {e}"),
         })?;
         config
@@ -4927,35 +4907,6 @@ fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()
         .map_err(|e| TransportError::SessionCreation {
             reason: format!("failed to set transport/link/tls/verify_name_on_connect: {e}"),
         })?;
-    Ok(())
-}
-
-/// A `quic/` listener's certificate (the first CERTIFICATE block of the file)
-/// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
-/// which rejects a CA certificate presented as the end entity
-/// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
-/// listener's log while the connector retries. `openssl req -x509` writes
-/// `CA:TRUE` unless told otherwise, so the error names the flag that fixes it.
-fn refuse_ca_listener_certificate(pem: &[u8]) -> Result<(), String> {
-    let block = x509_parser::pem::Pem::iter_from_buffer(pem)
-        .filter_map(Result::ok)
-        .find(|p| p.label == "CERTIFICATE")
-        .ok_or_else(|| "holds no CERTIFICATE PEM block".to_string())?;
-    let cert = block
-        .parse_x509()
-        .map_err(|e| format!("holds a CERTIFICATE block that does not parse: {e}"))?;
-    let is_ca = cert
-        .basic_constraints()
-        .map_err(|e| format!("has an unreadable basicConstraints extension: {e}"))?
-        .is_some_and(|bc| bc.value.ca);
-    if is_ca {
-        return Err(
-            "is marked CA:TRUE, and a quic/ peer refuses a CA certificate as the \
-                    listener's own certificate (CaUsedAsEndEntity); mint it as an end entity, \
-                    e.g. add `-addext basicConstraints=critical,CA:FALSE` to `openssl req -x509`"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
