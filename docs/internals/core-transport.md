@@ -354,11 +354,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 - A graph build starts NOTHING network. The graph process is network-free; the gateway
   is a SEPARATE process driven from the pure `compute_gateway_plan` → `GatewayRuntime`.
-  Plan derivation: explicit `network:` block ⇒ allow-list egress + announces + resolved
-  ingress table; permissive ⇒ allow-all + all produced topics announced; an ingress
+  Plan derivation: explicit `network:` block ⇒ allow-list egress + topic announce
+  tokens when LAN access is open + resolved ingress table; permissive ⇒ allow-all
+  egress, with produced-topic announce tokens declared only when LAN access is open; an ingress
   topic nobody consumes refuses loudly naming the topic + fix
   (`network_graph_wiring_test`).
-- `GatewayRuntime` owns one graph's network plane: announces produced topics, hears
+- `GatewayRuntime` owns one graph's network plane: announces produced topics when
+  LAN access is open, hears
   remote DEMAND tokens, forwards demanded topics' SHM frames to zenoh via listener-less
   taps (egress), re-injects declared ingress topics into local SHM. The zenoh payload is
   the Cerulion wire frame VERBATIM (no envelope); ONE network task serves all topics.

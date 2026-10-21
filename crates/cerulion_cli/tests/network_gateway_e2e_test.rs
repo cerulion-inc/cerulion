@@ -113,6 +113,12 @@ impl EgressPlane for SpyEgress {
         let first = self.registers.fetch_add(1, Ordering::SeqCst) == 0;
         Ok(first)
     }
+    /// The spy models a real netd's report: this harness registers a
+    /// permissive (no `network:` block) plan, so the plane answers Open,
+    /// like a gateway that took the posture it was given.
+    fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+        Some(cerulion_core::LanAccess::Open)
+    }
     fn release_egress(&self, _id: EgressId) {
         self.releases.fetch_add(1, Ordering::SeqCst);
     }

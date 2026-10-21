@@ -4,6 +4,7 @@ members = [
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
+    "crates/cerulion_android",
     # Local Studio workspace engine daemon. It links cli_engine, so it inherits
     # the workspace AGPL license rather than being a proprietary client library.
     "crates/cerulion_wsd",
@@ -483,6 +484,7 @@ cerulion_core = { path = "crates/cerulion_core", version = "=1.0.0" }
 cerulion_bag = { path = "crates/cerulion_bag", version = "=1.0.0" }
 cerulion_bagd = { path = "crates/cerulion_bagd", version = "=1.0.0" }
 cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=1.0.0" }
+indexmap = "2.8"
 cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=1.0.0" }
 cerulion_dds = { path = "crates/cerulion_dds", version = "=1.0.0", default-features = false }
 cerulion_discovery = { path = "crates/cerulion_discovery", version = "=1.0.0" }
