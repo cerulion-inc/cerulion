@@ -23,7 +23,7 @@
 //!   message proxy by default (advertised in the banner every viewer connects
 //!   to), or connect as a CLIENT to `$CERULION_RERUN_URL`.
 //! - [`net`] — the desk-default zenoh [`NetworkConfig`](cerulion_core::transport::network::NetworkConfig)
-//!   the daemon initializes its transport with (remote arm): scouting ON,
+//!   the daemon initializes its transport with (remote arm): gossip on, multicast off,
 //!   lazy session, env-threaded `--connect`/`--listen` locators, and the
 //!   `CERULION_VIZD_NETWORK=off` local-only kill switch.
 //! - [`monitors`] — MONITORS v1: the daemon-side plane around

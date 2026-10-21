@@ -2072,7 +2072,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 // mirror fold, the best-effort remote half) for the plain and
                 // the `-t` listing alike; the binary hands it the parsed flags.
                 // The remote options come from the engine's unit-pinned
-                // builder, which holds the scouting-ON default. Only `-t`
+                // builder, which holds the automagic default. Only `-t`
                 // names types, so only `-t` looks for the workspace.
                 let ws = if show_types {
                     discover_optional_workspace()?
@@ -2739,11 +2739,17 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
+    // A remote attach under a kill switch is refused after the arg-shape checks
+    // and before any daemon is spawned or contacted.
+    if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
+        return Err(val(refusal));
+    }
+
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are
     //    threaded into its network config (env-at-spawn); a daemon already running
     //    keeps its own boot-time locators (a shared long-lived daemon's config is
-    //    fixed at start — scouting covers the LAN regardless).
+    //    fixed at start).
     let socket = viz_client::vizd_socket_path();
     let log_path = viz_client::vizd_log_path(&socket);
     let log_for_spawn = log_path.clone();
@@ -2785,14 +2791,13 @@ fn run_viz_unix(
 
     // Note to the user: locators given, but the daemon was ALREADY running — this
     // command's locators do not reconfigure a live shared daemon (its network
-    // config is fixed at start). Scouting (on by default) still covers a LAN
-    // robot; restart the daemon to bake in new locators for a robot scouting
-    // can't reach. Never a silent drop (the project's loud-inference rule).
+    // config is fixed at start). Restart the daemon to bake in new locators.
+    // Never a silent drop (the project's loud-inference rule).
     if !spawned && (!connect.is_empty() || !listen.is_empty()) {
         eprintln!(
             "cerulion viz: note — the cerulion-vizd daemon was already running, so \
              --connect/--listen apply only to a daemon THIS command starts; the running daemon \
-             keeps its boot-time locators (scouting still covers LAN robots). Restart it \
+             keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
     }

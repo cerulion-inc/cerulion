@@ -827,7 +827,7 @@ pub fn unsearched_robots_note<'a>(
 /// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`]. An unknown type
 /// is an empty list; a malformed name is an error before any topic is read.
 /// `connect` and `listen` add locators to the discovery session, as `topic
-/// list --connect` and `--listen` do, for a robot scouting cannot find.
+/// list --connect` and `--listen` do, for a robot discovery cannot find.
 pub fn topic_find(
     type_name: &str,
     schemas_dir: Option<&Path>,

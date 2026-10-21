@@ -52,7 +52,7 @@ enum TopicIntrospectAction {
     /// (typed from one message) and every REMOTE robot's topic `topic list`
     /// discovers (typed from its catalog). A type no topic carries prints
     /// nothing and exits 0. Pass `--connect` or `--listen` locators to reach
-    /// robots scouting cannot find, as `topic list` takes them; pass
+    /// robots discovery cannot find, as `topic list` takes them; pass
     /// `--local` to read genuine local producers only, without remote
     /// discovery.
     Find {
@@ -61,11 +61,11 @@ enum TopicIntrospectAction {
         local: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// Message type, for example `geometry_msgs/Vector3`
