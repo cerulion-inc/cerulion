@@ -2084,7 +2084,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     topic_cmd::render_local_topics_section(&genuine_local, all)
                 );
                 // Automagic: remote discovery runs BY DEFAULT (the mDNS /
-                // cache / hostname ladder) — unpaired robots on the LAN show
+                // cache / hostname ladder), unpaired robots on the LAN show
                 // up with no flags. `--no-network` skips it (scripts / CI / offline).
                 // The options are built by the ENGINE's unit-pinned builder
                 // (`remote_discovery_options` — the

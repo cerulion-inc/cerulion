@@ -1070,7 +1070,7 @@ pub const CATALOG_GATHER_WINDOW: Duration = Duration::from_millis(250);
 /// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off).
 /// `false` keeps engine unit + live tests hermetic (an isolated session
 /// discovers only what its explicit locators reach); the CLI dispatch
-/// (`topic list`) sets it — that's where the automagic default lives, NOT in
+/// (`topic list`) sets it, that's where the automagic default lives, NOT in
 /// this struct.
 pub struct RemoteTopicsOptions {
     /// Remote locators to connect to (e.g. `tcp/192.168.123.99:7683` — a
@@ -1095,7 +1095,7 @@ impl RemoteTopicsOptions {
 }
 
 /// Build the automagic `topic list` discovery
-/// options — THE one place the CLI-path automagic default lives. The binary
+/// options, THE one place the CLI-path automagic default lives. The binary
 /// dispatch (`cerulion topic list`) is a thin passthrough to this fn, so the
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
 /// regression flipping `scouting` off would silently disable zero-flag

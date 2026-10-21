@@ -5,7 +5,7 @@
 //! netd is network-CONFIGURED by default (gossip scouting on, zenoh multicast
 //! scouting OFF) but its zenoh session stays LAZY: `cerulion_core` opens no
 //! session until the FIRST `register_ingress_topic` (the first remote-topic
-//! demand). So a netd spawned but never demanded opens NO zenoh session at all —
+//! demand). So a netd spawned but never demanded opens NO zenoh session at all,
 //! and then self-exits on idle (`daemon`), leaving nothing behind.
 //!
 //! Peers come from the boot-time fold in [`crate::discovery_fold`]: one bounded
@@ -16,7 +16,7 @@
 //! multicast scouting back on for a network where mDNS does not cross. The
 //! [`CONNECT_ENV`]/[`LISTEN_ENV`] locators are the boot-time escape hatch for a
 //! robot neither rung can reach (a different subnet). [`NETWORK_ENV`]`=off`
-//! forces a strictly local-only netd (never any zenoh) for a locked-down network —
+//! forces a strictly local-only netd (never any zenoh) for a locked-down network,
 //! a remote demand then surfaces the explicit "not network-configured" residual.
 //!
 //! netd is the ONE gateway per computer. An ingress-only desk would need NO robot identity
@@ -113,12 +113,12 @@ pub fn parse_locators(raw: &str) -> Vec<String> {
 /// Build netd's desk-default [`NetworkConfig`] from explicit locator lists:
 /// gossip scouting on, multicast scouting OFF, the given connect/listen locators
 /// folded in, everything else at [`NetworkConfig::default`] (peer mode,
-/// `robot_identity: None` — an ingress-only desk announces nothing). Gossip
+/// `robot_identity: None`, an ingress-only desk announces nothing). Gossip
 /// travels over links the session already has; it opens no UDP socket.
 /// [`network_config_from_env`] sets `multicast_scouting` from
 /// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`]. The zenoh
 /// session this configures stays LAZY (opened only on the first ingress
-/// register), so a never-demanded netd still opens nothing. Pure — oracle-tested.
+/// register), so a never-demanded netd still opens nothing. Pure, oracle-tested.
 pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> NetworkConfig {
     NetworkConfig {
         multicast_scouting: false,
@@ -153,7 +153,7 @@ pub fn standing_gateway_requested(cfg: Option<&NetworkConfig>) -> bool {
 /// foreseeable-mistake guard) is oracle-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSwitch {
-    /// Networking ON (env unset or empty) — the desk default.
+    /// Networking ON (env unset or empty), the desk default.
     On,
     /// Networking OFF — the value is EXACTLY [`NETWORK_OFF`] (the kill switch).
     Off,

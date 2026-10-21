@@ -12,9 +12,9 @@
 //! both machines listen (`CERULION_NETD_LISTEN` on each) either side can be the
 //! dialer. These tests pass the connect endpoint by hand (no mDNS):
 //!
-//! - `producer_boots_second_and_dials_the_running_consumer` — G_prod CONNECTS
+//! - `producer_boots_second_and_dials_the_running_consumer`, G_prod CONNECTS
 //!   to G_cons, so the consumer's demand rides an INBOUND link at the consumer.
-//! - `consumer_boots_second_and_dials_the_running_producer` — G_cons CONNECTS
+//! - `consumer_boots_second_and_dials_the_running_producer`, G_cons CONNECTS
 //!   to G_prod, the outbound shape a desk has always used.
 //!
 //! Each runs the production demand paths (the consumer's demand token and its

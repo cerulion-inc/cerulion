@@ -322,6 +322,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `network_yaml_e2e_test.rs` | Config-only cross-machine delivery: two YAML graphs, bit-identical payload through the full chain. | `#[serial]` | none |
 | `network_tf_e2e_test.rs` | Worst-case wire shape (variable array of nested-with-strings) crosses the link byte-identical, empty-array edge included. | `#[serial]` | none |
 | `network_two_gateway_inversion_e2e_test.rs` / `network_two_gateway_reconcile_e2e_test.rs` | Queryable-inversion demand on a strict connect-only peer link; true two-gateway egress + reconciler delivery. | `#[serial]` | none |
+| `network_boot_order_e2e_test.rs` | Two listening gateways with the connect endpoint passed by hand: a demanded topic reaches the consumer byte-identical whichever side dials, the producer or the consumer. | parallel | none |
 | `ingress_injection_seam_test.rs` | The zenoh-free local-SHM ingress injection seam (`create_ingress_injector`). | `#[serial]` tt1 | none |
 | `ingress_publish_raw_notify_iox2_test.rs` | A raw-ingress publisher wakes foreign consumers from `publish_raw` itself. | `#[serial]` tt1 | none |
 | `mirror_provenance_e2e_test.rs` | Mirror-provenance registration over the control service; gather-back attribution. | `#[serial]` | none |

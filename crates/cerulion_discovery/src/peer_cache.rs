@@ -116,7 +116,7 @@ pub struct CachedPeer {
 
 /// Default cache path: `$CERULION_HOME/peers.json` when `CERULION_HOME` is set
 /// and non-empty (used verbatim, the same rule as the CLI's config directory),
-/// else `~/.cerulion/peers.json`. `None` when neither resolves — the call sites
+/// else `~/.cerulion/peers.json`. `None` when neither resolves, the call sites
 /// that resolve it (the `topic_cmd` write-back, the `discovery_ladder`
 /// cache-rung wiring, and `cerulion-netd`'s boot fold; `record_confirmed` and
 /// [`cache_rung`] themselves take an explicit path) emit the loud warn (this

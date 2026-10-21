@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! FIRST-CONTACT AUTOMAGIC — fold the peers netd can find at boot (one
+//! FIRST-CONTACT AUTOMAGIC: fold the peers netd can find at boot (one
 //! `_cerulion._tcp` mDNS browse plus the verified peer cache) into netd's zenoh
 //! session, so a desk reaches a robot on its LAN with NO env var and with zenoh
 //! multicast scouting off.
@@ -31,7 +31,7 @@
 //! a FATAL 1 s `bounded_connect` bound, where an endpoint that cannot answer in
 //! time can only sink the whole gather. netd's session is long-lived and NOT
 //! `bounded_connect`, so zenoh keeps a configured endpoint on a background retry
-//! connector — a robot that is merely booting comes up on its own a few seconds
+//! connector, a robot that is merely booting comes up on its own a few seconds
 //! later. Dropping it here would turn "wait for the robot" into "never connect".
 //!
 //! A DISCOVERED locator (mDNS or cache) gets the probe, at
@@ -134,8 +134,8 @@ pub fn trust_explicit_by_fiat(explicit: &[String], probed: HashSet<String>) -> H
 /// PURE. Assemble the fold from the explicit locators, the discovered candidates
 /// and the reachability verdict.
 ///
-/// Kept separate from every syscall — the browse, the file read, the TCP probes
-/// and the session config all live in [`fold_discovered_peers`] — so the
+/// Kept separate from every syscall, the browse, the file read, the TCP probes
+/// and the session config all live in [`fold_discovered_peers`], so the
 /// DECISION can be oracle-tested (and mutated) without a test ever touching the
 /// network or the developer's real `~/.cerulion/peers.json`.
 pub fn decide_fold(
@@ -229,7 +229,7 @@ pub fn fold_discovered_peers(
     let cache = default_cache_path();
     if cache.is_none() {
         tracing::debug!(
-            "cerulion-netd: no home directory; cannot locate the peer cache — folding \
+            "cerulion-netd: no home directory; cannot locate the peer cache, folding \
              mDNS answers only"
         );
     }
@@ -276,17 +276,17 @@ pub fn fold_discovered_peers_at(
         fold.folded_discovered.is_empty(),
         fold.dropped_discovered.is_empty(),
     ) {
-        // Nothing found at all — the ordinary cold-desk case, quiet.
+        // Nothing found at all, the ordinary cold-desk case, quiet.
         (true, true) => tracing::debug!(
             path = %path,
-            "cerulion-netd: no peer answered the `_cerulion._tcp` browse and none is cached — \
+            "cerulion-netd: no peer answered the `_cerulion._tcp` browse and none is cached, \
              the session dials only {} locators",
             crate::net::CONNECT_ENV
         ),
         (true, false) => tracing::info!(
             dropped = fold.dropped_discovered.len(),
             path = %path,
-            "every discovered peer failed the reachability probe — none dialled (was the \
+            "every discovered peer failed the reachability probe, none dialled (was the \
              robot asleep at daemon start?). netd folds peers ONCE at boot, so restart \
              netd once the robot is up, or set {}",
             crate::net::CONNECT_ENV
@@ -295,7 +295,7 @@ pub fn fold_discovered_peers_at(
             folded = ?fold.folded_discovered,
             dropped = fold.dropped_discovered.len(),
             path = %path,
-            "folded verified discovered peers (mDNS + cache) into the netd session — first contact \
+            "folded verified discovered peers (mDNS + cache) into the netd session, first contact \
              works with no {} set",
             crate::net::CONNECT_ENV
         ),

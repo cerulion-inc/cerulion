@@ -320,7 +320,7 @@ fn an_expired_cache_entry_is_never_dialled_even_when_reachable() {
     );
 }
 
-/// The fold touches the connect endpoints and NOTHING else — the scouting flags,
+/// The fold touches the connect endpoints and NOTHING else, the scouting flags,
 /// the listen endpoints and the machine identity are carried through untouched.
 /// A fold that reset the session posture would break LAN discovery for every
 /// desk while looking like it worked.

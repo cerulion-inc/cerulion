@@ -3826,7 +3826,7 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// The SYNTHESIZED permissive-default `NetworkConfig` — peer mode, gossip
+/// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
 /// scouting on, multicast scouting from
 /// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
 /// the gateway's `_cerulion._tcp` mDNS beacon is how peers find it), NO

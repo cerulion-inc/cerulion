@@ -204,7 +204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ONE iceoryx2 node + ONE zenoh session for the whole machine (Principle #8).
     // Network-CONFIGURED by default (gossip on, multicast scouting off unless
     // CERULION_MULTICAST_SCOUTING=on) so demand-driven ingress works, but the
-    // session stays LAZY — a netd spawned but never demanded opens no zenoh
+    // session stays LAZY, a netd spawned but never demanded opens no zenoh
     // session and then self-exits on idle. `init` (not `get_or_init`) so the
     // network config is honored: netd is the sole initializer of its transport.
     //
@@ -221,7 +221,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             (Some(cfg), fold)
         }
         // LOCAL-ONLY (`CERULION_NETD_NETWORK=off`): no session is ever opened, so
-        // there is nothing to dial — no browse, no cache read.
+        // there is nothing to dial, no browse, no cache read.
         None => (None, discovery_fold::PeerFold::default()),
     };
     // Decide the STANDING-gateway posture BEFORE `network` moves

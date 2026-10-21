@@ -76,7 +76,7 @@ pub fn desk_network_config(connect: Vec<String>, listen: Vec<String>) -> Network
 /// foreseeable-mistake guard) is oracle-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSwitch {
-    /// Networking ON (env unset or empty) — the desk default.
+    /// Networking ON (env unset or empty), the desk default.
     On,
     /// Networking OFF — the value is EXACTLY [`NETWORK_OFF`] (the kill switch).
     Off,
