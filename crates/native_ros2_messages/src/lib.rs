@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! ROS 2 message types for Cerulion nodes.
 //!
-//! 22 packages and 254 messages, generated at build time from the `.msg`
+//! 23 packages and 255 messages, generated at build time from the `.msg`
 //! files vendored in this crate's `msg/` directory. Most packages follow
 //! ROS 2 Jazzy. `control_msgs` follows the Lyrical release, because 13 of its
 //! 39 messages do not exist in Jazzy, and the two `autoware_*` packages follow

@@ -46,8 +46,8 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.
-- `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`:
-  `-- --test-threads=1`, last two share iox2 ns; build
+- `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`,
+  `log_echo_iox2_test`: `-- --test-threads=1`, middle two share iox2 ns; build
   `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use

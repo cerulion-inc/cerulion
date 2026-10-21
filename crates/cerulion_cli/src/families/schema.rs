@@ -34,7 +34,7 @@ enum SchemaAction {
         /// Schema name
         // No completer, and this arm was the worst of the three.
         // The workspace half is what the verb rejects (already-exists), and
-        // the 254 built-in `pkg/Type` names are worse than useless here: a
+        // the 255 built-in `pkg/Type` names are worse than useless here: a
         // `sensor_msgs/Image` either fails on the `/` or silently creates a
         // workspace schema that SHADOWS the built-in for the whole workspace.
         name: String,

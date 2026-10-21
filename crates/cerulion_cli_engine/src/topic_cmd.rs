@@ -289,7 +289,7 @@ fn render_hidden_internal_count(hidden: usize) -> String {
 /// observes come from — a LOCAL SHM topic, or a REMOTE robot's topic this process
 /// just DEMANDED from the shared cerulion-netd daemon (carrying the seeded decode
 /// walker so the observer never has to re-discover).
-enum TopicSource {
+pub(crate) enum TopicSource {
     /// The topic is a live LOCAL iceoryx2 topic — read it directly.
     Local,
     /// The topic is remote; this process demanded its shared mirror from
@@ -330,8 +330,8 @@ impl TopicScope {
 
 /// A subscriber owns its observation guard and drops the data subscriber first.
 /// This is private CLI ownership; core publisher/subscriber ABI is unchanged.
-struct ScopedSubscriber {
-    subscriber: cerulion_core::CerulionSubscriber,
+pub(crate) struct ScopedSubscriber {
+    pub(crate) subscriber: cerulion_core::CerulionSubscriber,
     _guard: ObservationGuard,
 }
 
@@ -382,7 +382,7 @@ impl std::ops::Deref for ScopedSubscriber {
 /// closes its UDS connection → netd releases the demand (the crash-safe
 /// refcount). A topic found NOWHERE errors precisely, naming that both local AND
 /// remote were searched.
-fn ensure_topic_available(
+pub(crate) fn ensure_topic_available(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
     // The caller's cancellation flag, so the first-contact wait below stays
@@ -843,7 +843,9 @@ const RETRY_CLAUSE: &str = "Retry in a few seconds — a robot that is still boo
 /// stopped has nothing to report.
 ///
 /// `None` (no cancellation source) is never interrupted. PURE — oracle-tested.
-fn interrupted_before_observing(running: Option<&std::sync::atomic::AtomicBool>) -> bool {
+pub(crate) fn interrupted_before_observing(
+    running: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
     running.is_some_and(|r| !r.load(std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -3330,7 +3332,7 @@ pub fn render_remote_topics_section_with_mirrors(
 ///
 /// ~1 idle wake/s, versus the previous busy poll loops (echo: 100/s via a
 /// 10 ms sleep; hz: 1000/s via a 1 ms sleep).
-const OBSERVER_HEARTBEAT: Duration = Duration::from_millis(1000);
+pub(crate) const OBSERVER_HEARTBEAT: Duration = Duration::from_millis(1000);
 
 /// The `topic hz` reporting cadence — emit a rate line every
 /// second. `topic_hz` blocks for `min(OBSERVER_HEARTBEAT, time-until-next-
@@ -3357,7 +3359,7 @@ const MAX_CONSECUTIVE_WAIT_ERRORS: u32 = 5;
 /// The three possible dispositions of one `wait_for_message` outcome in an
 /// observer loop (`topic_echo` / `topic_hz`). See [`decide_wait_outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitOutcomeAction {
+pub(crate) enum WaitOutcomeAction {
     /// Keep looping: either the wait succeeded (the retry budget resets),
     /// or it failed within the budget (re-enter the same blocking wait).
     Continue,
@@ -3381,7 +3383,7 @@ enum WaitOutcomeAction {
 /// observer loops route every wait outcome through here — under the
 /// workspace's `dead_code = "deny"` lint, a regression that stops
 /// consulting this function fails the BUILD, not just a test.
-fn decide_wait_outcome(
+pub(crate) fn decide_wait_outcome(
     wait_ok: bool,
     running: bool,
     consecutive_wait_errors: &mut u32,
@@ -3429,7 +3431,7 @@ const OBSERVER_SILENCE_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 /// `frames_displayed` gates the whole thing: a topic that has EVER delivered a
 /// frame in the current silence window is not silent, and an observer that is
 /// showing data must never also claim to be waiting for it.
-fn silence_notice_due(silent_for: Duration, notices_emitted: u32) -> bool {
+pub(crate) fn silence_notice_due(silent_for: Duration, notices_emitted: u32) -> bool {
     let due = OBSERVER_FIRST_SILENCE_NOTICE
         .saturating_add(OBSERVER_SILENCE_NOTICE_INTERVAL.saturating_mul(notices_emitted));
     silent_for >= due
@@ -3497,7 +3499,7 @@ const _: () = assert!(
 /// Pausing cannot lose data (Principle #6): frames stay queued in shared memory
 /// and the very next iteration drains them. The floor only ever delays the
 /// display of frames on a topic that, by rule 1, delivered none.
-fn decide_observer_pacing(
+pub(crate) fn decide_observer_pacing(
     delivered: usize,
     waited: Duration,
     requested: Duration,
@@ -3554,7 +3556,7 @@ pub fn observer_pacing_engaged_count() -> u64 {
 /// Record that an observer loop engaged its pacing floor. Called from
 /// inside the guarded arm ONLY, so the count cannot advance unless
 /// [`decide_observer_pacing`] actually returned a pause.
-fn note_pacing_engaged() {
+pub(crate) fn note_pacing_engaged() {
     OBSERVER_PACING_ENGAGED.fetch_add(1, Ordering::Relaxed);
 }
 

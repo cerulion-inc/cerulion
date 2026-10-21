@@ -23,8 +23,8 @@
 
 # ─── provenance: where each package's upstream truth was verified against ───
 # ONE DISTRO PIN PER PACKAGE, pinned per https://github.com/ros/rosdistro
-# `<distro>/distribution.yaml`. Of the 22 packages below, 20 carry a distro pin
-# (19 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
+# `<distro>/distribution.yaml`. Of the 23 packages below, 21 carry a distro pin
+# (20 Jazzy, and `control_msgs` LYRICAL because 13 of its 39 messages do not exist
 # in Jazzy at all — see the waiver section for what that cost us) and 2 carry NO
 # distro pin at all. "Jazzy" is the majority, NOT the whole corpus.
 # `jazzy`   = the repo's jazzy branch, which IS its Jazzy release branch.
@@ -33,9 +33,9 @@
 # `UNVERIFIED` = no distro-pinned source exists for this package at all.
 #
 # MUTABILITY, stated because the gate's design leans on provenance being
-# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 17 name a
-# moving branch (`@jazzy` x15, `@main` x2), so two refreshes months apart emit
-# byte-identical `!source` lines over different upstream states. For those 17 the
+# reviewable: only the 5 `release` pins name an IMMUTABLE tag. The other 18 name a
+# moving branch (`@jazzy` x16, `@main` x2), so two refreshes months apart emit
+# byte-identical `!source` lines over different upstream states. For those 18 the
 # line records WHERE we looked, not WHEN — only this file's git history dates a
 # branch-pinned signature.
 #
@@ -45,6 +45,7 @@
 !source action_msgs jazzy ros2/rcl_interfaces@jazzy
 !source builtin_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source statistics_msgs jazzy ros2/rcl_interfaces@jazzy
+!source rcl_interfaces jazzy ros2/rcl_interfaces@jazzy
 !source unique_identifier_msgs jazzy ros2/unique_identifier_msgs@jazzy
 !source diagnostic_msgs jazzy ros2/common_interfaces@jazzy
 !source geometry_msgs jazzy ros2/common_interfaces@jazzy
@@ -1079,6 +1080,19 @@ c uint16 STATIC=1
 =radar_msgs/RadarTracks
 f std_msgs/Header header
 f radar_msgs/RadarTrack[] tracks
+=rcl_interfaces/Log
+f builtin_interfaces/Time stamp
+f uint8 level
+f string name
+f string msg
+f string file
+f string function
+f uint32 line
+c uint8 DEBUG=10
+c uint8 ERROR=40
+c uint8 FATAL=50
+c uint8 INFO=20
+c uint8 WARN=30
 =sensor_msgs/BatteryState
 f std_msgs/Header header
 f float32 voltage

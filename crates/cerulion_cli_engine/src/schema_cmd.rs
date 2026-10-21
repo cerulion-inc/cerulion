@@ -4070,8 +4070,10 @@ pub struct ResolvedPortSchema {
 
 /// Refuse a port-schema resolution the RUST node scaffolder cannot honor.
 ///
-/// A `.msg` store type gets a generated Rust type only in a workspace whose
-/// `.cargo/config.toml` names it to the message crate's build script
+/// A `.msg` store type gets a generated Rust type only in a workspace that the
+/// value the message crate's build script sees names: its
+/// `.cargo/config.toml` entry, unless the entry is not forced and an
+/// inherited value replaces it
 /// ([`crate::workspace::WORKSPACE_MSGS_ENV`]; every workspace `workspace
 /// create` / `workspace init` makes has the line): `native_ros2_messages` then
 /// generates the store's packages beside the built-ins, so
@@ -4104,7 +4106,11 @@ pub fn refuse_store_port_scaffold(
          workspace does not generate its .msg types into the message crate, so the \
          scaffolded `use native_ros2_messages::...;` import could not compile and no \
          node port is created. Add `{env} = {{ value = \".\", relative = true }}` under \
-         `[env]` in {config} (new workspaces have it), then run the command again.",
+         `[env]` in {config} (new workspaces have it), then run the command again. An \
+         entry without `force = true` yields to an inherited {env}: unset it, or set it \
+         to this workspace's path, not to an empty value or another workspace's path. \
+         An entry with `force = true` replaces any inherited value: make its `value` \
+         name this workspace.",
         env = crate::workspace::WORKSPACE_MSGS_ENV,
         config = root.join(".cargo/config.toml").display(),
     )))

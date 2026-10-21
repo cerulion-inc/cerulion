@@ -199,6 +199,7 @@ pin catches the CONSEQUENCE on the measured set.
 | `vendored_types_test.rs` | Acceptance for later-vendored packages (vision/radar/grid_map + the UUID dep): real loan/fill round-trips over `TestTransport`, pairwise-distinct hashes including bare-name twins across packages | no | none |
 | `generated_bindings_test.rs` | Package-qualified schema-hash linkage, rosidl scalar-default parity, and bool-array wire semantics, against the real generated bindings | no | none |
 | `max_slice_len_test.rs` | `MAX_SLICE_LEN` lands on the expected tier for representative schemas (NOT exhaustive; see checklist step 5) | no | none |
+| `generator_refusal_test.rs` | The check `build.rs` uses (`build/refusal.rs`, pulled in by path by both) to leave out a workspace schema the generator refused, over the generator's real output: a reserved-prefix field and an accessor-colliding field are refusals; a schema or field description that only mentions `compile_error!(` is not, since it is a doc comment; plus hand-written source lines | no | none |
 | `stamp_helper_test.rs` | `builtin_interfaces/Time::from_ns` against hand-computed oracles; a seconds count past the `i32` horizon fires a `debug_assert!` in debug/test builds | no | none |
 
 All binaries are parallel-safe within this crate: the transport-using tests build

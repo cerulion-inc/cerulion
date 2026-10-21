@@ -5,6 +5,7 @@ node	Node management
 graph	Graph management
 topic	Topic introspection
 schema	Schema management
+log	Node logs
 ros2	ROS 2 interop: run, launch, attach to and migrate a ROS 2 stack
 viz	Visualize live topics in Cerulion Studio
 connect	Connect to a remote robot and mirror its topics into local shared memory

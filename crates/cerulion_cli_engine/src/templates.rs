@@ -175,14 +175,24 @@ fn python_name(name: &str) -> bool {
         && !PYTHON_KEYWORDS.contains(&name)
 }
 
+/// Whether Python mangles `name` inside a class body (`__x` becomes
+/// `_Node__x`, in a bare name and in an attribute reference alike), so the
+/// scaffolded `class Node` could not reach a module-level binding or a module
+/// attribute spelled that way.
+fn python_mangled(name: &str) -> bool {
+    name.starts_with("__") && !name.ends_with("__")
+}
+
 /// The import lines and the per-schema class expression a scaffolded
 /// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
 /// `-` is `_`, the module spelling), a package-less `Name` is `Name` from
 /// `cerulion.msgs`. A leaf that two packages share, that the scaffold itself
 /// binds (`cerulion`, `Node`), or that a port of the node is named (a class-body
 /// assignment rebinds the name for every later port), is reached through its
-/// module (`pkg.Name`). A schema no import can name (a keyword, a name with several
-/// `/`) keeps the quoted-name form, the escape hatch `cerulion.input` takes.
+/// module under a private alias (`_m_pkg.Name`, `_msgs.Name` for the root). A
+/// schema no import can name (a keyword, a name with several `/`, a leaf the
+/// class body would mangle) keeps the quoted-name form, the escape hatch
+/// `cerulion.input` takes.
 fn python_message_refs(
     schemas: &[&str],
     ports: &std::collections::BTreeSet<&str>,
@@ -196,6 +206,7 @@ fn python_message_refs(
             None => (None, schema),
         };
         let importable = python_name(leaf)
+            && !python_mangled(leaf)
             && package
                 .as_deref()
                 .is_none_or(|module| python_name(module) && module != "cerulion");
@@ -210,7 +221,7 @@ fn python_message_refs(
         owners.entry(leaf.as_str()).or_default().insert(package);
     }
     let mut by_module: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
-    let mut modules: BTreeSet<&str> = BTreeSet::new();
+    let mut via_module: Vec<(&str, Option<&str>, &str)> = Vec::new();
     let mut refs = quoted;
     for (schema, (package, leaf)) in &parts {
         let shared = owners[leaf.as_str()].len() > 1
@@ -218,9 +229,7 @@ fn python_message_refs(
             || leaf == "Node"
             || ports.contains(leaf.as_str());
         if shared {
-            let module = package.as_deref().unwrap_or("msgs");
-            modules.insert(module);
-            refs.insert(schema.clone(), format!("{module}.{leaf}"));
+            via_module.push((schema, package.as_deref(), leaf));
         } else {
             by_module
                 .entry(package.as_deref())
@@ -228,6 +237,37 @@ fn python_message_refs(
                 .insert(leaf);
             refs.insert(schema.clone(), leaf.clone());
         }
+    }
+    // A module is bound under a private alias, never its own name: a port or
+    // an imported class spelled like the module would rebind it in the class
+    // body. The root namespace (`None`) and a package named `msgs` stay two
+    // distinct aliases.
+    let mut taken: BTreeSet<String> = ports.iter().map(|port| port.to_string()).collect();
+    taken.extend(["cerulion".to_string(), "Node".to_string()]);
+    taken.extend(by_module.values().flatten().map(|leaf| leaf.to_string()));
+    let mut aliases: BTreeMap<Option<&str>, String> = BTreeMap::new();
+    for &(_, package, _) in &via_module {
+        if aliases.contains_key(&package) {
+            continue;
+        }
+        // A collision takes a numeric suffix, never another leading `_`: a
+        // name that starts with `__` is mangled in the class body and would
+        // miss the module-level import.
+        let base = match package {
+            Some(module) => format!("_m_{module}"),
+            None => "_msgs".to_string(),
+        };
+        let mut alias = base.clone();
+        let mut suffix = 2;
+        while taken.contains(&alias) {
+            alias = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        taken.insert(alias.clone());
+        aliases.insert(package, alias);
+    }
+    for (schema, package, leaf) in via_module {
+        refs.insert(schema.to_string(), format!("{}.{leaf}", aliases[&package]));
     }
     let mut imports = Vec::new();
     for (module, leaves) in &by_module {
@@ -237,12 +277,11 @@ fn python_message_refs(
             None => imports.push(format!("from cerulion.msgs import {names}")),
         }
     }
-    let packaged: Vec<&str> = modules.iter().copied().filter(|m| *m != "msgs").collect();
-    if !packaged.is_empty() {
-        imports.push(format!("from cerulion.msgs import {}", packaged.join(", ")));
-    }
-    if modules.contains("msgs") {
-        imports.push("from cerulion import msgs".to_string());
+    for (package, alias) in &aliases {
+        match package {
+            Some(module) => imports.push(format!("from cerulion.msgs import {module} as {alias}")),
+            None => imports.push(format!("from cerulion import msgs as {alias}")),
+        }
     }
     imports.sort();
     (imports, refs)

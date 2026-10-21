@@ -4,7 +4,7 @@
 
 The user surface is intentionally narrow:
 
-1. **The `cerulion` CLI**: workspace, node, graph, topic, schema, recording, visualization, remote access.
+1. **The `cerulion` CLI**: workspace, node, graph, topic, schema, node logs, recording, visualization, remote access.
 2. **Three macros**: `#[cerulion_node]` on the struct, `#[cerulion_node_impl]` on the impl block, and `#[derive(CerulionState)]` on a type your node holds.
 3. **Field attributes**: `#[input(...)]`, `#[output(...)]` and `#[cerulion(...)]`.
 4. **Graph YAML**: declarative wiring. Topology only; trigger policy lives on the node's macro.
@@ -247,6 +247,13 @@ These are "could not CHECK" answers, not "does not EXIST" ones, and
 workspace … what failed is the CHECK, not the lookup`, so you look at the file
 named rather than hunting for a missing definition.
 
+### `cerulion log`
+
+| Command | Effect |
+|---|---|
+| `log echo [--node <NAME>]... [--level <LEVEL>]` | Stream the log records of the running local graph, one line per record: `<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>`. `--node` keeps the records of the node with that logger name (repeat it for several); for a ROS 2 node it is the node name. `--level` keeps records at that level or above: `debug`, `info`, `warn` or `error`. Reads the local `/rosout` topic only; see [Node logs](#node-logs). |
+
+
 ### `cerulion ros2`
 
 The ROS 2 interop family. `run` / `launch` run stock ROS 2 entry points on
@@ -389,7 +396,11 @@ under `[env]` (`workspace create` and `workspace init` write it), and the
 message crate's build script then generates the workspace's types beside the
 built-ins, regenerating when a file under `schemas/` changes; resolver warnings
 appear as cargo warnings. Without the setting the crate holds the built-ins
-only. A type the crate cannot declare is left out with a cargo warning naming
+only. A `CERULION_WORKSPACE_MSGS` set in the shell replaces that entry (unless
+it has `force = true`), so a value that names another workspace generates that
+workspace's types, and `node create` refuses a Rust port of a store type as it
+does without the setting. The build script reads a relative value from the
+message crate's own directory unless the entry has `relative = true`. A type the crate cannot declare is left out with a cargo warning naming
 why, and so is every type that embeds it: a name Rust cannot spell (a keyword,
 a leading digit), a field naming a type no package declares, a field naming another package's type whose name the
 type's own package also declares, a field name two imported packages both
@@ -1967,7 +1978,7 @@ A schema is "fixed" iff every field is fixed: a primitive, a `string_fixed[N]`, 
 
 ## ROS2 `.msg` re-use
 
-Standard ROS2 message types live in the `native_ros2_messages` crate (22 packages, 254 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
+Standard ROS2 message types live in the `native_ros2_messages` crate (23 packages, 255 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
 
 ```yaml
 schema: sensor_msgs/Image
@@ -2508,6 +2519,46 @@ park).
 | free-run construction | `crates/cerulion_core/tests/free_run_ctor_iox2_test.rs` |
 | the death report over REAL processes: the loud head and its field set, the ABSENCE of a repeat, the retraction, the free-run `groups=` | `crates/cerulion_cli/tests/credit_death_e2e_test.rs` |
 | the latch's DECADE re-announcement (`"STILL without its consumer"`) | `crates/cerulion_cli_engine/src/graph_cmd.rs` (in-crate tests) |
+
+---
+
+## Node logs
+
+`/rosout` is the host's one log topic, the same topic ROS 2 nodes publish their logs on: a ROS 2 node started with `cerulion ros2 run` keeps its topic names as they are, so its records land here. The name is absolute and host-wide, like `/tf`: every process on the host shares it, so one reader sees them all. A record on it is an `rcl_interfaces/Log` message, read under Cerulion names:
+
+| `Log` field | What `cerulion log echo` reads it as |
+|---|---|
+| `stamp` | The record time: seconds and nanoseconds. |
+| `level` | The severity constant: `DEBUG=10`, `INFO=20`, `WARN=30`, `ERROR=40`. A `FATAL=50` record prints too, and any other value prints as `L<n>`. |
+| `name` | The node: the logger name a ROS 2 node publishes, which is its node name. |
+| `msg` | The message text. |
+| `file`, `line` | The source location of the log call. |
+| `function` | The `tracing` target: the module path the record came from. |
+
+A record is at most 16 KiB on the wire: the wire header, the fixed fields, the offset table and the four strings share the topic's 16,384-byte slice. `/rosout` is a normal topic otherwise: `topic list` shows it while it has a publisher, `topic echo /rosout` prints its raw records, and a recording can carry it. Cerulion node `tracing` records are not published to `/rosout` yet: a Cerulion node's logs go to its stderr (see [Node (cdylib) logs](#node-cdylib-logs)), and on a host where nothing publishes `/rosout`, `log echo` exits 1.
+
+### `cerulion log echo`
+
+```text
+cerulion log echo [--node <NAME>]... [--level <LEVEL>]
+```
+
+Prints each record on one line, the message last:
+
+```text
+<seconds>.<nanoseconds> <LEVEL> <node> <target> <file>:<line> <message>
+```
+
+The nanoseconds always print nine digits, the columns are separated by one space each, and an empty node, target or file prints as `-` (a missing file drops the line number with it). The space before the message always prints, so an empty message is an empty last column. In every field a backslash prints as `\\`, a newline, carriage return or tab as `\n`, `\r` or `\t`, and any other control character as `\u{..}`, so one record is always one line. In the five columns before the message a space prints as `\u{20}` too, so those columns never contain a space: `awk '{print $3}'` is the node column and `cut -d' ' -f6-` is the message. Nothing is truncated.
+
+| Flag | Effect |
+|---|---|
+| `--node <NAME>` | Keep only the records whose logger name (the `name` field) is `NAME`. Repeat the flag for several nodes. A ROS 2 node's logger name is its node name, which can differ from the `id:` of the graph entry that starts it: a `ros2:` entry `sidecar` running `demo_nodes_cpp talker` logs as `talker`. The name is matched as given and needs no running graph, so it works for a node started with `cerulion ros2 run` too. A name that matches nothing is not an error: the waiting line lists the logger names the topic did carry, `[waiting] /rosout: 0 records matching --node sidecar in 3s; nodes on the topic: talker`. Each listed name is escaped like the node column of a record line, and a comma in a name prints as `\u{2c}`, so the `, ` between names is never part of a name. |
+| `--level <LEVEL>` | Keep records at this level or above. One of `debug`, `info`, `warn`, `error` (case does not matter): `unknown log level 'warning'; accepted levels: debug, info, warn, error` otherwise. |
+
+The filters are checked before the topic is opened. A `log echo`, filtered or not, while nothing publishes `/rosout` exits 1 with `no node on this host publishes /rosout; a ROS 2 node publishes it when started with ` `cerulion ros2 run <package> <executable>`. A frame on the topic that is not an `rcl_interfaces/Log` record (another type's schema hash, or a `Log` frame that does not lay out) is skipped and counted, and the stream goes on: a `[skipped]` line on stderr names the frame and the count so far, for the first bad frame after a record and then at 10, 100, 1000 and so on skipped, a `records decode again` line follows a run with unannounced skips, and when the stream ends a `[skipped] /rosout: N frames skipped in all` line gives the total. Only a topic that carries another type ends the stream: when 8 consecutive frames carry another type's schema hash before any record has decoded (a `Log` frame that does not lay out breaks the run, and once one record has decoded no run ends the stream), the verb exits 1 with an error that names that hash and the `Log` one. The verb reads the local topic only, like `topic echo --local`: a robot's logs on another machine are read on that machine. While no record has been shown for three seconds, and every five seconds after that, a `[waiting] /rosout: 0 records in 3s` line goes to stderr, naming the filter when one is set (`0 records matching --node camera --level warn`) and, under `--node`, the logger names seen on the topic (at most 16, then `and others`); stdout carries records only, so a pipeline sees nothing else. When the reader of stdout goes away (`cerulion log echo | head -5`), the verb exits 0. Ctrl-C ends the stream at once, even on a topic busier than the reader.
+
+**For ROS 2 users.** The topic is `/rosout` with the same `rcl_interfaces/Log` record, and `cerulion log echo` is `ros2 topic echo /rosout` with the node and level filters built in.
 
 ---
 

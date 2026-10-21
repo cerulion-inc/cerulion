@@ -1029,6 +1029,17 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // all 12 MultiArray containers are SMALL >= TINY. Breaks past ~300
         // dimensions. Essentially never published standalone.
         | "std_msgs/MultiArrayLayout"
+        // rcl_interfaces/Log: one log record, the node id, the tracing target, the
+        // source file and the message, each a short string. A record is at
+        // most 16 KiB on the wire: the 32 B wire header, the 16 B fixed
+        // section, the 32 B offset table and the four strings share the
+        // 16,384 B slice, so the strings have 16,304 B between them. A normal
+        // record is under 512 B and a panic report of a few KB fits with room
+        // (four 4 KB strings would not). The log topic is a STREAM, so the
+        // lowest tier buys it the deepest bridged ingress queue. A record over
+        // the slice fails its publish with `PayloadTooLarge`: `Static` pools
+        // cannot grow.
+        | "rcl_interfaces/Log"
         // sensor_msgs: scalar measurements + small structs.
         | "sensor_msgs/Imu"
         | "sensor_msgs/MagneticField"
@@ -1225,6 +1236,7 @@ pub const IN_REPO_PACKAGES: &[&str] = &[
     "object_recognition_msgs",
     "octomap_msgs",
     "radar_msgs",
+    "rcl_interfaces",
     "sensor_msgs",
     "shape_msgs",
     "statistics_msgs",

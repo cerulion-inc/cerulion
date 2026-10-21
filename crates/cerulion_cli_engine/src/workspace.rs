@@ -50,14 +50,139 @@ const ICEORYX2_FORK_CRATES: &[&str] = &[
 pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
 
 /// Whether the workspace at `root` generates its messages into the message
-/// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
-/// `[env]`. A missing or unparseable file is `false`.
+/// crate: the value of [`WORKSPACE_MSGS_ENV`] the build script sees names
+/// THIS workspace. That value is the inherited process variable unless the
+/// workspace's `.cargo/config.toml` sets the key under `[env]` with
+/// `force = true`; a non-forced entry applies only when nothing is inherited.
+/// Without a usable entry (no file, no `[env]` key, an unparseable file) the
+/// inherited value alone decides, as it does for the build script.
+///
+/// An empty value generates nothing. A value that names another workspace
+/// generates THAT workspace's types, so it does not count. A relative value
+/// resolves the way the build script reads it: from the config with
+/// `relative = true`, cargo anchors it at the workspace root; anywhere else
+/// (an inherited value, a config entry without `relative = true`) the build
+/// script reads it from its own package directory, the `native_ros2_messages`
+/// path dependency in the workspace manifest. A relative value with no such
+/// path dependency (a registry or git source) does not count.
 pub fn workspace_generates_messages(root: &Path) -> bool {
-    std::fs::read_to_string(root.join(".cargo").join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
-        .is_some_and(|env| env.contains_key(WORKSPACE_MSGS_ENV))
+    workspace_generates_messages_with(root, std::env::var_os(WORKSPACE_MSGS_ENV).as_deref())
+}
+
+/// [`workspace_generates_messages`] with the inherited value of
+/// [`WORKSPACE_MSGS_ENV`] passed in, so a test does not mutate the process
+/// environment.
+fn workspace_generates_messages_with(root: &Path, inherited: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = effective_workspace_msgs(root, inherited) else {
+        return false;
+    };
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(named), Ok(this)) => named == this,
+        _ => false,
+    }
+}
+
+/// The workspace's `.cargo/config.toml` `[env]` entry for
+/// [`WORKSPACE_MSGS_ENV`], in cargo's string or `{ value, relative, force }`
+/// table form.
+struct ConfiguredMsgs {
+    value: String,
+    /// Cargo joins the value to the directory that holds `.cargo/`.
+    relative: bool,
+    /// The entry replaces an inherited value instead of yielding to it.
+    force: bool,
+}
+
+impl ConfiguredMsgs {
+    /// The entry in the workspace at `root`, or `None` without a usable one
+    /// (no file, an unparseable file, no `[env]` key, a value of another type).
+    fn read(root: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(root.join(".cargo").join("config.toml")).ok()?;
+        let table = text.parse::<toml::Table>().ok()?;
+        match table.get("env")?.as_table()?.get(WORKSPACE_MSGS_ENV)? {
+            toml::Value::String(value) => Some(Self {
+                value: value.clone(),
+                relative: false,
+                force: false,
+            }),
+            toml::Value::Table(entry) => {
+                let flag = |key: &str| entry.get(key).and_then(|flag| flag.as_bool()) == Some(true);
+                Some(Self {
+                    value: entry
+                        .get("value")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    relative: flag("relative"),
+                    force: flag("force"),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The directory the build script reads for this entry in the workspace
+    /// at `root`, or `None` for an empty value or a relative value it cannot
+    /// resolve.
+    fn path(&self, root: &Path) -> Option<PathBuf> {
+        if self.value.is_empty() {
+            None
+        } else if self.relative {
+            Some(root.join(&self.value))
+        } else {
+            resolve_from_message_crate(root, Path::new(&self.value))
+        }
+    }
+}
+
+/// The directory the build script reads from [`WORKSPACE_MSGS_ENV`] for a
+/// build in the workspace at `root`, or `None` when the value it sees is
+/// unset, empty, or relative to a package directory this workspace does not
+/// name.
+fn effective_workspace_msgs(root: &Path, inherited: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    match (ConfiguredMsgs::read(root), inherited) {
+        (Some(entry), _) if entry.force => entry.path(root),
+        (_, Some(value)) if value.is_empty() => None,
+        (_, Some(value)) => resolve_from_message_crate(root, Path::new(value)),
+        (Some(entry), None) => entry.path(root),
+        (None, None) => None,
+    }
+}
+
+/// `value` as the `native_ros2_messages` build script reads it: cargo runs a
+/// build script in its package directory, so a relative value resolves from
+/// there. An absolute value is returned as is. A relative value resolves
+/// only when the workspace manifest at `root` gives the message crate a
+/// `path` source (`[workspace.dependencies]` or `[dependencies]`); for a
+/// registry or git source it is `None`.
+fn resolve_from_message_crate(root: &Path, value: &Path) -> Option<PathBuf> {
+    if value.is_absolute() {
+        return Some(value.to_path_buf());
+    }
+    Some(message_crate_dir(root)?.join(value))
+}
+
+/// The package directory of the `native_ros2_messages` path dependency that
+/// the workspace manifest at `root` declares, or `None` without one.
+fn message_crate_dir(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let manifest = text.parse::<toml::Table>().ok()?;
+    let declared = |deps: Option<&toml::Value>| {
+        deps?
+            .as_table()?
+            .get("native_ros2_messages")?
+            .as_table()?
+            .get("path")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let path = declared(
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+    )
+    .or_else(|| declared(manifest.get("dependencies")))?;
+    Some(root.join(path))
 }
 
 /// Discovered Cerulion workspace.
@@ -798,24 +923,160 @@ mod tests {
     fn workspace_messages_need_the_env_key_under_env() {
         let tmp = tempfile::tempdir().unwrap();
         let cargo = tmp.path().join(".cargo");
-        assert!(!workspace_generates_messages(tmp.path()), "no config file");
+        let this = tmp.path().display().to_string();
+        assert!(
+            !workspace_generates_messages_with(tmp.path(), None),
+            "no config file"
+        );
         std::fs::create_dir_all(&cargo).unwrap();
         for (text, expected) in [
-            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", false),
-            ("[build]\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
-            ("# CERULION_WORKSPACE_MSGS = \".\"\n[env]\n", false),
-            ("[env\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n".to_owned(), false),
             (
-                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n",
+                "[build]\nCERULION_WORKSPACE_MSGS = \".\"\n".to_owned(),
+                false,
+            ),
+            (
+                "# CERULION_WORKSPACE_MSGS = \".\"\n[env]\n".to_owned(),
+                false,
+            ),
+            ("[env\nCERULION_WORKSPACE_MSGS = \".\"\n".to_owned(), false),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n".to_owned(),
                 true,
             ),
-            ("[env]\nCERULION_WORKSPACE_MSGS = \"/abs/ws\"\n", true),
+            (format!("[env]\nCERULION_WORKSPACE_MSGS = {this:?}\n"), true),
+            // Another workspace's root generates that workspace's types.
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = \"/abs/ws\"\n".to_owned(),
+                false,
+            ),
+            // Without `relative = true` cargo passes "." unchanged and the
+            // build script reads it from its own package directory; this
+            // workspace has no manifest that names one.
+            ("[env]\nCERULION_WORKSPACE_MSGS = \".\"\n".to_owned(), false),
+        ] {
+            std::fs::write(cargo.join("config.toml"), &text).unwrap();
+            assert_eq!(
+                workspace_generates_messages_with(tmp.path(), None),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_value_must_name_this_workspace() {
+        // The build script reads the inherited variable whether or not the
+        // workspace has a `.cargo/config.toml`, and generates the workspace
+        // the value names.
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert!(workspace_generates_messages_with(
+            tmp.path(),
+            Some(tmp.path().as_os_str())
+        ));
+        assert!(!workspace_generates_messages_with(
+            tmp.path(),
+            Some(other.path().as_os_str())
+        ));
+        assert!(!workspace_generates_messages_with(
+            tmp.path(),
+            Some(std::ffi::OsStr::new("/other/ws"))
+        ));
+        assert!(!workspace_generates_messages_with(
+            tmp.path(),
+            Some(std::ffi::OsStr::new("."))
+        ));
+        assert!(!workspace_generates_messages_with(
+            tmp.path(),
+            Some(std::ffi::OsStr::new(""))
+        ));
+        assert!(!workspace_generates_messages_with(tmp.path(), None));
+    }
+
+    #[test]
+    fn workspace_messages_follow_the_value_the_build_script_sees() {
+        // Cargo lets an inherited variable override a non-forced `[env]`
+        // entry; the build script ignores an empty value.
+        let tmp = tempfile::tempdir().unwrap();
+        let other_ws = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join(".cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        let empty = Some(std::ffi::OsStr::new(""));
+        let this = Some(tmp.path().as_os_str());
+        let other = Some(other_ws.path().as_os_str());
+        let relative = "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n";
+        let forced =
+            "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true, force = true }\n";
+        for (text, inherited, expected) in [
+            (relative, None, true),
+            (relative, empty, false),
+            (relative, this, true),
+            // The inherited value wins over a non-forced entry, and names
+            // another workspace: cargo would generate THAT one's types.
+            (relative, other, false),
+            (forced, empty, true),
+            (forced, other, true),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"\"\n", None, false),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"\"\n", this, true),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"\"\n", other, false),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \"\", force = true }\n",
+                this,
+                false,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = 1\n", None, false),
+            ("[env]\nCERULION_WORKSPACE_MSGS = 1\n", this, true),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", this, true),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", other, false),
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", empty, false),
+            ("[build]\njobs = 4\n", this, true),
+            ("[build]\njobs = 4\n", other, false),
         ] {
             std::fs::write(cargo.join("config.toml"), text).unwrap();
             assert_eq!(
-                workspace_generates_messages(tmp.path()),
+                workspace_generates_messages_with(tmp.path(), inherited),
                 expected,
-                "{text:?}"
+                "{text:?} with inherited {inherited:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_value_resolves_from_the_message_crate_directory() {
+        // Cargo runs the build script in the message crate's package
+        // directory, so an inherited value or a config entry without
+        // `relative = true` resolves from there.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("vendor/msgs")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        let back = Some(std::ffi::OsStr::new("../.."));
+        let here = Some(std::ffi::OsStr::new("."));
+        let path_dep =
+            "[workspace]\n[workspace.dependencies]\nnative_ros2_messages = { path = \"vendor/msgs\" }\n";
+        let direct_dep = "[package]\nname = \"ws\"\n[dependencies]\nnative_ros2_messages = { path = \"vendor/msgs\" }\n";
+        let registry = "[workspace]\n[workspace.dependencies]\nnative_ros2_messages = \"=0.0.1\"\n";
+        let unanchored = "[env]\nCERULION_WORKSPACE_MSGS = \"../..\"\n";
+        let forced_unanchored =
+            "[env]\nCERULION_WORKSPACE_MSGS = { value = \"../..\", force = true }\n";
+        for (manifest, config, inherited, expected) in [
+            (path_dep, "", back, true),
+            (direct_dep, "", back, true),
+            // "." from the message crate is the message crate, not the root.
+            (path_dep, "", here, false),
+            (registry, "", back, false),
+            (path_dep, unanchored, None, true),
+            (registry, unanchored, None, false),
+            (path_dep, forced_unanchored, here, true),
+            (path_dep, unanchored, here, false),
+        ] {
+            std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(root.join(".cargo/config.toml"), config).unwrap();
+            assert_eq!(
+                workspace_generates_messages_with(root, inherited),
+                expected,
+                "{manifest:?} {config:?} with inherited {inherited:?}"
             );
         }
     }
