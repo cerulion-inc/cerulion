@@ -2777,6 +2777,12 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
+    // A remote attach under a kill switch is refused after the arg-shape checks
+    // and before any daemon is spawned or contacted.
+    if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
+        return Err(val(refusal));
+    }
+
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are
     //    threaded into its network config (env-at-spawn); a daemon already running
