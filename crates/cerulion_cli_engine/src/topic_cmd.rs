@@ -2288,11 +2288,11 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         None,
         // This seam makes NO absence claim (every failure
         // collapses to `None` below and the caller degrades to hex), and
-        // `topic_echo` calls it UNCONDITIONALLY for every LOCAL topic — so
-        // inheriting the first-contact wait stalled `cerulion topic echo
-        // /my/local/topic` for the full ceiling, printed a counter, and closed
-        // with "nothing on the network answered", all before the first frame of a
-        // topic that was streaming in local SHM the whole time.
+        // `topic_echo` calls it for a LOCAL topic's first undecodable frame, so
+        // inheriting the first-contact wait would stall `cerulion topic echo
+        // /my/local/topic` for the full ceiling, print a counter, and close
+        // with "nothing on the network answered", on a topic that is streaming
+        // in local SHM the whole time.
         ResolveWait::no_wait(),
     ) {
         SchemaResolve::Found { robot, walker, .. } => Some((robot, walker)),
@@ -4177,11 +4177,16 @@ pub fn topic_echo_with_scope(
     let mut consecutive_wait_errors: u32 = 0;
 
     // A REMOTE topic already carries the walker seeded during the
-    // ingress resolve — reuse it (no second discovery). A LOCAL topic keeps the
-    // earlier behavior: a ONE-TIME best-effort remote resolve as the FALLBACK for
-    // a frame carrying a type the desk never compiled (learn the type from a
-    // robot's catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk
-    // writes). A failed resolve is a `None` walker — the local path is unchanged.
+    // ingress resolve — reuse it (no second discovery). A LOCAL topic in automatic
+    // scope gets a ONE-TIME best-effort remote resolve as the FALLBACK for a frame
+    // carrying a type the desk never compiled (learn the type from a robot's
+    // catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk writes).
+    // That resolve runs on the FIRST frame whose schema hash the local walker
+    // cannot name, the same lazy rung `topic info` uses, never before the loop:
+    // the resolve can take seconds (a netd round trip, or the discovery ladder
+    // when netd is unreachable), and frames the desk can decode are displayed
+    // without waiting for it. A failed resolve is a `None` walker — the local
+    // path is unchanged.
     //
     // WHERE this observer's frames are supposed to come from, captured
     // before `source` is consumed below — it is the whole point of the silence
@@ -4190,10 +4195,11 @@ pub fn topic_echo_with_scope(
     // nothing").
     let source_desc = observer_source_description(&source);
 
-    let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
+    let mut remote_walker_pending =
+        matches!(source, TopicSource::Local) && scope != TopicScope::Local;
+    let mut remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
-        TopicSource::Local if scope == TopicScope::Local => None,
-        TopicSource::Local => resolve_remote_walker_for_topic(topic),
+        TopicSource::Local => None,
     };
     // The remote-fallback breadcrumb is emitted
     // LAZILY — only on the FIRST frame that ACTUALLY decodes via the remote
@@ -4293,6 +4299,14 @@ pub fn topic_echo_with_scope(
                     // fallback, hash-only hex otherwise. The one-time remote
                     // breadcrumb is emitted LAZILY inside — only when a frame
                     // ACTUALLY decodes remotely (factual, not predictive).
+                    if remote_walker_pending
+                        && local_walker
+                            .schema_name_for_hash(header.schema_hash)
+                            .is_none()
+                    {
+                        remote_walker_pending = false;
+                        remote_walker = resolve_remote_walker_for_topic(topic);
+                    }
                     write_custom_decode(
                         writer,
                         topic,
