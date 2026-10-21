@@ -754,6 +754,33 @@ fn hold_last_on_the_slow_edge_lets_the_chain_resolve_at_the_fast_edges_newest_st
             newest_ns: 19_000_000_000,
         })
     );
+    // A slow edge that stopped holds the chain back to what its hold
+    // reaches: newest 14 s plus 1 s is 15 s, where n = 1500.
+    let mut stale = TfBuffer::new();
+    stale
+        .set_edge_policy(
+            "map",
+            "odom",
+            EdgePolicy::HoldLast {
+                max_age_ns: 1_000_000_000,
+            },
+        )
+        .unwrap();
+    for k in 0..15u64 {
+        let y = tf([0.0, k as f64, 0.0], UnitQuaternion::IDENTITY);
+        stale
+            .insert(W, "map", "odom", k * 1_000_000_000, y)
+            .unwrap();
+    }
+    for n in 0..2_000u64 {
+        stale
+            .insert(W, "odom", "base", n * 10_000_000, shift(n as f64))
+            .unwrap();
+    }
+    assert_eq!(
+        stale.lookup_latest("map", "base").unwrap().translation(),
+        [1_500.0, 14.0, 0.0]
+    );
     // The fast edge keeps the default: nothing past its newest.
     assert!(matches!(
         b.lookup("map", "base", 19_990_000_001),

@@ -202,8 +202,9 @@ each dynamic edge the sample at `time` is an exact hit, returned bit for bit,
 or the interpolation between the two samples that bracket it: linear in
 translation, shortest-arc SLERP in rotation.
 
-`lookup_latest(parent, child)` resolves at the newest time every
-interpolated edge on the chain has a sample for, through the same code path.
+`lookup_latest(parent, child)` resolves at the newest time every edge on
+the chain answers, through the same code path: with the default policy, the
+oldest of the edges' newest stamps.
 A chain of static edges only has no time and resolves directly. With the
 default window, a 1 Hz `map` to `odom` edge and a 100 Hz or 1 kHz `odom` to
 `base_link` edge resolve at the slow edge's newest stamp.
@@ -229,9 +230,12 @@ By default a lookup one nanosecond after an edge's newest sample is
 | `EdgePolicy::Extrapolate { max_ns }` | The motion between the two newest samples, continued for up to `max_ns`. For an edge that publishes behind the data it is used with. |
 
 A policy can be set before the edge's first sample: the edge is declared with
-an empty ring. An edge with another policy does not hold `lookup_latest`
-back, so with `HoldLast` on `map` to `odom` the chain to `base_link`
-resolves at the fast edge's newest stamp. A time before an edge's oldest
+an empty ring. `lookup_latest` counts an edge's policy as part of what it
+answers: with `HoldLast { max_age_ns: 1_000_000_000 }` on `map` to `odom`,
+the chain to `base_link` resolves at the fast edge's newest stamp while the
+slow edge's newest sample is at most 1 s older, and at that sample plus 1 s
+when it is older than that. It never resolves later than the newest stamp
+on the chain. A time before an edge's oldest
 sample is `OutOfRange` under every policy.
 
 **Lookups never block.** There is no listener thread and no timeout: an

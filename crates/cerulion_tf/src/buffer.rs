@@ -567,12 +567,13 @@ impl TfBuffer {
     }
 
     /// `T_parent_child` at the latest time the chain answers, through the
-    /// same code path as [`Self::lookup`]: the oldest of the newest stamps
-    /// of its [`EdgePolicy::Interpolate`] edges, so every one of them has a
-    /// sample there. An edge with another policy answers past its newest
-    /// sample, so it does not hold the time back; a chain with only such
-    /// edges resolves at the newest stamp among them. A chain of static
-    /// edges only has no time and resolves directly.
+    /// same code path as [`Self::lookup`]. Each dynamic edge reaches its
+    /// newest stamp, plus the bound of its [`EdgePolicy`] past it; the
+    /// chain resolves at the earliest of those reaches, and never later
+    /// than the newest stamp on the chain. With the default policy on every
+    /// edge that is the oldest of the newest stamps, so every edge has a
+    /// sample there; a held slow edge does not hold a fast chain back. A
+    /// chain of static edges only has no time and resolves directly.
     ///
     /// # Errors
     ///
@@ -727,41 +728,30 @@ impl TfBuffer {
     /// `Some(Err)` for a first refusal, `Some(Ok)` for a counted repeat,
     /// `None` when the write may go ahead.
     fn refusal(&mut self, p: usize, c: usize, kind: Admit) -> Option<Result<(), TfError>> {
+        let (parent, child) = (Self::id(p), Self::id(c));
         let frame = &mut self.frames[c];
-        if frame.is_static && !matches!(kind, Admit::Static(_)) {
-            if matches!(kind, Admit::Policy) {
-                return Some(Err(TfError::EdgeIsStatic {
-                    parent: Self::id(p),
-                    child: Self::id(c),
-                }));
-            }
-            frame.static_refusals += 1;
-            return Some(if frame.static_refusals == 1 {
-                Err(TfError::EdgeIsStatic {
-                    parent: Self::id(p),
-                    child: Self::id(c),
-                })
-            } else {
-                Ok(())
-            });
-        }
         let writer = match kind {
-            Admit::Dynamic(w) | Admit::Static(w) => w,
+            // A policy has no place on a static edge; setting one is a
+            // configuration call, refused every time.
+            Admit::Policy if frame.is_static => {
+                return Some(Err(TfError::EdgeIsStatic { parent, child }));
+            }
             Admit::Policy => return None,
+            Admit::Dynamic(_) if frame.is_static => {
+                let err = TfError::EdgeIsStatic { parent, child };
+                return Some(first_then_count(&mut frame.static_refusals, err));
+            }
+            Admit::Dynamic(w) | Admit::Static(w) => w,
         };
         match frame.writer {
             Some(existing) if existing != writer => {
-                frame.second_writer_refusals += 1;
-                Some(if frame.second_writer_refusals == 1 {
-                    Err(TfError::SecondWriter {
-                        parent: Self::id(p),
-                        child: Self::id(c),
-                        writer,
-                        existing_writer: existing,
-                    })
-                } else {
-                    Ok(())
-                })
+                let err = TfError::SecondWriter {
+                    parent,
+                    child,
+                    writer,
+                    existing_writer: existing,
+                };
+                Some(first_then_count(&mut frame.second_writer_refusals, err))
             }
             _ => None,
         }
@@ -983,6 +973,17 @@ impl TfBuffer {
     }
 }
 
+/// Counts a refusal on `count` and returns `err` for the first one only;
+/// every later one is `Ok(())`, read back through the counter.
+fn first_then_count(count: &mut u64, err: TfError) -> Result<(), TfError> {
+    *count += 1;
+    if *count == 1 {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
 /// What an edge write is, for the checks in [`TfBuffer::admit`].
 #[derive(Debug, Clone, Copy)]
 enum Admit {
@@ -991,29 +992,29 @@ enum Admit {
     Policy,
 }
 
-/// The latest time a chain answers, folded edge by edge.
+/// The latest time a chain answers, folded edge by edge: the earliest of
+/// what each dynamic edge reaches (its newest stamp, plus its policy's
+/// bound past it), never later than the newest stamp on the chain.
 #[derive(Debug, Default)]
 struct Latest {
-    /// The oldest newest stamp of the `Interpolate` edges.
-    interpolate: Option<u64>,
-    /// The newest stamp of the edges with another policy.
-    other: Option<u64>,
+    /// The earliest reach of the dynamic edges.
+    reach: Option<u64>,
+    /// The newest stamp of the dynamic edges.
+    newest: Option<u64>,
 }
 
 impl Latest {
     fn fold(&mut self, policy: EdgePolicy, newest_ns: u64) {
-        match policy {
-            EdgePolicy::Interpolate => {
-                self.interpolate = Some(self.interpolate.map_or(newest_ns, |n| n.min(newest_ns)));
-            }
-            EdgePolicy::HoldLast { .. } | EdgePolicy::Extrapolate { .. } => {
-                self.other = Some(self.other.map_or(newest_ns, |n| n.max(newest_ns)));
-            }
-        }
+        let reach = newest_ns.saturating_add(policy.reach_ns());
+        self.reach = Some(self.reach.map_or(reach, |r| r.min(reach)));
+        self.newest = Some(self.newest.map_or(newest_ns, |n| n.max(newest_ns)));
     }
 
     fn stamp_ns(&self) -> u64 {
-        // Static edges only: every time is as good as any other.
-        self.interpolate.or(self.other).unwrap_or(0)
+        match (self.reach, self.newest) {
+            (Some(reach), Some(newest)) => reach.min(newest),
+            // Static edges only: every time is as good as any other.
+            _ => 0,
+        }
     }
 }
