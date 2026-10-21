@@ -342,8 +342,9 @@ fn type_listed(topic: &str, local_only: bool, publish: impl Fn()) -> TopicType {
     }
     let mut typed = handle.join().expect("listing thread");
     assert!(delivered_to(&witness) > 0, "no frame was delivered");
-    assert_eq!(typed.len(), 1);
-    typed.remove(0).ty
+    assert_eq!(typed.topics.len(), 1);
+    assert!(typed.unread.is_empty(), "read failed: {:?}", typed.unread);
+    typed.topics.remove(0).ty
 }
 
 #[test]
@@ -387,10 +388,49 @@ fn the_typed_listing_drops_a_topic_that_is_a_network_mirror() {
     }
 }
 
+/// A local topic the listing cannot open is not silently unknown: with every
+/// local-observation lease of the topic already held by other observers, the
+/// local-scope listing cannot take one, so the topic is named as unread
+/// (`topic find` turns that into its stderr note). The same topic is read
+/// once a lease is free again.
+#[test]
+#[serial]
+fn the_typed_listing_names_a_topic_it_cannot_open() {
+    let _net = EnvGuard::set("CERULION_NETWORK", "off");
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let topic = unique_topic("listed_unopenable");
+    let writer = RawTopicWriter::new(&topic, true);
+    let mut leases = Vec::new();
+    while let Ok(lease) = manager.acquire_local_topic_lease(&topic) {
+        leases.push(lease);
+        assert!(leases.len() <= 1024, "the lease quota never ran out");
+    }
+    assert!(!leases.is_empty(), "no lease was ever taken");
+    let walker = local_walker_from_workspace(None);
+    let listing = type_local_topics(
+        &[TopicInfo {
+            name: topic.clone(),
+        }],
+        &walker,
+        true,
+        InternalTopics::Read,
+    )
+    .expect("typed listing");
+    assert_eq!(listing.unread, vec![topic.clone()]);
+    assert_eq!(listing.topics.len(), 1);
+    assert_eq!(listing.topics[0].ty, TopicType::Unknown);
+
+    leases.pop();
+    let ty = type_listed(&topic, true, || {
+        writer.publish(&build_string_frame(0, 1_000, "x"))
+    });
+    assert_eq!(ty, TopicType::Named("std_msgs/String".to_string()));
+}
+
 /// More topics than one batch holds: the listing releases a batch before it
 /// opens the next, and every topic of every batch is still typed, in the
-/// order given. The last topic has no publisher, so it is unknown in its own
-/// (second) batch.
+/// order given. The last topic does not exist (it is gone since the
+/// listing), so it is unknown in its own (second) batch, and not unread.
 #[test]
 #[serial]
 fn the_typed_listing_types_every_topic_across_batches() {
@@ -415,7 +455,13 @@ fn the_typed_listing_types_every_topic_across_batches() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let typed = handle.join().expect("listing thread");
+    let listing = handle.join().expect("listing thread");
+    assert!(
+        listing.unread.is_empty(),
+        "read failed: {:?}",
+        listing.unread
+    );
+    let typed = listing.topics;
     let names: Vec<&str> = typed.iter().map(|t| t.name.as_str()).collect();
     let expected: Vec<&str> = live
         .iter()

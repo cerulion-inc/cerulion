@@ -159,9 +159,11 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
                 found.topics.iter().map(String::as_str),
             )?;
             // The `topic list` rule: a failed remote query is one loud
-            // stderr line, and the local result still stands.
+            // stderr line, and the local result still stands. Each topic or
+            // robot the search could not read is named the same way.
             for note in [
                 &found.remote_unavailable,
+                &found.unread_local,
                 &found.unsearched_mirrors,
                 &found.unsearched_robots,
             ]

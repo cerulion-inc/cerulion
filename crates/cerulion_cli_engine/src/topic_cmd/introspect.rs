@@ -510,24 +510,40 @@ fn first_schema_hash(
     }
 }
 
+/// How [`open_genuine_local`] ended.
+enum LocalOpen {
+    /// A genuine local producer, open for a typed read (boxed: a subscriber
+    /// is several kilobytes).
+    Opened(Box<super::ScopedSubscriber>),
+    /// No local topic to read: a network mirror (a REMOTE topic), or a
+    /// listed topic whose data service is gone since the listing.
+    Absent,
+    /// The topic could not be read as a local one, for the reason given.
+    Failed(cerulion_core::TransportError),
+}
+
 /// Open `topic` for a typed listing the way `topic info` opens a genuine
 /// local producer: under a local scope the local-observation lease is taken
 /// first, and a topic that turns out to be a network mirror after the open
-/// is dropped (it is not a local topic). `None` when the topic cannot be read
-/// as a genuine local one; the reason is logged at `debug`.
+/// is dropped (it is not a local topic). A failed lease is a mirror when the
+/// topic is marked as one (a live mirror refuses the lease), and a failed
+/// open is a topic that went away when its data service is missing; any
+/// other failure is [`LocalOpen::Failed`].
 fn open_genuine_local(
     transport: &cerulion_core::TransportManager,
     topic: &str,
     local_only: bool,
-) -> Option<super::ScopedSubscriber> {
+) -> LocalOpen {
     let guard = if local_only {
         match transport.acquire_local_topic_lease(topic) {
             Ok(lease) => super::ObservationGuard::LocalLease {
                 _lease: Box::new(lease),
             },
             Err(e) => {
-                tracing::debug!(topic = %topic, error = %e, "typed listing: no local lease for the topic");
-                return None;
+                return match transport.is_network_mirror(topic) {
+                    Ok(true) => LocalOpen::Absent,
+                    Ok(false) | Err(_) => LocalOpen::Failed(e),
+                }
             }
         }
     } else {
@@ -538,21 +554,13 @@ fn open_genuine_local(
             subscriber,
             _guard: guard,
         },
-        Err(e) => {
-            tracing::debug!(topic = %topic, error = %e, "typed listing: the topic did not open");
-            return None;
-        }
+        Err(_) if transport.data_service_missing(topic) => return LocalOpen::Absent,
+        Err(e) => return LocalOpen::Failed(e),
     };
     match transport.is_network_mirror(topic) {
-        Ok(false) => Some(subscriber),
-        Ok(true) => {
-            tracing::debug!(topic = %topic, "typed listing: the topic became a network mirror");
-            None
-        }
-        Err(e) => {
-            tracing::debug!(topic = %topic, error = %e, "typed listing: the mirror check failed");
-            None
-        }
+        Ok(false) => LocalOpen::Opened(Box::new(subscriber)),
+        Ok(true) => LocalOpen::Absent,
+        Err(e) => LocalOpen::Failed(e),
     }
 }
 
@@ -575,63 +583,103 @@ pub enum InternalTopics {
 /// frame's schema hash is named by `walker`; this listing opens no network.
 ///
 /// A topic is opened as a genuine local producer (see `local_only` and the
-/// mirror recheck of `topic info`). A topic that cannot be opened that way,
-/// that sends no frame in the wait, or whose receive fails is
-/// [`TopicType::Unknown`] (a failed receive is logged at `warn`); a hash
-/// `walker` does not name is [`TopicType::Unnamed`].
+/// mirror recheck of `topic info`). A network mirror, a topic gone since the
+/// listing, a skipped internal topic and a topic that sends no frame in the
+/// wait are [`TopicType::Unknown`]. A topic whose open, local lease, mirror
+/// check or receive fails is [`TopicType::Unknown`] too, but it is also
+/// named in [`TypedListing::unread`] and logged at `warn`, so a caller can
+/// say that the listing is short. A hash `walker` does not name is
+/// [`TopicType::Unnamed`].
 pub fn type_local_topics(
     local: &[super::TopicInfo],
     walker: &cerulion_core::codegen::FrameWalker,
     local_only: bool,
     internal: InternalTopics,
-) -> CliResult<Vec<TypedTopic>> {
+) -> CliResult<TypedListing> {
     let transport = cerulion_core::TransportManager::get_or_init()?;
-    let mut typed = Vec::with_capacity(local.len());
+    let mut listing = TypedListing {
+        topics: Vec::with_capacity(local.len()),
+        unread: Vec::new(),
+    };
     for batch in local.chunks(TYPED_LISTING_BATCH) {
-        type_local_batch(&transport, batch, walker, local_only, internal, &mut typed);
+        type_local_batch(
+            &transport,
+            batch,
+            walker,
+            local_only,
+            internal,
+            &mut listing,
+        );
     }
-    Ok(typed)
+    Ok(listing)
+}
+
+/// What [`type_local_topics`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedListing {
+    /// Every topic given, in the order given, with its type.
+    pub topics: Vec<TypedTopic>,
+    /// The topics that could not be read (the open, the local lease, the
+    /// mirror check or the receive failed), in the order given. Each one is
+    /// [`TopicType::Unknown`] in `topics`.
+    pub unread: Vec<String>,
+}
+
+/// The stderr note `topic find` gives for the local topics it could not
+/// read ([`TypedListing::unread`]), else `None`. Such a topic is not
+/// searched, so the note names each one and the result is never silently
+/// short.
+pub fn unread_local_note(unread: &[String]) -> Option<String> {
+    (!unread.is_empty()).then(|| {
+        let names: Vec<String> = unread.iter().map(|t| super::sanitize_display(t)).collect();
+        format!(
+            "local: {} topic(s) not searched: they could not be read ({}), so their type is \
+             not known\n",
+            names.len(),
+            names.join(", ")
+        )
+    })
 }
 
 /// One batch of [`type_local_topics`]: open every topic in `batch`, give the
 /// batch one shared [`TYPED_LISTING_WAIT`], and push each topic's type to
-/// `typed` in order. Every subscriber of the batch drops on return, so its
-/// listener descriptors are free before the next batch opens.
+/// `listing` in order. Each subscriber drops once its topic is read, so every
+/// listener descriptor of the batch is free before the next batch opens.
 fn type_local_batch(
     transport: &cerulion_core::TransportManager,
     batch: &[super::TopicInfo],
     walker: &cerulion_core::codegen::FrameWalker,
     local_only: bool,
     internal: InternalTopics,
-    typed: &mut Vec<TypedTopic>,
+    listing: &mut TypedListing,
 ) {
-    let subscribers: Vec<Option<super::ScopedSubscriber>> = batch
+    // `None`: an internal topic the listing skips.
+    let opened: Vec<Option<LocalOpen>> = batch
         .iter()
         .map(|t| {
             let skip = internal == InternalTopics::Skip && super::is_internal_topic(&t.name);
-            if skip {
-                None
-            } else {
-                open_genuine_local(transport, &t.name, local_only)
-            }
+            (!skip).then(|| open_genuine_local(transport, &t.name, local_only))
         })
         .collect();
     let deadline = Instant::now() + TYPED_LISTING_WAIT;
-    typed.extend(batch.iter().zip(&subscribers).map(|(topic, subscriber)| {
-        let hash = subscriber.as_ref().and_then(|s| {
-            match first_schema_hash(s, deadline.saturating_duration_since(Instant::now())) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    tracing::warn!(topic = %topic.name, error = %e, "typed listing: receive failed, so the type is unknown");
-                    None
-                }
+    for (topic, open) in batch.iter().zip(opened) {
+        let read = match open {
+            Some(LocalOpen::Opened(s)) => {
+                first_schema_hash(&s, deadline.saturating_duration_since(Instant::now()))
             }
+            Some(LocalOpen::Absent) | None => Ok(None),
+            Some(LocalOpen::Failed(e)) => Err(e),
+        };
+        let hash = read.unwrap_or_else(|e| {
+            tracing::warn!(topic = %topic.name, error = %e, "typed listing: the topic could not be read, so its type is unknown");
+            listing.unread.push(topic.name.clone());
+            None
         });
-        TypedTopic {
+        listing.topics.push(TypedTopic {
             name: topic.name.clone(),
             ty: hash.map_or(TopicType::Unknown, |h| TopicType::of_hash(h, &[walker])),
-        }
-    }));
+        });
+    }
 }
 
 /// Whether `topic list` prints each row's type (`-t`).
@@ -735,7 +783,7 @@ fn write_topic_list(
                 InternalTopics::Skip
             };
             let typed = type_local_topics(&local, walker, remote.is_none(), internal)?;
-            render_local_typed_topics_section(&typed, show_all)
+            render_local_typed_topics_section(&typed.topics, show_all)
         }
         None => super::render_local_topics_section(&local, show_all),
     };
@@ -789,6 +837,9 @@ pub struct FoundTopics {
     /// The `topic list` stderr line when the remote query failed (the local
     /// result still stands), else `None`.
     pub remote_unavailable: Option<String>,
+    /// The [`unread_local_note`] when a local topic could not be read, else
+    /// `None`.
+    pub unread_local: Option<String>,
     /// The [`unsearched_mirrors_note`] when a mirrored topic could not be
     /// searched, else `None`.
     pub unsearched_mirrors: Option<String>,
@@ -850,8 +901,9 @@ pub fn unsearched_robots_note<'a>(
 /// local, the remote robots `topic list` discovers are asked too and each
 /// robot's topics typed from its own catalog ([`remote_topics_of_type`]). A
 /// mirrored topic is searched through its origin robot's catalog only; one
-/// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`]. An unknown type
-/// is an empty list; a malformed name is an error before any topic is read.
+/// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`].
+/// A local topic that could not be read is named in
+/// [`FoundTopics::unread_local`]. An unknown type is an empty list; a malformed name is an error before any topic is read.
 /// `connect` and `listen` add locators to the discovery session, as `topic
 /// list --connect` and `--listen` do, for a robot discovery cannot find.
 pub fn topic_find(
@@ -867,7 +919,7 @@ pub fn topic_find(
     let walker = super::local_walker_from_workspace(schemas_dir);
     let remote = super::remote_discovery_options(scope == TopicScope::Local, connect, listen);
     let typed = type_local_topics(&local, &walker, remote.is_none(), InternalTopics::Read)?;
-    let mut topics: Vec<String> = topics_of_type(&typed, &wanted)
+    let mut topics: Vec<String> = topics_of_type(&typed.topics, &wanted)
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -896,6 +948,7 @@ pub fn topic_find(
     Ok(FoundTopics {
         topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
+        unread_local: unread_local_note(&typed.unread),
         unsearched_mirrors: unsearched_mirrors_note(&streaming, &gather.replies),
         unsearched_robots: unsearched_robots_note(discovered.iter().map(String::as_str), &gather),
     })
@@ -1973,6 +2026,20 @@ mod tests {
             unsearched_robots_note(["go2"], &gather).as_deref(),
             expected
         );
+    }
+
+    #[test]
+    fn every_unread_local_topic_is_named_in_one_note() {
+        assert_eq!(unread_local_note(&[]), None);
+        assert_eq!(
+            unread_local_note(&["/a".to_string(), "/b".to_string()]).as_deref(),
+            Some(
+                "local: 2 topic(s) not searched: they could not be read (/a, /b), so their \
+                 type is not known\n"
+            )
+        );
+        let note = unread_local_note(&["/x\u{1b}[2J".to_string()]).unwrap();
+        assert!(!note.contains('\u{1b}'), "{note:?}");
     }
 
     #[test]
