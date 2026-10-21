@@ -3256,6 +3256,15 @@ fn gen_cdylib(
                                 written: 0,
                                 refused: false,
                             };
+                            // A param written after `init` began refuses
+                            // the capture, as in process: an anchor does not
+                            // carry params, so it could not resume as it ran.
+                            if let ::std::option::Option::Some(reason) = node.__cer_param_change() {
+                                __cer_set_last_error(::std::format!(
+                                    "cerulion_node_capture_state: {}", reason,
+                                ));
+                                return -5_i32;
+                            }
                             // Drive the user's encoder under an
                             // INNER `catch_unwind` so a panicking
                             // `CerulionState` impl does NOT unwind through the
@@ -3276,12 +3285,6 @@ fn gen_cdylib(
                             // A capture is READ-ONLY, so an unwound one leaves
                             // no torn state — only a discarded encoding, which
                             // the -4 return already tells the host to distrust.
-                            if let ::std::option::Option::Some(reason) = node.__cer_param_change() {
-                                __cer_set_last_error(::std::format!(
-                                    "cerulion_node_capture_state: {}", reason,
-                                ));
-                                return -5_i32;
-                            }
                             let outcome = match ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
                                     ::cerulion_core::state::CerulionState::cer_capture(
