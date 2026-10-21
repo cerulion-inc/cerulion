@@ -6458,6 +6458,384 @@ def check_bench_graphs_validate() -> int:
     return errors
 
 
+_EXEC_MODE_BAD_MARKER = "is not an execution mode"
+_EXEC_MODE_MONO_MARKER = "on the mono leg is refused"
+_EXEC_MODE_NAME_LOCKSTEP_MARKER = "is not the pinned lockstep grammar"
+_EXEC_MODE_NAME_FREE_MARKER = "carries the lockstep token"
+_EXEC_MODE_CONTRA_MARKER = "contradictory execution mode"
+_LEG_NAME_MARKER = "does not name the"
+_WITNESS_MARKER = "EXECUTION-MODE WITNESS"
+
+
+def _drive_mode_witness(leg: str, exec_mode: str, log_text: str) -> tuple:
+    """Run the SHIPPED verify_mode_witness (and the RANKS/WANT_MODE block in
+    front of it), cut out of run_workspace.sh, against a synthetic log."""
+    src = _RUN_WORKSPACE.read_text(encoding="utf-8")
+    start = src.index("# ── execution-mode witness")
+    end = src.index("\n}\n", src.index("verify_mode_witness() {", start)) + 3
+    with tempfile.TemporaryDirectory(prefix="witness_") as td:
+        log = Path(td) / "run.log"
+        log.write_text(log_text, encoding="utf-8")
+        script = (f"LEG={leg}\nEXEC_MODE={exec_mode}\nSIZE=64\n"
+                  + src[start:end] + f"\nverify_mode_witness '{log}'\n")
+        r = subprocess.run(["bash", "-c", script], capture_output=True,
+                           text=True, timeout=30)
+        return r.returncode, r.stdout + r.stderr
+
+
+def check_workspace_execution_mode_contract() -> int:
+    """The execution-mode axis (CER_BENCH_EXECUTION_MODE) holds end to end,
+    and the split3 leg rides every rule the split leg does.
+
+    Runner (driven as the REAL run_workspace.sh, stopping at the SMOKE_N
+    tripwire before any build): an unknown mode, lockstep on the mono leg, a
+    lockstep run under a token-less pinned name, a free-run run under a
+    `_lockstep` name, and an exported CERULION_EXECUTION_MODE naming the
+    other mode are each refused with exit 2 and their own reason; the
+    matching pairs, an agreeing or empty export, and an ad-hoc name pass the
+    gate; split3 x backtoback is the rc=77 structural skip split's is. Every
+    lockstep name bench.py mints passes the runner's gate and every free-run
+    name it mints is refused under lockstep, so the two grammars cannot
+    drift. bench.py: the mint refuses an unknown mode and mono x lockstep,
+    and the free-run names stay byte-identical to the pre-axis prefixes.
+    plot.py: a lockstep stem parses to its leg, mode and class (the class
+    rule still reads `_pod`), its series shares the free-run twin's color
+    key on a different dash, its legend label names the mode, and split3
+    gets its own color rather than the headline's through the generic
+    `workspace_split` substring."""
+    errors = 0
+
+    def fail(msg):
+        nonlocal errors
+        print(f"FAIL  [execution mode: {msg}]")
+        errors += 1
+
+    with tempfile.TemporaryDirectory(prefix="execmode_") as td:
+        raw = Path(td)
+        # (desc, leg, axes, marker): each must exit 2 with ITS marker, before
+        # the SMOKE_N tripwire.
+        refusals = (
+            ("an unknown mode", "split",
+             {"CER_BENCH_EXECUTION_MODE": "freerun"}, _EXEC_MODE_BAD_MARKER),
+            ("lockstep on the mono leg", "mono",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_mono_lockstep_chrt0"},
+             _EXEC_MODE_MONO_MARKER),
+            ("lockstep under the free-run split name", "split",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt0"},
+             _EXEC_MODE_NAME_LOCKSTEP_MARKER),
+            ("lockstep with the token outside its position", "split",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_lockstep_split_chrt0"},
+             _EXEC_MODE_NAME_LOCKSTEP_MARKER),
+            ("lockstep with the token after the class token", "split",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep", "CER_BENCH_MSG": "pod",
+              "CER_BENCH_RAW_NAME":
+                  "cerulion_workspace_split_pod_lockstep_chrt0"},
+             # The pod gate runs first and refuses the shape too: either
+             # reason is a refusal of this name, but it must not pass.
+             None),
+            ("free_run (unset) under a lockstep name", "split3",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_split3_lockstep_chrt0"},
+             _EXEC_MODE_NAME_FREE_MARKER),
+            ("an exported lockstep under the free-run default", "split",
+             {"CERULION_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt0"},
+             _EXEC_MODE_CONTRA_MARKER),
+            ("an exported free_run under lockstep", "split",
+             {"CERULION_EXECUTION_MODE": "free_run",
+              "CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split_lockstep_chrt0"},
+             _EXEC_MODE_CONTRA_MARKER),
+            # `split` is a PREFIX of `split3`: both directions of the leg
+            # token must be refused, not just the one a prefix test catches.
+            ("the split leg under a split3 name", "split",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_split3_chrt0"},
+             _LEG_NAME_MARKER),
+            ("the split3 leg under a split name", "split3",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt0"},
+             _LEG_NAME_MARKER),
+            ("the mono leg under a split name", "mono",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt1"},
+             _LEG_NAME_MARKER),
+        )
+        for desc, leg, axes, marker in refusals:
+            rc, err = _drive_run_workspace(raw, leg, axes)
+            named = (marker in err) if marker is not None else True
+            if rc != 2 or not named or _SMOKE_N_MARKER in err:
+                fail(f"{desc}: want rc=2 + {marker!r} before the SMOKE_N "
+                     f"tripwire; got rc={rc}:\n{err.rstrip()[-400:]}")
+            else:
+                print(f"ok    [execution mode refuses: {desc}] rc={rc}")
+        controls = (
+            ("lockstep split under its lockstep name", "split",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split_lockstep_chrt0"}),
+            ("lockstep split3 pod under its lockstep pod name", "split3",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep", "CER_BENCH_MSG": "pod",
+              "CER_BENCH_RAW_NAME":
+                  "cerulion_workspace_split3_lockstep_pod_chrt1"}),
+            ("free-run split3 under its token-less name", "split3",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_split3_chrt0"}),
+            ("an exported free_run agreeing with the default", "split",
+             {"CERULION_EXECUTION_MODE": "free_run",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt0"}),
+            ("an exported EMPTY value (the CLI's default) under free_run",
+             "split", {"CERULION_EXECUTION_MODE": "",
+                       "CER_BENCH_RAW_NAME": "cerulion_workspace_split_chrt0"}),
+            ("an exported lockstep agreeing with lockstep", "split3",
+             {"CERULION_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "cerulion_workspace_split3_lockstep_chrt0"}),
+            ("an ad-hoc name claims no mode", "split",
+             {"CER_BENCH_EXECUTION_MODE": "lockstep",
+              "CER_BENCH_RAW_NAME": "parity_probe"}),
+            ("free-run mono (the mode the leg always has)", "mono",
+             {"CER_BENCH_RAW_NAME": "cerulion_workspace_mono_chrt0"}),
+        )
+        markers = (_EXEC_MODE_BAD_MARKER, _EXEC_MODE_MONO_MARKER,
+                   _EXEC_MODE_NAME_LOCKSTEP_MARKER, _EXEC_MODE_NAME_FREE_MARKER,
+                   _EXEC_MODE_CONTRA_MARKER, _LEG_NAME_MARKER)
+        for desc, leg, axes in controls:
+            rc, err = _drive_run_workspace(raw, leg, axes)
+            if (rc != 2 or _SMOKE_N_MARKER not in err
+                    or any(m in err for m in markers)):
+                fail(f"control {desc}: expected to pass the mode gate and "
+                     f"stop at the SMOKE_N tripwire; got rc={rc}:\n"
+                     f"{err.rstrip()[-400:]}")
+            else:
+                print(f"ok    [execution mode control passes: {desc}]")
+        for mode_axes in ({}, {"CER_BENCH_EXECUTION_MODE": "lockstep"}):
+            name = ("cerulion_workspace_split3_lockstep_chrt0" if mode_axes
+                    else "cerulion_workspace_split3_chrt0")
+            rc, err = _drive_run_workspace(
+                raw, "split3", dict(mode_axes, CER_BENCH_PACING="backtoback",
+                                    CER_BENCH_RAW_NAME=name))
+            if rc != 77 or "SKIP (rc=77): split3" not in err:
+                fail(f"split3 x backtoback ({mode_axes or 'free_run'}) must "
+                     f"be the rc=77 structural skip; got rc={rc}:\n"
+                     f"{err.rstrip()[-300:]}")
+            else:
+                print(f"ok    [execution mode: split3 x backtoback is rc=77 "
+                      f"({mode_axes.get('CER_BENCH_EXECUTION_MODE', 'free_run')})]")
+        # COVERAGE over the real enumeration, both directions.
+        uncovered = []
+        for leg in bench.WORKSPACE_MULTI_PROCESS_LEGS:
+            for chrt in (0, 1):
+                for msg in bench.WORKSPACE_MSG_CLASSES:
+                    lock = bench.workspace_raw_name(leg, chrt, msg, "lockstep")
+                    free = bench.workspace_raw_name(leg, chrt, msg, "free_run")
+                    axes = {"CER_BENCH_EXECUTION_MODE": "lockstep",
+                            "CER_BENCH_MSG": msg}
+                    rc, err = _drive_run_workspace(
+                        raw, leg, dict(axes, CER_BENCH_RAW_NAME=lock))
+                    if rc != 2 or _SMOKE_N_MARKER not in err:
+                        uncovered.append((lock, "minted lockstep name refused", rc))
+                    rc, err = _drive_run_workspace(
+                        raw, leg, dict(axes, CER_BENCH_RAW_NAME=free))
+                    if rc != 2 or _EXEC_MODE_NAME_LOCKSTEP_MARKER not in err:
+                        uncovered.append((free, "free-run name accepted under lockstep", rc))
+        if uncovered:
+            fail(f"the runner's lockstep grammar and bench.py's mint drifted: "
+                 f"{uncovered}")
+        else:
+            print("ok    [execution mode coverage: every minted lockstep name "
+                  "passes the runner's gate and every minted free-run name is "
+                  "refused under lockstep]")
+
+    # The shipped execution-mode witness, against logs shaped like the real
+    # ones (ANSI escapes between a field name and its `=`).
+    def worker_line(group, mode):
+        e = "\x1b"
+        return (f"{e}[2m2026-01-01T00:00:00Z{e}[0m {e}[32m INFO{e}[0m worker build "
+                f"path resolved from the stamped execution mode {e}[3mgroup{e}[0m"
+                f"{e}[2m={e}[0m{group} {e}[3mexecution_mode{e}[0m{e}[2m={e}[0m"
+                f"{mode} {e}[3mbuild_path{e}[0m{e}[2m={e}[0mX\n")
+    supervisor = ("execution mode stamped into every worker plan "
+                  "execution_mode=FreeRun workers=2\n")
+    for desc, leg, mode, text, ok in (
+            ("two FreeRun workers on split", "split", "free_run",
+             supervisor + worker_line("g1", "FreeRun") + worker_line("g2", "FreeRun"), True),
+            ("three Lockstep workers on split3", "split3", "lockstep",
+             worker_line("g1", "Lockstep") + worker_line("g2", "Lockstep")
+             + worker_line("g3", "Lockstep"), True),
+            ("mono needs no witness", "mono", "free_run", "", True),
+            ("a FreeRun run labeled lockstep", "split", "lockstep",
+             worker_line("g1", "FreeRun") + worker_line("g2", "FreeRun"), False),
+            ("one worker line missing on split3", "split3", "free_run",
+             worker_line("g1", "FreeRun") + worker_line("g2", "FreeRun"), False),
+            ("no worker lines at all (a stale binary)", "split", "free_run",
+             supervisor, False),
+            ("a mixed run", "split", "free_run",
+             worker_line("g1", "FreeRun") + worker_line("g2", "Lockstep"), False)):
+        rc, out = _drive_mode_witness(leg, mode, text)
+        if (rc == 0) != ok or (not ok and _WITNESS_MARKER not in out):
+            fail(f"mode witness, {desc}: rc={rc}, expected "
+                 f"{'pass' if ok else 'refusal'}:\n{out.rstrip()[-300:]}")
+        else:
+            print(f"ok    [execution mode witness: {desc}] rc={rc}")
+
+    # bench.py: the mint.
+    for desc, args in (("mono x lockstep", ("mono", 0, "variable", "lockstep")),
+                       ("an unknown mode", ("split", 0, "variable", "bogus"))):
+        try:
+            got = bench.workspace_raw_name(*args)
+        except ValueError:
+            print(f"ok    [execution mode mint refuses: {desc}]")
+        else:
+            fail(f"the mint accepted {desc}: {got!r}")
+    oracle = {
+        ("split", 0, "variable", "free_run"): "cerulion_workspace_split_chrt0",
+        ("mono", 1, "pod", "free_run"): "cerulion_workspace_mono_pod_chrt1",
+        ("split3", 0, "variable", "free_run"): "cerulion_workspace_split3_chrt0",
+        ("split", 1, "variable", "lockstep"):
+            "cerulion_workspace_split_lockstep_chrt1",
+        ("split3", 1, "pod", "lockstep"):
+            "cerulion_workspace_split3_lockstep_pod_chrt1",
+    }
+    for args, want in oracle.items():
+        got = bench.workspace_raw_name(*args)
+        if got != want:
+            fail(f"workspace_raw_name{args} = {got!r}, hand oracle {want!r}")
+    if bench.workspace_raw_name("split", 0) != "cerulion_workspace_split_chrt0":
+        fail("the defaulted mint no longer yields the pre-axis split prefix")
+    for args, runnable in ((("split3", "backtoback"), False),
+                           (("mono", "quiescent", "lockstep"), False),
+                           (("split3", "quiescent", "lockstep"), True),
+                           (("mono", "backtoback"), True)):
+        reason = bench.workspace_leg_skip_reason(*args)
+        if (reason is None) != runnable:
+            fail(f"workspace_leg_skip_reason{args} = {reason!r}, expected "
+                 f"{'runnable' if runnable else 'a skip'}")
+    saved = os.environ.get("CERULION_EXECUTION_MODE")
+    try:
+        for exported, modes, refused in (("lockstep", ("free_run",), True),
+                                         ("lockstep", ("lockstep",), False),
+                                         ("lockstep", bench.WORKSPACE_EXEC_MODES, True),
+                                         ("", ("free_run",), False),
+                                         ("free_run", ("lockstep",), True)):
+            os.environ["CERULION_EXECUTION_MODE"] = exported
+            try:
+                bench.refuse_contradictory_execution_mode(modes)
+                got_refused = False
+            except SystemExit:
+                got_refused = True
+            if got_refused != refused:
+                fail(f"refuse_contradictory_execution_mode(exported="
+                     f"{exported!r}, modes={modes}) refused={got_refused}, "
+                     f"expected {refused}")
+        os.environ.pop("CERULION_EXECUTION_MODE", None)
+        bench.refuse_contradictory_execution_mode(bench.WORKSPACE_EXEC_MODES)
+    except SystemExit as e:
+        fail(f"refuse_contradictory_execution_mode refused with nothing "
+             f"exported: {e}")
+    finally:
+        if saved is None:
+            os.environ.pop("CERULION_EXECUTION_MODE", None)
+        else:
+            os.environ["CERULION_EXECUTION_MODE"] = saved
+
+    # plot.py: classification, pairing, labels, colors.
+    try:
+        import plot
+    except ImportError as e:
+        print(f"skip  [execution mode plot arms: plot.py unimportable: {e}]")
+        return errors
+    ident = plot._ws_identity("cerulion_workspace_split3_lockstep_pod_chrt1")
+    if ident != ("split3", "lockstep", "pod"):
+        fail(f"_ws_identity of a lockstep pod stem = {ident!r}")
+    lock_pod = plot.Series("cerulion_workspace_split_lockstep_pod_chrt0",
+                           "results_cerulion_workspace_split_lockstep_pod_chrt0.csv",
+                           ":", "x")
+    if plot._type_class_of(lock_pod) != ("workspace", plot.CLASS_POD):
+        fail("a lockstep pod row no longer classifies as the pod class")
+    with contextlib.redirect_stderr(io.StringIO()):
+        lock = plot.workspace_series("0", "quiescent", ("lockstep",))
+        both = plot.workspace_series("0", "quiescent",
+                                     bench.WORKSPACE_EXEC_MODES)
+        lock_b2b = plot.workspace_series("0", "backtoback", ("lockstep",))
+    want_lock = {f"results_{bench.workspace_raw_name(leg, 0, msg, 'lockstep')}.csv"
+                 for leg in bench.WORKSPACE_MULTI_PROCESS_LEGS
+                 for msg in bench.WORKSPACE_MSG_CLASSES}
+    if {x.csv_name for x in lock} != want_lock:
+        fail(f"lockstep workspace_series = {sorted(x.csv_name for x in lock)}")
+    if lock_b2b:
+        fail(f"a backtoback lockstep render expects rows: "
+             f"{[x.csv_name for x in lock_b2b]}")
+    by_label = {x.label: x for x in both}
+    for leg in bench.WORKSPACE_MULTI_PROCESS_LEGS:
+        fr = by_label[bench.workspace_raw_name(leg, 0)]
+        ls = by_label[bench.workspace_raw_name(leg, 0, "variable", "lockstep")]
+        if fr.color_key != ls.color_key or fr.style == ls.style:
+            fail(f"{leg}: the lockstep row must share the free-run twin's "
+                 f"color key on a different dash (free {fr.color_key}/"
+                 f"{fr.style!r}, lockstep {ls.color_key}/{ls.style!r})")
+        if (plot.pretty_label(ls.label) == plot.pretty_label(fr.label)
+                or "lockstep" not in plot.pretty_label(ls.label)):
+            fail(f"{leg}: the lockstep legend label does not name the mode: "
+                 f"{plot.pretty_label(ls.label)!r}")
+    vis = plot._assign_visuals(both)
+    split_c = vis[by_label[bench.workspace_raw_name("split", 0)].color_key][0]
+    split3_c = vis[by_label[bench.workspace_raw_name("split3", 0)].color_key][0]
+    if split_c == split3_c:
+        fail(f"split3 wears the headline split's color {split_c}: the generic "
+             f"`workspace_split` substring captured it")
+    if len({c for c, _t in vis.values()}) != len(vis):
+        fail(f"two workspace entities share a color: {vis}")
+    if not errors:
+        print("ok    [execution mode plot arms: lockstep stems parse and keep "
+              "their class, pair with their free-run twin by color and differ "
+              "by dash, name the mode in the legend, and split3 has its own "
+              "color]")
+    return errors
+
+
+def check_split_graphs_are_faithful_mirrors() -> int:
+    """Every split graph (rtt_bench[_pod]_split, rtt_bench[_pod]_split3) is
+    its mono sibling verbatim plus a trailing `process_groups:` block, the
+    PROVENANCE rule their headers state, and the block is EXACTLY the hand
+    oracle below: group names, declaration order (= rank order) and members.
+    A hand parse, stdlib only: the shape is one key per line."""
+    errors = 0
+    two = [("g1", ["ping"]), ("g2", ["pong", "latency"])]
+    three = [("g1", ["ping"]), ("g2", ["pong"]), ("g3", ["latency"])]
+    for mono, split, want in (("rtt_bench", "rtt_bench_split", two),
+                              ("rtt_bench", "rtt_bench_split3", three),
+                              ("rtt_bench_pod", "rtt_bench_pod_split", two),
+                              ("rtt_bench_pod", "rtt_bench_pod_split3", three)):
+        def body(name):
+            return [ln for ln in (_GRAPHS_DIR / f"{name}.yaml").read_text(
+                encoding="utf-8").splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        m, sp = body(mono), body(split)
+        try:
+            cut = sp.index("process_groups:")
+        except ValueError:
+            print(f"FAIL  [graph mirror: {split}.yaml has no process_groups: block]")
+            errors += 1
+            continue
+        if sp[:cut] != m:
+            print(f"FAIL  [graph mirror: {split}.yaml is not {mono}.yaml "
+                  f"verbatim above its process_groups: block]")
+            errors += 1
+            continue
+        got = []
+        for ln in sp[cut + 1:]:
+            key, _, val = ln.strip().partition(":")
+            got.append((key.strip(),
+                        [x.strip() for x in val.strip().strip("[]").split(",")
+                         if x.strip()]))
+        if got != want:
+            print(f"FAIL  [graph mirror: {split}.yaml process_groups {got} != "
+                  f"the hand oracle {want}]")
+            errors += 1
+            continue
+        print(f"ok    [graph mirror: {split}.yaml = {mono}.yaml + "
+              f"process_groups {want}]")
+    return errors
+
+
 def check_class_carriers_refuse_at_the_mint() -> int:
     """The three places bench.py MINTS a class-carrying identity refuse a
     state their own docstrings forbid, instead of producing a name that
@@ -14811,6 +15189,10 @@ def main() -> int:
     print()
     errors += check_raw_name_class_agreement()
     print()
+    errors += check_workspace_execution_mode_contract()
+    print()
+    errors += check_split_graphs_are_faithful_mirrors()
+    print()
     errors += check_smoke_gates_refuse_an_unreadable_log()
     print()
     errors += check_class_carriers_refuse_at_the_mint()
@@ -14896,7 +15278,10 @@ def main() -> int:
           f"naming + stale guard, exact-set gate) drives clean both on and "
           f"off, the one_line sidecar encoder, the did-not-sustain "
           f"exclusion, the compile-csv raw-dir output default and the smoke "
-          f"no-baseline exit contract hold, and "
+          f"no-baseline exit contract hold, the execution-mode axis "
+          f"(CER_BENCH_EXECUTION_MODE) refuses every mislabel both ways "
+          f"and agrees with the mint, every split graph is its mono graph "
+          f"plus a process_groups block, and "
           f"the type-class axis holds (run_bench.sh refuses every "
           f"unenumerated image axis, image twins get their own visuals, the "
           f"matched-quantity footnote needs both classes, a paired "

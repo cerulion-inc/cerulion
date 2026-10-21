@@ -370,15 +370,15 @@ fn a_mid_run_attach_records_a_lapped_ring_from_a_complete_step_and_keeps_departu
     // wrong side of that circle; a live run streams, so the fixture does too.
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
     let published = Arc::new(AtomicU64::new(0));
     let published_count = Arc::clone(&published);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
         let mut undeclared_pub = undeclared_pub;
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -788,12 +788,12 @@ fn a_declared_topic_with_no_producer_does_not_refuse_the_whole_recording() {
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = live_topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&live_topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -914,12 +914,12 @@ fn a_run_that_declared_no_rings_gets_the_no_rings_verdict() {
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -1016,12 +1016,12 @@ fn a_declared_ring_that_vanished_costs_the_trace_not_the_recording() {
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -1263,17 +1263,18 @@ fn an_excluded_topic_stays_out_of_the_bag_even_though_discovery_is_on() {
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_mgr = Arc::clone(&manager);
     let (keep_topic, drop_topic) = (keep.clone(), drop.clone());
     let published = Arc::new(AtomicU64::new(0));
     let published_count = Arc::clone(&published);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut keep_pub = manager
+        .create_publisher(&keep_topic, MaxSliceLen::const_new(256), 0)
+        .expect("keep producer");
+    let mut drop_pub = manager
+        .create_publisher(&drop_topic, MaxSliceLen::const_new(256), 0)
+        .expect("drop producer");
     let producer = std::thread::spawn(move || {
-        let mut keep_pub = produce_mgr
-            .create_publisher(&keep_topic, MaxSliceLen::const_new(256), 0)
-            .expect("keep producer");
-        let mut drop_pub = produce_mgr
-            .create_publisher(&drop_topic, MaxSliceLen::const_new(256), 0)
-            .expect("drop producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             keep_pub.publish_raw(&frame(seq)).expect("publish");
@@ -1508,12 +1509,12 @@ fn an_unreadable_run_manifest_says_the_trace_is_unknown_not_that_none_was_declar
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -1721,12 +1722,12 @@ fn a_manifest_read_but_unparseable_says_unknown_not_that_none_was_declared() {
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let producer = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
@@ -2200,12 +2201,12 @@ fn attach_under_state_consumer(
 
     let producing = Arc::new(AtomicBool::new(true));
     let produce_stop = Arc::clone(&producing);
-    let produce_topic = topic.clone();
-    let produce_mgr = Arc::clone(&manager);
+    // Created before the recorder attaches: attach resolves liveness once, so a
+    // publisher created on the thread can lose that race ("NONE of them is live").
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
     let frames = std::thread::spawn(move || {
-        let mut publisher = produce_mgr
-            .create_publisher(&produce_topic, MaxSliceLen::const_new(256), 0)
-            .expect("producer");
         let mut seq = 0u32;
         while produce_stop.load(Ordering::Relaxed) {
             publisher.publish_raw(&frame(seq)).expect("publish");
