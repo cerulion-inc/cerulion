@@ -183,75 +183,53 @@ pub fn resolve_desk_seed(key_file: Option<&Path>) -> ConnectResult<[u8; 32]> {
 }
 
 /// Resolve the desk seed for PAIRING: load `path` if it exists (exactly 32
-/// bytes), else CREATE a fresh 32-byte key there (0600, parent dirs created).
+/// bytes), else CREATE a fresh 32-byte key there (0600, parent dirs created 0700).
 ///
 /// This is the persistent-identity path `cerulion pair` uses — an ephemeral key
 /// the robot access-lists would vanish on exit, so pairing always writes a stable
-/// key. An EXISTING key is NEVER overwritten (the create is `create_new`, which
-/// also closes the check-then-create race). A wrong-size existing file is a LOUD
-/// error (never silently regenerated over a real key).
+/// key. An EXISTING key is NEVER overwritten: the new key is written to a synced
+/// 0600 dot-named sibling that is hard-linked into place, which fails when the
+/// target exists (`create_new` on the target is the fallback where hard links
+/// are unavailable). A wrong-size existing file is a LOUD
+/// error (never silently regenerated over a real key). The file handling is the
+/// machine identity's own ([`cerulion_pairing::identity::load_or_create_key_file`]),
+/// so this and `cerulion login` write keys the same way.
+///
+/// When `path` is spelled exactly as this machine's key under the config
+/// directory (its `identity/device.key` or legacy `desk.key` name), the machine
+/// key is loaded
+/// or created through [`cerulion_pairing::identity::IdentityLayout`], so both
+/// names stay one key.
 pub fn resolve_or_create_desk_seed(path: &Path) -> ConnectResult<[u8; 32]> {
-    if path.exists() {
-        let seed = load_desk_seed(path)?;
-        tracing::info!(path = %path.display(), "cerulion pair: using the existing desk device key");
-        return Ok(seed);
+    use cerulion_pairing::identity::{load_or_create_key_file, IdentityLayout, KeyOrigin};
+    let machine = IdentityLayout::resolve()
+        .ok()
+        .filter(|l| path == l.legacy_desk_key_path() || path == l.device_key_path());
+    let (key, origin) = match machine {
+        Some(layout) => layout.load_or_create_machine_key(),
+        None => load_or_create_key_file(path),
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ConnectError::DeskKey(format!("creating {}: {e}", parent.display()))
-            })?;
-        }
+    .map_err(|e| ConnectError::DeskKey(e.to_string()))?;
+    match origin {
+        KeyOrigin::Created => tracing::info!(
+            path = %path.display(),
+            fingerprint = %key.short_fingerprint(),
+            "cerulion pair: created a new desk device key (0600)"
+        ),
+        _ => tracing::info!(
+            path = %path.display(),
+            fingerprint = %key.short_fingerprint(),
+            "cerulion pair: using the existing desk device key"
+        ),
     }
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
-        .map_err(|e| ConnectError::KeyGen(format!("getrandom failed: {e}")))?;
-    write_new_desk_key(path, &seed)?;
-    tracing::info!(path = %path.display(), "cerulion pair: created a new desk device key (0600)");
-    Ok(seed)
-}
-
-/// Create `path` with mode 0600 and write the 32-byte `seed`. `create_new` fails
-/// if the file already exists — NEVER overwrites (belt-and-suspenders vs the
-/// `exists()` check + a racing writer).
-#[cfg(unix)]
-fn write_new_desk_key(path: &Path, seed: &[u8; 32]) -> ConnectResult<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| ConnectError::DeskKey(format!("creating {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| ConnectError::DeskKey(format!("writing {}: {e}", path.display())))
-}
-
-/// Non-Unix: no POSIX mode bits; `create_new` still guards against overwrite.
-#[cfg(not(unix))]
-fn write_new_desk_key(path: &Path, seed: &[u8; 32]) -> ConnectResult<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| ConnectError::DeskKey(format!("creating {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| ConnectError::DeskKey(format!("writing {}: {e}", path.display())))
+    Ok(*key.seed())
 }
 
 /// Load a 32-byte raw device seed from `path` (exactly 32 bytes).
 fn load_desk_seed(path: &Path) -> ConnectResult<[u8; 32]> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| ConnectError::DeskKey(format!("{}: {e}", path.display())))?;
-    let len = bytes.len();
-    bytes.try_into().map_err(|_| {
-        ConnectError::DeskKey(format!(
-            "{} must be exactly 32 raw bytes (an ed25519 device seed), got {len}",
-            path.display()
-        ))
-    })
+    cerulion_pairing::identity::read_key_file(path)
+        .map(|key| *key.seed())
+        .map_err(|e| ConnectError::DeskKey(e.to_string()))
 }
 
 /// Generate a fresh ephemeral 32-byte seed from OS entropy.
@@ -764,7 +742,7 @@ mod tests {
         std::fs::write(&short, [1u8; 16]).unwrap();
         let err = resolve_desk_seed(Some(&short)).unwrap_err();
         assert!(matches!(err, ConnectError::DeskKey(_)));
-        assert!(err.to_string().contains("32 raw bytes"), "err: {err}");
+        assert!(err.to_string().contains("not 32"), "err: {err}");
 
         // Absent (with a path) → error (never fabricated).
         let missing = dir.path().join("nope.key");
@@ -828,6 +806,12 @@ mod tests {
                 0o600,
                 "a desk key must be created 0600 (owner-only)"
             );
+            let parent = std::fs::metadata(path.parent().unwrap()).unwrap();
+            assert_eq!(
+                parent.permissions().mode() & 0o777,
+                0o700,
+                "a created key directory is owner-only (0700)"
+            );
         }
 
         // 2. Present → the SAME bytes, never regenerated (never overwritten).
@@ -839,7 +823,7 @@ mod tests {
         std::fs::write(&bad, [1u8; 16]).unwrap();
         let err = resolve_or_create_desk_seed(&bad).unwrap_err();
         assert!(matches!(err, ConnectError::DeskKey(_)), "err: {err}");
-        assert!(err.to_string().contains("32 raw bytes"), "err: {err}");
+        assert!(err.to_string().contains("not 32"), "err: {err}");
     }
 
     /// An ephemeral seed (no key file) is non-zero and differs between calls
