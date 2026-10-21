@@ -491,6 +491,7 @@ impl EmbeddedRuntime {
         // startup: any failure after the replace puts it back, or the latched
         // surface would describe a run that never started.
         let mut replaced_serving = None;
+        let gateway_planned = !config.listen.is_empty();
         let result = (|| {
             Self::create_publishers(
                 &resolved_publish,
@@ -731,6 +732,15 @@ impl EmbeddedRuntime {
             // later `stop()` cannot recover the totals: keep them in status.
             let (summary, _) = stop_resource_set(&mut self.resources, &self.status, true);
             lock_status(&self.status).recorder = summary;
+            // The gateway thread is joined above, so no gateway drives the
+            // manager now. A gateway construction that failed part-way, or a
+            // gateway that booted before a later step failed, leaves its
+            // announcements and bridge flags on the process-wide manager:
+            // retract them all, or a remote `topic list` keeps listing topics
+            // of a run that never started.
+            if gateway_planned {
+                retire_failed_start_topics(&manager);
+            }
             if let Some((live, prior)) = replaced_serving {
                 live.restore(prior);
             }
@@ -1059,6 +1069,18 @@ fn retire_prior_run_topics(
         .unregister_topics_except(served)
         .map_err(|error| EmbedError::Network(error.to_string()))?;
     Ok(())
+}
+
+/// Retracts every announcement and bridge flag a failed start left on the
+/// process-wide manager. Call it only after the start's gateway thread is
+/// joined: with no gateway driving the manager, every egress topic on it
+/// belongs to the failed run (the prior run was retired before this start's
+/// gateway was built). The bare identity token stays. A cleanup error is
+/// logged and dropped so the start's own error reaches the caller.
+fn retire_failed_start_topics(manager: &TransportManager) {
+    if let Err(error) = retire_prior_run_topics(manager, &[]) {
+        tracing::warn!(%error, "failed-start cleanup could not drop the bridge flags");
+    }
 }
 
 fn recorded_publisher_config(
@@ -1426,6 +1448,43 @@ mod tests {
         let bridges = manager.bridge_manager();
         assert!(bridges.is_registered(&kept).expect("registered"));
         assert!(!bridges.is_registered(&dropped).expect("registered"));
+    }
+
+    /// A gateway construction that fails part-way has already committed some
+    /// bridge flags and announcements. The failed-start cleanup must retract
+    /// them all, so a remote `topic list` names no topic of the failed run.
+    /// Hand oracle: the failed run committed `announced` (flag + token) and
+    /// `registered` (flag only, its announce never ran); afterwards the
+    /// manager announces nothing and has no flag registered.
+    #[test]
+    fn a_failed_start_retracts_the_announcements_its_gateway_committed() {
+        let id = std::process::id();
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("failed_start_{id}"),
+                network: Some(NetworkConfig {
+                    robot_identity: Some("failedstart".to_string()),
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init gateway manager");
+        let announced = format!("/rt/failed/announced/{id}");
+        let registered = format!("/rt/failed/registered/{id}");
+        // The state a construction leaves when it fails mid announce loop.
+        let bridges = manager.bridge_manager();
+        bridges.register_topic(&announced).expect("register");
+        bridges.register_topic(&registered).expect("register");
+        manager.announce_egress_topic(&announced).expect("announce");
+        let network = manager.network().expect("network");
+        assert_eq!(network.announced_topics(), vec![announced.clone()]);
+
+        retire_failed_start_topics(&manager);
+
+        assert!(network.announced_topics().is_empty());
+        assert_eq!(bridges.registered_topic_count().expect("count"), 0);
     }
 
     #[test]
