@@ -1149,9 +1149,9 @@ _WS_PRETTY = {
                  "fixed array (pod)",
     "mono_pod": "Cerulion — graph run --single-process (mono) · "
                 "fixed array (pod)",
-    "split3": "Cerulion — cerulion graph run (multi-process split3, one "
+    "split3": "Cerulion — cerulion graph run (multi-process split3, one "  # dash-ok
               "node per process) · sensor_msgs/Image (variable)",
-    "split3_pod": "Cerulion — cerulion graph run (multi-process split3, one "
+    "split3_pod": "Cerulion — cerulion graph run (multi-process split3, one "  # dash-ok
                   "node per process) · fixed array (pod)",
     "default": "Cerulion — retired flagless default leg",
 }
