@@ -60,8 +60,15 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Wire format and framing
 
-- 32-byte little-endian `WireHeader` (`schema_hash`, `total_size`, offset-table
-  offset/count, `sequence`, `timestamp_ns`). The canonical schema-hash recipe lives in
+- 40-byte little-endian `WireHeader` (`schema_hash`, `total_size`, offset-table
+  offset/count, `sequence`, `timestamp_ns`, `step_tag`), wire header version 2
+  (`wire::WIRE_HEADER_VERSION`). Every boundary a frame crosses states that
+  version: the iceoryx2 data service attribute `cerulion.wire_header_version`
+  (required by every opener), the zenoh key namespace `cerulion_w2` plus the
+  demand GET payload (`refused:wire-header` on a mismatch), the catalog's
+  `wire_header_version`, the `cerulion-netd` banner and the bag schema descriptor
+  (version 2). A bag recorded with version 1 descriptors has its user frames
+  upgraded on read (`wire::upgrade_v1_frame_into`). The canonical schema-hash recipe lives in
   exactly ONE place: `MessageSchema::schema_hash` (`src/codegen/schema.rs`). Never
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original

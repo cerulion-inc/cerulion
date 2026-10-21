@@ -2,7 +2,7 @@
 
 The robot-side remote-plane daemon: ONE iroh endpoint per robot (the device
 key's PUBLIC half IS the `EndpointId`; its 32-byte secret also seeds the pairing
-identity), multiplexing `cerulion/wire/1` (topic frames) and `cerulion/ops/1`
+identity), multiplexing `cerulion/wire/2` (topic frames) and `cerulion/ops/1`
 (cerud verbs). This file also carries the family-wide rules
 for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
 `cerulion_connectd`, `cerud`, `cerulion_accountd`, `cerulion-wire` (none has its

@@ -1186,7 +1186,7 @@ Subscriber:    wait/poll    ->  callback with &[u8] reference into shared memory
 
 ### Wire format
 
-Every message on the wire has a 32-byte `WireHeader`:
+Every message on the wire has a 40-byte `WireHeader`:
 
 ```
 +----------------------------------+
@@ -1196,6 +1196,7 @@ Every message on the wire has a 32-byte `WireHeader`:
 |  offset_table_count:  u32  (4B)  |  Number of variable fields
 |  sequence:            u32  (4B)  |  Monotonic counter
 |  timestamp_ns:        u64  (8B)  |  Publish time (nanoseconds)
+|  step_tag:            u64  (8B)  |  Producer step (0 = untagged)
 +----------------------------------+
 |  Payload (message fields)        |
 +----------------------------------+

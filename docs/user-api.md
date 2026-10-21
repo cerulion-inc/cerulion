@@ -3294,7 +3294,7 @@ Python nodes cannot be amended with `node modify`.
 
 `cerulion_py` is a standalone PyO3 wheel (its own cargo workspace, not a
 member of the root one) giving Python processes raw and schema-aware access to
-the same transport: 32-byte wire headers plus payload bytes, over iceoryx2
+the same transport: 40-byte wire headers plus payload bytes, over iceoryx2
 shared memory. One process-wide transport lives behind `connect()`:
 a Python process that loads it must not also load another module
 embedding `cerulion_core`.
@@ -3373,7 +3373,7 @@ Full contract, including the zero-copy wording and the interop fixture:
 ## What this document is NOT
 
 - A tour of `cerulion_core`'s internal modules. Use `cargo doc --open` for the rustdoc if you need to read internals.
-- A specification of the wire format. See `crates/cerulion_core/src/wire.rs` for the 32-byte header layout.
+- A specification of the wire format. See `crates/cerulion_core/src/wire.rs` for the 40-byte header layout.
 - A description of the `iceoryx2` or `zenoh` configuration surfaces. Those are framework-internal.
 - A guide to writing tests against `cerulion_core::graph::*` directly. The integration-test patterns in `crates/cerulion_core/tests/` are framework-internal: they will continue to be supported but are not the path application authors take.
 

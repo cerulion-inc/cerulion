@@ -385,7 +385,11 @@ serialized plan + the run's iceoryx2 namespace.
   dispatches inbound GETs by verb. The `demand` verb: the DEMANDER (dialer) runs
   a ~2 s demand-GET loop that GETs `cerulion_q/{robot_or_*}/demand{topic}` (a
   dialer query: reaches the accepter), which pulls that topic's egress ON with a
-  synchronous `enabled`/`refused` ack. The `catalog` verb answers a
+  synchronous `enabled/w2`/`refused` ack. The GET carries the demander's wire
+  header version (two bytes); a producer at another version (or a demander that
+  sends none, a release before the version existed) answers
+  `refused:wire-header`, enables nothing, and both sides log the mismatch once
+  per run of refusals. The `catalog` verb answers a
   `cerulion_q/{robot}/catalog` GET with the robot's full topic catalog (every
   produced/announced topic + its schema hash **when the gateway knows it**
   (the field is `Option<u64>`, absent for a boot-announced topic whose hash the
@@ -1088,9 +1092,9 @@ Then `cerulion graph run go2_driver` on the robot and
 ## What crosses the wire
 
 Local delivery stays zero-copy shared memory; only egress topics pay the
-network. An exported frame travels as the SAME unified wire format (32-byte
+network. An exported frame travels as the SAME unified wire format (40-byte
 `WireHeader` + payload) VERBATIM as the zenoh payload on the key
-`cerulion{topic}`: no envelope, no per-hop translation, so the receiving
+`cerulion_w2{topic}`: no envelope, no per-hop translation, so the receiving
 side feeds the bytes straight into its subscriber path and schema hashes
 validate end-to-end. Discovery rides the separate liveliness key-spaces: the
 demand space `cerulion_lv{topic}` (a remote subscriber asking for a topic,
@@ -1166,7 +1170,7 @@ Notes:
 - **`/tf` and `/tf_static` are symmetric**: same schema and wire path; the
   only difference is publishing cadence (dynamic vs latched-once), a node
   concern.
-- **Byte-identity.** The `TFMessage` frame (32-byte `WireHeader` + offset
+- **Byte-identity.** The `TFMessage` frame (40-byte `WireHeader` + offset
   table + opaque `transforms` bytes) is re-injected verbatim (sequence,
   timestamp, nested transform bytes intact), pinned end-to-end by
   `crates/cerulion_core/tests/network_tf_e2e_test.rs`.

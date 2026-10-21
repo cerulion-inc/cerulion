@@ -54,9 +54,10 @@ def test_record_validates_wire_header():
         cerulion.Record(invalid)
 
     payload = bytes(range(8))
-    valid = struct.pack("<QIIIIQQ", 1, 48, 0, 0, 0, 0, 0) + payload
+    valid = struct.pack("<QIIIIQQ", 1, 48, 0, 0, 0, 0, 0x0001_0000_0000_0003) + payload
     record = cerulion.Record(valid)
     assert bytes(record.payload) == payload
+    assert record.step_tag == 0x0001_0000_0000_0003
 
 
 def test_bag_topics_and_records(fixture_bin, tmp_path):
