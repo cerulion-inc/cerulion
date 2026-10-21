@@ -101,6 +101,9 @@ with exact pins matching its own version (`cerulion_core = "=X.Y.Z"` and
 checkout (`cargo install --path crates/cerulion_cli`, or run from its `target/`)
 scaffolds absolute path dependencies into that checkout instead. The command
 prints which one it chose on a `dependencies:` line under `Created workspace`.
+The scaffolded `Cargo.toml` also pins the iceoryx2 crates to the fork revision
+the CLI is built with through `[patch.crates-io]`, so the first build fetches
+that git revision.
 
 To override the default, edit the two entries in the generated root
 `Cargo.toml` under `[workspace.dependencies]`; member manifests inherit them
@@ -3132,6 +3135,31 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 | Variable | Meaning |
 |---|---|
 | `CERULION_EXECUTION_MODE` | How the workers of a MULTI-PROCESS `graph run` coordinate their steps. Unset (or `free_run`) is the default: **free-run**, no shared barrier, each rank on its own wall-following clock. `lockstep` OPTS OUT into barrier lockstep, where every rank advances the same handed quantum per step behind a shared barrier, the shape that makes per-step boundary times EQUAL across ranks. Read ONCE per run and threaded to every consumer: the run directory's `gating` label (`recorded_wall` for a free-run run whose ranks mint their scheduler-trace rings, which is every run but `--no-rings`, where it reads `wall`; `quantum` for lockstep), every worker plan, and the `coordination` stamp of a bag `--record` writes (`free_run` / `lockstep`), so no two of them can disagree. Exact-match: any other value keeps the default and warns. The `lockstep` opt-out is kept as the revert path for the free-run default; it is not a long-term part of this surface. On a run that executes no process groups (`--single-process`, a non-Unix host, or an unpartitioned graph under a non-real clock; under the real clock an unpartitioned graph is auto-partitioned and free-runs like any supervisor run) there are no ranks to coordinate: the run is the one-rank lockstep timeline, an explicit `free_run` is inert there and warns, and `lockstep` is simply what that run already is (silent). A partitioned graph under `--time-source virtual` still runs the supervisor (the flag is ignored with a warning) and follows the variable; `external` is rejected outright. See [`docs/multi_process.md`](multi_process.md). |
+
+### Android CLI and node workspaces
+
+The CLI, `cerulion-netd` and `cerulion-wsd` build for Android. Node cdylibs
+must be cross-built on a host with the same Rust compiler as the CLI. On
+Android, graph and node runs search
+`<target-directory>/<target-triple>/<profile>` when that node's cdylib is
+present there, otherwise using `<target-directory>/<profile>` when its library
+is present there; missing-library errors name the cargo-ndk paths. Preserve the
+target-triple directory when copying a workspace to the device. When
+`cerulion node build` cannot find Cargo on Android, it directs you to cross-build
+the workspace on the host with `cargo ndk`.
+
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block from
+Cerulion's root manifest. A standalone workspace written by hand must carry
+the same block, pinned to one fork revision. Otherwise node initialization
+refuses an iceoryx2 build without Android shared-memory support. `cerulion viz`
+is desktop-only; run it on a desktop host and connect that host to the device's
+topics over the network.
+
+On Android, netd and wsd control sockets use the abstract Unix-socket
+namespace. Their configured paths become abstract names, not filesystem
+entries. Each daemon drops peers whose `SO_PEERCRED` UID differs from its own
+effective UID, as well as peers whose credentials cannot be verified.
 
 ### Android shared memory
 
