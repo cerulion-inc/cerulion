@@ -568,8 +568,9 @@ fn main() {
     // installed backend plugins through rosidl_buffer_backend_registry and
     // serializes through rosidl_typesupport_fastrtps_cpp, as rmw_zenoh_cpp
     // does, and links the registry and fastcdr. A vendored build has neither
-    // and carries non-CPU Buffers as host copies only.
-    if buffer_era && generated {
+    // and carries non-CPU Buffers as host copies only, and so does a generated
+    // build that misses one of the packages (with a warning naming it).
+    let hosted: Option<(Vec<PathBuf>, Vec<PathBuf>)> = if buffer_era && generated {
         let mut probe = |p: &Path| p.is_file();
         // Every `include*` directory of every ament prefix joins the roots:
         // fastcdr 2.3 installs its headers under `<prefix>/includefastcdr/`.
@@ -597,12 +598,13 @@ fn main() {
             &mut probe,
         );
         if !found.missing.is_empty() {
-            panic!(
-                "rmw_cerulion: this Buffer-era build cannot host rosidl::Buffer backends: no \
-                 include directory serves {}. They ship with rmw_fastrtps_cpp on every Lyrical \
-                 and Rolling install; install it (ros-<distro>-rmw-fastrtps-cpp).",
+            cargo_warning(&format!(
+                "rmw_cerulion: this build does NOT host rosidl::Buffer backends (non-CPU Buffers \
+                 cross processes as host copies): no include directory serves {}. They ship \
+                 with rmw_fastrtps_cpp on every Lyrical and Rolling install \
+                 (ros-<distro>-rmw-fastrtps-cpp).",
                 found.missing.join(", ")
-            );
+            ));
         }
         // `<prefix>/lib` and its one-level subdirectories (the multiarch
         // `lib/x86_64-linux-gnu/` fastcdr installs into).
@@ -614,22 +616,31 @@ fn main() {
             })
             .collect();
         let mut lib_dirs: Vec<PathBuf> = Vec::new();
+        let mut missing_libs: Vec<String> = Vec::new();
         for lib in era_check::BUFFER_BACKEND_LIBRARIES {
-            let file = format!("lib{lib}.so");
-            let dir = lib_candidates
+            let files = [format!("lib{lib}.so"), format!("lib{lib}.dylib")];
+            match lib_candidates
                 .iter()
-                .find(|d| d.join(&file).is_file())
-                .cloned()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "rmw_cerulion: the headers of the buffer backend packages were found, \
-                         but {file} is in no lib directory of AMENT_PREFIX_PATH"
-                    )
-                });
-            if !lib_dirs.contains(&dir) {
-                lib_dirs.push(dir);
+                .find(|d| files.iter().any(|f| d.join(f).is_file()))
+            {
+                Some(dir) if !lib_dirs.contains(dir) => lib_dirs.push(dir.clone()),
+                Some(_) => {}
+                None => missing_libs.push(format!("lib{lib}")),
             }
         }
+        if found.missing.is_empty() && !missing_libs.is_empty() {
+            cargo_warning(&format!(
+                "rmw_cerulion: this build does NOT host rosidl::Buffer backends (non-CPU Buffers \
+                 cross processes as host copies): {} is in no lib directory of \
+                 AMENT_PREFIX_PATH",
+                missing_libs.join(", ")
+            ));
+        }
+        (found.missing.is_empty() && missing_libs.is_empty()).then_some((found.dirs, lib_dirs))
+    } else {
+        None
+    };
+    if let Some((found_dirs, lib_dirs)) = hosted {
         let mut bb = cc::Build::new();
         // `-Wno-format-security`: rcutils' logging macros, expanded inside the
         // distro's own buffer_serialization.hpp, pass a non-literal format.
@@ -639,7 +650,7 @@ fn main() {
         for dir in include_dirs
             .iter()
             .chain(cpp_includes.dirs.iter())
-            .chain(found.dirs.iter())
+            .chain(found_dirs.iter())
         {
             bb.include(dir);
         }

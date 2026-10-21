@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -68,6 +69,20 @@ thread_local std::string t_last_error;
 // Set by the wrapped from_descriptor op when a backend hands back an empty
 // buffer, read by rmw_cerulion_bb_deserialize after the message is decoded.
 thread_local bool t_empty_import = false;
+// Descriptor creations this thread asked a backend for (created or refused):
+// a serialization that asks none held no Buffer on a backend other than cpu.
+thread_local uint64_t t_descriptor_calls = 0;
+// This thread's share of the created / refused counters, so a serialization
+// retried with a larger buffer takes back the counts its first attempt made.
+thread_local uint64_t t_created = 0;
+thread_local uint64_t t_refused = 0;
+
+void count_descriptor(bool created) {
+  g_counters[created ? kDescriptorsCreated : kDescriptorsRefused].fetch_add(
+      1, std::memory_order_relaxed);
+  ++(created ? t_created : t_refused);
+  ++t_descriptor_calls;
+}
 
 struct Context {
   std::unique_ptr<rosidl_buffer_backend_registry::BufferBackendRegistry> registry;
@@ -76,9 +91,11 @@ struct Context {
   std::string names_csv;
 };
 
-// Never destroyed (see the file comment).
+// Never destroyed (see the file comment). Readers (serialization, endpoint
+// hooks) hold g_ctx_mutex shared for the whole call; loading the plugins and
+// installing the test fixture backend hold it exclusive.
 Context *g_ctx = nullptr;
-std::mutex g_ctx_mutex;
+std::shared_mutex g_ctx_mutex;
 int g_init_result = -2;  // -2: not tried yet.
 
 const rosidl_message_type_support_t *resolve(const rosidl_message_type_support_t *ts,
@@ -134,8 +151,7 @@ bool bind_backend(Context &ctx, const std::shared_ptr<rosidl::BufferBackend> &ba
       throw std::runtime_error("buffer backend destroyed");
     }
     std::shared_ptr<void> descriptor = strong->create_descriptor_with_endpoint(impl, ep);
-    g_counters[descriptor ? kDescriptorsCreated : kDescriptorsRefused].fetch_add(
-        1, std::memory_order_relaxed);
+    count_descriptor(descriptor != nullptr);
     return descriptor;
   };
   ops.from_descriptor_with_endpoint = [weak](const void *descriptor,
@@ -235,7 +251,7 @@ extern "C" {
 /// rmw_cerulion_bb_last_error). A backend whose descriptor cannot be serialized
 /// is skipped; its reason is the last error even on success.
 int rmw_cerulion_bb_init() noexcept {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  std::unique_lock<std::shared_mutex> lock(g_ctx_mutex);
   if (g_init_result != -2) {
     return g_init_result;
   }
@@ -267,18 +283,33 @@ int rmw_cerulion_bb_init() noexcept {
   return g_init_result;
 }
 
-/// Comma-separated types of the loaded backends other than `cpu` ("" when none,
-/// or before rmw_cerulion_bb_init). Valid until the next backend is installed.
-const char *rmw_cerulion_bb_backend_names() noexcept {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  return g_ctx != nullptr ? g_ctx->names_csv.c_str() : "";
+/// Copy the comma-separated types of the loaded backends other than `cpu` into
+/// [out, out + cap) with a NUL ("" when none, or before rmw_cerulion_bb_init).
+/// Returns the length without the NUL; a result >= `cap` means the copy was
+/// cut short.
+size_t rmw_cerulion_bb_backend_names(char *out, size_t cap) noexcept {
+  try {
+    std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
+    const std::string names = g_ctx != nullptr ? g_ctx->names_csv : std::string();
+    if (cap > 0) {
+      const size_t n = names.size() < cap - 1 ? names.size() : cap - 1;
+      std::memcpy(out, names.data(), n);
+      out[n] = '\0';
+    }
+    return names.size();
+  } catch (...) {
+    if (cap > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
 }
 
 /// 1 when the loaded backend `type` advertises empty metadata, 0 when it
 /// advertises some, -1 when no such backend is loaded or it threw.
 int rmw_cerulion_bb_metadata_is_empty(const char *type) noexcept {
   try {
-    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
     if (g_ctx == nullptr) {
       return -1;
     }
@@ -294,6 +325,9 @@ int rmw_cerulion_bb_metadata_is_empty(const char *type) noexcept {
 
 /// The reason for this thread's last failure.
 const char *rmw_cerulion_bb_last_error() noexcept { return t_last_error.c_str(); }
+
+/// Descriptor creations this thread has asked a backend for, created or refused.
+uint64_t rmw_cerulion_bb_thread_descriptor_calls() noexcept { return t_descriptor_calls; }
 
 /// The process counter in slot `which` (see Counter), 0 for an unknown slot.
 uint64_t rmw_cerulion_bb_counter(int which) noexcept {
@@ -320,7 +354,7 @@ int rmw_cerulion_bb_on_creating(const uint8_t *gid, int is_publisher,
   try {
     std::unordered_map<std::string, std::shared_ptr<rosidl::BufferBackend>> backends;
     {
-      std::lock_guard<std::mutex> lock(g_ctx_mutex);
+      std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
       if (g_ctx == nullptr) {
         return 0;
       }
@@ -353,7 +387,7 @@ int rmw_cerulion_bb_on_discovering(const uint8_t *gid, const char *topic_type,
   try {
     std::unordered_map<std::string, std::shared_ptr<rosidl::BufferBackend>> backends;
     {
-      std::lock_guard<std::mutex> lock(g_ctx_mutex);
+      std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
       if (g_ctx == nullptr) {
         return 0;
       }
@@ -400,18 +434,18 @@ int rmw_cerulion_bb_serialize(const void *callbacks, const void *msg, const uint
                               size_t *len) noexcept {
   const auto *cb = static_cast<const Callbacks *>(callbacks);
   *len = 0;
+  const uint64_t created = t_created;
+  const uint64_t refused = t_refused;
+  const uint64_t calls = t_descriptor_calls;
   try {
+    std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
     eprosima::fastcdr::FastBuffer buffer(reinterpret_cast<char *>(out), cap);
     eprosima::fastcdr::Cdr cdr(buffer, eprosima::fastcdr::Cdr::DEFAULT_ENDIAN,
                                eprosima::fastcdr::CdrVersion::XCDRv1);
     cdr.serialize_encapsulation();
     bool ok = false;
     if (gid != nullptr) {
-      const SerializationContext *ser = nullptr;
-      {
-        std::lock_guard<std::mutex> lock(g_ctx_mutex);
-        ser = g_ctx != nullptr ? &g_ctx->ser : nullptr;
-      }
+      const SerializationContext *ser = g_ctx != nullptr ? &g_ctx->ser : nullptr;
       if (ser == nullptr) {
         t_last_error = "buffer backends are not loaded";
         return 2;
@@ -428,6 +462,13 @@ int rmw_cerulion_bb_serialize(const void *callbacks, const void *msg, const uint
     *len = cdr.get_serialized_data_length();
     return 0;
   } catch (const eprosima::fastcdr::exception::NotEnoughMemoryException &) {
+    // The caller retries with a larger buffer and the backend is asked again:
+    // this attempt's descriptor counts are taken back.
+    g_counters[kDescriptorsCreated].fetch_sub(t_created - created, std::memory_order_relaxed);
+    g_counters[kDescriptorsRefused].fetch_sub(t_refused - refused, std::memory_order_relaxed);
+    t_created = created;
+    t_refused = refused;
+    t_descriptor_calls = calls;
     try {
       *len = static_cast<size_t>(cb->get_serialized_size(msg)) + 4;
     } catch (...) {
@@ -459,11 +500,8 @@ int rmw_cerulion_bb_deserialize(const void *callbacks, const uint8_t *cdr_bytes,
   const auto *cb = static_cast<const Callbacks *>(callbacks);
   t_empty_import = false;
   try {
-    const SerializationContext *ser = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(g_ctx_mutex);
-      ser = g_ctx != nullptr ? &g_ctx->ser : nullptr;
-    }
+    std::shared_lock<std::shared_mutex> lock(g_ctx_mutex);
+    const SerializationContext *ser = g_ctx != nullptr ? &g_ctx->ser : nullptr;
     if (ser == nullptr) {
       t_last_error = "buffer backends are not loaded";
       return 2;
@@ -638,7 +676,7 @@ extern "C" {
 int rmw_cerulion_bb_install_fixture_backend(const char *type) noexcept {
   try {
     (void)rmw_cerulion_bb_init();
-    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_ctx_mutex);
     if (g_ctx == nullptr) {
       t_last_error = "buffer backends are not loaded";
       return 2;
@@ -650,8 +688,7 @@ int rmw_cerulion_bb_install_fixture_backend(const char *type) noexcept {
     ops.create_descriptor_with_endpoint = [weak](const void *impl,
                                                  const rmw_topic_endpoint_info_t &ep) {
       auto descriptor = weak.lock()->create_descriptor_with_endpoint(impl, ep);
-      g_counters[descriptor ? kDescriptorsCreated : kDescriptorsRefused].fetch_add(
-          1, std::memory_order_relaxed);
+      count_descriptor(descriptor != nullptr);
       return descriptor;
     };
     ops.from_descriptor_with_endpoint = [weak](const void *descriptor,
@@ -684,26 +721,35 @@ int rmw_cerulion_bb_install_fixture_backend(const char *type) noexcept {
   } catch (const std::exception &e) {
     t_last_error = std::string("fixture backend install threw: ") + e.what();
     return 2;
+  } catch (...) {
+    t_last_error = "fixture backend install threw";
+    return 2;
   }
 }
 
 /// Make the fixture backend refuse the endpoint with this gid (its discovery
 /// verdict is false and it creates no descriptor for it), or accept it again.
 void rmw_cerulion_bb_fixture_deny(const uint8_t *gid, int deny) noexcept {
-  std::lock_guard<std::mutex> lock(g_fixture_mutex);
-  std::vector<uint8_t> key(gid, gid + RMW_GID_STORAGE_SIZE);
-  if (deny) {
-    g_fixture_denied.insert(key);
-  } else {
-    g_fixture_denied.erase(key);
+  try {
+    std::lock_guard<std::mutex> lock(g_fixture_mutex);
+    std::vector<uint8_t> key(gid, gid + RMW_GID_STORAGE_SIZE);
+    if (deny) {
+      g_fixture_denied.insert(key);
+    } else {
+      g_fixture_denied.erase(key);
+    }
+  } catch (...) {
   }
 }
 
 /// Forget the fixture "device memory" behind `ipc_uid`, so a descriptor that
 /// names it imports as an empty buffer (a stale descriptor).
 void rmw_cerulion_bb_fixture_forget(uint64_t ipc_uid) noexcept {
-  std::lock_guard<std::mutex> lock(g_fixture_mutex);
-  g_fixture_memory.erase(ipc_uid);
+  try {
+    std::lock_guard<std::mutex> lock(g_fixture_mutex);
+    g_fixture_memory.erase(ipc_uid);
+  } catch (...) {
+  }
 }
 
 /// The descriptor fields a fixture device Buffer carries (the CudaBufferDescriptor layout).
@@ -742,6 +788,9 @@ int rmw_cerulion_bb_fixture_buffer_assign(void *buf, const char *type, const uin
     return 0;
   } catch (const std::exception &e) {
     t_last_error = std::string("fixture buffer assign threw: ") + e.what();
+    return 2;
+  } catch (...) {
+    t_last_error = "fixture buffer assign threw";
     return 2;
   }
 }

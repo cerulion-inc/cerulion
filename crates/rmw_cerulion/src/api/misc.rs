@@ -438,16 +438,47 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
 
         let mut frame: Option<Vec<u8>> = None;
         let mut info_out: Option<(u64, u64)> = None;
-        let receive = inner.subscriber.try_receive_one(|msg| {
-            // Reassemble the full frame (header + payload) — "cerulion"
-            // serialization format IS the wire frame.
-            let header = msg.header();
-            let mut buf = vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
-            header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
-            buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
-            frame = Some(buf);
-        });
+        // A buffer-aware subscription receives addressed frames
+        // (`crate::buffer_backends`): its own come back as the native frame,
+        // other ports' are passed over, up to the queue's depth.
+        let mut skips_left = runtime::runtime()
+            .map(|rt| rt.transport.subscriber_buffer_size())
+            .unwrap_or(16);
+        let receive = loop {
+            let mut passed_over = false;
+            let receive = inner.subscriber.try_receive_one(|msg| {
+                let header = msg.header();
+                #[cfg(cerulion_has_buffer_backends)]
+                {
+                    use super::pubsub::AddressedAsNative;
+                    match super::pubsub::addressed_as_native(data, header, msg.payload()) {
+                        AddressedAsNative::NotAddressed => {}
+                        AddressedAsNative::Native(native) => {
+                            info_out = Some((header.timestamp_ns, header.sequence as u64));
+                            frame = Some(native);
+                            return;
+                        }
+                        AddressedAsNative::NotMine | AddressedAsNative::Dropped => {
+                            passed_over = true;
+                            return;
+                        }
+                    }
+                }
+                // Reassemble the full frame (header + payload) — "cerulion"
+                // serialization format IS the wire frame.
+                let mut buf =
+                    vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
+                header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
+                buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
+                info_out = Some((header.timestamp_ns, header.sequence as u64));
+                frame = Some(buf);
+            });
+            if matches!(receive, Ok(true)) && passed_over && skips_left > 0 {
+                skips_left -= 1;
+                continue;
+            }
+            break receive;
+        };
         drop(inner);
         if let Err(e) = receive {
             tracing::error!(topic = %data.topic, error = %e, "serialized take failed");

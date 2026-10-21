@@ -1023,8 +1023,9 @@ headers of `rosidl_buffer_backend`, `rosidl_buffer_backend_registry`,
 `<prefix>/includefastcdr/`) and for `librosidl_buffer_backend_registry.so` and
 `libfastcdr.so` (in `<prefix>/lib` and its subdirectories), compiles `shim/buffer_shim.cpp`,
 links both libraries and emits `cfg(cerulion_has_buffer_backends)`. All of them ship with
-rmw_fastrtps_cpp; a generated build of that era that misses one fails, naming it. A vendored
-build has none of this and carries every non-CPU Buffer as a host copy (`src/rosidl_buffer.rs`).
+rmw_fastrtps_cpp; a generated build of that era that misses one builds without hosted backends
+and says so in a cargo warning naming what is missing. A vendored build has none of this either,
+and both carry every non-CPU Buffer as a host copy (`src/rosidl_buffer.rs`).
 
 **Loading.** The first buffer-aware endpoint's create loads every installed backend plugin
 through `rosidl_buffer_backend_registry`, the way rmw_zenoh_cpp's and rmw_fastrtps_cpp's
@@ -1036,7 +1037,9 @@ the backends down at context fini.
 
 **Who is buffer-aware.** A C++ (`introspection_cpp`) endpoint whose type support resolves to
 `rosidl_typesupport_fastrtps_cpp` callbacks with `has_buffer_fields`, while at least one
-backend other than `cpu` is loaded. A transient-local publisher never is. A buffer-aware
+backend other than `cpu` is loaded. A publisher whose service retains history (its provisioned
+depth, which a transient-local publisher that created the service first raises for every
+publisher on it) never is. A buffer-aware
 publisher serves no borrow and a buffer-aware subscription no loaned or adopted take
 (`can_loan_messages` is false for both): the CDR is encoded from and decoded into rclcpp's own
 message.
@@ -1052,8 +1055,13 @@ at create and holds a view of its data service's dynamic config
 (`TransportManager::topic_subscriber_view`). Each publish reads the live subscriber ports with
 their names; a port seen for the first time gets its verdict: not buffer-aware (any other
 name, an unnamed port included), or buffer-aware and ACCELERATED when a backend it accepts
-answers `on_discovering_endpoint` with true. A verdict lasts the port's life; a negative one
-for a buffer-aware port is asked again after 500 ms.
+answers `on_discovering_endpoint` with true. A verdict lasts the port's life. A buffer-aware
+port that accepts no backend is CPU-only without asking; a negative answer for one that does is
+asked again after 500 ms, at most four times (discovery runs inside the publish, under the
+publisher mutex, and the cuda backend's discovery reads a host-wide registry under a named
+semaphore). The buffer gid starts with the process's pid-namespace id (the low 32 bits of the
+`/proc/self/ns/pid` inode), and so does the port name after its tag, so containers sharing
+`/dev/shm` with pid namespaces of their own never collide.
 
 **Routing (`buffer_backends::route`).**
 
@@ -1064,23 +1072,41 @@ for a buffer-aware port is asked again after 500 ms.
 | all buffer-aware, none accelerated | the native frame |
 | all buffer-aware, some accelerated | per accelerated subscription, `cdr_serialize_with_endpoint` for its buffer gid; identical results sent once as one frame addressed to their port ids (`descriptor_frames`); the rest get one plain-CDR frame addressed to them (`cpu_group_frames`) |
 
+On the addressed route the first accelerated serialization also tells whether the message holds
+a Buffer on another backend at all: when it asked no backend for a descriptor, nothing addressed
+is sent and the native frame goes out instead (one extra CDR encode of a CPU message, counted in
+`native_frames`). Every frame is built before the publish reads its subscriber ports a second
+time; if a port came or went in between, nothing addressed is sent and the native frame goes out.
+
 An addressed frame is a `WireHeader` with its own schema hash (FNV-1a 64 of a fixed tag and the
-type's native hash, `buffer_frame_hash`), `offset_table_count` 0, and the payload: version
+type's native hash, `buffer_frame_hash`), `offset_table_count` 0 and the mark below, and the
+payload: version
 (u8, 1), kind (u8: 1 endpoint CDR, 2 plain CDR), recipient count (u16), CDR length (u32), the
 publisher's buffer gid (16 bytes), the recipient port ids (u128 LE each), then the CDR
 (encapsulation `00 01 00 00`, XCDRv1 body). Every frame of one publish carries the same
 sequence number, minted after every serialization succeeded. The CDR is what rmw_fastrtps_cpp
 and rmw_zenoh_cpp write for the same message (pinned byte-for-byte against the S2 golden wire by
-`tests/rosidl_buffer_backend_test.rs`). A reader that is not buffer-aware and attaches between a
-publish's port read and its send refuses the frame at its schema-hash gate.
+`tests/rosidl_buffer_backend_test.rs`). The header also carries `offset_table_count` 0 with
+`offset_table_offset` = `cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK` (`R B U F`), a value no
+native frame has. A reader that is not buffer-aware and attaches between the second port read
+and the send still receives the addressed frame: the rmw take paths refuse it at their
+schema-hash gate, and the bagd tap and the gateway's egress refuse it by its mark and count it
+(`BagdSummary::addressed_refused`, `GatewayRuntime::addressed_refused_count`), so a recording
+never holds one and an attach-mode channel never learns its hash.
 
 **Take.** A buffer-aware subscription matches the frame's schema hash before its native gate.
-A frame that does not name its port is skipped (`skipped_frames`, `taken = false`). One that
+A frame that does not name its port is passed over (`skipped_frames`) and the take receives the
+next one, up to the queue depth, so `taken = false` means no frame of its own is queued. Every
+subscriber's queue holds every addressed frame of a publish (one per distinct serialization plus
+one plain-CDR frame), so with mixed recipients a queue holds fewer messages of its own. One that
 does is decoded with `cdr_deserialize_with_endpoint` and the publisher's buffer gid; a
 descriptor becomes a Buffer through its backend (`imports`). A backend that returns an empty
 Buffer for a descriptor (NVIDIA's backend does for a stale one) makes the frame a LOST SAMPLE:
 not delivered, counted (`lost_samples`), a warning on the first loss per topic and at every
-power of ten. An undecodable frame goes through the decode-failure latch.
+power of ten. An undecodable frame goes through the decode-failure latch. A serialized take
+(`rmw_take_serialized_message`, rosbag2's generic subscriptions) returns the native frame: an
+addressed frame for its port is decoded into a scratch message and flattened back, a non-CPU
+Buffer copied to host memory and counted in `host_copies`.
 
 **Counters.** `buffer_backends::counters()` returns every counter under a stable name
 (`rmw_cerulion.rosidl_buffer.<name>`), and a buffer-aware endpoint's destroy logs them at

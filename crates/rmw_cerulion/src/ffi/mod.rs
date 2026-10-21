@@ -472,6 +472,19 @@ fn set_error_state_raw(msg: &std::ffi::CStr) -> RclErrorChannel {
     RclErrorChannel::Set
 }
 
+/// The `rcl_error_channel=` token a refusal line carries in this process:
+/// `set` when `librcutils` is mapped, else `unavailable`. A cargo test
+/// process maps it only on a build that hosts the buffer backends (the
+/// linked `librosidl_buffer_backend_registry` needs it).
+#[cfg(test)]
+pub(crate) fn rcl_error_channel_token() -> &'static str {
+    if resolved_set_error_state().is_some() {
+        "rcl_error_channel=set"
+    } else {
+        "rcl_error_channel=unavailable"
+    }
+}
+
 /// The resolved `rcutils_set_error_state`, or `None` outside a ROS
 /// process. Resolved ONCE — see the caller's docs for why a cached
 /// FAILURE is right for a dlopen'd `.so`.
@@ -578,8 +591,8 @@ mod tests {
         assert_eq!(ffi_guard(-1i32, || panic!("boom")), -1);
         assert!(logs_contain("rmw entry point panicked"));
         assert!(logs_contain("panic=boom"));
-        // Outside a ROS process no librcutils is mapped: the line says so.
-        assert!(logs_contain("rcl_error_channel=unavailable"));
+        // The line names whether librcutils is mapped in this process.
+        assert!(logs_contain(super::rcl_error_channel_token()));
     }
 
     #[test]

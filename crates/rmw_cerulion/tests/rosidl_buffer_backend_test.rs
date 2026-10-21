@@ -78,6 +78,10 @@ extern "C" {
     fn rmw_cerulion_cppstring_assign(s: *mut c_void, data: *const c_char, len: usize);
     fn rmw_cerulion_cppstring_view(s: *const c_void, data: *mut *const c_char, len: *mut usize);
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+    fn malloc(size: usize) -> *mut c_void;
+    fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+    fn calloc(n: usize, size: usize) -> *mut c_void;
+    fn free(ptr: *mut c_void);
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
 }
@@ -311,7 +315,7 @@ fn the_endpoint_aware_cdr_is_the_captured_wire_byte_for_byte() {
     unsafe {
         img.fill_fixture_fields();
         img.set_device_data(&[0xab; 48], &d);
-        let gid = buffer_backends::buffer_gid(1, 1);
+        let gid = buffer_backends::buffer_gid(0, 1, 1);
         let created = counter("descriptors_created");
         let aware = serialize(cb, img.ptr(), Some(&gid));
         assert_eq!(aware, fixture("image_cuda_descriptor.ddscdr.cdr"), "rmw_zenoh_cpp wire");
@@ -346,10 +350,10 @@ fn the_captured_wire_decodes_to_the_captured_descriptor_and_a_stale_one_is_lost(
         let mut src = Image::new(ts);
         src.fill_fixture_fields();
         src.set_device_data(&[0xab; 48], &d);
-        let _ = serialize(cb, src.ptr(), Some(&buffer_backends::buffer_gid(1, 2)));
+        let _ = serialize(cb, src.ptr(), Some(&buffer_backends::buffer_gid(0, 1, 2)));
 
         let mut out = Image::new(ts);
-        let gid = buffer_backends::buffer_gid(1, 3);
+        let gid = buffer_backends::buffer_gid(0, 1, 3);
         let r = bb::rmw_cerulion_bb_deserialize(
             cb,
             wire.as_ptr(),
@@ -563,6 +567,111 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
 
         assert_eq!(rmw_destroy_subscription(node, gpu), RMW_RET_OK);
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    }
+}
+
+unsafe extern "C" fn t_alloc(size: usize, _s: *mut c_void) -> *mut c_void {
+    malloc(size)
+}
+unsafe extern "C" fn t_free(p: *mut c_void, _s: *mut c_void) {
+    free(p)
+}
+unsafe extern "C" fn t_realloc(p: *mut c_void, size: usize, _s: *mut c_void) -> *mut c_void {
+    realloc(p, size)
+}
+unsafe extern "C" fn t_calloc(n: usize, size: usize, _s: *mut c_void) -> *mut c_void {
+    calloc(n, size)
+}
+
+fn malloc_allocator() -> ffi::rcutils_allocator_t {
+    let mut a: ffi::rcutils_allocator_t = unsafe { std::mem::zeroed() };
+    a.allocate = Some(t_alloc);
+    a.deallocate = Some(t_free);
+    a.reallocate = Some(t_realloc);
+    a.zero_allocate = Some(t_calloc);
+    a
+}
+
+#[test]
+#[serial]
+fn a_serialized_take_gets_the_native_frame_and_a_cpu_message_goes_native() {
+    install();
+    let ts = image_ts();
+    unsafe {
+        let node = setup_node("bb_ser");
+        let topic = CString::new(format!("/bb_ser/{}", std::process::id())).expect("topic");
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos(), &pub_opts);
+        assert!(!publisher.is_null());
+        let gpu = subscribe(node, ts, &topic, Some(c"cuda"));
+        let native_hash = sub_data(gpu).bridge.schema_hash();
+
+        // A serialized take of an addressed frame returns the native frame,
+        // with the device Buffer copied to host memory (one counted copy).
+        let copies = counter("host_copies");
+        let bytes = pattern(300, 9);
+        publish_device(publisher, ts, &bytes, 201);
+        let mut ser: ffi::rmw_serialized_message_t = std::mem::zeroed();
+        ser.allocator = malloc_allocator();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut taken = false;
+        while !taken && std::time::Instant::now() < deadline {
+            assert_eq!(rmw_take_serialized_message(gpu, &mut ser, &mut taken, std::ptr::null_mut()), RMW_RET_OK);
+        }
+        assert!(taken, "the serialized take received the frame");
+        let frame = std::slice::from_raw_parts(ser.buffer, ser.buffer_length);
+        let header = cerulion_core::wire::WireHeader::read_from_buf(frame).expect("header");
+        assert_eq!(header.schema_hash, native_hash, "a serialized message is the native frame");
+        assert!(frame.windows(bytes.len()).any(|w| w == &bytes[..]), "the Buffer's bytes are in it");
+        assert_eq!(counter("host_copies"), copies + 1);
+        (ser.allocator.deallocate.unwrap())(ser.buffer as *mut c_void, std::ptr::null_mut());
+
+        // A message whose Buffer is on the CPU goes out native even to an
+        // accelerated subscription: no descriptor frame, no host copy.
+        let (frames, natives, copies) = (counter("descriptor_frames"), counter("native_frames"), counter("host_copies"));
+        let mut img = Image::new(ts);
+        img.fill_fixture_fields();
+        let data = img.at(&["data"]) as *mut c_void;
+        // A default-constructed Buffer is a CPU Buffer; fill it through the R0 shim.
+        extern "C" {
+            fn rmw_cerulion_buffer_u8_assign(buf: *mut c_void, data: *const u8, len: usize) -> c_int;
+        }
+        let cpu_bytes = pattern(128, 11);
+        assert_ne!(rmw_cerulion_buffer_u8_assign(data, cpu_bytes.as_ptr(), cpu_bytes.len()), 2);
+        assert_eq!(rmw_publish(publisher, img.ptr(), std::ptr::null_mut()), RMW_RET_OK);
+        let (b, size, _, _) = take(gpu, ts).expect("cpu message delivered").data();
+        assert_eq!((b.as_str(), size), ("cpu", 128));
+        assert_eq!(
+            (counter("descriptor_frames"), counter("native_frames"), counter("host_copies")),
+            (frames, natives + 1, copies),
+        );
+        assert_eq!(rmw_destroy_subscription(node, gpu), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    }
+}
+
+#[test]
+#[serial]
+fn a_volatile_publisher_on_a_service_with_history_is_not_buffer_aware() {
+    install();
+    let ts = image_ts();
+    unsafe {
+        let node = setup_node("bb_hist");
+        let topic = CString::new(format!("/bb_hist/{}", std::process::id())).expect("topic");
+        let mut tl = qos();
+        tl.durability = ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let first = rmw_create_publisher(node, ts, topic.as_ptr(), &tl, &pub_opts);
+        assert!(!first.is_null());
+        let volatile = rmw_create_publisher(node, ts, topic.as_ptr(), &qos(), &pub_opts);
+        assert!(!volatile.is_null());
+        let pdata = &*((*volatile).data as *const PublisherData);
+        assert!(
+            pdata.inner.lock().expect("lock").buffer.is_none(),
+            "the service retains history, so a descriptor could be replayed after its memory is gone"
+        );
+        assert_eq!(rmw_destroy_publisher(node, volatile), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, first), RMW_RET_OK);
     }
 }
 

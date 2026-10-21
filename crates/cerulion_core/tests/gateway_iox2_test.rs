@@ -279,6 +279,44 @@ fn publish_one(
     proxy.z = v.2;
 }
 
+/// An rmw_cerulion ADDRESSED frame drained by a demanded egress tap is never
+/// forwarded: it is counted, and the topic's native frames still go out.
+#[test]
+fn an_addressed_frame_is_refused_and_counted_never_forwarded() {
+    let topic = format!("/gw/addr/{}", unique_id());
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![topic.clone()],
+        ingress: vec![],
+    };
+    let (p, clock, mut gateway, mut pubs) =
+        make_producer_and_gateway("addr", plan, std::slice::from_ref(&topic));
+    let _ = &p;
+    gateway
+        .manager()
+        .bridge_manager()
+        .enable_bridge(&topic)
+        .expect("enable");
+    assert_eq!(gateway.drive_once().expect("drive"), 0);
+    assert_eq!(gateway.active_tap_topics(), vec![topic.clone()]);
+
+    let mut addressed = vec![0u8; WireHeader::SIZE + 64];
+    let header = WireHeader {
+        schema_hash: 0x0123_4567_89ab_cdef,
+        total_size: addressed.len() as u32,
+        offset_table_offset: cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK,
+        offset_table_count: 0,
+        sequence: 0,
+        timestamp_ns: 5,
+    };
+    header.write_to_buf(&mut addressed[..WireHeader::SIZE]);
+    pubs[0].publish_raw(&addressed).expect("publish addressed frame");
+    publish_one(&mut pubs[0], &clock, 10, (1.0, 2.0, 3.0));
+    let _ = drive_until(&mut gateway, 1, &topic);
+    assert_eq!(gateway.forwarded_count(&topic), 1, "the native frame is forwarded");
+    assert_eq!(gateway.addressed_refused_count(), 1, "the addressed frame is counted");
+}
+
 /// (b) A demand token attaches the tap and forwards; dropping it detaches the
 /// tap and stops forwarding.
 #[test]

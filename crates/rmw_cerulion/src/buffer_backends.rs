@@ -14,8 +14,10 @@
 //!
 //! A C++ (`introspection_cpp`) endpoint whose type has `rosidl::Buffer` fields
 //! and a `rosidl_typesupport_fastrtps_cpp` type support is BUFFER-AWARE when at
-//! least one backend other than `cpu` is installed. A transient-local publisher
-//! is not (a retained descriptor would outlive the memory it names). Everything
+//! least one backend other than `cpu` is installed. A publisher whose service
+//! retains history (transient-local, or volatile on a service a transient-local
+//! publisher created) is not: a retained descriptor would outlive the memory it
+//! names. Everything
 //! else (C type support, native Cerulion nodes, recorders, the gateway) is not
 //! buffer-aware and reads the native frame.
 //!
@@ -29,7 +31,8 @@
 //! publisher reads its topic's live subscriber ports on every publish (a
 //! shared-memory read), and the first time it sees a port it asks every backend
 //! whether that subscription can receive descriptors (`on_discovering_endpoint`),
-//! keeping the verdict for the port's life ([`PeerVerdicts`]).
+//! keeping the verdict for the port's life; a negative answer is asked again a
+//! bounded number of times ([`PeerVerdicts`]).
 //!
 //! # Routing ([`route`])
 //!
@@ -45,18 +48,25 @@
 //!   on another backend is written as bytes.
 //! * Every subscriber buffer-aware, none accelerated: the native frame.
 //!
+//! On the addressed route a message whose first serialization asked no backend
+//! for a descriptor (it holds no non-CPU Buffer) goes out as the native frame,
+//! and so does one whose subscriber ports changed while its frames were built
+//! (they are read a second time just before the send).
+//!
 //! An addressed frame ([`encode_frame_prefix`]) carries its own schema hash
-//! ([`buffer_frame_hash`]), so a reader that is not buffer-aware and attached
-//! between the publisher's read of the port list and the send refuses it at the
-//! schema-hash gate rather than misreading it. The CDR inside is the CDR
+//! ([`buffer_frame_hash`]) and the header mark
+//! [`cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK`]: the rmw take paths of a
+//! subscription that is not buffer-aware refuse it at their schema-hash gate,
+//! and the bagd tap and the gateway refuse it by its mark and count it. The CDR inside is the CDR
 //! rmw_fastrtps_cpp and rmw_zenoh_cpp put on their wire for the same message
 //! and backend (the S2 golden fixtures pin it).
 //!
 //! # Take
 //!
-//! A buffer-aware subscription skips an addressed frame that does not name its
-//! port, and decodes one that does through `cdr_deserialize_with_endpoint`: a
-//! descriptor becomes a Buffer through its backend. A backend that returns an
+//! A buffer-aware subscription passes over an addressed frame that does not name
+//! its port, and decodes one that does through `cdr_deserialize_with_endpoint`:
+//! a descriptor becomes a Buffer through its backend. A serialized take flattens
+//! it back into the native frame. A backend that returns an
 //! empty Buffer for a descriptor (the cuda backend's answer to a stale one) is
 //! a LOST SAMPLE, counted and never delivered.
 //!
@@ -118,7 +128,8 @@ pub const COUNTER_NAMES: [&str; 11] = [
 ///   subscriptions that accept no backend of the Buffer; each non-CPU Buffer in
 ///   one was copied to host memory.
 /// * `native_frames`: native frames a buffer-aware publisher sent because a
-///   subscriber that is not buffer-aware, or no accelerated one, was attached.
+///   subscriber that is not buffer-aware, or no accelerated one, was attached,
+///   the message held no non-CPU Buffer, or the ports changed mid-publish.
 /// * `host_copies`: every non-CPU Buffer copied to host memory for a native
 ///   frame ([`crate::rosidl_buffer::downgrade_count`]).
 /// * `unsent_no_subscriber`: buffer-aware publishes with no subscriber attached.
@@ -126,7 +137,8 @@ pub const COUNTER_NAMES: [&str; 11] = [
 /// * `imports`: descriptors a backend turned back into a Buffer.
 /// * `lost_samples`: addressed frames dropped because a backend returned an
 ///   empty Buffer for a descriptor (stale, or not importable here).
-/// * `skipped_frames`: addressed frames a subscription received for another port.
+/// * `skipped_frames`: addressed frames a subscription passed over (for
+///   another port).
 pub fn counters() -> Vec<(&'static str, u64)> {
     let values = [
         DESCRIPTOR_FRAMES.load(Ordering::Relaxed),
@@ -164,21 +176,41 @@ fn shim_counter(_which: i32) -> u64 {
     0
 }
 
-/// The 16-byte gid a backend sees for a buffer-aware endpoint: `C R B 1`, the
-/// process id (u32 LE), the endpoint's entity number (u64 LE). Unique on the
-/// host while the process lives (rmw gids are the entity number plus the
+/// The 16-byte gid a backend sees for a buffer-aware endpoint: the process's
+/// pid-namespace id (u32 LE, the low half of the `/proc/self/ns/pid` inode),
+/// its process id (u32 LE) and the endpoint's entity number (u64 LE). Unique on
+/// the host while the process lives, across containers that share `/dev/shm`
+/// with pid namespaces of their own (rmw gids are the entity number plus the
 /// schema hash, the same in every process).
-pub fn buffer_gid(pid: u32, entity: u64) -> [u8; 16] {
+pub fn buffer_gid(pid_ns: u32, pid: u32, entity: u64) -> [u8; 16] {
     let mut gid = [0u8; 16];
-    gid[..4].copy_from_slice(b"CRB\x01");
+    gid[..4].copy_from_slice(&pid_ns.to_le_bytes());
     gid[4..8].copy_from_slice(&pid.to_le_bytes());
     gid[8..].copy_from_slice(&entity.to_le_bytes());
     gid
 }
 
+/// This process's pid-namespace id: the low 32 bits of the inode
+/// `/proc/self/ns/pid` names (`pid:[4026531836]`), 0 where there is none.
+pub fn pid_namespace_id() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .and_then(|p| {
+                let s = p.to_string_lossy().into_owned();
+                let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+                digits.parse::<u64>().ok()
+            })
+            .map_or(0, |inode| inode as u32)
+    })
+}
+
 /// A buffer-aware subscription as its port name describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwarePeer {
+    /// Pid-namespace id of the subscription's process ([`pid_namespace_id`]).
+    pub pid_ns: u32,
     /// Process id of the subscription.
     pub pid: u32,
     /// Its entity number in that process.
@@ -190,12 +222,12 @@ pub struct AwarePeer {
 impl AwarePeer {
     /// The gid its backends know it by ([`buffer_gid`]).
     pub fn gid(&self) -> [u8; 16] {
-        buffer_gid(self.pid, self.entity)
+        buffer_gid(self.pid_ns, self.pid, self.entity)
     }
 }
 
 /// The port name of a buffer-aware subscription:
-/// `rbuf1;<pid hex>;<entity hex>;<backend>,<backend>…`. `None` when it does
+/// `rbuf1;<pid namespace hex>;<pid hex>;<entity hex>;<backend>,<backend>…`. `None` when it does
 /// not fit `max_len` bytes or a backend name holds a character other than an
 /// ASCII letter, digit, `_` or `-`.
 pub fn encode_port_name(peer: &AwarePeer, max_len: usize) -> Option<String> {
@@ -208,7 +240,8 @@ pub fn encode_port_name(peer: &AwarePeer, max_len: usize) -> Option<String> {
         return None;
     }
     let name = format!(
-        "{PORT_NAME_TAG};{:x};{:x};{}",
+        "{PORT_NAME_TAG};{:x};{:x};{:x};{}",
+        peer.pid_ns,
         peer.pid,
         peer.entity,
         peer.backends.join(",")
@@ -223,6 +256,7 @@ pub fn parse_port_name(name: &str) -> Option<AwarePeer> {
     if parts.next()? != PORT_NAME_TAG {
         return None;
     }
+    let pid_ns = u32::from_str_radix(parts.next()?, 16).ok()?;
     let pid = u32::from_str_radix(parts.next()?, 16).ok()?;
     let entity = u64::from_str_radix(parts.next()?, 16).ok()?;
     let backends_field = parts.next()?;
@@ -235,6 +269,7 @@ pub fn parse_port_name(name: &str) -> Option<AwarePeer> {
         .map(str::to_owned)
         .collect();
     Some(AwarePeer {
+        pid_ns,
         pid,
         entity,
         backends,
@@ -399,24 +434,35 @@ pub fn route(peers: &[(u128, PeerVerdict)]) -> Route {
     }
 }
 
-/// How long a negative verdict for a buffer-aware port is kept before the
-/// backends are asked again: a subscription in another process registers with
-/// its backends before its port exists, but a backend's own host-wide registry
-/// can lag (the cuda backend refreshes its view on discovery).
+/// How long a negative verdict for a buffer-aware port that accepts a
+/// backend is kept before the backends are asked again: a subscription in
+/// another process registers with its backends before its port exists, but a
+/// backend's own host-wide registry can lag (the cuda backend refreshes its
+/// view on discovery).
 pub const NEGATIVE_VERDICT_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many times a negative verdict is asked again before it is kept for the
+/// port's life. Discovery runs inside a publish, so a peer the backends keep
+/// refusing (another uid, another device) costs at most this many extra
+/// discovery calls.
+pub const NEGATIVE_VERDICT_RETRIES: u8 = 4;
 
 /// A publisher's verdict cache, keyed by subscriber port id. A port's name is
 /// fixed for its life and its id is never reused while it lives, so a verdict
 /// stays valid until the port leaves the list ([`PeerVerdicts::retain_live`]).
 #[derive(Default)]
 pub struct PeerVerdicts {
-    entries: HashMap<u128, (PeerVerdict, Option<std::time::Instant>)>,
+    /// Verdict, when a negative one was last asked (`None`: final), and how
+    /// many retries it has left.
+    entries: HashMap<u128, (PeerVerdict, Option<std::time::Instant>, u8)>,
 }
 
 impl PeerVerdicts {
-    /// The verdict for `port` named `name`, computing it with `discover` (the
-    /// backends' answer for an aware peer) on first sight, and again for a
-    /// negative aware verdict older than [`NEGATIVE_VERDICT_RETRY`].
+    /// The verdict for `port` named `name`. On first sight a buffer-aware
+    /// peer that accepts at least one backend is asked about through
+    /// `discover` (the backends' answer); one that accepts none is CPU-only
+    /// for life without asking. A negative answer is asked again after
+    /// [`NEGATIVE_VERDICT_RETRY`], at most [`NEGATIVE_VERDICT_RETRIES`] times.
     pub fn verdict(
         &mut self,
         port: u128,
@@ -424,34 +470,42 @@ impl PeerVerdicts {
         now: std::time::Instant,
         discover: &mut dyn FnMut(&AwarePeer) -> bool,
     ) -> PeerVerdict {
-        if let Some((v, checked)) = self.entries.get(&port) {
-            let stale = matches!(
-                v,
-                PeerVerdict::Aware {
-                    accelerated: false,
-                    ..
+        let retries_left = match self.entries.get(&port) {
+            None => NEGATIVE_VERDICT_RETRIES,
+            Some((v, None, _)) => return v.clone(),
+            Some((v, Some(t), left)) => {
+                if now.duration_since(*t) < NEGATIVE_VERDICT_RETRY {
+                    return v.clone();
                 }
-            ) && checked.is_some_and(|t| now.duration_since(t) >= NEGATIVE_VERDICT_RETRY);
-            if !stale {
-                return v.clone();
+                *left
             }
-        }
-        let verdict = match parse_port_name(name) {
-            None => PeerVerdict::NotAware,
-            Some(peer) => PeerVerdict::Aware {
-                gid: peer.gid(),
-                accelerated: discover(&peer),
-            },
         };
-        let checked = matches!(
-            verdict,
-            PeerVerdict::Aware {
-                accelerated: false,
-                ..
+        let (verdict, recheck) = match parse_port_name(name) {
+            None => (PeerVerdict::NotAware, false),
+            Some(peer) if peer.backends.is_empty() => (
+                PeerVerdict::Aware {
+                    gid: peer.gid(),
+                    accelerated: false,
+                },
+                false,
+            ),
+            Some(peer) => {
+                let accelerated = discover(&peer);
+                (
+                    PeerVerdict::Aware {
+                        gid: peer.gid(),
+                        accelerated,
+                    },
+                    !accelerated && retries_left > 0,
+                )
             }
-        )
-        .then_some(now);
-        self.entries.insert(port, (verdict.clone(), checked));
+        };
+        let (checked, left) = if recheck {
+            (Some(now), retries_left - 1)
+        } else {
+            (None, 0)
+        };
+        self.entries.insert(port, (verdict.clone(), checked, left));
         verdict
     }
 
@@ -514,10 +568,11 @@ pub mod ffi {
 
     extern "C" {
         pub fn rmw_cerulion_bb_init() -> c_int;
-        pub fn rmw_cerulion_bb_backend_names() -> *const c_char;
+        pub fn rmw_cerulion_bb_backend_names(out: *mut c_char, cap: usize) -> usize;
         pub fn rmw_cerulion_bb_metadata_is_empty(backend: *const c_char) -> c_int;
         pub fn rmw_cerulion_bb_last_error() -> *const c_char;
         pub fn rmw_cerulion_bb_counter(which: c_int) -> u64;
+        pub fn rmw_cerulion_bb_thread_descriptor_calls() -> u64;
         pub fn rmw_cerulion_bb_has_buffer_fields(callbacks: *const c_void) -> c_int;
         pub fn rmw_cerulion_bb_on_creating(
             gid: *const u8,
@@ -584,11 +639,17 @@ fn load_backends() {}
 /// The loaded backend names as the shim lists them now.
 #[cfg(cerulion_has_buffer_backends)]
 fn current_backend_names() -> Vec<String> {
-    // SAFETY: the shim returns a NUL-terminated string valid until the next
-    // install, copied out here.
-    let csv = unsafe { std::ffi::CStr::from_ptr(ffi::rmw_cerulion_bb_backend_names()) }
-        .to_string_lossy()
-        .into_owned();
+    let mut buf = vec![0u8; 256];
+    loop {
+        // SAFETY: the shim writes at most `buf.len()` bytes, NUL included.
+        let n = unsafe { ffi::rmw_cerulion_bb_backend_names(buf.as_mut_ptr().cast(), buf.len()) };
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf = vec![0u8; n + 1];
+    }
+    let csv = String::from_utf8_lossy(&buf).into_owned();
     csv.split(',')
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
@@ -636,7 +697,6 @@ pub struct BufferPublisher {
     live: Vec<(u128, PeerVerdict)>,
     scratch: Vec<u8>,
     outputs: Vec<Vec<u8>>,
-    frame: Vec<u8>,
     last_route: Option<RouteKind>,
 }
 
@@ -687,7 +747,7 @@ impl BufferPublisher {
         native_hash: u64,
         view: cerulion_core::transport::TopicSubscriberView,
     ) -> Result<Self, String> {
-        let gid = buffer_gid(std::process::id(), entity);
+        let gid = buffer_gid(pid_namespace_id(), std::process::id(), entity);
         let topic_type = std::ffi::CString::new(topic_type).map_err(|e| e.to_string())?;
         // SAFETY: gid is 16 bytes; topic_type is NUL-terminated.
         if unsafe { ffi::rmw_cerulion_bb_on_creating(gid.as_ptr(), 1, topic_type.as_ptr()) } != 0
@@ -705,7 +765,6 @@ impl BufferPublisher {
             live: Vec::new(),
             scratch: vec![0u8; 64 * 1024],
             outputs: Vec::new(),
-            frame: Vec::new(),
             last_route: None,
         })
     }
@@ -820,13 +879,19 @@ impl BufferPublisher {
         Err("the serialization did not fit the type support's own size estimate".to_owned())
     }
 
-    /// Build the addressed frames of one publish, calling `send` with each
-    /// complete frame (wire header included, stamped with `timestamp_ns` and
-    /// the one sequence number `mint_sequence` returns once every
-    /// serialization has succeeded). Returns the number of frames sent.
+    /// Build and send the addressed frames of one publish. Every frame is
+    /// stamped with `timestamp_ns` and the one sequence number
+    /// `mint_sequence` returns, which is called only once every frame is
+    /// built and the subscriber ports are read again and found unchanged.
+    /// [`AddressedOutcome::NoDeviceBuffer`] when the first serialization asked
+    /// no backend for a descriptor (the message holds no non-CPU Buffer), and
+    /// [`AddressedOutcome::PortsChanged`] when a port came or went while the
+    /// frames were built: nothing is sent and no number is spent in either case,
+    /// and the caller sends the native frame.
     ///
     /// # Safety
     /// `msg` is a live C++ message of this endpoint's type.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn publish_addressed(
         &mut self,
         msg: *const std::os::raw::c_void,
@@ -835,13 +900,19 @@ impl BufferPublisher {
         timestamp_ns: u64,
         mint_sequence: &mut dyn FnMut() -> u32,
         send: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-    ) -> Result<usize, String> {
+    ) -> Result<AddressedOutcome, String> {
         let mut outputs = std::mem::take(&mut self.outputs);
         outputs.clear();
-        for (_, gid) in accelerated {
+        for (i, (_, gid)) in accelerated.iter().enumerate() {
+            let before = ffi::rmw_cerulion_bb_thread_descriptor_calls();
             let len = self.serialize_one(msg, Some(gid))?;
+            let asked = ffi::rmw_cerulion_bb_thread_descriptor_calls() != before;
             outputs.push(self.scratch[..len].to_vec());
             self.scratch[..len].fill(0);
+            if i == 0 && !asked {
+                self.outputs = outputs;
+                return Ok(AddressedOutcome::NoDeviceBuffer);
+            }
         }
         let cpu_cdr = if cpu_group.is_empty() {
             None
@@ -851,63 +922,93 @@ impl BufferPublisher {
             self.scratch[..len].fill(0);
             Some(cdr)
         };
-        // Every serialization succeeded: only now is a sequence number spent,
-        // the same one for every frame of this publish.
-        let sequence = mint_sequence();
-        let mut sent = 0;
-        let groups = group_identical(&outputs);
-        for (first, members) in &groups {
+        let mut frames: Vec<(u8, Vec<u8>)> = Vec::new();
+        for (first, members) in group_identical(&outputs) {
             let recipients: Vec<u128> = members.iter().map(|i| accelerated[*i].0).collect();
-            let cdr = std::mem::take(&mut outputs[*first]);
-            self.send_frame(FRAME_KIND_ENDPOINT_CDR, &recipients, &cdr, sequence, timestamp_ns, send)?;
-            outputs[*first] = cdr;
-            note_descriptor_frame();
-            sent += 1;
+            frames.push((
+                FRAME_KIND_ENDPOINT_CDR,
+                self.build_frame(FRAME_KIND_ENDPOINT_CDR, &recipients, &outputs[first], timestamp_ns)?,
+            ));
         }
         if let Some(cdr) = cpu_cdr {
-            self.send_frame(FRAME_KIND_PLAIN_CDR, cpu_group, &cdr, sequence, timestamp_ns, send)?;
-            note_cpu_group_frame();
-            sent += 1;
+            frames.push((
+                FRAME_KIND_PLAIN_CDR,
+                self.build_frame(FRAME_KIND_PLAIN_CDR, cpu_group, &cdr, timestamp_ns)?,
+            ));
         }
         self.outputs = outputs;
-        Ok(sent)
+        if !self.ports_unchanged() {
+            return Ok(AddressedOutcome::PortsChanged);
+        }
+        let sequence = mint_sequence();
+        let mut sent = 0;
+        for (kind, mut frame) in frames {
+            frame[20..24].copy_from_slice(&sequence.to_le_bytes());
+            send(&frame)?;
+            if kind == FRAME_KIND_ENDPOINT_CDR {
+                note_descriptor_frame();
+            } else {
+                note_cpu_group_frame();
+            }
+            sent += 1;
+        }
+        Ok(AddressedOutcome::Sent(sent))
     }
 
-    fn send_frame(
-        &mut self,
+    /// Whether the data service's subscriber ports are still exactly the ones
+    /// [`Self::route_now`] read.
+    fn ports_unchanged(&mut self) -> bool {
+        let mut now: Vec<u128> = Vec::with_capacity(self.live.len());
+        self.view.for_each_subscriber(|id, _| now.push(id));
+        now.len() == self.live.len() && now.iter().zip(&self.live).all(|(a, (b, _))| a == b)
+    }
+
+    /// One addressed frame: wire header (sequence 0, stamped at send), prefix,
+    /// CDR.
+    fn build_frame(
+        &self,
         kind: u8,
         recipients: &[u128],
         cdr: &[u8],
-        sequence: u32,
         timestamp_ns: u64,
-        send: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         use cerulion_core::wire::WireHeader;
         let prefix = frame_prefix_len(recipients.len());
         let total = WireHeader::SIZE + prefix + cdr.len();
         let total_u32 = u32::try_from(total).map_err(|_| "frame exceeds 4 GiB".to_owned())?;
         let cdr_len = u32::try_from(cdr.len()).map_err(|_| "CDR exceeds 4 GiB".to_owned())?;
-        self.frame.clear();
-        self.frame.resize(total, 0);
+        let mut frame = vec![0u8; total];
         let header = WireHeader {
             schema_hash: self.frame_hash,
             total_size: total_u32,
-            offset_table_offset: 0,
+            offset_table_offset: cerulion_core::wire::RMW_ADDRESSED_FRAME_MARK,
             offset_table_count: 0,
-            sequence,
+            sequence: 0,
             timestamp_ns,
         };
-        header.write_to_buf(&mut self.frame[..WireHeader::SIZE]);
+        header.write_to_buf(&mut frame[..WireHeader::SIZE]);
         encode_frame_prefix(
-            &mut self.frame[WireHeader::SIZE..WireHeader::SIZE + prefix],
+            &mut frame[WireHeader::SIZE..WireHeader::SIZE + prefix],
             kind,
             &self.gid,
             recipients,
             cdr_len,
         );
-        self.frame[WireHeader::SIZE + prefix..].copy_from_slice(cdr);
-        send(&self.frame)
+        frame[WireHeader::SIZE + prefix..].copy_from_slice(cdr);
+        Ok(frame)
     }
+}
+
+/// What [`BufferPublisher::publish_addressed`] did.
+#[cfg(cerulion_has_buffer_backends)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressedOutcome {
+    /// This many frames were sent.
+    Sent(usize),
+    /// The message holds no non-CPU Buffer: nothing sent.
+    NoDeviceBuffer,
+    /// The subscriber ports changed while the frames were built: nothing sent.
+    PortsChanged,
 }
 
 /// The subscription half of a buffer-aware endpoint.
@@ -954,6 +1055,7 @@ impl BufferSubscription {
         accepted: &[String],
     ) -> Result<String, String> {
         let peer = AwarePeer {
+            pid_ns: pid_namespace_id(),
             pid: std::process::id(),
             entity,
             backends: accepted.to_vec(),
@@ -986,7 +1088,7 @@ impl BufferSubscription {
             topic_type: std::ffi::CString::new(topic_type).unwrap_or_default(),
             frame_hash: buffer_frame_hash(native_hash),
             port_id,
-            gid: buffer_gid(std::process::id(), entity),
+            gid: buffer_gid(pid_namespace_id(), std::process::id(), entity),
         }
     }
 
@@ -1040,21 +1142,22 @@ mod tests {
     #[test]
     fn a_port_name_round_trips_and_other_names_are_not_aware() {
         let peer = AwarePeer {
+            pid_ns: 0xeffffffc,
             pid: 0x1f3a,
             entity: 7,
             backends: vec!["cuda".into()],
         };
         let name = encode_port_name(&peer, 64).unwrap();
-        assert_eq!(name, "rbuf1;1f3a;7;cuda");
+        assert_eq!(name, "rbuf1;effffffc;1f3a;7;cuda");
         assert_eq!(parse_port_name(&name), Some(peer.clone()));
         let cpu_only = AwarePeer {
             backends: vec![],
             ..peer.clone()
         };
         let name = encode_port_name(&cpu_only, 64).unwrap();
-        assert_eq!(name, "rbuf1;1f3a;7;");
+        assert_eq!(name, "rbuf1;effffffc;1f3a;7;");
         assert_eq!(parse_port_name(&name), Some(cpu_only));
-        for other in ["", "rbuf2;1;1;cuda", "rbuf1;zz;1;", "rbuf1;1;1", "rbuf1;1;1;a;b"] {
+        for other in ["", "rbuf2;1;1;1;cuda", "rbuf1;1;zz;1;", "rbuf1;1;1;1", "rbuf1;1;1;1;a;b"] {
             assert_eq!(parse_port_name(other), None, "{other:?}");
         }
         let long = AwarePeer {
@@ -1070,10 +1173,10 @@ mod tests {
     }
 
     #[test]
-    fn buffer_gids_differ_by_process_and_entity() {
-        assert_ne!(buffer_gid(1, 1), buffer_gid(2, 1));
-        assert_ne!(buffer_gid(1, 1), buffer_gid(1, 2));
-        assert_eq!(&buffer_gid(9, 3)[..4], b"CRB\x01");
+    fn buffer_gids_differ_by_namespace_process_and_entity() {
+        assert_ne!(buffer_gid(1, 1, 1), buffer_gid(2, 1, 1));
+        assert_ne!(buffer_gid(1, 1, 1), buffer_gid(1, 2, 1));
+        assert_ne!(buffer_gid(1, 1, 1), buffer_gid(1, 1, 2));
     }
 
     #[test]
@@ -1087,7 +1190,7 @@ mod tests {
 
     #[test]
     fn a_frame_prefix_round_trips_and_names_only_its_recipients() {
-        let gid = buffer_gid(4, 5);
+        let gid = buffer_gid(3, 4, 5);
         let recipients = [7u128, u128::MAX - 3];
         let cdr = [0u8, 1, 0, 0, 9, 9];
         let mut payload = vec![0u8; frame_prefix_len(2)];
@@ -1140,21 +1243,32 @@ mod tests {
         };
         assert_eq!(v.verdict(1, "", t0, &mut yes), PeerVerdict::NotAware);
         assert!(matches!(
-            v.verdict(2, "rbuf1;1;2;cuda", t0, &mut yes),
+            v.verdict(2, "rbuf1;1;1;2;cuda", t0, &mut yes),
             PeerVerdict::Aware { accelerated: true, .. }
         ));
-        let _ = v.verdict(2, "rbuf1;1;2;cuda", t0, &mut yes);
+        let _ = v.verdict(2, "rbuf1;1;1;2;cuda", t0, &mut yes);
         assert_eq!(asked, 1);
         let no_count = std::cell::Cell::new(0);
         let mut no = |_: &AwarePeer| {
             no_count.set(no_count.get() + 1);
             false
         };
-        let _ = v.verdict(3, "rbuf1;1;3;cuda", t0, &mut no);
-        let _ = v.verdict(3, "rbuf1;1;3;cuda", t0, &mut no);
+        let _ = v.verdict(3, "rbuf1;1;1;3;cuda", t0, &mut no);
+        let _ = v.verdict(3, "rbuf1;1;1;3;cuda", t0, &mut no);
         assert_eq!(no_count.get(), 1);
-        let _ = v.verdict(3, "rbuf1;1;3;cuda", t0 + NEGATIVE_VERDICT_RETRY, &mut no);
-        assert_eq!(no_count.get(), 2);
+        let mut t = t0;
+        for _ in 0..10 {
+            t += NEGATIVE_VERDICT_RETRY;
+            let _ = v.verdict(3, "rbuf1;1;1;3;cuda", t, &mut no);
+        }
+        assert_eq!(
+            no_count.get(),
+            1 + usize::from(NEGATIVE_VERDICT_RETRIES),
+            "a refused peer is asked again a bounded number of times"
+        );
+        // A CPU-only peer is never asked.
+        let _ = v.verdict(4, "rbuf1;1;1;4;", t0, &mut no);
+        assert_eq!(no_count.get(), 1 + usize::from(NEGATIVE_VERDICT_RETRIES));
         v.retain_live(&[(2, aware(true))]);
         assert_eq!(v.entries.len(), 1);
     }

@@ -3402,6 +3402,10 @@ pub struct BagdSummary {
     /// emits a `tracing::warn!`; `> 0` means some recorded timestamps are
     /// fabricated, not wire truth.
     pub headerless: u64,
+    /// rmw_cerulion addressed frames the taps drained and did not record
+    /// (across all taps): CDR for particular buffer-aware subscriptions, never
+    /// the topic's native frame.
+    pub addressed_refused: u64,
     /// `/bagd/status` was REQUESTED (`status_period` set) but its publisher
     /// could not be created at setup — the entire run published NO status
     /// frames (periodic or terminal). Warned at setup and restated in the
@@ -5798,6 +5802,11 @@ struct TapState {
     headerless: u64,
     /// The headerless warn fired for this tap (warn once per topic, count all).
     headerless_warned: bool,
+    /// rmw_cerulion addressed frames drained and NOT recorded
+    /// (`WireHeader::is_rmw_addressed`).
+    addressed_refused: u64,
+    /// The addressed-frame warn fired for this tap (once per topic, count all).
+    addressed_warned: bool,
     /// The "spoke AFTER bag creation" warn fired for this tap (a
     /// placeholder channel is immutable once registered — say so once).
     placeholder_stuck_warned: bool,
@@ -11145,6 +11154,8 @@ fn open_tap(
         dropped_unwritten: 0,
         headerless: 0,
         headerless_warned: false,
+        addressed_refused: 0,
+        addressed_warned: false,
         placeholder_stuck_warned: false,
         count: 0,
         defer_count: 0,
@@ -13632,6 +13643,23 @@ impl Recorder {
             loop {
                 let n = tap.sub.drain_owned(DRAIN_REQUEST_SAMPLES, &mut scratch)?;
                 for sample in scratch.drain(..) {
+                    // An rmw_cerulion ADDRESSED frame is CDR for particular
+                    // buffer-aware subscriptions, possibly naming device memory,
+                    // not the topic's native layout: never recorded (it would
+                    // also give an attach-mode channel the wrong schema hash).
+                    if sample.wire_header().is_some_and(|h| h.is_rmw_addressed()) {
+                        tap.addressed_refused += 1;
+                        if !tap.addressed_warned {
+                            tap.addressed_warned = true;
+                            tracing::warn!(
+                                topic = %tap.topic,
+                                "bagd refused an rmw_cerulion addressed frame (CDR for particular \
+                                 subscriptions, possibly naming device memory): not recorded, \
+                                 counted in addressed_refused (further ones are not logged)"
+                            );
+                        }
+                        continue;
+                    }
                     let header = sample.wire_header().map(|h| (h.sequence, h.timestamp_ns));
                     if let Some((seq, stamp)) = header {
                         // The batch MAX, which is what `DrainObservation`
@@ -14842,6 +14870,7 @@ impl Recorder {
             frozen_burst_markers: outcome.frozen_burst_markers,
             dropped_unwritten: self.taps.iter().map(|t| t.dropped_unwritten).sum(),
             headerless: self.taps.iter().map(|t| t.headerless).sum(),
+            addressed_refused: self.taps.iter().map(|t| t.addressed_refused).sum(),
             status_unavailable: self.status_unavailable,
             frames_lost: self.taps.iter().map(|t| t.gap.frames_lost).sum(),
             record_health: health,
@@ -15408,6 +15437,7 @@ impl Recorder {
             frozen_burst_markers: 0,
             dropped_unwritten: self.taps.iter().map(|t| t.dropped_unwritten).sum(),
             headerless: self.taps.iter().map(|t| t.headerless).sum(),
+            addressed_refused: self.taps.iter().map(|t| t.addressed_refused).sum(),
             status_unavailable: self.status_unavailable,
             frames_lost: self.taps.iter().map(|t| t.gap.frames_lost).sum(),
             record_health,
