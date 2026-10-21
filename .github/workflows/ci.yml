@@ -359,8 +359,8 @@ jobs:
         id: version
         run: echo "version=$(tools/scripts/workspace_version.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Build the three release binaries
-        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd
+      - name: Build the four release binaries
+        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted
 
       # build_deb.sh requires every license notice the archive ships, so this
       # smoke has to produce the generated one like the release does. Doing it
@@ -394,10 +394,11 @@ jobs:
           cp target/debug/cerulion "$stage/cerulion"
           cp target/debug/cerulion-netd "$stage/cerulion-netd"
           cp target/debug/cerulion-connectd "$stage/cerulion-connectd"
+          cp target/debug/cerulion-remoted "$stage/cerulion-remoted"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
-          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd
+          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           deb=$(tools/scripts/build_deb.sh "$archive" amd64 "$RUNNER_TEMP/debs")
           test "$(printf '%s\n' "$deb" | wc -l)" -eq 1
@@ -551,6 +552,8 @@ jobs:
                 test -x /usr/bin/cerulion
                 test -x /usr/bin/cerulion-netd
                 test -x /usr/bin/cerulion-connectd
+                test -x /usr/bin/cerulion-remoted
+                cerulion-remoted --version
                 test "$(dirname "$(readlink -f "$(command -v cerulion)")")" = \
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"
               '
