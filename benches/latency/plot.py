@@ -23,7 +23,10 @@ lane is a NO-OP stub).
 Plot groups:
 
     native         iox2 / zenoh_shm host lines (floor + comparison)
-    workspace      cerulion_workspace_{split,mono} legs (split = headline)
+    workspace      cerulion_workspace_{split,split3,mono} legs (split =
+                   headline); --execution-mode lockstep|both adds the
+                   `_lockstep` rows of split and split3 (dotted, same hue as
+                   their free-run twin)
     ros2-humble    all enumerated ROS 2 cells for that distro
     ros2-jazzy       (be1 solid; rel10 dotted, color-paired with its be1
     ros2-lyrical      sibling; chrt1 dashed, color-paired with chrt0)
@@ -194,11 +197,23 @@ def native_series(chrt_arg: str) -> List[Series]:
     return out
 
 
+def _ws_style(chrt: int, mode: str) -> str:
+    """A workspace row's dash: the chrt convention of _style_for, with the
+    lockstep execution mode on the dotted pair (lockstep = dotted, lockstep
+    x chrt1 = dashdot), the way rel10 rides it on the ROS 2 rows. Color stays
+    the entity's, so a lockstep row pairs with its free-run twin."""
+    if mode == "lockstep":
+        return "-." if chrt == 1 else ":"
+    return "--" if chrt == 1 else "-"
+
+
 def workspace_series(chrt_arg: str,
-                     variant: str = "quiescent") -> List[Series]:
+                     variant: str = "quiescent",
+                     exec_modes: Sequence[str] = ("free_run",)
+                     ) -> List[Series]:
     """The workspace legs a run under `variant` can carry: a leg the
-    variant gate (bench.workspace_leg_skip_reason — split x backtoback is
-    structurally unmeasurable) never produces is not EXPECTED here either,
+    variant gate (bench.workspace_leg_skip_reason: split and split3 x
+    backtoback are structurally unmeasurable) never produces is not EXPECTED here either,
     so a strict render of a backtoback run dir does not fail on a CSV the
     sweep was never going to write.
 
@@ -206,21 +221,30 @@ def workspace_series(chrt_arg: str,
     carries a variable row (the incumbent Image legs — pinned token-less
     prefixes) AND a pod row (`_pod` prefixes, the fixed-PodPayload
     twin). The two classes are separate Series — never merged into one
-    plotted line — with the class named in the legend vocabulary."""
+    plotted line, with the class named in the legend vocabulary.
+
+    Execution-mode axis: `exec_modes` names the modes the run carried
+    (bench.py `workspace --execution-mode`; default free_run, the rows
+    `full` produces). A lockstep row shares its free-run twin's color_key
+    (the same entity) and rides the dotted dash (_ws_style). mono has no
+    lockstep row (bench.workspace_leg_skip_reason), so it is never
+    expected there."""
     out: List[Series] = []
-    for leg in bench.WORKSPACE_LEGS:
-        reason = bench.workspace_leg_skip_reason(leg, variant)
-        if reason is not None:
-            print(f"note: workspace leg '{leg}' is not expected under "
-                  f"variant {variant}: {reason}", file=sys.stderr)
-            continue
-        for msg in bench.WORKSPACE_MSG_CLASSES:
-            for chrt in _chrt_modes(chrt_arg):
-                name = bench.workspace_raw_name(leg, chrt, msg)
-                key = (f"workspace_{leg}" if msg == "variable"
-                       else f"workspace_{leg}_pod")
-                out.append(Series(name, f"results_{name}.csv",
-                                  _style_for(chrt, None), key))
+    for mode in exec_modes:
+        for leg in bench.WORKSPACE_LEGS:
+            reason = bench.workspace_leg_skip_reason(leg, variant, mode)
+            if reason is not None:
+                print(f"note: workspace leg '{leg}' ({mode}) is not "
+                      f"expected under variant {variant}: {reason}",
+                      file=sys.stderr)
+                continue
+            for msg in bench.WORKSPACE_MSG_CLASSES:
+                for chrt in _chrt_modes(chrt_arg):
+                    name = bench.workspace_raw_name(leg, chrt, msg, mode)
+                    key = (f"workspace_{leg}" if msg == "variable"
+                           else f"workspace_{leg}_pod")
+                    out.append(Series(name, f"results_{name}.csv",
+                                      _ws_style(chrt, mode), key))
     return out
 
 
@@ -250,6 +274,11 @@ def ros2_series(distro: str, chrt_arg: str) -> List[Series]:
 # live in the per-distro group plots with the audit callout); ipc-off
 # composed likewise stays per-distro only.
 HERO_POSTURES = ("tuned", "stock")
+
+# The workspace legs the hero draws (free-run rows only). split3 is a
+# workspace-group row, not a hero line: the hero's six lines are the pinned
+# cross-stack comparison set.
+HERO_WORKSPACE_LEGS = ("split", "mono")
 
 # Fixed legend vocabulary — identical across both postures (the
 # posture is named by the title and the knob-matrix footnote, never per
@@ -296,7 +325,9 @@ def hero_series(posture: str) -> List[Series]:
     # which reads ~25.9 µs p50 under the park-wake inflation until its
     # fix lands).
     # mono rides along, clearly labeled, as the single-process opt-in.
-    for leg in bench.WORKSPACE_LEGS:
+    # HERO_WORKSPACE_LEGS, not bench.WORKSPACE_LEGS: the hero is a fixed
+    # six-line set, so a leg added to the suite does not join it silently.
+    for leg in HERO_WORKSPACE_LEGS:
         name = bench.workspace_raw_name(leg, chrt)
         out.append(Series(name, f"results_{name}.csv", "-",
                           f"workspace_{leg}", pretty=_HERO_PRETTY[leg]))
@@ -409,11 +440,12 @@ def resolve_variant(results_dir: Path, requested: Optional[str]) -> str:
 
 
 def group_series(group: str, chrt_arg: str,
-                 variant: str = "quiescent") -> List[Series]:
+                 variant: str = "quiescent",
+                 exec_modes: Sequence[str] = ("free_run",)) -> List[Series]:
     if group == "native":
         return native_series(chrt_arg)
     if group == "workspace":
-        return workspace_series(chrt_arg, variant)
+        return workspace_series(chrt_arg, variant, exec_modes)
     if group.startswith("ros2-"):
         distro = group[len("ros2-"):]
         if distro not in bench.ROS2_DISTROS:
@@ -447,7 +479,7 @@ GROUP_TITLES = {
     "native": "Native host round-trip latency (Cerulion API, raw iceoryx2 "
               "floor, zenoh SHM comparison)",
     "workspace": "Cerulion workspace round-trip latency "
-                 "(cerulion graph run, split vs mono)",
+                 "(cerulion graph run, split, split3 and mono)",
     # The hero pair: titles/subtitles name the posture; footnotes carry
     # the knob matrix.
     "hero-tuned": "Round-trip latency across stacks (SHM ping-pong) — "
@@ -582,7 +614,7 @@ OCHRE_COMPOSED = "#976125"   # ROS 2 composed + intra-process: a DULL NON-GREEN
                              # endpoint labels + the CSV table twin.
 YELLOW = "#eda100"    # fallback pool only
 MAGENTA = "#e87ba4"   # fallback pool only
-VIOLET = "#4a3aa7"    # fallback pool only
+VIOLET = "#4a3aa7"    # split3's role hue (_WS_ROLES), and a fallback slot
 RED = "#e34948"       # fallback pool only
 GRAY_FLOOR = "#898781"  # de-emphasis gray — the raw iox2 floor is context,
                         # not a comparison line (the dataviz 'emphasis' form);
@@ -638,6 +670,19 @@ def _role_for(s: Series) -> Optional[Tuple[str, str]]:
         return any(p == prefix or p.startswith(prefix + "_chrt")
                    for p in parts)
 
+    # A parsed workspace STEM first: the leg and class are read off the
+    # pinned grammar (cerulion_workspace_<leg>[_lockstep][_pod]_chrt<N>),
+    # so a lockstep row maps to its free-run twin's entity, and split3 (whose
+    # name contains the generic `workspace_split` substring) gets its own
+    # hue instead of the headline's.
+    for p in parts:
+        ident = _ws_identity(p)
+        if ident is not None:
+            leg, _mode, msg = ident
+            role = _WS_ROLES.get((leg, msg))
+            if role is not None:
+                return role
+            break
     # Type-class pod twins BEFORE the generic workspace probes (their
     # names contain the generic substrings): same entity, same hue
     # family, tinted shade — the sanctioned 1-hue-2-shades pairing (the
@@ -652,8 +697,9 @@ def _role_for(s: Series) -> Optional[Tuple[str, str]]:
         # #66b3ff -- a delta of (1, 1, 2), indistinguishable, and it is
         # the MONO row's color. That collision breaks the very pairing
         # the comment above promises: split_pod would read as belonging
-        # to the mono hue family. At 0.20 (#3299fe) the four workspace
-        # rows separate by at least 50 per channel pairwise, and
+        # to the mono hue family. At 0.20 (#3299fe) the six workspace
+        # colors (split3 and its pod twin included, see _WS_ROLES) separate
+        # by at least 50 per channel pairwise, and
         # split_pod stays a shade of BLUE, so the pairing holds on both
         # sides for the first time.
         return _tint(BLUE, 0.20), TIER_SECONDARY
@@ -722,6 +768,23 @@ def _tint(hex_color: str, frac: float) -> str:
     sr, sg, sb = (int(SURFACE[i:i + 2], 16) for i in (1, 3, 5))
     mix = tuple(round(c + (s - c) * frac) for c, s in ((r, sr), (g, sg), (b, sb)))
     return "#{:02x}{:02x}{:02x}".format(*mix)
+
+
+# Workspace entity -> (color, tier), keyed by (leg, class) off the parsed
+# stem (_ws_identity); the execution mode is NOT a key, so a lockstep row
+# wears its free-run twin's color and differs by dash only (_ws_style).
+# split is the headline (primary); mono the same-hue light shade; split3
+# its own hue, VIOLET, since it is a different process shape rather than a
+# shade of the headline's; each pod twin is a tint of its leg's hue one tier
+# down (see the split_pod note in _role_for for the 0.20 asymmetry).
+_WS_ROLES: Dict[Tuple[str, str], Tuple[str, str]] = {
+    ("split", "variable"): (BLUE, TIER_PRIMARY),
+    ("split", "pod"): (_tint(BLUE, 0.20), TIER_SECONDARY),
+    ("mono", "variable"): (BLUE_LT, TIER_SECONDARY),
+    ("mono", "pod"): (_tint(BLUE_LT, 0.40), TIER_TERTIARY),
+    ("split3", "variable"): (VIOLET, TIER_SECONDARY),
+    ("split3", "pod"): (_tint(VIOLET, 0.40), TIER_TERTIARY),
+}
 
 
 def _rel_luminance(hex_color: str) -> float:
@@ -903,6 +966,25 @@ def _draw_axis_braces(ax, sizes: Sequence[int], variant: str) -> bool:
 # ------------------------------------------------------- pretty labels
 
 _WS_RE = re.compile(r"^cerulion_workspace_([a-z0-9_]+)_chrt([01])$")
+
+
+def _ws_identity(stem: str) -> Optional[Tuple[str, str, str]]:
+    """(leg, execution mode, class) of a workspace raw prefix, read off the
+    pinned grammar cerulion_workspace_<leg>[_lockstep][_pod]_chrt<N>
+    (bench.workspace_raw_name), or None for any other stem. The `_pod`
+    token is the LAST one, which is why _type_class_of's `_pod` suffix rule
+    still holds on a lockstep row."""
+    m = _WS_RE.match(stem)
+    if m is None:
+        return None
+    group = m.group(1)
+    msg = CLASS_VARIABLE
+    if group.endswith("_pod"):
+        msg, group = CLASS_POD, group[: -len("_pod")]
+    mode = "free_run"
+    if group.endswith("_lockstep"):
+        mode, group = "lockstep", group[: -len("_lockstep")]
+    return group, mode, msg
 _NATIVE_RE = re.compile(r"^(iox2|zenoh_shm)_chrt([01])$")
 # Type-class image cells (CER_BENCH_MSG=image — the `image` token rides
 # between the shm mode and the recv path). Matched BEFORE _ROS2_RE
@@ -1067,6 +1149,10 @@ _WS_PRETTY = {
                  "fixed array (pod)",
     "mono_pod": "Cerulion — graph run --single-process (mono) · "
                 "fixed array (pod)",
+    "split3": "Cerulion: cerulion graph run (multi-process split3, one "
+              "node per process) · sensor_msgs/Image (variable)",
+    "split3_pod": "Cerulion: cerulion graph run (multi-process split3, one "
+                  "node per process) · fixed array (pod)",
     "default": "Cerulion — retired flagless default leg",
 }
 _NATIVE_PRETTY = {
@@ -1090,7 +1176,15 @@ def pretty_label(raw: str) -> str:
     m = _WS_RE.match(raw)
     if m:
         leg, chrt = m.groups()
+        ident = _ws_identity(raw)
+        mode = "free_run"
+        if ident is not None and ident[1] == "lockstep":
+            # The pretty key is the free-run twin's; the mode rides a suffix.
+            mode = "lockstep"
+            leg = ident[0] + ("_pod" if ident[2] == CLASS_POD else "")
         base = _WS_PRETTY.get(leg, f"Cerulion workspace — {leg} leg")
+        if mode == "lockstep":
+            base += " · lockstep (CERULION_EXECUTION_MODE=lockstep)"
         return base + (" · chrt1" if chrt == "1" else "")
     m = _NATIVE_RE.match(raw)
     if m:
@@ -2061,6 +2155,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--skip-missing", action="store_true",
                    help="Warn loudly instead of failing when an expected CSV "
                         "is missing (partial runs)")
+    p.add_argument("--execution-mode", dest="execution_mode",
+                   choices=bench.WORKSPACE_EXEC_MODES + ("both",),
+                   default="free_run",
+                   help="Which execution modes' workspace rows the workspace "
+                        "group EXPECTS: free_run (default; the rows `bench.py "
+                        "full` produces), lockstep (the `_lockstep` rows of "
+                        "the multi-process legs), or both. Pass the value the "
+                        "`bench.py workspace --execution-mode` sweep ran with.")
     p.add_argument("--series", action="append",
                    help="Manual overlay: LABEL=csv_path[:dashed|:dotted][@KEY]. "
                         "When given, groups are ignored and ONE custom plot "
@@ -2156,8 +2258,10 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"must match).", file=sys.stderr)
 
     variant = resolve_variant(args.results_dir, args.variant)
+    exec_modes = (bench.WORKSPACE_EXEC_MODES if args.execution_mode == "both"
+                  else (args.execution_mode,))
     for g in groups:
-        series = group_series(g, args.chrt, variant)
+        series = group_series(g, args.chrt, variant, exec_modes)
         footnotes: List[str] = list(args.footnote)
         if g in HERO_GROUPS:
             # Label-accuracy gate: the hero's posture-naming title must be

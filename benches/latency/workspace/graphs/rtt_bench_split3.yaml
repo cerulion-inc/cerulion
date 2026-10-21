@@ -1,0 +1,50 @@
+# SPLIT3 leg graph: the IDENTICAL 3-node round-trip chain, split into
+# THREE OS processes by `process_groups`, one node per group:
+# g1 = {ping} at global level 0, g2 = {pong} at level 1, g3 = {latency}
+# at level 2 (each group owns a contiguous band of global levels in every
+# execution mode, since each rank re-levelizes its own subgraph onto that
+# band). BOTH edges become REAL cross-process iceoryx2 hops (ping -> pong
+# and pong -> latency), so the split3-vs-split delta is the SECOND
+# cross-process hop, and split3 matches ROS 2's own 3-process shape hop for
+# hop. Declaration order = rank (g1 = 0, g2 = 1, g3 = 2). Run with
+# `cerulion graph run rtt_bench_split3 --release` (NO --single-process)
+# under the real clock (the product default).
+#
+# PROVENANCE (do not edit in isolation): every node / topic / schema /
+# max_slice_len value here is a FAITHFUL MIRROR of graphs/rtt_bench.yaml,
+# copied verbatim, exactly as graphs/rtt_bench_split.yaml is. The ONLY
+# intended difference is the `process_groups:` block appended at the end
+# (plus these provenance comments); the graph's name is its file stem, so
+# no file of the set carries a `name:` key. The split3-vs-split-vs-mono A/B
+# depends on IDENTICAL provisioning: do NOT change one file without the
+# others.
+prefix: rtt_bench
+nodes:
+- id: ping
+  type: ping_node
+  inputs: []
+  outputs:
+  - name: ping_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: pong
+  type: pong_node
+  inputs:
+  - name: ping_in
+    source: ping/ping_out
+  outputs:
+  - name: echo_out
+    schema: sensor_msgs/Image
+    max_slice_len: 17000000
+    history_size: 0
+- id: latency
+  type: latency_node
+  inputs:
+  - name: echo_in
+    source: pong/echo_out
+  outputs: []
+process_groups:
+  g1: [ping]
+  g2: [pong]
+  g3: [latency]
