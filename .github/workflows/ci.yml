@@ -1602,6 +1602,9 @@ jobs:
       - name: Obstacle avoidance source regressions
         run: cd examples/obstacle_avoidance && cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
 
+      - name: Simulated arm plant (examples/aspire_arm)
+        run: cd examples/aspire_arm && cargo test -p arm_sim --lib
+
   # The Go2 demo workspace (examples/go2) is ISOLATED: not a member of
   # the root cargo workspace, and deliberately skipped by `examples` (its
   # joystick crate needs the libudev system library, which only this job

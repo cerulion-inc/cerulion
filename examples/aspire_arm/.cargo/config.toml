@@ -1,0 +1,3 @@
+[env]
+IOX2_LOG_LEVEL = "error"
+RUST_LOG = { value = "warn", force = false }
