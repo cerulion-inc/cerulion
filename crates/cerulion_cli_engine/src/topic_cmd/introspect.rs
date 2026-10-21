@@ -449,10 +449,19 @@ const LOCAL_FRAME_WAIT: Duration = Duration::from_secs(1);
 /// handshake comes first (the `topic info` wait).
 const REMOTE_FRAME_WAIT: Duration = Duration::from_secs(3);
 
-/// The one shared wait a typed listing gives every local topic for its first
-/// frame. Every subscriber opens before the wait starts, so a listing of many
-/// topics costs about one wait, not one per topic.
+/// The one shared wait a typed listing gives each batch of local topics for
+/// its first frames. Every subscriber of a batch opens before the wait
+/// starts, so a batch costs about one wait, not one per topic.
 pub const TYPED_LISTING_WAIT: Duration = Duration::from_secs(1);
+
+/// The most local topics a typed listing holds open at once. Each open
+/// subscriber holds an event listener file descriptor, and on macOS the
+/// iceoryx2 wait aborts the process when a descriptor NUMBER at or above
+/// 1024 (`FD_SETSIZE`) enters it. The listing therefore opens, reads and
+/// releases its topics in batches of this size, so the descriptors a batch
+/// takes are the ones the previous batch gave back and stay far below that
+/// ceiling however many topics the host has.
+pub const TYPED_LISTING_BATCH: usize = 128;
 
 /// The schema hash of the first frame `subscriber` delivers within `wait`,
 /// `Ok(None)` when none arrived.
@@ -559,9 +568,11 @@ pub enum InternalTopics {
 }
 
 /// The type of every genuine LOCAL topic in `local` (the listing after the
-/// mirror fold), in the order given. Every subscriber opens first; then each
-/// topic gets what is left of one shared [`TYPED_LISTING_WAIT`] for a frame.
-/// A frame's schema hash is named by `walker`; this listing opens no network.
+/// mirror fold), in the order given. The topics are read in batches of
+/// [`TYPED_LISTING_BATCH`]: every subscriber of a batch opens first, then
+/// each topic gets what is left of one shared [`TYPED_LISTING_WAIT`] for a
+/// frame, then the whole batch is released before the next one opens. A
+/// frame's schema hash is named by `walker`; this listing opens no network.
 ///
 /// A topic is opened as a genuine local producer (see `local_only` and the
 /// mirror recheck of `topic info`). A topic that cannot be opened that way,
@@ -575,37 +586,52 @@ pub fn type_local_topics(
     internal: InternalTopics,
 ) -> CliResult<Vec<TypedTopic>> {
     let transport = cerulion_core::TransportManager::get_or_init()?;
-    let subscribers: Vec<Option<super::ScopedSubscriber>> = local
+    let mut typed = Vec::with_capacity(local.len());
+    for batch in local.chunks(TYPED_LISTING_BATCH) {
+        type_local_batch(&transport, batch, walker, local_only, internal, &mut typed);
+    }
+    Ok(typed)
+}
+
+/// One batch of [`type_local_topics`]: open every topic in `batch`, give the
+/// batch one shared [`TYPED_LISTING_WAIT`], and push each topic's type to
+/// `typed` in order. Every subscriber of the batch drops on return, so its
+/// listener descriptors are free before the next batch opens.
+fn type_local_batch(
+    transport: &cerulion_core::TransportManager,
+    batch: &[super::TopicInfo],
+    walker: &cerulion_core::codegen::FrameWalker,
+    local_only: bool,
+    internal: InternalTopics,
+    typed: &mut Vec<TypedTopic>,
+) {
+    let subscribers: Vec<Option<super::ScopedSubscriber>> = batch
         .iter()
         .map(|t| {
             let skip = internal == InternalTopics::Skip && super::is_internal_topic(&t.name);
             if skip {
                 None
             } else {
-                open_genuine_local(&transport, &t.name, local_only)
+                open_genuine_local(transport, &t.name, local_only)
             }
         })
         .collect();
     let deadline = Instant::now() + TYPED_LISTING_WAIT;
-    Ok(local
-        .iter()
-        .zip(&subscribers)
-        .map(|(topic, subscriber)| {
-            let hash = subscriber.as_ref().and_then(|s| {
-                match first_schema_hash(s, deadline.saturating_duration_since(Instant::now())) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        tracing::warn!(topic = %topic.name, error = %e, "typed listing: receive failed, so the type is unknown");
-                        None
-                    }
+    typed.extend(batch.iter().zip(&subscribers).map(|(topic, subscriber)| {
+        let hash = subscriber.as_ref().and_then(|s| {
+            match first_schema_hash(s, deadline.saturating_duration_since(Instant::now())) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::warn!(topic = %topic.name, error = %e, "typed listing: receive failed, so the type is unknown");
+                    None
                 }
-            });
-            TypedTopic {
-                name: topic.name.clone(),
-                ty: hash.map_or(TopicType::Unknown, |h| TopicType::of_hash(h, &[walker])),
             }
-        })
-        .collect())
+        });
+        TypedTopic {
+            name: topic.name.clone(),
+            ty: hash.map_or(TopicType::Unknown, |h| TopicType::of_hash(h, &[walker])),
+        }
+    }));
 }
 
 /// Whether `topic list` prints each row's type (`-t`).

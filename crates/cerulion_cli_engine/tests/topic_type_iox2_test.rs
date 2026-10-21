@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `topic type`, the typed local listing and `topic bw` over real iceoryx2
 //! shared memory: the error arms (a topic that sends nothing, a hash no type
-//! names), a first wait that returns with no sample, the mirror recheck of
-//! the typed listing, and the bandwidth of a publisher slower than one
-//! report a second.
+//! names), a first wait that returns with no sample, the mirror recheck and
+//! the batches of the typed listing, and the bandwidth of a publisher slower
+//! than one report a second.
 //!
 //! These tests open REAL iceoryx2 services on the process-global namespace
 //! (the engine calls `TransportManager::get_or_init()`), so every test is
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cerulion_cli_engine::topic_cmd::introspect::{
     topic_bw_with_scope, topic_type_with_scope, type_local_topics, InternalTopics, TopicType,
+    TYPED_LISTING_BATCH,
 };
 use cerulion_cli_engine::topic_cmd::{
     local_walker_from_workspace, observer_pacing_engaged_count, TopicInfo, TopicScope,
@@ -384,6 +385,53 @@ fn the_typed_listing_drops_a_topic_that_is_a_network_mirror() {
         });
         assert_eq!(ty, TopicType::Unknown, "local_only = {local_only}");
     }
+}
+
+/// More topics than one batch holds: the listing releases a batch before it
+/// opens the next, and every topic of every batch is still typed, in the
+/// order given. The last topic has no publisher, so it is unknown in its own
+/// (second) batch.
+#[test]
+#[serial]
+fn the_typed_listing_types_every_topic_across_batches() {
+    let _net = EnvGuard::set("CERULION_NETWORK", "off");
+    let live: Vec<String> = (0..=TYPED_LISTING_BATCH)
+        .map(|i| unique_topic(&format!("listed_batch{i}")))
+        .collect();
+    let silent = unique_topic("listed_batch_silent");
+    let writers: Vec<RawTopicWriter> = live.iter().map(|t| RawTopicWriter::new(t, true)).collect();
+    let listing: Vec<TopicInfo> = live
+        .iter()
+        .chain(std::iter::once(&silent))
+        .map(|name| TopicInfo { name: name.clone() })
+        .collect();
+    let handle = std::thread::spawn(move || {
+        let walker = local_walker_from_workspace(None);
+        type_local_topics(&listing, &walker, false, InternalTopics::Read).expect("typed listing")
+    });
+    while !handle.is_finished() {
+        for writer in &writers {
+            writer.publish(&build_string_frame(0, 1_000, "x"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let typed = handle.join().expect("listing thread");
+    let names: Vec<&str> = typed.iter().map(|t| t.name.as_str()).collect();
+    let expected: Vec<&str> = live
+        .iter()
+        .chain(std::iter::once(&silent))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, expected);
+    for t in &typed[..live.len()] {
+        assert_eq!(
+            t.ty,
+            TopicType::Named("std_msgs/String".to_string()),
+            "{}",
+            t.name
+        );
+    }
+    assert_eq!(typed[live.len()].ty, TopicType::Unknown);
 }
 
 #[test]

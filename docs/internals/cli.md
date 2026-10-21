@@ -961,7 +961,7 @@ own binary.
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
 | `topic_network_live_test.rs` | Live loopback remote-topic e2e (real zenoh sessions, no shared memory) | no | none |
 | `mdns_live_test.rs` | Real-multicast mDNS loopback | `#[ignore]` (hardware only) | none |
-| `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck, and `topic bw` on a publisher slower than one report a second | yes (process-global transport singleton) | none |
+| `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck and its batches (more topics than one batch holds), and `topic bw` on a publisher slower than one report a second | yes (process-global transport singleton) | none |
 | `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
