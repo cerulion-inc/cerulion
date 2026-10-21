@@ -18,7 +18,7 @@ trap cleanup EXIT
 archive_root="$workdir/cerulion-0.1.0-x86_64-unknown-linux-gnu"
 mkdir -p "$archive_root"
 ln -s /etc/hostname "$archive_root/cerulion"
-for binary in cerulion-netd cerulion-connectd; do
+for binary in cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$archive_root/$binary"
 done
 printf '%s\n' 'license' > "$archive_root/LICENSE"
@@ -43,7 +43,7 @@ grep -Eq 'non-regular archive entry.*cerulion' "$workdir/error" ||
 printf '%s\n' 'build_deb archive rejection passed'
 
 rm "$archive_root/cerulion"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$archive_root/$binary"
 done
 printf '%s\n' 'license' > "$archive_root/LICENSE"
@@ -55,7 +55,7 @@ tar -czf "$archive" -C "$workdir" \
 valid_deb=$("$script_dir/build_deb.sh" "$archive" amd64 "$workdir/debs")
 valid_hash=$(sha256sum "$valid_deb" | awk '{ print $1 }')
 valid_contents=$(dpkg-deb --fsys-tarfile "$valid_deb" | tar -tvf -)
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' "$valid_contents" |
         grep -Eq "^-rwxr-xr-x .* \./usr/bin/$binary$" || {
         printf 'error: Debian binary mode is not 0755: %s\n' "$binary" >&2
@@ -225,6 +225,26 @@ for notice in LICENSE NOTICE LICENSE-BSD-3-CLAUSE THIRD-PARTY-LICENSES.md; do
 done
 printf '%s\n' 'build_deb replacement preservation passed'
 
+# Each binary is required on its own, the same shape as the notices above:
+# every round removes exactly one program and the refusal names that one.
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
+    rm "$archive_root/$binary"
+    tar -czf "$archive" -C "$workdir" \
+        cerulion-0.1.0-x86_64-unknown-linux-gnu
+    if "$script_dir/build_deb.sh" "$archive" amd64 "$workdir/debs" \
+        >"$workdir/rebuild-output" 2>"$workdir/rebuild-error"; then
+        printf '%s\n' "error: rebuild archive without $binary was accepted" >&2
+        exit 1
+    fi
+    grep -Fqx "error: archive is missing $binary" "$workdir/rebuild-error" || {
+        printf '%s\n' "error: the refusal did not name the missing $binary" >&2
+        cat "$workdir/rebuild-error" >&2
+        exit 1
+    }
+    printf '%s\n' '#!/bin/sh' > "$archive_root/$binary"
+done
+printf '%s\n' 'build_deb binary requirement passed'
+
 # The two shared objects. A Linux archive without the rmw, or with the rmw
 # but without the heap hook, is refused unless the synthetic opt-out is set
 # (the variable is exported at the top of this file, so the refusals are
@@ -233,7 +253,7 @@ printf '%s\n' 'build_deb replacement preservation passed'
 # link-time dependencies plus ROS 2 as a Suggests.
 no_rmw_root="$workdir/cerulion-0.1.1-x86_64-unknown-linux-gnu"
 mkdir -p "$no_rmw_root"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$no_rmw_root/$binary"
 done
 printf '%s\n' 'license' > "$no_rmw_root/LICENSE"
@@ -347,7 +367,7 @@ fi
 
 bootstrap_root="$workdir/cerulion-0.1.2-x86_64-unknown-linux-gnu"
 mkdir -p "$bootstrap_root"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$bootstrap_root/$binary"
 done
 printf '%s\n' 'license' > "$bootstrap_root/LICENSE"
@@ -595,7 +615,7 @@ do
     test "$mapped_version" = "$expected"
     mapping_root="$workdir/cerulion-$version-x86_64-unknown-linux-gnu"
     mkdir -p "$mapping_root"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' '#!/bin/sh' > "$mapping_root/$binary"
     done
     printf '%s\n' 'license' > "$mapping_root/LICENSE"
@@ -672,7 +692,7 @@ printf '%s\n' 'debian version control-character rejection passed'
 
 prerelease_root="$workdir/cerulion-0.1.0-rc.1-x86_64-unknown-linux-gnu"
 mkdir -p "$prerelease_root"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$prerelease_root/$binary"
 done
 printf '%s\n' 'license' > "$prerelease_root/LICENSE"
@@ -687,7 +707,7 @@ prerelease_deb=$("$script_dir/build_deb.sh" "$prerelease_archive" amd64 \
 test "$(dpkg-deb -f "$prerelease_deb" Version)" = '0.1.0~rc.1'
 plus_root="$workdir/cerulion-0.1.0+build.1-x86_64-unknown-linux-gnu"
 mkdir -p "$plus_root"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$plus_root/$binary"
 done
 printf '%s\n' 'license' > "$plus_root/LICENSE"
@@ -780,7 +800,7 @@ printf '%s\n' 'build_apt_repo SHA-256 failure handling passed'
 
 prerelease_plus_root="$workdir/cerulion-0.1.0-rc.1+build.1-x86_64-unknown-linux-gnu"
 mkdir -p "$prerelease_plus_root"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '%s\n' '#!/bin/sh' > "$prerelease_plus_root/$binary"
 done
 printf '%s\n' 'license' > "$prerelease_plus_root/LICENSE"
