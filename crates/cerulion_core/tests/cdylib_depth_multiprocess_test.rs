@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Process groups need cross-process shared memory, which local-transport refuses.
 //! Cdylib-parity cluster 4: the FFI-parsed `#[input(depth = 32)]` of a cdylib survives
 //! into the MULTI-PROCESS provisioning path.
 //!

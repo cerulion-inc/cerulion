@@ -765,3 +765,110 @@ fn a_cdylib_style_panic_class_error_mints_exactly_one_death() {
     }
     assert_eq!(ids.len(), 1, "one death is ONE ask: {ids:?}");
 }
+
+/// A node that returns `NodeError::Fatal` is stopped by the scheduler, so it
+/// will not execute again: that is a node death, and it mints EXACTLY ONE
+/// capture whose detail names the fatal cause (not a panic). The node stops
+/// firing at the fatal tick (hand oracle: tick 2), so later steps cannot
+/// mint a second one.
+#[test]
+fn a_fatal_error_stop_mints_exactly_one_death_naming_the_fatal_cause() {
+    let prefix = unique_prefix("nd_fatal");
+    let fires = Arc::new(AtomicU64::new(0));
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "node_death_fatal".to_string(),
+        prefix: prefix.clone(),
+        nodes: vec![NodeDef {
+            params: Default::default(),
+            fuse: None,
+            ros2: None,
+            id: "lidar".to_string(),
+            node_type: "fatal_node".to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "Vector3".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: None,
+            }],
+        }],
+    };
+    let fires_cb = Arc::clone(&fires);
+    let info = NodeInfo::from_names(vec![], vec!["out".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 10 });
+    let entry = ClosureNodeEntry::new(info, move |_ctx| {
+        let tick = fires_cb.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick >= 2 {
+            // What the macro boundary returns for `NodeError::Fatal`.
+            return Err(cerulion_core::TransportError::NodeFailed {
+                node_id: "lidar".to_string(),
+                kind: cerulion_core::error::NodeErrorKind::Fatal,
+                reason: "Fatal error: lidar lost".to_string(),
+            });
+        }
+        Ok(())
+    })
+    .with_label("fatal_node");
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("lidar".to_string(), Box::new(entry));
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(config, factories, clock, 8).expect("build the fatal graph");
+
+    let responder = FlashbackResponder::open_on_manager(
+        runtime.test_transport().expect("a per-test manager"),
+        "test-recorder",
+    )
+    .expect("the responder opens");
+    runtime.node_death_ledger_for_test().arm();
+
+    let mut ids = std::collections::BTreeSet::new();
+    let mut details = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && ids.is_empty() {
+        runtime.step(Duration::from_millis(10));
+        for frame in responder.drain_requests() {
+            assert_eq!(frame.request.kind, TriggerKind::PanicDisable);
+            assert_eq!(frame.request.subject, "lidar");
+            details.push(frame.request.detail.clone());
+            ids.insert(frame.request_id);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(ids.len(), 1, "a fatal stop is a node death");
+    assert!(
+        details[0].contains(NodeDeathCause::FatalError.as_wire()),
+        "the detail names the fatal cause: {:?}",
+        details[0]
+    );
+
+    let settle = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle {
+        runtime.step(Duration::from_millis(10));
+        for frame in responder.drain_requests() {
+            ids.insert(frame.request_id);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(ids.len(), 1, "one stop is ONE ask: {ids:?}");
+    assert_eq!(
+        fires.load(Ordering::Relaxed),
+        2,
+        "the node fired up to its fatal tick and never again"
+    );
+    assert_eq!(
+        runtime
+            .node_fatal_errors()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec!["lidar".to_string()]
+    );
+}

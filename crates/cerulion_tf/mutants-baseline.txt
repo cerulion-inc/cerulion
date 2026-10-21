@@ -1,0 +1,10 @@
+# Mutation baseline for cerulion_tf (every function in the crate is pure).
+#
+# Run:     cargo mutants -p cerulion_tf
+# Result:  491 mutants: 404 caught, 87 unviable (do not compile), 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+#
+# No survivors.

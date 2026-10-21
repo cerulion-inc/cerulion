@@ -430,6 +430,184 @@ fn test_try_receive_one_owned_hold_and_budget() {
     );
 }
 
+/// The create-leg port floors size the service a floored opener CREATES,
+/// data and event halves: with floors of 6 publishers and 14 subscribers,
+/// exactly 6 publishers and 14 subscribers attach (default openers included)
+/// and the next of each is refused. 6 + 14 = 20 data ports is past
+/// iceoryx2's event create default of 16 notifiers/listeners, so the 20th
+/// attach also proves the event service was created for every data port.
+#[test]
+fn test_create_port_floors_size_the_created_service() {
+    let mgr = TransportManager::get_or_init().expect("init");
+    let topic = unique_topic("port_floors");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(6);
+    cfg.create_subscriber_floor = Some(14);
+    let msl = MaxSliceLen::const_new(256);
+
+    let mut publishers = vec![mgr
+        .create_publisher_with_topic_config(&topic, msl, 0, cfg)
+        .expect("floored publisher creates the service")];
+    for i in 1..6 {
+        publishers.push(
+            mgr.create_publisher(&topic, msl, 0)
+                .unwrap_or_else(|e| panic!("publisher {i} of 6 must attach: {e}")),
+        );
+    }
+    let mut subscribers = Vec::new();
+    for i in 0..14 {
+        subscribers.push(
+            mgr.create_subscriber(&topic)
+                .unwrap_or_else(|e| panic!("subscriber {i} of 14 must attach: {e}")),
+        );
+    }
+    let refused = match mgr.create_publisher(&topic, msl, 0) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a 7th publisher must be refused: the service has 6 slots"),
+    };
+    assert!(
+        refused.contains("ExceedsMaxSupportedPublishers"),
+        "refusal names the publisher cap: {refused}"
+    );
+    let refused = match mgr.create_subscriber(&topic) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a 15th subscriber must be refused: the service has 14 slots"),
+    };
+    assert!(
+        refused.contains("ExceedsMaxSupportedSubscribers"),
+        "refusal names the subscriber cap: {refused}"
+    );
+
+    // One frame from the last publisher reaches every subscriber.
+    {
+        let mut proxy = publishers[5].loan_proxy::<Vector3>().expect("loan_proxy");
+        proxy.x = 7.0;
+        proxy.y = 0.0;
+        proxy.z = 0.0;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    for (i, sub) in subscribers.iter().enumerate() {
+        let sample = sub
+            .try_receive_one_owned()
+            .expect("owned receive")
+            .unwrap_or_else(|| panic!("subscriber {i} must receive the frame"));
+        let x = f64::from_le_bytes(sample.payload()[32..40].try_into().unwrap());
+        assert_eq!(x, 7.0, "subscriber {i} payload");
+    }
+}
+
+/// The port floors arm no open requirement: a floored opener ATTACHES to a
+/// service a default opener created first (iceoryx2's 2 publishers), and
+/// that service's caps then bind (2 publishers attach, the 3rd is refused).
+/// If a floor armed the open leg, the floored create here would fail with
+/// `DoesNotSupportRequestedAmountOfPublishers`.
+#[test]
+fn test_create_port_floors_open_leg_tolerates_smaller_service() {
+    let mgr = TransportManager::get_or_init().expect("init");
+    let topic = unique_topic("port_floors_open");
+    let _subscriber = mgr
+        .create_subscriber(&topic)
+        .expect("default opener creates");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(32);
+    cfg.create_subscriber_floor = Some(32);
+    let msl = MaxSliceLen::const_new(256);
+    let defaults = &iceoryx2::config::Config::global_config()
+        .defaults
+        .publish_subscribe;
+    let mut publishers = Vec::new();
+    for i in 0..defaults.max_publishers {
+        publishers.push(
+            mgr.create_publisher_with_topic_config(&topic, msl, 0, cfg)
+                .unwrap_or_else(|e| {
+                    panic!("floored publisher {i} must attach to the smaller service: {e}")
+                }),
+        );
+    }
+    let refused = match mgr.create_publisher_with_topic_config(&topic, msl, 0, cfg) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the pre-existing service's publisher cap binds"),
+    };
+    assert!(
+        refused.contains("ExceedsMaxSupportedPublishers"),
+        "refusal names the publisher cap: {refused}"
+    );
+}
+
+/// A service an rmw-style floored opener created (32 publishers, 32
+/// subscribers) must still open for a graph that OWNS the topic. That graph
+/// arms `publishers + subscribers + extra_event_listeners` on the event
+/// service from the live data caps; with a unified data-trigger input
+/// (`extra_event_listeners > 0`) that is past `32 + 32`, so an event service
+/// created at exactly one port per data slot would refuse the graph.
+#[test]
+fn test_create_port_floors_leave_room_for_an_owning_graph() {
+    use cerulion_core::transport::{PublisherProvisioning, TopicServiceConfig};
+    let mgr = TransportManager::get_or_init().expect("init");
+    let topic = unique_topic("port_floors_owner");
+    let mut floored = mgr.default_topic_config();
+    floored.create_publisher_floor = Some(32);
+    floored.create_subscriber_floor = Some(32);
+    let rmw_side = mgr
+        .create_subscriber_with_buffers(&topic, floored, floored.subscriber_max_buffer_size)
+        .expect("floored subscriber creates the service");
+
+    let in_graph_subscribers = 3;
+    let unified_inputs = 3;
+    let owned = TopicServiceConfig::for_topology(
+        mgr.default_topic_config(),
+        0,
+        in_graph_subscribers,
+        PublisherProvisioning::SingleWriter,
+        0,
+        unified_inputs,
+    );
+    let graph_side = mgr
+        .create_subscriber_with_buffers(&topic, owned, owned.subscriber_max_buffer_size)
+        .expect("an owning graph's open must pass the event requirement on a floored service");
+    drop(graph_side);
+    drop(rmw_side);
+}
+
+/// The create floors are checked at the choke point like the port caps: zero,
+/// a value past `MAX_REASONABLE_PORTS`, and a pair whose event service
+/// (`publishers + 2 x subscribers`) would pass it are refused, naming the
+/// field.
+#[test]
+fn test_create_port_floors_out_of_range_are_refused() {
+    use cerulion_core::transport::MAX_REASONABLE_PORTS;
+    let mgr = TransportManager::get_or_init().expect("init");
+    let msl = MaxSliceLen::const_new(256);
+    let cases: [(Option<usize>, Option<usize>, &str); 4] = [
+        (Some(0), None, "create_publisher_floor"),
+        (
+            None,
+            Some(MAX_REASONABLE_PORTS + 1),
+            "create_subscriber_floor",
+        ),
+        (
+            Some(MAX_REASONABLE_PORTS / 2),
+            Some(MAX_REASONABLE_PORTS / 2),
+            "2 x create_subscriber_floor",
+        ),
+        (None, Some(0), "create_subscriber_floor"),
+    ];
+    for (i, (pubs, subs, named)) in cases.into_iter().enumerate() {
+        let mut cfg = mgr.default_topic_config();
+        cfg.create_publisher_floor = pubs;
+        cfg.create_subscriber_floor = subs;
+        let topic = unique_topic(&format!("port_floors_bad_{i}"));
+        let err = match mgr.create_publisher_with_topic_config(&topic, msl, 0, cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("case {i}: floors {pubs:?}/{subs:?} must be refused"),
+        };
+        assert!(
+            err.contains(named),
+            "case {i}: the refusal names {named}: {err}"
+        );
+    }
+}
+
 /// The create-leg borrow floor NEVER arms an open
 /// requirement — a floored publisher create must ATTACH to a pre-existing
 /// service born at the iceoryx2 default (2), and the effective loan budget

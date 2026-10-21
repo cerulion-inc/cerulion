@@ -39,6 +39,9 @@ pub mod node_death;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
 pub mod sync_match;
+// Capture-time Sync matching. Hidden: it has no user-facing opt-in yet.
+#[doc(hidden)]
+pub mod sync_stamp;
 pub mod trace_merge;
 pub mod trigger;
 // Inert for now: the wake-origin taxonomy the WaitSet reactor will consume.
@@ -946,6 +949,14 @@ struct ScheduledNode {
     /// reads a comment block above a line, and a doc block quoting the marker
     /// verbatim registers as an annotation on the field declaration.)
     node_death: Arc<crate::scheduler::node_death::NodeDeathLedger>,
+    /// Set by the node's tick callback when the node returned
+    /// `NodeError::Fatal`. Read once after every fire that returns: the first
+    /// fire that sees it set disables the node, so the scheduler never fires it
+    /// again. A fresh unshared flag on a bare scheduler (nothing sets it); the
+    /// runtime installs the one its callback writes
+    /// (`set_node_fatal_stop`). Deterministic: it is set by the tick's own
+    /// return value, which a resim reproduces at the same step.
+    fatal_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScheduledNode {
@@ -2492,6 +2503,7 @@ impl Scheduler {
             // edge below records nothing at all until a runtime installs the
             // shared one AND a live loop arms it.
             node_death: Arc::new(crate::scheduler::node_death::NodeDeathLedger::new()),
+            fatal_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         self.nodes.insert(config.id, node);
@@ -2549,6 +2561,11 @@ impl Scheduler {
     /// Clears the `disabled` flag, resets the consecutive panic counter, and
     /// for Period nodes, advances `next_fire_ns` past the current time so
     /// the node doesn't catch up on fires missed while disabled.
+    ///
+    /// It also lifts a `NodeError::Fatal` stop: the fatal-stop flag is cleared,
+    /// so the node fires again and is stopped again only by a NEW fatal return.
+    /// The runtime's `node_fatal_errors()` keeps reporting the earlier stop,
+    /// because it records what happened in the run.
     // hot-path-alloc-ok-fn: cold: node reset — a build/teardown edit, never a step
     pub fn reset_node(&mut self, node_id: &str) -> TransportResult<()> {
         let current_time = match &self.clock {
@@ -2565,6 +2582,9 @@ impl Scheduler {
             })?;
         node.disabled = false;
         node.consecutive_panics = 0;
+        // Without this the flag stays latched: the next fire would disable the
+        // node again even when that tick succeeds.
+        node.fatal_stop.store(false, Ordering::Release);
 
         // For Period nodes, skip ahead to avoid catch-up burst.
         //
@@ -3609,6 +3629,8 @@ impl Scheduler {
                 .map(|(input, head)| (input.clone(), head.ts))
                 .collect(),
             input_service: None,
+            sync_capture_high_water: Default::default(),
+            sync_epoch_floor: None,
         })
     }
 
@@ -3675,6 +3697,64 @@ impl Scheduler {
                 node.sync_heads
                     .insert(input.clone(), SyncHead::restored(*ts));
             }
+        }
+    }
+
+    /// Raise one `Sync` input's wire-stamp epoch high-water to at least `ts`
+    /// on a resumed run.
+    ///
+    /// The high-water is what an epoch reset is detected against, and it is
+    /// only ever set by a POP, so a resumed run starts with none: the first
+    /// frame after a clock restart would be filled as an ordinary head instead
+    /// of re-basing the node, and the held partner the live run voided would
+    /// discard it. A capture-time node therefore seeds this from the same
+    /// checkpointed capture stamps that seed its capture high-water, which is
+    /// what keeps the two layers deciding the same epoch.
+    ///
+    /// A value only ever raises the mark (several restore seams may each
+    /// state a stamp for the same input). A non-`Sync` or unknown node is
+    /// left alone, for the reason [`Self::restore_sync_input_timestamps`]
+    /// gives. Must be called BEFORE the first `step()`.
+    // hot-path-alloc-ok-fn: cold: state RESTORE, once at run start
+    pub(crate) fn restore_sync_stamp_high_water(&mut self, node_id: &str, input: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if !matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            return;
+        }
+        let high_water = node
+            .sync_stamp_high_water
+            .entry(input.to_string())
+            .or_insert(ts);
+        *high_water = (*high_water).max(ts);
+    }
+
+    /// The newest stamp of a `Sync` node's current clock epoch, once an epoch
+    /// reset has established one. `None` for any other node, and before the
+    /// node's first reset.
+    pub(crate) fn sync_epoch_floor(&self, node_id: &str) -> Option<u64> {
+        self.nodes.get(node_id)?.sync_epoch_floor
+    }
+
+    /// Set a `Sync` node's epoch floor on a resumed run.
+    ///
+    /// The floor is what a RE-BASED input (one an epoch reset removed the
+    /// high-water of) is tested against, and it is only ever set by a pop, so
+    /// a run resumed between a reset and that input's first in-band frame
+    /// starts with none and would fill an old-epoch straggler the live run
+    /// discards. The re-based input itself needs nothing restored: its
+    /// missing high-water already IS "awaiting re-base".
+    ///
+    /// A non-`Sync` or unknown node is left alone, for the reason
+    /// [`Self::restore_sync_input_timestamps`] gives. Must be called BEFORE
+    /// the first `step()`.
+    pub(crate) fn restore_sync_epoch_floor(&mut self, node_id: &str, ts: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if matches!(node.policy, TriggerPolicy::Sync { .. }) {
+            node.sync_epoch_floor = Some(ts);
         }
     }
 
@@ -4359,6 +4439,17 @@ impl Scheduler {
         })
     }
 
+    /// The node's shared Sync counters, for a graph-build seam that counts
+    /// on them from outside the scheduler (capture-time matching).
+    pub(crate) fn sync_counters(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::scheduler::handle::SyncCounters>> {
+        self.nodes
+            .get(id)
+            .map(|node| Arc::clone(&node.sync_counters))
+    }
+
     /// Hand the runtime liveliness sweep a clone of
     /// `node_id`'s per-node publisher-disconnect counter `Arc` so it can
     /// bump it lock-free on every `Lost` transition it observes on one of
@@ -4427,6 +4518,34 @@ impl Scheduler {
                 node_id: node_id.to_string(),
             })?;
         node.node_death = ledger;
+        Ok(())
+    }
+
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
+    /// consecutive-panic breaker? A disabled node never fires until
+    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
+    /// lookup, no allocation: the live loop reads it per external binding per
+    /// wait.
+    pub fn is_node_disabled(&self, node_id: &str) -> bool {
+        self.nodes.get(node_id).is_some_and(|n| n.disabled)
+    }
+
+    /// Install the fatal-stop flag `node_id`'s tick callback sets when the node
+    /// returns `NodeError::Fatal` (see the field doc). Unknown node id = a
+    /// wiring desync: loud `Err`.
+    // hot-path-alloc-ok-fn: cold: installs a node's fatal-stop flag ONCE at graph BUILD
+    pub(crate) fn set_node_fatal_stop(
+        &mut self,
+        node_id: &str,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.fatal_stop = flag;
         Ok(())
     }
 
@@ -8654,6 +8773,12 @@ impl Scheduler {
         match result {
             Ok(()) => {
                 node.consecutive_panics = 0;
+                // A node that returned `NodeError::Fatal` this fire is stopped:
+                // this fire stays in the trace (it ran), and no later fire
+                // happens. One atomic load per fire; no allocation.
+                if !node.disabled && node.fatal_stop.load(Ordering::Acquire) {
+                    node.disabled = true;
+                }
             }
             Err(panic_info) => {
                 let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -10129,6 +10254,206 @@ mod tests {
             Some(INTERVAL_NS),
             "the disabled break must not rewind `next_fire_ns` (the block-defer \
              arm does; this one must not)"
+        );
+    }
+
+    /// A Period node with the fatal-stop flag installed, whose callback counts
+    /// its calls and sets the flag on every call (the runtime's callback sets it
+    /// when the tick returned `NodeError::Fatal`).
+    fn add_fatal_period(
+        scheduler: &mut Scheduler,
+        id: &str,
+        sets_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Arc<AtomicU64>, Arc<std::sync::atomic::AtomicBool>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_cb = Arc::clone(&flag);
+        scheduler
+            .add_node(NodeConfig {
+                id: id.to_string(),
+                policy: TriggerPolicy::Period {
+                    interval: Duration::from_millis(10),
+                    max_catchup: None,
+                },
+                callback: Box::new(move || {
+                    calls_cb.fetch_add(1, Ordering::Relaxed);
+                    if sets_flag.load(Ordering::Relaxed) {
+                        flag_cb.store(true, Ordering::Release);
+                    }
+                }),
+            })
+            .unwrap();
+        scheduler
+            .set_node_fatal_stop(id, Arc::clone(&flag))
+            .expect("known node");
+        (calls, flag)
+    }
+
+    /// A fatal return on the FIRST fire of a catch-up burst stops the burst
+    /// there: one call, one trace entry, the node disabled. The panic breaker
+    /// test above pins the same loop for its own flag.
+    #[test]
+    fn the_collect_mirror_period_burst_stops_at_a_fatal_stop() {
+        const BURST: u32 = 10;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+
+        let mut sink: Vec<TraceEntry> = Vec::new();
+        let node = scheduler.nodes.get_mut("fatal").expect("node present");
+        Scheduler::tick_node_into(
+            "fatal",
+            node,
+            FireKind::Period {
+                first_fire_ns: INTERVAL_NS,
+                fire_count: BURST,
+                interval_ns: INTERVAL_NS,
+                current_time_ns: INTERVAL_NS * BURST as u64,
+            },
+            0,
+            0,
+            &mut sink,
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the burst stops at its first fire"
+        );
+        assert_eq!(sink.len(), 1, "one trace entry: the fatal fire ran");
+        assert!(node.disabled, "the fatal stop disabled the node");
+    }
+
+    /// The SERIAL twin of the test above: `tick_node`'s own Period burst loop
+    /// over the ring sink stops at the fatal fire too.
+    #[test]
+    fn the_serial_period_burst_stops_at_a_fatal_stop() {
+        const BURST: u32 = 10;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+
+        let mut trace: VecDeque<TraceEntry> = VecDeque::new();
+        let mut appended: u64 = 0;
+        let node = scheduler.nodes.get_mut("fatal").expect("node present");
+        Scheduler::tick_node(
+            "fatal",
+            node,
+            FireKind::Period {
+                first_fire_ns: INTERVAL_NS,
+                fire_count: BURST,
+                interval_ns: INTERVAL_NS,
+                current_time_ns: INTERVAL_NS * BURST as u64,
+            },
+            0,
+            0,
+            &mut trace,
+            None,
+            &mut appended,
+            None,
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the burst stops at its first fire"
+        );
+        assert_eq!(trace.len(), 1, "one trace entry: the fatal fire ran");
+        assert_eq!(appended, 1);
+        assert!(node.disabled, "the fatal stop disabled the node");
+    }
+
+    /// A trace-driven (replay) burst and a data-triggered burst stop at the
+    /// fatal fire as well: the recording's later fires in the same step are
+    /// not run, the same as live.
+    #[test]
+    fn the_replay_and_data_bursts_stop_at_a_fatal_stop() {
+        const BURST: u32 = 5;
+        const INTERVAL_NS: u64 = 10_000_000;
+        let kinds = [
+            (
+                "replay",
+                FireKind::Replay {
+                    first_fire_ns: INTERVAL_NS,
+                    fire_count: BURST,
+                    interval_ns: INTERVAL_NS,
+                },
+            ),
+            (
+                "data",
+                FireKind::Data {
+                    fire_time_ns: INTERVAL_NS,
+                    fire_count: BURST,
+                },
+            ),
+        ];
+        for (label, kind) in kinds {
+            let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+            let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (calls, _flag) = add_fatal_period(&mut scheduler, "fatal", always);
+            let mut sink: Vec<TraceEntry> = Vec::new();
+            let node = scheduler.nodes.get_mut("fatal").expect("node present");
+            Scheduler::tick_node_into("fatal", node, kind, 0, 0, &mut sink);
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{label}: one call");
+            assert_eq!(sink.len(), 1, "{label}: one trace entry");
+            assert!(node.disabled, "{label}: the fatal stop disabled the node");
+        }
+    }
+
+    /// `reset_node` lifts a fatal stop: the flag is cleared, so a later fire
+    /// whose tick does not set it again leaves the node enabled.
+    #[test]
+    fn reset_node_clears_the_fatal_stop_flag() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let sets = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, flag) = add_fatal_period(&mut scheduler, "fatal", Arc::clone(&sets));
+        let fire = |scheduler: &mut Scheduler| {
+            let mut sink: Vec<TraceEntry> = Vec::new();
+            let node = scheduler.nodes.get_mut("fatal").expect("node present");
+            Scheduler::tick_node_into(
+                "fatal",
+                node,
+                FireKind::Period {
+                    first_fire_ns: 10_000_000,
+                    fire_count: 1,
+                    interval_ns: 10_000_000,
+                    current_time_ns: 10_000_000,
+                },
+                0,
+                0,
+                &mut sink,
+            );
+        };
+        fire(&mut scheduler);
+        assert!(
+            scheduler.nodes["fatal"].disabled,
+            "stopped by the fatal fire"
+        );
+
+        // The tick is healthy from now on; the reset must not leave the flag latched.
+        sets.store(false, Ordering::Relaxed);
+        scheduler.reset_node("fatal").expect("known node");
+        assert!(!flag.load(Ordering::Acquire), "reset cleared the flag");
+        assert!(!scheduler.nodes["fatal"].disabled);
+        fire(&mut scheduler);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(
+            !scheduler.nodes["fatal"].disabled,
+            "a healthy fire after the reset keeps the node enabled"
+        );
+    }
+
+    /// An unknown node id is a wiring desync: `NodeNotFound` naming the id.
+    #[test]
+    fn set_node_fatal_stop_on_an_unknown_node_is_node_not_found() {
+        let mut scheduler = Scheduler::new();
+        let err = scheduler
+            .set_node_fatal_stop("nope", Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .expect_err("no such node");
+        assert!(
+            matches!(&err, TransportError::NodeNotFound { node_id } if node_id == "nope"),
+            "{err:?}"
         );
     }
 

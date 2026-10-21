@@ -166,7 +166,7 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
 | Symbol | Role |
 |---|---|
-| `cerulion_abi_version` | Must return `CERULION_ABI_VERSION`; the loader hard-rejects a mismatch or a missing symbol. |
+| `cerulion_abi_version` | Returns `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for cross-process nodes, with the transport id above bit 16 for in-process nodes. A host built before the transport id rejects an in-process node as an ABI mismatch; a missing symbol is rejected. |
 | `cerulion_rustc_fingerprint` | Must return `RUSTC_FINGERPRINT` (ABI v22); the loader hard-rejects a mismatch or a missing symbol, checked immediately after `cerulion_abi_version`, because two different rustc releases can agree on every struct size and offset the ABI check proves and still encode a niche-holding `Option::None` differently. |
 | `cerulion_node_info` | Node metadata JSON (ports, policy, capabilities). Parsed host-side into `PolicyJson`; corrupt JSON refuses the load. |
 | `cerulion_node_init` / `cerulion_node_tick` / `cerulion_node_shutdown` / `cerulion_node_pump_history` | Lifecycle. Shared return-code semantics below. |
@@ -174,11 +174,14 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 | `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
 | `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
 | `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build, and a cdylib whose info JSON declares params without exporting it is refused when its info is read (`DylibNodeEntry::info`). |
+| `cerulion_take_last_error_kind` | OPTIONAL typed error kind: the `NodeErrorKind` wire code of the last error (`0` = none), read by the host after a code-1 / handle-0 return so a node error arrives as `TransportError::NodeFailed`. Absent: the error stays the untyped `NodeError` (and a `Fatal` does not stop the node). |
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
 panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex is poisoned; `4`
-handle not found.
+handle not found. The macros convert a user `NodeError` at the boundary with
+`NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
+part of the same contract (never renumber one).
 
 **The ABI rule**: any change to a generated FFI signature or to these return-code
 semantics MUST bump `CERULION_ABI_VERSION` (`crates/cerulion_core/src/lib.rs`; name the

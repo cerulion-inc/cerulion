@@ -106,8 +106,10 @@ fn peer_block(egress: Vec<String>, ingress: Vec<String>) -> NetworkBlock {
         mode: NetworkMode::Peer,
         connect: vec![],
         listen: vec![],
-        egress,
+        egress: egress.into_iter().map(Into::into).collect(),
         ingress,
+        tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 
@@ -116,8 +118,10 @@ fn disabled_block(egress: Vec<String>, ingress: Vec<String>) -> NetworkBlock {
         mode: NetworkMode::Disabled,
         connect: vec![],
         listen: vec![],
-        egress,
+        egress: egress.into_iter().map(Into::into).collect(),
         ingress,
+        tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 

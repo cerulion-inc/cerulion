@@ -128,7 +128,9 @@ def test_cli_python_node_build_info_and_graph_run(tmp_path):
 
     node_py = workspace / "nodes" / "echo" / "node.py"
     source = node_py.read_text()
-    assert '@cer.node(trigger="inp")' in source
+    assert '@cerulion.node(trigger="inp")' in source
+    assert "from cerulion.msgs.geometry_msgs import Vector3\n" in source
+    assert "inp = cerulion.input(Vector3, trigger=True)" in source
     source = source.replace(
         "        # copy fields here, e.g. out.x = msg.x",
         "        out.x = msg.x + 1.5\n        out.y = msg.y - 2.0\n        out.z = msg.z + 0.25",
@@ -277,7 +279,7 @@ nodes:
     for topic, record in records:
         assert topic == "/echo/echo/out"
         assert record.schema_hash == vector_hash
-        message = record.view(schemas, "geometry_msgs/Vector3")
+        message = record.view("geometry_msgs/Vector3", schemas=schemas)
         assert (message.x, message.y, message.z) == (1.5, -2.0, 0.25)
 
 
@@ -311,11 +313,12 @@ def test_cli_python_sync_node_takes_repeated_inputs_and_rejects_one(tmp_path):
     )
     source = (workspace / "nodes" / "pair" / "node.py").read_text()
     for line in (
-        "@cer.node(sync_window_ms=10)",
-        'a = cer.input("std_msgs/Int32", trigger=True)',
-        'b = cer.input("std_msgs/Int32", trigger=True)',
-        'x = cer.output("std_msgs/Int32")',
-        'y = cer.output("std_msgs/Int32")',
+        "import cerulion\nfrom cerulion.msgs.std_msgs import Int32\n",
+        "@cerulion.node(sync_window_ms=10)",
+        "a = cerulion.input(Int32, trigger=True)",
+        "b = cerulion.input(Int32, trigger=True)",
+        "x = cerulion.output(Int32)",
+        "y = cerulion.output(Int32)",
     ):
         assert line in source, source
 
@@ -355,3 +358,160 @@ def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path
     assert built.returncode == 0, built.stderr
     lib_source = (workspace / "nodes" / "echo" / "src" / "lib.rs").read_text()
     assert r'\"schema_hash\":15293913555552287199' in lib_source
+
+
+def test_cli_one_msg_file_types_a_rust_and_a_python_port(tmp_path):
+    # One `.msg` file in the workspace store is the only definition of
+    # `demo_pkg/Reading`: the Rust producer imports the type the message crate
+    # generated from it, the Python node the class `cerulion.msgs` built from
+    # it, and the graph carries frames between them.
+    env = os.environ.copy()
+    env.pop("CERULION_PYTHON", None)
+    env.pop("CERULION_PY_PATH", None)
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("DYLD_LIBRARY_PATH", None)
+    env["PATH"] = f"{Path(PYTHON).parent}{os.pathsep}{env.get('PATH', '')}"
+    env["CERULION_LOGIN_GATE"] = "off"
+    _run(CLI, "workspace", "create", "ws", cwd=tmp_path, env=env)
+    workspace = tmp_path / "ws"
+    store = workspace / "schemas" / "demo_pkg" / "msg"
+    store.mkdir(parents=True)
+    (store / "Reading.msg").write_text("float64 value\ngeometry_msgs/Point position\n")
+    # YAML types the producer never uses still generate into its message
+    # crate: a package-less one and a packaged one that embeds it.
+    (workspace / "schemas" / "extra.yaml").write_text(
+        'schemas:\n  Note:\n    fields:\n      "float64 level":\n'
+        '  yam/Wrapper:\n    fields:\n      "Note inner":\n      "uint8 z":\n'
+    )
+
+    _run(
+        CLI, "node", "new", "producer", "--policy", "period_ms=5",
+        "-o", "demo_pkg/Reading", "cmd",
+        cwd=workspace, env=env,
+    )
+    producer_lib = workspace / "nodes" / "producer" / "src" / "lib.rs"
+    scaffold = producer_lib.read_text()
+    assert "use native_ros2_messages::demo_pkg::Reading;" in scaffold, scaffold
+    producer_lib.write_text(
+        """\
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
+use cerulion_core::prelude::*;
+use native_ros2_messages::demo_pkg::Reading;
+
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    cmd: Reading,
+}
+
+#[cerulion_node_impl]
+impl ProducerNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.cmd.value = 40.0;
+        self.cmd.position.x = 2.0;
+        Ok(())
+    }
+}
+"""
+    )
+    built = _run(CLI, "node", "build", "producer", cwd=workspace, env=env, check=False)
+    assert built.returncode == 0, built.stdout + built.stderr
+
+    _run(
+        CLI, "node", "new", "--lang", "python", "relay",
+        "-T", "Reading", "inp", "-o", "demo_pkg/Reading", "out",
+        cwd=workspace, env=env,
+    )
+    node_py = workspace / "nodes" / "relay" / "node.py"
+    source = node_py.read_text()
+    assert "from cerulion.msgs.demo_pkg import Reading\n" in source, source
+    node_py.write_text(
+        source.replace(
+            "        # copy fields here, e.g. out.x = msg.x",
+            "        assert isinstance(msg, Reading)\n"
+            "        out.value = msg.value + 1.5\n"
+            "        out.position.x = msg.position.x * 3",
+        )
+    )
+    built = _run(CLI, "node", "build", "relay", cwd=workspace, env=env, check=False)
+    assert built.returncode == 0, built.stdout + built.stderr
+    stub = workspace / ".cerulion" / "python" / "cerulion-stubs" / "msgs" / "demo_pkg.pyi"
+    assert "class Reading(_Message):" in stub.read_text()
+    assert (stub.parent.parent / "py.typed").read_text() == "partial\n"
+
+    graph = workspace / "graphs"
+    (graph / "relay.yaml").write_text(
+        """\
+prefix: relay
+nodes:
+  - id: producer
+    type: producer
+    outputs:
+      - name: cmd
+        schema: demo_pkg/Reading
+  - id: relay
+    type: relay
+    inputs:
+      - name: inp
+        source: producer/cmd
+    outputs:
+      - name: out
+        schema: demo_pkg/Reading
+"""
+    )
+    run = subprocess.Popen(
+        [CLI, "graph", "run", "relay", "--single-process", "--network", "off"],
+        cwd=workspace,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        echo = ""
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and run.poll() is None and "value:" not in echo:
+            echo_proc = subprocess.Popen(
+                [CLI, "topic", "echo", "/relay/relay/out"],
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                echo, _ = echo_proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                echo_proc.send_signal(signal.SIGINT)
+                echo, _ = echo_proc.communicate(timeout=10)
+    finally:
+        run.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = run.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            run.kill()
+            stdout, stderr = run.communicate()
+    assert "value: 41.5" in echo and "x: 6" in echo, echo + stdout + stderr
+    assert run.returncode in (0, -signal.SIGINT), stderr
+
+    # Delivery already proves the two hashes agree: the Python host refuses an
+    # input frame whose hash differs from its class's (SchemaMismatch), so no
+    # relayed value would reach the echo. The class also carries the hash its
+    # node build baked.
+    check = subprocess.run(
+        [
+            PYTHON,
+            "-c",
+            "from cerulion.msgs.demo_pkg import Reading; "
+            "print(Reading.__cerulion_schema_hash__)",
+        ],
+        cwd=workspace,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lib_source = (workspace / "nodes" / "relay" / "src" / "lib.rs").read_text()
+    assert f'\\"schema_hash\\":{check.stdout.strip()}' in lib_source

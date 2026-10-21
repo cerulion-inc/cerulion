@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Detached managers serve other processes, which local-transport refuses.
 //! The CORE SEAMS for supervisor-side pre-creation of every
 //! graph-owned iceoryx2 service BEFORE any worker spawns.
 //!

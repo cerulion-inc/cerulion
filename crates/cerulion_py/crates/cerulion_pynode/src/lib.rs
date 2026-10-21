@@ -960,7 +960,8 @@ impl Host {
 
     /// Load the node module and build its instance. `first_instance` is false
     /// when another instance of this node type (another `Host` of the same
-    /// cdylib) is alive in the process; see [`Self::activate_node_dir`].
+    /// cdylib) is alive in the process; node-directory activation uses the
+    /// process-wide Python registry.
     pub fn init(
         mut ctx: Box<NodeContext>,
         module_name: &str,
@@ -973,6 +974,19 @@ impl Host {
             install_host_module(py).map_err(python_error)?;
             Self::install_search_path(py, sys_path)?;
             Self::activate_node_dir(py, sys_path.first().copied(), first_instance)?;
+            // `cerulion.msgs` resolves the node's class imports against the
+            // node's own workspace, so it is bound before `node.py` runs; the
+            // first instance of the type reads a changed workspace afresh,
+            // a further one keeps the set its running sibling uses.
+            let workspace = node_workspace(&ctx, sys_path)?;
+            py.import("cerulion.msgs")
+                .and_then(|module| {
+                    module.call_method1(
+                        "_bind_workspace",
+                        (workspace.to_string_lossy().into_owned(), first_instance),
+                    )
+                })
+                .map_err(python_error)?;
             py.import("sys")
                 .and_then(|sys| sys.getattr("modules"))
                 .and_then(|modules| modules.call_method1("pop", (module_name, py.None())))
@@ -990,7 +1004,6 @@ impl Host {
                 ));
             }
             let metadata = Self::metadata(info, &classes[0].1)?;
-            let workspace = node_workspace(&ctx, sys_path)?;
             let schemas = node_schemas(&workspace)?;
             let ctx_ptr = Arc::new(AtomicPtr::new((&mut *ctx) as *mut NodeContext));
             // Armed from here: Python can retain the HostCtx handed out below,
@@ -1411,7 +1424,7 @@ macro_rules! export_node {
         }
         #[no_mangle]
         pub extern "C" fn cerulion_abi_version() -> u32 {
-            $crate::cerulion_core::CERULION_ABI_VERSION
+            $crate::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
         }
         #[no_mangle]
         pub extern "C" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {
@@ -1611,6 +1624,45 @@ mod tests {
 
     const INFO: &[u8] =
         br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":7}],"policy":{"period_ms":10}}"#;
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    mod abi_export_test {
+        use super::INFO;
+
+        crate::export_node! {
+            module: "abi_value_test",
+            sys_path: [],
+            info: INFO
+        }
+
+        #[test]
+        fn exported_abi_version_carries_the_transport_kind() {
+            assert_eq!(
+                cerulion_abi_version(),
+                cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
+            );
+        }
+
+        #[test]
+        fn exported_abi_version_reflects_the_local_transport_feature() {
+            // A Python-node cdylib built with `--features
+            // cerulion_pynode/local-transport` must tag its ABI value InProcess
+            // so an in-process host accepts it; without the feature it must
+            // tag CrossProcess, matching a generated Rust node's
+            // `cerulion_core/local-transport` forwarding.
+            use cerulion_core::transport::TransportKind;
+            let expected = if cfg!(feature = "local-transport") {
+                TransportKind::InProcess
+            } else {
+                TransportKind::CrossProcess
+            };
+            assert_eq!(
+                cerulion_abi_version(),
+                expected.cdylib_abi_version(),
+                "the exported ABI tag must follow the build's transport kind"
+            );
+        }
+    }
 
     #[test]
     fn declaration_matching_info_apart_from_schema_names_is_accepted() {

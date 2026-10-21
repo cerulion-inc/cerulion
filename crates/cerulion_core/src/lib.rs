@@ -798,6 +798,9 @@ pub use scheduler::{
     RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
+pub use transport::carrier::{
+    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+};
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,

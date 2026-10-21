@@ -140,6 +140,12 @@ impl From<PeerLoss> for EnginePeerLossPolicy {
     }
 }
 
+// Only the `Commands` verbs. The full `cerulion` command, which also holds
+// every registered verb family (`cerulion schema`, ...), is
+// `families::cli_command()`: parse, complete and check the verb tree with that,
+// never with `Cli::command()` or `Cli::try_parse_from`, which do not see the
+// families. A plain comment, not a doc comment, so `cerulion --help` keeps the
+// text it has: clap's derive copies a doc comment into the root's help.
 #[derive(Parser)]
 #[command(name = "cerulion", about = "Cerulion robotics middleware CLI", version)]
 pub struct Cli {
@@ -224,11 +230,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: TopicAction,
     },
-    /// Schema management
-    Schema {
-        #[command(subcommand)]
-        action: SchemaAction,
-    },
     /// Removed: `cerulion ros attach` is now `cerulion ros2 attach`.
     ///
     /// The `ros` family folded into `ros2` (run, launch, attach, migrate). The
@@ -308,7 +309,7 @@ pub enum Commands {
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
         /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found by scouting with no configuration, and
+        /// typical LAN the robot is found over mDNS with no configuration, and
         /// no schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
@@ -316,11 +317,11 @@ pub enum Commands {
         /// A topic the robot does not serve is an error, not a silent skip.
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Additional zenoh gateway locator to CONNECT to, for a robot scouting
-        /// cannot reach, for example `tcp/192.0.2.10:7683`. Repeatable. Requires
-        /// `--robot`. Used when this command STARTS the daemon; a daemon that is
-        /// already running keeps the locators it started with (scouting covers
-        /// the LAN regardless, and the verb says so).
+        /// Additional zenoh gateway locator to CONNECT to, for a robot mDNS
+        /// discovery cannot reach, for example `tcp/192.0.2.10:7683`.
+        /// Repeatable. Requires `--robot`. Used when this command STARTS the
+        /// daemon; a daemon that is already running keeps the locators it
+        /// started with, and the verb says so.
         #[arg(long, value_name = "LOCATOR", requires = "robot")]
         connect: Vec<String>,
         /// Local zenoh locator to LISTEN on for remote discovery and ingress, for
@@ -744,7 +745,6 @@ impl Commands {
             | Commands::Logout
             | Commands::Workspace { .. }
             | Commands::Topic { .. }
-            | Commands::Schema { .. }
             | Commands::Trace { .. }
             // Prints a shell script to stdout and exits. It is also
             // the one verb whose stdout is EVALUATED by a shell, so a stray
@@ -1789,8 +1789,9 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (multicast and gossip scouting
-    /// on), so robots on the LAN show up with no flags and no pairing; when it
+    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
+    /// cache and the hostname rung), so robots on the LAN show up with no
+    /// flags and no pairing; when it
     /// finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
@@ -1799,7 +1800,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--local` to skip the remote
+    /// peers discovery cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1819,11 +1820,11 @@ pub enum TopicAction {
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// OPT-IN: also sweep the local /24 subnets, one address at a time, on
@@ -2224,34 +2225,6 @@ pub enum BagAction {
         )]
         run: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-pub enum SchemaAction {
-    /// Create a new schema
-    Create {
-        /// Schema name
-        // No completer, and this arm was the worst of the three.
-        // The workspace half is what the verb rejects (already-exists), and
-        // the 254 built-in `pkg/Type` names are worse than useless here: a
-        // `sensor_msgs/Image` either fails on the `/` or silently creates a
-        // workspace schema that SHADOWS the built-in for the whole workspace.
-        name: String,
-    },
-    /// Delete a schema
-    Delete {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// Show info about a schema
-    Info {
-        /// Schema name
-        #[arg(add = ArgValueCandidates::new(completion::schema_names))]
-        name: String,
-    },
-    /// List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by package
-    List,
 }
 
 #[cfg(test)]
@@ -4491,12 +4464,20 @@ mod verb_log_class_tests {
     use super::*;
 
     /// Parse a full argv and return the classified verb log class — the exact
-    /// path `main` takes (`Cli::parse().command.log_verb_class()`).
+    /// path `main` takes: a registered verb family classifies itself, every
+    /// other verb goes through `Commands::log_verb_class`.
     fn class_of(argv: &[&str]) -> VerbLogClass {
-        Cli::try_parse_from(argv)
-            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
-            .command
-            .log_verb_class()
+        use clap::FromArgMatches as _;
+        let matches = crate::families::cli_command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"));
+        match crate::families::find(crate::families::FAMILIES, &matches) {
+            Some((family, sub)) => family.log_class(sub),
+            None => Cli::from_arg_matches(&matches)
+                .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
+                .command
+                .log_verb_class(),
+        }
     }
 
     /// One-shot introspection / management verbs default QUIET
