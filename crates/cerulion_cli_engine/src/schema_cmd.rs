@@ -3766,10 +3766,10 @@ fn shadowed_builtin_names(result: &SchemaInfoResult) -> Option<String> {
 /// surfaces can never drift. `bare` is already `::`-normalized and carries
 /// no `/`. EXISTENCE + IDENTITY ONLY — deliberately not
 /// [`store_schema_lookup`]: that one builds a full [`SchemaEntry`], which
-/// RESOLVES the schema's layout, and layout resolution PANICS on fixed-array
-/// size overflow (`cerulion_core`'s `layout.rs`: `fixed-array size overflow
-/// (8 x 18446744073709551615)`). Calling it from `port_schema_exists` —
-/// which only ever asks a yes/no question — meant a single
+/// RESOLVES the schema's layout, and layout resolution PANICKED on fixed-array
+/// size overflow when this probe was written (`cerulion_core`'s `layout.rs`,
+/// now a typed `FixedSectionOverflow`). Calling it from `port_schema_exists`,
+/// which only ever asks a yes/no question, meant a single
 /// hostile-but-parseable `.msg` anywhere in `schemas/` CRASHED `cerulion
 /// graph validate` and `graph run`. `float64[18446744073709551615]
 /// a` in a store `.msg`, referenced by a graph output, panics the verb; with
@@ -6683,7 +6683,7 @@ mod tests {
     /// layout — a hostile-but-parseable `.msg` crashed `graph validate`.
     ///
     /// `store_schema_lookup` builds a full `SchemaEntry`, which resolves the
-    /// layout, and layout resolution PANICS on fixed-array size overflow. The
+    /// layout, and layout resolution PANICKED on fixed-array size overflow. The
     /// `.msg`-store tier added one commit earlier called it, so a single
     /// `float64[18446744073709551615] a` anywhere in `schemas/` panicked
     /// `cerulion graph validate` and `graph run` on the real
