@@ -39,6 +39,7 @@
 //!   tests below.
 
 use cerulion_core::wire::MaxSliceLen;
+use iceoryx2::service::port_factory::PortFactory as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -606,6 +607,141 @@ fn test_create_port_floors_out_of_range_are_refused() {
             "case {i}: the refusal names {named}: {err}"
         );
     }
+}
+
+/// A transport manager on its own isolated iceoryx2 root, so a test can read
+/// the services it creates through raw iceoryx2 nodes on the same config.
+fn isolated_manager(name: &str, ix: iceoryx2::config::Config) -> std::sync::Arc<TransportManager> {
+    TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: name.into(),
+            clock: std::sync::Arc::new(cerulion_core::clock::VirtualClock::new()),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        ix,
+    )
+    .expect("init isolated transport manager")
+}
+
+/// A raw iceoryx2 node on `ix`: one more attached process, as iceoryx2 counts
+/// them against a service's `max_nodes`.
+fn raw_node(
+    ix: &iceoryx2::config::Config,
+) -> iceoryx2::node::Node<iceoryx2::service::ipc::Service> {
+    iceoryx2::node::NodeBuilder::new()
+        .config(ix)
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("raw iceoryx2 node")
+}
+
+/// A floored opener creates the data and event services with room for one
+/// attached node per data port (`publishers + subscribers`), above iceoryx2's
+/// `max_nodes` defaults (20 data, 36 event). With floors of 32 and 32 the
+/// service takes 64 nodes, so a 21st process on `/rosout` attaches; at the
+/// default the 20th raw node below (the 21st with the creator) is refused
+/// with `ExceedsMaxNumberOfNodes`.
+#[test]
+fn test_create_port_floors_raise_the_node_cap() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let mgr = isolated_manager("node_floor", ix.clone());
+    let topic = unique_topic("node_floor");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(32);
+    cfg.create_subscriber_floor = Some(32);
+    let _publisher = mgr
+        .create_publisher_with_topic_config(&topic, MaxSliceLen::const_new(256), 0, cfg)
+        .expect("floored publisher creates the service");
+
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let defaults = &ix.defaults;
+    let attach = defaults
+        .publish_subscribe
+        .max_nodes
+        .max(defaults.event.max_nodes)
+        + 1;
+    let mut held = Vec::new();
+    for i in 0..attach {
+        let node = raw_node(&ix);
+        let data = node
+            .service_builder(&data_name)
+            .publish_subscribe::<[u8]>()
+            .open()
+            .unwrap_or_else(|e| {
+                panic!("raw node {i} of {attach} must open the data service: {e:?}")
+            });
+        let event = node
+            .service_builder(&event_name)
+            .event()
+            .open()
+            .unwrap_or_else(|e| {
+                panic!("raw node {i} of {attach} must open the event service: {e:?}")
+            });
+        if i == 0 {
+            assert_eq!(
+                data.static_config().max_nodes(),
+                64,
+                "data max_nodes = 32 + 32"
+            );
+            assert_eq!(
+                event.static_config().max_nodes(),
+                64,
+                "event max_nodes follows the data service"
+            );
+        }
+        held.push((node, data, event));
+    }
+}
+
+/// When the iceoryx2 config already sets both data caps to the floor values,
+/// the floors raise nothing on the data service, and the event service a
+/// floored opener creates must still be sized from the live data caps
+/// (`publishers + 2 x subscribers`), not left at the config's event defaults
+/// (16 notifiers and listeners, fewer than the 64 data ports).
+#[test]
+fn test_create_port_floors_size_the_event_service_when_config_already_raises_data_caps() {
+    let mut ix = cerulion_core::testing::iceoryx_test_config();
+    ix.defaults.publish_subscribe.max_publishers = 32;
+    ix.defaults.publish_subscribe.max_subscribers = 32;
+    let mgr = isolated_manager("event_from_config_caps", ix.clone());
+    let topic = unique_topic("event_from_config_caps");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(32);
+    cfg.create_subscriber_floor = Some(32);
+    let _subscriber = mgr
+        .create_subscriber_with_buffers(&topic, cfg, cfg.subscriber_max_buffer_size)
+        .expect("floored subscriber creates the service");
+
+    let node = raw_node(&ix);
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let data = node
+        .service_builder(&data_name)
+        .publish_subscribe::<[u8]>()
+        .open()
+        .expect("open the data service raw");
+    let event = node
+        .service_builder(&event_name)
+        .event()
+        .open()
+        .expect("open the event service raw");
+    assert_eq!(data.static_config().max_publishers(), 32);
+    assert_eq!(data.static_config().max_subscribers(), 32);
+    assert_eq!(
+        event.static_config().max_listeners(),
+        32 + 2 * 32,
+        "event listeners sized from the live data caps"
+    );
+    assert_eq!(
+        event.static_config().max_notifiers(),
+        32 + 2 * 32,
+        "event notifiers sized from the live data caps"
+    );
 }
 
 /// The create-leg borrow floor NEVER arms an open
