@@ -14,9 +14,9 @@
 #
 # The engine already depends on netd (`NetdClient`) and vizd depends on netd,
 # so the shared code cannot live in either daemon — the same shape that
-# produced `cerulion_discovery` and `cerulion_mdns`. std + libc + tracing ONLY:
-# no transport, no tokio (the wsd wrapper converts to a tokio listener itself),
-# so it adds nothing to the default build.
+# produced `cerulion_discovery` and `cerulion_mdns`. std + libc + rustix peer
+# credentials + tracing ONLY: no transport, no tokio (the wsd wrapper converts
+# to a tokio listener itself), so it adds nothing to the default build.
 [package]
 name = "cerulion_hygiene"
 version.workspace = true
@@ -41,6 +41,7 @@ workspace = true
 
 [dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["net"] }
 tracing = "0.1"
 
 [dev-dependencies]

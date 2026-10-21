@@ -91,10 +91,11 @@ Cerulion run end to end, install the CLI and follow the quickstart in the
 [README](../README.md):
 
 ```bash
-cargo build --release --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd
+cargo build --release --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd \
+  -p cerulion_remoted
 mkdir -p "$HOME/.cargo/bin"
 install -m 0755 target/release/cerulion target/release/cerulion-netd \
-  target/release/cerulion-connectd "$HOME/.cargo/bin/"
+  target/release/cerulion-connectd target/release/cerulion-remoted "$HOME/.cargo/bin/"
 ```
 
 The quickstart's commands run under a Cerulion account: sign in once on that
