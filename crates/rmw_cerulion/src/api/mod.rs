@@ -239,6 +239,17 @@ pub(crate) fn stamp_sequence_numbers(info: &mut ffi::rmw_message_info_t, publica
     }
 }
 
+/// Writes the publisher gid of a taken message into `info`: this
+/// implementation's identifier and `gid` in the first 16 bytes of the
+/// storage, the tail (24-byte storage before Iron) zero. One helper for all
+/// four take paths.
+#[inline]
+pub(crate) fn stamp_publisher_gid(info: &mut ffi::rmw_message_info_t, gid: &[u8; 16]) {
+    info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+    info.publisher_gid.data = Default::default();
+    info.publisher_gid.data[..16].copy_from_slice(gid);
+}
+
 unsafe fn resolve_service_for_identifier(
     ts: *const ffi::rosidl_service_type_support_t,
     identifier: &[u8],
