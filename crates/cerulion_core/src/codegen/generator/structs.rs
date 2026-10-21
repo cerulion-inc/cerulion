@@ -199,6 +199,7 @@ pub(super) fn generate_marker_struct(out: &mut String, schema: &MessageSchema) {
     // (the canonical pattern for `#[cerulion_node(... zero_copy)]` user
     // structs that hold port markers as fields).
     writeln!(out, "#[derive(Debug, Clone, Copy, Default)]").unwrap();
+    emit_type_name_lint_allow(out, &schema.name);
     writeln!(out, "pub struct {};", schema.name).unwrap();
     writeln!(out).unwrap();
 
@@ -413,6 +414,7 @@ pub(super) fn generate_shm_struct(out: &mut String, schema: &MessageSchema) {
             writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Default)]").unwrap()
         }
     }
+    emit_type_name_lint_allow(out, &shm_name);
     writeln!(out, "pub struct {shm_name} {{").unwrap();
 
     for field in &schema.fields {
@@ -1117,6 +1119,25 @@ const BIG_ARRAY_PATH: &str = "::cerulion_core::codegen::big_array";
 /// line to its `Cargo.toml`.
 const STATE_PATH: &str = "::cerulion_core::state::CerulionState";
 
+/// Emit `#[allow(non_camel_case_types)]` before a generated type whose name
+/// the `non_camel_case_types` lint rejects. A ROS 2 service names its request
+/// and response messages `<Srv>_Request` and `<Srv>_Response`; codegen keeps
+/// those names, so the marker and every type derived from it (`<Name>Shm`,
+/// `<Name>Snapshot`, `<Name>FixedSection`) carry an underscore. The test is
+/// wider than the lint (any underscore, or a lowercase first letter); an
+/// unneeded allow is harmless. A plain UpperCamelCase name writes nothing, so
+/// its output is byte-identical to earlier codegen.
+fn emit_type_name_lint_allow(out: &mut String, type_name: &str) {
+    if !is_upper_camel_case(type_name) {
+        writeln!(out, "#[allow(non_camel_case_types)]").unwrap();
+    }
+}
+
+/// True when `name` starts with a non-lowercase letter and has no underscore.
+fn is_upper_camel_case(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| !c.is_lowercase()) && !name.contains('_')
+}
+
 /// Emit the `#[derive(...)]` (and its `#[serde(crate = ...)]` companion) for a
 /// `<Name>Snapshot` struct. Shared by the fixed and variable emitters so the
 /// two can never disagree about what a snapshot derives.
@@ -1261,6 +1282,7 @@ pub(super) fn generate_snapshot_struct(out: &mut String, schema: &MessageSchema)
     writeln!(out, "/// [`{name}Shm::write_from_snapshot`].").unwrap();
 
     emit_snapshot_derives(out, schema);
+    emit_type_name_lint_allow(out, &snapshot_name);
     writeln!(out, "pub struct {snapshot_name} {{").unwrap();
 
     for field in &schema.fields {
@@ -1575,6 +1597,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
         "/// `proxy.<field> = value` writes directly into the loaned SHM slot."
     )
     .unwrap();
+    emit_type_name_lint_allow(out, &shm_name);
     writeln!(out, "pub struct {shm_name}<'a> {{").unwrap();
     writeln!(
         out,
@@ -2123,6 +2146,7 @@ fn generate_variable_fixed_section_struct(
             writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Default)]").unwrap()
         }
     }
+    emit_type_name_lint_allow(out, fixed_section_name);
     writeln!(out, "pub struct {fixed_section_name} {{").unwrap();
 
     if has_fixed {
@@ -4874,6 +4898,7 @@ pub(super) fn generate_variable_snapshot_struct(out: &mut String, schema: &Messa
     .unwrap();
 
     emit_snapshot_derives(out, schema);
+    emit_type_name_lint_allow(out, &snapshot_name);
     writeln!(out, "pub struct {snapshot_name} {{").unwrap();
 
     for field in &schema.fields {

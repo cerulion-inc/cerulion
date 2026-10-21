@@ -2012,7 +2012,10 @@ A `.srv` file is a request body and a response body split by one `---` line. Eac
 part parses as its own message in the package of the service, named as ROS 2 names
 it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
 `std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
-a ROS 2 peer on `rmw_cerulion` agree on the hash of each part.
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part. The generated Rust
+types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
+`SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
+code generated from a `.srv` passes `clippy -D warnings`.
 
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
