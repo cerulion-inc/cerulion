@@ -581,9 +581,8 @@ impl EmbeddedRuntime {
                 // snapshot to take yet - roll back to EMPTY serving below.
                 first_surface = true;
             }
-            // The replace snapshot must cover EVERY served topic - including
-            // schema-less outputs, which carry no topic_schemas binding - or
-            // the filtered catalog would drop them on a restart.
+            // The served set names EVERY served topic, including schema-less
+            // outputs, which carry no topic_schemas binding.
             let mut served = serving.clone();
             {
                 let mut announce = graph_topics.clone();
@@ -656,9 +655,9 @@ impl EmbeddedRuntime {
                         announce.push(publish.topic.clone());
                     }
                 }
-                // The replace snapshot must cover EVERY served topic -
-                // including schema-less outputs, which carry no topic_schemas
-                // binding - or the filtered catalog would drop them.
+                // The served set must name EVERY served topic - including
+                // schema-less outputs, which carry no topic_schemas binding -
+                // or the retirement below would drop them.
                 let mut serving_clone = serving.clone();
                 serving_clone.served_topics = announce.clone();
                 let plan = GatewayPlan {
@@ -667,9 +666,9 @@ impl EmbeddedRuntime {
                     ingress: Vec::new(),
                 };
                 // The process-wide query surface may outlive the prior
-                // gateway: install the new snapshot BEFORE construction
+                // gateway: install the new schema serving BEFORE construction
                 // registers topics and exposes the restarted gateway, or the
-                // latched callback keeps filtering through the prior snapshot.
+                // latched callback keeps naming topics from the prior run.
                 if let Some(live) = manager
                     .network()
                     .and_then(|network| network.query_surface_serving_handles())
