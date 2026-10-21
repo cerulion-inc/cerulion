@@ -454,7 +454,7 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node; only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
 | `tls` | Certificate files for `quic/` locators (see below). |
 
@@ -595,7 +595,8 @@ Strict block, which topics cross the machine boundary is declared in YAML.
 
 - **Egress = a per-graph export SCOPE.** An `egress` topic must be
   graph-OWNED: produced by an in-graph node, under its derived name
-  (`/{prefix}/{node}/{output}`) or a `topic:` override. The gateway
+  (`/{prefix}/{node}/{output}`) or a `topic:` override, unless the entry is
+  marked `external: true` (below). The gateway
   announces exactly the declared list and taps only a declared topic a
   remote actually demands. A remote demand for an UNdeclared produced topic
   is refused at the bridge scoping filter (its flag structurally never
@@ -615,6 +616,34 @@ Strict block, which topics cross the machine boundary is declared in YAML.
   gateway booted still sees the announces: every declared egress topic
   carries a standing announce token, so discovery is not a race.
 
+### Topics published outside the graph
+
+A process outside the graph file can publish on this machine's shared
+memory: a ROS 2 program running on `rmw_cerulion`, for example. Under a
+Strict block its topic leaves the machine only when `egress:` lists it, and
+the entry says it has no in-graph producer:
+
+```yaml
+network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  egress:
+    - /robot/odom              # produced by a node in this graph
+    - topic: /chatter
+      external: true           # published by a ROS 2 program on rmw_cerulion
+```
+
+The gateway announces `/chatter` from boot and taps it when a remote demands
+it. Until the outside program has created the topic, the tap attach fails,
+is counted, logs once at warn, and is retried on every gateway pass. An
+outside topic that `egress:` does not list is still announced when its
+publisher registers it, and a remote demand for it is refused at the bridge
+scoping filter, so none of its frames leave the machine.
+`external: true` on a topic an in-graph node produces is a graph-load error,
+and so is an unmarked entry with no in-graph producer; that error names the
+`external: true` spelling.
+
 ### Loop-safety rules (graph-load validation)
 
 Every rejection names the offending topic or setting and states the fix:
@@ -622,7 +651,8 @@ Every rejection names the offending topic or setting and states the fix:
 1. **No topic in both lists** (it would loop back to itself): remove it
    from one list. The gateway ALSO refuses a plan whose announce and ingress
    sets intersect, as a structural backstop.
-2. **Egress must be produced in-graph.**
+2. **Egress must be produced in-graph**, unless the entry is `external:
+   true`; an `external: true` entry must NOT be produced in-graph.
 3. **Ingress must NOT be produced in-graph.**
 4. **Canonical absolute names only** (bare names rejected with the expected
    `/`-prefixed form; malformed shapes rejected like any topic name).

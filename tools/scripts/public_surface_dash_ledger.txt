@@ -129,7 +129,7 @@
 33 crates/cerulion_core/src/graph/partition.rs
 103 crates/cerulion_core/src/graph/runtime.rs
 20 crates/cerulion_core/src/graph/topology.rs
-34 crates/cerulion_core/src/graph/validation.rs
+33 crates/cerulion_core/src/graph/validation.rs
 1 crates/cerulion_core/src/graph/waitset.rs
 4 crates/cerulion_core/src/lat_probe.rs
 1 crates/cerulion_core/src/lib.rs
