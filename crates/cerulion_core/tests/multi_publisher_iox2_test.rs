@@ -1334,7 +1334,10 @@ fn foreign_default_service_locks_out_listed_graph_with_multi_hint() {
     let _foreign = raw_node
         .service_builder(&data_name)
         .publish_subscribe::<[u8]>()
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign service at iceoryx2 defaults");
 
     let mgr = manager("foreign_lockout", ix);

@@ -115,7 +115,17 @@ use serde::{Deserialize, Serialize};
 /// wire (see [`RunsQueryResponse::discovery`]), so there is no absent-field default to
 /// distrust; its one optional field, `plane_unsettled_ms`, means UNKNOWN when absent
 /// and suppresses nothing.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// `8`: the [`Hello`] banner states the daemon's
+/// [`WIRE_HEADER_VERSION`](cerulion_core::wire::WIRE_HEADER_VERSION) in a new
+/// `wire_header` field. netd re-injects remote frames into this machine's shared
+/// memory, so a client and a daemon built at different wire header versions
+/// would read each other's frames at the wrong offsets; the client refuses such a
+/// daemon at the handshake, naming the remedy. A daemon older than the field omits
+/// it, and its absence decodes as version 1, the header every such daemon carries:
+/// a true statement, not a positive claim the old daemon cannot make, so no trust
+/// floor is needed. Every verb's request and response shape is unchanged.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The minimum daemon [`PROTOCOL_VERSION`] that serves the `query_runs`
 /// verb — the version that INTRODUCED it, frozen here rather than spelled inline so
@@ -162,14 +172,25 @@ pub struct Hello {
     pub hello: String,
     /// The [`PROTOCOL_VERSION`] this daemon speaks.
     pub protocol: u32,
+    /// The [`WIRE_HEADER_VERSION`](cerulion_core::wire::WIRE_HEADER_VERSION)
+    /// of the frames this daemon re-injects. Absent (a daemon older than
+    /// protocol 8) decodes as 1.
+    #[serde(default = "hello_wire_header_absent")]
+    pub wire_header: u16,
+}
+
+/// The wire header version a banner without the field states: 1.
+fn hello_wire_header_absent() -> u16 {
+    1
 }
 
 impl Hello {
-    /// The banner for THIS daemon's protocol version.
+    /// The banner for THIS daemon's protocol and wire header versions.
     pub fn new() -> Self {
         Self {
             hello: HELLO_MARKER.to_string(),
             protocol: PROTOCOL_VERSION,
+            wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
         }
     }
 
@@ -1096,6 +1117,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["hello"], "cerulion-netd");
         assert_eq!(v["protocol"], PROTOCOL_VERSION);
+        assert_eq!(v["wire_header"], cerulion_core::wire::WIRE_HEADER_VERSION);
+    }
+
+    /// Protocol 8 added the banner's `wire_header`; a banner from an older
+    /// daemon (literal JSON, no such key) decodes as wire header version 1.
+    #[test]
+    fn a_banner_without_wire_header_decodes_as_version_1() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        let old: Hello =
+            serde_json::from_str(r#"{"hello":"cerulion-netd","protocol":7}"#).expect("decodes");
+        assert_eq!(old.wire_header, 1);
+        assert_eq!(old.protocol, 7);
+        let new: Hello =
+            serde_json::from_str(r#"{"hello":"cerulion-netd","protocol":8,"wire_header":2}"#)
+                .expect("decodes");
+        assert_eq!(new.wire_header, 2);
     }
 
     #[test]
@@ -1287,6 +1324,7 @@ mod tests {
         let cat = Response::CatalogQuery(CatalogQueryResponse {
             id: 5,
             catalogs: vec![CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: 1,
                 robot: "ubuntu".to_string(),
                 entries: vec![CatalogEntry {
@@ -1396,6 +1434,7 @@ mod tests {
         let resp = Response::CatalogQuery(CatalogQueryResponse {
             id: 11,
             catalogs: vec![CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: 1,
                 robot: "go2".to_string(),
                 entries: vec![
@@ -1851,8 +1890,8 @@ mod tests {
             "the runs verb gates on the version that introduced it"
         );
         assert_eq!(RUNS_MIN_DAEMON_VERSION, 7);
-        assert_eq!(
-            PROTOCOL_VERSION, 7,
+        assert!(
+            PROTOCOL_VERSION >= 7,
             "the banner bump is what makes the per-verb gate reachable"
         );
 

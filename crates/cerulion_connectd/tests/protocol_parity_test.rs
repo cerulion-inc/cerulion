@@ -44,6 +44,7 @@ where
 /// A catalog reply carrying both a hashed and a silent (None) topic.
 fn a_catalog() -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: "go2".to_string(),
         entries: vec![

@@ -10420,6 +10420,7 @@ mod tests {
     fn catalog(robot: &str, topic: &str, schema_name: Option<&str>) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -10465,6 +10466,7 @@ mod tests {
     fn multi_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> CatalogReply {
         use cerulion_core::CatalogProvenance;
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: entries
@@ -10575,6 +10577,7 @@ mod tests {
         use cerulion_core::CatalogProvenance;
         use std::collections::BTreeSet;
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -10655,6 +10658,7 @@ mod tests {
             liveness,
         };
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -11201,6 +11205,7 @@ mod tests {
         // (c) A REFUSED catalog serves nothing by definition, so its emptiness says
         //     nothing about any topic.
         let refused = cerulion_core::CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: Vec::new(),
@@ -11792,6 +11797,7 @@ mod tests {
         // `Settled` case that must still make the terminal claim.
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         let served = |topic: &str| CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
@@ -11984,6 +11990,7 @@ mod tests {
     fn catalog_reply_for_test(robot: &str, topic: &str) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -14440,6 +14447,7 @@ mod monitor_snapshot_tests {
     /// A catalog reply carrying `entries`, each with the liveness handed in.
     fn catalog(robot: &str, entries: &[(&str, Option<TopicLiveness>)]) -> CatalogReply {
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
             robot: robot.to_string(),
             entries: entries

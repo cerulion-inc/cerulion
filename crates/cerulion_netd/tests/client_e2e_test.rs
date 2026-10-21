@@ -884,6 +884,7 @@ fn bind_and_serve_banner_when(
             let banner = Hello {
                 hello: HELLO_MARKER.to_string(),
                 protocol: PROTOCOL_VERSION,
+                wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
             }
             .to_json_line();
             let _ = writeln!(stream, "{banner}");
@@ -1682,6 +1683,7 @@ fn serve_crafted_banner(tag: &str, protocol: u32) -> (PathBuf, PathBuf) {
             let banner = Hello {
                 hello: HELLO_MARKER.to_string(),
                 protocol,
+                wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
             }
             .to_json_line();
             let _ = writeln!(stream, "{banner}");
@@ -1749,6 +1751,7 @@ fn client_refuses_a_daemon_too_old_for_the_baseline() {
 fn client_query_catalog_and_schema_round_trip_against_a_real_daemon() {
     let (netd, dir, sock, query_spy) = start_daemon_with_query("query");
     *query_spy.catalogs.lock().unwrap() = vec![CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: "ubuntu".to_string(),
         entries: vec![CatalogEntry {

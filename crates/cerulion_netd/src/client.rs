@@ -891,6 +891,16 @@ impl NetdClient {
                 hello.protocol
             )));
         }
+        if hello.wire_header != cerulion_core::wire::WIRE_HEADER_VERSION {
+            return Err(ClientError::Protocol(format!(
+                "cerulion-netd re-injects frames with wire header version {} but this client \
+                 reads version {}, so every frame it delivered would be read at the wrong \
+                 offsets. The running daemon belongs to a different Cerulion release: stop it \
+                 (it restarts on next use) or install the same release for both.",
+                hello.wire_header,
+                cerulion_core::wire::WIRE_HEADER_VERSION
+            )));
+        }
         client.daemon_protocol = hello.protocol;
         Ok(client)
     }
@@ -2655,6 +2665,67 @@ mod tests {
         ));
     }
 
+    /// A daemon whose banner states another wire header version is refused at
+    /// the handshake (every frame it re-injected would be misread here), naming
+    /// both versions and the remedy. A banner from a daemon older than the field
+    /// states version 1, so it is refused exactly when this build is not version 1.
+    #[test]
+    fn a_daemon_at_another_wire_header_version_is_refused_at_the_handshake() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        fn serve(banner: String) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "cer_netd_wirehdr_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("netd.sock");
+            let listener = UnixListener::bind(&sock).expect("bind");
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = writeln!(stream, "{banner}");
+                    let _ = stream.flush();
+                    let mut buf = [0u8; 64];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                }
+            });
+            sock
+        }
+
+        let ours = cerulion_core::wire::WIRE_HEADER_VERSION;
+        let other = ours + 1;
+        let sock = serve(format!(
+            r#"{{"hello":"cerulion-netd","protocol":{PROTOCOL_VERSION},"wire_header":{other}}}"#
+        ));
+        let err = NetdClient::connect_existing_at(sock)
+            .err()
+            .expect("a daemon at another wire header version must be refused");
+        let text = err.to_string();
+        assert!(matches!(err, ClientError::Protocol(_)), "got: {text}");
+        assert!(
+            text.contains(&format!("wire header version {other}"))
+                && text.contains(&format!("reads version {ours}")),
+            "names both versions: {text}"
+        );
+        assert!(text.contains("stop it"), "names the remedy: {text}");
+
+        let sock = serve(format!(
+            r#"{{"hello":"cerulion-netd","protocol":{PROTOCOL_VERSION},"wire_header":{ours}}}"#
+        ));
+        let client = NetdClient::connect_existing_at(sock).expect("a matching daemon connects");
+        assert_eq!(client.daemon_protocol(), PROTOCOL_VERSION);
+
+        // A banner without the field (a daemon older than protocol 8) is version 1.
+        let sock = serve(r#"{"hello":"cerulion-netd","protocol":7}"#.to_string());
+        let legacy = NetdClient::connect_existing_at(sock);
+        assert_eq!(legacy.is_ok(), ours == 1, "absent means version 1");
+    }
+
     #[test]
     fn reconnect_adopts_the_fresh_daemon_protocol_version() {
         // A reconnect can land on a different-version daemon (a v2
@@ -2689,6 +2760,7 @@ mod tests {
                         let banner = Hello {
                             hello: HELLO_MARKER.to_string(),
                             protocol,
+                            wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
                         }
                         .to_json_line();
                         let _ = writeln!(stream, "{banner}");
@@ -2762,6 +2834,7 @@ mod tests {
                 let banner = Hello {
                     hello: HELLO_MARKER.to_string(),
                     protocol,
+                    wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
                 }
                 .to_json_line();
                 let _ = writeln!(w, "{banner}");
@@ -2917,6 +2990,7 @@ mod tests {
                 let banner = Hello {
                     hello: HELLO_MARKER.to_string(),
                     protocol,
+                    wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
                 }
                 .to_json_line();
                 let _ = writeln!(w, "{banner}");

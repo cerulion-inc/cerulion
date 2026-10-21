@@ -5081,6 +5081,7 @@ fn discover_over_many_silent_topics_is_bounded() {
 fn oracle_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: entries
@@ -8652,6 +8653,7 @@ fn plan_has_view_named(plan: &BlueprintPlan, name: &str) -> bool {
 fn big_catalog(robot: &str, n: usize) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: (0..n)
@@ -12255,6 +12257,7 @@ fn liveness_catalog(
 ) -> cerulion_core::CatalogReply {
     use cerulion_core::{CatalogEntry, CatalogProvenance};
     cerulion_core::CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: entries

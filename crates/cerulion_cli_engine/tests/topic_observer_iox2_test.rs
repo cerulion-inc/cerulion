@@ -143,7 +143,10 @@ impl RawTopicWriter {
             .publish_subscribe::<[u8]>()
             // Room for several frames between the observer's drains.
             .subscriber_max_buffer_size(16)
-            .create()
+            .create_with_attributes(
+                &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                    .expect("attribute"),
+            )
             .expect("raw data service");
         let publisher = data_service
             .publisher_builder()

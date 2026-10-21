@@ -727,6 +727,7 @@ mod tests {
             liveness: None,
         };
         let catalog = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             // A hostile robot NAME: CSI screen-clear + CR + newline.
             robot: "go\u{1b}[2J2\rx\ny".to_string(),

@@ -1757,6 +1757,7 @@ mod tests {
                 return Ok(Vec::new());
             }
             Ok(vec![CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
                 robot: "go2".to_string(),
                 entries: vec![cerulion_core::CatalogEntry {

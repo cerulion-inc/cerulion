@@ -60,6 +60,7 @@ pub(crate) mod shm_guard;
 mod shm_sample;
 pub mod subscriber;
 pub mod uds_write;
+pub mod wire_header_attribute;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
 #[doc(hidden)]
@@ -1812,6 +1813,15 @@ fn publish_subscribe_open_env_hint(
              Cerulion version) or a foreign iceoryx2 service \
              squatting on this topic name"
         }
+        PublishSubscribeOpenError::IncompatibleAttributes => {
+            "; the existing service does not state this build's wire header \
+             version: it was created by a process from a different Cerulion \
+             release (or by a raw iceoryx2 program that did not define the \
+             `cerulion.wire_header_version` attribute), so its frames would be \
+             read at the wrong offsets. Stop the processes from the other \
+             release, rebuild node libraries against the installed `cerulion` \
+             (`cerulion node build`), and retry"
+        }
         PublishSubscribeOpenError::HangsInCreation => {
             "; a peer crashed while creating this service — remove \
              the stale iceoryx2 shared-memory artifacts (or reboot) \
@@ -3088,7 +3098,9 @@ impl TransportManager {
             .node
             .service_builder(&name)
             .publish_subscribe::<[u8]>()
-            .open_or_create()
+            .open_or_create_with_attributes(
+                &wire_header_attribute::data_service_verifier().expect("attribute"),
+            )
             .expect("create default service");
         svc.static_config().subscriber_max_borrowed_samples()
     }
@@ -5137,11 +5149,12 @@ impl TransportManager {
         // service is deliberately never opened: a data-only tap must not register
         // with, or even reference, the topic's event service (the
         // invisibility property).
+        let wire_header = wire_header_attribute::data_service_verifier()?;
         let data_service = self
             .node
             .service_builder(&data_service_name)
             .publish_subscribe::<[u8]>()
-            .open()
+            .open_with_attributes(&wire_header)
             .map_err(|e| {
                 use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
                 let hint = if matches!(e, PublishSubscribeOpenError::DoesNotExist) {
@@ -5338,11 +5351,12 @@ impl TransportManager {
             .try_into()
             .map_err(|e| map_err(format!("{}", e)))?;
 
+        let wire_header = wire_header_attribute::data_service_verifier()?;
         let data_service = self
             .node
             .service_builder(&data_service_name)
             .publish_subscribe::<[u8]>()
-            .open()
+            .open_with_attributes(&wire_header)
             .map_err(|e| {
                 use iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenError;
                 // Open-only parity: the missing-topic arm is
@@ -6435,6 +6449,10 @@ impl TransportManager {
         // `create_subscriber_floor`, see `TopicServiceConfig::create_port_caps`):
         // the OPEN leg arms only `max_publishers` / `max_subscribers`, the
         // CREATE leg the floored values.
+        // Every data service states the wire header version its frames carry,
+        // and every opener requires it (see `wire_header_attribute`).
+        let wire_header_verifier = wire_header_attribute::data_service_verifier()?;
+        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let (create_publishers, create_subscribers) = topic_config
             .create_port_caps((node_defaults.max_publishers, node_defaults.max_subscribers));
@@ -6453,7 +6471,7 @@ impl TransportManager {
             // at or above the floor, port floors at or below the requirement
             // or the node default): iceoryx2's native loop is exactly
             // equivalent — keep the single call.
-            make_data_builder(open_leg).open_or_create()
+            make_data_builder(open_leg).open_or_create_with_attributes(&wire_header_verifier)
         } else {
             use iceoryx2::service::builder::publish_subscribe::{
                 PublishSubscribeCreateError, PublishSubscribeOpenError,
@@ -6462,14 +6480,14 @@ impl TransportManager {
             open_then_create(
                 self.node.config().global.creation_timeout,
                 PublishSubscribeOpenOrCreateError::SystemInFlux,
-                || make_data_builder(open_leg).open(),
+                || make_data_builder(open_leg).open_with_attributes(&wire_header_verifier),
                 |e| match e {
                     PublishSubscribeOpenError::DoesNotExist => OpenStep::Create,
                     PublishSubscribeOpenError::HangsInCreation
                     | PublishSubscribeOpenError::IsMarkedForDestruction => OpenStep::Wait,
                     _ => OpenStep::Fail,
                 },
-                || make_data_builder(create_leg).create(),
+                || make_data_builder(create_leg).create_with_attributes(&wire_header_specifier),
                 |e| {
                     matches!(
                         e,

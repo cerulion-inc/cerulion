@@ -47,7 +47,8 @@ use super::run_artifacts;
 use super::run_registry;
 use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
-use crate::wire::WireHeader;
+use crate::wire::{WireHeader, WIRE_HEADER_VERSION};
+use super::failure_regime_latch::{lock_regime_latch, FailureRegimeLatch, RegimeDecision};
 
 // Re-entrant READ acquire for `announce_gate`: the demand queryable and the
 // liveliness Put arm hold the gate's read guard across a reply that can itself
@@ -405,6 +406,28 @@ const ACK_ENABLED: &[u8] = b"enabled";
 /// See [`ACK_ENABLED`]. Returned for an allow-list miss / unregistered / a
 /// suppressed producer.
 const ACK_REFUSED: &[u8] = b"refused";
+/// See [`ACK_ENABLED`]. Returned, without enabling egress, when the demand GET
+/// states a [`WireHeader`] version other than this build's
+/// [`WIRE_HEADER_VERSION`] (or a malformed one): the two sides would read each
+/// other's frames at the wrong offsets.
+const ACK_REFUSED_WIRE_HEADER: &[u8] = b"refused:wire-header";
+
+/// The demand GET payload: this build's [`WIRE_HEADER_VERSION`], two bytes
+/// little-endian.
+fn demand_get_payload() -> [u8; 2] {
+    WIRE_HEADER_VERSION.to_le_bytes()
+}
+
+/// The wire header version a demand GET payload states. A GET with NO payload
+/// comes from a demander that predates the handshake, which speaks version 1. A
+/// payload that is not exactly two bytes states no version at all (`None`).
+fn demand_payload_wire_header_version(payload: Option<&[u8]>) -> Option<u16> {
+    match payload {
+        None => Some(1),
+        Some(&[lo, hi]) => Some(u16::from_le_bytes([lo, hi])),
+        Some(_) => None,
+    }
+}
 
 /// The synthetic RESOURCE label the `catalog` verb passes to the
 /// [`DemandAuthorizer`] gate. The catalog enumerates the WHOLE machine (no single
@@ -871,6 +894,12 @@ pub struct GetDemandState {
     refusals: AtomicU64,
     /// cumulative GET-expiry disables applied by the reconciler thread.
     expiries: AtomicU64,
+    /// cumulative GETs refused because the demander's wire header version is
+    /// not this build's (counted inside [`Self::wire_header_latch`] too).
+    wire_header_refusals: AtomicU64,
+    /// flood suppression for the wire header refusal: loud on the first one of
+    /// a run, counted repeats, re-armed by the next accepted GET.
+    wire_header_latch: Mutex<FailureRegimeLatch>,
 }
 
 impl GetDemandState {
@@ -911,6 +940,60 @@ impl GetDemandState {
         self.expiries.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): cumulative GETs refused with
+    /// `refused:wire-header` (the demander's wire header version differs from
+    /// this build's, or its GET stated none this build can read).
+    pub fn wire_header_refusal_count(&self) -> u64 {
+        self.wire_header_refusals.load(Ordering::Relaxed)
+    }
+
+    /// The wire header gate of one demand GET, run before any grant decision:
+    /// `Some(ack)` refuses it (counted, loud on the first of a run, egress
+    /// untouched), `None` lets the grant decision run.
+    fn wire_header_gate(&self, canonical: &str, payload: Option<&[u8]>) -> Option<&'static [u8]> {
+        let peer = demand_payload_wire_header_version(payload);
+        if peer == Some(WIRE_HEADER_VERSION) {
+            if let Some(suppressed) = lock_regime_latch(&self.wire_header_latch).on_success() {
+                tracing::info!(
+                    topic = %canonical,
+                    suppressed,
+                    "demand GET wire header versions agree again; the refusals stopped"
+                );
+            }
+            return None;
+        }
+        self.wire_header_refusals.fetch_add(1, Ordering::Relaxed);
+        let peer_text = match peer {
+            Some(v) => v.to_string(),
+            None => "unreadable".to_string(),
+        };
+        match lock_regime_latch(&self.wire_header_latch).on_failure() {
+            RegimeDecision::Loud => tracing::warn!(
+                topic = %canonical,
+                peer_wire_header = %peer_text,
+                local_wire_header = WIRE_HEADER_VERSION,
+                "demand REFUSED: the demanding machine runs a Cerulion build with a different \
+                 wire header version, so neither side could read the other's frames; serving \
+                 nothing. Install the same Cerulion release on both machines"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                topic = %canonical,
+                peer_wire_header = %peer_text,
+                local_wire_header = WIRE_HEADER_VERSION,
+                total_failures = total,
+                suppressed,
+                "demand GETs still refused for a wire header version mismatch"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                topic = %canonical,
+                peer_wire_header = %peer_text,
+                suppressed,
+                "demand GET refused for a wire header version mismatch (repeat)"
+            ),
+        }
+        Some(ACK_REFUSED_WIRE_HEADER)
+    }
+
     /// Observable state (Principle #3): the canonical topics currently GET-granted
     /// (holding egress via a fresh-enough GET), SORTED for deterministic
     /// assertions. Poison-recovering.
@@ -943,6 +1026,11 @@ pub struct DemandGetState {
     enabled_acks: AtomicU64,
     /// cumulative replies acking "refused".
     refused_acks: AtomicU64,
+    /// cumulative replies acking "refused:wire-header" (the producer runs a
+    /// build with a different wire header version).
+    wire_header_refused_acks: AtomicU64,
+    /// flood suppression for the wire header refusals this demander receives.
+    wire_header_latch: Mutex<FailureRegimeLatch>,
     /// once-per-regime GET-failure latch (loud-once; a dead link must not flood).
     fail: Mutex<GatherFailureLatch>,
 }
@@ -1004,6 +1092,45 @@ impl DemandGetState {
     /// Observable state (Principle #3): cumulative replies acking "refused".
     pub fn refused_ack_count(&self) -> u64 {
         self.refused_acks.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): cumulative replies acking
+    /// "refused:wire-header".
+    pub fn wire_header_refused_ack_count(&self) -> u64 {
+        self.wire_header_refused_acks.load(Ordering::Relaxed)
+    }
+
+    /// Tally one demand ack. A grant re-arms the wire header latch; a wire
+    /// header refusal is counted and loud on the first of a run.
+    fn record_ack(&self, topic: &str, ack: &[u8]) {
+        if ack == ACK_ENABLED {
+            self.enabled_acks.fetch_add(1, Ordering::Relaxed);
+            lock_regime_latch(&self.wire_header_latch).on_success();
+        } else if ack == ACK_REFUSED {
+            self.refused_acks.fetch_add(1, Ordering::Relaxed);
+        } else if ack == ACK_REFUSED_WIRE_HEADER {
+            self.wire_header_refused_acks.fetch_add(1, Ordering::Relaxed);
+            match lock_regime_latch(&self.wire_header_latch).on_failure() {
+                RegimeDecision::Loud => tracing::warn!(
+                    topic = %topic,
+                    local_wire_header = WIRE_HEADER_VERSION,
+                    "demand REFUSED by the producing machine: it runs a Cerulion build with a \
+                     different wire header version, so this topic cannot be received from it. \
+                     Install the same Cerulion release on both machines"
+                ),
+                RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                    topic = %topic,
+                    total_failures = total,
+                    suppressed,
+                    "demand still refused by the producer for a wire header version mismatch"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    topic = %topic,
+                    suppressed,
+                    "demand refused by the producer for a wire header version mismatch (repeat)"
+                ),
+            }
+        }
     }
 
     /// Observable state (Principle #3): the harvested producer identities, SORTED. Empty
@@ -1627,6 +1754,7 @@ fn handle_demand_verb(
     authorizer: &dyn DemandAuthorizer,
     canonical: &str,
 ) {
+    let payload = query.payload().map(|p| p.to_bytes());
     let ack: &[u8] = if suppress.load(Ordering::Relaxed) {
         // Suppress arm (test seam): a NON-flipping demand path - reply REFUSED
         // without `enable_bridge`, a keepalive stamp, OR the probe. It touches no
@@ -1637,6 +1765,8 @@ fn handle_demand_verb(
         );
         get_state.record_refusal();
         ACK_REFUSED
+    } else if let Some(refusal) = get_state.wire_header_gate(canonical, payload.as_deref()) {
+        refusal
     } else {
         demand_grant_decision(
             bridge_mgr,
@@ -2598,6 +2728,7 @@ fn run_demand_get_pass_on_session(
             }
             match session
                 .get(selector.as_str())
+                .payload(demand_get_payload().to_vec())
                 .timeout(DEMAND_GET_TIMEOUT)
                 .wait()
             {
@@ -2607,12 +2738,7 @@ fn run_demand_get_pass_on_session(
                     while let Ok(reply) = replies.recv() {
                         if let Ok(sample) = reply.into_result() {
                             let payload = sample.payload().to_bytes();
-                            let bytes = payload.as_ref();
-                            if bytes == ACK_ENABLED {
-                                demand_state.enabled_acks.fetch_add(1, Ordering::Relaxed);
-                            } else if bytes == ACK_REFUSED {
-                                demand_state.refused_acks.fetch_add(1, Ordering::Relaxed);
-                            }
+                            demand_state.record_ack(topic, payload.as_ref());
                         }
                     }
                 }
@@ -6821,13 +6947,114 @@ mod tests {
         );
     }
 
-    /// ACK payloads are the two distinct control tokens the demander
+    /// ACK payloads are the three distinct control tokens the demander
     /// distinguishes.
     #[test]
     fn demand_ack_constants_are_distinct() {
         assert_eq!(ACK_ENABLED, b"enabled");
         assert_eq!(ACK_REFUSED, b"refused");
+        assert_eq!(ACK_REFUSED_WIRE_HEADER, b"refused:wire-header");
         assert_ne!(ACK_ENABLED, ACK_REFUSED);
+        assert_ne!(ACK_ENABLED, ACK_REFUSED_WIRE_HEADER);
+        assert_ne!(ACK_REFUSED, ACK_REFUSED_WIRE_HEADER);
+    }
+
+    /// The demand GET payload is the wire header version as two little-endian
+    /// bytes; no payload reads as version 1 (a demander older than the
+    /// handshake); any other length reads as no version.
+    #[test]
+    fn demand_payload_states_the_wire_header_version_and_absence_means_version_1() {
+        assert_eq!(demand_get_payload(), [0x01, 0x00]);
+        assert_eq!(demand_payload_wire_header_version(None), Some(1));
+        assert_eq!(demand_payload_wire_header_version(Some(&[0x01, 0x00])), Some(1));
+        assert_eq!(demand_payload_wire_header_version(Some(&[0x02, 0x00])), Some(2));
+        assert_eq!(
+            demand_payload_wire_header_version(Some(&[0x34, 0x12])),
+            Some(0x1234)
+        );
+        assert_eq!(demand_payload_wire_header_version(Some(&[])), None);
+        assert_eq!(demand_payload_wire_header_version(Some(&[0x01])), None);
+        assert_eq!(
+            demand_payload_wire_header_version(Some(&[0x01, 0x00, 0x00])),
+            None
+        );
+        // Our own payload always passes our own gate.
+        assert_eq!(
+            demand_payload_wire_header_version(Some(&demand_get_payload())),
+            Some(WIRE_HEADER_VERSION)
+        );
+    }
+
+    /// The producer's wire header gate: a matching version (and an absent
+    /// payload, which is version 1) passes without counting; a different or
+    /// unreadable version is refused with `refused:wire-header`, counted every
+    /// time, loud once per run, and re-armed by the next passing GET. It never
+    /// grants: `granted_topics` stays empty.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_demand_from_a_different_wire_header_version_is_refused_counted_and_loud_once() {
+        let state = GetDemandState::default();
+        assert_eq!(state.wire_header_gate("/a", Some(&[0x01, 0x00])), None);
+        assert_eq!(state.wire_header_gate("/a", None), None);
+        assert_eq!(state.wire_header_refusal_count(), 0);
+
+        for _ in 0..3 {
+            assert_eq!(
+                state.wire_header_gate("/a", Some(&[0x63, 0x00])),
+                Some(ACK_REFUSED_WIRE_HEADER)
+            );
+        }
+        assert_eq!(
+            state.wire_header_gate("/a", Some(&[0x01])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 4);
+        assert!(state.granted_topics().is_empty(), "a refusal never grants");
+        assert_eq!(state.grant_count(), 0);
+        assert_eq!(state.refusal_count(), 0, "a distinct counter from the allow list's");
+
+        // A passing GET closes the run; the next mismatch is loud again.
+        assert_eq!(state.wire_header_gate("/a", Some(&[0x01, 0x00])), None);
+        assert_eq!(
+            state.wire_header_gate("/b", Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 5);
+        logs_assert(|lines: &[&str]| {
+            let loud = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("demand REFUSED: the demanding machine"))
+                .count();
+            match loud {
+                2 => Ok(()),
+                n => Err(format!("expected 2 loud refusals (one per run), got {n}")),
+            }
+        });
+    }
+
+    /// The demander tallies each ack class into its own counter.
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_demander_counts_each_ack_class_and_warns_once_on_a_wire_header_refusal() {
+        let state = DemandGetState::default();
+        state.record_ack("/a", ACK_ENABLED);
+        state.record_ack("/a", ACK_REFUSED);
+        state.record_ack("/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("/a", b"something-newer");
+        assert_eq!(state.enabled_ack_count(), 1);
+        assert_eq!(state.refused_ack_count(), 1);
+        assert_eq!(state.wire_header_refused_ack_count(), 2);
+        logs_assert(|lines: &[&str]| {
+            let loud = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("demand REFUSED by the producing machine"))
+                .count();
+            match loud {
+                1 => Ok(()),
+                n => Err(format!("expected 1 loud refusal, got {n}")),
+            }
+        });
     }
 
     /// A validated frame whose local re-injection fails is

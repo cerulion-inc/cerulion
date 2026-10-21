@@ -20,6 +20,16 @@
 
 use std::mem::size_of;
 
+/// The version of the [`WireHeader`] layout this build reads and writes.
+///
+/// Every place a frame crosses a process or a file states it: the zenoh
+/// demand handshake, the network catalog, the `cerulion-netd` banner, the
+/// iceoryx2 service attribute and the bag schema descriptor. A peer, a
+/// service or a recording at a different version is refused loudly (or, for
+/// a recording, its frames are upgraded on read), never read at the wrong
+/// offsets. Version 1 is the 32-byte header.
+pub const WIRE_HEADER_VERSION: u16 = 1;
+
 /// Wire message header - fixed 32 bytes.
 ///
 /// Minimal header for zero-copy messaging. No magic/version/flags - iceoryx2

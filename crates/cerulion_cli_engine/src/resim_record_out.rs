@@ -397,6 +397,7 @@ mod tests {
                 hash_recipe: cerulion_core::trace::bag::HASH_RECIPE,
                 schema_hash: HASH,
                 wire_fixed_size: 8,
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             }),
             provisioning: ChannelProvisioning::default(),
         }
@@ -562,6 +563,7 @@ mod tests {
             hash_recipe: cerulion_core::trace::bag::HASH_RECIPE.wrapping_sub(1),
             schema_hash: HASH,
             wire_fixed_size: 8,
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         });
         legacy.schema_encoding = SCHEMA_ENCODING.to_string();
         let (plan, path) = plan(dir.path(), vec![legacy]);
@@ -645,6 +647,7 @@ mod tests {
             hash_recipe: cerulion_core::trace::bag::HASH_RECIPE,
             schema_hash: 0,
             wire_fixed_size: 8,
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         });
         let (mut plan, path) = plan(dir.path(), vec![placeholder]);
         plan.catalog = Some(catalog());

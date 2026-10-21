@@ -1257,9 +1257,11 @@ pub fn user_topic_schemas(channels: &[BagChannel]) -> CliResult<Vec<TopicSchema>
                 ch.topic, ch.schema_encoding
             )));
         };
-        if d.descriptor_version != DESCRIPTOR_VERSION
-            || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE
-        {
+        // A version 1 descriptor differs from the current one only by the wire
+        // header version it implies, which the decoder fills in; the hash
+        // fields mean the same thing in both, so it migrates.
+        let descriptor_readable = d.descriptor_version == 1 || d.descriptor_version == DESCRIPTOR_VERSION;
+        if !descriptor_readable || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE {
             return Err(CliError::Validation(format!(
                 "bag migrate: channel '{}' was recorded with schema descriptor version {} / hash \
                  recipe {}, and this build writes version {DESCRIPTOR_VERSION} / recipe {}. A \
@@ -3959,6 +3961,28 @@ mod tests {
             err.contains("did not compute them"),
             "must say what re-stamping would claim: {err}"
         );
+    }
+
+    #[test]
+    fn a_version_1_descriptor_channel_is_carried_and_an_unknown_version_is_refused() {
+        // A version 1 blob: 18 bytes, recipe 3, hash 0xAB, fixed size 12.
+        let mut v1 = [0u8; cerulion_bag::DESCRIPTOR_V1_LEN];
+        v1[0] = 1;
+        v1[2] = 3;
+        v1[6] = 0xAB;
+        v1[14] = 12;
+        let d = cerulion_bag::SchemaDescriptor::decode(&v1).expect("v1 decodes");
+        let got = user_topic_schemas(&[chan("/v1", Some(d))]).expect("a v1 channel migrates");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].schema_hash, 0xAB);
+        assert_eq!(got[0].wire_fixed_size, 12);
+
+        let mut unknown = cerulion_bag::SchemaDescriptor::new(0xAB, 12);
+        unknown.descriptor_version = 3;
+        let err = user_topic_schemas(&[chan("/v3", Some(unknown))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("schema descriptor version 3"), "got: {err}");
     }
 
     #[test]

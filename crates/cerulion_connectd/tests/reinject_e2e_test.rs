@@ -1067,6 +1067,7 @@ async fn multi_topic_interleaved_reinject_byte_identical_per_topic() {
 /// A single-topic catalog (the misbehaving robot lists the topic it will ACK).
 fn single_topic_catalog(robot: &str, topic: &str) -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
@@ -1271,6 +1272,7 @@ async fn catalog_then_stop_reading_robot(daemon: Endpoint, robot: &str) {
     // Answer exactly ONE request (the catalog), then never read again.
     let _ = read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await;
     let reply = WireResponse::Catalog(CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![],

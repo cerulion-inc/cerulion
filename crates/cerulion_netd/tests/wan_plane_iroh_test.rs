@@ -1017,6 +1017,7 @@ async fn recording_robot_recording_epochs(
         };
         let resp = match req {
             WireRequest::Catalog => WireResponse::Catalog(CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: CATALOG_WIRE_VERSION,
                 robot: "rec-robot".to_string(),
                 entries: catalog_topics
