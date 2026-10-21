@@ -75,7 +75,7 @@ fn serve_robot(robot: &str, base: u16) -> (NetworkManager, u16, Vec<TopicToken>)
                 "/r/plain".to_string(),
                 STD_MSGS_STRING_SCHEMA_HASH,
             )]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::from([(
                 "/r/widget".to_string(),
                 WIDGET.to_string(),
@@ -84,6 +84,7 @@ fn serve_robot(robot: &str, base: u16) -> (NetworkManager, u16, Vec<TopicToken>)
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
+            snapshot_lock: Arc::new(Mutex::new(())),
         },
         SchemaSource {
             docs: Arc::new(Mutex::new(BTreeMap::from([(
@@ -95,6 +96,7 @@ fn serve_robot(robot: &str, base: u16) -> (NetworkManager, u16, Vec<TopicToken>)
                     deps: vec![],
                 },
             )]))),
+            snapshot_lock: Arc::new(Mutex::new(())),
         },
         isolated_runs_source(),
     )

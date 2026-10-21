@@ -2055,7 +2055,7 @@ fn two_sites_share_a_ledger_key_only_if_they_share_a_message() {
 /// whether this line is the loud first of a regime or a counted repeat.
 const FORMERLY_COLLIDING_PAIR: (&str, &str) = (
     "cerulion_core/src/transport/network.rs",
-    "ingress: local publisher mutex poisoned — validated frame dr",
+    "ingress: local publisher mutex poisoned: validated frame dro",
 );
 
 #[test]

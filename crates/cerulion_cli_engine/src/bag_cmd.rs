@@ -5051,7 +5051,7 @@ impl Default for RecordOptions {
 /// and `bag info` can decode from the bag's own records into one they cannot
 /// (`NamedButUndecodable`). A bag is a record of what this machine knew; the
 /// place to state what a VIEWER will do with it is the reader-side
-/// report, which is [`bag_doc_is_viewable`]'s job and covers bags this recorder
+/// report, which is `bag_doc_is_viewable`'s job and covers bags this recorder
 /// never wrote.
 ///
 /// Never fails — an unreadable schema file is skipped with a `warn!` inside the
@@ -5059,7 +5059,7 @@ impl Default for RecordOptions {
 /// closure of the hashes actually recorded, not this whole corpus (see
 /// `BagSchemaCatalog::closure_for_hashes`), so a recording whose hashes resolve
 /// to nothing still writes no attachment at all.
-pub(crate) fn build_record_schema_catalog(
+pub fn build_record_schema_catalog(
     schemas_dir: Option<&Path>,
     bridge_config: Option<&Path>,
 ) -> Option<cerulion_bag::BagSchemaCatalog> {
