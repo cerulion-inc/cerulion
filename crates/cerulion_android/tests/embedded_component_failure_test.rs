@@ -114,11 +114,14 @@ fn a_retry_after_a_component_failure_starts_cleanly() {
     let second_path = files_dir.join("bags/second.mcap");
     assert_eq!(string_payloads(&second_path, &topic), ["after"]);
 
-    // LAN posture rollback after a failure that lands AFTER the gateway
-    // spawned (so teardown itself closes LAN access first). Each prior
-    // posture differs from - or equals - the applied `open`, so a skipped
-    // rollback and a rollback that compares against the applied value both
-    // fail here.
+    // LAN posture after a failed start. A failure once the start owns the
+    // gateway (here the node's init fails during the graph build) returns
+    // the manager to the paired baseline whatever the posture was before.
+    // A failure while the start is still planning (here the `bags`
+    // directory cannot be created) touches no shared state at all, so the
+    // posture stays as it was. Both prior postures run, so a start that
+    // opened LAN access early, or one that reset a planning failure, fails
+    // here.
     let manager = TransportManager::get().expect("the retry created the process manager");
     let network = manager.network().expect("gateway network");
     let node_lib_dir = fixture_dir();
@@ -134,9 +137,8 @@ fn a_retry_after_a_component_failure_starts_cleanly() {
     );
     for prior in [LanAccess::Paired, LanAccess::Open] {
         network.set_lan_access(prior);
-        // A failure BEFORE the gateway is built (the node's init fails during
-        // graph construction): teardown does not close LAN access here, so
-        // only the rollback can undo the applied `open`.
+        // The node's init fails during the graph build, after the start
+        // took the gateway and before LAN access opens.
         std::env::set_var("CER_FAIL_MODE", "init_fail");
         let error = runtime
             .start(
@@ -156,11 +158,12 @@ fn a_retry_after_a_component_failure_starts_cleanly() {
         );
         assert_eq!(
             network.lan_access(),
-            prior,
-            "a start that failed before its gateway must restore the prior LAN posture ({prior:?})"
+            LanAccess::Paired,
+            "a start that failed during its build must leave LAN access paired (prior {prior:?})"
         );
-        // A `bags` FILE makes the recorder's directory creation fail after
-        // the gateway worker is already running.
+        network.set_lan_access(prior);
+        // A `bags` FILE makes the recorder's directory creation fail while
+        // the start is still planning.
         let blocked = tempdir().unwrap();
         std::fs::write(blocked.path().join("bags"), b"not a directory").unwrap();
         let mut failing =
@@ -183,7 +186,7 @@ fn a_retry_after_a_component_failure_starts_cleanly() {
         assert_eq!(
             network.lan_access(),
             prior,
-            "a failed start must restore the prior LAN posture ({prior:?})"
+            "a start refused while planning must leave the LAN posture alone ({prior:?})"
         );
     }
 }

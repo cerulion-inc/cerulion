@@ -2329,22 +2329,20 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
     // The hook spawns the closer and returns WITHOUT joining it: joining
     // under the announce gate's read guard would deadlock the close's
     // write side, which waits for this announce to finish. Before returning,
-    // the hook proves the serialization actually holds: the closer signals
-    // just before `set_lan_access(Paired)`, and ~100 ms later it must still
-    // be alive, BLOCKED on the announce gate's write guard this announce
-    // holds. With the gate removed the closer finishes immediately and the
-    // is_finished assertion fails.
+    // the hook proves the serialization actually holds: the closer reports
+    // that its write lock on the announce gate is contended, which happens
+    // only while this announce holds the read guard. With the gate removed
+    // the closer never contends and the hook never returns.
     let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slot_for_hook = Arc::clone(&closer_slot);
     let manager_for_hook = Arc::clone(&manager);
-    // Fired inside `set_lan_access` just before the announce gate's write
-    // lock: proves the closer actually reached the gate's threshold, so the
-    // 100 ms window below measures the gate's wait, not a spawn delay.
+    // Fired inside `set_lan_access` when its write lock on the announce
+    // gate is contended, just before it blocks there.
     {
         let at_gate = Arc::clone(&closer_at_gate);
-        network.set_before_announce_gate_write_for_test(Some(Arc::new(move || {
+        network.set_on_announce_gate_contended_for_test(Some(Arc::new(move || {
             at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
         })));
     }
@@ -2359,30 +2357,24 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
                     .expect("network")
                     .set_lan_access(LanAccess::Paired);
             }));
+        // The closer contended on the gate this announce holds: it is
+        // parked on the write side until the announce releases its read
+        // guard. (The announce has not inserted its token yet at this hook
+        // point; the retained-token check lives in the after-insert hook
+        // below.)
         while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        // Evidence the close is actually BLOCKED, not merely unfinished: it
-        // must stay unfinished for the whole window this hook holds the read
-        // guard - with the gate removed the closer's write slips in and the
-        // thread finishes inside the first poll. (The announce has not
-        // inserted its token yet at this hook point; the retained-token check
-        // lives in the after-insert hook below.)
-        let window_end = std::time::Instant::now() + Duration::from_millis(300);
-        while std::time::Instant::now() < window_end {
-            let closer_finished = slot_for_hook
+        assert!(
+            !slot_for_hook
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .expect("closer handle")
-                .is_finished();
-            assert!(
-                !closer_finished,
-                "the closer finished while an announce was in flight: the \
-                 paired switch did not wait on the announce gate"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+                .is_finished(),
+            "the closer finished while an announce was in flight: the \
+             paired switch did not wait on the announce gate"
+        );
     })));
     // The token must have been retained first - otherwise the blocked-close
     // checks and the post-close observer prove nothing about a withdrawal
@@ -2445,7 +2437,7 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
         .announce_egress_topic(&topic)
         .expect("an announce that beats the close returns Ok");
     network.set_after_announce_posture_check_for_test(None);
-    network.set_before_announce_gate_write_for_test(None);
+    network.set_on_announce_gate_contended_for_test(None);
     network.set_after_announce_insert_for_test(None);
     assert!(
         token_retained.load(std::sync::atomic::Ordering::SeqCst),
@@ -2528,22 +2520,20 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     let go_path = dir.path().join("go");
     let endpoint = format!("tcp/127.0.0.1:{port}");
 
-    // Same serialization proof as the announce arm: the closer signals just
-    // before `set_lan_access(Paired)`; ~100 ms into the hook it must still be
-    // alive, blocked on the gate's WRITE side while the callback holds READ.
-    // With the callback's guard removed the closer finishes immediately and
-    // the is_finished assertion fails.
+    // Same serialization proof as the announce arm: the closer reports that
+    // its write lock on the gate is contended while the callback holds READ.
+    // With the callback's guard removed the closer never contends and the
+    // hook never returns.
     let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slot_for_hook = Arc::clone(&closer_slot);
     let manager_for_hook = Arc::clone(&manager);
-    // Fired inside `set_lan_access` just before the announce gate's write
-    // lock: proves the closer actually reached the gate's threshold, so the
-    // 100 ms window below measures the gate's wait, not a spawn delay.
+    // Fired inside `set_lan_access` when its write lock on the announce
+    // gate is contended, just before it blocks there.
     {
         let at_gate = Arc::clone(&closer_at_gate);
-        network.set_before_announce_gate_write_for_test(Some(Arc::new(move || {
+        network.set_on_announce_gate_contended_for_test(Some(Arc::new(move || {
             at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
         })));
     }
@@ -2561,24 +2551,16 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
         while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        // Same sustained evidence as the announce arm: blocked means staying
-        // unfinished for the whole held-read window, not one sample that a
-        // scheduling pause could fake.
-        let window_end = std::time::Instant::now() + Duration::from_millis(300);
-        while std::time::Instant::now() < window_end {
-            let closer_finished = slot_for_hook
+        assert!(
+            !slot_for_hook
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .expect("closer handle")
-                .is_finished();
-            assert!(
-                !closer_finished,
-                "the closer finished while a demand query was in flight: the \
-                 paired switch did not wait on the announce gate"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+                .is_finished(),
+            "the closer finished while a demand query was in flight: the \
+             paired switch did not wait on the announce gate"
+        );
     })));
 
     // Spawn the demander only now: both hooks are installed, so its first
@@ -2593,7 +2575,7 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled");
 
     network.set_after_demand_authorizer_read_for_test(None);
-    network.set_before_announce_gate_write_for_test(None);
+    network.set_on_announce_gate_contended_for_test(None);
     closer_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3037,7 +3019,7 @@ fn permissive_probe_refuses_an_ingress_topic_naming_the_loop() {
     // is fresh and only a HIT re-arms it), so the WARN token is required — the
     // debug repeat carries the same phrase and must not satisfy this.
     logs_assert(|lines: &[&str]| {
-        logged_at(lines, "WARN", "network INGRESS topic - echo-loop")
+        logged_at(lines, "WARN", "network INGRESS topic (echo-loop)")
             .map_err(|e| format!("the loop refusal names the ingress/echo-loop hazard — {e}"))
     });
 }
@@ -3188,7 +3170,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
             let loud = lines
                 .iter()
                 .filter(|l| {
-                    line_level(l) == Some(level) && (l.contains("(repeat - see the first warning)"))
+                    line_level(l) == Some(level) && (l.contains("(repeat; see the first warning)"))
                 })
                 .count();
             if loud != 0 {
@@ -3205,7 +3187,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
         // Counted AT DEBUG, not by text: a repeat re-emitted at `trace!` is
         // still one line, and the loud sweep above permits TRACE.
         let suppressed =
-            count_at_exclusively(lines, "DEBUG", &["(repeat - see the first warning)"])?;
+            count_at_exclusively(lines, "DEBUG", &["(repeat; see the first warning)"])?;
         if warns != 1 {
             return Err(format!("expected exactly 1 MISS warn, got {warns}"));
         }
@@ -4608,13 +4590,7 @@ fn c5c_demand_authorizer_refuses_denied_topic_on_both_lan_paths() {
 
     // The refusal is LOUD (Principle #3 / the loud-over-silent rule) — a WARN,
     // level token included.
-    logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "demand REFUSED by the demand-authorization gate",
-        )
-    });
+    logs_assert(|lines: &[&str]| logged_at(lines, "WARN", "request=\"demand\""));
 
     // ANTI-TAUTOLOGY: re-install the deny-nothing default → a fresh live topic admits,
     // proving the deny was the authorizer's doing (not a MISS).
@@ -4824,16 +4800,8 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
     // The refusals are LOUD (Principle #3 / the loud-over-silent rule) — WARNs,
     // level token included.
     logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "catalog GET REFUSED by the demand-authorization gate",
-        )?;
-        logged_at(
-            lines,
-            "WARN",
-            "schema GET REFUSED by the demand-authorization gate",
-        )
+        logged_at(lines, "WARN", "request=\"catalog GET\"")?;
+        logged_at(lines, "WARN", "request=\"schema GET\"")
     });
 
     // --- ANTI-TAUTOLOGY: restore AllowAll → both serve again (the deny was the

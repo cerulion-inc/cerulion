@@ -3628,6 +3628,20 @@ impl NetworkEnvKill {
     pub fn is_off(&self) -> bool {
         !matches!(self, NetworkEnvKill::Unset)
     }
+
+    /// How a refusal names this setting: `CERULION_NETWORK=off`, or the
+    /// unrecognized value that failed closed, trimmed and terminal-sanitized.
+    /// `None` when the variable is unset.
+    pub fn refusal_label(&self) -> Option<String> {
+        match self {
+            NetworkEnvKill::Unset => None,
+            NetworkEnvKill::Off => Some(format!("{NETWORK_ENV}=off")),
+            NetworkEnvKill::Unrecognized(value) => Some(format!(
+                "{NETWORK_ENV}={} (an unrecognized value, which fails closed to local-only)",
+                crate::topic_cmd::sanitize_display(value.trim())
+            )),
+        }
+    }
 }
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
@@ -3638,8 +3652,14 @@ impl NetworkEnvKill {
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
 pub fn network_env_kill() -> NetworkEnvKill {
-    match std::env::var(NETWORK_ENV) {
-        Ok(v) => {
+    network_env_kill_from(std::env::var(NETWORK_ENV).ok())
+}
+
+/// The pure half of [`network_env_kill`]: classify one `CERULION_NETWORK` value
+/// (`None` = the variable is not set).
+pub fn network_env_kill_from(value: Option<String>) -> NetworkEnvKill {
+    match value {
+        Some(v) => {
             let trimmed = v.trim();
             if trimmed.is_empty() {
                 NetworkEnvKill::Unset
@@ -3649,22 +3669,95 @@ pub fn network_env_kill() -> NetworkEnvKill {
                 NetworkEnvKill::Unrecognized(v)
             }
         }
-        Err(_) => NetworkEnvKill::Unset,
+        None => NetworkEnvKill::Unset,
     }
 }
 
-/// Is the REMOTE network tier suppressed by the
-/// `CERULION_NETWORK` kill-switch, for the discovery-side callers that carry no
-/// `GraphConfig` — `schema info`'s remote fetch and `topic echo`'s remote
-/// decode-seed? Uses the SAME parse as [`resolve_run_network`]
-/// ([`network_env_kill`], the ONE env-parse). Emits the fail-closed warn on an
-/// unrecognized value; returns `true` iff the tier must stay LOCAL-ONLY. The
+/// The `cerulion-netd` daemon's own kill switch. The query verbs read it beside
+/// `CERULION_NETWORK` ([`query_network_kill`]), so with it engaged they neither
+/// query netd nor open their own discovery session.
+pub const NETD_NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
+
+/// The kill-switch state the query verbs (`topic list`, `topic echo`,
+/// `topic hz`, `topic info`, `schema info`) act on: `CERULION_NETWORK` under the
+/// [`network_env_kill`] parse, plus [`NETD_NETWORK_ENV`] under netd's own
+/// byte-exact parse (only exactly `off` engages it). Either one engaged makes
+/// the query LOCAL-ONLY. Runs (`graph run`, `node run`, `ros2 attach`) read
+/// `CERULION_NETWORK` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryNetworkKill {
+    /// The `CERULION_NETWORK` decision.
+    pub network: NetworkEnvKill,
+    /// `CERULION_NETD_NETWORK` is exactly `off`.
+    pub netd_off: bool,
+}
+
+impl QueryNetworkKill {
+    /// No switch engaged.
+    pub const UNSET: Self = Self {
+        network: NetworkEnvKill::Unset,
+        netd_off: false,
+    };
+
+    /// True when either switch is engaged: the query must stay LOCAL-ONLY.
+    pub fn is_off(&self) -> bool {
+        self.network.is_off() || self.netd_off
+    }
+
+    /// Both switches are engaged.
+    pub fn both_engaged(&self) -> bool {
+        self.network.is_off() && self.netd_off
+    }
+
+    /// The `unset ...` remedy naming every engaged variable. With only
+    /// `CERULION_NETD_NETWORK` engaged it names that one; otherwise it names
+    /// `CERULION_NETWORK`, plus `CERULION_NETD_NETWORK` when both are engaged.
+    pub fn unset_remedy(&self) -> &'static str {
+        match (self.network.is_off(), self.netd_off) {
+            (false, true) => "unset CERULION_NETD_NETWORK",
+            (true, true) => "unset CERULION_NETWORK and CERULION_NETD_NETWORK",
+            _ => "unset CERULION_NETWORK",
+        }
+    }
+}
+
+/// Classify one `CERULION_NETD_NETWORK` value the way `cerulion-netd` does:
+/// only the exact value `off` engages it (`None` = not set).
+pub fn netd_network_off_from(value: Option<&str>) -> bool {
+    value == Some("off")
+}
+
+/// Read both query-side kill switches from the environment ONCE. Pure over the
+/// environment; it emits no log.
+pub fn query_network_kill() -> QueryNetworkKill {
+    query_network_kill_from(
+        std::env::var(NETWORK_ENV).ok(),
+        std::env::var(NETD_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+/// The pure half of [`query_network_kill`].
+pub fn query_network_kill_from(network: Option<String>, netd: Option<&str>) -> QueryNetworkKill {
+    QueryNetworkKill {
+        network: network_env_kill_from(network),
+        netd_off: netd_network_off_from(netd),
+    }
+}
+
+/// Is the REMOTE network tier suppressed by a query-side kill switch
+/// ([`query_network_kill`]: `CERULION_NETWORK`, or `CERULION_NETD_NETWORK=off`),
+/// for the discovery-side callers that carry no `GraphConfig`: `topic list`,
+/// `schema info`'s remote fetch, and the `topic echo`/`hz`/`info` remote tiers?
+/// `CERULION_NETWORK` goes through the SAME parse as [`resolve_run_network`]
+/// ([`network_env_kill_from`]). Emits the fail-closed warn on an unrecognized
+/// `CERULION_NETWORK` value; returns `true` iff the tier must stay LOCAL-ONLY. The
 /// caller MUST consult this BEFORE opening any discovery session so a
 /// kill-switched run never touches the network (the LOCAL-ONLY
 /// contract).
 pub fn remote_network_suppressed() -> bool {
-    match network_env_kill() {
-        NetworkEnvKill::Unset => false,
+    let kill = query_network_kill();
+    match kill.network {
+        NetworkEnvKill::Unset => kill.netd_off,
         NetworkEnvKill::Off => true,
         NetworkEnvKill::Unrecognized(v) => {
             tracing::warn!(
@@ -3748,7 +3841,8 @@ pub enum RunNetwork {
     /// No (or disabled) `network:` block under the real clock ⇒ run the
     /// gateway PERMISSIVE: every produced topic is egressable, and its announce
     /// token is declared when LAN access is open. Carries the SYNTHESIZED permissive
-    /// `NetworkConfig` (peer mode, scouting ON, no connect endpoints, listen
+    /// `NetworkConfig` (peer mode, gossip on, multicast scouting per
+    /// `CERULION_MULTICAST_SCOUTING`, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
     /// construction.
     Permissive(cerulion_core::NetworkConfig),
@@ -3904,8 +3998,10 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// The SYNTHESIZED permissive-default `NetworkConfig` — peer mode,
-/// multicast + gossip scouting ON (unpaired robots are LAN-discoverable), NO
+/// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
+/// scouting on, multicast scouting from
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
+/// the gateway's `_cerulion._tcp` mDNS beacon is how peers find it), NO
 /// connect endpoints, listening on the well-known gateway port
 /// ([`GATEWAY_WELL_KNOWN_PORT`], overridable via [`GATEWAY_PORT_ENV`]). The
 /// gateway process bind-probes upward from this base on AddrInUse.
@@ -3915,7 +4011,7 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         mode: cerulion_core::ZenohMode::Peer,
         connect_endpoints: Vec::new(),
         listen_endpoints: vec![format!("tcp/[::]:{port}")],
-        multicast_scouting: true,
+        multicast_scouting: cerulion_core::transport::network::multicast_scouting_from_env(),
         gossip_scouting: true,
         // A gateway keeps zenoh's robust default connect retry (bounded
         // connect is only for the ephemeral `topic list` discovery session).
@@ -4739,7 +4835,27 @@ fn register_egress_with_netd(
     ix_config_json: Option<&str>,
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
+    // Check netd's posture BEFORE registering: a registration's topics and
+    // schemas stay served on the shared gateway after release, so refusing an
+    // open netd after registering would not close the LAN access. A paired run
+    // rides only a netd that reports paired; otherwise dropping the client
+    // registers nothing and the caller falls back to a per-run gateway child,
+    // which enforces this run's own posture.
+    let requested = cerulion_core::LanAccess::from_env();
+    if requested == cerulion_core::LanAccess::Paired {
+        let reported = client.lan_access()?;
+        if !netd_posture_acceptable(reported, requested) {
+            drop(client);
+            return Err(netd_posture_refusal(reported));
+        }
+    }
     let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
+    // The register response reports the posture too, so the check never
+    // rests on the probe alone.
+    if !netd_posture_acceptable(resp.lan_access, requested) {
+        drop(client);
+        return Err(netd_posture_refusal(resp.lan_access));
+    }
     tracing::info!(
         graph = %graph_name,
         registered_topics = resp.registered_topics,
@@ -4759,6 +4875,35 @@ fn register_egress_with_netd(
     // NO reconnect: recovery is not this watch's job.
     let watch = spawn_netd_liveness_watch(client.control_fd(), graph_name.to_string());
     Ok(NetdEgressGuard { watch, client })
+}
+
+/// The error that sends a paired run to its own gateway because netd
+/// `reported` a posture other than paired.
+#[cfg(unix)]
+fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_netd::ClientError {
+    let reported = match reported {
+        Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+        Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+        None => "did not report its LAN access posture (an older daemon)",
+    };
+    cerulion_netd::ClientError::Protocol(format!(
+        "cerulion-netd {reported} and this run requires paired access, so the run uses its \
+         own gateway; restart cerulion-netd with paired access to share its session"
+    ))
+}
+
+/// Whether a run that requires `requested` LAN access may ride a netd
+/// that reported `reported`. A paired run rides only a netd that reports
+/// paired: one that reports open serves its LAN openly, and one that
+/// reports no posture (an older daemon) may. An open run accepts any netd,
+/// because a paired netd is only stricter.
+#[cfg(unix)]
+fn netd_posture_acceptable(
+    reported: Option<cerulion_core::LanAccess>,
+    requested: cerulion_core::LanAccess,
+) -> bool {
+    requested == cerulion_core::LanAccess::Open
+        || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
 /// Establish the network-egress overlay for a real-clock live run. `None`
@@ -21680,6 +21825,21 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paired run rides only a netd that reports paired: an open or an
+    /// unknown posture is refused. An open run accepts every netd. Hand
+    /// oracle over all six (reported, requested) pairs.
+    #[cfg(unix)]
+    #[test]
+    fn netd_posture_acceptable_requires_a_reported_paired_netd_for_a_paired_run() {
+        use cerulion_core::LanAccess::{Open, Paired};
+        assert!(!netd_posture_acceptable(None, Paired));
+        assert!(!netd_posture_acceptable(Some(Open), Paired));
+        assert!(netd_posture_acceptable(Some(Paired), Paired));
+        assert!(netd_posture_acceptable(None, Open));
+        assert!(netd_posture_acceptable(Some(Paired), Open));
+        assert!(netd_posture_acceptable(Some(Open), Open));
+    }
 
     // ======================================================================
     // The scrub fixpoint's NO-PROGRESS fallback, DRIVEN.

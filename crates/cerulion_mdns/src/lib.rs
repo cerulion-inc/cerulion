@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The `_cerulion._tcp` mDNS gateway beacon: the advertise half.
+//! The `_cerulion._tcp` mDNS gateway beacon: the advertise half and a bounded
+//! browse.
 //!
 //! mDNS is the primary robot-discovery rung on every network: mDNS finds robots,
 //! zenoh connects and does everything after. A serving gateway advertises
@@ -18,13 +19,14 @@
 //! depend on it; two copies of the TXT vocabulary would drift, so it lives here
 //! once.
 //!
-//! # What is not here
+//! # The browse half
 //!
-//! The browse half (`browse_rung`, `resolve_robot_eid`, the record-to-peer mapping)
-//! stays in `cerulion_cli_engine::mdns_discovery`: netd never browses, and those
-//! functions return `cerulion_discovery::DiscoveredPeer`. [`CERULION_SERVICE_TYPE`]
-//! is defined once, here, and imported by the browser, so the one string that must
-//! match on both sides cannot drift.
+//! [`browse_rung`] is the bounded `_cerulion._tcp` browse. The CLI's discovery
+//! ladder and `cerulion-netd`'s boot-time peer fold both call it, so the
+//! record-to-locator mapping exists once. [`CERULION_SERVICE_TYPE`] is defined
+//! here and used by both halves. `resolve_robot_eid` (the `eid=` TXT reader)
+//! stays in `cerulion_cli_engine::mdns_discovery`, because it normalizes ids
+//! through the CLI's `connect_cmd::normalize_eid`.
 //!
 //! # Failure posture
 //!
@@ -57,6 +59,9 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+
+mod browse;
+pub use browse::{browse_rung, browse_rung_report, instance_from_fullname, BrowseRungReport};
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Deserialize;

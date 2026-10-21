@@ -26,7 +26,13 @@ tracing = "0.1"
 [target.'cfg(target_os = "android")'.dependencies]
 cerulion_core = { workspace = true, features = ["local-transport"] }
 
+[features]
+# Test seams for this crate's own integration tests (the dev-dependency on
+# itself below turns it on); never enabled by an app build.
+test-helpers = ["cerulion_core/test-helpers"]
+
 [dev-dependencies]
+cerulion_android = { path = ".", features = ["test-helpers"] }
 # Turns on cerulion_core's `test-helpers` for tests (`testing::TestTransport`,
 # used to seed a TopicServiceConfig for the pure provisioning helpers).
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }

@@ -1239,6 +1239,7 @@ dependencies = [
 name = "cerulion_android"
 version = "1.0.0"
 dependencies = [
+ "cerulion_android",
  "cerulion_bag",
  "cerulion_bagd",
  "cerulion_cli_engine",
@@ -1528,6 +1529,7 @@ dependencies = [
 name = "cerulion_mdns"
 version = "1.0.0"
 dependencies = [
+ "cerulion_discovery",
  "mdns-sd",
  "serde",
  "serde_json",

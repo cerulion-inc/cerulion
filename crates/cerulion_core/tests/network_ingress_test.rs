@@ -872,7 +872,7 @@ fn test_reinject_failure_is_counted_and_latch_warns_once() {
             .count();
         let recoveries = lines
             .iter()
-            .filter(|l| l.contains(topic.as_str()) && l.contains("recovered - frames validating"))
+            .filter(|l| l.contains(topic.as_str()) && l.contains("recovered; frames validating"))
             .count();
         if warns == 1 && recoveries == 1 {
             Ok(())
@@ -1100,4 +1100,44 @@ fn test_paired_receive_callback_refuses_and_counts_every_lan_frame() {
     assert_eq!(header.sequence, 9);
     let stats = mgr.ingress_stats(&topic).expect("stats");
     assert_eq!((stats.frames, stats.lan_refused_drops), (1, 5));
+}
+
+/// Opening LAN access redeclares a paired ingress entry's data subscriber
+/// and demand token. When the token declaration fails, frames still flow
+/// (the subscriber is declared) and the entry stays retryable: the next
+/// open declares the missing token.
+#[test]
+fn a_failed_ingress_token_is_redeclared_by_the_next_open() {
+    let (transport, topic) = setup("lan_token_retry");
+    let hash = 0x2468_ACE0_1357_9BDFu64;
+    let subscriber = transport.create_subscriber(&topic).expect("subscriber");
+    let ingress_pub = transport
+        .create_ingress_publisher(&topic, MaxSliceLen::const_new(64))
+        .expect("ingress publisher");
+    let mgr = Arc::new(NetworkManager::new(NetworkConfig::default()));
+    mgr.set_lan_access(LanAccess::Paired);
+    mgr.register_ingress(&topic, hash, ingress_pub)
+        .expect("register ingress");
+    assert_eq!(mgr.ingress_token_declared_for_test(&topic), Some(false));
+
+    mgr.fault_inject_ingress_token_once();
+    mgr.set_lan_access(LanAccess::Open);
+    assert_eq!(
+        mgr.ingress_token_declared_for_test(&topic),
+        Some(false),
+        "the injected failure leaves the token undeclared"
+    );
+    mgr.publish_to_network(&topic, make_wire_frame(hash, 7, 1, b"cmd"))
+        .expect("put");
+    let (header, payload) = poll_one(&subscriber, Duration::from_secs(3))
+        .expect("the data subscriber is declared despite the token failure");
+    assert_eq!(header.sequence, 7);
+    assert_eq!(payload, b"cmd");
+
+    mgr.set_lan_access(LanAccess::Open);
+    assert_eq!(
+        mgr.ingress_token_declared_for_test(&topic),
+        Some(true),
+        "the next open declares the missing token"
+    );
 }

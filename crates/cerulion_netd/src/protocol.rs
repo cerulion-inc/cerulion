@@ -545,6 +545,13 @@ pub struct StatusResponse {
     /// same reason, as the `DiscoveryState` marker.
     #[serde(default)]
     pub connect_endpoints: Option<Vec<String>>,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent (`None`, UNKNOWN, never open) on older daemons and on egress
+    /// planes without a network manager. A run that requires paired access
+    /// reads it BEFORE it registers egress, because a registration's topics
+    /// and schemas stay served on the shared gateway after release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::RegisterEgress`].
@@ -584,8 +591,8 @@ pub struct EgressReleaseResponse {
 /// # Why the protocol has to carry this
 ///
 /// netd's session is LAZY: the FIRST query on a freshly-spawned daemon opens it,
-/// and a just-opened scouting session has not yet completed the multicast scout →
-/// TCP connect → session establishment → liveliness/queryable exchange that makes a
+/// and a just-opened session has not yet completed the TCP connect to its
+/// folded peers → session establishment → liveliness/queryable exchange that makes a
 /// robot's announce tokens (and its `catalog` queryable) visible. Before the discovery marker the
 /// resulting empty gather was indistinguishable on the wire from "the LAN was
 /// reached and nobody has this topic", so the desk rendered a TERMINAL "not found"
@@ -1741,8 +1748,10 @@ mod tests {
             active_connections: 3,
             idle: false,
             connect_endpoints: Some(vec!["tcp/10.0.0.5:7683".to_string()]),
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&st.to_json_line()).unwrap();
+        assert_eq!(v["lan_access"], "paired");
         assert_eq!(v["active_connections"], 3);
         assert_eq!(v["idle"], false);
         assert_eq!(v["demands"][0]["refcount"], 2);
@@ -1764,6 +1773,10 @@ mod tests {
         assert_eq!(
             decoded.connect_endpoints, None,
             "an absent field is UNKNOWN, never an empty (and therefore positive) claim"
+        );
+        assert_eq!(
+            decoded.lan_access, None,
+            "an absent LAN posture is UNKNOWN, never open"
         );
         // The anti-tautology half: a daemon that DOES report an empty set is
         // distinguishable from the one above.

@@ -634,6 +634,7 @@ impl Ctx {
             // vec is the explicit "nothing was folded", distinct from an older
             // daemon's absent field (which decodes to `None`).
             connect_endpoints: Some(self.connect_endpoints.clone()),
+            lan_access: self.egress_plane.lan_access(),
         })
     }
 

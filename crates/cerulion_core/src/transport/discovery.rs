@@ -511,7 +511,14 @@ pub fn query_announce_entries_clean_window(
                         entries.push(entry);
                     }
                 }
-                Err(_) => saw_error_reply = true,
+                // zenoh ends a timed GET with one error reply whose payload
+                // is "Timeout", then closes the channel: that is the window
+                // ending normally. Any other error reply spoils the snapshot.
+                Err(error) => {
+                    if !is_query_timeout_payload(&error.payload().to_bytes()) {
+                        saw_error_reply = true;
+                    }
+                }
             },
             // `Err(_)`: every sender dropped - the reply channel closed, so
             // the GET finished. Only a closed channel marks the snapshot
@@ -530,6 +537,14 @@ pub fn query_announce_entries_clean_window(
     entries.sort();
     entries.dedup();
     Ok(Some(entries))
+}
+
+/// Whether a GET error reply's payload is zenoh's own query-timeout notice
+/// (the reply a timed GET delivers when its timeout fires, just before the
+/// reply channel closes). Exactly the bytes `Timeout`; a queryable's own
+/// error text is anything else.
+fn is_query_timeout_payload(payload: &[u8]) -> bool {
+    payload == b"Timeout"
 }
 
 /// GET a robot's full topic catalog over the `cerulion_q` query surface
@@ -1427,6 +1442,18 @@ mod tests {
             gathered.is_some(),
             "the reply channel never closed after the zenoh timeout:              a completed gather cannot be distinguished from a partial one"
         );
+    }
+
+    /// Only zenoh's exact query-timeout payload counts as the normal end of
+    /// a timed window; every other error payload (a refusal, an empty
+    /// payload, a different case) still marks the gather as erroneous.
+    #[test]
+    fn only_the_zenoh_timeout_payload_is_a_normal_completion() {
+        assert!(is_query_timeout_payload(b"Timeout"));
+        assert!(!is_query_timeout_payload(b"timeout"));
+        assert!(!is_query_timeout_payload(b"Timeout "));
+        assert!(!is_query_timeout_payload(b""));
+        assert!(!is_query_timeout_payload(b"query refused"));
     }
 
     /// The sample→event mapping, against a HAND-WRITTEN table. Every row

@@ -2048,3 +2048,210 @@ fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
         "the latched catalog must see the restarted gateway's hash"
     );
 }
+
+/// A gateway rebuilt on a manager whose query surface an EARLIER gateway
+/// latched serves ITS schema names, hash names and docs through that
+/// surface, even after the first run's teardown emptied it
+/// (`serve_nothing`): the surface keeps reading its own maps, so the
+/// restarted construction must fill those, not fresh ones. Hand oracle.
+#[test]
+fn a_restarted_gateway_serves_its_schemas_through_the_latched_surface() {
+    use cerulion_core::transport::cerulion_q::{SchemaDoc, SchemaEncoding};
+    use cerulion_core::transport::gateway::{SchemaHashName, SchemaServing, TopicSchema};
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_serving_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rcserve".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let serving = |topic: &str, schema: &str, hash: u64| SchemaServing {
+        topic_schemas: vec![TopicSchema {
+            topic: topic.to_string(),
+            schema_name: schema.to_string(),
+        }],
+        schema_docs: vec![SchemaDoc {
+            qualified: schema.to_string(),
+            encoding: SchemaEncoding::Msg,
+            text: "float64 x\n".to_string(),
+            deps: Vec::new(),
+        }],
+        schema_hashes: vec![SchemaHashName {
+            schema_hash: hash,
+            qualified: schema.to_string(),
+        }],
+        served_topics: vec![topic.to_string()],
+    };
+    let first_topic = format!("/rt/serving/first/{}", unique_id());
+    let next_topic = format!("/rt/serving/next/{}", unique_id());
+    let first = GatewayRuntime::new_embedded(
+        Arc::clone(&manager),
+        serving(&first_topic, "first_pkg/First", 0xA1),
+    )
+    .expect("first gateway boot");
+    let latched = manager
+        .network()
+        .and_then(|network| network.query_surface_serving_handles())
+        .expect("the first gateway latches the query surface");
+    drop(first);
+    latched.serve_nothing();
+
+    let restarted = GatewayRuntime::new_embedded(
+        Arc::clone(&manager),
+        serving(&next_topic, "next_pkg/Next", 0xB2),
+    )
+    .expect("restarted gateway boot");
+
+    assert_eq!(
+        latched.served_topics_for_test(),
+        (Vec::<String>::new(), vec![next_topic.clone()]),
+        "the latched surface must carry the restarted run's bindings, and an \
+         embedded construction announces no boot topic"
+    );
+    let schema = restarted.schema_serve_for_test("rcserve", "next_pkg/Next");
+    assert!(schema.error.is_none(), "{:?}", schema.error);
+    assert_eq!(
+        schema
+            .docs
+            .iter()
+            .map(|doc| doc.qualified.as_str())
+            .collect::<Vec<_>>(),
+        ["next_pkg/Next"]
+    );
+    let missing = restarted.schema_serve_for_test("rcserve", "first_pkg/First");
+    assert!(
+        missing.docs.is_empty(),
+        "the first run's schema must not be served after its teardown"
+    );
+}
+
+/// A gateway restarted on the same manager with a smaller topic set withdraws
+/// the prior run's announce tokens: the manager outlives the first gateway, so
+/// without the withdrawal a remote `topic list` keeps listing topics the new
+/// run no longer serves. Hand oracle.
+#[test]
+fn a_restarted_gateway_withdraws_the_prior_runs_announcements() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_withdraw_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rctest".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let kept = format!("/rt/withdraw/kept/{}", unique_id());
+    let dropped = format!("/rt/withdraw/dropped/{}", unique_id());
+    let plan = |announce: Vec<String>| GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce,
+        ingress: vec![],
+    };
+    let first = GatewayRuntime::new(
+        Arc::clone(&manager),
+        plan(vec![kept.clone(), dropped.clone()]),
+    )
+    .expect("first gateway boot");
+    drop(first);
+
+    let _restarted = GatewayRuntime::new(Arc::clone(&manager), plan(vec![kept.clone()]))
+        .expect("restarted gateway boot");
+    let network = manager.network().expect("network");
+    assert_eq!(
+        network.announced_topics(),
+        {
+            let mut both = vec![kept.clone(), dropped.clone()];
+            both.sort();
+            both
+        },
+        "the restarted gateway does not withdraw on its own"
+    );
+
+    assert_eq!(
+        network.withdraw_announcements_except(std::slice::from_ref(&kept)),
+        1
+    );
+    assert_eq!(network.announced_topics(), vec![kept.clone()]);
+    assert_eq!(
+        network.withdraw_announcements_except(std::slice::from_ref(&kept)),
+        0,
+        "a second withdrawal finds nothing left to withdraw"
+    );
+    assert!(
+        network.has_identity_token(),
+        "the bare identity token is not an egress announcement and stays"
+    );
+}
+
+/// A gateway restarted on the same manager drives only the topics left
+/// registered: the manager keeps the prior run's bridge flags, so the host
+/// drops the ones the new run does not serve BEFORE the restart, or a
+/// prior-run topic whose demand flag is still on joins the new drive view and
+/// keeps egressing. Hand oracle.
+#[test]
+fn a_restarted_gateway_does_not_drive_the_prior_runs_unregistered_topics() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("rc_g_unregister_{}", unique_id()),
+            network: Some(NetworkConfig {
+                robot_identity: Some("rctest".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    let kept = format!("/rt/unregister/kept/{}", unique_id());
+    let dropped = format!("/rt/unregister/dropped/{}", unique_id());
+    let plan = |announce: Vec<String>| GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce,
+        ingress: vec![],
+    };
+    let first = GatewayRuntime::new(
+        Arc::clone(&manager),
+        plan(vec![kept.clone(), dropped.clone()]),
+    )
+    .expect("first gateway boot");
+    assert!(manager
+        .bridge_manager()
+        .enable_bridge(&dropped)
+        .expect("enable"));
+    drop(first);
+
+    assert_eq!(
+        manager
+            .bridge_manager()
+            .unregister_topics_except(std::slice::from_ref(&kept))
+            .expect("unregister"),
+        1
+    );
+    let restarted = GatewayRuntime::new(Arc::clone(&manager), plan(vec![kept.clone()]))
+        .expect("restarted gateway boot");
+
+    assert_eq!(restarted.egress_view_count(), 1);
+    assert_eq!(restarted.registered_topic_count().expect("count"), 1);
+    assert!(!manager
+        .bridge_manager()
+        .is_registered(&dropped)
+        .expect("registered"));
+    assert!(
+        !manager
+            .bridge_manager()
+            .enable_bridge(&dropped)
+            .expect("enable"),
+        "a remote demand cannot turn an unregistered topic back on"
+    );
+}

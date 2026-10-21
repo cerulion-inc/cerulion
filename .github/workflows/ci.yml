@@ -2605,6 +2605,9 @@ jobs:
       - name: cerulion_android schema restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android gateway exclusivity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
       - name: cerulion_android identity integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_identity_test -- --test-threads=1
@@ -2617,6 +2620,12 @@ jobs:
       - name: cerulion_android gateway owner tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test gateway_owner_test -- --test-threads=1
+      - name: cerulion_android gateway restart baseline tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test gateway_restart_baseline_test -- --test-threads=1
+      - name: cerulion_android first start failure tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:

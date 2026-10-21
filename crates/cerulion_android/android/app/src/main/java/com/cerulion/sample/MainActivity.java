@@ -196,6 +196,9 @@ public final class MainActivity extends Activity {
             return;
         }
         if (code == CerulionRuntime.OK || code == CerulionRuntime.BAD_STATE) {
+            // A retry queued by an earlier failed stop must not fire later
+            // and stop the runtime started below.
+            handler.removeCallbacks(stopRetry);
             stopRequested = true;
             handler.removeCallbacks(heartbeat);
             releaseMulticastLock();

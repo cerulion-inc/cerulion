@@ -405,7 +405,7 @@ fn ensure_topic_available(
     // rule: one data source = one topic, obtained over the network once).
     let killed = scope.local_only();
     // Read once, so every refusal below names the kill-switch state this call saw.
-    let env_kill = crate::graph_cmd::network_env_kill();
+    let env_kill = crate::graph_cmd::query_network_kill();
     let transport = cerulion_core::TransportManager::get_or_init()?;
 
     // Classify: a topic LISTED locally that is NOT a netd mirror is a
@@ -964,7 +964,7 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
 fn local_lease_refusal_message(
     error: &cerulion_core::TransportError,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (_, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -980,30 +980,31 @@ fn local_lease_refusal_message(
 /// Pure over its inputs: the caller reads the kill-switch state once.
 fn scope_selection_and_remedy(
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
-) -> (String, &'static str) {
+    env: &crate::graph_cmd::QueryNetworkKill,
+) -> (String, String) {
     match scope {
         TopicScope::Local => (
             "--local".to_string(),
-            "remove --local and unset CERULION_NETWORK",
+            format!("remove --local and {}", env.unset_remedy()),
         ),
-        TopicScope::Automatic => (environment_selection_label(env), "unset CERULION_NETWORK"),
+        TopicScope::Automatic => (
+            environment_selection_label(env),
+            env.unset_remedy().to_string(),
+        ),
     }
 }
 
 /// The label for a local-only refusal the environment kill-switch caused: the
 /// accepted `off`, or the unrecognized value that failed closed, named as such so
-/// the refusal states what actually engaged the switch. `Unset` cannot reach a
-/// local-only refusal (nothing engaged the switch); it names the accepted value.
-fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String {
-    match env {
-        crate::graph_cmd::NetworkEnvKill::Off | crate::graph_cmd::NetworkEnvKill::Unset => {
-            "CERULION_NETWORK=off".to_string()
-        }
-        crate::graph_cmd::NetworkEnvKill::Unrecognized(value) => format!(
-            "CERULION_NETWORK={} (an unrecognized value, which fails closed to local-only)",
-            sanitize_display(value.trim())
-        ),
+/// the refusal states what actually engaged the switch, joined with
+/// `CERULION_NETD_NETWORK=off` when that switch is engaged too. Nothing engaged
+/// cannot reach a local-only refusal; it names `CERULION_NETWORK=off`.
+fn environment_selection_label(env: &crate::graph_cmd::QueryNetworkKill) -> String {
+    match (env.network.refusal_label(), env.netd_off) {
+        (Some(network), true) => format!("{network} and CERULION_NETD_NETWORK=off"),
+        (Some(network), false) => network,
+        (None, true) => "CERULION_NETD_NETWORK=off".to_string(),
+        (None, false) => "CERULION_NETWORK=off".to_string(),
     }
 }
 
@@ -1012,7 +1013,7 @@ fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String
 fn unknown_origin_mirror_message(
     topic: &str,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -1027,12 +1028,13 @@ fn scope_unavailable_message(
     mirror_robot: Option<&str>,
     has_slashed_twin: bool,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     let short_remedy = match scope {
-        TopicScope::Local => remedy,
-        TopicScope::Automatic => "unset it",
+        TopicScope::Local => remedy.clone(),
+        TopicScope::Automatic if env.both_engaged() => "unset both".to_string(),
+        TopicScope::Automatic => "unset it".to_string(),
     };
     match mirror_robot {
         Some(robot) => {
@@ -1081,19 +1083,23 @@ pub const CATALOG_GATHER_WINDOW: Duration = Duration::from_millis(250);
 /// map 1:1 onto zenoh locator strings and onto
 /// `NetworkConfig::{connect,listen}_endpoints`.
 ///
-/// `scouting` maps onto BOTH `multicast_scouting` and `gossip_scouting`. The
-/// struct DEFAULT (via `Default`/field init) keeps scouting OFF so engine
-/// unit + live tests stay hermetic (an isolated session discovers only what
-/// its explicit locators reach); the CLI dispatch (`topic list`) flips it ON
-/// — that's where the automagic default lives, NOT in this struct.
+/// `scouting` selects the AUTOMAGIC path: the discovery ladder (mDNS, cache,
+/// hostname) runs, the session has gossip scouting on, and zenoh multicast
+/// scouting follows
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off).
+/// `false` keeps engine unit + live tests hermetic (an isolated session
+/// discovers only what its explicit locators reach); the CLI dispatch
+/// (`topic list`) sets it, that's where the automagic default lives, NOT in
+/// this struct.
 pub struct RemoteTopicsOptions {
     /// Remote locators to connect to (e.g. `tcp/192.168.123.99:7683` — a
     /// permissive robot's gateway listens on the well-known 7683).
     pub connect: Vec<String>,
     /// Local locators to listen on (e.g. `tcp/0.0.0.0:7447`).
     pub listen: Vec<String>,
-    /// Enable multicast + gossip scouting (LAN auto-discovery). The CLI-path
-    /// default is `true` (automagic); tests keep it `false` for hermeticity.
+    /// The automagic path: ladder + gossip, multicast per
+    /// `CERULION_MULTICAST_SCOUTING`. The CLI-path default is `true`; tests keep
+    /// it `false` for hermeticity.
     pub scouting: bool,
 }
 
@@ -1108,17 +1114,18 @@ impl RemoteTopicsOptions {
 }
 
 /// Build the automagic `topic list` discovery
-/// options — THE one place the CLI-path scouting-ON default lives. The binary
+/// options, THE one place the CLI-path automagic default lives. The binary
 /// dispatch (`cerulion topic list`) is a thin passthrough to this fn, so the
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
-/// regression flipping scouting off would silently disable zero-flag discovery.
+/// regression flipping `scouting` off would silently disable zero-flag
+/// discovery (no ladder, no netd query plane).
 ///
 /// - `no_network == true` (`--local` or `--no-network`), or the environment
 ///   kill-switch, yields `None`: skip the remote query entirely.
-/// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
-///   on the LAN are discoverable with zero flags) and any `--connect` /
-///   `--listen` locators carried ADDITIVELY (they extend the scouting
-///   session; they never replace it).
+/// - otherwise ⇒ `Some` with `scouting` set (the ladder finds unpaired robots
+///   on the LAN with zero flags) and any `--connect` / `--listen` locators
+///   carried ADDITIVELY (they extend the discovered set; they never replace
+///   it).
 pub fn remote_discovery_options(
     no_network: bool,
     connect: Vec<String>,
@@ -1372,8 +1379,13 @@ pub fn query_remote_topics_with_scan(
 ) -> CliResult<RemoteDiscovery> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
+    // This machine's own netd and gateway processes answer the browse under its
+    // identity on its own addresses; they are not remote robots.
     let ladder_peers = if opts.scouting {
-        crate::discovery_ladder::discover_peers(scan)
+        cerulion_discovery::ladder::drop_this_hosts_gateways(
+            crate::discovery_ladder::discover_peers(scan),
+            &cerulion_core::graph::robot_identity_from_env(),
+        )
     } else {
         Vec::new()
     };
@@ -2158,8 +2170,8 @@ pub fn fetch_remote_schema(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             requested = %requested,
-            "remote schema fetch suppressed by the CERULION_NETWORK kill-switch \
-             — LOCAL-ONLY (no remote attempt)"
+            "remote schema fetch suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         // NOT a cold start: the user asked for local-only, so the local "not found"
         // IS the correct answer.
@@ -2185,7 +2197,7 @@ pub fn fetch_remote_schema(
     // "no robot serves this type" is a claim with no evidence behind it (and it is
     // reached exactly when netd is broken, which is when the desk is most likely to
     // get it wrong).
-    let mgr = match open_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
+    let mgr = match open_fallback_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(requested = %requested, error = %e,
@@ -2297,11 +2309,11 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         None,
         // This seam makes NO absence claim (every failure
         // collapses to `None` below and the caller degrades to hex), and
-        // `topic_echo` calls it UNCONDITIONALLY for every LOCAL topic — so
-        // inheriting the first-contact wait stalled `cerulion topic echo
-        // /my/local/topic` for the full ceiling, printed a counter, and closed
-        // with "nothing on the network answered", all before the first frame of a
-        // topic that was streaming in local SHM the whole time.
+        // `topic_echo` calls it for a LOCAL topic's first undecodable frame, so
+        // inheriting the first-contact wait would stall `cerulion topic echo
+        // /my/local/topic` for the full ceiling, print a counter, and close
+        // with "nothing on the network answered", on a topic that is streaming
+        // in local SHM the whole time.
         ResolveWait::no_wait(),
     ) {
         SchemaResolve::Found { robot, walker, .. } => Some((robot, walker)),
@@ -2840,8 +2852,8 @@ fn resolve_remote_topic_schema_with_opts(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             topic = %topic,
-            "remote schema resolve for `topic echo` suppressed by the CERULION_NETWORK \
-             kill-switch — LOCAL-ONLY (no remote attempt)"
+            "remote schema resolve for `topic echo` suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         return SchemaResolve::NoProducer;
     }
@@ -2865,7 +2877,7 @@ fn resolve_remote_topic_schema_with_opts(
     // user as PROOF the topic does not exist. Nothing was searched in any of them, so
     // they report non-convergence (and say why, loudly). This needs no grace and adds
     // no wait — it is pure classification.
-    let mgr = match open_discovery_session(connect, listen, scouting) {
+    let mgr = match open_fallback_discovery_session(connect, listen, scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(topic = %topic, error = %e,
@@ -2972,6 +2984,67 @@ fn resolve_remote_topic_schema_with_opts(
     }
 }
 
+/// The `NetworkConfig` of a CLI discovery session. Pure. `scouting` (the
+/// automagic path) turns gossip on; `multicast` (the caller's read of
+/// `CERULION_MULTICAST_SCOUTING`) turns multicast scouting on only together
+/// with `scouting`. The connect phase is always bounded.
+fn discovery_session_config(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+    multicast: bool,
+) -> cerulion_core::transport::network::NetworkConfig {
+    cerulion_core::transport::network::NetworkConfig {
+        connect_endpoints: connect.to_vec(),
+        listen_endpoints: listen.to_vec(),
+        multicast_scouting: scouting && multicast,
+        gossip_scouting: scouting,
+        bounded_connect: true,
+        ..cerulion_core::transport::network::NetworkConfig::default()
+    }
+}
+
+/// Open the transient session a schema fallback (netd not applicable or
+/// unreachable) searches. With `scouting` set, the discovery ladder runs first
+/// and its candidates that accept a TCP connect within
+/// [`crate::discovery_ladder::LADDER_PROBE_TIMEOUT`] are appended to `connect`,
+/// because a session with multicast scouting off reaches only its connect
+/// endpoints. `connect` itself is kept verbatim. If the open fails with ladder
+/// candidates folded in, it is retried once with `connect` alone.
+fn open_fallback_discovery_session(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+) -> CliResult<cerulion_core::transport::network::NetworkManager> {
+    if !scouting {
+        return open_discovery_session(connect, listen, false);
+    }
+    let ladder_peers = cerulion_discovery::ladder::drop_this_hosts_gateways(
+        crate::discovery_ladder::discover_peers(false),
+        &cerulion_core::graph::robot_identity_from_env(),
+    );
+    let ladder_locators: Vec<String> = ladder_peers.iter().map(|p| p.locator.clone()).collect();
+    let mut reachable = crate::discovery_ladder::probe_reachable_locators(
+        &ladder_locators,
+        crate::discovery_ladder::LADDER_PROBE_TIMEOUT,
+    );
+    reachable.extend(connect.iter().cloned());
+    let plan = crate::discovery_ladder::plan_connect_set(connect, &ladder_peers, &reachable);
+    match open_discovery_session(&plan.connect, listen, true) {
+        Ok(mgr) => Ok(mgr),
+        Err(first_err) if !plan.folded_ladder.is_empty() => {
+            tracing::warn!(
+                error = %first_err,
+                dropped = ?plan.folded_ladder,
+                "a discovered candidate poisoned the fallback discovery session open; retrying \
+                 with the given locators only"
+            );
+            open_discovery_session(connect, listen, true)
+        }
+        Err(first_err) => Err(first_err),
+    }
+}
+
 /// Open ONE bounded-connect discovery session over `connect`/`listen`
 /// (the EPHEMERAL `topic list` session — the one place `bounded_connect` opts
 /// in, so a black-hole locator can't stall the open past the 1 s bound). A
@@ -2984,18 +3057,11 @@ fn open_discovery_session(
     listen: &[String],
     scouting: bool,
 ) -> CliResult<cerulion_core::transport::network::NetworkManager> {
-    use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-    let config = NetworkConfig {
-        connect_endpoints: connect.to_vec(),
-        listen_endpoints: listen.to_vec(),
-        // Scouting is caller-controlled — ON for the automagic CLI
-        // path, OFF for hermetic tests (reaches exactly the named locators).
-        multicast_scouting: scouting,
-        gossip_scouting: scouting,
-        bounded_connect: true,
-        ..NetworkConfig::default()
-    };
-    let mgr = NetworkManager::new(config);
+    use cerulion_core::transport::network::NetworkManager;
+    let multicast = scouting && cerulion_core::transport::network::multicast_scouting_from_env();
+    let mgr = NetworkManager::new(discovery_session_config(
+        connect, listen, scouting, multicast,
+    ));
     mgr.session().map_err(|e| {
         CliError::Validation(format!(
             "failed to open the zenoh discovery session: {e} — check the \
@@ -3066,8 +3132,9 @@ pub(crate) fn sanitize_display(s: &str) -> String {
 }
 
 /// A remote authorizer's refusal reason is untrusted remote text: control
-/// characters (ESC, CR, LF, ...) become `?` so the error cannot inject
-/// terminal sequences or extra lines, and the text truncates at 200 chars
+/// characters (ESC, CR, LF, ...) and the Unicode line and paragraph
+/// separators become `?` so the error cannot inject terminal sequences or
+/// extra lines, and the text truncates at 200 chars
 /// with a `…` marker.
 pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     const LIMIT: usize = 200;
@@ -3075,16 +3142,19 @@ pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     let mut chars = s.chars();
     for _ in 0..LIMIT {
         match chars.next() {
-            // C0/C1 controls and the bidi/format controls that reorder or
-            // hide text in a terminal all become `?`: a hostile LAN peer
-            // cannot smuggle terminal sequences, line breaks, or
-            // right-to-left overrides into a logged or printed refusal.
+            // C0/C1 controls, the Unicode line and paragraph separators,
+            // and the bidi/format controls that reorder or hide text in a
+            // terminal all become `?`: a hostile LAN peer cannot smuggle
+            // terminal sequences, line breaks, or right-to-left overrides
+            // into a logged or printed refusal.
             Some(
                 '\u{0000}'..='\u{001F}'
                 | '\u{007F}'..='\u{009F}'
                 | '\u{061C}'
                 | '\u{200E}'
                 | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2066}'..='\u{2069}',
             ) => out.push('?'),
@@ -4208,11 +4278,16 @@ pub fn topic_echo_with_scope(
     let mut consecutive_wait_errors: u32 = 0;
 
     // A REMOTE topic already carries the walker seeded during the
-    // ingress resolve — reuse it (no second discovery). A LOCAL topic keeps the
-    // earlier behavior: a ONE-TIME best-effort remote resolve as the FALLBACK for
-    // a frame carrying a type the desk never compiled (learn the type from a
-    // robot's catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk
-    // writes). A failed resolve is a `None` walker — the local path is unchanged.
+    // ingress resolve, reuse it (no second discovery). A LOCAL topic in automatic
+    // scope gets a ONE-TIME best-effort remote resolve as the FALLBACK for a frame
+    // carrying a type the desk never compiled (learn the type from a robot's
+    // catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk writes).
+    // That resolve runs on the FIRST frame whose schema hash the local walker
+    // cannot name, the same lazy rung `topic info` uses, never before the loop:
+    // the resolve can take seconds (a netd round trip, or the discovery ladder
+    // when netd is unreachable), and frames the desk can decode are displayed
+    // without waiting for it. A failed resolve is a `None` walker, the local
+    // path is unchanged.
     //
     // WHERE this observer's frames are supposed to come from, captured
     // before `source` is consumed below — it is the whole point of the silence
@@ -4221,10 +4296,11 @@ pub fn topic_echo_with_scope(
     // nothing").
     let source_desc = observer_source_description(&source);
 
-    let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
+    let mut remote_walker_pending =
+        matches!(source, TopicSource::Local) && scope != TopicScope::Local;
+    let mut remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
-        TopicSource::Local if scope == TopicScope::Local => None,
-        TopicSource::Local => resolve_remote_walker_for_topic(topic),
+        TopicSource::Local => None,
     };
     // The remote-fallback breadcrumb is emitted
     // LAZILY — only on the FIRST frame that ACTUALLY decodes via the remote
@@ -4324,6 +4400,14 @@ pub fn topic_echo_with_scope(
                     // fallback, hash-only hex otherwise. The one-time remote
                     // breadcrumb is emitted LAZILY inside — only when a frame
                     // ACTUALLY decodes remotely (factual, not predictive).
+                    if remote_walker_pending
+                        && local_walker
+                            .schema_name_for_hash(header.schema_hash)
+                            .is_none()
+                    {
+                        remote_walker_pending = false;
+                        remote_walker = resolve_remote_walker_for_topic(topic);
+                    }
                     write_custom_decode(
                         writer,
                         topic,
@@ -4769,7 +4853,10 @@ mod tests {
             mirror_robot,
             has_slashed_twin,
             TopicScope::Automatic,
-            &crate::graph_cmd::NetworkEnvKill::Off,
+            &crate::graph_cmd::QueryNetworkKill {
+                network: crate::graph_cmd::NetworkEnvKill::Off,
+                netd_off: false,
+            },
         )
     }
 
@@ -4795,7 +4882,10 @@ mod tests {
             topic: "/cam".to_string(),
             reason: "a live network mirror owns this topic".to_string(),
         };
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = local_lease_refusal_message(&error, TopicScope::Local, &off);
         assert!(flagged.starts_with("Local observation of topic '/cam' could not hold its source: a live network mirror owns this topic; "), "{flagged}");
         assert!(
@@ -4820,24 +4910,91 @@ mod tests {
     /// never `off` for a value the user did not set.
     #[test]
     fn environment_selection_label_preserves_an_unrecognized_value() {
-        use crate::graph_cmd::NetworkEnvKill;
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let network = |network| QueryNetworkKill {
+            network,
+            netd_off: false,
+        };
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Off),
+            environment_selection_label(&network(NetworkEnvKill::Off)),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unset),
+            environment_selection_label(&QueryNetworkKill::UNSET),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unrecognized(" typo ".to_string())),
+            environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+                " typo ".to_string()
+            ))),
             "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)"
         );
-        let hostile =
-            environment_selection_label(&NetworkEnvKill::Unrecognized("on\u{1b}[2J".to_string()));
+        let hostile = environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+            "on\u{1b}[2J".to_string(),
+        )));
         assert!(
             hostile.starts_with("CERULION_NETWORK=on\u{fffd}[2J ("),
             "{hostile}"
+        );
+    }
+
+    /// The netd daemon's switch is named on its own when it alone engaged the
+    /// local scope, and beside `CERULION_NETWORK` when both did; each remedy
+    /// unsets exactly the engaged variables.
+    #[test]
+    fn netd_network_switch_is_named_in_the_label_and_the_remedy() {
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let netd = QueryNetworkKill {
+            network: NetworkEnvKill::Unset,
+            netd_off: true,
+        };
+        assert_eq!(
+            environment_selection_label(&netd),
+            "CERULION_NETD_NETWORK=off"
+        );
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &netd);
+        assert_eq!(
+            missing,
+            "topic '/cam' not found locally, and remote discovery is disabled by \
+             CERULION_NETD_NETWORK=off; unset it to search robots on the LAN (a matching \
+             remote topic is then demanded automatically via cerulion-netd)"
+        );
+        let mirror = unknown_origin_mirror_message("/cam", TopicScope::Automatic, &netd);
+        assert!(
+            mirror.contains(
+                "; CERULION_NETD_NETWORK=off forbids demanding it from cerulion-netd; \
+                 unset CERULION_NETD_NETWORK to resolve"
+            ),
+            "{mirror}"
+        );
+        let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &netd);
+        assert!(
+            flagged.contains("; remove --local and unset CERULION_NETD_NETWORK to resolve"),
+            "{flagged}"
+        );
+        let both = QueryNetworkKill {
+            network: NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: true,
+        };
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &both);
+        assert!(
+            missing.contains(
+                "disabled by CERULION_NETWORK=on (an unrecognized value, which fails closed to \
+                 local-only) and CERULION_NETD_NETWORK=off; unset both to search"
+            ),
+            "{missing}"
+        );
+        let lease = local_lease_refusal_message(
+            &cerulion_core::TransportError::LocalObservationLease {
+                topic: "/cam".to_string(),
+                reason: "a live network mirror owns this topic".to_string(),
+            },
+            TopicScope::Automatic,
+            &both,
+        );
+        assert!(
+            lease.contains("; unset CERULION_NETWORK and CERULION_NETD_NETWORK to demand"),
+            "{lease}"
         );
     }
 
@@ -4845,7 +5002,10 @@ mod tests {
     /// remedy: `--local` only when the flag was passed, the environment switch otherwise.
     #[test]
     fn unknown_origin_mirror_refusal_names_the_active_selection() {
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &off);
         assert!(
             flagged.starts_with("topic '/cam' exists locally as a network mirror with origin unavailable; --local forbids demanding it from cerulion-netd; remove --local and unset CERULION_NETWORK to resolve"),
@@ -4857,7 +5017,10 @@ mod tests {
             "{environment}"
         );
         assert!(!environment.contains("--local"), "{environment}");
-        let unrecognized = crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string());
+        let unrecognized = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: false,
+        };
         let failed_closed =
             unknown_origin_mirror_message("/cam", TopicScope::Automatic, &unrecognized);
         assert!(
@@ -5922,6 +6085,25 @@ mod tests {
         assert_eq!(sanitize_refusal_reason(&long), format!("{exact}\u{2026}"));
     }
 
+    /// U+2028 LINE SEPARATOR cannot forge a second line in a displayed or
+    /// logged refusal.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_line_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2028}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
+    /// U+2029 PARAGRAPH SEPARATOR cannot forge a second line either.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_paragraph_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2029}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
     /// A hostile LAN-supplied robot name — from
     /// EITHER the announce-key robot chunk OR the mDNS TXT record — cannot
     /// inject terminal escapes into the rendered ROBOTS section, and the mDNS
@@ -6628,6 +6810,22 @@ mod tests {
         );
         assert!(opts.connect.is_empty() && opts.listen.is_empty());
         assert!(!opts.has_endpoints());
+    }
+
+    /// A CLI discovery session runs gossip on the automagic path and adds
+    /// multicast scouting only when the switch is also on.
+    #[test]
+    fn discovery_session_config_is_multicast_off_unless_both_flags() {
+        let c = vec!["tcp/10.0.0.1:7683".to_string()];
+        let auto = discovery_session_config(&c, &[], true, false);
+        assert!(auto.gossip_scouting && !auto.multicast_scouting);
+        assert!(auto.bounded_connect);
+        assert_eq!(auto.connect_endpoints, c);
+        let opted_in = discovery_session_config(&c, &[], true, true);
+        assert!(opted_in.gossip_scouting && opted_in.multicast_scouting);
+        // Hermetic sessions never scout, whatever the switch says.
+        let hermetic = discovery_session_config(&c, &[], false, true);
+        assert!(!hermetic.gossip_scouting && !hermetic.multicast_scouting);
     }
 
     /// `--no-network` skips the remote query

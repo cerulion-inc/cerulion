@@ -40,6 +40,7 @@ use super::demand_authorizer::{
 use super::discovery::{
     liveliness_prefix, query_announce_entries, query_live_topics_by_prefix, TopicToken,
 };
+use super::failure_regime_latch::RegimeDecision;
 use super::gateway::is_reserved_topic;
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
@@ -119,6 +120,75 @@ impl ZenohMode {
     }
 }
 
+/// The opt-in switch for zenoh multicast scouting (UDP `224.0.0.224:7446`).
+///
+/// Read when a `NetworkConfig` is built: by `cerulion-netd` and `cerulion-vizd`
+/// at daemon start, by `graph run` for a permissive gateway process it spawns
+/// itself, and by the `topic list` discovery session. A permissive `graph run`
+/// whose egress rides an already running `cerulion-netd` gets that daemon's
+/// boot-time value. Peers
+/// are found through the `_cerulion._tcp` mDNS browse and the peer cache, so
+/// with the switch unset a session sends no scout packets and answers none.
+/// The value `on` (trimmed, ASCII case-insensitive) sets
+/// [`NetworkConfig::multicast_scouting`] for networks where mDNS does not cross;
+/// both ends of a link need it, since a session with multicast scouting off
+/// neither sends nor answers scouts.
+pub const MULTICAST_SCOUTING_ENV: &str = "CERULION_MULTICAST_SCOUTING";
+
+/// What a [`MULTICAST_SCOUTING_ENV`] value selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulticastScoutingSwitch {
+    /// Unset, empty, or `off`: no multicast scouting.
+    Off,
+    /// `on`: multicast scouting enabled.
+    On,
+    /// Any other non-empty value: multicast scouting stays off and the reader
+    /// logs a warning naming the value.
+    OffUnrecognized,
+}
+
+/// Classify a [`MULTICAST_SCOUTING_ENV`] value. Pure.
+///
+/// The value is trimmed and compared ASCII case-insensitively: `on` enables,
+/// `off` / empty / unset disable, anything else disables and is reported as
+/// [`MulticastScoutingSwitch::OffUnrecognized`].
+pub fn classify_multicast_scouting(value: Option<&str>) -> MulticastScoutingSwitch {
+    let Some(v) = value.map(str::trim) else {
+        return MulticastScoutingSwitch::Off;
+    };
+    if v.is_empty() || v.eq_ignore_ascii_case("off") {
+        MulticastScoutingSwitch::Off
+    } else if v.eq_ignore_ascii_case("on") {
+        MulticastScoutingSwitch::On
+    } else {
+        MulticastScoutingSwitch::OffUnrecognized
+    }
+}
+
+/// Read [`MULTICAST_SCOUTING_ENV`] from the process environment and return
+/// whether multicast scouting is enabled. An unrecognized value logs one
+/// `warn!` and returns `false`; `on` logs one `info!`.
+pub fn multicast_scouting_from_env() -> bool {
+    let raw = std::env::var(MULTICAST_SCOUTING_ENV).ok();
+    match classify_multicast_scouting(raw.as_deref()) {
+        MulticastScoutingSwitch::Off => false,
+        MulticastScoutingSwitch::On => {
+            tracing::info!(
+                "{MULTICAST_SCOUTING_ENV}=on: zenoh multicast scouting enabled (UDP 7446)"
+            );
+            true
+        }
+        MulticastScoutingSwitch::OffUnrecognized => {
+            tracing::warn!(
+                value = raw.as_deref().unwrap_or(""),
+                "{MULTICAST_SCOUTING_ENV} is set but is neither \"on\" nor \"off\"; zenoh \
+                 multicast scouting stays OFF. Set {MULTICAST_SCOUTING_ENV}=on to enable it."
+            );
+            false
+        }
+    }
+}
+
 /// Configuration for the zenoh network transport.
 ///
 /// Defaults are safe for local development: scouting disabled, no endpoints.
@@ -166,7 +236,8 @@ pub struct NetworkConfig {
     ///
     /// Default `false` - gateways and graph runs keep zenoh's robust default
     /// retry semantics (`-1` = dead endpoints retry on a background connector).
-    /// ONLY the EPHEMERAL `topic list` discovery query session sets it (that
+    /// ONLY the EPHEMERAL CLI discovery sessions (`topic list` and the schema
+    /// fallbacks) set it (that
     /// session is a one-shot bounded gather, so its connect phase must be
     /// hard-bounded - the 11 s stall fix).
     pub bounded_connect: bool,
@@ -454,7 +525,7 @@ fn apply_demand_reconcile(
                     Ok(true) => tracing::info!(
                         topic = %canonical,
                         remove_confirm = REMOVE_CONFIRM,
-                        "network bridge disabled - demand absent across REMOVE_CONFIRM \
+                        "network bridge disabled: demand absent across REMOVE_CONFIRM \
                          consecutive reconcile passes"
                     ),
                     Ok(false) => {}
@@ -473,9 +544,8 @@ fn apply_demand_reconcile(
 
 /// The belt feed: refresh `topics` (the reconciler belt's
 /// live iteration set) from the bridge manager's registered-topic snapshot (THE
-/// source of truth for which topics may egress), using the SAME monotonic-count
-/// dirty-check discipline [`crate::transport::gateway::GatewayRuntime::drive_once`]
-/// uses.
+/// source of truth for which topics may egress), re-snapshotting only when the
+/// registered membership changed (see the cost discipline below).
 ///
 /// # Why the belt needs this
 ///
@@ -491,15 +561,16 @@ fn apply_demand_reconcile(
 ///
 /// # Cost discipline
 ///
-/// The bridge `bridges` map is ADD-ONLY (`register_topic` inserts; nothing
-/// removes a key), so `registered_topic_count()` is MONOTONIC and a bare count
-/// read (one uncontended mutex lock, no alloc) is a reliable "a new egress topic
-/// registered" dirty-check. The per-pass steady-state cost is exactly that one
-/// count read; only a GROWN count takes the full (locked, allocating) snapshot +
-/// rebuilds `topics`. The seed at thread spawn IS the boot announce set (whose
-/// length equals the registered count at boot - both derived from the same
-/// snapshot), so the dirty-check is stable from the first pass and never
-/// re-snapshots spuriously.
+/// The per-pass steady-state cost is one
+/// [`TopicBridgeManager::registered_set_is`] check (one mutex lock and one
+/// hash lookup per topic, no allocation). Only a CHANGED membership takes the
+/// full (locked, allocating) snapshot and rebuilds `topics`. A count check
+/// alone is not enough: a host that restarts its gateway inside one process
+/// (`TopicBridgeManager::unregister_topics_except`) can drop `/a` and then
+/// register `/b`, and this thread outlives that gateway, so a same-count swap
+/// must re-snapshot too. The seed at thread spawn IS the boot announce set
+/// (canonical, deduplicated), so the check is stable from the first pass and
+/// never re-snapshots spuriously.
 ///
 /// Robust: a poisoned bridge mutex leaves `topics` UNCHANGED (the belt keeps its
 /// last-known set + logs at `debug!` - never wedges, never silently drops a
@@ -507,10 +578,13 @@ fn apply_demand_reconcile(
 /// `topics` needs no re-canonicalization ([`apply_demand_reconcile`] canonicalizes
 /// each entry again anyway, a no-op on an already-canonical name).
 fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<String>) {
-    match bridge_mgr.registered_topic_count() {
-        // Grew since the last pass - a runtime registration. Re-snapshot the live
-        // registered set (canonical + sorted) into `topics`.
-        Ok(count) if count > topics.len() => match bridge_mgr.registered_topics() {
+    match bridge_mgr.registered_set_is(topics) {
+        // Unchanged (steady state) - the cheap path, no snapshot.
+        Ok(true) => {}
+        // The membership changed - a runtime registration, or a host restart
+        // that retired the prior run's topics. Re-snapshot the live registered
+        // set (canonical + sorted) into `topics`.
+        Ok(false) => match bridge_mgr.registered_topics() {
             Ok(registered) => {
                 topics.clear();
                 topics.extend(registered.into_iter().map(|(topic, _)| topic));
@@ -518,15 +592,13 @@ fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<St
             Err(e) => tracing::debug!(
                 error = %e,
                 "reconciler belt: could not snapshot the registered egress set \
-                 (bridge manager poisoned) - the belt keeps its last-known iteration set this pass"
+                 (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
             ),
         },
-        // Unchanged (steady state) - the cheap path, no snapshot.
-        Ok(_) => {}
         Err(e) => tracing::debug!(
             error = %e,
-            "reconciler belt: could not read the registered egress count \
-             (bridge manager poisoned) - the belt keeps its last-known iteration set this pass"
+            "reconciler belt: could not read the registered egress set \
+             (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
         ),
     }
 }
@@ -567,7 +639,7 @@ fn gather_with_latch(
             if gather_latch.consecutive_failures > 0 {
                 tracing::info!(
                     suppressed = gather_latch.consecutive_failures,
-                    "demand reconcile query recovered - the reconciler can query \
+                    "demand reconcile query recovered: the reconciler can query \
                      again; egress flags reconcile this pass"
                 );
                 gather_latch.consecutive_failures = 0;
@@ -579,7 +651,7 @@ fn gather_with_latch(
             if gather_latch.consecutive_failures == 1 {
                 tracing::warn!(
                     error = %e,
-                    "demand reconcile query FAILED - the demand reconciler cannot \
+                    "demand reconcile query FAILED: the demand reconciler cannot \
                      query, so egress flags are FROZEN this regime (no topic can start or \
                      stop egressing until the query recovers); repeats log at debug"
                 );
@@ -587,8 +659,8 @@ fn gather_with_latch(
                 tracing::debug!(
                     error = %e,
                     consecutive_failures = gather_latch.consecutive_failures,
-                    "demand reconcile query still failing - egress flags frozen \
-                     (repeat - see the first warning for this regime)"
+                    "demand reconcile query still failing: egress flags frozen \
+                     (repeat; see the first warning for this regime)"
                 );
             }
             None
@@ -962,7 +1034,7 @@ impl DemandGetState {
         if latch.consecutive_failures == 1 {
             tracing::warn!(
                 error = %error,
-                "demand GET FAILED - the demander cannot query the producer's demand \
+                "demand GET FAILED: the demander cannot query the producer's demand \
                  queryable, so its ingress topics may never start egressing on the remote; \
                  repeats log at debug"
             );
@@ -970,7 +1042,7 @@ impl DemandGetState {
             tracing::debug!(
                 error = %error,
                 consecutive_failures = latch.consecutive_failures,
-                "demand GET still failing (repeat - see the first warning for this regime)"
+                "demand GET still failing (repeat; see the first warning for this regime)"
             );
         }
     }
@@ -984,7 +1056,7 @@ impl DemandGetState {
         if latch.consecutive_failures > 0 {
             tracing::info!(
                 suppressed = latch.consecutive_failures,
-                "demand GET recovered - the demander can query the producer again"
+                "demand GET recovered: the demander can query the producer again"
             );
             latch.consecutive_failures = 0;
         }
@@ -1214,14 +1286,14 @@ impl PermissiveShmProbe {
             tracing::debug!(
                 topic = %canonical,
                 detail = %detail,
-                "permissive SHM probe REFUSED (repeat - see the first warning; \
+                "permissive SHM probe REFUSED (repeat; see the first warning; \
                  loop_refusal_count keeps counting)"
             );
         } else {
             tracing::warn!(
                 topic = %canonical,
                 detail = %detail,
-                "permissive SHM probe REFUSED - this gateway must never serve \
+                "permissive SHM probe REFUSED: this gateway must never serve \
                  it to the network (repeats log at debug; loop_refusal_count keeps counting)"
             );
         }
@@ -1255,7 +1327,7 @@ impl PermissiveShmProbe {
             Ok(()) => {
                 tracing::info!(
                     topic = %canonical,
-                    "permissive SHM probe: deferred announce HEALED - the network announce \
+                    "permissive SHM probe: deferred announce HEALED; the network announce \
                      that failed on an earlier probe hit succeeded on this demand's re-attempt; \
                      remote discovery now lists this topic (the flag was grantable throughout)"
                 );
@@ -1267,7 +1339,7 @@ impl PermissiveShmProbe {
                     error = %e,
                     "permissive SHM probe: deferred announce re-attempt FAILED again \
                      (registered + demand-grantable; the flag is RETAINED and re-attempts on the \
-                     next demand - see the first serve warning; announce_deferred keeps counting)"
+                     next demand; see the first serve warning; announce_deferred keeps counting)"
                 );
             }
         }
@@ -1298,7 +1370,7 @@ impl PermissiveShmProbe {
         let Some(manager) = self.manager.upgrade() else {
             tracing::debug!(
                 topic = %topic,
-                "permissive SHM probe skipped - owning manager is gone (mid-Drop)"
+                "permissive SHM probe skipped: owning manager is gone (mid-Drop)"
             );
             return ProbeVerdict::ManagerGone;
         };
@@ -1363,7 +1435,7 @@ impl PermissiveShmProbe {
         {
             // Its local SHM service is this gateway's OWN re-injection - serving it
             // back out would echo-loop.
-            self.record_loop_refusal(&canonical, "network INGRESS topic - echo-loop");
+            self.record_loop_refusal(&canonical, "network INGRESS topic (echo-loop)");
             return ProbeVerdict::LoopRefused;
         }
 
@@ -1388,7 +1460,7 @@ impl PermissiveShmProbe {
                         topic = %canonical,
                         error = %e,
                         "permissive SHM probe: live service found but registration FAILED \
-                         (bridge manager poisoned) - not served"
+                         (bridge manager poisoned): not served"
                     );
                     return ProbeVerdict::Missing;
                 }
@@ -1407,7 +1479,7 @@ impl PermissiveShmProbe {
                         topic = %canonical,
                         error = %e,
                         "permissive SHM probe HIT registered + demand-grantable but its \
-                         network announce FAILED - remote discovery will not list it yet (a demand \
+                         network announce FAILED: remote discovery will not list it yet (a demand \
                          token still grants egress; the flag is RETAINED). Heals on the next demand: \
                          its AlreadyRegistered arm re-attempts the announce idempotently"
                     );
@@ -1418,7 +1490,7 @@ impl PermissiveShmProbe {
                 self.loop_flood_warned.store(false, Ordering::Relaxed);
                 tracing::info!(
                     topic = %canonical,
-                    "permissive SHM probe HIT - live local service registered + announced \
+                    "permissive SHM probe HIT: live local service registered + announced \
                      on demand (announce-on-first-serve)"
                 );
                 ProbeVerdict::Served
@@ -1431,14 +1503,14 @@ impl PermissiveShmProbe {
                 if !self.flood_warned.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         topic = %canonical,
-                        "permissive SHM probe MISS - remote demand for a topic with no \
+                        "permissive SHM probe MISS: remote demand for a topic with no \
                          live local SHM service; refused (nothing created). Repeats log at debug; \
                          miss_count keeps counting"
                     );
                 } else {
                     tracing::debug!(
                         topic = %canonical,
-                        "permissive SHM probe MISS (repeat - see the first warning)"
+                        "permissive SHM probe MISS (repeat; see the first warning)"
                     );
                 }
                 ProbeVerdict::Missing
@@ -1523,7 +1595,7 @@ fn handle_query(
         None => {
             tracing::debug!(
                 key = %query.key_expr().as_str(),
-                "query surface: unrecognized or malformed key - ignored"
+                "query surface: unrecognized or malformed key; ignored"
             );
         }
     }
@@ -1616,6 +1688,71 @@ fn handle_catalog_verb(
     }
 }
 
+/// Log a LAN `request` the authorization gate refused. With the
+/// authorizer's refusal latches (the live [`LanAccessAuthorizer`] keeps
+/// them; a paired machine refuses every LAN request) the first refusal of a
+/// regime is a loud warn, repeats are counted at debug, and each decade of
+/// the running total re-announces loudly. Without latches every refusal is
+/// loud. `resource` is the topic or verb resource the request named.
+fn log_lan_refusal(
+    authorizer: &dyn DemandAuthorizer,
+    request: &'static str,
+    resource: &str,
+    reason: &str,
+) -> RegimeDecision {
+    let decision = authorizer
+        .lan_refusal_latches()
+        .map_or(RegimeDecision::Loud, |latches| {
+            latches.on_refusal(request, resource)
+        });
+    match decision {
+        RegimeDecision::Loud => tracing::warn!(
+            request,
+            resource = %resource,
+            plane = "zenoh-lan",
+            reason = %reason,
+            "LAN request REFUSED by the demand-authorization gate: the demanding party is \
+             not authorized for this machine (account/pairing grant); serving nothing. \
+             Repeated refusals are counted, not logged, until the refused resource is authorized"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            request,
+            resource = %resource,
+            plane = "zenoh-lan",
+            reason = %reason,
+            total_failures = total,
+            suppressed,
+            "LAN requests are still refused by the demand-authorization gate"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            request,
+            resource = %resource,
+            reason = %reason,
+            suppressed,
+            "LAN request refused by the demand-authorization gate (repeat)"
+        ),
+    }
+    decision
+}
+
+/// Record a LAN `request` for `resource` the gate authorized: closes an
+/// open refusal regime of that kind when its latest refusal named the same
+/// resource, logging one recovery line when it counted repeats. An
+/// authorization for another resource leaves that regime open.
+fn note_lan_authorized(authorizer: &dyn DemandAuthorizer, request: &'static str, resource: &str) {
+    if let Some(suppressed) = authorizer
+        .lan_refusal_latches()
+        .and_then(|latches| latches.on_authorized(request, resource))
+    {
+        tracing::info!(
+            request,
+            resource = %resource,
+            suppressed,
+            "LAN requests are authorized again after refused requests"
+        );
+    }
+}
+
 /// The catalog-serve DECISION - the demand-authorization gate FIRST
 /// (the access boundary), then the catalog build. An unauthorized
 /// catalog GET serves NOTHING: a LOUD `warn!` plus an explicit
@@ -1637,16 +1774,10 @@ fn catalog_serve_decision(
         &DemandSubject::Lan { locator: None },
         CATALOG_QUERY_RESOURCE,
     ) {
-        tracing::warn!(
-            robot = %robot,
-            plane = "zenoh-lan",
-            reason = %reason,
-            "catalog GET REFUSED by the demand-authorization gate - the \
-             demanding party is not authorized for this machine (account/pairing grant\
-             ); enumerating nothing"
-        );
+        log_lan_refusal(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE, &reason);
         return cerulion_q::CatalogReply::refused(robot, reason);
     }
+    note_lan_authorized(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE);
     build_catalog_reply_from_bridge(bridge_mgr, catalog, robot)
 }
 
@@ -1705,17 +1836,10 @@ fn schema_serve_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, requested)
     {
-        tracing::warn!(
-            robot = %robot,
-            requested = %requested,
-            plane = "zenoh-lan",
-            reason = %reason,
-            "schema GET REFUSED by the demand-authorization gate - the \
-             demanding party is not authorized for this machine (account/pairing grant\
-             ); serving nothing"
-        );
+        log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
     }
+    note_lan_authorized(authorizer, "schema GET", requested);
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
     // so a schema GET never mixes the old and new maps mid-closure.
     let _snapshot_guard = schema
@@ -1810,23 +1934,17 @@ fn runs_serve_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, RUNS_QUERY_RESOURCE)
     {
-        tracing::warn!(
-            robot = %robot,
-            plane = "zenoh-lan",
-            reason = %reason,
-            "runs GET REFUSED by the demand-authorization gate - the \
-             demanding party is not authorized for this machine (account/pairing grant\
-             ); serving no runs"
-        );
+        log_lan_refusal(authorizer, "runs GET", RUNS_QUERY_RESOURCE, &reason);
         return cerulion_q::RunsReply::refused(robot, reason);
     }
+    note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
     let gather = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
         Ok(gather) => gather,
         Err(e) => {
             tracing::warn!(
                 robot = %robot,
                 error = %e,
-                "runs GET: the run registry could not be gathered - answering \
+                "runs GET: the run registry could not be gathered; answering \
                  'could not establish', never 'no runs'"
             );
             return cerulion_q::build_runs_reply(
@@ -1844,7 +1962,7 @@ fn runs_serve_decision(
             run_id = %cerulion_q::format_run_id(skip.run_id),
             run_dir = %skip.run_dir,
             reason = %skip.reason,
-            "runs GET: skipping a live run whose directory could not be read - \
+            "runs GET: skipping a live run whose directory could not be read; \
              an entry carrying an empty document would render desk-side as a graph with \
              no nodes"
         );
@@ -1862,8 +1980,8 @@ fn runs_serve_decision(
 
 /// The shared, thread-safe source the `catalog` verb reads to build a
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
-/// runtime-registration control channel into `hashes`, and `boot_topics` is fixed
-/// at boot - while the query-surface callback (on the zenoh callback thread) reads
+/// runtime-registration control channel into `hashes`, and `boot_topics` is set
+/// at boot (and by a host restart's `SchemaServingHandles::replace`) - while the query-surface callback (on the zenoh callback thread) reads
 /// them + the live bridge manager to answer a catalog GET. Cheap to clone (three
 /// `Arc`s).
 #[derive(Clone)]
@@ -1874,8 +1992,9 @@ pub struct CatalogSource {
     /// `schema_hash: None`.
     pub hashes: Arc<Mutex<HashMap<String, u64>>>,
     /// Canonical boot-plan announce topics - provenance `Boot`; every other
-    /// registered topic is provenance `Runtime`.
-    pub boot_topics: Arc<HashSet<String>>,
+    /// registered topic is provenance `Runtime`. A host restart's
+    /// `SchemaServingHandles::replace` swaps it for the next run's set.
+    pub boot_topics: Arc<Mutex<HashSet<String>>>,
     /// Canonical topic → its qualified schema NAME (`pkg/Type`),
     /// resolved by the CLI from the graph's node OUTPUTS and handed to the gateway
     /// in its plan. A topic absent here falls through to [`Self::hash_names`]
@@ -1895,12 +2014,6 @@ pub struct CatalogSource {
     /// bindings (built-in corpus included); a later registration's
     /// serving MERGES in through the gateway's `SchemaServingHandles`.
     pub hash_names: Arc<Mutex<HashMap<u64, String>>>,
-    /// The current run's catalog topic set when a `SchemaServingHandles::replace`
-    /// has installed a snapshot: the bridge registry is add-only for the process
-    /// lifetime, so a restart with a different topic set must not keep listing
-    /// the prior run's routes. `None` = unfiltered (no replace has run).
-    /// Shared with the serving handles so `replace` narrows this serve.
-    pub snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
     /// The whole-operation mutex `merge`/`replace` hold (shared with the
     /// serving handles so the two can never interleave).
     pub snapshot_lock: Arc<Mutex<()>>,
@@ -2032,21 +2145,11 @@ fn build_catalog_reply_from_bridge(
         .snapshot_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The bridge registry is the one source of truth for the listed set: a
+    // host restarting its gateway unregisters the prior run's topics
+    // (`TopicBridgeManager::unregister_topics_except`), and a topic registered
+    // later (a runtime registration, a probe serve) lists at once.
     let registered = bridge_mgr.registered_topics().unwrap_or_default();
-    let registered: Vec<(String, _)> = match &*catalog
-        .snapshot_topics
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        // A replaced snapshot narrows the catalog to the current run's set:
-        // the bridge registry is add-only and would otherwise keep serving
-        // a prior run's topics.
-        Some(snapshot) => registered
-            .into_iter()
-            .filter(|(topic, _flag)| snapshot.contains(topic))
-            .collect(),
-        None => registered,
-    };
     let hashes = catalog
         .hashes
         .lock()
@@ -2059,6 +2162,10 @@ fn build_catalog_reply_from_bridge(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let hash_names = catalog
         .hash_names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let boot_topics = catalog
+        .boot_topics
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Upgrade the WEAK manager handle ONCE for the whole sweep (a live
@@ -2092,7 +2199,7 @@ fn build_catalog_reply_from_bridge(
             .get(&topic)
             .cloned()
             .or_else(|| schema_hash.and_then(|h| hash_names.get(&h).cloned()));
-        let provenance = if catalog.boot_topics.contains(&topic) {
+        let provenance = if boot_topics.contains(&topic) {
             CatalogProvenance::Boot
         } else {
             CatalogProvenance::Runtime
@@ -2143,17 +2250,11 @@ fn demand_grant_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, canonical)
     {
-        tracing::warn!(
-            topic = %canonical,
-            plane = "zenoh-lan",
-            reason = %reason,
-            "demand REFUSED by the demand-authorization gate - the demanding \
-             party is not authorized for this machine (account/pairing grant); \
-             serving nothing"
-        );
+        log_lan_refusal(authorizer, "demand", canonical, &reason);
         get_state.record_refusal();
         return ACK_REFUSED;
     }
+    note_lan_authorized(authorizer, "demand", canonical);
     // Permissive SHM probe FIRST - OUTSIDE the `last_get` critical
     // section (the SHM open + zenoh announce must not extend the FINDING-1 lock
     // scope). A demand for an UNregistered topic under AllowAll egress that is LIVE
@@ -2179,7 +2280,7 @@ fn demand_grant_decision(
     if demand_put_targets_self_ingress(self_ingress, canonical) {
         tracing::debug!(
             topic = %canonical,
-            "demand GET for our own network-ingress topic - not an egress candidate (loop exclusion); refused without enable_bridge"
+            "demand GET for our own network-ingress topic: not an egress candidate (loop exclusion); refused without enable_bridge"
         );
         get_state.record_refusal();
         return ACK_REFUSED;
@@ -2245,16 +2346,10 @@ fn apply_live_put_demand(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, topic)
     {
-        tracing::warn!(
-            topic = %topic,
-            plane = "zenoh-lan",
-            reason = %reason,
-            "liveliness demand REFUSED by the demand-authorization gate - \
-             the demanding party is not authorized for this machine (account/pairing \
-             grant); egress not enabled"
-        );
+        log_lan_refusal(authorizer, "liveliness demand", topic, &reason);
         return Ok(false);
     }
+    note_lan_authorized(authorizer, "liveliness demand", topic);
     // Same permissive SHM probe as the queryable path - a live unregistered
     // AllowAll topic is registered + announced here so the enable below flips its
     // (now-existing) egress flag. Self-gating (see `PermissiveShmProbe::try_serve`).
@@ -2405,7 +2500,7 @@ fn run_get_expiry(
                 tracing::info!(
                     topic = %topic,
                     ttl_secs = DEMAND_TTL.as_secs(),
-                    "network bridge disabled - no demand GET within DEMAND_TTL and \
+                    "network bridge disabled: no demand GET within DEMAND_TTL and \
                      liveliness absent (both demand paths released this topic)"
                 );
             }
@@ -2475,7 +2570,7 @@ fn run_demand_get_pass_on_session(
         }
         Err(e) => tracing::debug!(
             error = %e,
-            "demand GET: announce identity harvest failed - using the wildcard selector"
+            "demand GET: announce identity harvest failed; using the wildcard selector"
         ),
     }
 
@@ -2724,7 +2819,7 @@ fn record_ingress_rejection(
         tracing::debug!(
             topic = %topic,
             reason = %rejection,
-            "ingress: dropped network frame (repeat - see the first warning for this class)"
+            "ingress: dropped network frame (repeat; see the first warning for this class)"
         );
     } else {
         tracing::warn!(
@@ -2761,23 +2856,23 @@ fn record_reinject_failure(
         (true, Some(e)) => tracing::debug!(
             topic = %topic,
             error = %e,
-            "ingress: re-injection into local iceoryx2 failed - validated frame dropped \
-             (repeat - see the first warning for this class)"
+            "ingress: re-injection into local iceoryx2 failed: validated frame dropped \
+             (repeat; see the first warning for this class)"
         ),
         (true, None) => tracing::debug!(
             topic = %topic,
-            "ingress: local publisher mutex poisoned - validated frame dropped \
-             (repeat - see the first error for this class)"
+            "ingress: local publisher mutex poisoned: validated frame dropped \
+             (repeat; see the first error for this class)"
         ),
         (false, Some(e)) => tracing::warn!(
             topic = %topic,
             error = %e,
-            "ingress: re-injection into local iceoryx2 failed - validated frame dropped \
+            "ingress: re-injection into local iceoryx2 failed: validated frame dropped \
              (reinject_failure_drops counts these; repeats log at debug)"
         ),
         (false, None) => tracing::error!(
             topic = %topic,
-            "ingress: local publisher mutex poisoned - validated frame dropped \
+            "ingress: local publisher mutex poisoned: validated frame dropped \
              (reinject_failure_drops counts these; repeats log at debug)"
         ),
     }
@@ -2956,7 +3051,7 @@ impl IngressInjector {
                         if self.warn.reset() {
                             tracing::info!(
                                 topic = %self.topic,
-                                "ingress: recovered - frames validating and re-injecting again"
+                                "ingress: recovered; frames validating and re-injecting again"
                             );
                         }
                         self.counters.frames.fetch_add(1, Ordering::Relaxed);
@@ -3181,6 +3276,10 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
+    /// TEST-SEAM fire-once flag: when set, the NEXT ingress demand token
+    /// declaration fails. Written only by
+    /// [`NetworkManager::fault_inject_ingress_token_once`].
+    fail_next_ingress_token: AtomicBool,
     /// True while LAN access is [`LanAccess::Paired`]. Shared with every
     /// ingress receive callback, which refuses frames while it is set.
     lan_paired: Arc<AtomicBool>,
@@ -3226,7 +3325,11 @@ pub struct NetworkManager {
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
     after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    before_announce_gate_write: Mutex<Option<TestHook>>,
+    /// TEST SEAM: callback fired inside [`Self::set_lan_access`] when its
+    /// write lock on the announce gate is contended (another caller holds a
+    /// read guard), just before it blocks. Always present and unset in
+    /// production.
+    on_announce_gate_contended: Mutex<Option<TestHook>>,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] retains its
     /// token, still inside the announce gate's read guard. Always present and
     /// unset in production.
@@ -3260,10 +3363,6 @@ pub struct NetworkManager {
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
     demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
-    /// Counts posture writes; bumped only while `demand_authorizer_parts` is
-    /// held, so a write token names exactly one [`Self::set_lan_access`]
-    /// call even when two calls store the same [`LanAccess`] value.
-    lan_access_generation: AtomicU64,
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
@@ -3315,19 +3414,19 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
+            fail_next_ingress_token: AtomicBool::new(false),
             lan_paired: Arc::new(AtomicBool::new(lan_access == LanAccess::Paired)),
             ingress_gate: Arc::new(std::sync::RwLock::new(())),
             ingress_posture: Mutex::new(()),
             retain_ingress_subscriber: AtomicBool::new(false),
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
-            before_announce_gate_write: Mutex::new(None),
+            on_announce_gate_contended: Mutex::new(None),
             after_announce_insert: Mutex::new(None),
             after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
             demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
-            lan_access_generation: AtomicU64::new(0),
             lan_bridges: Mutex::new(None),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
                 lan_access,
@@ -3372,7 +3471,10 @@ impl NetworkManager {
 
     /// Set the LAN posture applied in front of the installed demand authorizer.
     /// Set it before the gateway boots: opening access later does not replay topic
-    /// announces withheld while paired. Switching to [`LanAccess::Paired`] withdraws
+    /// announces withheld while paired. A host that builds its gateway while
+    /// paired and opens access afterwards replays those announces itself (the
+    /// embedded Android runtime announces every registered topic when its start
+    /// commits). Switching to [`LanAccess::Paired`] withdraws
     /// every retained egress-topic announce token and disables every LAN egress
     /// bridge. The bridge manager refuses LAN enables until access is opened again;
     /// reopening permits demands but does not replay withheld announces.
@@ -3380,62 +3482,40 @@ impl NetworkManager {
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
     pub fn set_lan_access(&self, access: LanAccess) {
-        self.set_lan_access_tracked(access);
+        self.apply_lan_access(access);
     }
 
-    /// [`Self::set_lan_access`], returning a token that names this write.
-    /// Pass the token to [`Self::set_lan_access_if_current`] to change the
-    /// posture again only while no other write has happened since.
-    pub fn set_lan_access_tracked(&self, access: LanAccess) -> u64 {
-        match self.apply_lan_access(access, None) {
-            Some(write) => write,
-            None => unreachable!("an unconditional posture write always applies"),
-        }
-    }
-
-    /// Set the posture only while the last write is still the one `write`
-    /// names (a token from [`Self::set_lan_access_tracked`] or this method).
-    /// Returns the new write's token, or `None` (posture untouched) when any
-    /// other write happened since - even one that stored the same value.
-    /// The check and the write are one atomic step against every other
-    /// posture write.
-    pub fn set_lan_access_if_current(&self, write: u64, access: LanAccess) -> Option<u64> {
-        self.apply_lan_access(access, Some(write))
-    }
-
-    fn apply_lan_access(&self, access: LanAccess, expected: Option<u64>) -> Option<u64> {
-        let (bridges, write, released) = {
-            // Test seam: the announce/demand race tests place the closer
-            // HERE - proven to be at the write lock's threshold, so the
-            // 100 ms blocked check measures the gate, not a spawn delay.
-            if let Some(hook) = self
-                .before_announce_gate_write
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-            {
-                hook();
-            }
+    fn apply_lan_access(&self, access: LanAccess) {
+        let (bridges, released) = {
             // The WRITE guard wraps the flag store and the `announced`
             // clear: every in-flight announce holds a READ guard from its
             // posture check through its insert, so this waits out each one
             // before revoking; no token an announce declared can outlive
             // the close. Taken before `demand_authorizer_parts` to match
-            // the announce path's lock order.
-            let _announce_write = self
-                .announce_gate
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // the announce path's lock order. A contended gate fires the
+            // test hook before blocking, so a race test learns the close
+            // really is waiting on the gate.
+            let _announce_write = match self.announce_gate.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let hook = self
+                        .on_announce_gate_contended
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    self.announce_gate
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+            };
             let mut parts = self
                 .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let current = self.lan_access_generation.load(Ordering::SeqCst);
-            if expected.is_some_and(|expected| expected != current) {
-                return None;
-            }
-            let write = current.wrapping_add(1);
-            self.lan_access_generation.store(write, Ordering::SeqCst);
             parts.0 = access;
             self.lan_paired
                 .store(access == LanAccess::Paired, Ordering::SeqCst);
@@ -3468,7 +3548,7 @@ impl NetworkManager {
             // zenoh declaration never runs under the authorizer parts lock.
             drop(parts);
             let released = self.apply_ingress_posture(access == LanAccess::Paired);
-            (bridges, write, released)
+            (bridges, released)
         };
         drop(released);
         // Every lock above is released before these waits: a gateway pass that
@@ -3486,7 +3566,6 @@ impl NetworkManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
         }
-        Some(write)
     }
 
     /// The LAN posture applied in front of the installed demand authorizer.
@@ -4008,6 +4087,17 @@ impl NetworkManager {
         session: &zenoh::Session,
         canonical: &str,
     ) -> TransportResult<Option<TopicToken>> {
+        // TEST SEAM (fire-once): `fault_inject_ingress_token_once` fails the
+        // NEXT declaration, as a broken liveliness declare would. One relaxed
+        // load on the cold registration path, always `false` in production.
+        if self.fail_next_ingress_token.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::Publish {
+                topic: canonical.to_string(),
+                reason: "test seam: injected ingress demand token failure \
+                         (fault_inject_ingress_token_once)"
+                    .to_string(),
+            });
+        }
         if self.suppress_ingress_token.load(Ordering::Relaxed) {
             tracing::debug!(
                 topic = %canonical,
@@ -4050,9 +4140,11 @@ impl NetworkManager {
                 }
                 return released;
             }
+            // A suspended entry, or an open one whose demand token failed to
+            // declare on an earlier open: declare only the missing parts.
             ingress
                 .iter()
-                .filter(|(_, entry)| entry.suspended)
+                .filter(|(_, entry)| entry.suspended || entry.token.is_none())
                 .map(|(topic, entry)| {
                     (
                         topic.clone(),
@@ -4089,7 +4181,8 @@ impl NetworkManager {
                         topic = %topic,
                         error = %e,
                         "ingress demand token declaration failed after opening LAN access; \
-                         the demand GET path still requests the topic"
+                         the demand GET path still requests the topic, and the next open \
+                         retries the token"
                     );
                     None
                 }
@@ -4099,12 +4192,27 @@ impl NetworkManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match ingress.get_mut(&topic) {
-                Some(entry) if entry.suspended && Arc::ptr_eq(&entry.injector, &injector) => {
-                    if subscriber.is_some() {
+                Some(entry) if Arc::ptr_eq(&entry.injector, &injector) => {
+                    let mut unused = IngressHandles {
+                        _token: None,
+                        _subscriber: None,
+                    };
+                    if entry.subscriber.is_none() {
                         entry.subscriber = subscriber;
+                    } else {
+                        unused._subscriber = subscriber;
                     }
-                    entry.token = token;
-                    entry.suspended = false;
+                    if entry.token.is_none() {
+                        entry.token = token;
+                    } else {
+                        unused._token = token;
+                    }
+                    // Frames flow once the data subscriber exists; a missing
+                    // token stays retryable (`token.is_none()` above).
+                    if entry.subscriber.is_some() {
+                        entry.suspended = false;
+                    }
+                    released.push(unused);
                 }
                 // Unregistered while the declarations ran: drop them.
                 _ => released.push(IngressHandles {
@@ -4173,8 +4281,8 @@ impl NetworkManager {
         let Some(entry) = removed else {
             return Err(TransportError::Internal {
                 reason: format!(
-                    "topic '{canonical}' has no registered network ingress bridge to unregister \
-                     - it was never registered, or it was already unregistered"
+                    "topic '{canonical}' has no registered network ingress bridge to unregister: \
+                     it was never registered, or it was already unregistered"
                 ),
             });
         };
@@ -4195,7 +4303,7 @@ impl NetworkManager {
 
         tracing::info!(
             topic = %canonical,
-            "network ingress bridge unregistered - subscriber + demand token undeclared, \
+            "network ingress bridge unregistered: subscriber + demand token undeclared, \
              injection publisher released"
         );
         Ok(())
@@ -4226,7 +4334,7 @@ impl NetworkManager {
             Some(robot) => Ok(robot),
             None => Err(TransportError::InvalidTransportConfig {
                 reason: "announcing on the network requires a robot identity, but this \
-                         NetworkConfig has none - set `NetworkConfig.robot_identity` \
+                         NetworkConfig has none; set `NetworkConfig.robot_identity` \
                          (both the gateway and `GraphConfig::network_transport_config` \
                          stamp it from the resolved hostname or the \
                          `CERULION_ROBOT_IDENTITY` override, never the graph prefix)"
@@ -4444,6 +4552,41 @@ impl NetworkManager {
             .contains_key(&canonical)
     }
 
+    /// Undeclare every retained egress-announce token whose topic is not in
+    /// `keep` (topics are canonicalized before the compare), and return how
+    /// many were withdrawn. The bare identity token stays.
+    ///
+    /// A host that restarts its gateway inside one process lifetime calls this
+    /// once the next run's gateway is up: the manager outlives the gateway, so
+    /// without it a remote `topic list` keeps listing the prior run's topics
+    /// after they leave the new run's set. Poison-recovering.
+    pub fn withdraw_announcements_except(&self, keep: &[String]) -> usize {
+        // hot-path-alloc-ok: gateway restart, never per frame.
+        let keep: HashSet<String> = keep
+            .iter()
+            .map(|topic| canonical_topic(topic).into_owned())
+            .collect();
+        let withdrawn: Vec<TopicToken> = {
+            let mut announced = self
+                .announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stale: Vec<String> = announced
+                .keys()
+                .filter(|topic| !keep.contains(*topic))
+                .cloned()
+                .collect();
+            stale
+                .iter()
+                .filter_map(|topic| announced.remove(topic))
+                .collect()
+        };
+        // Dropped outside the lock: each drop undeclares its liveliness token.
+        let count = withdrawn.len();
+        drop(withdrawn);
+        count
+    }
+
     /// The canonical topic names currently announced on the network,
     /// SORTED for deterministic assertions (Principle #3). Poison-recovering.
     pub fn announced_topics(&self) -> Vec<String> {
@@ -4549,7 +4692,7 @@ impl NetworkManager {
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
-                                "failed to create liveliness subscriber - bridge disabled"
+                                "failed to create liveliness subscriber: bridge disabled"
                             );
                             // Fall back to just waiting for shutdown
                             let _ = rx.recv().await;
@@ -4584,7 +4727,7 @@ impl NetworkManager {
                                             tracing::warn!(
                                                 key = %key,
                                                 "liveliness key matched the namespace but is \
-                                                 not a canonical topic - ignored"
+                                                 not a canonical topic; ignored"
                                             );
                                         }
                                         if let Some(topic) = recovered {
@@ -4618,7 +4761,7 @@ impl NetworkManager {
                                                         // enable_bridge and warns.
                                                         let is_self_ingress = demand_put_targets_self_ingress(&self_ingress, topic);
                                                         if is_self_ingress {
-                                                            tracing::debug!(topic = %topic, "demand for our own network-ingress topic - not an egress candidate (loop exclusion); enable_bridge skipped");
+                                                            tracing::debug!(topic = %topic, "demand for our own network-ingress topic: not an egress candidate (loop exclusion); enable_bridge skipped");
                                                         } else {
                                                             let _lan_gate = lan_gate_read(&announce_gate);
                                                             let authorizer = demand_authorizer
@@ -4635,10 +4778,10 @@ impl NetworkManager {
                                                         match bridge_mgr.disable_bridge(topic) {
                                                             // Caller-owned log on the true→false edge:
                                                             // a `Delete` is a real-time subscriber departure.
-                                                            Ok(true) => tracing::info!(topic = %topic, "network bridge disabled - remote subscriber left"),
+                                                            Ok(true) => tracing::info!(topic = %topic, "network bridge disabled: remote subscriber left"),
                                                             Ok(false) => {}
                                                             Err(e) => {
-                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned - stopping liveliness watcher");
+                                                                tracing::error!(topic = %topic, error = %e, "bridge manager poisoned: stopping liveliness watcher");
                                                                 break;
                                                             }
                                                         }
@@ -4648,7 +4791,7 @@ impl NetworkManager {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::error!(error = %e, "liveliness subscriber channel closed unexpectedly - network bridge state is now frozen");
+                                        tracing::error!(error = %e, "liveliness subscriber channel closed unexpectedly: network bridge state is now frozen");
                                         break;
                                     }
                                 }
@@ -4776,7 +4919,7 @@ impl NetworkManager {
         // the GET-expiry sweep of its runtime-granted topics.
         if announced.is_empty() && !start_when_empty {
             tracing::debug!(
-                "demand reconciler: no announced topics (non-permissive) - reconciler \
+                "demand reconciler: no announced topics (non-permissive); reconciler \
                  not started"
             );
             return Ok(());
@@ -4801,10 +4944,14 @@ impl NetworkManager {
         state.shutdown_tx = Some(tx);
 
         // Canonicalize once so the thread compares against canonical demand keys.
-        let announced: Vec<String> = announced
+        // Deduplicated too, so the belt's membership check matches the
+        // registered set from the first pass.
+        let mut announced: Vec<String> = announced
             .iter()
             .map(|t| canonical_topic(t).into_owned())
             .collect();
+        announced.sort();
+        announced.dedup();
         let topic_count = announced.len();
 
         let handle = std::thread::Builder::new()
@@ -4980,8 +5127,8 @@ impl NetworkManager {
             Arc::clone(&catalog.hash_names),
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
-            Arc::clone(&catalog.snapshot_topics),
             Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
         let queryable = session
             .declare_queryable(&key)
@@ -5089,7 +5236,7 @@ impl NetworkManager {
                     reason: "demand-get state topics mutex poisoned".to_string(),
                 })?;
             if topics.is_empty() {
-                tracing::debug!("demand-get loop: no ingress topics - loop not started");
+                tracing::debug!("demand-get loop: no ingress topics; loop not started");
                 return Ok(());
             }
         }
@@ -5315,6 +5462,25 @@ impl NetworkManager {
             .store(true, Ordering::Relaxed);
     }
 
+    /// TEST SEAM: arm fire-once fault injection on the ingress demand token
+    /// declaration: the NEXT declaration fails, as a broken liveliness
+    /// declare would, and disarms the flag.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn fault_inject_ingress_token_once(&self) {
+        self.fail_next_ingress_token.store(true, Ordering::Relaxed);
+    }
+
+    /// TEST SEAM: whether `topic`'s ingress entry holds its demand token,
+    /// or `None` when no ingress is registered for it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn ingress_token_declared_for_test(&self, topic: &str) -> Option<bool> {
+        self.ingress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(canonical_topic(topic).as_ref())
+            .map(|entry| entry.token.is_some())
+    }
+
     /// TEST SEAM: install a callback after [`Self::announce_egress_topic`] passes
     /// its LAN posture check.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -5328,18 +5494,17 @@ impl NetworkManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
-    /// TEST SEAM: hook fired inside the demand queryable callback right after
-    /// the live authorizer is read (under the announce gate's read guard).
-    /// A test uses it to overlap a [`Self::set_lan_access`] close with an
-    /// in-flight query reply.
+    /// TEST SEAM: install a callback fired inside [`Self::set_lan_access`]
+    /// when its announce-gate write lock is contended, just before it blocks:
+    /// a race test waits on it to know the close is parked on the gate.
     #[cfg(any(test, feature = "test-helpers"))]
-    /// Install the `before_announce_gate_write` hook fired inside
-    /// `set_lan_access` immediately before the announce gate's write lock is
-    /// taken. Test-only.
     #[doc(hidden)]
-    pub fn set_before_announce_gate_write_for_test(&self, hook: Option<TestHook>) {
+    pub fn set_on_announce_gate_contended_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
         *self
-            .before_announce_gate_write
+            .on_announce_gate_contended
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
@@ -5348,7 +5513,7 @@ impl NetworkManager {
     /// retains its token, while the announce gate's read guard is still held.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
-    pub fn set_after_announce_insert_for_test(&self, hook: Option<TestHook>) {
+    pub fn set_after_announce_insert_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self
             .after_announce_insert
             .lock()
@@ -5823,6 +5988,28 @@ mod tests {
         );
     }
 
+    /// Only `on` (trimmed, any ASCII case) enables multicast scouting; unset,
+    /// empty and `off` disable it; every other value disables it and is flagged
+    /// for the warning.
+    #[test]
+    fn classify_multicast_scouting_enables_only_on() {
+        use MulticastScoutingSwitch::{Off, OffUnrecognized, On};
+        assert_eq!(classify_multicast_scouting(None), Off);
+        for off in ["", "   ", "off", "OFF", " Off "] {
+            assert_eq!(classify_multicast_scouting(Some(off)), Off, "{off:?}");
+        }
+        for on in ["on", "ON", " On ", "on\n"] {
+            assert_eq!(classify_multicast_scouting(Some(on)), On, "{on:?}");
+        }
+        for other in ["1", "true", "yes", "enabled", "onn", "o n"] {
+            assert_eq!(
+                classify_multicast_scouting(Some(other)),
+                OffUnrecognized,
+                "{other:?}"
+            );
+        }
+    }
+
     /// The DYNAMIC demand-keepalive set (`DemandGetState::add_topic` /
     /// `remove_topic` / `topic_count`) grows + shrinks correctly and is idempotent.
     /// The demand-GET pass re-reads this set every pass, so this is the seam that
@@ -5892,7 +6079,7 @@ mod tests {
         assert_eq!(
             mgr.ingress_demand_state.pass_count(),
             1,
-            "abort=false runs the pass exactly once (anti-tautology - the closure is honored)"
+            "abort=false runs the pass exactly once (anti-tautology: the closure is honored)"
         );
     }
 
@@ -5983,7 +6170,7 @@ mod tests {
                 ("/rt/widget".to_string(), WIDGET_HASH),
                 ("/rt/unknown".to_string(), 0xDEAD_BEEF_u64),
             ]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             // No explicit topic→name binding for either runtime topic.
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             // The reverse map names the widget hash; the unknown hash is absent.
@@ -5996,7 +6183,6 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
         };
 
@@ -6034,7 +6220,7 @@ mod tests {
                 "/g/cam/image".to_string(),
                 HASH,
             )]))),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::from([(
                 "/g/cam/image".to_string(),
                 "sensor_msgs/Image".to_string(),
@@ -6047,7 +6233,6 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
         };
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
@@ -6059,164 +6244,237 @@ mod tests {
         assert_eq!(entry.schema_name.as_deref(), Some("sensor_msgs/Image"));
     }
 
-    /// After `SchemaServingHandles::replace` installs a snapshot, the catalog
-    /// lists only the current run's topics: the add-only bridge registry
-    /// cannot resurrect a prior run's route. Pure. Hand oracle.
+    /// After a restart the catalog lists exactly the bridge registry: the
+    /// host's `unregister_topics_except` drops the prior run's topic, and a
+    /// topic registered AFTER `replace` (a runtime registration, which never
+    /// passes through the serving) still lists. Pure. Hand oracle.
     #[test]
-    fn a_replaced_snapshot_drops_the_prior_run_catalog_topics() {
-        use std::collections::{HashMap, HashSet};
+    fn a_restarted_catalog_lists_the_registry_including_later_registrations() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
         use std::sync::{Arc, Mutex};
 
         let bridge = TopicBridgeManager::new();
         bridge.register_topic("/run_one/cam").expect("register old");
         bridge.register_topic("/run_two/cam").expect("register new");
 
-        let make_catalog = |snapshot: Option<HashSet<String>>| CatalogSource {
+        let snapshot_lock = Arc::new(Mutex::new(()));
+        let catalog = CatalogSource {
             hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             hash_names: Arc::new(Mutex::new(HashMap::new())),
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(snapshot)),
-            snapshot_lock: Arc::new(Mutex::new(())),
+            snapshot_lock: Arc::clone(&snapshot_lock),
         };
-
-        // Before any replace the catalog is unfiltered: both routes list.
-        let reply = build_catalog_reply_from_bridge(&bridge, &make_catalog(None), "go2");
-        assert_eq!(reply.entries.len(), 2);
-
-        // After replace with the run-two set, the old topic is gone.
-        let reply = build_catalog_reply_from_bridge(
-            &bridge,
-            &make_catalog(Some(HashSet::from(["/run_two/cam".to_string()]))),
-            "go2",
+        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_lock,
+            Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
+
+        // The restart: the next run serves /run_two/cam only.
+        handles.replace(&crate::transport::gateway::SchemaServing {
+            served_topics: vec!["/run_two/cam".to_string()],
+            ..Default::default()
+        });
+        bridge
+            .unregister_topics_except(&["/run_two/cam".to_string()])
+            .expect("unregister");
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
         assert_eq!(topics, ["/run_two/cam"]);
+        // The restarted run's served topic is a boot topic of that run.
+        assert_eq!(reply.entries[0].provenance, CatalogProvenance::Boot);
+
+        // A runtime registration after the restart lists alongside it, and
+        // only it is labelled `Runtime`.
+        bridge.register_topic("/host/late").expect("register late");
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
+        let provenance: HashMap<&str, CatalogProvenance> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.provenance))
+            .collect();
+        assert_eq!(
+            provenance,
+            HashMap::from([
+                ("/run_two/cam", CatalogProvenance::Boot),
+                ("/host/late", CatalogProvenance::Runtime),
+            ])
+        );
     }
 
-    /// A `merge` AFTER a `replace` registers its topics in the snapshot: the
-    /// gateway can backfill schema data for a topic that was not in the
-    /// replaced set, and the catalog must list it alongside the replaced set
-    /// instead of filtering it out. Pure. Hand oracle.
+    /// The belt's iteration set must follow a host restart that keeps the
+    /// registered count: the reconciler thread outlives the prior gateway, so
+    /// a run serving `/a` replaced by one serving `/b` must re-snapshot, or
+    /// `/b` is never re-affirmed by the belt. Hand oracle: the set is `[/b]`
+    /// after the swap, and an unchanged set in a different order is left as is.
     #[test]
-    fn a_merge_after_replace_adds_its_topics_to_the_catalog_snapshot() {
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        use std::sync::{Arc, Mutex};
-
+    fn the_belt_set_follows_a_same_count_restart_swap() {
         let bridge = TopicBridgeManager::new();
-        bridge.register_topic("/run_one/cam").expect("register old");
         bridge.register_topic("/a").expect("register a");
+        let mut topics = vec!["/a".to_string()];
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/a"]);
+
+        bridge
+            .unregister_topics_except(&[])
+            .expect("retire the prior run");
         bridge.register_topic("/b").expect("register b");
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/b"]);
 
-        let snapshot_topics: Arc<Mutex<Option<HashSet<String>>>> = Arc::new(Mutex::new(None));
-        let snapshot_lock = Arc::new(Mutex::new(()));
-        let catalog = CatalogSource {
-            hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
-            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
-            hash_names: Arc::new(Mutex::new(HashMap::new())),
-            producer_probe: None,
-            liveness: None,
-            liveness_clock: None,
-            snapshot_topics: Arc::clone(&snapshot_topics),
-            snapshot_lock: Arc::clone(&snapshot_lock),
-        };
-        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            snapshot_lock,
-            snapshot_topics,
-            Arc::new(Mutex::new(HashMap::new())),
-        );
-
-        let serving = |topic: &str| crate::transport::gateway::SchemaServing {
-            topic_schemas: vec![crate::transport::gateway::TopicSchema {
-                topic: topic.to_string(),
-                schema_name: "std_msgs/String".to_string(),
-            }],
-            schema_docs: vec![],
-            schema_hashes: vec![],
-            served_topics: vec![],
-        };
-
-        // Replace with {/a}: the catalog drops the prior-run topic.
-        handles.replace(&serving("/a"));
-        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
+        bridge.register_topic("/c").expect("register c");
+        let mut unsorted = vec!["/c".to_string(), "/b".to_string()];
+        refresh_reconcile_topics(&bridge, &mut unsorted);
         assert_eq!(
-            topics,
-            ["/a"],
-            "replace narrows the snapshot to the new run"
-        );
-
-        // A later merge registers /b in the SAME snapshot, not a filtered-out one.
-        handles.merge(&serving("/b"));
-        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(
-            topics,
-            HashSet::from(["/a", "/b"]),
-            "merge after replace must add its topic to the snapshot"
+            unsorted,
+            ["/c", "/b"],
+            "an unchanged set is not re-snapshotted"
         );
     }
 
-    /// A schema-LESS output (no `topic_schemas` binding) stays in the catalog
-    /// after `replace`: the snapshot is built from `served_topics`, not the
-    /// schema bindings, or every untyped route a run serves would be filtered
-    /// out of its own catalog. Pure. Hand oracle.
+    /// The catalog lists the bridge registry, not the served set: a
+    /// schema-less topic registered before a later merge that names an
+    /// explicit `served_topics` list stays listed (as `Runtime`, unnamed).
+    /// Hand oracle: `/schemaless/a` registered first, then an explicit merge
+    /// serving only `/explicit/b`.
     #[test]
-    fn a_schema_less_output_survives_the_replace_snapshot() {
+    fn a_schema_less_topic_registered_earlier_stays_listed_after_an_explicit_merge() {
         use std::collections::{BTreeMap, HashMap, HashSet};
         use std::sync::{Arc, Mutex};
 
         let bridge = TopicBridgeManager::new();
-        bridge.register_topic("/typed").expect("register typed");
-        bridge.register_topic("/untyped").expect("register untyped");
-
-        let snapshot_topics: Arc<Mutex<Option<HashSet<String>>>> = Arc::new(Mutex::new(None));
-        let snapshot_lock = Arc::new(Mutex::new(()));
+        bridge
+            .register_topic("/schemaless/a")
+            .expect("register a schema-less topic");
         let catalog = CatalogSource {
             hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
             hash_names: Arc::new(Mutex::new(HashMap::new())),
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::clone(&snapshot_topics),
-            snapshot_lock: Arc::clone(&snapshot_lock),
+            snapshot_lock: Arc::new(Mutex::new(())),
         };
         let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
             Arc::new(Mutex::new(BTreeMap::new())),
-            snapshot_lock,
-            snapshot_topics,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::clone(&catalog.snapshot_lock),
+            Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
         );
-
-        let serving = crate::transport::gateway::SchemaServing {
+        handles.merge(&crate::transport::gateway::SchemaServing {
             topic_schemas: vec![crate::transport::gateway::TopicSchema {
-                topic: "/typed".to_string(),
+                topic: "/explicit/b".to_string(),
                 schema_name: "std_msgs/String".to_string(),
             }],
-            schema_docs: vec![],
-            schema_hashes: vec![],
-            // The app serves /untyped too - it just has no schema binding.
-            served_topics: vec!["/typed".to_string(), "/untyped".to_string()],
-        };
-        handles.replace(&serving);
+            served_topics: vec!["/explicit/b".to_string()],
+            ..Default::default()
+        });
+        bridge.register_topic("/explicit/b").expect("register b");
+
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
+        let listed: Vec<(&str, Option<&str>)> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.schema_name.as_deref()))
+            .collect();
         assert_eq!(
-            topics,
-            HashSet::from(["/typed", "/untyped"]),
-            "a schema-less output must survive the replace snapshot"
+            listed,
+            [
+                ("/explicit/b", Some("std_msgs/String")),
+                ("/schemaless/a", None)
+            ]
         );
+    }
+
+    /// A paired machine refuses every LAN request: N refusals of one kind
+    /// log ONE loud warn and count every refusal, the decade re-announces,
+    /// a first refusal of another kind is loud again, and an authorized
+    /// request closes the regime. Hand oracle: nine catalog refusals are one
+    /// Loud and eight Suppressed (total 9); the tenth is StillFailing.
+    #[test]
+    fn repeated_lan_refusals_warn_once_and_count_every_refusal() {
+        let paired = LanAccessAuthorizer::new(LanAccess::Paired, Arc::new(AllowAllAuthorizer));
+        let decisions: Vec<RegimeDecision> = (0..9)
+            .map(|_| log_lan_refusal(&paired, "catalog GET", "catalog", "paired"))
+            .collect();
+        let loud = decisions
+            .iter()
+            .filter(|d| matches!(d, RegimeDecision::Loud))
+            .count();
+        let suppressed = decisions
+            .iter()
+            .filter(|d| matches!(d, RegimeDecision::Suppressed { .. }))
+            .count();
+        assert_eq!((loud, suppressed), (1, 8));
+        let latches = paired.lan_refusal_latches().expect("paired keeps latches");
+        assert_eq!(latches.total_refusals("catalog GET"), 9);
+        assert!(matches!(
+            log_lan_refusal(&paired, "catalog GET", "catalog", "paired"),
+            RegimeDecision::StillFailing { total: 10, .. }
+        ));
+        assert_eq!(
+            log_lan_refusal(&paired, "schema GET", "std_msgs/String", "paired"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.on_authorized("catalog GET", "catalog"), Some(8));
+        // An authorizer without latches logs every refusal loudly.
+        assert_eq!(
+            log_lan_refusal(&AllowAllAuthorizer, "demand", "/t", "denied"),
+            RegimeDecision::Loud
+        );
+    }
+
+    /// Under an open posture a topic-selective inner authorizer denies one
+    /// topic and allows another. An authorized demand for the allowed topic
+    /// must not close the denied topic's regime: the next refusal stays a
+    /// counted repeat and no recovery is reported. Only an authorized
+    /// demand for the refused topic closes it. Hand oracle: refuse /denied
+    /// (Loud), allow /allowed (None), refuse /denied (Suppressed 1), allow
+    /// /denied (Some(1)), refuse /denied (Loud again).
+    #[test]
+    fn an_authorized_other_topic_does_not_close_a_denied_topics_refusal_regime() {
+        struct DenyOne;
+        impl DemandAuthorizer for DenyOne {
+            fn authorize_demand(&self, _subject: &DemandSubject, topic: &str) -> DemandDecision {
+                if topic == "/denied" {
+                    DemandDecision::deny("not granted")
+                } else {
+                    DemandDecision::Allow
+                }
+            }
+        }
+        let open = LanAccessAuthorizer::new(LanAccess::Open, Arc::new(DenyOne));
+        let lan = DemandSubject::Lan { locator: None };
+        assert!(!open.authorize_demand(&lan, "/denied").is_allowed());
+        assert!(open.authorize_demand(&lan, "/allowed").is_allowed());
+        let latches = open.lan_refusal_latches().expect("open keeps latches");
+
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.on_authorized("demand", "/allowed"), None);
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latches.on_authorized("demand", "/allowed"), None);
+        assert_eq!(latches.on_authorized("demand", "/denied"), Some(1));
+        assert_eq!(
+            log_lan_refusal(&open, "demand", "/denied", "not granted"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.total_refusals("demand"), 3);
     }
 
     #[test]
@@ -6274,7 +6532,7 @@ mod tests {
             retry["period_init_ms"],
             serde_json::json!(0),
             "bounded_connect must set connect/retry.period_init_ms=0 (single \
-             inline attempt - reachable robots connect before the open returns)"
+             inline attempt; reachable robots connect before the open returns)"
         );
         assert_eq!(
             cfg.get_json("connect/exit_on_failure").ok().as_deref(),
