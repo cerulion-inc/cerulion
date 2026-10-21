@@ -432,6 +432,180 @@ fn register_dynamic_egress(transport: &TransportManager, topic: &str, schema_has
 
 /// The human-readable text of a caught panic payload (`panic!("…")` carries a
 /// `&str` or a `String`; anything else is named as such rather than dropped).
+/// The fastrtps_cpp callbacks of a C++ message type with `rosidl::Buffer`
+/// fields, when this process has a backend other than `cpu` loaded: the
+/// condition for a buffer-aware endpoint (`crate::buffer_backends`).
+///
+/// # Safety
+/// `type_support` is null or a valid rosidl message typesupport handle.
+#[cfg(cerulion_has_buffer_backends)]
+unsafe fn buffer_type_callbacks(
+    type_support: *const ffi::rosidl_message_type_support_t,
+    bridge: &AnyBridge,
+) -> Option<*const c_void> {
+    if !matches!(bridge, AnyBridge::Cpp(_)) {
+        return None;
+    }
+    if crate::buffer_backends::installed_backends().is_empty() {
+        return None;
+    }
+    crate::buffer_backends::buffer_callbacks(type_support)
+}
+
+#[cfg(not(cerulion_has_buffer_backends))]
+unsafe fn buffer_type_callbacks(
+    _type_support: *const ffi::rosidl_message_type_support_t,
+    _bridge: &AnyBridge,
+) -> Option<*const c_void> {
+    None
+}
+
+/// Build the buffer-aware half of a publisher, or log why the publisher stays
+/// on the CPU path.
+#[cfg(cerulion_has_buffer_backends)]
+fn make_buffer_publisher(
+    callbacks: *const c_void,
+    entity: u64,
+    type_name: &str,
+    schema_hash: u64,
+    transport: &TransportManager,
+    topic: &str,
+) -> Option<crate::buffer_backends::BufferPublisher> {
+    let view = match transport.topic_subscriber_view(topic) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(topic = %topic, error = %e, "buffer-aware publishing is off for \
+                this topic: its subscriber list cannot be read; non-CPU Buffers are copied \
+                to host memory");
+            return None;
+        }
+    };
+    match crate::buffer_backends::BufferPublisher::new(
+        callbacks,
+        entity,
+        type_name,
+        schema_hash,
+        view,
+    ) {
+        Ok(p) => {
+            tracing::info!(
+                topic = %topic,
+                backends = %crate::buffer_backends::installed_backends().join(","),
+                "buffer-aware publisher: rosidl::Buffer fields go to subscribers that accept \
+                 their backend as descriptors"
+            );
+            Some(p)
+        }
+        Err(reason) => {
+            tracing::warn!(topic = %topic, reason = %reason, "buffer-aware publishing is off \
+                for this topic: a buffer backend refused the endpoint; non-CPU Buffers are \
+                copied to host memory");
+            None
+        }
+    }
+}
+
+#[cfg(not(cerulion_has_buffer_backends))]
+fn make_buffer_publisher(
+    _callbacks: *const c_void,
+    _entity: u64,
+    _type_name: &str,
+    _schema_hash: u64,
+    _transport: &TransportManager,
+    _topic: &str,
+) -> Option<crate::buffer_backends::BufferPublisher> {
+    None
+}
+
+/// Whether a new subscription is buffer-aware, and if so its fastrtps_cpp
+/// callbacks and the port name it announced. Every backend has been told
+/// about it (`on_creating_endpoint`) when this returns `Some`.
+///
+/// # Safety
+/// `type_support` is null or a valid handle; `options` is valid.
+#[cfg(cerulion_has_buffer_backends)]
+unsafe fn plan_buffer_subscription(
+    type_support: *const ffi::rosidl_message_type_support_t,
+    bridge: &AnyBridge,
+    options: *const ffi::rmw_subscription_options_t,
+    entity: u64,
+    type_name: &str,
+    topic: &str,
+) -> Option<(*const c_void, String)> {
+    let callbacks = buffer_type_callbacks(type_support, bridge)?;
+    let requested = (*options).acceptable_buffer_backends;
+    let requested =
+        (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+    let installed = crate::buffer_backends::installed_backends();
+    let mut accepted = crate::buffer_backends::accepted_backends(requested, &installed);
+    // A backend's metadata travels in the port name only when it is empty
+    // (the cuda backend's is); a backend that needs more is not advertised.
+    accepted.retain(|b| {
+        let name = std::ffi::CString::new(b.as_str()).unwrap_or_default();
+        let empty = crate::buffer_backends::ffi::rmw_cerulion_bb_metadata_is_empty(name.as_ptr());
+        if empty != 1 {
+            tracing::warn!(
+                topic = %topic,
+                backend = %b,
+                "this subscription does not advertise the backend: its metadata does not fit \
+                 the subscriber port name, so it receives that backend's Buffers as bytes"
+            );
+        }
+        empty == 1
+    });
+    match crate::buffer_backends::BufferSubscription::announce(entity, type_name, &accepted) {
+        Ok(port_name) => Some((callbacks, port_name)),
+        Err(reason) => {
+            tracing::warn!(
+                topic = %topic,
+                reason = %reason,
+                "this subscription is not buffer-aware; non-CPU Buffers reach it as host copies"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(cerulion_has_buffer_backends))]
+unsafe fn plan_buffer_subscription(
+    _type_support: *const ffi::rosidl_message_type_support_t,
+    _bridge: &AnyBridge,
+    _options: *const ffi::rmw_subscription_options_t,
+    _entity: u64,
+    _type_name: &str,
+    _topic: &str,
+) -> Option<(*const c_void, String)> {
+    None
+}
+
+#[cfg(cerulion_has_buffer_backends)]
+fn make_buffer_subscription(
+    callbacks: *const c_void,
+    entity: u64,
+    type_name: &str,
+    schema_hash: u64,
+    subscriber: &cerulion_core::transport::subscriber::CerulionSubscriber,
+) -> crate::buffer_backends::BufferSubscription {
+    crate::buffer_backends::BufferSubscription::new(
+        callbacks,
+        entity,
+        type_name,
+        schema_hash,
+        subscriber.port_id(),
+    )
+}
+
+#[cfg(not(cerulion_has_buffer_backends))]
+fn make_buffer_subscription(
+    _callbacks: *const c_void,
+    _entity: u64,
+    _type_name: &str,
+    _schema_hash: u64,
+    _subscriber: &cerulion_core::transport::subscriber::CerulionSubscriber,
+) -> crate::buffer_backends::BufferSubscription {
+    unreachable!("no buffer plan exists on a build without hosted backends")
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
@@ -570,11 +744,22 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // geometry is cached on the handle so the per-call paths never
         // recompute eligibility.
         let slice_len = slice_len_for(&bridge);
+        // A buffer-aware publisher (`crate::buffer_backends`) serializes the
+        // message itself through its fastrtps_cpp type support, so it serves
+        // no borrow: rclcpp then hands every publish to `rmw_publish`. A
+        // transient-local one is never buffer-aware (a retained descriptor
+        // would outlive the device memory it names).
+        let buffer_callbacks = if history == 0 {
+            buffer_type_callbacks(type_support, &bridge)
+        } else {
+            None
+        };
         let windowed_geo = windowed_borrow_geometry(
             &bridge,
             slice_len.get() as usize,
             crate::heaphook::active_hook().is_some(),
-        );
+        )
+        .filter(|_| buffer_callbacks.is_none());
         if windowed_geo.is_none()
             && crate::heaphook::active_hook().is_some()
             && bridge.can_borrow_windowed()
@@ -681,7 +866,17 @@ pub unsafe extern "C" fn rmw_create_publisher(
         gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
-        let can_loan = bridge.can_loan();
+        let buffer = buffer_callbacks.and_then(|callbacks| {
+            make_buffer_publisher(
+                callbacks,
+                entity,
+                &type_name,
+                bridge.schema_hash(),
+                &rt.transport,
+                &topic,
+            )
+        });
+        let can_loan = bridge.can_loan() && buffer.is_none();
         // Parity with the native graph build: arm the producer-side SHM
         // doorbell (rings inside `notify_sent_sample`, which every rmw
         // publish path already calls), so a consumer parked on this topic's
@@ -723,6 +918,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
                 quarantined_tails: Vec::with_capacity(RMW_LOANED_SAMPLES_BUDGET),
                 orphaned_loans: Vec::with_capacity(RMW_LOANED_SAMPLES_BUDGET),
                 seal_scratch: crate::type_bridge::SealScratch::new(),
+                buffer,
             }),
             gid,
             sequence: std::sync::atomic::AtomicU64::new(0),
@@ -891,6 +1087,19 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
             // rather than silently copying. Gated to windowed publishers:
             // for every other publisher both totals are structurally zero
             // and the line would be per-destroy noise.
+            // The same window for the hosted rosidl::Buffer backends: the
+            // process counters by stable name, so a run can show its
+            // descriptor frames against its host copies.
+            let buffer_aware = runtime::lock_unpoisoned(&data.inner)
+                .map(|inner| inner.buffer.is_some())
+                .unwrap_or(false);
+            if buffer_aware {
+                tracing::info!(
+                    topic = %data.topic,
+                    counters = %crate::buffer_backends::counters_line(),
+                    "rosidl::Buffer counters at publisher destroy"
+                );
+            }
             if data.windowed_borrow.is_some() {
                 tracing::info!(
                     topic = %data.topic,
@@ -1196,6 +1405,14 @@ pub unsafe extern "C" fn rmw_publish(
                 }
             }
         } else {
+            // A buffer-aware publisher decides from the live subscriber list
+            // (`crate::buffer_backends::route`): no subscriber sends nothing,
+            // all buffer-aware with one accelerated sends addressed CDR
+            // frames, anything else falls through to the native frame below.
+            #[cfg(cerulion_has_buffer_backends)]
+            if let Some(ret) = publish_buffer_aware(data, &mut inner, ros_message, now) {
+                return ret;
+            }
             // VOLATILE hot path (flatten-into-loan): size
             // pre-pass → exact-size UNINIT loan → bounds-checked
             // flatten straight into the SHM slot → send. ONE
@@ -1298,6 +1515,73 @@ pub unsafe extern "C" fn rmw_publish(
             }
         }
     })
+}
+
+/// The buffer-aware publish (`crate::buffer_backends`): `Some` when the
+/// publish is complete (nothing to send, or the addressed frames sent or
+/// failed), `None` when the native frame is to be sent.
+///
+/// # Safety
+/// `ros_message` is a live C++ message of the publisher's type.
+#[cfg(cerulion_has_buffer_backends)]
+unsafe fn publish_buffer_aware(
+    data: &PublisherData,
+    inner: &mut runtime::PublisherInner,
+    ros_message: *const c_void,
+    now: u64,
+) -> Option<rmw_ret_t> {
+    use crate::buffer_backends::Route;
+    let runtime::PublisherInner {
+        publisher, buffer, ..
+    } = inner;
+    let bp = buffer.as_mut()?;
+    match bp.route_now(&data.topic) {
+        Route::Nobody => {
+            crate::buffer_backends::note_unsent();
+            Some(RMW_RET_OK)
+        }
+        Route::Native => {
+            crate::buffer_backends::note_native_frame();
+            None
+        }
+        Route::Addressed {
+            accelerated,
+            cpu_group,
+        } => {
+            let sequence = &data.sequence;
+            let mut mint = || sequence.fetch_add(1, Ordering::Relaxed) as u32;
+            let result = bp.publish_addressed(
+                ros_message,
+                &accelerated,
+                &cpu_group,
+                now,
+                &mut mint,
+                &mut |frame| {
+                    publisher
+                        .publish_raw(frame)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                },
+            );
+            match result {
+                Ok(_) => {
+                    publisher.check_subscriber_events();
+                    if let Err(e) = publisher.notify_sent_sample() {
+                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
+                    }
+                    Some(RMW_RET_OK)
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        topic = %data.topic,
+                        reason = %reason,
+                        "buffer-aware publish failed"
+                    );
+                    Some(RMW_RET_ERROR)
+                }
+            }
+        }
+    }
 }
 
 /// Zero-copy loan: hand rclcpp a pointer DIRECTLY into a loaned SHM
@@ -2180,9 +2464,9 @@ pub unsafe extern "C" fn rmw_create_subscription(
             return std::ptr::null_mut();
         };
         // Lyrical and Rolling: `acceptable_buffer_backends`. CPU is always
-        // acceptable and is the only backend this rmw has, so a subscription
-        // naming another backend is created, logs one warning naming the
-        // backends it ignores, and receives CPU data. Malformed input fails
+        // acceptable; a subscription naming a backend this process has not
+        // loaded is created, logs one warning naming the backends it ignores,
+        // and receives Buffers on them as CPU data. Malformed input fails
         // the create (null, the RMW_RET_ERROR of a constructor) with the
         // reason on rcl's error channel.
         #[cfg(cerulion_has_is_rosidl_buffer)]
@@ -2195,8 +2479,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
                     tracing::warn!(
                         topic = %ros_topic,
                         ignored_backends = %ignored.join(","),
-                        "acceptable_buffer_backends names backends rmw_cerulion does not have; \
-                         this subscription receives every frame as CPU data"
+                        "acceptable_buffer_backends names backends this process has not \
+                         loaded; Buffers on them reach this subscription as CPU data"
                     );
                 }
                 Ok(_) => {}
@@ -2288,17 +2572,57 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
-        let subscriber = match rt.transport.create_subscriber_with_buffers(
+        // Deterministic gid: entity counter + schema hash (never random) —
+        // mirrors the publisher; the endpoint id reported by
+        // rmw_get_subscriptions_info_by_topic and the registry deregister
+        // key. Minted before the port: a buffer-aware subscription's port
+        // name carries the entity number.
+        let entity = runtime::next_entity_id();
+        let type_name = ros_graph_type_name(bridge.qualified_name());
+        // A buffer-aware subscription (`crate::buffer_backends`) announces
+        // itself to every backend BEFORE its port exists, then names the port
+        // so publishers can read what it accepts.
+        let buffer_plan = plan_buffer_subscription(
+            type_support,
+            &bridge,
+            subscription_options,
+            entity,
+            &type_name,
             &topic,
-            topic_config,
-            provisioned_depth,
-        ) {
+        );
+        let created = match &buffer_plan {
+            Some((_, port_name)) => rt.transport.create_subscriber_with_buffers_named(
+                &topic,
+                topic_config,
+                provisioned_depth,
+                port_name,
+            ),
+            None => {
+                rt.transport
+                    .create_subscriber_with_buffers(&topic, topic_config, provisioned_depth)
+            }
+        };
+        let subscriber = match created {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(topic = %topic, error = %e, "subscription creation failed");
                 return std::ptr::null_mut();
             }
         };
+        let buffer = buffer_plan.map(|(callbacks, _)| {
+            make_buffer_subscription(
+                callbacks,
+                entity,
+                &type_name,
+                bridge.schema_hash(),
+                &subscriber,
+            )
+        });
+        if buffer.is_some() {
+            // The take decodes the CDR into rclcpp's own message; there is no
+            // loaned or adopted form of it.
+            adopt = None;
+        }
         // The effective borrow budget is the
         // service's real capacity — smaller than the requested floor when the
         // service already existed (the floor is CREATE-leg-only). The adopt
@@ -2365,16 +2689,11 @@ pub unsafe extern "C" fn rmw_create_subscription(
             );
         }
 
-        // Deterministic gid: entity counter + schema hash (never random) —
-        // mirrors the publisher; the endpoint id reported by
-        // rmw_get_subscriptions_info_by_topic and the registry deregister
-        // key. Read the bridge BEFORE it moves into `data`.
-        let entity = runtime::next_entity_id();
+        // Read the bridge BEFORE it moves into `data`.
         let mut gid = [0u8; 16];
         gid[..8].copy_from_slice(&entity.to_le_bytes());
         gid[8..].copy_from_slice(&bridge.schema_hash().to_le_bytes());
-
-        let type_name = ros_graph_type_name(bridge.qualified_name());
+        let can_loan_take = can_loan_take && buffer.is_none();
         // Adopt-take hot path: the
         // adoption scratch is reserved UP FRONT to the type's forgeable-
         // member count — the high-water bound both Vecs ever reach — so the
@@ -2423,6 +2742,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             ),
             adopt,
+            buffer,
         });
 
         // Computed BEFORE `Box::into_raw(data)` so an OOM panic here drops
@@ -2518,6 +2838,13 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
         // Borrow first, free last (see rmw_destroy_publisher).
         {
             let data = &*((*subscription).data as *const SubscriptionData);
+            if data.buffer.is_some() {
+                tracing::info!(
+                    topic = %data.topic,
+                    counters = %crate::buffer_backends::counters_line(),
+                    "rosidl::Buffer counters at subscription destroy"
+                );
+            }
             // A destroy with outstanding take loans RELEASES them
             // (the Box drop below drops the pending_takes samples, freeing
             // the SHM borrows — and un-forges + destroys
@@ -2633,6 +2960,39 @@ unsafe fn take_impl(
     // silently lost (Principle #6).
     let receive = inner.subscriber.try_receive_one(|msg| {
         let header = msg.header();
+        // An addressed frame (`crate::buffer_backends`) for a buffer-aware
+        // subscription: decoded through the backends, or skipped when it
+        // names another subscriber port.
+        #[cfg(cerulion_has_buffer_backends)]
+        if let Some(bs) = data.buffer.as_ref() {
+            if header.schema_hash == bs.frame_hash {
+                use crate::buffer_backends::TakeOutcome;
+                match bs.take(msg.payload(), ros_message) {
+                    TakeOutcome::Delivered => {
+                        took = true;
+                        info_out = Some((header.timestamp_ns, header.sequence as u64));
+                        crate::decode_failure_latch::report_decode_success(
+                            &data.decode_failures,
+                            crate::decode_failure_latch::DecodeSite::Subscription,
+                            &data.topic,
+                        );
+                    }
+                    TakeOutcome::NotMine => {}
+                    TakeOutcome::Lost => report_lost_buffer_sample(&data.topic),
+                    TakeOutcome::Failed(reason) => {
+                        tracing::debug!(topic = %data.topic, reason = %reason, "addressed frame undecodable");
+                        crate::decode_failure_latch::report_decode_failure(
+                            &data.decode_failures,
+                            crate::decode_failure_latch::DecodeSite::Subscription,
+                            &data.topic,
+                            &data.type_name,
+                            msg.payload().len(),
+                        );
+                    }
+                }
+                return;
+            }
+        }
         // The DECISION lives in `take_gate` — one pure
         // function, one legal mutation target, shared by all three take
         // paths; the CONSEQUENCE (which latch, whether the frame is
@@ -2739,6 +3099,33 @@ unsafe fn take_impl(
         }
     }
     result
+}
+
+/// A buffer-aware take dropped an addressed frame because a backend returned
+/// an empty Buffer for its descriptor. Loud on the first loss per topic and
+/// at every power of ten after, counted always
+/// (`rmw_cerulion.rosidl_buffer.lost_samples`).
+#[cfg(cerulion_has_buffer_backends)]
+fn report_lost_buffer_sample(topic: &str) {
+    static PER_TOPIC: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let n = {
+        let mut guard = PER_TOPIC.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .get_or_insert_with(HashMap::new)
+            .entry(topic.to_owned())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    if crate::rosidl_buffer::announces(n) {
+        tracing::warn!(
+            topic = %topic,
+            lost_on_topic = n,
+            "a rosidl::Buffer descriptor could not be imported (the backend returned an empty \
+             buffer: the publisher reused the memory, or it is not reachable from here); the \
+             message was dropped, not delivered empty"
+        );
+    }
 }
 
 /// Withdraw a set of adopt-take registrations and reclaim their refcount

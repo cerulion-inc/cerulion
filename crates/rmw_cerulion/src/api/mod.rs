@@ -265,6 +265,20 @@ unsafe fn resolve_service_for_identifier(
     None
 }
 
+/// The handle of `ts` for the type support `identifier` (NUL-terminated),
+/// walking the dispatcher chain; `None` when the chain has none. A failed
+/// probe may leave rcutils error state set (the caller resets it).
+///
+/// # Safety
+/// `ts` must be null or a valid rosidl message typesupport handle.
+#[cfg_attr(not(cerulion_has_buffer_backends), allow(dead_code))]
+pub(crate) unsafe fn resolve_message_typesupport(
+    ts: *const ffi::rosidl_message_type_support_t,
+    identifier: &[u8],
+) -> Option<*const ffi::rosidl_message_type_support_t> {
+    resolve_for_identifier(ts, identifier)
+}
+
 unsafe fn resolve_for_identifier(
     ts: *const ffi::rosidl_message_type_support_t,
     identifier: &[u8],

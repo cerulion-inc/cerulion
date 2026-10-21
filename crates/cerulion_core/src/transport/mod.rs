@@ -205,6 +205,33 @@ pub(crate) const ICEORYX2_DEFAULT_BORROWED_SAMPLES: usize = 2;
 /// [`TopicServiceConfig::subscriber_max_borrowed_samples`]).
 pub(crate) const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
 
+/// The longest iceoryx2 port name, in bytes
+/// ([`TransportManager::create_subscriber_with_buffers_named`]).
+pub fn max_port_name_len() -> usize {
+    iceoryx2::port::port_name::PortName::max_len()
+}
+
+/// The live subscriber ports of one topic's data service
+/// ([`TransportManager::topic_subscriber_view`]).
+pub struct TopicSubscriberView {
+    data_service:
+        iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>,
+}
+
+impl TopicSubscriberView {
+    /// Call `f` with the port id ([`CerulionSubscriber::port_id`]) and the
+    /// port name of every subscriber attached to the data service right now,
+    /// in every process. A port created without a name reports `""`.
+    pub fn for_each_subscriber(&self, mut f: impl FnMut(u128, &str)) {
+        self.data_service
+            .dynamic_config()
+            .list_subscribers(|details| {
+                f(details.subscriber_id.value(), details.subscriber_name.as_str());
+                iceoryx2::prelude::CallbackProgression::Continue
+            });
+    }
+}
+
 /// Drift-guard hook (test-only): iceoryx2's LIVE create-default
 /// `max_subscribers` for a publish-subscribe service — the subscriber cap a
 /// service gets when it is created with NO explicit subscriber requirement,
@@ -4845,7 +4872,58 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, true, None)
+    }
+
+    /// [`Self::create_subscriber_with_buffers`] with the subscriber port
+    /// created under `port_name`, which every process attached to the topic
+    /// can read back through [`Self::topic_subscriber_view`]. Fails when
+    /// `port_name` is not a valid iceoryx2 port name (longer than
+    /// [`max_port_name_len`] bytes, or empty).
+    pub fn create_subscriber_with_buffers_named(
+        &self,
+        topic: &str,
+        topic_config: TopicServiceConfig,
+        buffer_size: usize,
+        port_name: &str,
+    ) -> TransportResult<CerulionSubscriber> {
+        let name = iceoryx2::port::port_name::PortName::new(port_name).map_err(|e| {
+            TransportError::SubscriberCreation {
+                topic: topic.to_string(),
+                reason: format!("'{port_name}' is not a valid iceoryx2 port name: {e:?}"),
+            }
+        })?;
+        self.create_subscriber_with_buffers_inner(
+            topic,
+            topic_config,
+            buffer_size,
+            true,
+            Some(&name),
+        )
+    }
+
+    /// The live subscriber ports of `topic`'s data service, across every
+    /// process, read from iceoryx2's dynamic config. The view holds the
+    /// service open for as long as it lives; each
+    /// [`TopicSubscriberView::for_each_subscriber`] call reads the current
+    /// port list from shared memory. Fails when the data service does not
+    /// exist.
+    pub fn topic_subscriber_view(&self, topic: &str) -> TransportResult<TopicSubscriberView> {
+        let map_err = |reason: String| TransportError::SubscriberCreation {
+            topic: topic.to_string(),
+            reason,
+        };
+        let name: ServiceName = format!("{}/data", topic)
+            .as_str()
+            .try_into()
+            .map_err(|e| map_err(format!("{e}")))?;
+        let data_service = self
+            .node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .open()
+            .map_err(|e| map_err(format!("{e}")))?;
+        Ok(TopicSubscriberView { data_service })
     }
 
     /// A subscriber built the way a latest-value input is built: with no event
@@ -4876,7 +4954,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
     ) -> TransportResult<CerulionSubscriber> {
-        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false)
+        self.create_subscriber_with_buffers_inner(topic, topic_config, buffer_size, false, None)
     }
 
     fn create_subscriber_with_buffers_inner(
@@ -4885,6 +4963,7 @@ impl TransportManager {
         topic_config: TopicServiceConfig,
         buffer_size: usize,
         with_listener: bool,
+        port_name: Option<&iceoryx2::port::port_name::PortName>,
     ) -> TransportResult<CerulionSubscriber> {
         let topic_owned = topic.to_string();
         let map_err = move |reason: String| TransportError::SubscriberCreation {
@@ -4902,6 +4981,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             topic_config.create_subscriber_floor,
+            port_name,
             &map_err,
         )
     }
@@ -4955,6 +5035,7 @@ impl TransportManager {
             &event_service,
             None,
             true,
+            None,
             None,
             &map_err,
         )
@@ -5432,6 +5513,7 @@ impl TransportManager {
             Some(buffer_size),
             with_listener,
             None,
+            None,
             &map_err,
         )
     }
@@ -5674,6 +5756,10 @@ impl TransportManager {
         // The opener's `create_subscriber_floor`, named in a slot-exhaustion
         // error when the service holds fewer slots than it.
         create_subscriber_floor: Option<usize>,
+        // The iceoryx2 port name the subscriber is created with, which every
+        // process reads back from the data service's dynamic config (see
+        // [`TopicSubscriberView`]). `None` leaves iceoryx2's empty default.
+        port_name: Option<&iceoryx2::port::port_name::PortName>,
         map_err: &impl Fn(String) -> TransportError,
     ) -> TransportResult<CerulionSubscriber> {
         // Slot exhaustion at port creation is the
@@ -5687,6 +5773,9 @@ impl TransportManager {
         let mut subscriber_builder = data_service.subscriber_builder();
         if let Some(buffer_size) = buffer_size {
             subscriber_builder = subscriber_builder.buffer_size(buffer_size);
+        }
+        if let Some(name) = port_name {
+            subscriber_builder = subscriber_builder.name(name);
         }
         let subscriber = subscriber_builder.create().map_err(|e| {
             use iceoryx2::port::subscriber::SubscriberCreateError;

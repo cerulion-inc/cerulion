@@ -23,10 +23,13 @@ hook's source by `heaphook_source_parity` tests),
 / `src/borrow_degrade_latch.rs` (flood-suppression reporters), `src/rosidl_buffer.rs`
 (Lyrical and Rolling `rosidl::Buffer<uint8_t>`: the CPU copy of a non-CPU Buffer on publish,
 its counter and per-topic warning, the CPU Buffer a take leaves behind, and the
-`acceptable_buffer_backends` check), `shim/cppstring_shim.cpp` (the only compiled C++; on
-Lyrical and Rolling it compiles against the distro's `rosidl_buffer` headers, or on a
+`acceptable_buffer_backends` check), `src/buffer_backends.rs` (Lyrical and Rolling: the
+hosted `rosidl::Buffer` backend plugins, buffer-aware discovery, routing and take, and the
+counters; see "Hosted rosidl::Buffer backends" below), `shim/cppstring_shim.cpp` (compiled
+C++; on Lyrical and Rolling it compiles against the distro's `rosidl_buffer` headers, or on a
 vendored-bindings build the copy in `shim/vendored/` from the rosidl commit the vendored
-bindings pin).
+bindings pin), `shim/buffer_shim.cpp` (compiled C++, only on a generated Lyrical or Rolling
+build: the backend registry and the fastrtps_cpp endpoint-aware serialization).
 
 ## The FFI seam
 
@@ -1011,6 +1014,81 @@ unset); `rmw_wait_spin_test` carries the explicit-env clamp-at-`u64::MAX` pins a
   together. A skew in either direction degrades nested arrays to the loud opaque-text
   fallback (`NestedArrayOpaque`), never a wrong decode.
 
+## Hosted rosidl::Buffer backends (Lyrical, Rolling)
+
+On a GENERATED build whose bindings carry `is_rosidl_buffer`, `build.rs` looks for the
+headers of `rosidl_buffer_backend`, `rosidl_buffer_backend_registry`,
+`rosidl_typesupport_fastrtps_cpp` (`buffer_serialization.hpp`) and `fastcdr` (in every
+`include*` directory of every ament prefix: fastcdr 2.3 installs under
+`<prefix>/includefastcdr/`) and for `librosidl_buffer_backend_registry.so` and
+`libfastcdr.so` (in `<prefix>/lib` and its subdirectories), compiles `shim/buffer_shim.cpp`,
+links both libraries and emits `cfg(cerulion_has_buffer_backends)`. All of them ship with
+rmw_fastrtps_cpp; a generated build of that era that misses one fails, naming it. A vendored
+build has none of this and carries every non-CPU Buffer as a host copy (`src/rosidl_buffer.rs`).
+
+**Loading.** The first buffer-aware endpoint's create loads every installed backend plugin
+through `rosidl_buffer_backend_registry`, the way rmw_zenoh_cpp's and rmw_fastrtps_cpp's
+`buffer_backend_loader.cpp` do: one instance per plugin, descriptor ops bound to the instance,
+and FastCDR descriptor serializers from the backend's descriptor type support. The instances
+and the plugin libraries stay loaded until the process exits (a Buffer the application holds
+keeps a deleter inside its plugin library), which differs from both upstream rmws, which shut
+the backends down at context fini.
+
+**Who is buffer-aware.** A C++ (`introspection_cpp`) endpoint whose type support resolves to
+`rosidl_typesupport_fastrtps_cpp` callbacks with `has_buffer_fields`, while at least one
+backend other than `cpu` is loaded. A transient-local publisher never is. A buffer-aware
+publisher serves no borrow and a buffer-aware subscription no loaned or adopted take
+(`can_loan_messages` is false for both): the CDR is encoded from and decoded into rclcpp's own
+message.
+
+**Discovery.** rmw gids are the entity counter plus the schema hash, the same in every process,
+so the backends see a separate BUFFER GID: `C R B 1`, the process id, the entity number. A
+buffer-aware subscription calls every backend's `on_creating_endpoint` under that gid, and only
+then creates its iceoryx2 subscriber port, named `rbuf1;<pid hex>;<entity hex>;<backends>`
+(the backends it accepts other than `cpu`, from `acceptable_buffer_backends`: `any` is every
+loaded one; a backend whose metadata is not empty is left out with a warning, because the
+64-byte port name carries names only). A buffer-aware publisher calls `on_creating_endpoint`
+at create and holds a view of its data service's dynamic config
+(`TransportManager::topic_subscriber_view`). Each publish reads the live subscriber ports with
+their names; a port seen for the first time gets its verdict: not buffer-aware (any other
+name, an unnamed port included), or buffer-aware and ACCELERATED when a backend it accepts
+answers `on_discovering_endpoint` with true. A verdict lasts the port's life; a negative one
+for a buffer-aware port is asked again after 500 ms.
+
+**Routing (`buffer_backends::route`).**
+
+| Subscribers attached | Publish |
+|---|---|
+| none | nothing (`unsent_no_subscriber`) |
+| any not buffer-aware | the native frame; a non-CPU Buffer copied to host memory (R0's path, `host_copies`, `native_frames`) |
+| all buffer-aware, none accelerated | the native frame |
+| all buffer-aware, some accelerated | per accelerated subscription, `cdr_serialize_with_endpoint` for its buffer gid; identical results sent once as one frame addressed to their port ids (`descriptor_frames`); the rest get one plain-CDR frame addressed to them (`cpu_group_frames`) |
+
+An addressed frame is a `WireHeader` with its own schema hash (FNV-1a 64 of a fixed tag and the
+type's native hash, `buffer_frame_hash`), `offset_table_count` 0, and the payload: version
+(u8, 1), kind (u8: 1 endpoint CDR, 2 plain CDR), recipient count (u16), CDR length (u32), the
+publisher's buffer gid (16 bytes), the recipient port ids (u128 LE each), then the CDR
+(encapsulation `00 01 00 00`, XCDRv1 body). Every frame of one publish carries the same
+sequence number, minted after every serialization succeeded. The CDR is what rmw_fastrtps_cpp
+and rmw_zenoh_cpp write for the same message (pinned byte-for-byte against the S2 golden wire by
+`tests/rosidl_buffer_backend_test.rs`). A reader that is not buffer-aware and attaches between a
+publish's port read and its send refuses the frame at its schema-hash gate.
+
+**Take.** A buffer-aware subscription matches the frame's schema hash before its native gate.
+A frame that does not name its port is skipped (`skipped_frames`, `taken = false`). One that
+does is decoded with `cdr_deserialize_with_endpoint` and the publisher's buffer gid; a
+descriptor becomes a Buffer through its backend (`imports`). A backend that returns an empty
+Buffer for a descriptor (NVIDIA's backend does for a stale one) makes the frame a LOST SAMPLE:
+not delivered, counted (`lost_samples`), a warning on the first loss per topic and at every
+power of ten. An undecodable frame goes through the decode-failure latch.
+
+**Counters.** `buffer_backends::counters()` returns every counter under a stable name
+(`rmw_cerulion.rosidl_buffer.<name>`), and a buffer-aware endpoint's destroy logs them at
+`info`. `descriptors_refused` counts Buffers a backend declined to describe for an accelerated
+subscription, each then written as bytes inside the CDR. A topic carried with zero host copies
+shows `descriptor_frames` growing while `descriptors_refused`, `cpu_group_frames` and
+`host_copies` stay 0.
+
 ## Serialized-message path
 
 `rmw_serialize` produces a wire frame stamped with sequence 0, so
@@ -1097,6 +1175,7 @@ with rmw-specific additions:
 | `tests/bridge_test.rs` | C introspection codec: hand-built rosidl fixtures, native-reader interop, padding determinism, hostile-count rejection, complex roundtrips | no | none |
 | `tests/cpp_bridge_test.rs` | C++ codec + shim: real `std::string`, bit-packed `vector<bool>`, resize spy, over-bound UB guard, padding poison, corrupt-size caps, cpp↔native byte identity; the registration census for a `bool[]` this build cannot write, at the top level, inside a nested message, through a nested message array and at the bottom of a chain whose depth comes from a constant, with both boundary twins (the `assign` accessor present, and a fixed `bool[N]`, which needs none) recording nothing and decoding | no (its `#[serial]` arms self-serialize) | none |
 | `tests/rosidl_buffer_downgrade_test.rs` | Lyrical and Rolling `rosidl::Buffer<uint8_t>`, built by the shim (a CPU Buffer and one on a fixture non-CPU backend, read through the accessors rosidl generates, which throw off the CPU): a non-CPU Buffer publishes the bytes a CPU Buffer or a plain sequence would, copied to host memory by the write pass only (the size pass measures a nested Buffer with zeros, never a copy), on both bridges and inside nested C and C++ messages; a backend whose `size()` disagrees with its host copy refuses the frame; `rmw_serialize` downgrades and counts under `<rmw_serialize>`; a take into a non-CPU C++ Buffer leaves a CPU Buffer holding the frame; on C, an owned Buffer is filled in place and a borrowed one is detached and left untouched; a backend that throws on the host copy, or a null Buffer, refuses the frame and counts nothing; through the C ABI, `acceptable_buffer_backends` accepts `NULL`, `""`, `cpu`, `any` and a backend the rmw lacks (a `cuda` subscription receives a device frame as CPU bytes), refuses only a malformed list with the reason on rcl's error channel, a refused create leaves the topic free for a CPU subscription, and three published device Buffers arrive with matching bytes (the first taken into an owned device Buffer, which ends on the CPU backend) and a per-topic count of 3 | yes; `#[serial]` + `--test-threads=1` (process-wide counter, SHM singleton) | none; compiled only where the bindings carry `is_rosidl_buffer` |
+| `tests/rosidl_buffer_backend_test.rs` | Hosted backends on the distro's real `sensor_msgs/msg/Image` type supports, with the shim's fixture backend installed as `cuda` (its descriptor has the `CudaBufferDescriptor.msg` layout; its "device memory" is a table keyed by `ipc_uid`): the endpoint-aware CDR of the S2 fixture image equals the golden wire captured from rmw_fastrtps_cpp and rmw_zenoh_cpp byte for byte (marker at 44), a declined descriptor writes the captured CPU form and counts `descriptors_refused`, the plain CDR equals the captured plain form; the captured wire decodes to the captured descriptor and bytes, and a stale one reports a lost sample; through the C ABI: no subscriber sends nothing, an accepting subscription gets the descriptor with zero host copies and byte-exact data, a CPU-only and a declined subscription beside it get one plain frame between them with no duplicate, a stale descriptor is dropped and counted, a native reader forces native frames with one host copy; a transient-local publisher is not buffer-aware | yes; `#[serial]` + `--test-threads=1` (process-wide counters, SHM singleton) | compiled only where `cerulion_has_buffer_backends`; needs the distro's `sensor_msgs` |
 | `tests/rosidl_buffer_warn_test.rs` | The operator's view of the Buffer downgrade: a topic's first frame carrying a non-CPU Buffer logs exactly one WARN naming the topic, the backend and `topic_downgrades=1`, the eleventh frame logs nothing more than the decade line at 10, a second topic gets its own first warning, and a subscription naming `cuda` logs one warning carrying `ignored_backends=cuda` | yes; own binary (`#[traced_test]`) | none; compiled only where the bindings carry `is_rosidl_buffer` |
 | `tests/canonical_element_body_test.rs` | Variable-element bodies match the canonical framing: rmw encodes, independent `FrameWalker` decodes, vs hand-built byte oracles | no | none |
 | `tests/rmw_endpoint_info_test.rs` | Endpoint info by topic: field round-trips, gid cross-check, QoS (three axes echoed, depth reported as PROVISIONED), null-arg guards, OOM rollback (countdown allocator + pointer ledger), remove-by-gid exactness | yes | none |

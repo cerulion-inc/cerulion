@@ -1703,6 +1703,13 @@ impl CerulionSubscriber {
         self.max_borrowed_samples
     }
 
+    /// The iceoryx2 id of this subscriber's data port, unique on the host
+    /// for the port's lifetime: the value
+    /// [`super::TopicSubscriberView::for_each_subscriber`] reports for it.
+    pub fn port_id(&self) -> u128 {
+        self.subscriber.id().value()
+    }
+
     /// Install this input's shared read-outcome stage.
     /// Called by the graph runtime at WIRING time (every graph-wired
     /// subscriber — body inputs and the Separate/Sync trigger-drain

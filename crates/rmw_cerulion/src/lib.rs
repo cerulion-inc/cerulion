@@ -55,6 +55,7 @@
 pub mod adopt_take;
 pub mod borrow_degrade_latch;
 pub mod bridge;
+pub mod buffer_backends;
 pub mod decode_failure_latch;
 pub mod era;
 pub mod era_check;
