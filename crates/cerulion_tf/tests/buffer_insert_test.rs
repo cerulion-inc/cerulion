@@ -67,6 +67,7 @@ fn a_fresh_buffer_knows_no_frame_and_has_counted_nothing() {
     assert_eq!(b.ring_capacity(), 1_001);
     assert_eq!(b.retention(), Duration::from_secs(10));
     assert_eq!(b.name_budget(), 4_096);
+    assert_eq!(cerulion_tf::DEFAULT_NAME_BYTES, 4_096);
     assert_eq!((b.expired(), b.replacements(), b.epoch()), (0, 0, 0));
     assert!(!b.contains_frame("odom"));
     assert_eq!(b.edge("odom"), None);
@@ -205,6 +206,8 @@ fn different_writers_may_feed_different_edges() {
     b.insert_static(W2, "base", "lidar", tf(0.17)).unwrap();
     assert_eq!(edge(&b, "base").writer, Some(W));
     assert_eq!(edge(&b, "arm").writer, Some(W2));
+    assert_eq!(edge(&b, "arm").writer.map(WriterId::get), Some(2));
+    assert_eq!(WriterId::new(u64::MAX).get(), u64::MAX);
     assert_eq!(b.lookup("odom", "arm", 10).unwrap(), tf(3.0));
 }
 

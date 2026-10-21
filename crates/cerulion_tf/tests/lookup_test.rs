@@ -916,3 +916,29 @@ fn a_handle_from_another_buffer_is_refused() {
         Err(TfError::UnknownFrameId { frame: foreign })
     );
 }
+
+#[test]
+fn extrapolate_steps_by_the_span_between_the_two_newest_samples() {
+    // Samples at 1000 and 3000 ns: the span is 2000, not their sum.
+    let mut b = TfBuffer::new();
+    b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 4_000 })
+        .unwrap();
+    b.insert(W, "odom", "base", 1_000, shift(1.0)).unwrap();
+    b.insert(W, "odom", "base", 3_000, shift(3.0)).unwrap();
+    // 2 m per 2000 ns: 1000 ns past the newest is 4 m, 4000 ns is 7 m.
+    assert_eq!(b.lookup("odom", "base", 4_000).unwrap(), shift(4.0));
+    assert_eq!(b.lookup("odom", "base", 7_000).unwrap(), shift(7.0));
+}
+
+#[test]
+fn one_whole_extrapolation_step_composes_the_step_once_and_no_more() {
+    // The step is 1.7e308 m: one step from 0 is 1.7e308, which is finite,
+    // and two steps would overflow. A lookup one span past the newest
+    // composes the step exactly once.
+    let mut b = TfBuffer::new();
+    b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 1_000 })
+        .unwrap();
+    b.insert(W, "odom", "base", 0, shift(-1.7e308)).unwrap();
+    b.insert(W, "odom", "base", 1_000, shift(0.0)).unwrap();
+    assert_eq!(b.lookup("odom", "base", 2_000).unwrap(), shift(1.7e308));
+}
