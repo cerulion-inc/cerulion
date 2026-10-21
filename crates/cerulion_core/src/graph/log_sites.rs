@@ -22,7 +22,9 @@
 //! A throttle reads the node's own clock, the one `self.now_ns()` reads, never
 //! the wall clock. Under `--time-source virtual`, and when a recording is
 //! re-executed, the emit and suppress pattern is a pure function of graph
-//! time, so two runs print the same lines. The state is part of the node's
+//! time, so two runs emit at the same calls and suppress the same calls.
+//! What an emitted line says is what its arguments say in that run: the
+//! macros decide only whether a call emits. The state is part of the node's
 //! captured state, so a re-execution from a mid-run checkpoint continues each
 //! site's once and throttle state from that checkpoint: a once line that
 //! printed before the checkpoint does not print again, and an open throttle
@@ -45,28 +47,37 @@
 //! # State
 //!
 //! Each call site has a stable id, fixed when the node is compiled: a hash of
-//! its module path, line, column, macro name and arguments. The same source
-//! gives the same id in every run and every build, so a checkpoint names each
-//! site by id. The file path is not part of the id: a build that remaps its
-//! source paths (`--remap-path-prefix`, a different checkout directory) gives
-//! the same ids, so a checkpoint from one build restores into the other.
-//! A module is one file, so the module path already tells two files apart;
-//! the one exception is two files that `include!` puts in one module, whose
-//! sites share an id only when they also share line, column and arguments. Two log calls that one invocation of a user's own
+//! its module path, file name, line, column, macro name and arguments. The
+//! same source gives the same id in every run and every build, so a
+//! checkpoint names each site by id. Only the file NAME is part of the id,
+//! not its directory: a build that remaps its source paths
+//! (`--remap-path-prefix`, a different checkout directory) gives the same
+//! ids, so a checkpoint from one build restores into the other, and two
+//! files that `include!` puts in one module still get their own ids. Two
+//! such files share an id only when they also share their file name, line,
+//! column and arguments. Two log calls that one invocation of a user's own
 //! macro produces with the same arguments get the same id, so they count as
 //! one site.
 //!
 //! The state itself is one entry per site in a fixed table inside each node
-//! instance ([`LogSiteTable`], [`LOG_SITE_SLOTS`] entries), keyed by the
-//! site's id, so a `once` site emits once PER NODE INSTANCE, and two
-//! instances of one node type keep separate throttles. The same call site
-//! inside a loop is one site. Nothing grows: no map, no allocation.
+//! instance ([`LogSiteTable`]), keyed by the site's id, so a `once` site
+//! emits once PER NODE INSTANCE, and two instances of one node type keep
+//! separate throttles. The same call site inside a loop is one site. Nothing
+//! grows: no map, no allocation.
 //!
-//! An instance whose code runs more than [`LOG_SITE_SLOTS`] distinct sites
-//! has no entry for the extra ones. Such a site keeps no state at all: every
-//! call emits, as the plain macro would, and the first time each such site
-//! runs it says so with an `error` that names its file, line and module. No
-//! site ever shares state with another site or another instance.
+//! An instance keeps state for [`LOG_SITE_SLOTS`] distinct sites. A site past
+//! that has no entry: it keeps no state at all, every call emits, as the
+//! plain macro would, and the first time each such site runs it says so with
+//! an `error` that names its file, line and module. No site ever shares state
+//! with another site or another instance.
+//!
+//! A restore keeps the recorded entries apart until their sites run: a
+//! recorded entry counts toward [`LOG_SITE_SLOTS`] only from its site's first
+//! call after the restore. A checkpoint from a build whose sites an edit has
+//! since moved or removed therefore never takes the room of the sites this
+//! build has. The one cost is on an instance that runs more than
+//! [`LOG_SITE_SLOTS`] distinct sites: after a restore, which sites keep state
+//! follows the order they run in after the restore.
 //!
 //! # Cost
 //!
@@ -77,15 +88,21 @@
 //! nothing: the call does not read the clock, keeps no state and takes no
 //! entry.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::graph::node::CerNodeRuntimeFields;
 use crate::state::{StateCursor, StateError, StateSink};
 
-/// Entries in each node instance's [`LogSiteTable`]: the number of distinct
-/// throttle and once call sites one node instance keeps state for.
+/// The number of distinct throttle and once call sites one node instance
+/// keeps state for.
 pub const LOG_SITE_SLOTS: usize = 64;
+
+/// Entries in each [`LogSiteTable`]. Twice [`LOG_SITE_SLOTS`]: a restore puts
+/// at most [`LOG_SITE_SLOTS`] recorded entries in, and the sites of this
+/// build take at most [`LOG_SITE_SLOTS`] more, so a probe always finds the
+/// site's id or a free entry.
+const TABLE_ENTRIES: usize = 2 * LOG_SITE_SLOTS;
 
 /// State word meaning "this site has not emitted yet".
 const NEVER: u64 = 0;
@@ -108,19 +125,36 @@ const fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The stable id of the call site at `line:column` in `module`, where `call`
-/// is the macro name and its arguments as written. A pure function of the
-/// source, computed at compile time. Never [`EMPTY`].
+/// The last component of `path`: the bytes after its last `/` or `\`.
+const fn file_name(path: &str) -> &[u8] {
+    let bytes = path.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' || bytes[i] == b'\\' {
+            start = i + 1;
+        }
+        i += 1;
+    }
+    bytes.split_at(start).1
+}
+
+/// The stable id of the call site at `line:column` in `module`, in the file
+/// `file`, where `call` is the macro name and its arguments as written. A
+/// pure function of the source, computed at compile time. Never [`EMPTY`].
 ///
-/// The file path is left out on purpose: it changes with the build directory
-/// and `--remap-path-prefix`, and an id must not.
+/// Only the file NAME counts, not its directory: the directory changes with
+/// the build directory and `--remap-path-prefix`, and an id must not. The
+/// name tells apart two files that `include!` puts in one module.
 ///
-/// A `0xff` byte ends the module path: it never occurs in UTF-8, so no byte
-/// moves between the module and the parts after it.
+/// A `0xff` byte ends the module path and the file name: it never occurs in
+/// UTF-8, so no byte moves between one part and the next.
 #[doc(hidden)]
-pub const fn site_id(module: &str, line: u32, column: u32, call: &str) -> u64 {
+pub const fn site_id(file: &str, module: &str, line: u32, column: u32, call: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     hash = fnv1a(hash, module.as_bytes());
+    hash = fnv1a(hash, &[0xff]);
+    hash = fnv1a(hash, file_name(file));
     hash = fnv1a(hash, &[0xff]);
     hash = fnv1a(hash, &line.to_le_bytes());
     hash = fnv1a(hash, &column.to_le_bytes());
@@ -132,10 +166,15 @@ pub const fn site_id(module: &str, line: u32, column: u32, call: &str) -> u64 {
     }
 }
 
-/// One table entry: the id of the site that owns it and its state word.
+/// One table entry: the id of the site that owns it, its state word, and
+/// whether a site of this build has claimed it.
 struct Entry {
     id: AtomicU64,
     word: AtomicU64,
+    /// `false` only for an entry a restore wrote that no site has run since:
+    /// it may belong to a site an edit removed, so it does not count toward
+    /// [`LOG_SITE_SLOTS`].
+    claimed: AtomicBool,
 }
 
 /// The per-instance state table, one entry per call site, keyed by the
@@ -143,7 +182,9 @@ struct Entry {
 /// `#[cerulion_node]` struct carries, and rides the node's captured state.
 #[doc(hidden)]
 pub struct LogSiteTable {
-    entries: [Entry; LOG_SITE_SLOTS],
+    entries: [Entry; TABLE_ENTRIES],
+    /// Claimed entries, at most [`LOG_SITE_SLOTS`].
+    claimed_count: AtomicUsize,
 }
 
 impl Default for LogSiteTable {
@@ -152,7 +193,9 @@ impl Default for LogSiteTable {
             entries: std::array::from_fn(|_| Entry {
                 id: AtomicU64::new(EMPTY),
                 word: AtomicU64::new(NEVER),
+                claimed: AtomicBool::new(false),
             }),
+            claimed_count: AtomicUsize::new(0),
         }
     }
 }
@@ -176,36 +219,100 @@ impl std::fmt::Debug for LogSiteTable {
 }
 
 impl LogSiteTable {
-    /// The state word of the site `id`, taking a free entry on the site's
-    /// first call. `None` when every entry holds another site.
+    /// The state word of the site `id`. The site's first call claims an
+    /// entry: the restored one that holds `id`, or a free one. `None` when
+    /// [`LOG_SITE_SLOTS`] other sites have claimed entries.
     ///
-    /// Open addressing with linear probing from `id % LOG_SITE_SLOTS`. An
-    /// entry, once taken, keeps its id for the life of the table (only
+    /// Open addressing with linear probing from `id % TABLE_ENTRIES`. An
+    /// entry, once it holds an id, keeps it for the life of the table (only
     /// [`Self::restore`], which holds the table exclusively, rewrites ids),
     /// so a probe that passes an entry never has to look at it again.
     fn word(&self, id: u64) -> Option<&AtomicU64> {
-        let start = (id % LOG_SITE_SLOTS as u64) as usize;
-        for step in 0..LOG_SITE_SLOTS {
-            let entry = &self.entries[(start + step) % LOG_SITE_SLOTS];
+        let start = (id % TABLE_ENTRIES as u64) as usize;
+        for step in 0..TABLE_ENTRIES {
+            let entry = &self.entries[(start + step) % TABLE_ENTRIES];
             let held = entry.id.load(Ordering::Acquire);
             if held == id {
-                return Some(&entry.word);
+                return self.claim(entry).then_some(&entry.word);
             }
             if held == EMPTY {
+                // Count the site first, so no entry is taken past the limit.
+                if !self.try_count() {
+                    return None;
+                }
                 match entry
                     .id
                     .compare_exchange(EMPTY, id, Ordering::AcqRel, Ordering::Acquire)
                 {
-                    // This call took the entry, or a racing first call of
-                    // the same site took it a moment earlier.
-                    Ok(_) => return Some(&entry.word),
-                    Err(won) if won == id => return Some(&entry.word),
+                    Ok(_) => {
+                        if entry
+                            .claimed
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                        {
+                            // A racing first call of this site saw the id
+                            // and claimed it, counting itself.
+                            self.uncount();
+                        }
+                        return Some(&entry.word);
+                    }
+                    // A racing first call of the same site took it a moment
+                    // earlier and counts it.
+                    Err(won) if won == id => {
+                        self.uncount();
+                        return self.claim(entry).then_some(&entry.word);
+                    }
                     // Another site took it: keep probing.
-                    Err(_) => {}
+                    Err(_) => self.uncount(),
                 }
             }
         }
+        // Unreachable: at most `LOG_SITE_SLOTS` restored entries plus
+        // `LOG_SITE_SLOTS` claimed ones fill `TABLE_ENTRIES`, and a claim is
+        // counted before it takes an entry.
         None
+    }
+
+    /// Mark `entry`, which holds this site's id, as claimed. `false` when it
+    /// was not claimed yet and [`LOG_SITE_SLOTS`] other sites have claimed
+    /// entries.
+    fn claim(&self, entry: &Entry) -> bool {
+        if entry.claimed.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self.try_count() {
+            return false;
+        }
+        if entry
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.uncount();
+        }
+        true
+    }
+
+    /// Count one more claimed entry, unless [`LOG_SITE_SLOTS`] are claimed.
+    fn try_count(&self) -> bool {
+        let mut n = self.claimed_count.load(Ordering::Acquire);
+        while n < LOG_SITE_SLOTS {
+            match self.claimed_count.compare_exchange_weak(
+                n,
+                n + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
+    }
+
+    /// Give back a count [`Self::try_count`] took.
+    fn uncount(&self) {
+        self.claimed_count.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Entries that hold a site.
@@ -216,10 +323,38 @@ impl LogSiteTable {
             .count()
     }
 
+    /// `true` when the capture writes `entry`: every claimed entry, and a
+    /// restored one no site has run since when its id is at or below `cut`.
+    fn kept(entry: &Entry, cut: Option<u64>) -> bool {
+        let id = entry.id.load(Ordering::Acquire);
+        id != EMPTY && (entry.claimed.load(Ordering::Acquire) || cut.is_some_and(|c| id <= c))
+    }
+
+    /// The smallest id above `floor` among the entries `pick` accepts.
+    fn next_above(
+        &self,
+        floor: Option<u64>,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Option<(u64, &Entry)> {
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let id = e.id.load(Ordering::Acquire);
+                let above = floor.is_none_or(|f| id > f);
+                (id != EMPTY && above && pick(e)).then_some((id, e))
+            })
+            .min_by_key(|(id, _)| *id)
+    }
+
     /// Write this table into a node's captured state. A table no site has
     /// used writes nothing, so a node without throttle or once calls captures
     /// exactly the bytes of its fields and accumulate inputs. The node's
     /// generated `capture_state` appends this last.
+    ///
+    /// The capture holds every claimed entry, then the restored entries no
+    /// site has run since, smallest id first, up to [`LOG_SITE_SLOTS`] in
+    /// all. A restored entry is dropped only when the instance has seen more
+    /// than [`LOG_SITE_SLOTS`] distinct sites since the restore.
     ///
     /// Layout (little-endian): `u32` tag `CLOG`, `u32` entry count, then per
     /// entry `u64` site id and `u64` state word, in ascending id order, so
@@ -230,27 +365,36 @@ impl LogSiteTable {
     ///
     /// What the sink refuses.
     pub fn capture(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
-        let used = self.used();
-        if used == 0 {
+        let claimed = self
+            .entries
+            .iter()
+            .filter(|e| e.id.load(Ordering::Relaxed) != EMPTY && e.claimed.load(Ordering::Acquire))
+            .count();
+        // The largest restored id that still fits, walking them in ascending
+        // id order without a buffer. 128 entries, at a checkpoint only.
+        let unclaimed = |e: &Entry| !e.claimed.load(Ordering::Acquire);
+        let mut cut: Option<u64> = None;
+        let mut written = claimed;
+        while written < LOG_SITE_SLOTS {
+            let Some((id, _)) = self.next_above(cut, unclaimed) else {
+                break;
+            };
+            cut = Some(id);
+            written += 1;
+        }
+        if written == 0 {
             return Ok(());
         }
         out.write(&SECTION_TAG.to_le_bytes())?;
         // At most `LOG_SITE_SLOTS` (64), so the cast is exact.
-        out.write(&(used as u32).to_le_bytes())?;
+        out.write(&(written as u32).to_le_bytes())?;
         // Ascending id order without a buffer: each pass writes the smallest
-        // id above the last one written. 64 entries, at a checkpoint only.
+        // kept id above the last one written.
         let mut floor: Option<u64> = None;
-        for _ in 0..used {
-            let next = self
-                .entries
-                .iter()
-                .filter_map(|e| {
-                    let id = e.id.load(Ordering::Acquire);
-                    let above = floor.is_none_or(|f| id > f);
-                    (id != EMPTY && above).then_some((id, e))
-                })
-                .min_by_key(|(id, _)| *id);
-            let Some((id, entry)) = next else { break };
+        for _ in 0..written {
+            let Some((id, entry)) = self.next_above(floor, |e| Self::kept(e, cut)) else {
+                break;
+            };
             out.write(&id.to_le_bytes())?;
             out.write(&entry.word.load(Ordering::Relaxed).to_le_bytes())?;
             floor = Some(id);
@@ -265,13 +409,18 @@ impl LogSiteTable {
     /// generated `restore_state` calls this after its accumulate inputs,
     /// before the cursor's trailing-byte check.
     ///
+    /// A restored entry counts toward [`LOG_SITE_SLOTS`] only once its site
+    /// runs, so entries of sites an edit removed never take the room of the
+    /// sites this build has.
+    ///
     /// # Errors
     ///
     /// [`StateError::TrailingBytes`] when the bytes left do not open with the
     /// section tag (the node's field list changed since the recording);
-    /// [`StateError::LogSiteRestore`] when the section holds more entries
-    /// than the table, or repeats or misorders an id; the cursor's own errors
-    /// for truncated bytes.
+    /// [`StateError::LogSiteRestore`] when the section holds no entry (a
+    /// capture writes no section for an empty table) or more entries than
+    /// the table, or repeats or misorders an id; the cursor's own errors for
+    /// truncated bytes.
     // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
     // it allocates only to name a refusal
     pub fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
@@ -288,6 +437,12 @@ impl LogSiteTable {
         }
         let refuse = |reason: String| StateError::LogSiteRestore { reason };
         let count = src.read_element_count()?;
+        if count == 0 {
+            return Err(refuse(String::from(
+                "the recording holds a log site section with no entries; a capture \
+                 writes no section for an empty table",
+            )));
+        }
         if count > LOG_SITE_SLOTS {
             return Err(refuse(format!(
                 "the recording holds {count} log sites, a node instance holds at most \
@@ -309,15 +464,25 @@ impl LogSiteTable {
                      capture never does"
                 )));
             }
-            match self.word(id) {
-                Some(slot) => slot.store(word, Ordering::Relaxed),
-                // Unreachable: `count` is at most the table size and every
-                // id is distinct, so each one finds a free entry.
-                None => return Err(refuse(format!("no free entry for log site 0x{id:016x}"))),
-            }
+            self.place_restored(id, word);
             last = Some(id);
         }
         Ok(())
+    }
+
+    /// Put a recorded entry in the first free entry of its probe, unclaimed.
+    /// `count` is at most [`LOG_SITE_SLOTS`] and every id is distinct, so a
+    /// free entry always exists and no probe meets `id` already there.
+    fn place_restored(&mut self, id: u64, word: u64) {
+        let start = (id % TABLE_ENTRIES as u64) as usize;
+        for step in 0..TABLE_ENTRIES {
+            let entry = &mut self.entries[(start + step) % TABLE_ENTRIES];
+            if *entry.id.get_mut() == EMPTY {
+                *entry.id.get_mut() = id;
+                *entry.word.get_mut() = word;
+                return;
+            }
+        }
     }
 }
 
@@ -346,7 +511,7 @@ impl LogSite {
         call: &'static str,
     ) -> Self {
         Self {
-            id: site_id(module, line, column, call),
+            id: site_id(file, module, line, column, call),
             file,
             line,
             module,
@@ -726,20 +891,49 @@ mod tests {
     #[test]
     fn a_site_id_is_a_pure_function_of_the_source_and_each_part_counts() {
         use super::site_id;
-        let base = site_id("m", 10, 5, "warn_once(\"x\")");
-        assert_eq!(base, site_id("m", 10, 5, "warn_once(\"x\")"));
+        let base = site_id("a.rs", "m", 10, 5, "warn_once(\"x\")");
+        assert_eq!(base, site_id("a.rs", "m", 10, 5, "warn_once(\"x\")"));
         for other in [
-            site_id("m2", 10, 5, "warn_once(\"x\")"),
-            site_id("m", 11, 5, "warn_once(\"x\")"),
-            site_id("m", 10, 6, "warn_once(\"x\")"),
-            site_id("m", 10, 5, "warn_once(\"y\")"),
+            site_id("b.rs", "m", 10, 5, "warn_once(\"x\")"),
+            site_id("a.rs", "m2", 10, 5, "warn_once(\"x\")"),
+            site_id("a.rs", "m", 11, 5, "warn_once(\"x\")"),
+            site_id("a.rs", "m", 10, 6, "warn_once(\"x\")"),
+            site_id("a.rs", "m", 10, 5, "warn_once(\"y\")"),
         ] {
             assert_ne!(base, other);
         }
         // Computed at compile time, as the macros use it.
-        const AT_COMPILE_TIME: u64 = super::site_id("m", 10, 5, "warn_once(\"x\")");
+        const AT_COMPILE_TIME: u64 = super::site_id("a.rs", "m", 10, 5, "warn_once(\"x\")");
         assert_eq!(AT_COMPILE_TIME, base);
         assert_ne!(base, super::EMPTY);
+    }
+
+    /// HAND ORACLE: the id is FNV-1a over module, `0xff`, file name, `0xff`,
+    /// line and column (little-endian), then the call text.
+    #[test]
+    fn a_site_id_hashes_its_parts_in_the_documented_order() {
+        const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"m");
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"lib.rs");
+        bytes.push(0xff);
+        bytes.extend_from_slice(&[10, 0, 0, 0, 5, 0, 0, 0]);
+        bytes.extend_from_slice(b"warn_once(\"x\")");
+        assert_eq!(
+            super::site_id("src/lib.rs", "m", 10, 5, "warn_once(\"x\")"),
+            super::fnv1a(BASIS, &bytes)
+        );
+    }
+
+    /// The last path component, for both separators and for a bare name.
+    #[test]
+    fn the_file_name_is_the_part_after_the_last_separator() {
+        assert_eq!(super::file_name("node/src/lib.rs"), b"lib.rs");
+        assert_eq!(super::file_name("C:\\build\\src\\part.rs"), b"part.rs");
+        assert_eq!(super::file_name("lib.rs"), b"lib.rs");
+        assert_eq!(super::file_name("dir/"), b"");
+        assert_eq!(super::file_name(""), b"");
     }
 
     /// A build that remaps its source paths sees a different `file!()` for
@@ -752,9 +946,25 @@ mod tests {
         let here = LogSite::new("node/src/lib.rs", 10, 5, "node", call);
         let remapped = LogSite::new("/build/src/lib.rs", 10, 5, "node", call);
         assert_eq!(here.id(), remapped.id());
-        assert_eq!(here.id(), super::site_id("node", 10, 5, call));
+        assert_eq!(here.id(), super::site_id("lib.rs", "node", 10, 5, call));
         let elsewhere = LogSite::new("/build/src/lib.rs", 10, 5, "node::inner", call);
         assert_ne!(here.id(), elsewhere.id());
+    }
+
+    /// Two files that `include!` puts in one module have one module path.
+    /// The same call at the same line and column in each is two sites,
+    /// because their file names differ.
+    #[test]
+    fn the_same_call_in_two_included_files_of_one_module_is_two_sites() {
+        use super::LogSite;
+        let call = "warn_once(\"x\")";
+        let first = LogSite::new("node/src/part_a.rs", 3, 9, "node", call);
+        let second = LogSite::new("node/src/part_b.rs", 3, 9, "node", call);
+        assert_ne!(first.id(), second.id());
+        let table = super::LogSiteTable::default();
+        let a = std::ptr::from_ref(table.word(first.id()).unwrap());
+        let b = std::ptr::from_ref(table.word(second.id()).unwrap());
+        assert_ne!(a, b, "each file's site has its own state word");
     }
 
     /// Sixteen threads make the FIRST call at one site on one table at the
@@ -796,15 +1006,16 @@ mod tests {
     fn a_full_table_has_no_entry_for_one_more_site_and_keeps_every_other() {
         let table = super::LogSiteTable::default();
         let slots = super::LOG_SITE_SLOTS as u64;
-        // Ids k * 64 + 64 all hash to entry 0 and probe from there.
-        let ids: Vec<u64> = (1..=slots).map(|k| k * slots).collect();
+        // Ids k * TABLE_ENTRIES all hash to entry 0 and probe from there.
+        let entries = super::TABLE_ENTRIES as u64;
+        let ids: Vec<u64> = (1..=slots).map(|k| k * entries).collect();
         for (n, &id) in ids.iter().enumerate() {
             table
                 .word(id)
                 .expect("room")
                 .store(n as u64 + 1, Ordering::Relaxed);
         }
-        assert!(table.word(9 * slots + 1).is_none(), "65th site: no entry");
+        assert!(table.word(9 * entries + 1).is_none(), "65th site: no entry");
         for (n, &id) in ids.iter().enumerate() {
             assert_eq!(
                 table.word(id).unwrap().load(Ordering::Relaxed),
@@ -892,6 +1103,9 @@ mod tests {
         assert!(refusal(&section(2, &[6, 5])).contains("out of ascending order"));
         // The reserved id.
         assert!(refusal(&section(1, &[0])).contains("id 0"));
+        // A section with no entries: a capture writes none for an empty
+        // table, so these bytes are not one.
+        assert!(refusal(&section(0, &[])).contains("no entries"));
         // More entries than a table holds.
         let ids: Vec<u64> = (1..=65).collect();
         assert!(refusal(&section(65, &ids)).contains("at most 64"));
@@ -899,5 +1113,69 @@ mod tests {
         let mut short = section(1, &[5]);
         short.pop();
         assert!(refusal(&short).contains("truncated"));
+    }
+
+    /// A checkpoint whose 64 entries all belong to sites an edit removed:
+    /// every current site still gets an entry, and the old entries ride the
+    /// next capture only in the room the current sites leave.
+    #[test]
+    fn obsolete_checkpoint_entries_never_take_the_room_of_current_sites() {
+        let slots = super::LOG_SITE_SLOTS as u64;
+        let old: Vec<u64> = (1..=slots).collect();
+        let mut table = super::LogSiteTable::default();
+        let bytes = section(slots as u32, &old);
+        let mut cursor = crate::state::StateCursor::new(&bytes);
+        table
+            .restore(&mut cursor)
+            .expect("a full checkpoint restores");
+        // 64 current sites, none of them in the checkpoint.
+        let current: Vec<u64> = (1..=slots).map(|k| 1000 + k).collect();
+        for &id in &current {
+            let word = table.word(id).expect("a current site gets an entry");
+            assert_eq!(word.load(Ordering::Relaxed), super::NEVER, "fresh");
+            word.store(7, Ordering::Relaxed);
+        }
+        // The 65th current site is past the limit, as without a restore.
+        assert!(table.word(5000).is_none());
+        // The capture holds the 64 current sites and none of the old ones.
+        let mut oracle = Vec::new();
+        oracle.extend_from_slice(b"CLOG");
+        oracle.extend_from_slice(&64u32.to_le_bytes());
+        for &id in &current {
+            oracle.extend_from_slice(&id.to_le_bytes());
+            oracle.extend_from_slice(&7u64.to_le_bytes());
+        }
+        assert_eq!(captured(&table), oracle);
+    }
+
+    /// A restored entry a site claims keeps its recorded word; one no site
+    /// has run since still rides the next capture when there is room, so a
+    /// capture right after a restore writes the same bytes.
+    #[test]
+    fn a_restored_entry_keeps_its_word_and_rides_the_next_capture_until_claimed() {
+        let bytes = section(2, &[0x10, 0x20]);
+        let mut table = super::LogSiteTable::default();
+        table
+            .restore(&mut crate::state::StateCursor::new(&bytes))
+            .expect("restore");
+        assert_eq!(captured(&table), bytes, "an untouched restore round-trips");
+        // Site 0x10 runs: it gets its recorded word, not a fresh one.
+        assert_eq!(table.word(0x10).unwrap().load(Ordering::Relaxed), 1);
+        // 63 more current sites fill the limit with 0x10; 0x20 is not run.
+        for k in 1..super::LOG_SITE_SLOTS as u64 {
+            table.word(0x1000 + k).unwrap().store(2, Ordering::Relaxed);
+        }
+        let capture = captured(&table);
+        assert_eq!(&capture[4..8], &64u32.to_le_bytes(), "64 entries at most");
+        assert!(
+            !capture
+                .chunks(8)
+                .skip(1)
+                .step_by(2)
+                .any(|id| id == 0x20u64.to_le_bytes()),
+            "the unrun restored entry gave its room to a current site"
+        );
+        // Site 0x20 is the 65th claimed site: past the limit.
+        assert!(table.word(0x20).is_none());
     }
 }
