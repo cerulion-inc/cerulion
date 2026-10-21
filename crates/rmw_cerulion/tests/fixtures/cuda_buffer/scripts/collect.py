@@ -51,6 +51,10 @@ def strace_transcript(path, pid_names):
 
 
 def main():
+    # Both latency runs are inputs; refuse before golden/ is cleared.
+    for src_name in ("latency", "latency_ready"):
+        if not os.path.isdir(os.path.join(OUT, src_name)):
+            sys.exit(f"collect: {os.path.join(OUT, src_name)} is missing; run the latency stage")
     if os.path.isdir(GOLD):
         shutil.rmtree(GOLD)
     os.makedirs(GOLD)
@@ -129,8 +133,6 @@ def main():
     # latency_ready/ after the producer's stream is synchronized.
     for src_name, dst_name in (("latency", "enqueued"), ("latency_ready", "ready")):
         lat = os.path.join(OUT, src_name)
-        if not os.path.isdir(lat):
-            continue
         dst = os.path.join(GOLD, "latency", dst_name)
         for f in ("summary.tsv", "summary.md", "params.txt", "cells.log"):
             if os.path.exists(os.path.join(lat, f)):

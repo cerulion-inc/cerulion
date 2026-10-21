@@ -60,7 +60,12 @@ for stage in $STAGES; do
     fallback)
       locked "$RUN" exec bash /opt/s2/fixtures/scripts/fallback_wire.sh "$OUT" ;;
     latency)
-      locked "$RUN" exec bash /opt/s2/fixtures/scripts/latency.sh "$OUT" ;;
+      # Two runs: latency/ stamps before the producer's GPU write (enqueued),
+      # latency_ready/ after it (golden/latency/ready/). run.sh exec does not
+      # forward host env, so the ready run's overrides are in the command.
+      locked "$RUN" exec bash /opt/s2/fixtures/scripts/latency.sh "$OUT"
+      locked "$RUN" exec "S2_STAMP=ready S2_MODES='inter intra proc1_rmw' \
+        bash /opt/s2/fixtures/scripts/latency.sh $OUT" ;;
     collect)
       "$RUN" exec python3 /opt/s2/fixtures/scripts/collect.py "$OUT" /opt/s2/fixtures/golden ;;
     *) echo "unknown stage $stage" >&2; exit 2 ;;
