@@ -8,7 +8,7 @@
 # container/run.sh bind-mounts the host toolkit /usr/local/cuda-12.6
 # read-only, and the overlay is built at run time (container/build-overlay.sh).
 #
-# Build on the box from this directory:
+# Build on the Jetson host from this directory:
 #   docker build --network host -t cerulion/lyrical-cuda:s2 .
 FROM ros@sha256:f79cd486fa218596747c45d00ca42101b0303fc6d94ed5adb72145cd6f54b86c
 

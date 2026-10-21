@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Regenerate every fixture in golden/ on a Jetson with CUDA (the capture box:
-# L4T R36, CUDA 12.6 at /usr/local/cuda-12.6, docker + nvidia runtime).
+# Regenerate every fixture in golden/. Needs Linux on an NVIDIA Jetson with
+# L4T R36, CUDA 12.6 at /usr/local/cuda-12.6, and docker with the nvidia runtime.
 #
 #   ./capture.sh [stage ...]       stages: image overlay env samples descriptor
 #                                  ipc fallback latency collect (default: all)
 #
-# Run it from this directory on the box. Each stage writes under
+# Run it from this directory. Each stage writes under
 # $S2_WS/out/<stage> inside the container's workspace mount; `collect` copies
-# the small, reviewable outputs into golden/. The box lock is taken per
-# stage, waiting for it.
+# the small, reviewable outputs into golden/. Each stage runs under
+# flock on one lock file ($S2_LOCK sets it), so concurrent runs on one host
+# wait for each other.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 export S2_WS=${S2_WS:-$HOME/gpu-s2/ws}

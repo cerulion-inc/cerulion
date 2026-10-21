@@ -9,7 +9,7 @@ read these files. None of them is built or run by cargo.
 | Upstream | `ros2/rosidl_buffer_backends` at `4f3b257db3a5cc4c8e62d526f11f344c1e5801dc` |
 | Distro | Lyrical binaries on Ubuntu 26.04 arm64; versions in `golden/env/ros-lyrical-packages.tsv` |
 | rmws | `rmw_fastrtps_cpp` 9.4.10, `rmw_zenoh_cpp` 0.10.6 |
-| Box | Jetson Orin NX 16 GB, L4T R36.4.3, CUDA 12.6 (`golden/env/host.txt`) |
+| Hardware | Jetson Orin NX 16 GB, L4T R36.4.3, CUDA 12.6 (`golden/env/host.txt`) |
 | Captured | 2026-10-21 |
 
 ## Layout
@@ -18,12 +18,13 @@ read these files. None of them is built or run by cargo.
 container/      Dockerfile (Lyrical underlay), run.sh, build-overlay.sh
 probe/          ament package cuda_buffer_s2_probe: the capture binaries
 scripts/        stage scripts, the CDR decoder, the collector
-capture.sh      runs every stage on the box and refreshes golden/
+capture.sh      runs every stage and refreshes golden/
 golden/         the fixtures
 ```
 
-`./capture.sh` on the box rebuilds the image, builds the overlay (upstream
-packages plus `probe/`), runs each stage under the box lock, and copies the
+`./capture.sh` needs Linux on an NVIDIA Jetson with CUDA 12.6, docker and the
+nvidia runtime. It rebuilds the image, builds the overlay (upstream
+packages plus `probe/`), runs each stage under flock on one lock file (`$S2_LOCK` sets it), and copies the
 outputs into `golden/` with pids, socket inodes and the container hostname
 normalized. `./capture.sh <stage>` reruns one stage.
 
@@ -74,7 +75,7 @@ byte-identical for both message types. A reader tells the two `data` forms
 apart by the first two uint32 words. A legacy length can never be
 0xFFFFFFFF followed by "ROS2".
 
-`scripts/decode_cdr.py` decodes every file from the `.msg` layouts alone and
+`./scripts/decode_cdr.py` decodes every file from the `.msg` layouts alone and
 checks the values against `probe.json`. `decoded.json` holds the field table
 with offsets. On Tegra the first uint32 of `ipc_event_handle` is the pid of
 the process that created the event.
@@ -148,7 +149,7 @@ The pool reuses a released block only when `refcount == 0` and at least
   `IPC import failed, falling back to CPU`, then returns an **empty CUDA
   buffer** (size 0, backend `cuda`) with no error to the caller. Nothing
   falls back to CPU. In the plugin source, a descriptor whose `device_id` is
-  not the local device takes the same path. This box has one GPU, so that
+  not the local device takes the same path. The capture hardware has one GPU, so that
   path was not exercised.
 
 ### CPU fallback (`golden/fallback/`)
@@ -214,7 +215,7 @@ How to read these:
 - On the GPU path, inter-process latency is about 0.85 to 1.1 ms p50 on both rmws, and it does not depend on payload size once the producer's write is excluded.
 - In the enqueued table, the growth with size, up to 3.4 ms at 64 MiB, is the fill kernel itself.
 - The CPU fallback saturates at 64 MiB and 50 Hz on both rmws. The parenthesized counts are the samples delivered.
-- The GPU ran under its dynamic governor (`nvhost_podgov`; 306 MHz at capture, 1173 MHz max). Power mode was 40 W, with the CPU governor `schedutil`. The box settings were left as found.
+- The GPU ran under its dynamic governor (`nvhost_podgov`; 306 MHz at capture, 1173 MHz max). Power mode was 40 W, with the CPU governor `schedutil`. No clock or power setting was pinned for the capture.
 - The one-process medians move between about 90 and 450 µs from cell to cell, so read them as a band, not a curve.
 
 `samples.tsv` in each directory holds every post-warmup sample in µs. `summary.tsv` adds p90, p99.9 and max.
