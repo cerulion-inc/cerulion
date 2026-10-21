@@ -29,7 +29,7 @@ use crate::{FrameId, FrameLabel, TfBuffer, WriterId};
 ///
 /// The insert refusals are `EmptyFrameId`, `SelfEdge`, `SecondParent`,
 /// `Cycle`, `EdgeIsStatic`, `SecondWriter`, `StampBeforeWindow`,
-/// `FrameTableFull` and `NameBudgetFull`. The lookup refusals are
+/// `StampTooFarAhead`, `FrameTableFull` and `NameBudgetFull`. The lookup refusals are
 /// `EmptyFrameId`, `UnknownFrame`, `UnknownFrameId`, `NoPath`, `EdgeEmpty`,
 /// `NotYetAvailable`, `OutOfRange` and `ChainMath`.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
@@ -119,6 +119,23 @@ pub enum TfError {
         /// The newest stamp the edge holds, in nanoseconds.
         newest_ns: u64,
     },
+    /// The stamp is more than the buffer's retention past the newest sample
+    /// on the edge: accepted, it would expire the whole ring at once. A
+    /// single far-future stamp is refused this way and leaves the ring as it
+    /// was; the next insert at a later stamp within the retention of the
+    /// refused one confirms the jump, since two inserts that agree on the
+    /// new time are a clock that moved forward. Returned for every such
+    /// insert; the edge counts every one.
+    StampTooFarAhead {
+        /// The parent of the edge.
+        parent: FrameId,
+        /// The child of the edge.
+        child: FrameId,
+        /// The refused stamp, in nanoseconds.
+        stamp_ns: u64,
+        /// The newest stamp the edge holds, in nanoseconds.
+        newest_ns: u64,
+    },
     /// The buffer holds as many frames as it was built for and the transform
     /// names a frame it has never seen.
     FrameTableFull {
@@ -134,6 +151,9 @@ pub enum TfError {
         frame: FrameLabel,
         /// The length of its id, in bytes.
         len: usize,
+        /// The name bytes left for it, in bytes: for a new child named
+        /// beside a new parent, what the parent leaves.
+        left: usize,
         /// The buffer's name byte budget.
         budget: usize,
     },
@@ -313,14 +333,32 @@ impl TfError {
                 n(parent),
                 n(child)
             ),
+            Self::StampTooFarAhead {
+                parent,
+                child,
+                stamp_ns,
+                newest_ns,
+            } => write!(
+                f,
+                "transform `{}` to `{}` at {stamp_ns} ns is more than the retention window past \
+                 the newest stamp {newest_ns} ns and is refused; a later transform within the \
+                 retention of it confirms the jump",
+                n(parent),
+                n(child)
+            ),
             Self::FrameTableFull { frame, capacity } => write!(
                 f,
                 "frame `{frame}` does not fit: the buffer holds its capacity of {capacity} frames"
             ),
-            Self::NameBudgetFull { frame, len, budget } => write!(
+            Self::NameBudgetFull {
+                frame,
+                len,
+                left,
+                budget,
+            } => write!(
                 f,
-                "frame `{frame}` does not fit: its {len}-byte id exceeds what is left of the \
-                 name budget of {budget} bytes"
+                "frame `{frame}` does not fit: its {len}-byte id is longer than the {left} bytes \
+                 left of the name budget of {budget} bytes"
             ),
             Self::UnknownFrame { frame } => write!(
                 f,

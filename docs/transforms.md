@@ -149,7 +149,15 @@ The rules:
   10 s before its newest stamp, the tf2 default, whatever its publish rate.
   An insert drops every sample older than that window (counted in
   `expired()`), and a stamp older than the window is refused
-  (`StampBeforeWindow`). A sample at a stamp the ring already holds is a
+  (`StampBeforeWindow`). A stamp more than the window past the newest sample
+  is refused too (`StampTooFarAhead`): accepted, one bad stamp would expire
+  the whole ring and leave every later good sample before the window. The
+  next insert confirms the jump when its stamp is later than the refused one
+  and within the window of it, so a publisher that paused and resumes loses
+  one sample, and a lone far-future stamp changes nothing. Both refusals come
+  back every time and count in the edge's `window_refusals` and
+  `jump_refusals`, read through `edge()`, so a stuck edge is observable. A
+  sample at a stamp the ring already holds is a
   no-op when the transform is the same and replaces it when it differs
   (counted in `replacements()`).
 - **Rings sized up front.** Each ring holds enough samples for the window at
@@ -180,7 +188,8 @@ The rules:
   is left of the name budget (`NameBudgetFull`); both name the frame.
 
 Every refusal happens before the buffer changes: a refused insert leaves it
-exactly as it was, apart from the refusal counters above.
+exactly as it was, apart from the refusal counters above and the stamp a
+`StampTooFarAhead` refusal keeps for the next insert to confirm.
 
 ### Time jumps
 
@@ -211,7 +220,8 @@ default window, a 1 Hz `map` to `odom` edge and a 100 Hz or 1 kHz `odom` to
 
 A node that looks up the same frames on every tick resolves them once with
 `buffer.frame_id("map")` and calls `lookup_ids(map, lidar, time)` and
-`lookup_latest_ids`, which skip the string work.
+`lookup_latest_ids`, which skip the string work. A handle belongs to the
+buffer that issued it; another buffer refuses it with `UnknownFrameId`.
 
 Time is a plain stamp: `lookup(parent, child, 0)` asks for 0 ns, which is out
 of range on an edge whose oldest sample is later. For the ROS meaning of
@@ -231,7 +241,8 @@ By default a lookup one nanosecond after an edge's newest sample is
 
 A policy can be set before the edge's first sample: the edge is declared with
 an empty ring. `lookup_latest` counts an edge's policy as part of what it
-answers: with `HoldLast { max_age_ns: 1_000_000_000 }` on `map` to `odom`,
+answers (an `Extrapolate` edge with one sample has no motion yet, so it
+reaches only that sample): with `HoldLast { max_age_ns: 1_000_000_000 }` on `map` to `odom`,
 the chain to `base_link` resolves at the fast edge's newest stamp while the
 slow edge's newest sample is at most 1 s older, and at that sample plus 1 s
 when it is older than that. It never resolves later than the newest stamp
@@ -269,7 +280,7 @@ registered is carried as a `FrameLabel`, its first 48 bytes.
 | Variant | When | What to do |
 |---|---|---|
 | `UnknownFrame { frame }` | No inserted transform has named `frame`. | Check the frame id; wait for the publisher. |
-| `UnknownFrameId { frame }` | `lookup_ids` got a handle this buffer never issued. | Resolve the handle from the same buffer. |
+| `UnknownFrameId { frame }` | `lookup_ids` got a handle this buffer never issued, such as one from another buffer. | Resolve the handle from the same buffer. |
 | `NoPath { parent, child }` | Both frames are known but no chain of edges joins them. | A broadcaster is missing an edge. |
 | `EdgeEmpty { parent, child }` | A dynamic edge on the chain has no sample since it was declared or since the last epoch. | Ask again on the next fire. |
 | `NotYetAvailable { parent, child, requested_ns, newest_ns }` | `requested_ns` is past the newest sample on the edge `parent` to `child`, further than its policy reaches. | Ask again on the next fire, or set an edge policy. |
@@ -283,8 +294,9 @@ registered is carried as a `FrameLabel`, its first 48 bytes.
 | `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
 | `SecondWriter { parent, child, writer, existing_writer }` | Another writer already feeds the edge. | Two broadcasters publish the same edge; keep one. |
 | `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
+| `StampTooFarAhead { parent, child, stamp_ns, newest_ns }` | The stamp is more than the window past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. |
 | `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with a larger frame capacity. |
-| `NameBudgetFull { frame, len, budget }` | The new frame's id does not fit in the rest of the name budget. | Build the buffer with a larger `name_bytes`. |
+| `NameBudgetFull { frame, len, left, budget }` | The new frame's `len`-byte id does not fit in the `left` bytes of the name budget. | Build the buffer with a larger `name_bytes`. |
 
 Errors are plain `Copy` values: building one allocates nothing, so a lookup
 that fails on every fire costs no more than one that succeeds.

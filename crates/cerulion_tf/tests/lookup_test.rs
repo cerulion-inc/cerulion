@@ -918,6 +918,45 @@ fn a_handle_from_another_buffer_is_refused() {
 }
 
 #[test]
+fn a_handle_from_another_buffer_in_a_used_slot_is_refused() {
+    // Slot 1 is `base` here and `lidar` there: the foreign handle must not
+    // look up `base`.
+    let b = turning_edge();
+    let mut other = TfBuffer::new();
+    other.insert_static(W, "map", "lidar", shift(0.17)).unwrap();
+    let (map, lidar) = (id(&other, "map"), id(&other, "lidar"));
+    let odom = id(&b, "odom");
+    assert_eq!(
+        b.lookup_ids(odom, lidar, 500),
+        Err(TfError::UnknownFrameId { frame: lidar })
+    );
+    assert_eq!(
+        b.lookup_latest_ids(map, odom),
+        Err(TfError::UnknownFrameId { frame: map })
+    );
+    // The issuing buffer still resolves its own handles.
+    assert_eq!(other.lookup_ids(map, lidar, 0).unwrap(), shift(0.17));
+}
+
+#[test]
+fn latest_counts_a_one_sample_extrapolating_edge_only_to_its_sample() {
+    // map -> odom has one sample at 100 ns and may extrapolate 1000 ns,
+    // but one sample gives no motion; odom -> base covers 0 to 200 ns.
+    // Both answer at 100 ns: map -> odom 1 m, odom -> base halfway, 1 m.
+    let mut b = TfBuffer::new();
+    b.set_edge_policy("map", "odom", EdgePolicy::Extrapolate { max_ns: 1_000 })
+        .unwrap();
+    b.insert(W, "map", "odom", 100, shift(1.0)).unwrap();
+    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
+    b.insert(W, "odom", "base", 200, shift(2.0)).unwrap();
+    assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(2.0));
+    // With a second sample the edge has motion and reaches past it: the
+    // chain resolves at 200 ns, map -> odom one 50 ns step past 150 ns.
+    b.insert(W, "map", "odom", 150, shift(1.5)).unwrap();
+    assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(4.0));
+}
+
+#[test]
 fn extrapolate_steps_by_the_span_between_the_two_newest_samples() {
     // Samples at 1000 and 3000 ns: the span is 2000, not their sum.
     let mut b = TfBuffer::new();

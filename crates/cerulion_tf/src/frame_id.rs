@@ -15,29 +15,44 @@ use std::fmt;
 /// [`crate::TfBuffer::frame_name`] gives the name back. A node can resolve
 /// its frame ids once and look up by handle on every tick with
 /// [`crate::TfBuffer::lookup_ids`], which skips the string work. A handle
-/// belongs to the buffer that issued it; another buffer may hold a
-/// different frame, or none, under the same handle. Prints as `#n`; use
+/// belongs to the buffer that issued it: it carries that buffer's identity,
+/// so another buffer refuses it ([`crate::TfError::UnknownFrameId`]) even
+/// when it holds a frame in the same slot. The identity is a process-wide
+/// counter value taken at construction; it tells buffers apart and never
+/// changes what a lookup returns. Prints as `#n`, the slot; use
 /// [`crate::TfBuffer::describe`] for the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FrameId(u32);
+pub struct FrameId {
+    buffer: u32,
+    slot: u32,
+}
 
 impl FrameId {
-    /// The handle of the frame table slot `index`.
-    pub(crate) fn from_index(index: usize) -> Self {
+    /// The handle of the frame table slot `index` of the buffer whose
+    /// identity is `buffer`.
+    pub(crate) fn new(buffer: u32, index: usize) -> Self {
         // The frame table never holds more than `u32::MAX` slots: the
         // constructor refuses a larger capacity.
-        Self(index as u32)
+        Self {
+            buffer,
+            slot: index as u32,
+        }
+    }
+
+    /// The identity of the buffer that issued this handle.
+    pub(crate) fn buffer(self) -> u32 {
+        self.buffer
     }
 
     /// The frame table slot of this handle.
     pub(crate) fn index(self) -> usize {
-        self.0 as usize
+        self.slot as usize
     }
 }
 
 impl fmt::Display for FrameId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "#{}", self.0)
+        write!(f, "#{}", self.slot)
     }
 }
 

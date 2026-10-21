@@ -256,6 +256,10 @@ fn every_buffer_operation(b: &mut TfBuffer) {
         b.insert(W, "odom", "base", 0, shift(0.0)),
         Err(TfError::StampBeforeWindow { .. })
     ));
+    // 10 000 is more than the window past the newest stamp, 1300.
+    let ahead = b.insert(W, "odom", "base", 10_000, shift(0.0));
+    assert!(matches!(ahead, Err(TfError::StampTooFarAhead { .. })));
+    write!(sink, "{}", b.describe(ahead.as_ref().unwrap_err())).unwrap();
     // A first refusal, or a counted repeat when the operations run again.
     assert!(matches!(
         b.insert(W, "base", "lidar", 0, shift(0.0)),
@@ -353,6 +357,7 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     assert_eq!(buffer.epoch(), 2);
     let base = buffer.edge("base").unwrap();
     assert_eq!((base.overflows, base.second_writer_refusals), (2, 2));
+    assert_eq!((base.window_refusals, base.jump_refusals), (2, 2));
     assert_eq!(buffer.edge("lidar").unwrap().static_refusals, 2);
 
     // A dynamic edge turned static: the static insert clears the ring.

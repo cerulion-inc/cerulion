@@ -111,6 +111,8 @@ fn one_dynamic_insert_registers_both_frames_and_one_sample() {
             overflows: 0,
             static_refusals: 0,
             second_writer_refusals: 0,
+            window_refusals: 0,
+            jump_refusals: 0,
         }
     );
     // A root has no edge of its own.
@@ -134,6 +136,8 @@ fn a_static_insert_records_the_edge_without_a_ring_sample() {
             overflows: 0,
             static_refusals: 0,
             second_writer_refusals: 0,
+            window_refusals: 0,
+            jump_refusals: 0,
         }
     );
 }
@@ -229,10 +233,18 @@ fn an_insert_expires_every_sample_older_than_the_window() {
         (3, Some(500), Some(1_500), 0)
     );
     assert_eq!(b.expired(), 1);
-    // A jump of two windows expires everything but the new sample.
-    b.insert(W, "odom", "base", 5_000, tf(5_000.0)).unwrap();
+    // A jump of more than a window is refused alone; a second stamp that
+    // agrees with it confirms it and expires everything but itself.
+    assert!(matches!(
+        b.insert(W, "odom", "base", 5_000, tf(5_000.0)),
+        Err(TfError::StampTooFarAhead {
+            newest_ns: 1_500,
+            ..
+        })
+    ));
+    b.insert(W, "odom", "base", 5_010, tf(5_010.0)).unwrap();
     let e = edge(&b, "base");
-    assert_eq!((e.samples, e.oldest_ns), (1, Some(5_000)));
+    assert_eq!((e.samples, e.oldest_ns), (1, Some(5_010)));
     assert_eq!(b.expired(), 4);
 }
 
@@ -540,6 +552,24 @@ fn a_long_namespaced_frame_id_is_accepted_whole() {
 }
 
 #[test]
+fn a_handle_from_another_buffer_names_no_frame_even_in_a_used_slot() {
+    // Both buffers use slots 0 and 1, for different frames.
+    let mut b = TfBuffer::new();
+    b.insert(W, "odom", "base", 1, tf(1.0)).unwrap();
+    let mut other = TfBuffer::new();
+    other.insert(W, "map", "lidar", 1, tf(1.0)).unwrap();
+    let lidar = other.frame_id("lidar").unwrap();
+    assert_eq!(lidar.to_string(), id(&b, "base").to_string());
+    assert_ne!(lidar, id(&b, "base"));
+    assert_eq!(b.frame_name(lidar), None);
+    assert_eq!(
+        b.describe(&TfError::UnknownFrameId { frame: lidar })
+            .to_string(),
+        "frame handle #1 was not issued by this buffer"
+    );
+}
+
+#[test]
 fn frame_ids_are_handles_that_round_trip_through_their_names() {
     let mut b = TfBuffer::new();
     b.insert(W, "odom", "base", 1, tf(1.0)).unwrap();
@@ -617,7 +647,7 @@ fn the_buffer_fills_to_exactly_its_frame_capacity() {
 
 #[test]
 fn the_name_budget_fills_to_exactly_its_bytes() {
-    // Ten bytes: `odom` (4) and `base` (4) leave 2.
+    // Ten bytes: `odom` (4) and `base` (4) leave 2, and `ab` takes them.
     let mut b = TfBuffer::with_config(TfBufferConfig {
         name_bytes: 10,
         ..TfBufferConfig::default()
@@ -629,13 +659,15 @@ fn the_name_budget_fills_to_exactly_its_bytes() {
         Err(TfError::NameBudgetFull {
             frame: FrameLabel::new("c"),
             len: 1,
+            left: 0,
             budget: 10,
         })
     );
     assert_eq!(b.frame_count(), 3);
     // Both frames new: the parent is interned first. With 2 bytes left,
-    // `x` (1) fits and `yy` (2) does not fit after it, so `yy` is named;
-    // `xyz` (3) does not fit on its own, so it is named.
+    // `x` (1) fits and `yy` (2) does not fit in the 1 byte after it, so
+    // `yy` is named; `xyz` (3) does not fit in the 2 on its own, so it is
+    // named.
     let mut b = TfBuffer::with_config(TfBufferConfig {
         name_bytes: 10,
         ..TfBufferConfig::default()
@@ -646,6 +678,7 @@ fn the_name_budget_fills_to_exactly_its_bytes() {
         Err(TfError::NameBudgetFull {
             frame: FrameLabel::new("yy"),
             len: 2,
+            left: 1,
             budget: 10,
         })
     );
@@ -654,6 +687,7 @@ fn the_name_budget_fills_to_exactly_its_bytes() {
         Err(TfError::NameBudgetFull {
             frame: FrameLabel::new("xyz"),
             len: 3,
+            left: 2,
             budget: 10,
         })
     );
@@ -749,6 +783,7 @@ type OwnedEdge = (
     usize,
     Option<u64>,
     Option<u64>,
+    u64,
 );
 
 fn snapshot(b: &TfBuffer) -> Snapshot {
@@ -760,6 +795,7 @@ fn snapshot(b: &TfBuffer) -> Snapshot {
             e.samples,
             e.oldest_ns,
             e.newest_ns,
+            e.overflows,
         )
     };
     (
@@ -896,8 +932,120 @@ fn a_write_conflicting_with_the_edge_is_refused_without_changing_it() {
         })
     ));
     assert_eq!(span(&b), before);
+    assert_eq!(edge(&b, "base").window_refusals, 1);
     b.insert(W, "odom", "base", 10_000_000_000, tf(1.0))
         .unwrap();
+}
+
+// The retention of `windowed(1_000)` is 1000 ns: a stamp more than 1000 ns
+// past the newest sample is too far ahead.
+
+#[test]
+fn a_far_future_stamp_is_refused_and_evicts_nothing() {
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "odom", "base", 200, tf(2.0)).unwrap();
+    assert_eq!(
+        b.insert(W, "odom", "base", u64::MAX, tf(9.0)),
+        Err(TfError::StampTooFarAhead {
+            parent: id(&b, "odom"),
+            child: id(&b, "base"),
+            stamp_ns: u64::MAX,
+            newest_ns: 200,
+        })
+    );
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.oldest_ns, e.newest_ns),
+        (2, Some(100), Some(200))
+    );
+    assert_eq!((e.jump_refusals, e.window_refusals), (1, 0));
+    assert_eq!(b.expired(), 0);
+    // Normal samples keep being accepted after it.
+    b.insert(W, "odom", "base", 300, tf(3.0)).unwrap();
+    b.insert(W, "odom", "base", 400, tf(4.0)).unwrap();
+    assert_eq!(edge(&b, "base").samples, 4);
+    assert_eq!(b.lookup("odom", "base", 400).unwrap(), tf(4.0));
+}
+
+#[test]
+fn a_stamp_exactly_the_retention_ahead_is_accepted_and_one_past_is_not() {
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "odom", "base", 1_100, tf(2.0)).unwrap();
+    assert!(matches!(
+        b.insert(W, "odom", "base", 2_101, tf(3.0)),
+        Err(TfError::StampTooFarAhead {
+            stamp_ns: 2_101,
+            newest_ns: 1_100,
+            ..
+        })
+    ));
+    assert_eq!(edge(&b, "base").newest_ns, Some(1_100));
+}
+
+#[test]
+fn far_future_stamps_that_never_agree_keep_being_refused() {
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    // Each is more than the retention past the one before: no two agree.
+    for stamp in [10_000, 20_000, 30_000] {
+        assert!(matches!(
+            b.insert(W, "odom", "base", stamp, tf(9.0)),
+            Err(TfError::StampTooFarAhead { newest_ns: 100, .. })
+        ));
+    }
+    // The same far stamp twice is not a clock moving forward either.
+    assert!(b.insert(W, "odom", "base", 30_000, tf(9.0)).is_err());
+    // A refused stamp earlier than the pending one does not confirm it.
+    assert!(b.insert(W, "odom", "base", 29_999, tf(9.0)).is_err());
+    let e = edge(&b, "base");
+    assert_eq!((e.samples, e.newest_ns, e.jump_refusals), (1, Some(100), 5));
+}
+
+#[test]
+fn a_good_sample_between_two_far_stamps_cancels_the_pending_jump() {
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    assert!(b.insert(W, "odom", "base", 50_000, tf(9.0)).is_err());
+    b.insert(W, "odom", "base", 200, tf(2.0)).unwrap();
+    // 50 010 would have confirmed 50 000; the good sample cleared it.
+    assert!(b.insert(W, "odom", "base", 50_010, tf(9.0)).is_err());
+    assert_eq!(edge(&b, "base").newest_ns, Some(200));
+}
+
+#[test]
+fn a_second_agreeing_stamp_confirms_a_forward_jump() {
+    // A publisher that paused: its next two stamps are 1 s on and agree.
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "odom", "base", 200, tf(2.0)).unwrap();
+    assert!(b.insert(W, "odom", "base", 1_000_000, tf(5.0)).is_err());
+    b.insert(W, "odom", "base", 1_000_010, tf(6.0)).unwrap();
+    // The old timeline expired; the confirming sample is the ring.
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.oldest_ns, e.newest_ns, e.jump_refusals),
+        (1, Some(1_000_010), Some(1_000_010), 1)
+    );
+    assert_eq!(b.expired(), 2);
+    // The new timeline goes on as normal.
+    b.insert(W, "odom", "base", 1_000_020, tf(7.0)).unwrap();
+    assert_eq!(b.lookup("odom", "base", 1_000_020).unwrap(), tf(7.0));
+}
+
+#[test]
+fn a_new_epoch_clears_a_pending_jump() {
+    let mut b = windowed(1_000);
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    assert!(b.insert(W, "odom", "base", 50_000, tf(9.0)).is_err());
+    b.begin_epoch();
+    b.insert(W, "odom", "base", 10, tf(1.0)).unwrap();
+    // Without the pending stamp, 50 010 is a lone far stamp again.
+    assert!(matches!(
+        b.insert(W, "odom", "base", 50_010, tf(9.0)),
+        Err(TfError::StampTooFarAhead { newest_ns: 10, .. })
+    ));
 }
 
 #[test]
@@ -935,6 +1083,7 @@ fn a_frame_beyond_the_name_budget_is_refused_naming_it() {
         |_| TfError::NameBudgetFull {
             frame: FrameLabel::new(&"q".repeat(244)),
             len: 244,
+            left: 243,
             budget: 256,
         },
     );
@@ -956,7 +1105,7 @@ fn every_refusal_names_the_frames_involved() {
     let [odom, base, lidar, map] = ["odom", "base", "lidar", "map"].map(|f| id(&b, f));
     let label = FrameLabel::new;
     // (error, its plain text, its text described by the buffer)
-    let cases: [(TfError, &str, &str); 14] = [
+    let cases: [(TfError, &str, &str); 15] = [
         (
             TfError::SelfEdge {
                 frame: label("base"),
@@ -1015,6 +1164,18 @@ fn every_refusal_names_the_frames_involved() {
              newest stamp 20000000000 ns; after a clock reset or a bag loop, begin a new epoch",
         ),
         (
+            TfError::StampTooFarAhead {
+                parent: odom,
+                child: base,
+                stamp_ns: 20_000_000_301,
+                newest_ns: 300,
+            },
+            "",
+            "transform `odom` to `base` at 20000000301 ns is more than the retention window past \
+             the newest stamp 300 ns and is refused; a later transform within the retention of \
+             it confirms the jump",
+        ),
+        (
             TfError::FrameTableFull {
                 frame: label("imu"),
                 capacity: 64,
@@ -1026,10 +1187,11 @@ fn every_refusal_names_the_frames_involved() {
             TfError::NameBudgetFull {
                 frame: label(&"r".repeat(50)),
                 len: 50,
+                left: 12,
                 budget: 4_096,
             },
             "frame `rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr...` does not fit: its 50-byte \
-             id exceeds what is left of the name budget of 4096 bytes",
+             id is longer than the 12 bytes left of the name budget of 4096 bytes",
             "",
         ),
         (

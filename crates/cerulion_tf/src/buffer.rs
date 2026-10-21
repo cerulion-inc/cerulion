@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::edge_policy::extrapolate;
@@ -120,6 +121,24 @@ struct Frame {
     overflows: u64,
     static_refusals: u64,
     second_writer_refusals: u64,
+    window_refusals: u64,
+    jump_refusals: u64,
+    /// The stamp of the last insert refused as [`TfError::StampTooFarAhead`]
+    /// when no insert was accepted after it: the next insert at a later
+    /// stamp within the retention of it confirms the jump.
+    pending_jump: Option<u64>,
+}
+
+impl Frame {
+    /// How far past its newest sample this edge answers, in nanoseconds.
+    /// One sample alone gives no motion, so an extrapolating edge with one
+    /// sample reaches only that sample.
+    fn reach_ns(&self) -> u64 {
+        match self.policy {
+            EdgePolicy::Extrapolate { .. } if self.samples.len() < 2 => 0,
+            policy => policy.reach_ns(),
+        }
+    }
 }
 
 /// What the buffer holds for one edge, read through [`TfBuffer::edge`].
@@ -152,6 +171,13 @@ pub struct EdgeInfo<'a> {
     /// Every insert from a second writer refused on this edge. The first
     /// one returned [`TfError::SecondWriter`]; the rest returned `Ok(())`.
     pub second_writer_refusals: u64,
+    /// Every insert refused on this edge with
+    /// [`TfError::StampBeforeWindow`]. A count that keeps rising is an edge
+    /// whose publisher's clock went back without a new epoch.
+    pub window_refusals: u64,
+    /// Every insert refused on this edge with
+    /// [`TfError::StampTooFarAhead`].
+    pub jump_refusals: u64,
 }
 
 /// A buffer of stamped transforms, queried by `lookup(parent, child, time)`.
@@ -183,9 +209,19 @@ pub struct EdgeInfo<'a> {
 /// [`TfBufferConfig::retention`] before its newest stamp, sorted by stamp.
 /// An insert expires every sample older than `newest - retention` (counted
 /// in [`Self::expired`]), and refuses a stamp older than that with
-/// [`TfError::StampBeforeWindow`]. A sample at a stamp the ring already
-/// holds is a no-op when the transform is the same and replaces it when it
-/// differs (counted in [`Self::replacements`]). The ring itself has a fixed
+/// [`TfError::StampBeforeWindow`]. A stamp more than the retention past the
+/// newest sample would expire the whole ring at once, so one bad stamp could
+/// empty an edge and leave every later good sample before its window; it is
+/// refused with [`TfError::StampTooFarAhead`]. The next insert confirms the
+/// jump when its stamp is later than the refused one and within the
+/// retention of it: two inserts that agree on the new time are a clock that
+/// moved forward (a publisher that paused), and the edge moves to it. Both
+/// refusals return their error every time and count on the edge
+/// ([`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]).
+///
+/// A sample at a stamp the ring already holds is a no-op when the
+/// transform is the same and replaces it when it differs (counted in
+/// [`Self::replacements`]). The ring itself has a fixed
 /// capacity ([`TfBufferConfig::ring_capacity`]); when an edge publishes
 /// faster than the ring was sized for, the ring fills before its window,
 /// the oldest sample makes room, and every such loss counts in
@@ -222,6 +258,8 @@ pub struct EdgeInfo<'a> {
 /// deterministic math of this crate, so lookups replay byte-exact.
 #[derive(Debug)]
 pub struct TfBuffer {
+    /// The identity every [`FrameId`] this buffer issues carries.
+    tag: u32,
     /// `frames.len()` is the capacity; the first `names` slots are in use.
     frames: Vec<Frame>,
     names: NameTable,
@@ -275,9 +313,13 @@ impl TfBuffer {
                 overflows: 0,
                 static_refusals: 0,
                 second_writer_refusals: 0,
+                window_refusals: 0,
+                jump_refusals: 0,
+                pending_jump: None,
             })
             .collect();
         Self {
+            tag: NEXT_TAG.fetch_add(1, Ordering::Relaxed),
             frames: table,
             names: NameTable::with_capacity(frames, config.name_bytes),
             ring_capacity,
@@ -335,13 +377,13 @@ impl TfBuffer {
     /// The handle of the registered frame `frame`; `None` when no inserted
     /// transform has named it.
     pub fn frame_id(&self, frame: &str) -> Option<FrameId> {
-        self.names.find(normalize(frame)).map(FrameId::from_index)
+        self.names.find(normalize(frame)).map(|slot| self.id(slot))
     }
 
     /// The id of the frame behind `frame`; `None` for a handle this buffer
     /// never issued.
     pub fn frame_name(&self, frame: FrameId) -> Option<&str> {
-        (frame.index() < self.active()).then(|| self.names.name(frame.index()))
+        self.owns(frame).then(|| self.names.name(frame.index()))
     }
 
     /// Whether an inserted transform has named this frame.
@@ -375,6 +417,8 @@ impl TfBuffer {
             overflows: frame.overflows,
             static_refusals: frame.static_refusals,
             second_writer_refusals: frame.second_writer_refusals,
+            window_refusals: frame.window_refusals,
+            jump_refusals: frame.jump_refusals,
         })
     }
 
@@ -389,10 +433,12 @@ impl TfBuffer {
     ///
     /// [`TfError::EmptyFrameId`], [`TfError::SelfEdge`],
     /// [`TfError::SecondParent`], [`TfError::Cycle`],
-    /// [`TfError::FrameTableFull`], [`TfError::NameBudgetFull`] and
-    /// [`TfError::StampBeforeWindow`]; [`TfError::EdgeIsStatic`] and
-    /// [`TfError::SecondWriter`] the first time on an edge. A refusal
-    /// changes nothing but the edge's refusal counters.
+    /// [`TfError::FrameTableFull`], [`TfError::NameBudgetFull`],
+    /// [`TfError::StampBeforeWindow`] and [`TfError::StampTooFarAhead`];
+    /// [`TfError::EdgeIsStatic`] and [`TfError::SecondWriter`] the first
+    /// time on an edge. A refusal changes nothing but the edge's refusal
+    /// counters, and a [`TfError::StampTooFarAhead`] refusal also records
+    /// its stamp for the next insert to confirm.
     pub fn insert(
         &mut self,
         writer: WriterId,
@@ -404,22 +450,40 @@ impl TfBuffer {
         let Some((p, c)) = self.admit(parent, child, Admit::Dynamic(writer))? else {
             return Ok(());
         };
+        let (parent, child) = (self.id(p), self.id(c));
         let retention_ns = self.retention_ns;
         let cap = self.ring_capacity;
         let frame = &mut self.frames[c];
-        let ring = &mut frame.samples;
-        if let Some(newest) = ring.back().map(|s| s.stamp_ns) {
-            if stamp_ns < newest.saturating_sub(retention_ns) {
+        if let Some(newest_ns) = frame.samples.back().map(|s| s.stamp_ns) {
+            if stamp_ns < newest_ns.saturating_sub(retention_ns) {
+                frame.window_refusals += 1;
                 return Err(TfError::StampBeforeWindow {
-                    parent: FrameId::from_index(p),
-                    child: FrameId::from_index(c),
+                    parent,
+                    child,
                     stamp_ns,
-                    newest_ns: newest,
+                    newest_ns,
                 });
+            }
+            if stamp_ns.saturating_sub(newest_ns) > retention_ns {
+                let confirmed = frame
+                    .pending_jump
+                    .is_some_and(|prev| prev < stamp_ns && stamp_ns - prev <= retention_ns);
+                if !confirmed {
+                    frame.pending_jump = Some(stamp_ns);
+                    frame.jump_refusals += 1;
+                    return Err(TfError::StampTooFarAhead {
+                        parent,
+                        child,
+                        stamp_ns,
+                        newest_ns,
+                    });
+                }
             }
         }
         // Every check passed: the writes start here.
+        frame.pending_jump = None;
         frame.writer = Some(writer);
+        let ring = &mut frame.samples;
         let mut i = match ring.binary_search_by_key(&stamp_ns, |s| s.stamp_ns) {
             Ok(i) => {
                 if ring[i].transform != transform {
@@ -488,6 +552,7 @@ impl TfBuffer {
         }
         self.expired += frame.samples.len() as u64;
         frame.samples.clear();
+        frame.pending_jump = None;
         frame.writer = Some(writer);
         frame.is_static = true;
         frame.static_transform = transform;
@@ -520,8 +585,9 @@ impl TfBuffer {
     }
 
     /// Starts a new timeline after a clock reset or a bag loop: clears
-    /// every dynamic ring (counting the cleared samples in
-    /// [`Self::expired`]) and increments [`Self::epoch`]. Frames, edges,
+    /// every dynamic ring and every unconfirmed forward jump (counting the
+    /// cleared samples in [`Self::expired`]) and increments
+    /// [`Self::epoch`]. Frames, edges,
     /// writers, policies and static transforms are kept. The runtime that
     /// resets the clock calls it at the reset, so a replay calls it at the
     /// same point.
@@ -530,6 +596,7 @@ impl TfBuffer {
         for frame in &mut self.frames[..active] {
             self.expired += frame.samples.len() as u64;
             frame.samples.clear();
+            frame.pending_jump = None;
         }
         self.epoch += 1;
     }
@@ -568,7 +635,8 @@ impl TfBuffer {
 
     /// `T_parent_child` at the latest time the chain answers, through the
     /// same code path as [`Self::lookup`]. Each dynamic edge reaches its
-    /// newest stamp, plus the bound of its [`EdgePolicy`] past it; the
+    /// newest stamp, plus the bound of its [`EdgePolicy`] past it (an
+    /// extrapolating edge with one sample reaches only that sample); the
     /// chain resolves at the earliest of those reaches, and never later
     /// than the newest stamp on the chain. With the default policy on every
     /// edge that is the oldest of the newest stamps, so every edge has a
@@ -613,15 +681,21 @@ impl TfBuffer {
     }
 
     fn slot_of_id(&self, frame: FrameId) -> Result<usize, TfError> {
-        if frame.index() < self.active() {
+        if self.owns(frame) {
             Ok(frame.index())
         } else {
             Err(TfError::UnknownFrameId { frame })
         }
     }
 
-    fn id(slot: usize) -> FrameId {
-        FrameId::from_index(slot)
+    /// Whether this buffer issued `frame`: it carries this buffer's
+    /// identity and names a registered slot.
+    fn owns(&self, frame: FrameId) -> bool {
+        frame.buffer() == self.tag && frame.index() < self.active()
+    }
+
+    fn id(&self, slot: usize) -> FrameId {
+        FrameId::new(self.tag, slot)
     }
 
     /// Whether walking up from `from` reaches `target`.
@@ -668,9 +742,9 @@ impl TfBuffer {
             match frame.parent {
                 Some(existing) if Some(existing) != p => {
                     return Err(TfError::SecondParent {
-                        child: Self::id(c),
+                        child: self.id(c),
                         parent: FrameLabel::of(parent_name),
-                        existing_parent: Self::id(existing),
+                        existing_parent: self.id(existing),
                     });
                 }
                 Some(_) => {}
@@ -678,8 +752,8 @@ impl TfBuffer {
                     if let Some(p) = p {
                         if self.descends_from(p, c) {
                             return Err(TfError::Cycle {
-                                parent: Self::id(p),
-                                child: Self::id(c),
+                                parent: self.id(p),
+                                child: self.id(c),
                             });
                         }
                     }
@@ -711,9 +785,17 @@ impl TfBuffer {
             None
         };
         if let Some(frame) = unfit {
+            // The bytes left for this frame: for a new child, what the
+            // new parent leaves.
+            let left = if frame == parent_name {
+                spare
+            } else {
+                spare.saturating_sub(parent_bytes)
+            };
             return Err(TfError::NameBudgetFull {
                 frame: FrameLabel::of(frame),
                 len: frame.len(),
+                left,
                 budget: self.names.budget(),
             });
         }
@@ -728,7 +810,7 @@ impl TfBuffer {
     /// `Some(Err)` for a first refusal, `Some(Ok)` for a counted repeat,
     /// `None` when the write may go ahead.
     fn refusal(&mut self, p: usize, c: usize, kind: Admit) -> Option<Result<(), TfError>> {
-        let (parent, child) = (Self::id(p), Self::id(c));
+        let (parent, child) = (self.id(p), self.id(c));
         let frame = &mut self.frames[c];
         let writer = match kind {
             // A policy has no place on a static edge; setting one is a
@@ -767,6 +849,7 @@ impl TfBuffer {
         frame.static_transform = Transform::IDENTITY;
         frame.policy = EdgePolicy::Interpolate;
         frame.samples.clear();
+        frame.pending_jump = None;
         i
     }
 
@@ -779,8 +862,8 @@ impl TfBuffer {
         stamp_ns: Option<u64>,
     ) -> Result<Transform, TfError> {
         let anc = self.common_ancestor(p, c).ok_or(TfError::NoPath {
-            parent: Self::id(p),
-            child: Self::id(c),
+            parent: self.id(p),
+            child: self.id(c),
         })?;
         let stamp_ns = match stamp_ns {
             Some(stamp_ns) => stamp_ns,
@@ -839,8 +922,8 @@ impl TfBuffer {
         self.compose_chain(p, c, anc, stamp_ns)
             .map_err(|err| match err {
                 TfError::NonFiniteTranslation => TfError::ChainMath {
-                    parent: Self::id(p),
-                    child: Self::id(c),
+                    parent: self.id(p),
+                    child: self.id(c),
                 },
                 other => other,
             })
@@ -892,7 +975,7 @@ impl TfBuffer {
         while cur != anc {
             let frame = &self.frames[cur];
             if let (false, Some(last)) = (frame.is_static, frame.samples.back()) {
-                latest.fold(frame.policy, last.stamp_ns);
+                latest.fold(last.stamp_ns, frame.reach_ns());
             }
             match frame.parent {
                 Some(next) => cur = next,
@@ -910,8 +993,8 @@ impl TfBuffer {
             return Ok(frame.static_transform);
         }
         // Every frame on a chain below the common ancestor has a parent.
-        let parent = Self::id(frame.parent.unwrap_or(child));
-        let child_id = Self::id(child);
+        let parent = self.id(frame.parent.unwrap_or(child));
+        let child_id = self.id(child);
         let ring = &frame.samples;
         let (Some(first), Some(last)) = (ring.front(), ring.back()) else {
             return Err(TfError::EdgeEmpty {
@@ -936,24 +1019,22 @@ impl TfBuffer {
                 requested_ns: stamp_ns,
                 newest_ns: last.stamp_ns,
             };
-            if ahead_ns > frame.policy.reach_ns() {
+            if ahead_ns > frame.reach_ns() {
                 return Err(not_yet);
             }
             return match frame.policy {
                 EdgePolicy::Interpolate => Err(not_yet),
                 EdgePolicy::HoldLast { .. } => Ok(last.transform),
-                EdgePolicy::Extrapolate { .. } => match ring.len().checked_sub(2) {
-                    Some(i) => {
-                        let before = &ring[i];
-                        extrapolate(
-                            &before.transform,
-                            &last.transform,
-                            last.stamp_ns - before.stamp_ns,
-                            ahead_ns,
-                        )
-                    }
-                    None => Err(not_yet),
-                },
+                EdgePolicy::Extrapolate { .. } => {
+                    // A nonzero reach means the ring holds two samples.
+                    let before = &ring[ring.len() - 2];
+                    extrapolate(
+                        &before.transform,
+                        &last.transform,
+                        last.stamp_ns - before.stamp_ns,
+                        ahead_ns,
+                    )
+                }
             };
         }
         let i = ring.partition_point(|s| s.stamp_ns < stamp_ns);
@@ -972,6 +1053,10 @@ impl TfBuffer {
         before.transform.interpolate(&after.transform, into / span)
     }
 }
+
+/// The identity the next buffer takes. It wraps after `u32::MAX` buffers,
+/// so two buffers built that far apart in one process share one.
+static NEXT_TAG: AtomicU32 = AtomicU32::new(0);
 
 /// Counts a refusal on `count` and returns `err` for the first one only;
 /// every later one is `Ok(())`, read back through the counter.
@@ -993,8 +1078,8 @@ enum Admit {
 }
 
 /// The latest time a chain answers, folded edge by edge: the earliest of
-/// what each dynamic edge reaches (its newest stamp, plus its policy's
-/// bound past it), never later than the newest stamp on the chain.
+/// what each dynamic edge reaches (its newest stamp, plus how far past it
+/// the edge answers), never later than the newest stamp on the chain.
 #[derive(Debug, Default)]
 struct Latest {
     /// The earliest reach of the dynamic edges.
@@ -1004,8 +1089,8 @@ struct Latest {
 }
 
 impl Latest {
-    fn fold(&mut self, policy: EdgePolicy, newest_ns: u64) {
-        let reach = newest_ns.saturating_add(policy.reach_ns());
+    fn fold(&mut self, newest_ns: u64, reach_ns: u64) {
+        let reach = newest_ns.saturating_add(reach_ns);
         self.reach = Some(self.reach.map_or(reach, |r| r.min(reach)));
         self.newest = Some(self.newest.map_or(newest_ns, |n| n.max(newest_ns)));
     }
