@@ -18,8 +18,9 @@
 //! operator opted in to the current values.
 //!
 //! A change to a param's TYPE does not invalidate an anchor: no param is in
-//! `STATE_SHAPE`. It shows up here instead, as a recorded value that differs
-//! from the value in force.
+//! `STATE_SHAPE`. A recorded value the new type still accepts is compared in
+//! that type's canonical form here; one it does not accept is refused when
+//! the graph is built, before any resume.
 //!
 //! Cold: one call per resumed node, before the first step.
 
