@@ -74,7 +74,7 @@ pub const RERUN_URL_ENV: &str = "CERULION_RERUN_URL";
 // fetches any custom type's schema over the network. A pin is still accepted (it
 // skips the catalog lookup for a type the desk already knows). A topic the robot
 // genuinely does not serve is a hard error, never a silent skip. The daemon is
-// network-configured by default (scouting ON); only a kill-switched
+// network-configured by default; only a kill-switched
 // (CERULION_VIZD_NETWORK=off) daemon surfaces the not-network-configured residual.
 // The old graph-generation remote path (`generate_remote_viz_graph` /
 // `plan_viz_inputs` / the `viz_anchor` node) was DELETED with the rest of the

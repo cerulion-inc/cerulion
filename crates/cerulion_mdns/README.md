@@ -1,7 +1,8 @@
 # cerulion_mdns
 
-The advertise half of the `_cerulion._tcp` mDNS gateway beacon for
-[Cerulion](https://github.com/cerulion-inc/cerulion).
+The `_cerulion._tcp` mDNS gateway beacon for
+[Cerulion](https://github.com/cerulion-inc/cerulion): the advertise half and a
+bounded browse.
 
 A Cerulion robot announces itself on the local network with one mDNS service:
 the SRV record carries the zenoh port the gateway really bound, and the TXT
@@ -11,15 +12,18 @@ service and returns a guard that withdraws it on drop. A failed advertisement is
 returned as a typed `MdnsError`; callers warn and keep serving, because a
 discovery beacon must never stop a run.
 
-`CERULION_SERVICE_TYPE` is defined here once and imported by the browsing side,
-so the one string both sides must agree on cannot drift.
+`browse_rung` browses the same service type for a fixed budget, maps each
+answering gateway to one locator per IPv4 address (IPv6 only when it has
+none), and shuts its mDNS daemon down
+before it returns. `CERULION_SERVICE_TYPE` is defined here once and used by both
+halves.
 
 ## Who uses it
 
 This is an internal building block: `cerulion-netd` and the fallback gateway
-process of `cerulion graph run` both advertise through it, and it is published
-because they depend on it. The browse half lives in the `cerulion` CLI
-(`cerulion topic list`).
+process of `cerulion graph run` both advertise through it, `cerulion-netd`'s
+boot-time peer fold and the `cerulion topic list` discovery ladder both browse
+through it, and it is published because they depend on it.
 
 See the [networking guide](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots).
 Design notes for contributors live in

@@ -3711,7 +3711,8 @@ pub enum RunNetwork {
     /// No (or disabled) `network:` block under the real clock ⇒ run the
     /// gateway PERMISSIVE: every produced topic is announced + egressable
     /// (to any LAN peer, no pairing required). Carries the SYNTHESIZED permissive
-    /// `NetworkConfig` (peer mode, scouting ON, no connect endpoints, listen
+    /// `NetworkConfig` (peer mode, gossip on, multicast scouting per
+    /// `CERULION_MULTICAST_SCOUTING`, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
     /// construction.
     Permissive(cerulion_core::NetworkConfig),
@@ -3867,8 +3868,10 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// The SYNTHESIZED permissive-default `NetworkConfig` — peer mode,
-/// multicast + gossip scouting ON (unpaired robots are LAN-discoverable), NO
+/// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
+/// scouting on, multicast scouting from
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
+/// the gateway's `_cerulion._tcp` mDNS beacon is how peers find it), NO
 /// connect endpoints, listening on the well-known gateway port
 /// ([`GATEWAY_WELL_KNOWN_PORT`], overridable via [`GATEWAY_PORT_ENV`]). The
 /// gateway process bind-probes upward from this base on AddrInUse.
@@ -3878,7 +3881,7 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         mode: cerulion_core::ZenohMode::Peer,
         connect_endpoints: Vec::new(),
         listen_endpoints: vec![format!("tcp/[::]:{port}")],
-        multicast_scouting: true,
+        multicast_scouting: cerulion_core::transport::network::multicast_scouting_from_env(),
         gossip_scouting: true,
         // A gateway keeps zenoh's robust default connect retry (bounded
         // connect is only for the ephemeral `topic list` discovery session).
