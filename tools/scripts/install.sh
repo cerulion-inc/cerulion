@@ -777,14 +777,83 @@ dir_reachable_by_all() {
     return 0
 }
 
+# 0 when no account other than root and this one can change $1 or any
+# directory above it. Two chains are walked up to /: the path as written
+# (made absolute), where each component is followed through a symlink and the
+# symlink's own directory is the next component up, and the physical path.
+# The directories above a symlink's target are on the physical chain only
+# when that target is part of the resolved path.
+# Each directory has to pass path_safe_from_others. On a nonzero return,
+# unsafe_dir names the first directory that failed; safe_physical holds the
+# physical path that was checked.
+dir_safe_from_others() {
+    unsafe_dir=$1
+    safe_physical=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd) || return 1
+    case "$1" in
+        /*) safe_written=$1 ;;
+        *) safe_written="$(pwd)/$1" ;;
+    esac
+    safe_uid=$(id -u)
+    # The same test seam as dir_reachable_by_all: the walk ends below the
+    # self-test's scratch root, whose parents are the machine's temporary
+    # directories. Both spellings of the root end it.
+    safe_stop_written=
+    safe_stop_physical=
+    if [ -n "${CERULION_SELF_TEST_REACH_ROOT:-}" ]; then
+        safe_stop_written=${CERULION_SELF_TEST_REACH_ROOT%/}
+        safe_stop_physical=$(CDPATH='' cd -P -- "$CERULION_SELF_TEST_REACH_ROOT" 2>/dev/null && pwd) ||
+            safe_stop_physical=
+    fi
+    for safe_dir in "$safe_written" "$safe_physical"; do
+        while [ "$safe_dir" != / ] && [ "${safe_dir%/}" != "$safe_dir" ]; do
+            safe_dir=${safe_dir%/}
+        done
+        while [ -n "$safe_dir" ] && [ "$safe_dir" != "$safe_stop_written" ] &&
+            [ "$safe_dir" != "$safe_stop_physical" ]; do
+            path_safe_from_others "$safe_dir" "$safe_uid" || return 1
+            [ "$safe_dir" != / ] || break
+            safe_dir=${safe_dir%/*}
+            [ -n "$safe_dir" ] || safe_dir=/
+        done
+    done
+    return 0
+}
+
+# 0 when $1 (followed through a symlink) is owned by uid 0 or uid $2 and has
+# neither the group nor the other write bit; sets unsafe_dir to $1 otherwise.
+# A sticky world-writable directory fails. On Linux a POSIX ACL entry that
+# grants write also sets the group write bit ls prints (the ACL mask). A macOS
+# ACL is separate from the mode, so the entries `ls -le` lists are read too,
+# and one that allows any kind of write fails; where ls has no ACL listing
+# (GNU, busybox) no entry line is printed and the mode decides.
+path_safe_from_others() {
+    unsafe_dir=$1
+    # shellcheck disable=SC2012
+    safe_mode=$(ls -dLn -- "$1" 2>/dev/null | awk -v uid="$2" '
+        NR == 1 {
+            if (($3 == 0 || $3 == uid) && substr($1, 6, 1) != "w" && substr($1, 9, 1) != "w")
+                print $1
+        }
+    ')
+    [ -n "$safe_mode" ] || return 1
+    # shellcheck disable=SC2010  # the ACL entry lines are read, not file names
+    if ls -dLle -- "$1" 2>/dev/null |
+        grep -E '^ *[0-9]+: .* allow .*(write|add_file|add_subdirectory|delete_child|append|delete|chown)' >/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # A piped installer cannot change the PATH of the shell that ran it, so the
 # programs are linked into a directory that shell may already search: always
 # ~/.local/bin, and /usr/local/bin as well when ~/.local/bin is not on this
 # PATH but /usr/local/bin is, already exists and is writable without sudo
 # (in practice root). The shared directory is skipped when another account
 # could not follow the link into the install directory (root's 0700 home, a
-# macOS home), and when a different cerulion is already on this PATH, which a
-# link earlier on the PATH would hide. The links are made only after every
+# macOS home), when a different cerulion is already on this PATH, which a
+# link earlier on the PATH would hide, and with a warning when another
+# account could change the shared directory, the install directory or a
+# linked program (system_link_safe). The links are made only after every
 # binary is activated, and a failure is a warning.
 link_into_path_dirs() {
     path_link_source=$1
@@ -803,10 +872,34 @@ link_into_path_dirs() {
         if [ -n "$path_link_existing" ] &&
             ! [ "$path_link_existing" -ef "$path_link_source/cerulion" ]; then
             :
+        elif ! system_link_safe "$path_link_system" "$path_link_source"; then
+            printf 'warning: not linking the Cerulion programs into %s: another account can change %s; add %s to PATH to run cerulion by name\n' \
+                "$path_link_system" "$unsafe_dir" "$path_link_home" >&2
         else
-            link_programs "$path_link_system" "$path_link_source" || :
+            # The links name the physical install directory, so running one
+            # follows no symlink outside the chain system_link_safe checked.
+            link_programs "$path_link_system" "$system_safe_root" || :
         fi
     fi
+}
+
+# 0 when a link in the shared directory $1 to the programs in $2 runs only
+# what root or this account put there: both directories pass
+# dir_safe_from_others and so does each linked program that exists. Sets
+# system_safe_root to the physical path of $2.
+system_link_safe() {
+    dir_safe_from_others "$1" || return 1
+    dir_safe_from_others "$2" || return 1
+    # The string that was checked is the one linked to: a second resolution
+    # could follow a symlink changed after the check.
+    system_safe_root=$safe_physical
+    system_safe_uid=$(id -u)
+    for system_safe_program in $LINKED_PROGRAMS; do
+        [ -e "$system_safe_root/$system_safe_program" ] || continue
+        path_safe_from_others "$system_safe_root/$system_safe_program" "$system_safe_uid" ||
+            return 1
+    done
+    return 0
 }
 
 # The last line of an install: whether `cerulion` already runs in the shell
@@ -931,6 +1024,8 @@ $(system_bin_dir)"
     else
         un_link_dirs=$(system_bin_dir)
     fi
+    # The system links name the physical install directory.
+    un_physical=$(CDPATH='' cd -P -- "$un_dir" 2>/dev/null && pwd) || un_physical=
     un_old_ifs=$IFS
     set -f
     IFS='
@@ -940,7 +1035,8 @@ $(system_bin_dir)"
         for un_program in $LINKED_PROGRAMS; do
             un_link="$un_link_dir/$un_program"
             if link_is_ours "$un_link" "$un_abs/$un_program" ||
-                link_is_ours "$un_link" "$un_dir/$un_program"; then
+                link_is_ours "$un_link" "$un_dir/$un_program" ||
+                { [ -n "$un_physical" ] && link_is_ours "$un_link" "$un_physical/$un_program"; }; then
                 if rm -f "$un_link"; then
                     printf 'Removed %s\n' "$un_link"
                     un_removed=1
@@ -2554,6 +2650,12 @@ EOF
             "install.sh self-test: skipping FIFO destination arm because mkfifo is unavailable" >&2
     fi
 
+    # tar applies the umask to the programs it extracts, and a group-writable
+    # program is never linked into the system bin directory, so the arms up to
+    # the system link uninstall run under 022 whatever umask started the
+    # self-test.
+    self_test_umask=$(umask)
+    umask 022
     path_setup_root="$owner_test_dir/path-setup"
     mkdir -p "$path_setup_root"
     # The PATH of the shell the arms pretend to run in: this one's, minus any
@@ -2795,14 +2897,187 @@ EOF
         [ ! -L "$guard_system/cerulion" ] ||
             die "self-test: the $guard_case case still linked into the system bin directory"
     done
+    # Nor when another account could change what the shared links run: a
+    # group- or world-writable directory on the way to the install directory,
+    # a world-writable sticky one included, or a group-writable system bin
+    # directory. The skip is a warning that names the directory.
+    unsafe_system="$path_setup_root/unsafe-system-bin"
+    mkdir -p "$unsafe_system"
+    chmod 0755 "$unsafe_system"
+    path_run_system=$unsafe_system
+    path_run_path="$unsafe_system:$path_clean"
+    for unsafe_case in group-parent world-sticky-parent group-install group-system; do
+        unsafe_home="$path_setup_root/unsafe-$unsafe_case-home"
+        unsafe_parent="$path_setup_root/unsafe-$unsafe_case-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        case "$unsafe_case" in
+            group-parent) unsafe_named=$unsafe_parent && chmod 0775 "$unsafe_parent" ;;
+            world-sticky-parent) unsafe_named=$unsafe_parent && chmod 1777 "$unsafe_parent" ;;
+            group-install) unsafe_named=$unsafe_install && chmod 0775 "$unsafe_install" ;;
+            group-system) unsafe_named=$unsafe_system && chmod 0775 "$unsafe_system" ;;
+        esac
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-$unsafe_case-output" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case install failed"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: the $unsafe_case case linked $path_program into the system bin directory"
+            fi
+            [ -L "$unsafe_home/.local/bin/$path_program" ] ||
+                die "self-test: the $unsafe_case case did not link $path_program into ~/.local/bin"
+        done
+        grep -Fq "warning: not linking the Cerulion programs into $unsafe_system: another account can change $unsafe_named" \
+            "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case case did not warn about $unsafe_named: $(cat "$path_setup_root/unsafe-$unsafe_case-error")"
+        grep -Fq "add $unsafe_home/.local/bin to PATH" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case warning did not name the ~/.local/bin fix"
+        chmod 0755 "$unsafe_parent" "$unsafe_system"
+    done
+    # A program file another account can write is refused the same way. The
+    # arm calls the linking step directly on stub programs, so no install
+    # rewrites the file mode it sets.
+    (
+        file_home="$path_setup_root/unsafe-group-file-home"
+        file_install="$path_setup_root/unsafe-group-file-install"
+        mkdir -p "$file_home" "$file_install"
+        chmod 0755 "$file_install"
+        for path_program in $LINKED_PROGRAMS; do
+            printf '#!/bin/sh\n' > "$file_install/$path_program"
+            chmod 0755 "$file_install/$path_program"
+        done
+        chmod 0775 "$file_install/cerulion-netd"
+        HOME=$file_home PATH="$unsafe_system:$path_clean" \
+            CERULION_SYSTEM_BIN_DIR=$unsafe_system \
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root \
+            link_into_path_dirs "$file_install" \
+            >"$path_setup_root/unsafe-group-file-output" 2>"$path_setup_root/unsafe-group-file-error"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: a group-writable program let $path_program be linked into the system bin directory"
+            fi
+        done
+        grep -Fq "another account can change $(CDPATH='' cd -P -- "$file_install" && pwd)/cerulion-netd" \
+            "$path_setup_root/unsafe-group-file-error" ||
+            die "self-test: the group-writable program case did not warn: $(cat "$path_setup_root/unsafe-group-file-error")"
+    ) || exit 1
+    # Ownership: a directory another non-root account owns is refused. Only
+    # root can hand a directory to another account, so the arm runs as root.
+    if [ "$(id -u)" -eq 0 ]; then
+        unsafe_home="$path_setup_root/unsafe-owner-home"
+        unsafe_parent="$path_setup_root/unsafe-owner-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        chown 65534 "$unsafe_parent"
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-owner-output" "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner install failed"
+        [ ! -L "$unsafe_system/cerulion" ] ||
+            die "self-test: an install under another account's directory was linked into the system bin directory"
+        grep -Fq "another account can change $unsafe_parent" \
+            "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner case did not warn"
+        chown 0 "$unsafe_parent"
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the foreign-owner system link arm because it needs root" >&2
+    fi
+    # The check itself: / and a 0755 tree are safe, 0775 and 1777 are not.
+    dir_safe_from_others / ||
+        die "self-test: / was reported writable by another account: $unsafe_dir"
+    (
+        CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+        unit_dir="$path_setup_root/unit/a/b"
+        mkdir -p "$unit_dir"
+        chmod 0755 "$path_setup_root/unit" "$path_setup_root/unit/a" "$unit_dir"
+        dir_safe_from_others "$unit_dir" ||
+            die "self-test: a 0755 tree was reported writable by another account: $unsafe_dir"
+        for unit_mode in 0775 0757 1777; do
+            chmod "$unit_mode" "$path_setup_root/unit/a"
+            if dir_safe_from_others "$unit_dir"; then
+                die "self-test: a mode $unit_mode parent was reported safe"
+            fi
+            [ "$unsafe_dir" = "$path_setup_root/unit/a" ] ||
+                die "self-test: the mode $unit_mode check named $unsafe_dir"
+        done
+        chmod 0755 "$path_setup_root/unit/a"
+    ) || exit 1
+    # A symlink on the way to the install directory is checked where it sits:
+    # one inside a group-writable directory is refused, though the directory
+    # it points at passes.
+    unsafe_home="$path_setup_root/unsafe-symlink-home"
+    unsafe_parent="$path_setup_root/unsafe-symlink-parent"
+    unsafe_real="$path_setup_root/unsafe-symlink-real"
+    mkdir -p "$unsafe_home" "$unsafe_parent" "$unsafe_real/install"
+    chmod 0755 "$unsafe_real" "$unsafe_real/install"
+    ln -s "$unsafe_real" "$unsafe_parent/link"
+    chmod 0775 "$unsafe_parent"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/unsafe-symlink-output" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the install through a symlink failed"
+    [ ! -L "$unsafe_system/cerulion" ] ||
+        die "self-test: an install through a symlink in a group-writable directory was linked into the system bin directory"
+    grep -Fq "another account can change $unsafe_parent" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the symlink case did not name its directory: $(cat "$path_setup_root/unsafe-symlink-error")"
+    chmod 0755 "$unsafe_parent"
+    # In a tree nobody else can change, the same install is linked, and the
+    # system links name the physical directory rather than the symlink.
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-output" "$path_setup_root/safe-symlink-error" ||
+        die "self-test: the install through a safe symlink failed"
+    unsafe_real_physical=$(CDPATH='' cd -P -- "$unsafe_real/install" && pwd)
+    for path_program in $LINKED_PROGRAMS; do
+        [ "$(readlink "$unsafe_system/$path_program")" = "$unsafe_real_physical/$path_program" ] ||
+            die "self-test: the $path_program system link through a safe symlink reads $(readlink "$unsafe_system/$path_program")"
+    done
+    # --uninstall through the symlink takes those links back, the one whose
+    # program is already gone included.
+    rm -f "$unsafe_real/install/cerulion-connectd"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-uninstall-output" "$path_setup_root/safe-symlink-uninstall-error" --uninstall ||
+        die "self-test: --uninstall through a safe symlink failed: $(cat "$path_setup_root/safe-symlink-uninstall-error")"
+    for path_program in $LINKED_PROGRAMS; do
+        if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+            die "self-test: --uninstall through a symlink left the $path_program system link"
+        fi
+    done
+    # A macOS ACL entry that lets another account write is refused although
+    # the mode bits pass; the stock home entry (everyone deny delete) is not.
+    acl_dir="$path_setup_root/unit-acl"
+    mkdir -p "$acl_dir"
+    chmod 0755 "$acl_dir"
+    if chmod +a "everyone deny delete" "$acl_dir" 2>/dev/null; then
+        # The entries come off before a failure exits: the deny entry would
+        # stop the scratch tree's removal.
+        acl_status=0
+        (
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+            dir_safe_from_others "$acl_dir" ||
+                die "self-test: a deny-only ACL was reported writable by another account"
+            chmod +a "everyone allow add_file,delete_child" "$acl_dir" ||
+                die "self-test: could not add an allow ACL entry"
+            if dir_safe_from_others "$acl_dir"; then
+                die "self-test: an ACL that lets everyone add files was reported safe"
+            fi
+        ) || acl_status=1
+        chmod -N "$acl_dir"
+        [ "$acl_status" -eq 0 ] || exit 1
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the macOS ACL arm because chmod +a is unavailable" >&2
+    fi
     path_run_system="$path_setup_root/system-bin"
+    chmod 0755 "$path_run_system"
+    system_install_physical=$(CDPATH='' cd -P -- "$system_install" && pwd)
     path_run_path="$path_run_system:$path_clean"
     path_run_shell=/usr/bin/fish
     run_path_setup_install "$system_home" "$system_install" \
         "$path_setup_root/system-output" "$path_setup_root/system-error" ||
         die "self-test: the install with a writable system bin directory failed"
     for path_program in $LINKED_PROGRAMS; do
-        [ "$(readlink "$path_run_system/$path_program")" = "$system_install/$path_program" ] ||
+        [ "$(readlink "$path_run_system/$path_program")" = "$system_install_physical/$path_program" ] ||
             die "self-test: a writable system bin directory on PATH did not get the $path_program link"
         [ -L "$system_home/.local/bin/$path_program" ] ||
             die "self-test: the system bin links replaced the ~/.local/bin ones"
@@ -2816,7 +3091,7 @@ EOF
     run_path_setup_install "$fish_home" "$fish_install" \
         "$path_setup_root/fish-output" "$path_setup_root/fish-error" ||
         die "self-test: the install under fish failed"
-    [ "$(readlink "$path_run_system/cerulion")" = "$system_install/cerulion" ] ||
+    [ "$(readlink "$path_run_system/cerulion")" = "$system_install_physical/cerulion" ] ||
         die "self-test: a system bin directory off this PATH was linked"
     if grep -Fq "$path_run_system" "$path_setup_root/fish-error"; then
         die "self-test: an install with the system bin directory off PATH tried to link there"
@@ -2878,6 +3153,7 @@ EOF
     [ ! -L "$path_run_system/cerulion" ] ||
         die "self-test: --uninstall left the system bin link"
     path_run_system="$path_setup_root/no-system-bin"
+    umask "$self_test_umask"
     unmarked_home="$path_setup_root/unmarked-home"
     unmarked_install="$path_setup_root/unmarked-install"
     mkdir -p "$unmarked_home/.cerulion" "$unmarked_install"
