@@ -260,10 +260,11 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
 The published `cerulion_cli_engine` 1.0.0 package exposes the graph-run partition
 APIs in [`partition_emit`](https://github.com/cerulion-inc/cerulion/blob/36135c33a10a09aa0dc6e7e7317c7f93c4f63ef8/crates/cerulion_cli_engine/src/partition_emit.rs#L1515).
 Removing their public fields, lifetime parameter, function argument and outcome
-variant breaks Rust callers. Publish the changed engine under a new major version,
-with the workspace version and internal dependency pins updated together under the
-lockstep release policy in `Cargo.toml`. Migration guidance alone does not make a
-1.x library update source compatible.
+variant breaks Rust callers. SemVer in 1.x does not cover the `cerulion_cli_engine`
+library API (see `CHANGELOG.md`), and these changes ship in a 1.x minor release with
+the workspace version and internal dependency pins updated together under the
+lockstep release policy in `Cargo.toml`. Rust code that calls the engine directly
+applies the migrations below.
 
 | 1.0.0 API | Migration |
 |---|---|
