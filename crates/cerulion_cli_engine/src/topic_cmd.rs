@@ -3132,8 +3132,9 @@ pub(crate) fn sanitize_display(s: &str) -> String {
 }
 
 /// A remote authorizer's refusal reason is untrusted remote text: control
-/// characters (ESC, CR, LF, ...) become `?` so the error cannot inject
-/// terminal sequences or extra lines, and the text truncates at 200 chars
+/// characters (ESC, CR, LF, ...) and the Unicode line and paragraph
+/// separators become `?` so the error cannot inject terminal sequences or
+/// extra lines, and the text truncates at 200 chars
 /// with a `…` marker.
 pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     const LIMIT: usize = 200;
@@ -3141,16 +3142,19 @@ pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     let mut chars = s.chars();
     for _ in 0..LIMIT {
         match chars.next() {
-            // C0/C1 controls and the bidi/format controls that reorder or
-            // hide text in a terminal all become `?`: a hostile LAN peer
-            // cannot smuggle terminal sequences, line breaks, or
-            // right-to-left overrides into a logged or printed refusal.
+            // C0/C1 controls, the Unicode line and paragraph separators,
+            // and the bidi/format controls that reorder or hide text in a
+            // terminal all become `?`: a hostile LAN peer cannot smuggle
+            // terminal sequences, line breaks, or right-to-left overrides
+            // into a logged or printed refusal.
             Some(
                 '\u{0000}'..='\u{001F}'
                 | '\u{007F}'..='\u{009F}'
                 | '\u{061C}'
                 | '\u{200E}'
                 | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2066}'..='\u{2069}',
             ) => out.push('?'),
@@ -6079,6 +6083,25 @@ mod tests {
         assert_eq!(sanitize_refusal_reason(&exact), exact);
         let long: String = std::iter::repeat_n('x', 201).collect();
         assert_eq!(sanitize_refusal_reason(&long), format!("{exact}\u{2026}"));
+    }
+
+    /// U+2028 LINE SEPARATOR cannot forge a second line in a displayed or
+    /// logged refusal.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_line_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2028}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
+    /// U+2029 PARAGRAPH SEPARATOR cannot forge a second line either.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_paragraph_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2029}error: forged"),
+            "denied?error: forged"
+        );
     }
 
     /// A hostile LAN-supplied robot name — from
