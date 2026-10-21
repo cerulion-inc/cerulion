@@ -65,11 +65,12 @@ cerulion_core = { path = "../../../crates/cerulion_core" }
 # pin closes.) Verify after any lockfile regeneration:
 #   grep '^name = "iceoryx2' -A1 Cargo.lock   # every entry must be 0.10.0
 iceoryx2 = "=0.10.0"
-# Pinned to the version the May-2026 campaign verified the SHM config
-# against (`zenoh_shm_config`'s JSON5 keys + the Talc-backend 1 MiB floor
-# are 1.7.2-verified). The main workspace is on zenoh 1.8 — bumping this
-# bench line is a deliberate change that re-verifies those keys, not a drive-by.
-zenoh = { version = "=1.7.2", features = ["shared-memory", "unstable"] }
+# Pinned to the zenoh release cerulion_core depends on (1.10.1): both reach
+# this crate's graph through the `cerulion_core` path dependency, so the two
+# requirements must name one version or the lockfile does not resolve.
+# `zenoh_shm_config`'s JSON5 keys and the 1 MiB SHM provider floor are
+# checked against 1.10.1. Moving this pin re-checks both.
+zenoh = { version = "=1.10.1", features = ["shared-memory", "unstable"] }
 
 [profile.release]
 opt-level = 3
