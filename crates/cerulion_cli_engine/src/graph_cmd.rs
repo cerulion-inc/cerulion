@@ -8342,7 +8342,7 @@ fn credit_open_refusal_message(topic: &str, ns: &str, id: &str, e: &std::io::Err
 }
 
 /// Write the GO sentinel carrying `epoch_ns` so a polling worker never reads a
-/// partial file: the text goes to a sibling `.tmp` file first and is renamed
+/// half-written file: the text goes to a sibling `.tmp` file first and is renamed
 /// over `go_path`, and a rename within one directory is atomic, so `exists()`
 /// turns true only once the whole line is there.
 fn write_go_sentinel(go_path: &Path, epoch_ns: u64) -> std::io::Result<()> {
