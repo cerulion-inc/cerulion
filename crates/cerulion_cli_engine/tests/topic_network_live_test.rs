@@ -253,12 +253,13 @@ fn remote_discovery_catalog_get_enriches_with_catalog_only_topics() {
     )])));
     let catalog = CatalogSource {
         hashes,
-        boot_topics: Arc::new(HashSet::new()),
+        boot_topics: Arc::new(Mutex::new(HashSet::new())),
         topic_schemas: Arc::new(Mutex::new(HashMap::new())),
         hash_names: Arc::new(Mutex::new(HashMap::new())),
         producer_probe: None,
         liveness: None,
         liveness_clock: None,
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -343,12 +344,13 @@ fn remote_discovery_catalog_union_preserves_announce_only_topics() {
     bridge.register_topic("/uni/a").expect("register /uni/a");
     let catalog = CatalogSource {
         hashes: Arc::new(Mutex::new(HashMap::new())),
-        boot_topics: Arc::new(HashSet::new()),
+        boot_topics: Arc::new(Mutex::new(HashSet::new())),
         topic_schemas: Arc::new(Mutex::new(HashMap::new())),
         hash_names: Arc::new(Mutex::new(HashMap::new())),
         producer_probe: None,
         liveness: None,
         liveness_clock: None,
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -450,6 +452,9 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
         RemoteResolve::Found(_) => panic!("nothing can be found on an isolated session"),
         RemoteResolve::SchemaUnavailable { robot, cause } => {
             panic!("unexpected SchemaUnavailable from an isolated session: {robot} / {cause}")
+        }
+        RemoteResolve::CatalogRefused { robot, .. } => {
+            panic!("no catalog was read in an isolated session: {robot}")
         }
         // This resolve carries no cancellation source, so an interruption
         // cannot arise. Named explicitly rather than caught by a wildcard.
@@ -890,6 +895,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
                 .map(|d| (d.qualified.clone(), d.clone()))
                 .collect::<BTreeMap<_, _>>(),
         )),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     // A bridge with one registered topic so the query surface starts (non-empty).
     let bridge = Arc::new(TopicBridgeManager::new());
@@ -900,12 +906,13 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
             Arc::new(GetDemandState::default()),
             cerulion_core::transport::network::CatalogSource {
                 hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                boot_topics: Arc::new(std::collections::HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 topic_schemas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 hash_names: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1052,12 +1059,13 @@ fn catalog_verb_carries_per_topic_schema_name() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             SchemaSource::default(),
             runs_source_for_a_zenoh_only_surface(),
@@ -1138,6 +1146,7 @@ fn schema_verb_serves_package_less_yaml_type() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/state").expect("register");
@@ -1147,12 +1156,13 @@ fn schema_verb_serves_package_less_yaml_type() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1258,6 +1268,7 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
                 },
             ),
         ]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/nested").expect("register");
@@ -1267,12 +1278,13 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1373,6 +1385,7 @@ fn fetch_remote_schema_success_and_unreachable() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     let bridge = Arc::new(TopicBridgeManager::new());
     bridge.register_topic("/fetch").expect("register");
@@ -1382,12 +1395,13 @@ fn fetch_remote_schema_success_and_unreachable() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1578,6 +1592,7 @@ fn resolve_remote_walker_for_topic_decodes_named_topic_and_degrades_on_unknown()
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -1585,12 +1600,13 @@ fn resolve_remote_walker_for_topic_decodes_named_topic_and_degrades_on_unknown()
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1724,6 +1740,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
                 deps: vec![],
             },
         )]))),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -1731,12 +1748,13 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -1903,6 +1921,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
     // The robot serves NO schemas at all — the built-in must resolve LOCALLY.
     let schema = SchemaSource {
         docs: Arc::new(Mutex::new(BTreeMap::new())),
+        snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     };
     robot_mgr
         .start_query_surface(
@@ -1910,12 +1929,13 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes: Arc::new(Mutex::new(HashMap::new())),
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas,
                 hash_names: Arc::new(Mutex::new(HashMap::new())),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             schema,
             runs_source_for_a_zenoh_only_surface(),
@@ -2000,6 +2020,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
                 // instead of failing to compile with no diagnostic value.
                 RemoteResolve::DiscoveryNotConverged => "DiscoveryNotConverged",
                 RemoteResolve::SchemaUnavailable { .. } => "SchemaUnavailable",
+                RemoteResolve::CatalogRefused { .. } => "CatalogRefused",
                 RemoteResolve::Cancelled => "Cancelled",
             };
             assert!(
@@ -2097,16 +2118,18 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
             Arc::new(GetDemandState::default()),
             CatalogSource {
                 hashes,
-                boot_topics: Arc::new(HashSet::new()),
+                boot_topics: Arc::new(Mutex::new(HashSet::new())),
                 topic_schemas: Arc::new(Mutex::new(HashMap::new())),
                 hash_names: Arc::new(Mutex::new(hash_names)),
                 producer_probe: None,
                 liveness: None,
                 liveness_clock: None,
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             // The robot serves NO schemas — a built-in must resolve LOCALLY.
             SchemaSource {
                 docs: Arc::new(Mutex::new(BTreeMap::new())),
+                snapshot_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             runs_source_for_a_zenoh_only_surface(),
         )

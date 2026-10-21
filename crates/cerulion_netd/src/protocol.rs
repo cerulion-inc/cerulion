@@ -22,7 +22,7 @@
 //! (C3's migrated vizd / `topic echo` / connectd) can lift it verbatim.
 
 use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
-use cerulion_core::{CatalogReply, GatewayPlan, RunsReply, SchemaReply, SchemaServing};
+use cerulion_core::{CatalogReply, GatewayPlan, LanAccess, RunsReply, SchemaReply, SchemaServing};
 use serde::{Deserialize, Serialize};
 
 /// The `cerulion-netd` control-protocol version. Bumped on any
@@ -545,6 +545,13 @@ pub struct StatusResponse {
     /// same reason, as the `DiscoveryState` marker.
     #[serde(default)]
     pub connect_endpoints: Option<Vec<String>>,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent (`None`, UNKNOWN, never open) on older daemons and on egress
+    /// planes without a network manager. A run that requires paired access
+    /// reads it BEFORE it registers egress, because a registration's topics
+    /// and schemas stay served on the shared gateway after release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::RegisterEgress`].
@@ -558,6 +565,10 @@ pub struct EgressResponse {
     /// Whether THIS registration BOOTED the shared embedded egress gateway (the
     /// first egress plan on this daemon); `false` when it joined a running one.
     pub gateway_started: bool,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent on older daemons and on egress planes without a network manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::ReleaseEgress`].
@@ -1585,11 +1596,13 @@ mod tests {
             id: 1,
             registered_topics: 3,
             gateway_started: true,
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&e.to_json_line()).unwrap();
         assert_eq!(v["id"], 1);
         assert_eq!(v["registered_topics"], 3);
         assert_eq!(v["gateway_started"], true);
+        assert_eq!(v["lan_access"], "paired");
         assert!(v.get("Egress").is_none(), "flat untagged, no wrapper key");
         // The concrete struct round-trips (the consumer half).
         assert_eq!(
@@ -1598,8 +1611,29 @@ mod tests {
                 id: 1,
                 registered_topics: 3,
                 gateway_started: true,
+                lan_access: Some(LanAccess::Paired),
             }
         );
+        let legacy: EgressResponse =
+            serde_json::from_str(r#"{"id":1,"registered_topics":3,"gateway_started":true}"#)
+                .expect("legacy egress response");
+        assert_eq!(
+            legacy,
+            EgressResponse {
+                id: 1,
+                registered_topics: 3,
+                gateway_started: true,
+                lan_access: None,
+            }
+        );
+        let without_posture = EgressResponse {
+            id: 2,
+            registered_topics: 0,
+            gateway_started: false,
+            lan_access: None,
+        };
+        let v = serde_json::to_value(without_posture).expect("serialize absent posture");
+        assert!(v.get("lan_access").is_none());
 
         let r = Response::EgressRelease(EgressReleaseResponse {
             id: 2,
@@ -1714,8 +1748,10 @@ mod tests {
             active_connections: 3,
             idle: false,
             connect_endpoints: Some(vec!["tcp/10.0.0.5:7683".to_string()]),
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&st.to_json_line()).unwrap();
+        assert_eq!(v["lan_access"], "paired");
         assert_eq!(v["active_connections"], 3);
         assert_eq!(v["idle"], false);
         assert_eq!(v["demands"][0]["refcount"], 2);
@@ -1737,6 +1773,10 @@ mod tests {
         assert_eq!(
             decoded.connect_endpoints, None,
             "an absent field is UNKNOWN, never an empty (and therefore positive) claim"
+        );
+        assert_eq!(
+            decoded.lan_access, None,
+            "an absent LAN posture is UNKNOWN, never open"
         );
         // The anti-tautology half: a daemon that DOES report an empty set is
         // distinguishable from the one above.
