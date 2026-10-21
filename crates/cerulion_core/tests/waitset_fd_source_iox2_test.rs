@@ -386,9 +386,10 @@ fn invalid_fd_rejected_at_construction() {
     // SAFETY: sole close of the fd we just relinquished from `closed_pipe`.
     unsafe { libc::close(closed_fd) };
 
-    // Exactly at the FD_SETSIZE boundary: `non_owning` rejects `>= FD_SETSIZE`
-    // regardless of whether the number happens to be open, so this pins the guard
-    // (not fd-openness). `RawFd` is `i32`; `FD_SETSIZE` (1024) fits.
+    // Exactly at the FD_SETSIZE boundary: where the WaitSet selects (every
+    // target but Linux) `non_owning` rejects `>= FD_SETSIZE` whether or not the
+    // number is open; on Linux (epoll, no ceiling) it is rejected because it is
+    // not open. `RawFd` is `i32`; `FD_SETSIZE` (1024) fits.
     let over_fd_setsize: RawFd = libc::FD_SETSIZE as RawFd;
 
     let outcome = runtime.run_waitset_reactor_once_with_fds_for_test(
