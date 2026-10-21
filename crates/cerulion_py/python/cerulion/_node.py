@@ -8,6 +8,7 @@ import os
 import sys
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
+from cerulion._native import WIRE_HEADER_SIZE
 from cerulion._typed import (
     Message,
     SchemaSet,
@@ -605,7 +606,7 @@ class _Runtime:
             raw = memoryview(frame)
             self.instance._cer_input_views[port.name] = raw
             resolved = self.schemas._native.resolve_frame_buffer(raw, port.schema)
-            payload = raw[32:]
+            payload = raw[WIRE_HEADER_SIZE:]
             layout = self.schemas.layout(port.schema)
             inputs[port.name] = _view(
                 payload,

@@ -169,7 +169,7 @@ fn recorded_x(bag: &Path, topic: &str) -> Vec<f64> {
     );
     msgs.iter()
         .filter(|m| m.topic == topic)
-        .map(|m| f64::from_le_bytes(m.data[32..40].try_into().unwrap()))
+        .map(|m| f64::from_le_bytes(m.data[cerulion_core::wire::WireHeader::SIZE..cerulion_core::wire::WireHeader::SIZE + 8].try_into().unwrap()))
         .collect()
 }
 

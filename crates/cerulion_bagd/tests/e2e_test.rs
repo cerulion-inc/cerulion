@@ -3203,7 +3203,7 @@ fn salvage_reflush_after_durable_prefix_counts_no_false_gap() {
         .into_iter()
         .filter(|m| m.topic == topic)
         .map(|m| {
-            cerulion_core::wire::WireHeader::read_from_buf(&m.data[..32])
+            cerulion_core::wire::WireHeader::read_from_buf(&m.data[..cerulion_core::wire::WireHeader::SIZE])
                 .expect("header")
                 .sequence
         })
@@ -5222,7 +5222,7 @@ fn a_low_rate_recording_reaches_disk_on_the_chunk_time_floor() {
 #[test]
 fn a_high_rate_recording_closes_its_chunk_on_size_well_inside_the_time_floor() {
     const BODY: usize = 256;
-    const N: u32 = 64; // 64 * (32 + 256) B = 18 KiB, ~4.5x the chunk cap below.
+    const N: u32 = 64; // 64 * (header + 256) B = about 18 KiB, ~4.5x the chunk cap below.
     const CHUNK_CAP: usize = 4096;
     let mgr = make_manager(16);
     let topic = unique_topic("timefloorhigh");
@@ -5262,7 +5262,7 @@ fn a_high_rate_recording_closes_its_chunk_on_size_well_inside_the_time_floor() {
         landed,
         "a recording {}x the chunk cap must close a chunk mid-run (nothing readable after \
          {:?})",
-        (N as usize * (32 + BODY)) / CHUNK_CAP,
+        (N as usize * (cerulion_core::wire::WireHeader::SIZE + BODY)) / CHUNK_CAP,
         started.elapsed()
     );
 

@@ -785,7 +785,7 @@ fn assert_frames_match_the_fixture_oracle(
     );
 
     const VECTOR3_WIRE_BYTES: usize = 24;
-    const HEADER_BYTES: usize = 32;
+    const HEADER_BYTES: usize = WireHeader::SIZE;
     let hash =
         <native_ros2_messages::geometry_msgs::Vector3 as cerulion_core::ShmMessage>::SCHEMA_HASH;
 

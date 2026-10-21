@@ -887,13 +887,14 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
 
     // The POISON: a well-FRAMED Vector3-sized frame whose schema_hash is
     // wrong, sequence 99. `publish_raw` writes the caller's header verbatim.
-    let mut frame = vec![0u8; 56];
+    const HDR: usize = cerulion_core::wire::WireHeader::SIZE;
+    let mut frame = vec![0u8; HDR + 24];
     let mut header =
         cerulion_core::wire::WireHeader::new(<Vector3 as ShmMessage>::SCHEMA_HASH ^ 1, 99, 0);
-    header.total_size = 56;
-    header.offset_table_offset = 56;
-    header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
-    frame[32..40].copy_from_slice(&777.0f64.to_le_bytes()); // x, must never be summed
+    header.total_size = (HDR + 24) as u32;
+    header.offset_table_offset = (HDR + 24) as u32;
+    header.write_to_buf(&mut frame[..HDR]);
+    frame[HDR..HDR + 8].copy_from_slice(&777.0f64.to_le_bytes()); // x, must never be summed
     ext.publish_raw(&frame).expect("raw publish");
     step_n(&mut h.runtime, 1);
 

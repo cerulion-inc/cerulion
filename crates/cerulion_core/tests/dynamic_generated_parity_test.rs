@@ -109,7 +109,7 @@ fn channel_float32_generated_publish_equals_frame_encoder_bytes() {
     let mut payload = vec![16, 0, 0, 0, 3, 0, 0, 0, 20, 0, 0, 0, 12, 0, 0, 0];
     payload.extend_from_slice(b"rgb\0");
     payload.extend_from_slice(&[0, 0, 0, 0x3F, 0, 0, 0x80, 0xBF, 0, 0, 0, 0x40]);
-    assert_eq!(&generated[32..], &payload[..]);
+    assert_eq!(&generated[WireHeader::SIZE..], &payload[..]);
 }
 
 /// `Image` exercises fixed fields with interior padding, an empty nested

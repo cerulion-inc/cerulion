@@ -663,7 +663,7 @@ fn empty_variable_field_out_of_range_offset_clamps_instead_of_panicking() {
     buf.truncate(n);
     // Corrupt the `samples` entry's offset while len stays 0: construction
     // skips bounds checks for empty entries, so the accessor must clamp.
-    let entry = 32 + layout.fixed_size + 8;
+    let entry = crate::wire::WireHeader::SIZE + layout.fixed_size + 8;
     buf[entry..entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     let view =
         FrameView::new(set.walker(), &buf).expect("empty entries skip construction bounds checks");
@@ -983,7 +983,7 @@ fn view_reads_every_field_of_the_oracle_frame() {
     assert_eq!(samples, [1.0, 2.0]);
     assert_eq!(
         arr.bytes.as_ptr() as usize % 8,
-        frame[32..].as_ptr() as usize % 8
+        frame[crate::wire::WireHeader::SIZE..].as_ptr() as usize % 8
     );
 
     assert_eq!(

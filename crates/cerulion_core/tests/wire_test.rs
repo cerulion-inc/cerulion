@@ -171,7 +171,7 @@ fn test_wire_header_bytes_roundtrip() {
     assert_eq!(bytes.len(), WireHeader::SIZE);
 
     let mut aligned_buf = AlignedBuf::<64>([0u8; 64]);
-    aligned_buf.0[..32].copy_from_slice(bytes);
+    aligned_buf.0[..WireHeader::SIZE].copy_from_slice(bytes);
 
     let parsed = WireHeader::from_bytes(&aligned_buf.0).expect("Should parse");
     assert_eq!(parsed.schema_hash, original.schema_hash);

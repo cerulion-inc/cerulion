@@ -354,7 +354,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
     let header = held.wire_header().expect("held frame header");
     assert_eq!(header.sequence, 0, "FIFO: first published frame first");
     assert_eq!(held.payload().len(), WireHeader::SIZE + 24);
-    let x = f64::from_le_bytes(held.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(held.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
     assert_eq!(x, 1.0);
 
     // HOLD across further publishes: the held bytes must be UNCHANGED —
@@ -381,7 +381,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
         assert_eq!(x, f64::from(expect_x), "FIFO order");
         more.push(s);
     }
@@ -406,7 +406,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 5 must still be queued");
-    let x = f64::from_le_bytes(next.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(next.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
     assert_eq!(x, 5.0, "no frame was lost to the refused receive");
 
     // Drain the rest + empty.
@@ -418,7 +418,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
         assert_eq!(x, f64::from(expect_x));
     }
     assert!(
@@ -491,7 +491,7 @@ fn test_create_port_floors_size_the_created_service() {
             .try_receive_one_owned()
             .expect("owned receive")
             .unwrap_or_else(|| panic!("subscriber {i} must receive the frame"));
-        let x = f64::from_le_bytes(sample.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(sample.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
         assert_eq!(x, 7.0, "subscriber {i} payload");
     }
 }
@@ -664,7 +664,7 @@ fn test_borrow_floor_open_leg_tolerates_smaller_service() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 3");
-    let x = f64::from_le_bytes(c.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(c.payload()[WireHeader::SIZE..WireHeader::SIZE + 8].try_into().unwrap());
     assert_eq!(x, 3.0);
     drop(b);
     drop(c);
