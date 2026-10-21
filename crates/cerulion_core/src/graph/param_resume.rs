@@ -84,7 +84,7 @@ impl ParamsInForce {
             let recorded_value = recorded
                 .get(&spec.name)
                 .map(|v| spec.ty.canonicalize(v).unwrap_or_else(|| v.clone()));
-            if recorded_value != current {
+            if !identical(recorded_value.as_ref(), current.as_ref()) {
                 out.push(ParamDifference {
                     node: node.to_string(),
                     param: spec.name.clone(),
@@ -104,6 +104,17 @@ impl ParamsInForce {
             }
         }
         out
+    }
+}
+
+/// True when `a` and `b` are the same value BIT FOR BIT. A float compares
+/// by its bit pattern, not by `==`: a recorded `-0.0` against a current
+/// `0.0` is a change a node can observe (`1.0 / x`, `x.signum()`), so a
+/// resume must report it.
+fn identical(a: Option<&ParamValue>, b: Option<&ParamValue>) -> bool {
+    match (a, b) {
+        (Some(ParamValue::Float(x)), Some(ParamValue::Float(y))) => x.to_bits() == y.to_bits(),
+        _ => a == b,
     }
 }
 
@@ -151,6 +162,32 @@ mod tests {
             ("frame_id", ParamValue::Str("base_link".into())),
         ]);
         assert!(in_force().differences("cam", &recorded).is_empty());
+    }
+
+    #[test]
+    fn a_signed_zero_change_is_a_difference() {
+        // `-0.0 == 0.0` in IEEE arithmetic, but a node can tell them apart
+        // (`1.0 / gain` is minus or plus infinity), so the resume must not.
+        let recorded = values(&[
+            ("gain", ParamValue::Float(-0.0)),
+            ("frame_id", ParamValue::Str("base_link".into())),
+        ]);
+        let in_force = ParamsInForce {
+            values: values(&[
+                ("gain", ParamValue::Float(0.0)),
+                ("frame_id", ParamValue::Str("base_link".into())),
+            ]),
+            ..in_force()
+        };
+        let lines: Vec<String> = in_force
+            .differences("cam", &recorded)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["node 'cam' param 'gain': recorded -0.0, current 0.0".to_string()]
+        );
     }
 
     #[test]

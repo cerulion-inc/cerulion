@@ -1044,7 +1044,15 @@ those are the values at every anchor it took. Any difference, including a param 
 recording names no value for, refuses the resume with exit 2 and one line per param:
 `node '<id>' param '<name>': recorded <value>, current <value>`. Pass
 `--allow-param-change` to resume on the current values instead; each difference is then
-logged as a warning.
+logged as a warning, and a recorded param the node no longer declares is left out of the
+resumed graph rather than refused as an unknown name. A float is compared bit for bit, so
+a recorded `-0.0` against a current `0.0` is a difference.
+
+Because a value is fixed for the run, a node must not write a `#[param]` field, in `init`
+or in `tick`. An anchor does not carry the field, so a resume would run on the graph's
+value instead of the one the node held live. A state capture checks each param against
+the value it held when `init` began and refuses once one differs, naming the param. Keep a
+value the node changes in a plain field: it is state, captured and restored like any other.
 
 **For ROS 2 users.** The same concepts, in Cerulion's form:
 

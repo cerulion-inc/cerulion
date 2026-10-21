@@ -799,9 +799,93 @@ pub fn gen_apply_impl(
             }
         })
         .collect();
+    let root = quote! { ::cerulion_core::graph::params::ParamValue };
+    let snapshot_entries: Vec<TokenStream> = params
+        .iter()
+        .map(|p| {
+            let field = &p.field_name;
+            let name = &p.name;
+            let value = match p.kind {
+                ParamKind::Bool => quote! { #root::Bool(self.#field) },
+                ParamKind::String => quote! { #root::Str(self.#field.clone()) },
+                ParamKind::F32 | ParamKind::F64 => {
+                    quote! { #root::Float(::core::primitive::f64::from(self.#field)) }
+                }
+                kind if kind.is_unsigned() => {
+                    quote! { #root::UInt(::core::primitive::u64::from(self.#field)) }
+                }
+                _ => quote! { #root::Int(::core::primitive::i64::from(self.#field)) },
+            };
+            quote! { (::std::string::String::from(#name), #value) }
+        })
+        .collect();
+    // One check per param against the snapshot `__cer_param_values` took:
+    // a float compares by bit pattern (a `-0.0` written over `0.0` is a
+    // change), a string by its bytes, without a clone.
+    let change_checks: Vec<TokenStream> = params
+        .iter()
+        .map(|p| {
+            let field = &p.field_name;
+            let name = &p.name;
+            let changed = match p.kind {
+                ParamKind::Bool => quote! {
+                    ::std::matches!(__cer_at, ::std::option::Option::Some(#root::Bool(__cer_v))
+                        if *__cer_v != self.#field)
+                },
+                ParamKind::String => quote! {
+                    ::std::matches!(__cer_at, ::std::option::Option::Some(#root::Str(__cer_v))
+                        if __cer_v.as_str() != self.#field.as_str())
+                },
+                ParamKind::F32 | ParamKind::F64 => quote! {
+                    ::std::matches!(__cer_at, ::std::option::Option::Some(#root::Float(__cer_v))
+                        if __cer_v.to_bits()
+                            != ::core::primitive::f64::from(self.#field).to_bits())
+                },
+                kind if kind.is_unsigned() => quote! {
+                    ::std::matches!(__cer_at, ::std::option::Option::Some(#root::UInt(__cer_v))
+                        if *__cer_v != ::core::primitive::u64::from(self.#field))
+                },
+                _ => quote! {
+                    ::std::matches!(__cer_at, ::std::option::Option::Some(#root::Int(__cer_v))
+                        if *__cer_v != ::core::primitive::i64::from(self.#field))
+                },
+            };
+            quote! {
+                let __cer_at = __cer_at_init.get(#name);
+                if #changed {
+                    return ::std::option::Option::Some(#name);
+                }
+            }
+        })
+        .collect();
     quote! {
         #[automatically_derived]
         impl #impl_generics #struct_name #ty_generics #where_clause {
+            /// Every `#[param]` field's current value, keyed by param name,
+            /// in declaration order. The wrapper takes it once in `init`,
+            /// right after the graph's values are written: the values the
+            /// node must hold for the whole run.
+            #[doc(hidden)]
+            pub fn __cer_param_values(&self) -> ::cerulion_core::graph::params::ParamValues {
+                [#(#snapshot_entries),*].into_iter().collect()
+            }
+
+            /// The first `#[param]` whose field no longer holds the value in
+            /// `__cer_at_init`, or `None`. A param is not node state, so an
+            /// anchor does not carry it: a node that writes one after the
+            /// graph set it would resume on the graph's value, not on the one
+            /// it held live. The state capture asks this first and refuses.
+            /// No allocation: it runs at each anchor capture.
+            #[doc(hidden)]
+            #[allow(unused_variables)]
+            pub fn __cer_changed_param(
+                &self,
+                __cer_at_init: &::cerulion_core::graph::params::ParamValues,
+            ) -> ::std::option::Option<&'static str> {
+                #(#change_checks)*
+                ::std::option::Option::None
+            }
+
             /// Write every `#[param]` default into its field.
             #[doc(hidden)]
             pub fn __cer_apply_param_defaults(&mut self) {

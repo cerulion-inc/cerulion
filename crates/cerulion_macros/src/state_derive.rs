@@ -480,7 +480,10 @@ fn is_port_field(field: &Field) -> bool {
 /// not captured, untouched on restore, and not in `STATE_SHAPE`, so changing
 /// a param's type or name never refuses an anchor. A resume compares the
 /// recorded values with the ones in force instead (`apply_resume` in the
-/// replay engine). The same attribute path `parse.rs` reads.
+/// replay engine). A node that WRITES a param after the graph set it would
+/// resume on the graph's value, so the wrapper's capture refuses once a
+/// param no longer holds its value from `init` (`__cer_changed_param` in
+/// `param_attr.rs`). The same attribute path `parse.rs` reads.
 fn is_param_field(field: &Field) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident("param"))
 }

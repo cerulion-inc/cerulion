@@ -36,7 +36,7 @@ use serial_test::serial;
 
 mod mp_support;
 use mp_support::{
-    dylib_file, fixture_cdylib, read_file, send_signal, wait_for_bag, wait_for_bag_state,
+    dylib_file, fixture_cdylib, read_file, signal_live_process, wait_for_bag, wait_for_bag_state,
     ChildGuard, RECORDED_WINDOW_TIMEOUT,
 };
 
@@ -217,7 +217,7 @@ fn two_instances_publish_their_own_params_and_the_recording_resims_with_the_reco
         RECORDED_WINDOW_TIMEOUT,
         |snap| snap.frames_on(&left) >= 3 && snap.frames_on(&right) >= 3,
     );
-    send_signal(guard.id(), libc::SIGINT);
+    signal_live_process(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(60))
         .expect("graph run did not exit after SIGINT");

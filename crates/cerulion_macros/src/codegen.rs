@@ -681,6 +681,11 @@ fn gen_wrapper(
             /// takes them; a node run with no `params:` keeps the defaults
             /// `new()` wrote.
             __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            /// Every `#[param]` field's value just after `init` wrote the
+            /// graph's values, before the user's own `init`. A param is
+            /// fixed for the run, so a state capture refuses once a field no
+            /// longer holds its value here. `None` before `init`.
+            __cer_params_at_init: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
             /// The node's `#[input(accumulate)]` buffers (empty for a node
             /// with none), filled at the step-boundary freeze and served to
             /// the tick.
@@ -700,6 +705,7 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
                         ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
@@ -715,9 +721,27 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
                         ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
+            }
+
+            /// Why this node's state cannot be captured because of a param,
+            /// or `None`: a `#[param]` field no longer holds the value it
+            /// held when `init` began. A param is not node state, so an
+            /// anchor taken now would resume on the graph's value, not on
+            /// the one the node runs on. No allocation unless it refuses.
+            fn __cer_param_change(&self) -> ::std::option::Option<::std::string::String> {
+                let at_init = self.__cer_params_at_init.as_ref()?;
+                let param = self.inner.__cer_changed_param(at_init)?;
+                ::std::option::Option::Some(::std::format!(
+                    "param '{}' changed after the graph set it. A param is fixed for the \
+                     run and an anchor does not carry it, so a resume would run on the \
+                     graph's value. Fix: keep a value the node changes in a field that \
+                     is not a #[param]",
+                    param,
+                ))
             }
         }
     }
@@ -998,6 +1022,19 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             &self,
             out: &mut dyn ::cerulion_core::state::StateSink,
         ) -> ::cerulion_core::error::TransportResult<()> {
+            // A param the node wrote after the graph set it cannot ride an
+            // anchor (a param is not state), so a resume would run on the
+            // graph's value instead: refuse the capture rather than record
+            // an anchor that does not reproduce the live run.
+            if let ::std::option::Option::Some(reason) = self.__cer_param_change() {
+                return ::std::result::Result::Err(
+                    ::cerulion_core::error::TransportError::GraphError {
+                        reason: ::std::format!(
+                            "node '{}' state capture failed: {}", #diag_label, reason,
+                        ),
+                    },
+                );
+            }
             // The user's fields, then the node's accumulate buffers (which
             // write nothing for a node without an accumulate input).
             ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
@@ -1194,6 +1231,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         }
                     })?;
                 }
+                // What every param holds for the run. Taken BEFORE the
+                // user's `init`, so a write there is a change too. Cold: one
+                // map per node at graph build.
+                self.__cer_params_at_init =
+                    ::std::option::Option::Some(self.inner.__cer_param_values());
                 // Overwrite the user struct's hidden
                 // runtime-context fields with the live clock + shared
                 // shutdown signal from NodeContext, so `self.now_ns()` /
@@ -3234,6 +3276,12 @@ fn gen_cdylib(
                             // A capture is READ-ONLY, so an unwound one leaves
                             // no torn state — only a discarded encoding, which
                             // the -4 return already tells the host to distrust.
+                            if let ::std::option::Option::Some(reason) = node.__cer_param_change() {
+                                __cer_set_last_error(::std::format!(
+                                    "cerulion_node_capture_state: {}", reason,
+                                ));
+                                return -5_i32;
+                            }
                             let outcome = match ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
                                     ::cerulion_core::state::CerulionState::cer_capture(

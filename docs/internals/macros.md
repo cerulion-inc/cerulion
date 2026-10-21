@@ -68,7 +68,10 @@ cannot also be a port. The module emits three things from one parsed list: the
 `.with_params(vec![ParamSpec{..}])` chain in `info()`, the `,"params":[..]` fragment of the
 cdylib info JSON, and `__cer_apply_param_defaults` (called by the wrapper's `new()`) plus
 `__cer_apply_params` (called by `init` before the user's `init`, on the values
-`NodeEntry::set_params` held). Resolution against a graph's `params:` is core's
+`NodeEntry::set_params` held). `__cer_param_values` snapshots every param right after that
+write and `__cer_changed_param` compares the fields with the snapshot (floats by bit
+pattern); the wrapper's `capture_state` and the cdylib `cerulion_node_capture_state`
+refuse a capture once a param changed, because an anchor does not carry params. Resolution against a graph's `params:` is core's
 `graph::params::resolve_params`. The `inputs(...)`/`outputs(...)` args are rejected at parse
 time with a hint pointing at field attributes (`PORT_ARGS_NOT_ACCEPTED_HINT` in
 `parse.rs` centralizes that wording); `type_name` is rejected separately with a
@@ -258,7 +261,7 @@ test file's header names its exact prereqs.
 | `cdylib_non_trigger_hold_test.rs` | Optional snapshot symbol pair: capability by presence; symbol-less cdylib is a safe no-op | yes | `test_node_macro_period_input_cdylib`, `test_node_cdylib` |
 | `cdylib_unified_drain_test.rs` | Optional drain symbol: capability by presence; FFI failure maps to a safe empty drain | yes | see header (3 fixtures) |
 | `cdylib_iox2_log_level_test.rs` | Generated + hand-written inits apply `IOX2_LOG_LEVEL` (repo-walk guard) | yes | `test_node_discard_probe_cdylib`, `test_node_cdylib` |
-| `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init` | no | none |
+| `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init`, a param written in `init` or `tick` refuses the state capture | no | none |
 | `cdylib_params_test.rs` | `#[param]` across the FFI: specs in the info JSON, values through the optional `cerulion_node_init_with_params` symbol, two instances differ, a symbol-less cdylib refuses a handoff, a library that declares params without the symbol is refused when its info is read | yes | `test_node_macro_param_cdylib`, `test_node_cdylib`, `test_node_params_no_symbol_cdylib` |
 | `tests/ui/param_*.rs` | The six `#[param]` compile-fail diagnostics (unknown key, wrong-type default, `min` above `max`, default outside bounds, bounds on a `String`, `live` reserved) and `pass/param_fields_pass.rs` | no | none |
 

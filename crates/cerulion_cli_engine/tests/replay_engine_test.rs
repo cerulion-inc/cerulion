@@ -13996,6 +13996,74 @@ fn write_checkpoint_bag_with_params(
     bag
 }
 
+/// Replay `bag` with the counter built as a [`GainCounterEntry`], with or
+/// without `--allow-param-change`: the outcome, and the `gain` the node held
+/// at its first tick (`None` when it never ticked).
+fn run_gain_resume(
+    bag: &std::path::Path,
+    allow_param_change: bool,
+) -> (Result<ReplayOutcome, ReplayError>, Option<f64>) {
+    let probe = Arc::new(std::sync::Mutex::new(None));
+    let entry_probe = Arc::clone(&probe);
+    let outcome = replay_inner_with_transport(
+        bag,
+        move |_| {
+            factories(vec![(
+                CP_NODE,
+                Box::new(GainCounterEntry::new(entry_probe)) as Box<dyn NodeEntry>,
+            )])
+        },
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        None,
+        false,
+        allow_param_change,
+    );
+    let first_tick_gain = *probe.lock().expect("probe lock");
+    (outcome, first_tick_gain)
+}
+
+#[test]
+#[serial]
+fn a_resume_judges_a_recorded_param_the_node_no_longer_declares() {
+    // The recording names `gain: 2.0` and `legacy: true`; this build's node
+    // declares only `gain`. The build alone would refuse `legacy` as an
+    // unknown name, so the resume rule must judge it first.
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_checkpoint_bag_with_params(
+        &dir,
+        "removed.mcap",
+        "      gain: 2.0\n      legacy: true\n",
+    );
+
+    // DEFAULT: the resume refusal (exit 2), naming the dropped param, not a
+    // build failure; nothing ticks.
+    let (outcome, first_tick_gain) = run_gain_resume(&bag, false);
+    let err = outcome.expect_err("a dropped param refuses the resume");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("node 'counter' param 'legacy': recorded true, current no value"),
+        "{text}"
+    );
+    assert!(
+        text.contains("--allow-param-change"),
+        "names the opt-in: {text}"
+    );
+    assert_eq!(first_tick_gain, None, "a refused resume ticks nothing");
+
+    // `--allow-param-change`: the resume runs, the dropped name never reaches
+    // the node (its `set_params` refuses any name but `gain`), and the kept
+    // recorded value is the one in force.
+    let (outcome, first_tick_gain) = run_gain_resume(&bag, true);
+    let outcome = outcome.expect("the opt-in resumes without the dropped param");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert!(outcome.resume.is_some(), "still a resume");
+    assert_eq!(first_tick_gain, Some(2.0));
+}
+
 #[test]
 #[serial]
 fn a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed() {
@@ -14004,28 +14072,7 @@ fn a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed() {
     // a value the recording never ran with.
     let dir = tempfile::tempdir().unwrap();
     let unnamed = write_healthy_checkpoint_bag(&dir, CP_FIRST_STEP);
-    let run = |bag: &std::path::Path, allow: bool| {
-        let probe = Arc::new(std::sync::Mutex::new(None));
-        let entry_probe = Arc::clone(&probe);
-        let outcome = replay_inner_with_transport(
-            bag,
-            move |_| {
-                factories(vec![(
-                    CP_NODE,
-                    Box::new(GainCounterEntry::new(entry_probe)) as Box<dyn NodeEntry>,
-                )])
-            },
-            None,
-            None,
-            None,
-            RecordHealthReport::Absent,
-            None,
-            false,
-            allow,
-        );
-        let first_tick_gain = *probe.lock().expect("probe lock");
-        (outcome, first_tick_gain)
-    };
+    let run = run_gain_resume;
 
     // DEFAULT: refused before any state lands or any node ticks, one line
     // naming the node, the param and both values.

@@ -18,9 +18,12 @@ use crate::node_inspector::NodeInspector;
 /// What `node info` can say about a type's params.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeclaredParams {
-    /// No built library for the type: the specs live in the library's node
-    /// info, so there is nothing to read until `cerulion node build <type>`.
-    NotBuilt,
+    /// No loadable library for the type: the specs live in the library's
+    /// node info, so there is nothing to read until `cerulion node build
+    /// <type>`. Carries the lookup's own reason (the paths it searched, and
+    /// any library it skipped, such as one built for another machine), so
+    /// the table says WHY rather than only that it could not read.
+    NotBuilt(String),
     /// The library exists but its node info could not be read.
     Unreadable(String),
     /// The type name is not a node type name (`[A-Za-z_][A-Za-z0-9_]*`), so
@@ -47,8 +50,12 @@ pub fn declared_params(
     if let Err(e) = crate::utils::validate_node_type(node_type) {
         return DeclaredParams::InvalidName(e.to_string());
     }
-    let Ok(lib) = crate::graph_cmd::find_cdylib(workspace_root, node_type, false) else {
-        return DeclaredParams::NotBuilt;
+    let lib = match crate::graph_cmd::find_cdylib(workspace_root, node_type, false) {
+        Ok(lib) => lib,
+        Err(crate::error::CliError::CdylibNotFound { reason, .. }) => {
+            return DeclaredParams::NotBuilt(reason);
+        }
+        Err(e) => return DeclaredParams::NotBuilt(e.to_string()),
     };
     match inspector.inspect(&lib.path, node_type) {
         Ok(info) => DeclaredParams::Declared {
@@ -64,11 +71,8 @@ pub fn declared_params(
 /// is older than its source. Pure: the caller prints it.
 pub fn render_params(node_type: &str, declared: &DeclaredParams) -> String {
     let (specs, stale) = match declared {
-        DeclaredParams::NotBuilt => {
-            return format!(
-                "Params: not read (no built library; run `cerulion node build {node_type}` \
-                 and ask again)\n"
-            );
+        DeclaredParams::NotBuilt(reason) => {
+            return format!("Params: not read (no loadable library: {reason})\n");
         }
         DeclaredParams::Unreadable(reason) => {
             return format!("Params: not read (the node library could not be read: {reason})\n");
@@ -277,6 +281,41 @@ mod tests {
         );
     }
 
+    /// An unbuilt type keeps the lookup's reason: the paths searched and the
+    /// build to run, never a bare "not built" that hides a skipped library.
+    #[test]
+    fn an_unbuilt_type_keeps_the_lookups_reason() {
+        struct NeverAsked;
+        impl NodeInspector for NeverAsked {
+            fn inspect(
+                &self,
+                cdylib: &Path,
+                _label: &str,
+            ) -> crate::error::CliResult<cerulion_core::graph::NodeInfo> {
+                panic!("inspected {} with no library built", cdylib.display());
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let declared = declared_params(tmp.path(), "cam", &NeverAsked);
+        let DeclaredParams::NotBuilt(reason) = &declared else {
+            panic!("an empty workspace has no library, got {declared:?}");
+        };
+        let lib = crate::graph_cmd::cdylib_name("cam");
+        assert!(reason.starts_with("searched "), "{reason}");
+        assert!(
+            reason.contains(&lib),
+            "names the library it looked for: {reason}"
+        );
+        assert!(
+            reason.contains("cerulion node build cam"),
+            "names the build to run: {reason}"
+        );
+        assert_eq!(
+            render_params("cam", &declared),
+            format!("Params: not read (no loadable library: {reason})\n")
+        );
+    }
+
     #[test]
     fn a_type_without_params_and_an_unbuilt_type_each_say_so() {
         assert_eq!(
@@ -290,8 +329,15 @@ mod tests {
             "Params: none\n"
         );
         assert_eq!(
-            render_params("cam", &DeclaredParams::NotBuilt),
-            "Params: not read (no built library; run `cerulion node build cam` and ask again)\n"
+            render_params(
+                "cam",
+                &DeclaredParams::NotBuilt(
+                    "skipped target/debug/libcam.so (ELF e_machine 62 does not match the target)"
+                        .into()
+                )
+            ),
+            "Params: not read (no loadable library: skipped target/debug/libcam.so (ELF \
+             e_machine 62 does not match the target))\n"
         );
         assert_eq!(
             render_params("cam", &DeclaredParams::Unreadable("boom".into())),

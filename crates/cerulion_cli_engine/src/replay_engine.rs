@@ -4125,8 +4125,18 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 config: &config,
                 record_out: record_out.clone(),
             };
+            // A resume judges a param the recording names and this build no
+            // longer declares BEFORE the build, which would refuse the name.
+            let subgraph = match resume.as_ref().map(|resume| {
+                drop_removed_resume_params(resume, plan.subgraph(), &node_infos, allow_param_change)
+            }) {
+                Some(Ok(Some(stripped))) => stripped,
+                Some(Err(e)) => break 'passes Some((rank, e)),
+                Some(Ok(None)) | None => plan.subgraph().clone(),
+            };
             let mut runtime = match build_pass_runtime(
                 plan,
+                subgraph,
                 &mut factories,
                 &transport,
                 &clock,
@@ -7722,6 +7732,7 @@ fn build_replay_context(
 /// [`ReplayError::Internal`] (exit 5), never as a divergence.
 fn build_pass_runtime(
     plan: &RankPlan,
+    subgraph: GraphConfig,
     factories: &mut IndexMap<String, Box<dyn NodeEntry>>,
     transport: &Arc<TransportManager>,
     clock: &Arc<VirtualClock>,
@@ -7745,7 +7756,7 @@ fn build_pass_runtime(
     }
     let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
     GraphRuntime::build_with_schema_hashes_and_provisioning(
-        plan.subgraph().clone(),
+        subgraph,
         pass_factories,
         transport,
         clock.clone(),
@@ -8217,12 +8228,21 @@ fn refuse_param_differences(
         .filter(|node| plan.blobs.contains_key(&node.id))
         .map(|node| (node.id.clone(), node.params.clone()))
         .collect();
-    let differences = runtime.param_differences(&recorded);
+    judge_param_differences(&runtime.param_differences(&recorded), allow_param_change)
+}
+
+/// The resume rule's verdict on a list of param differences: none passes;
+/// any refuses the resume, one line per param, unless `allow_param_change`
+/// says to resume on the current values, when each is a WARN instead.
+fn judge_param_differences(
+    differences: &[cerulion_core::graph::param_resume::ParamDifference],
+    allow_param_change: bool,
+) -> Result<(), ReplayError> {
     if differences.is_empty() {
         return Ok(());
     }
     if allow_param_change {
-        for difference in &differences {
+        for difference in differences {
             tracing::warn!(
                 node_id = %difference.node,
                 param = %difference.param,
@@ -8245,6 +8265,81 @@ fn refuse_param_differences(
             lines.join("\n"),
         ),
     })
+}
+
+/// The resume rule for a param the recording names and this build's node
+/// type no longer declares, applied BEFORE the runtime is built.
+///
+/// The build resolves every node's recorded `params:` against what its type
+/// declares and refuses an unknown name, so a removed param would abort the
+/// replay before [`refuse_param_differences`] could judge it. This judges it
+/// first, for each node the anchor restores. Without `allow_param_change`
+/// the resume is refused with every difference of those nodes listed (the
+/// removed names and any changed value). With it, each removed name is a
+/// WARN and the subgraph to build leaves it out; a changed value is judged
+/// after the build, as before.
+///
+/// `Ok(None)` when no restored node names a removed param: build the plan's
+/// subgraph as it is. Cold: once per resumed replay, before the build.
+fn drop_removed_resume_params(
+    resume: &ResumePlan,
+    subgraph: &GraphConfig,
+    node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    allow_param_change: bool,
+) -> Result<Option<GraphConfig>, ReplayError> {
+    use cerulion_core::graph::param_resume::ParamsInForce;
+    use cerulion_core::graph::params::{resolve_params, ParamValues};
+    let mut differences = Vec::new();
+    let mut any_removed = false;
+    for node in &subgraph.nodes {
+        if node.is_ros2() || !resume.blobs.contains_key(&node.id) {
+            continue;
+        }
+        let Some(info) = node_infos.get(&node.id) else {
+            continue;
+        };
+        let specs = info.params();
+        let kept: ParamValues = node
+            .params
+            .iter()
+            .filter(|(name, _)| specs.iter().any(|spec| &spec.name == *name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        any_removed |= kept.len() != node.params.len();
+        // A kept value the declared type refuses is the build's to report,
+        // with its own reason; it is not a resume difference.
+        let Ok(values) = resolve_params(&node.id, specs, &kept) else {
+            continue;
+        };
+        let in_force = ParamsInForce {
+            specs: specs.to_vec(),
+            values,
+        };
+        differences.extend(in_force.differences(&node.id, &node.params));
+    }
+    if !any_removed {
+        return Ok(None);
+    }
+    if !allow_param_change {
+        judge_param_differences(&differences, false)?;
+        return Ok(None);
+    }
+    // A difference with no current value is a param the node no longer
+    // declares: every other spec resolves to a value.
+    let removed: Vec<_> = differences
+        .into_iter()
+        .filter(|difference| difference.current.is_none())
+        .collect();
+    judge_param_differences(&removed, true)?;
+    let mut stripped = subgraph.clone();
+    for node in &mut stripped.nodes {
+        node.params.retain(|name, _| {
+            !removed
+                .iter()
+                .any(|difference| difference.node == node.id && &difference.param == name)
+        });
+    }
+    Ok(Some(stripped))
 }
 
 /// Apply a mid-run resume anchor to a freshly built runtime.
