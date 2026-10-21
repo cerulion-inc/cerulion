@@ -144,7 +144,7 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
         ..Default::default()
     };
 
-    // Stand in for `Entry::init`: give the target the things a LIVE node's
+    // Stand in for `Entry::init`: give the target the two things a LIVE node's
     // hidden runtime field holds, each distinguishable from what `Default`
     // would mint.
     let virtual_clock = VirtualClock::new();
@@ -158,21 +158,8 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
         log_sites: Default::default(),
     };
 
-    // The third thing: this instance's log state. A once site that already
-    // printed on the target must stay printed through the restore.
-    static ONCE_SITE: cerulion_core::graph::log_sites::LogSite =
-        cerulion_core::graph::log_sites::LogSite::new(file!(), line!(), module_path!());
-    assert!(cerulion_core::graph::log_sites::once_permits(
-        &target.__cer_rt,
-        &ONCE_SITE
-    ));
-
     restore_from(&mut target, &bytes);
 
-    assert!(
-        !cerulion_core::graph::log_sites::once_permits(&target.__cer_rt, &ONCE_SITE),
-        "restore must not swap in a fresh log site table: a once line would print again"
-    );
     assert_eq!(target.frames, 77);
     assert_eq!(target.label, "restored");
 
@@ -197,6 +184,91 @@ fn an_ordinary_node_restores_in_place_and_leaves_every_non_state_field_alone() {
     // afterwards, not something borrowed from the blob.
     target.frames += 1;
     assert_eq!(target.frames, 78);
+}
+
+/// The node's throttle and once log state rides its captured state, after
+/// the fields: a resume from a checkpoint continues each site from the
+/// CHECKPOINT, not from whatever the resumed instance did before the
+/// restore. Driven through the generated `NodeEntry` forwards the runtime
+/// calls, with a hand-written byte oracle.
+#[test]
+fn a_node_checkpoint_carries_its_log_site_state_and_restore_takes_it_from_the_bytes() {
+    use cerulion_core::graph::log_sites::{once_permits, throttle_permits, LogSite};
+    use cerulion_core::graph::node::NodeEntry;
+    use std::time::Duration;
+
+    static ONCE_SITE: LogSite = LogSite::new(file!(), line!(), column!(), module_path!(), "once");
+    static THROTTLE_SITE: LogSite =
+        LogSite::new(file!(), line!(), column!(), module_path!(), "throttle");
+    static TARGET_ONLY_SITE: LogSite =
+        LogSite::new(file!(), line!(), column!(), module_path!(), "target only");
+    const PERIOD: Duration = Duration::from_millis(100);
+
+    let runtime_at = |now: u64| {
+        let clock = VirtualClock::new();
+        clock.set(now);
+        CerNodeRuntimeFields {
+            clock: std::sync::Arc::new(clock),
+            ..Default::default()
+        }
+    };
+
+    // The source: a once line printed and a throttle window opened at 1000 ns.
+    let mut source = OrdinaryNodeEntry::with_state(OrdinaryNode {
+        frames: 77,
+        label: "hi".to_string(),
+        ..Default::default()
+    });
+    source.inner.__cer_rt = runtime_at(1000);
+    assert!(once_permits(&source.inner.__cer_rt, &ONCE_SITE));
+    assert!(throttle_permits(
+        &source.inner.__cer_rt,
+        &THROTTLE_SITE,
+        PERIOD
+    ));
+
+    let mut sink = VecSink::new();
+    source.capture_state(&mut sink).expect("capture");
+    let bytes = sink.into_inner();
+
+    // HAND ORACLE: the fields, then tag `CLOG`, two entries in ascending id
+    // order: the once word is 1, the throttle word is its last emit plus one.
+    let mut entries = [(ONCE_SITE.id(), 1u64), (THROTTLE_SITE.id(), 1001u64)];
+    entries.sort_unstable();
+    let mut oracle = Vec::new();
+    oracle.extend_from_slice(&77u64.to_le_bytes());
+    oracle.extend_from_slice(&2u32.to_le_bytes());
+    oracle.extend_from_slice(b"hi");
+    oracle.extend_from_slice(b"CLOG");
+    oracle.extend_from_slice(&2u32.to_le_bytes());
+    for (id, word) in entries {
+        oracle.extend_from_slice(&id.to_le_bytes());
+        oracle.extend_from_slice(&word.to_le_bytes());
+    }
+    assert_eq!(bytes, oracle);
+
+    // The target: a fresh instance at 1050 ns whose OWN live table printed a
+    // line the checkpoint never saw.
+    let mut target = OrdinaryNodeEntry::new();
+    target.inner.__cer_rt = runtime_at(1050);
+    assert!(once_permits(&target.inner.__cer_rt, &TARGET_ONLY_SITE));
+
+    target.restore_state(&bytes).expect("restore");
+
+    let rt = &target.inner.__cer_rt;
+    assert!(
+        !once_permits(rt, &ONCE_SITE),
+        "the once line printed before the checkpoint does not print again"
+    );
+    assert!(
+        !throttle_permits(rt, &THROTTLE_SITE, PERIOD),
+        "the window the checkpoint opened at 1000 ns is still open at 1050 ns"
+    );
+    assert!(
+        once_permits(rt, &TARGET_ONLY_SITE),
+        "the restored table is the checkpoint's: the target's own entry is gone"
+    );
+    assert_eq!(target.inner.frames, 77);
 }
 
 #[test]

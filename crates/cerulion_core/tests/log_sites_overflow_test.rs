@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The throttle and once log macros past the per-instance table: a binary
-//! with more than `LOG_SITE_SLOTS` (64) call sites.
+//! The throttle and once log macros past the per-instance table: a node
+//! instance that runs more than `LOG_SITE_SLOTS` (64) distinct call sites.
 //!
-//! Slot numbers are counted per linked binary, so this file is its own binary
-//! with ONE test and no other call site: its 65 `warn_once!` sites take slots
-//! 0 to 63 and the 65th overflows, in run order. Hand oracle, over two probe
-//! instances `a` then `b`, each running all 65 sites once:
+//! Each site keys its state by its own stable id, so this file runs 65
+//! `warn_once!` sites on one probe instance: the first 64 to run take the 64
+//! entries and the 65th finds none. Hand oracle, over two probe instances
+//! `a` (run twice) then `b`, each run calling all 65 sites once:
 //!
-//! - `a` prints all 65 lines;
-//! - `b` prints sites 0 to 63 (their state is per instance) and NOT site 64,
-//!   whose state lives in the site's `static` and is shared with `a`;
-//! - the overflow `warn` prints exactly once, at site 64's first run, and
-//!   names this file.
+//! - the first run on `a` prints all 65 lines;
+//! - the second run on `a` prints only site 64: sites 0 to 63 keep their
+//!   once state, site 64 keeps none, so every call to it prints;
+//! - `b` prints all 65 lines: its state is its own, never `a`'s;
+//! - the `error` that site 64 keeps no state prints exactly once, right
+//!   before site 64's first line, and names this file, the line and the
+//!   module.
 //!
 //! ```bash
 //! cargo test -p cerulion_core --test log_sites_overflow_test
@@ -61,10 +63,10 @@ struct Probe {
     __cer_rt: CerNodeRuntimeFields,
 }
 
-/// One `warn_once!` call site per literal: each expansion declares its own
-/// `static` site. Evaluates to `line!()`, which inside a macro expansion is
-/// the line of the outermost invocation: the line every one of these sites
-/// reports.
+/// One `warn_once!` call site per literal: all share one file, line and
+/// column, and the arguments (`k = N`) give each its own id. Evaluates to
+/// `line!()`, which inside a macro expansion is the line of the outermost
+/// invocation: the line every one of these sites reports.
 macro_rules! sites {
     ($p:expr; $($k:literal)*) => {{ $( warn_once!($p, k = $k, "site"); )* line!() }};
 }
@@ -87,7 +89,7 @@ fn site_keys(lines: &[Line]) -> Vec<u32> {
 }
 
 #[test]
-fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
+fn a_site_past_the_table_keeps_no_state_prints_every_call_and_says_so() {
     assert_eq!(LOG_SITE_SLOTS, 64, "the oracle below is written for 64");
     let a = Probe {
         __cer_rt: CerNodeRuntimeFields::default(),
@@ -103,44 +105,51 @@ fn sites_past_the_table_share_state_across_instances_and_say_so_once() {
         (lines, line)
     };
     let (on_a, sites_line) = run(&a);
+    let (on_a_again, _) = run(&a);
     let (on_b, _) = run(&b);
 
     assert_eq!(site_keys(&on_a), (0..=64).collect::<Vec<u32>>());
     assert_eq!(
+        site_keys(&on_a_again),
+        vec![64],
+        "sites 0 to 63 keep their once state; site 64 keeps none and prints again"
+    );
+    assert_eq!(
         site_keys(&on_b),
-        (0..=63).collect::<Vec<u32>>(),
-        "sites 0 to 63 are per instance; site 64 shares a's state"
+        (0..=64).collect::<Vec<u32>>(),
+        "b prints every line: no site shares a's state"
     );
 
-    let overflow = |lines: &[Line]| -> Vec<Line> {
+    let unkept = |lines: &[Line]| -> Vec<Line> {
         lines
             .iter()
-            .filter(|(m, _, _)| m.contains("per-instance table"))
+            .filter(|(m, _, _)| m.contains("than its table holds"))
             .cloned()
             .collect()
     };
-    let warned_a = overflow(&on_a);
-    assert_eq!(warned_a.len(), 1, "one overflow warn: {on_a:?}");
-    assert!(overflow(&on_b).is_empty(), "never a second one: {on_b:?}");
-    // It comes right before site 64's own line, and names this file.
-    let at = on_a.iter().position(|l| l == &warned_a[0]).unwrap();
+    let said = unkept(&on_a);
+    assert_eq!(said.len(), 1, "one error for the one unkept site: {on_a:?}");
+    assert!(unkept(&on_a_again).is_empty(), "said once: {on_a_again:?}");
+    assert!(unkept(&on_b).is_empty(), "said once: {on_b:?}");
+    // It comes right before site 64's own line, and names the site.
+    let at = on_a.iter().position(|l| l == &said[0]).unwrap();
     assert_eq!(on_a[at + 1].1, vec!["k=64"]);
-    assert_eq!(warned_a[0].2, Level::WARN, "the overflow notice is a warn");
+    assert_eq!(said[0].2, Level::ERROR, "a site with no state is an error");
     assert!(
-        warned_a[0]
+        said[0]
             .1
             .iter()
             .any(|f| f.starts_with("site=") && f.contains("log_sites_overflow_test.rs")),
-        "the warn names the site: {:?}",
-        warned_a[0]
+        "the error names the site: {:?}",
+        said[0]
     );
     let want_line = format!("line={sites_line}");
     assert!(
-        warned_a[0].1.iter().any(|f| f == &want_line),
-        "the warn names the site's line, {want_line}: {:?}",
-        warned_a[0]
+        said[0].1.iter().any(|f| f == &want_line),
+        "the error names the site's line, {want_line}: {:?}",
+        said[0]
     );
-    assert!(warned_a[0]
+    assert!(said[0]
         .1
         .iter()
         .any(|f| f == "module=log_sites_overflow_test"));

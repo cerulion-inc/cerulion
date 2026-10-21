@@ -21,11 +21,12 @@
 //!
 //! A throttle reads the node's own clock, the one `self.now_ns()` reads, never
 //! the wall clock. Under `--time-source virtual`, and when a recording is
-//! re-executed from its first step, the emit and suppress pattern is a pure
-//! function of graph time, so two runs print the same lines. A re-execution
-//! from a mid-run checkpoint builds fresh nodes, and this state is not part
-//! of a node's captured state, so it starts fresh at the anchor: the first
-//! call at each site emits there. The rule, in graph nanoseconds:
+//! re-executed, the emit and suppress pattern is a pure function of graph
+//! time, so two runs print the same lines. The state is part of the node's
+//! captured state, so a re-execution from a mid-run checkpoint continues each
+//! site's once and throttle state from that checkpoint: a once line that
+//! printed before the checkpoint does not print again, and an open throttle
+//! window stays open. The rule, in graph nanoseconds:
 //!
 //! - the first call at a site emits;
 //! - a later call emits when `now >= last_emit + period` (a call exactly at
@@ -43,68 +44,109 @@
 //!
 //! # State
 //!
-//! Each call site owns one `static` [`LogSite`]: a slot number it takes the
-//! first time it runs. The state itself is one word per slot in a fixed table
-//! inside each node instance ([`LogSiteTable`], [`LOG_SITE_SLOTS`] slots), so
-//! a `once` site emits once PER NODE INSTANCE, and two instances of one node
-//! type keep separate throttles. Two call sites never share a slot; the same
-//! call site inside a loop is one site. Nothing grows: no map, no
-//! allocation.
+//! Each call site has a stable id, fixed when the node is compiled: a hash of
+//! its module path, file, line, column, macro name and arguments. The same
+//! source gives the same id in every run and every build, so a checkpoint
+//! names each site by id. Two log calls that one invocation of a user's own
+//! macro produces with the same arguments get the same id, so they count as
+//! one site.
 //!
-//! Slot numbers are counted per linked binary: each node cdylib counts its
-//! own sites, and an in-process host counts every site of every node type
-//! linked into it, together. Past [`LOG_SITE_SLOTS`] sites in one binary, the
-//! extra sites keep their state in the site's `static`, which every instance
-//! of that node type shares, and the first such site says so once with a
-//! `warn` that names its file, line and module.
+//! The state itself is one entry per site in a fixed table inside each node
+//! instance ([`LogSiteTable`], [`LOG_SITE_SLOTS`] entries), keyed by the
+//! site's id, so a `once` site emits once PER NODE INSTANCE, and two
+//! instances of one node type keep separate throttles. The same call site
+//! inside a loop is one site. Nothing grows: no map, no allocation.
+//!
+//! An instance whose code runs more than [`LOG_SITE_SLOTS`] distinct sites
+//! has no entry for the extra ones. Such a site keeps no state at all: every
+//! call emits, as the plain macro would, and the first time each such site
+//! runs it says so with an `error` that names its file, line and module. No
+//! site ever shares state with another site or another instance.
 //!
 //! # Cost
 //!
-//! A suppressed call is one atomic load of the slot number, one clock
-//! read (throttle only) and one relaxed atomic load of the slot. It does not
-//! format or evaluate its message arguments, and it allocates nothing. A
-//! level the build compiles out (a release build removes `debug` and
-//! `trace`) costs nothing: the call does not read the clock, keeps no state
-//! and takes no slot.
+//! A suppressed call is a few relaxed atomic loads (the table lookup and the
+//! state word) and one clock read (throttle only). It does not format or
+//! evaluate its message arguments, and it allocates nothing. A level the
+//! build compiles out (a release build removes `debug` and `trace`) costs
+//! nothing: the call does not read the clock, keeps no state and takes no
+//! entry.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::graph::node::CerNodeRuntimeFields;
+use crate::state::{StateCursor, StateError, StateSink};
 
-/// Slots in each node instance's [`LogSiteTable`]: the number of throttle and
-/// once call sites one linked binary (a node cdylib, or an in-process host
-/// with all its node types) can hold per instance.
+/// Entries in each node instance's [`LogSiteTable`]: the number of distinct
+/// throttle and once call sites one node instance keeps state for.
 pub const LOG_SITE_SLOTS: usize = 64;
 
-/// Slot word meaning "this site has not emitted yet".
+/// State word meaning "this site has not emitted yet".
 const NEVER: u64 = 0;
 
-/// Slot number a [`LogSite`] holds before its first call.
-const UNASSIGNED: u32 = u32::MAX;
+/// Entry id meaning "this entry holds no site". [`site_id`] never returns it.
+const EMPTY: u64 = 0;
 
-/// Slot number a [`LogSite`] holds while its first caller takes a number.
-const RESERVING: u32 = u32::MAX - 1;
+/// The first word of a captured log site section ("CLOG", little-endian).
+/// It tells the section apart from bytes a changed field list left behind.
+const SECTION_TAG: u32 = u32::from_le_bytes(*b"CLOG");
 
-/// The next free slot number in this linked copy of the framework. Each node
-/// cdylib links its own copy, so each node library numbers its own sites; an
-/// in-process host numbers the sites of all its node types from one counter.
-static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
+/// FNV-1a over `bytes`, continuing from `hash`.
+const fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
 
-/// Set once the first site past [`LOG_SITE_SLOTS`] has said so.
-static OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
+/// The stable id of the call site at `file:line:column` in `module`, where
+/// `call` is the macro name and its arguments as written. A pure function of
+/// the source, computed at compile time. Never [`EMPTY`].
+///
+/// A `0xff` byte separates the text parts: it never occurs in UTF-8, so no
+/// two different sites hash the same bytes.
+#[doc(hidden)]
+pub const fn site_id(module: &str, file: &str, line: u32, column: u32, call: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    hash = fnv1a(hash, module.as_bytes());
+    hash = fnv1a(hash, &[0xff]);
+    hash = fnv1a(hash, file.as_bytes());
+    hash = fnv1a(hash, &[0xff]);
+    hash = fnv1a(hash, &line.to_le_bytes());
+    hash = fnv1a(hash, &column.to_le_bytes());
+    hash = fnv1a(hash, call.as_bytes());
+    if hash == EMPTY {
+        1
+    } else {
+        hash
+    }
+}
 
-/// The per-instance state table, one word per call site. Lives in the hidden
-/// runtime fields every `#[cerulion_node]` struct carries.
+/// One table entry: the id of the site that owns it and its state word.
+struct Entry {
+    id: AtomicU64,
+    word: AtomicU64,
+}
+
+/// The per-instance state table, one entry per call site, keyed by the
+/// site's stable id. Lives in the hidden runtime fields every
+/// `#[cerulion_node]` struct carries, and rides the node's captured state.
 #[doc(hidden)]
 pub struct LogSiteTable {
-    slots: [AtomicU64; LOG_SITE_SLOTS],
+    entries: [Entry; LOG_SITE_SLOTS],
 }
 
 impl Default for LogSiteTable {
     fn default() -> Self {
         Self {
-            slots: std::array::from_fn(|_| AtomicU64::new(NEVER)),
+            entries: std::array::from_fn(|_| Entry {
+                id: AtomicU64::new(EMPTY),
+                word: AtomicU64::new(NEVER),
+            }),
         }
     }
 }
@@ -120,15 +162,156 @@ impl Clone for LogSiteTable {
 
 impl std::fmt::Debug for LogSiteTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let used = self
-            .slots
-            .iter()
-            .filter(|s| s.load(Ordering::Relaxed) != NEVER)
-            .count();
         f.debug_struct("LogSiteTable")
             .field("slots", &LOG_SITE_SLOTS)
-            .field("used", &used)
+            .field("used", &self.used())
             .finish()
+    }
+}
+
+impl LogSiteTable {
+    /// The state word of the site `id`, taking a free entry on the site's
+    /// first call. `None` when every entry holds another site.
+    ///
+    /// Open addressing with linear probing from `id % LOG_SITE_SLOTS`. An
+    /// entry, once taken, keeps its id for the life of the table (only
+    /// [`Self::restore`], which holds the table exclusively, rewrites ids),
+    /// so a probe that passes an entry never has to look at it again.
+    fn word(&self, id: u64) -> Option<&AtomicU64> {
+        let start = (id % LOG_SITE_SLOTS as u64) as usize;
+        for step in 0..LOG_SITE_SLOTS {
+            let entry = &self.entries[(start + step) % LOG_SITE_SLOTS];
+            let held = entry.id.load(Ordering::Acquire);
+            if held == id {
+                return Some(&entry.word);
+            }
+            if held == EMPTY {
+                match entry
+                    .id
+                    .compare_exchange(EMPTY, id, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    // This call took the entry, or a racing first call of
+                    // the same site took it a moment earlier.
+                    Ok(_) => return Some(&entry.word),
+                    Err(won) if won == id => return Some(&entry.word),
+                    // Another site took it: keep probing.
+                    Err(_) => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Entries that hold a site.
+    fn used(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.id.load(Ordering::Relaxed) != EMPTY)
+            .count()
+    }
+
+    /// Write this table into a node's captured state. A table no site has
+    /// used writes nothing, so a node without throttle or once calls captures
+    /// exactly the bytes of its fields and accumulate inputs. The node's
+    /// generated `capture_state` appends this last.
+    ///
+    /// Layout (little-endian): `u32` tag `CLOG`, `u32` entry count, then per
+    /// entry `u64` site id and `u64` state word, in ascending id order, so
+    /// one table state has one encoding whatever order its sites first ran
+    /// in.
+    ///
+    /// # Errors
+    ///
+    /// What the sink refuses.
+    pub fn capture(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
+        let used = self.used();
+        if used == 0 {
+            return Ok(());
+        }
+        out.write(&SECTION_TAG.to_le_bytes())?;
+        // At most `LOG_SITE_SLOTS` (64), so the cast is exact.
+        out.write(&(used as u32).to_le_bytes())?;
+        // Ascending id order without a buffer: each pass writes the smallest
+        // id above the last one written. 64 entries, at a checkpoint only.
+        let mut floor: Option<u64> = None;
+        for _ in 0..used {
+            let next = self
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    let id = e.id.load(Ordering::Acquire);
+                    let above = floor.is_none_or(|f| id > f);
+                    (id != EMPTY && above).then_some((id, e))
+                })
+                .min_by_key(|(id, _)| *id);
+            let Some((id, entry)) = next else { break };
+            out.write(&id.to_le_bytes())?;
+            out.write(&entry.word.load(Ordering::Relaxed).to_le_bytes())?;
+            floor = Some(id);
+        }
+        Ok(())
+    }
+
+    /// Replace this table with what [`Self::capture`] wrote. The table ends
+    /// up holding exactly the recorded entries: a site the recording does not
+    /// name starts fresh, whatever this instance did before the restore. No
+    /// bytes left in `src` means the recorded table was empty. The node's
+    /// generated `restore_state` calls this after its accumulate inputs,
+    /// before the cursor's trailing-byte check.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::TrailingBytes`] when the bytes left do not open with the
+    /// section tag (the node's field list changed since the recording);
+    /// [`StateError::LogSiteRestore`] when the section holds more entries
+    /// than the table, or repeats or misorders an id; the cursor's own errors
+    /// for truncated bytes.
+    // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
+    // it allocates only to name a refusal
+    pub fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
+        *self = Self::default();
+        if src.is_empty() {
+            return Ok(());
+        }
+        // Bytes that do not open with the tag are not a log site section:
+        // the node's field list disagrees with the recorded one, the drift
+        // the cursor's trailing-byte check reports, so report it the same way.
+        let remaining = src.remaining();
+        if remaining < 4 || src.take_array::<4>()? != SECTION_TAG.to_le_bytes() {
+            return Err(StateError::TrailingBytes { remaining });
+        }
+        let refuse = |reason: String| StateError::LogSiteRestore { reason };
+        let count = src.read_element_count()?;
+        if count > LOG_SITE_SLOTS {
+            return Err(refuse(format!(
+                "the recording holds {count} log sites, a node instance holds at most \
+                 {LOG_SITE_SLOTS}"
+            )));
+        }
+        let mut last: Option<u64> = None;
+        for _ in 0..count {
+            let id = u64::from_le_bytes(src.take_array::<8>()?);
+            let word = u64::from_le_bytes(src.take_array::<8>()?);
+            if id == EMPTY {
+                return Err(refuse(String::from(
+                    "the recording holds a log site with id 0",
+                )));
+            }
+            if last.is_some_and(|l| id <= l) {
+                return Err(refuse(format!(
+                    "the recording lists log site 0x{id:016x} out of ascending order; a \
+                     capture never does"
+                )));
+            }
+            match self.word(id) {
+                Some(slot) => slot.store(word, Ordering::Relaxed),
+                // Unreachable: `count` is at most the table size and every
+                // id is distinct, so each one finds a free entry.
+                None => return Err(refuse(format!("no free entry for log site 0x{id:016x}"))),
+            }
+            last = Some(id);
+        }
+        Ok(())
     }
 }
 
@@ -136,77 +319,56 @@ impl std::fmt::Debug for LogSiteTable {
 /// each call.
 #[doc(hidden)]
 pub struct LogSite {
-    slot: AtomicU32,
-    /// Where the site is, for the one overflow `warn`.
+    /// The stable id ([`site_id`]).
+    id: u64,
+    /// Where the site is, for the error a site with no table entry prints.
     file: &'static str,
     line: u32,
     module: &'static str,
-    /// The state word for a site past [`LOG_SITE_SLOTS`]: shared by every
-    /// instance of the node type.
-    overflow: AtomicU64,
+    /// Set once this site has said it has no table entry.
+    unkept_reported: AtomicBool,
 }
 
 impl LogSite {
-    /// A site at `file:line` in `module` that has not run yet.
-    pub const fn new(file: &'static str, line: u32, module: &'static str) -> Self {
+    /// The site at `file:line:column` in `module`, whose macro name and
+    /// arguments read `call`.
+    pub const fn new(
+        file: &'static str,
+        line: u32,
+        column: u32,
+        module: &'static str,
+        call: &'static str,
+    ) -> Self {
         Self {
-            slot: AtomicU32::new(UNASSIGNED),
+            id: site_id(module, file, line, column, call),
             file,
             line,
             module,
-            overflow: AtomicU64::new(NEVER),
+            unkept_reported: AtomicBool::new(false),
         }
     }
 
-    /// The slot number, taken on the first call.
-    ///
-    /// Exactly one caller takes a number from [`NEXT_SLOT`]: the first to move
-    /// the site from [`UNASSIGNED`] to [`RESERVING`]. Callers that race it wait
-    /// for its number instead of taking one of their own, so concurrent first
-    /// calls never spend a slot the site does not keep. The wait happens once
-    /// per site, on its first calls only.
-    fn slot(&self) -> u32 {
-        let slot = self.slot.load(Ordering::Acquire);
-        if slot != UNASSIGNED && slot != RESERVING {
-            return slot;
-        }
-        if self
-            .slot
-            .compare_exchange(UNASSIGNED, RESERVING, Ordering::Acquire, Ordering::Acquire)
-            .is_ok()
-        {
-            let fresh = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-            self.slot.store(fresh, Ordering::Release);
-            return fresh;
-        }
-        loop {
-            let slot = self.slot.load(Ordering::Acquire);
-            if slot != RESERVING {
-                return slot;
-            }
-            std::thread::yield_now();
-        }
+    /// The site's stable id.
+    pub const fn id(&self) -> u64 {
+        self.id
     }
 
-    /// The state word this site uses in `table`.
-    fn word<'a>(&'a self, table: &'a LogSiteTable) -> &'a AtomicU64 {
-        match table.slots.get(self.slot() as usize) {
-            Some(word) => word,
-            None => {
-                if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        slots = LOG_SITE_SLOTS,
-                        site = %self.file,
-                        line = self.line,
-                        module = %self.module,
-                        "this binary has more throttle and once log call sites than the \
-                         per-instance table holds; this site and every later one share \
-                         their state across every instance of the node type"
-                    );
-                }
-                &self.overflow
-            }
+    /// The state word this site uses in `table`, or `None` when the table is
+    /// full. The first `None` for this site says so with an `error`.
+    fn word<'a>(&self, table: &'a LogSiteTable) -> Option<&'a AtomicU64> {
+        let word = table.word(self.id);
+        if word.is_none() && !self.unkept_reported.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                slots = LOG_SITE_SLOTS,
+                site = %self.file,
+                line = self.line,
+                module = %self.module,
+                "this node instance runs more distinct throttle and once log call sites \
+                 than its table holds; this site keeps no state, so every call to it \
+                 prints"
+            );
         }
+        word
     }
 }
 
@@ -254,7 +416,9 @@ fn decode(word: u64) -> Option<u64> {
 #[doc(hidden)]
 #[inline]
 pub fn throttle_permits(rt: &CerNodeRuntimeFields, site: &LogSite, period: Duration) -> bool {
-    let word = site.word(&rt.log_sites);
+    let Some(word) = site.word(&rt.log_sites) else {
+        return true;
+    };
     let now = rt.clock.now_ns().min(LATEST);
     let period_ns = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
     let old = word.load(Ordering::Relaxed);
@@ -276,7 +440,9 @@ pub fn throttle_permits(rt: &CerNodeRuntimeFields, site: &LogSite, period: Durat
 #[doc(hidden)]
 #[inline]
 pub fn once_permits(rt: &CerNodeRuntimeFields, site: &LogSite) -> bool {
-    let word = site.word(&rt.log_sites);
+    let Some(word) = site.word(&rt.log_sites) else {
+        return true;
+    };
     word.load(Ordering::Relaxed) == NEVER && word.swap(1, Ordering::Relaxed) == NEVER
 }
 
@@ -334,11 +500,13 @@ macro_rules! __cer_log_throttle {
             $crate::graph::log_sites::LogSite::new(
                 ::core::file!(),
                 ::core::line!(),
+                ::core::column!(),
                 ::core::module_path!(),
+                ::core::concat!($name, "(", ::core::stringify!($($arg)+), ")"),
             );
         // A level this build compiles out (`release_max_level_info` removes
         // debug and trace) does no work at all: no clock read, no state, no
-        // slot. The comparison is a constant, so the branch compiles away.
+        // table entry. The comparison is a constant, so the branch compiles away.
         if $crate::tracing::Level::$LEVEL <= $crate::tracing::level_filters::STATIC_MAX_LEVEL
             && $crate::graph::log_sites::throttle_permits(
             &$node.__cer_rt,
@@ -371,10 +539,12 @@ macro_rules! __cer_log_once {
             $crate::graph::log_sites::LogSite::new(
                 ::core::file!(),
                 ::core::line!(),
+                ::core::column!(),
                 ::core::module_path!(),
+                ::core::concat!($name, "(", ::core::stringify!($($arg)+), ")"),
             );
         // As for a throttle: a compiled-out level does no work and takes no
-        // slot.
+        // table entry.
         if $crate::tracing::Level::$LEVEL <= $crate::tracing::level_filters::STATIC_MAX_LEVEL
             && $crate::graph::log_sites::once_permits(&$node.__cer_rt, &__CER_LOG_SITE)
         {
@@ -537,44 +707,179 @@ mod tests {
         assert_eq!(super::decode(super::NEVER), None);
     }
 
-    /// Sixteen threads make the FIRST call at one site at the same moment. The
-    /// site keeps one number and the counter moves by exactly one: no racer
-    /// spends a slot of its own. No other code in this library takes slot
-    /// numbers, so the counter is this test's to read.
+    /// FNV-1a 64 over the published test vectors: the empty input is the
+    /// offset basis, and `"a"` is `0xaf63dc4c8601ec8c`.
     #[test]
-    fn concurrent_first_calls_at_one_site_take_exactly_one_slot() {
-        use std::sync::atomic::Ordering;
+    fn the_site_hash_is_fnv1a_over_the_published_vectors() {
+        const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        assert_eq!(super::fnv1a(BASIS, b""), BASIS);
+        assert_eq!(super::fnv1a(BASIS, b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(super::fnv1a(BASIS, b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn a_site_id_is_a_pure_function_of_the_source_and_each_part_counts() {
+        use super::site_id;
+        let base = site_id("m", "f.rs", 10, 5, "warn_once(\"x\")");
+        assert_eq!(base, site_id("m", "f.rs", 10, 5, "warn_once(\"x\")"));
+        for other in [
+            site_id("m2", "f.rs", 10, 5, "warn_once(\"x\")"),
+            site_id("m", "g.rs", 10, 5, "warn_once(\"x\")"),
+            site_id("m", "f.rs", 11, 5, "warn_once(\"x\")"),
+            site_id("m", "f.rs", 10, 6, "warn_once(\"x\")"),
+            site_id("m", "f.rs", 10, 5, "warn_once(\"y\")"),
+            // The separator keeps a byte from moving between two parts.
+            site_id("mf", ".rs", 10, 5, "warn_once(\"x\")"),
+        ] {
+            assert_ne!(base, other);
+        }
+        // Computed at compile time, as the macros use it.
+        const AT_COMPILE_TIME: u64 = super::site_id("m", "f.rs", 10, 5, "warn_once(\"x\")");
+        assert_eq!(AT_COMPILE_TIME, base);
+        assert_ne!(base, super::EMPTY);
+    }
+
+    /// Sixteen threads make the FIRST call at one site on one table at the
+    /// same moment: the site takes exactly one entry, and every racer gets
+    /// that entry's word.
+    #[test]
+    fn concurrent_first_calls_at_one_site_take_exactly_one_entry() {
         use std::sync::Barrier;
 
-        static RACED: super::LogSite = super::LogSite::new(file!(), line!(), module_path!());
-        static NEXT: super::LogSite = super::LogSite::new(file!(), line!(), module_path!());
         const RACERS: usize = 16;
-
-        let before = super::NEXT_SLOT.load(Ordering::SeqCst);
+        let table = super::LogSiteTable::default();
         let barrier = Barrier::new(RACERS);
-        let slots: Vec<u32> = std::thread::scope(|s| {
+        let words: Vec<usize> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..RACERS)
                 .map(|_| {
                     s.spawn(|| {
                         barrier.wait();
-                        RACED.slot()
+                        let word = table.word(0x1234).expect("an empty table has room");
+                        std::ptr::from_ref(word) as usize
                     })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         assert!(
-            slots.iter().all(|&n| n == slots[0]),
-            "every racer sees the one number the site keeps: {slots:?}"
+            words.iter().all(|&w| w == words[0]),
+            "every racer sees the one entry the site took"
         );
-        assert_eq!(slots[0], before, "the site took the next free number");
         assert_eq!(
-            super::NEXT_SLOT.load(Ordering::SeqCst),
-            before + 1,
-            "the race spent one number, not one per racer"
+            table.used(),
+            1,
+            "the race took one entry, not one per racer"
         );
-        // The next site gets the very next number: nothing was skipped.
-        assert_eq!(NEXT.slot(), before + 1);
-        assert_eq!(RACED.slot(), before, "a later call reads the same number");
+    }
+
+    /// Sites whose ids all start their probe at entry 0 still each get an
+    /// entry of their own until the table is full; the next site gets none.
+    #[test]
+    fn a_full_table_has_no_entry_for_one_more_site_and_keeps_every_other() {
+        let table = super::LogSiteTable::default();
+        let slots = super::LOG_SITE_SLOTS as u64;
+        // Ids k * 64 + 64 all hash to entry 0 and probe from there.
+        let ids: Vec<u64> = (1..=slots).map(|k| k * slots).collect();
+        for (n, &id) in ids.iter().enumerate() {
+            table
+                .word(id)
+                .expect("room")
+                .store(n as u64 + 1, Ordering::Relaxed);
+        }
+        assert!(table.word(9 * slots + 1).is_none(), "65th site: no entry");
+        for (n, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                table.word(id).unwrap().load(Ordering::Relaxed),
+                n as u64 + 1,
+                "site {id} keeps its own word"
+            );
+        }
+    }
+
+    use std::sync::atomic::Ordering;
+
+    fn captured(table: &super::LogSiteTable) -> Vec<u8> {
+        let mut sink = crate::state::VecSink::new();
+        table.capture(&mut sink).expect("unbounded capture");
+        sink.into_inner()
+    }
+
+    #[test]
+    fn an_unused_table_captures_nothing_and_restores_from_nothing() {
+        let table = super::LogSiteTable::default();
+        assert!(captured(&table).is_empty());
+        let mut target = super::LogSiteTable::default();
+        target.word(7).unwrap().store(3, Ordering::Relaxed);
+        let mut cursor = crate::state::StateCursor::new(&[]);
+        target
+            .restore(&mut cursor)
+            .expect("an empty section is an empty table");
+        assert_eq!(
+            target.used(),
+            0,
+            "the live entry did not survive the restore"
+        );
+    }
+
+    /// HAND ORACLE: tag, count, then (id, word) pairs in ascending id order,
+    /// whatever order the sites first ran in.
+    #[test]
+    fn a_table_captures_in_ascending_id_order_and_restores_to_the_same_bytes() {
+        let table = super::LogSiteTable::default();
+        table.word(0x30).unwrap().store(1, Ordering::Relaxed);
+        table.word(0x10).unwrap().store(0x0506, Ordering::Relaxed);
+        let mut oracle = Vec::new();
+        oracle.extend_from_slice(b"CLOG");
+        oracle.extend_from_slice(&2u32.to_le_bytes());
+        oracle.extend_from_slice(&0x10u64.to_le_bytes());
+        oracle.extend_from_slice(&0x0506u64.to_le_bytes());
+        oracle.extend_from_slice(&0x30u64.to_le_bytes());
+        oracle.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(captured(&table), oracle);
+
+        let mut target = super::LogSiteTable::default();
+        target.word(0x99).unwrap().store(1, Ordering::Relaxed);
+        let mut cursor = crate::state::StateCursor::new(&oracle);
+        target.restore(&mut cursor).expect("restore");
+        assert!(cursor.is_empty());
+        assert_eq!(captured(&target), oracle, "exactly the recorded entries");
+        assert_eq!(target.word(0x10).unwrap().load(Ordering::Relaxed), 0x0506);
+    }
+
+    fn refusal(bytes: &[u8]) -> String {
+        let mut table = super::LogSiteTable::default();
+        let mut cursor = crate::state::StateCursor::new(bytes);
+        table.restore(&mut cursor).expect_err("refused").to_string()
+    }
+
+    fn section(count: u32, ids: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"CLOG");
+        out.extend_from_slice(&count.to_le_bytes());
+        for id in ids {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&1u64.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn a_restore_refuses_bytes_that_are_not_a_canonical_log_site_section() {
+        // Bytes a changed field list left behind: the trailing-byte drift
+        // signal, whether shorter than the tag or not.
+        assert!(refusal(&[1, 2, 3, 4, 5]).contains("5 trailing byte(s)"));
+        assert!(refusal(&[0xab]).contains("1 trailing byte(s)"));
+        // Repeated and misordered ids.
+        assert!(refusal(&section(2, &[5, 5])).contains("out of ascending order"));
+        assert!(refusal(&section(2, &[6, 5])).contains("out of ascending order"));
+        // The reserved id.
+        assert!(refusal(&section(1, &[0])).contains("id 0"));
+        // More entries than a table holds.
+        let ids: Vec<u64> = (1..=65).collect();
+        assert!(refusal(&section(65, &ids)).contains("at most 64"));
+        // Truncated.
+        let mut short = section(1, &[5]);
+        short.pop();
+        assert!(refusal(&short).contains("truncated"));
     }
 }
