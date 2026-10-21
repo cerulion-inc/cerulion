@@ -484,9 +484,8 @@ fn apply_demand_reconcile(
 
 /// The belt feed: refresh `topics` (the reconciler belt's
 /// live iteration set) from the bridge manager's registered-topic snapshot (THE
-/// source of truth for which topics may egress), using the SAME monotonic-count
-/// dirty-check discipline [`crate::transport::gateway::GatewayRuntime::drive_once`]
-/// uses.
+/// source of truth for which topics may egress), re-snapshotting only when the
+/// registered membership changed (see the cost discipline below).
 ///
 /// # Why the belt needs this
 ///
@@ -502,15 +501,16 @@ fn apply_demand_reconcile(
 ///
 /// # Cost discipline
 ///
-/// The bridge `bridges` map is ADD-ONLY (`register_topic` inserts; nothing
-/// removes a key), so `registered_topic_count()` is MONOTONIC and a bare count
-/// read (one uncontended mutex lock, no alloc) is a reliable "a new egress topic
-/// registered" dirty-check. The per-pass steady-state cost is exactly that one
-/// count read; only a GROWN count takes the full (locked, allocating) snapshot +
-/// rebuilds `topics`. The seed at thread spawn IS the boot announce set (whose
-/// length equals the registered count at boot - both derived from the same
-/// snapshot), so the dirty-check is stable from the first pass and never
-/// re-snapshots spuriously.
+/// The per-pass steady-state cost is one
+/// [`TopicBridgeManager::registered_set_is`] check (one mutex lock and one
+/// hash lookup per topic, no allocation). Only a CHANGED membership takes the
+/// full (locked, allocating) snapshot and rebuilds `topics`. A count check
+/// alone is not enough: a host that restarts its gateway inside one process
+/// (`TopicBridgeManager::unregister_topics_except`) can drop `/a` and then
+/// register `/b`, and this thread outlives that gateway, so a same-count swap
+/// must re-snapshot too. The seed at thread spawn IS the boot announce set
+/// (canonical, deduplicated), so the check is stable from the first pass and
+/// never re-snapshots spuriously.
 ///
 /// Robust: a poisoned bridge mutex leaves `topics` UNCHANGED (the belt keeps its
 /// last-known set + logs at `debug!` - never wedges, never silently drops a
@@ -518,10 +518,13 @@ fn apply_demand_reconcile(
 /// `topics` needs no re-canonicalization ([`apply_demand_reconcile`] canonicalizes
 /// each entry again anyway, a no-op on an already-canonical name).
 fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<String>) {
-    match bridge_mgr.registered_topic_count() {
-        // Grew since the last pass - a runtime registration. Re-snapshot the live
-        // registered set (canonical + sorted) into `topics`.
-        Ok(count) if count > topics.len() => match bridge_mgr.registered_topics() {
+    match bridge_mgr.registered_set_is(topics) {
+        // Unchanged (steady state) - the cheap path, no snapshot.
+        Ok(true) => {}
+        // The membership changed - a runtime registration, or a host restart
+        // that retired the prior run's topics. Re-snapshot the live registered
+        // set (canonical + sorted) into `topics`.
+        Ok(false) => match bridge_mgr.registered_topics() {
             Ok(registered) => {
                 topics.clear();
                 topics.extend(registered.into_iter().map(|(topic, _)| topic));
@@ -532,11 +535,9 @@ fn refresh_reconcile_topics(bridge_mgr: &TopicBridgeManager, topics: &mut Vec<St
                  (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
             ),
         },
-        // Unchanged (steady state) - the cheap path, no snapshot.
-        Ok(_) => {}
         Err(e) => tracing::debug!(
             error = %e,
-            "reconciler belt: could not read the registered egress count \
+            "reconciler belt: could not read the registered egress set \
              (bridge manager poisoned); the belt keeps its last-known iteration set this pass"
         ),
     }
@@ -4349,10 +4350,14 @@ impl NetworkManager {
         state.shutdown_tx = Some(tx);
 
         // Canonicalize once so the thread compares against canonical demand keys.
-        let announced: Vec<String> = announced
+        // Deduplicated too, so the belt's membership check matches the
+        // registered set from the first pass.
+        let mut announced: Vec<String> = announced
             .iter()
             .map(|t| canonical_topic(t).into_owned())
             .collect();
+        announced.sort();
+        announced.dedup();
         let topic_count = announced.len();
 
         let handle = std::thread::Builder::new()
@@ -5452,6 +5457,36 @@ mod tests {
                 ("/run_two/cam", CatalogProvenance::Boot),
                 ("/host/late", CatalogProvenance::Runtime),
             ])
+        );
+    }
+
+    /// The belt's iteration set must follow a host restart that keeps the
+    /// registered count: the reconciler thread outlives the prior gateway, so
+    /// a run serving `/a` replaced by one serving `/b` must re-snapshot, or
+    /// `/b` is never re-affirmed by the belt. Hand oracle: the set is `[/b]`
+    /// after the swap, and an unchanged set in a different order is left as is.
+    #[test]
+    fn the_belt_set_follows_a_same_count_restart_swap() {
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/a").expect("register a");
+        let mut topics = vec!["/a".to_string()];
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/a"]);
+
+        bridge
+            .unregister_topics_except(&[])
+            .expect("retire the prior run");
+        bridge.register_topic("/b").expect("register b");
+        refresh_reconcile_topics(&bridge, &mut topics);
+        assert_eq!(topics, ["/b"]);
+
+        bridge.register_topic("/c").expect("register c");
+        let mut unsorted = vec!["/c".to_string(), "/b".to_string()];
+        refresh_reconcile_topics(&bridge, &mut unsorted);
+        assert_eq!(
+            unsorted,
+            ["/c", "/b"],
+            "an unchanged set is not re-snapshotted"
         );
     }
 
