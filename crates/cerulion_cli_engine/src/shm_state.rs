@@ -980,7 +980,7 @@ impl SystemProbe for LibcProbe {
         let c_name = std::ffi::CString::new(name).ok()?;
         // SAFETY: `c_name` is a valid NUL-terminated string for the duration of
         // the call; no `O_CREAT`, so this can only observe an existing object.
-        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+        let fd = unsafe { cerulion_core::posix_shm::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
         if fd < 0 {
             return None;
         }
@@ -1007,7 +1007,7 @@ impl SystemProbe for LibcProbe {
         let c_name = std::ffi::CString::new(name)
             .map_err(|_| "the recorded name contains an interior NUL".to_string())?;
         // SAFETY: `c_name` is a valid NUL-terminated string for the call.
-        let rc = unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(c_name.as_ptr()) };
         if rc == 0 {
             return Ok(());
         }
@@ -4492,9 +4492,10 @@ mod tests {
         // reported as a liveness answer.
         assert_eq!(probe.process_liveness(0), ProcessLiveness::Unknown);
         assert_eq!(probe.process_liveness(-1), ProcessLiveness::Unknown);
-        assert_eq!(probe.shm_object_size("no-such-object-anywhere"), None);
+        let missing_name = format!("/cerulion-no-such-object-{}", std::process::id());
+        assert_eq!(probe.shm_object_size(&missing_name), None);
         assert!(
-            probe.unlink_shm_object("no-such-object-anywhere").is_ok(),
+            probe.unlink_shm_object(&missing_name).is_ok(),
             "an already-absent object is the same outcome as one we just removed"
         );
     }

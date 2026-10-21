@@ -35,6 +35,20 @@ pub extern "C" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {
     ::cerulion_core::rustc_fingerprint_cstr()
 }
 
+// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
+// build of this library is refused at load on Android (see docs/android.md).
+// A raw-FFI library without this export does not load on Android.
+#[no_mangle]
+pub extern "C" fn cerulion_node_platform_check() -> i32 {
+    match ::cerulion_core::graph::node::cdylib_platform_check() {
+        ::std::result::Result::Ok(()) => 0,
+        ::std::result::Result::Err(error) => {
+            __cer_set_last_error(::std::format!("node library: {error}"));
+            1
+        }
+    }
+}
+
 // CERULION:INFO_START
 static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
 

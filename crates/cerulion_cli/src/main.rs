@@ -274,6 +274,18 @@ fn dispatch(cli: Cli) -> ExitCode {
         }
     }
 
+    // The Android viz refusal is hoisted ABOVE the identity gate for the same
+    // reason the resim one is: an unsupported platform must never answer with
+    // a sign-in prompt. `unsupported_viz_message` is a pure platform check, so
+    // the hoist refuses nothing it did not refuse before. It exits 1
+    // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
+    // error through the generic dispatch: the command line is well-formed, so
+    // it is not a usage error (2), and the hoist must not change the code.
+    if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
+        eprintln!("Error: {refusal}");
+        return ExitCode::FAILURE;
+    }
+
     if command_needs_identity(&cli.command) {
         if let Some(refused) = login_gate() {
             return refused;
@@ -2707,6 +2719,11 @@ fn run_viz(
     listen: &[String],
     detach: bool,
 ) -> CliResult<()> {
+    if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
+        return Err(cerulion_cli_engine::error::CliError::Validation(
+            message.to_string(),
+        ));
+    }
     #[cfg(not(unix))]
     {
         let _ = (running, topics, robot, connect, listen, detach);
@@ -3777,6 +3794,17 @@ fn command_needs_identity(command: &Commands) -> bool {
     )
 }
 
+/// The platform refusal for `cerulion viz`, when the platform cannot run it,
+/// lifted out of `run_viz` so `dispatch` can refuse BEFORE the identity gate.
+/// `is_android` is an argument (not a cfg read) so the decision is
+/// oracle-testable on host. PURE.
+fn viz_refusal(command: &Commands, is_android: bool) -> Option<&'static str> {
+    if !matches!(command, Commands::Viz { .. }) {
+        return None;
+    }
+    cerulion_cli_engine::viz_client::unsupported_viz_message(is_android)
+}
+
 /// Install the process-wide shutdown-signal handler and return the shared
 /// `running` flag every long-running verb (`graph run`, `topic echo`/`hz`, …)
 /// polls to exit cleanly.
@@ -3996,6 +4024,28 @@ mod login_gate_exemption_tests {
         assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
         }));
+    }
+
+    #[test]
+    fn the_android_viz_refusal_fires_before_the_identity_gate() {
+        // A never-signed-in Android device must see the platform refusal, not
+        // a sign-in prompt: `viz_refusal` is what `dispatch` checks above the
+        // gate, and `viz` stays gated underneath it (it is NOT exempted).
+        let viz = Commands::Viz {
+            topics: vec!["/t".to_string()],
+            robot: None,
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(command_needs_identity(&viz));
+        assert_eq!(
+            viz_refusal(&viz, true),
+            cerulion_cli_engine::viz_client::unsupported_viz_message(true)
+        );
+        assert!(viz_refusal(&viz, true).is_some());
+        assert!(viz_refusal(&viz, false).is_none());
+        assert!(viz_refusal(&Commands::Login, true).is_none());
     }
 
     #[test]
