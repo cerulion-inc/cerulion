@@ -1821,7 +1821,7 @@ impl NetdEventClient {
 /// [`io::ErrorKind::ConnectionRefused`] means "no daemon is listening" (see
 /// [`is_not_running`]); any other error is a real failure.
 fn try_connect(socket: &Path) -> io::Result<UnixStream> {
-    UnixStream::connect(socket)
+    cerulion_hygiene::connect_control_socket(socket)
 }
 
 /// What the readiness wait knows about the spawned daemon process.
@@ -1894,10 +1894,10 @@ fn stall_notice_due(elapsed: Duration, notice_after: Duration, already_notified:
     !already_notified && elapsed >= notice_after
 }
 
-/// Whether a [`UnixStream::connect`] error means "no daemon is running" (so the
-/// client should spawn one) vs a real error to surface. A missing socket file is
-/// `NotFound`; a stale socket left by a crashed daemon is `ConnectionRefused`. Pure
-/// — oracle-tested.
+/// Whether a control-socket connection error means "no daemon is running" (so the
+/// client should spawn one) vs a real error to surface. A missing pathname is
+/// `NotFound`; a missing abstract name or stale pathname socket is `ConnectionRefused`.
+/// Pure - oracle-tested.
 pub fn is_not_running(e: &io::Error) -> bool {
     matches!(
         e.kind(),
