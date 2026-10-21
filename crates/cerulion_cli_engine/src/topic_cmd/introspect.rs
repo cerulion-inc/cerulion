@@ -931,14 +931,15 @@ pub fn topic_type_with_scope(
 /// only a little out of order (later than the oldest frame) is kept, and a
 /// silent gap never clears the ring, because its stamps still go forward.
 /// The check reads the two ends of the ring only, so it is constant time
-/// and never allocates.
-pub fn push_bw_frame(ring: &mut VecDeque<BwFrame>, window: usize, frame: BwFrame) {
+/// and never allocates. `window` is never zero, so the ring always stays
+/// bounded: a full ring drops its oldest frame before the new one goes in.
+pub fn push_bw_frame(ring: &mut VecDeque<BwFrame>, window: NonZeroUsize, frame: BwFrame) {
     if let (Some(oldest), Some(newest)) = (ring.front(), ring.back()) {
         if frame.timestamp_ns < newest.timestamp_ns && frame.timestamp_ns <= oldest.timestamp_ns {
             ring.clear();
         }
     }
-    if ring.len() == window {
+    if ring.len() >= window.get() {
         ring.pop_front();
     }
     ring.push_back(frame);
@@ -997,9 +998,8 @@ pub fn topic_bw_with_scope(
             Err(e) => return Err(e),
         };
     let source_desc = super::observer_source_description(&source);
-    let window = window.get();
     // The one allocation of the loop: the full window, before any frame.
-    let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(window);
+    let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(window.get());
     let mut arrived_this_report = 0usize;
     let mut last_report = Instant::now();
     let mut silence_since = Instant::now();
@@ -1493,7 +1493,8 @@ mod tests {
     }
 
     fn pushed(window: usize, frames: &[BwFrame]) -> VecDeque<BwFrame> {
-        let mut ring = VecDeque::with_capacity(window);
+        let window = NonZeroUsize::new(window).expect("test window is not zero");
+        let mut ring = VecDeque::with_capacity(window.get());
         for f in frames {
             push_bw_frame(&mut ring, window, *f);
         }
@@ -1502,8 +1503,8 @@ mod tests {
 
     #[test]
     fn a_looped_replay_measures_one_pass_not_both() {
-        // Two passes of 100-byte frames stamped 0, 1, 2 s: the second pass
-        // restarts the clock, so only its frames are in the window. 200 bytes
+        // A loop that plays 100-byte frames stamped 0, 1, 2 s two times: the
+        // replay restarts the clock, so only its frames are in the window. 200 bytes
         // after 0 s over 2 s is 100 B/s (both passes together would be 200).
         let pass = [frame(0, 100), frame(SEC, 100), frame(2 * SEC, 100)];
         let mut frames = pass.to_vec();
