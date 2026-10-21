@@ -92,6 +92,7 @@ sha_count=$(grep -c '^ *sha256 "' "$formula")
 [ "$sha_count" = 4 ] || fail "rendered formula has $sha_count checksums, expected 4"
 
 want_line '  version "9.8.7"'
+want_line '    ["cerulion", "cerulion-netd", "cerulion-connectd", "cerulion-remoted"].each do |binary|'
 want_line '  def caveats'
 want_line '    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"'
 want_line '        cerulion-install-rust'
