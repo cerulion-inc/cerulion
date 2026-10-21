@@ -37,25 +37,19 @@
 //! a parse of the whole header, and those are not counted here because
 //! `read_from_buf` is not what they call.
 //!
-//! It also does not claim the typed view's own header accessor is counted in.
-//! `InputView::wire_header` parses the frame again on demand, which is
-//! `read_from_buf`, on a path these arms measure: a closure that calls it, or
-//! calls `wire_timestamp_ns` over it, reads two rather than one. The frame checks'
-//! header is not threaded into the view yet, and the closure in the third arm
-//! below reads two plain fields instead, so what that arm pins is the read path
-//! and not the accessor.
+//! # The accessors, which are inside the count
 //!
-//! One more accessor parses on demand, for the same reason, and one more read
-//! entry can be made to; both are likewise out of these counts.
-//! `OwnedInboundSample::wire_header` re-reads the thirty-two bytes its loop
-//! already parsed, and the ROS 2 middleware layer's take calls it one statement
-//! after the entry, so that path really costs two parses per frame and the fourth
-//! arm reads one only because it never asks for the header. And
-//! `spin_view_until_seq` parses ONCE in its own loop to read the sequence, and
-//! building the view parses nothing, so a closure that then asks the view for the
-//! header pays the second parse, exactly as in the `try_view` case above.
-//! Threading the validated header into the owned sample and into the view is the
-//! fix for both, and it touches construction sites these commits do not.
+//! Three arms ASK for the header rather than reading two plain fields, which is
+//! what makes the accessors part of the rule rather than a carve-out from it. The
+//! typed view carries the header the frame checks parsed and the owned sample
+//! carries the one its loop parsed, so `InputView::wire_header`,
+//! `wire_timestamp_ns` over it, and `OwnedInboundSample::wire_header` each read a
+//! copy and the tally stays at one. The third of those arms reads the spin entry,
+//! which parses in its own loop to find the sequence it waits for and hands that
+//! header to the view it builds.
+//!
+//! The ROS 2 middleware layer's take is the caller that asks: it calls the owned
+//! sample's accessor one statement after the entry returns.
 //!
 //! ```bash
 //! cargo test -p cerulion_core --test wire_header_parsed_once_test
@@ -299,5 +293,118 @@ fn try_receive_one_owned_parses_the_header_once_per_frame() {
         1,
         "the served cursor must have advanced past the one frame served, otherwise this arm \
          measured a path the cursor recorder never reached"
+    );
+}
+
+/// The typed view's own header accessor is inside the count.
+///
+/// The closure asks the view for the whole header and for the publish stamp. Both
+/// read the copy the frame checks handed the view at construction, so the frame
+/// costs ONE parse however many times the closure asks.
+#[test]
+#[serial]
+fn try_view_asking_the_view_for_its_header_parses_once() {
+    let (mut publisher, mut sub, cursor) = pair("view_header");
+    publish(&mut publisher);
+
+    reset_header_parse_count();
+    let seen = sub
+        .try_view::<Image, _>(|view| (view.wire_header(), view.wire_timestamp_ns()))
+        .expect("a view of the frame just published");
+    let parses = header_parse_count();
+
+    let (header, stamp) = seen.expect("the frame just published must be viewable");
+    assert_eq!(
+        parses, 1,
+        "a view whose closure asks for the header must still cost ONE parse for the frame; \
+         {parses} means the accessor parsed the bytes the frame checks had already parsed"
+    );
+    assert_eq!(
+        header.schema_hash,
+        Image::SCHEMA_HASH,
+        "the header the accessor returned must be this frame's own, not a fabricated one"
+    );
+    assert!(
+        stamp > 0 && stamp == header.timestamp_ns,
+        "the stamp projection must read the same header the accessor returned; got {stamp} \
+         against {}",
+        header.timestamp_ns
+    );
+    assert_eq!(
+        cursor.load(Ordering::Acquire),
+        1,
+        "the served cursor must have advanced past the one frame served, otherwise this arm \
+         measured a path the cursor recorder never reached"
+    );
+}
+
+/// The owned sample's header accessor is inside the count, which is the ROS 2
+/// middleware layer's own shape: it takes a frame and asks for its header one
+/// statement later.
+#[test]
+#[serial]
+fn try_receive_one_owned_asking_for_the_header_parses_once() {
+    let (mut publisher, sub, cursor) = pair("owned_header");
+    publish(&mut publisher);
+
+    reset_header_parse_count();
+    let taken = sub.try_receive_one_owned().expect("an owned receive");
+    let header = taken
+        .as_ref()
+        .expect("the frame just published must be taken")
+        .wire_header();
+    let parses = header_parse_count();
+
+    assert_eq!(
+        parses, 1,
+        "a take whose caller asks for the header must cost ONE parse for the frame; {parses} \
+         means the accessor re-read the thirty-two bytes the loop had parsed"
+    );
+    let header = header.expect("a frame a publisher wrote carries a parseable header");
+    assert_eq!(
+        header.schema_hash,
+        Image::SCHEMA_HASH,
+        "the header the accessor returned must be this frame's own, not a fabricated one"
+    );
+    assert_eq!(
+        cursor.load(Ordering::Acquire),
+        1,
+        "the served cursor must have advanced past the one frame served, otherwise this arm \
+         measured a path the cursor recorder never reached"
+    );
+}
+
+/// The spin entry parses once in its own loop, and the view it builds carries that
+/// header: a closure asking for it pays nothing further.
+///
+/// No cursor assertion here, because this entry records no read outcome at all. What
+/// stands in for it is the header the closure read: a frame's own schema hash and a
+/// nonzero publish stamp cannot come from a zeroed or fabricated header.
+#[test]
+#[serial]
+fn spin_view_until_seq_asking_the_view_for_its_header_parses_once() {
+    let (mut publisher, mut sub, _cursor) = pair("spin_header");
+    publish(&mut publisher);
+
+    reset_header_parse_count();
+    let seen = sub
+        .spin_view_until_seq::<Image, _>(0, Duration::from_secs(2), |view| view.wire_header())
+        .expect("a spin read of the frame just published");
+    let parses = header_parse_count();
+
+    let header = seen.expect("the frame just published must be served within the timeout");
+    assert_eq!(
+        parses, 1,
+        "a spin read whose closure asks for the header must cost ONE parse for the frame; \
+         {parses} means the view parsed the bytes the spin loop had already parsed"
+    );
+    assert_eq!(
+        header.schema_hash,
+        Image::SCHEMA_HASH,
+        "the header the accessor returned must be this frame's own, not a fabricated one"
+    );
+    assert!(
+        header.timestamp_ns > 0,
+        "the publisher stamps a publish time, so a zero here is a header nobody wrote"
     );
 }

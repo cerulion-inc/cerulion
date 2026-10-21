@@ -108,3 +108,22 @@ pub fn publish_and_requeue<E>(
     requeue()?;
     result
 }
+
+/// Linux `ENODEV` (`asm-generic/errno-base.h`): the device is gone, which is
+/// what a dequeue returns once the camera is unplugged.
+const ENODEV: i32 = 19;
+
+/// What a failed dequeue does to the node. An unplugged camera never comes
+/// back on this file descriptor, so it STOPS the node (`NodeError::Fatal`):
+/// the graph keeps running and `cerulion graph run` exits 3 when stopped.
+/// Any other error fails this tick only, and the node keeps running.
+pub fn dequeue_error(error: io::Error) -> cerulion_core::prelude::NodeError {
+    use cerulion_core::prelude::NodeError;
+    if error.raw_os_error() == Some(ENODEV) {
+        NodeError::Fatal(format!(
+            "the camera was disconnected ({error}); replug it and restart the graph"
+        ))
+    } else {
+        NodeError::Io(error)
+    }
+}

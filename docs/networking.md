@@ -484,13 +484,125 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node; only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node; only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
+| `tls` | Certificate files for `quic/` locators (see below). |
 
 `router` mode is deliberately not exposed: a graph declares a participant,
 not infrastructure. A Strict block's scouting stays OFF (the mesh is exactly
 the locators you declared); scouting-ON is the permissive-default behavior,
 not a block knob.
+
+### Carriers and per-topic reliability
+
+The carrier is the first segment of each `listen` / `connect` locator, so a
+locator string is the whole choice. TCP stays the default.
+
+| Locator | Carrier | Needs |
+|---|---|---|
+| `tcp/<host>:<port>` | TCP | nothing |
+| `quic/<host>:<port>` | QUIC over TLS 1.3, one stream per priority | `tls` files |
+| `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
+| `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
+
+Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
+lets the peer decide, which is why it does not satisfy a `best_effort` topic
+(the connection may come up with streams only).
+
+`quic/` encrypts the link and lets the CONNECTING side check the listener's
+certificate. The listener does not check who connects (no client certificate
+is requested), so on a robot that listens on `quic/`, who may pull which topic
+is still the pairing grant's decision, as on `tcp/`.
+
+```yaml
+network:
+  mode: peer
+  listen:
+    - quic/0.0.0.0:7447?mixed_rel=1
+  egress:
+    - /robot/cmd_status                 # reliable, the default
+    - topic: /robot/lidar/points
+      reliability: best_effort          # rides QUIC datagrams
+  tls:
+    certificate: /etc/cerulion/robot.pem   # presented by a quic/ listener
+    private_key: /etc/cerulion/robot.key
+```
+
+The machine that dials it lists the robot's certificate as its trust anchor:
+
+```yaml
+network:
+  mode: peer
+  connect:
+    - quic/192.168.1.10:7447?mixed_rel=1
+  ingress:
+    - /robot/lidar/points
+  tls:
+    root_ca: /etc/cerulion/robot.pem
+```
+
+- **`reliability`**: `reliable` (in order, retransmitted on loss) or
+  `best_effort`; an entry without it is put at `default_reliability`. A
+  best-effort topic is put with zenoh's best-effort marker, and on a `mixed_rel=1` QUIC connection zenoh sends it on the datagram
+  link: a lost frame is gone, and the frames after it are not held behind it.
+  All best-effort topics share that one datagram flow, which has no priority
+  order. zenoh sizes datagrams once, when the link comes up: if the path MTU
+  later shrinks below that size, a datagram send fails, and zenoh closes the
+  datagram link and the stream link with it, so the whole connection
+  reconnects. Mark a topic best effort on a path whose MTU is stable. A
+  bare-string entry is a map with no `reliability`, and is put at
+  `default_reliability`.
+- **`default_reliability`**: `reliable` (the default) or `best_effort`, for
+  every `egress` entry that sets no `reliability` of its own. An entry's own
+  `reliability` always wins, so `{topic: /robot/cmd, reliability: reliable}`
+  keeps one topic reliable under a `best_effort` default. A `best_effort`
+  default needs a `mixed_rel=1` locator, as a best-effort topic does:
+
+  ```yaml
+  network:
+    mode: peer
+    listen:
+      - quic/0.0.0.0:7447?mixed_rel=1
+    default_reliability: best_effort
+    egress:
+      - /robot/lidar/points             # best effort, from the default
+      - topic: /robot/cmd_status
+        reliability: reliable           # reliable, its own setting wins
+    tls:
+      certificate: /etc/cerulion/robot.pem
+      private_key: /etc/cerulion/robot.key
+  ```
+- **`tls`**: absolute paths to PEM files, read when the gateway opens its
+  session (a missing file fails the open, naming the path). A `quic/` listener
+  needs `certificate` and `private_key`; a `quic/` connect needs `root_ca`,
+  the certificate(s) the peer's certificate chains to. A self-signed peer
+  certificate can be its own `root_ca` (ECDSA P-256 and Ed25519 keys both
+  work) when it is NOT marked as a CA: `openssl req -x509` marks it
+  `CA:TRUE` by default, and a `quic/` listener refuses to open with such a
+  certificate, naming the file and the fix. Mint it as an end entity:
+
+  ```sh
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout robot.key -out robot.pem -days 365 -subj /CN=robot \
+    -addext subjectAltName=IP:192.168.1.10 \
+    -addext basicConstraints=critical,CA:FALSE
+  ```
+
+  Put every peer's certificate in that one file to trust several. The
+  connecting side always checks that the certificate names the host or IP in
+  the locator, so a certificate for a robot dialled by IP carries that IP in
+  its subject alternative names. zenoh also trusts the public Web PKI root
+  set beside `root_ca`, so a listener holding a publicly issued certificate
+  for that name is accepted too.
+- **`cerulion-netd`** reads the same files for its own `quic/` locators from
+  `CERULION_NETD_TLS_ROOT_CA`, `CERULION_NETD_TLS_CERTIFICATE` and
+  `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
+  `CERULION_NETD_LISTEN`.
+- **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
+  port only (a graph listening on `quic/` alone is not advertised), and
+  `topic list --connect` takes `<carrier>/<host>:<port>` with no `?` metadata
+  and probes it over TCP before it uses it, so it cannot reach a QUIC-only
+  robot. Reach one through `CERULION_NETD_CONNECT` or a graph's `connect:`.
 
 ### The egress/ingress model
 
@@ -535,7 +647,7 @@ Strict block, which topics cross the machine boundary is declared in YAML.
 
 ### Loop-safety rules (graph-load validation)
 
-Every rejection names the offending topic and states the fix:
+Every rejection names the offending topic or setting and states the fix:
 
 1. **No topic in both lists** (it would loop back to itself): remove it
    from one list. The gateway ALSO refuses a plan whose announce and ingress
@@ -545,7 +657,20 @@ Every rejection names the offending topic and states the fix:
 4. **Canonical absolute names only** (bare names rejected with the expected
    `/`-prefixed form; malformed shapes rejected like any topic name).
 5. **No lists under `disabled`.**
-6. **No duplicates within a list.**
+6. **No duplicates within a list** (a bare name and a map naming the same
+   topic are duplicates).
+7. **Known carrier**: `tcp/`, `quic/` or `udp/`, with `rel` / `mixed_rel`
+   values zenoh accepts. `tls/` is refused: this build does not compile it.
+8. **`quic/` has its files**: `certificate` + `private_key` for a `quic/`
+   listener, `root_ca` for a `quic/` connect; absolute paths only.
+9. **No inert `tls` setting**: `root_ca` without a `quic/` connect locator,
+   or `certificate` / `private_key` without a `quic/` listen locator, is
+   refused (each is read only by that side).
+10. **Best effort needs a datagram link**: a `best_effort` topic, and a
+    `default_reliability: best_effort`, each need a `mixed_rel=1` QUIC
+    locator (not `auto`) in `listen` or `connect`; without one the topics
+    would ride the reliable link with nothing saying so. The default is
+    refused even when every entry sets its own `reliability`.
 
 Empty `egress`/`ingress` with `peer`/`client` mode is valid.
 

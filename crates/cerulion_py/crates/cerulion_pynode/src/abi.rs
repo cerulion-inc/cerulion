@@ -25,10 +25,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use cerulion_core::graph::node::{
-    SYNC_HEAD_OP_ADVANCE, SYNC_HEAD_OP_PEEK_NEXT, SYNC_HEAD_OP_PROBE_NEXT, SYNC_HEAD_OP_VOID,
-    SYNC_OP_ANSWER_HEAD, SYNC_OP_ANSWER_NOTHING, SYNC_OP_ANSWER_PRESENT, SYNC_OP_ANSWER_STAMP,
+    SYNC_HEAD_OP_ADVANCE, SYNC_HEAD_OP_ADVANCE_REFILL, SYNC_HEAD_OP_PEEK_NEXT,
+    SYNC_HEAD_OP_PEEK_NEXT_REFILL, SYNC_HEAD_OP_PROBE_NEXT, SYNC_HEAD_OP_VOID, SYNC_OP_ANSWER_HEAD,
+    SYNC_OP_ANSWER_NOTHING, SYNC_OP_ANSWER_PRESENT, SYNC_OP_ANSWER_STAMP,
 };
-use cerulion_core::{SyncHeadOp, SyncOpAnswer};
+use cerulion_core::{SyncAlignSite, SyncHeadOp, SyncOpAnswer};
 
 use crate::Host;
 
@@ -244,14 +245,24 @@ pub unsafe fn sync_head_op(
     };
     let head_op = match op {
         SYNC_HEAD_OP_PROBE_NEXT => SyncHeadOp::ProbeNext,
-        SYNC_HEAD_OP_PEEK_NEXT => SyncHeadOp::PeekNext,
-        SYNC_HEAD_OP_ADVANCE => SyncHeadOp::Advance,
+        SYNC_HEAD_OP_PEEK_NEXT => SyncHeadOp::PeekNext {
+            site: SyncAlignSite::Boundary,
+        },
+        SYNC_HEAD_OP_PEEK_NEXT_REFILL => SyncHeadOp::PeekNext {
+            site: SyncAlignSite::Refill,
+        },
+        SYNC_HEAD_OP_ADVANCE => SyncHeadOp::Advance {
+            site: SyncAlignSite::Boundary,
+        },
+        SYNC_HEAD_OP_ADVANCE_REFILL => SyncHeadOp::Advance {
+            site: SyncAlignSite::Refill,
+        },
         SYNC_HEAD_OP_VOID => SyncHeadOp::Void,
         other => {
             set_error(format!(
                 "{EXPORT}: unknown op code {other} (this ABI carries 0=ProbeNext, 1=PeekNext, \
-                 2=Advance, 3=Void; the two FILL ops ride cerulion_node_drain_trigger_input / \
-                 cerulion_node_refill_trigger_input)"
+                 2=Advance, 3=Void, 4=PeekNext(refill), 5=Advance(refill); the two FILL ops ride \
+                 cerulion_node_drain_trigger_input / cerulion_node_refill_trigger_input)"
             ));
             return -5;
         }
@@ -405,5 +416,64 @@ mod tests {
         let code =
             unsafe { set_snapshot_inputs(&nodes, no_error, 1, bad_utf8.as_ptr(), bad_utf8.len()) };
         assert_eq!(code, -3, "names that are not UTF-8");
+    }
+
+    /// The align pass sends the REFILL-site codes 4 and 5 to this export, so
+    /// the ladder must decode them: the unknown-op arm answers -5, which
+    /// `DylibNodeEntry` reads as `SyncOpAnswer::Failed` and the align driver's
+    /// R-Fail policy reads as descent-disabling.
+    ///
+    /// Hand oracle: the handle map is empty, so a code that DECODES gets as far
+    /// as the handle lookup and answers -2, and a code outside the ABI answers
+    /// -5 from the ladder itself. The site a decoded code carries rides into
+    /// `Host::sync_head_op`, which needs a live Python node, so the arms below
+    /// pin the decode boundary and the text that names the two codes.
+    #[test]
+    fn the_refill_site_op_codes_decode_and_code_six_does_not() {
+        static ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(message: String) {
+            ERRORS.lock().expect("the recorder mutex").push(message);
+        }
+
+        let nodes: Nodes = Mutex::new(None);
+        let mut ts = 0_u64;
+        let mut kind = -1_i32;
+        for op in [
+            SYNC_HEAD_OP_PROBE_NEXT,
+            SYNC_HEAD_OP_PEEK_NEXT,
+            SYNC_HEAD_OP_ADVANCE,
+            SYNC_HEAD_OP_VOID,
+            SYNC_HEAD_OP_PEEK_NEXT_REFILL,
+            SYNC_HEAD_OP_ADVANCE_REFILL,
+        ] {
+            let code = unsafe {
+                sync_head_op(
+                    &nodes,
+                    record,
+                    1,
+                    b"inp".as_ptr(),
+                    3,
+                    op,
+                    &mut ts,
+                    &mut kind,
+                )
+            };
+            assert_eq!(code, -2, "op code {op} reached the handle lookup");
+        }
+        let code =
+            unsafe { sync_head_op(&nodes, record, 1, b"inp".as_ptr(), 3, 6, &mut ts, &mut kind) };
+        assert_eq!(code, -5, "code 6 is outside this ABI");
+        assert_eq!(
+            (ts, kind),
+            (0, -1),
+            "out-parameters are written only on success"
+        );
+        let errors = ERRORS.lock().expect("the recorder mutex");
+        assert_eq!(errors.len(), 7, "one error text per call");
+        assert!(
+            errors[6].contains("4=PeekNext(refill)") && errors[6].contains("5=Advance(refill)"),
+            "the unknown-op text names the refill codes: {}",
+            errors[6]
+        );
     }
 }

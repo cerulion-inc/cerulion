@@ -2611,10 +2611,11 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
             // while the topic still reported `enforced`. A step the stream holds
             // no entry for is the same declaration, which is why the tail of a
             // stream that stops early needs no refusal: the steps past it name
-            // no read, and an EMPTY boundary drain writes no record at all, so
+            // no read. (Below trace format 7 an EMPTY boundary drain wrote no
+            // record at all, so most steps of a gated stage held no entry and
             // keying a refusal on the rank's last boundary step refused ordinary
-            // recordings. Positive truncation evidence is still a refusal, from
-            // the overflow marker (`RecordDropped`).
+            // recordings.) Positive truncation evidence is still a refusal,
+            // from the overflow marker (`RecordDropped`).
             if !exists || !roles.gateable(role) {
                 continue;
             }

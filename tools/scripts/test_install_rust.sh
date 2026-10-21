@@ -4,6 +4,13 @@ original_path=$PATH
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-rust-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT
+# The installs below that succeed write the PATH setup under HOME and link
+# into ~/.local/bin; give them a scratch home so a run on a workstation leaves
+# the real one alone, and a system link directory that does not exist.
+HOME=$work/home
+CERULION_SYSTEM_BIN_DIR=$work/no-system-bin
+export HOME CERULION_SYSTEM_BIN_DIR
+mkdir -p "$HOME"
 tools=$work/tools
 mkdir -p "$tools"
 for utility in awk grep sed mktemp rm chmod cp cat dirname mkdir ln sleep; do

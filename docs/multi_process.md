@@ -713,7 +713,7 @@ stamped rather than assumed: `__cerulion/recorder.json` carries a
 |---|---|---|
 | absent | Any bag recorded before the stamp existed | **Lockstep, INFERRED**: the verdict says so out loud (`coordination: lockstep (inferred: no coordination stamp)`), because an absence is not a claim |
 | `lockstep` | The barrier path (the `CERULION_EXECUTION_MODE=lockstep` opt-out), and every MONOLITH recording (a monolith is the degenerate one-rank lockstep timeline) | Lockstep: one authoritative clock, cross-rank boundary equality, one first boundary to anchor a mid-run resume |
-| `free_run` | The free-run path: per-rank wall-faithful boundary streams sharing only the GO epoch. The DEFAULT for a multi-process `graph run --record` (`CERULION_EXECUTION_MODE=lockstep` opts a run out) | **Per-rank re-execution** (below). The bag also stamps a `trace_format` past 3, so an older binary refuses it instead of mis-applying the lockstep contract (a bag stamps 6 by default, or 5 when it is recorded with `CERULION_READ_LOG_FOLD=off`, see [`docs/bag.md`](bag.md)) |
+| `free_run` | The free-run path: per-rank wall-faithful boundary streams sharing only the GO epoch. The DEFAULT for a multi-process `graph run --record` (`CERULION_EXECUTION_MODE=lockstep` opts a run out) | **Per-rank re-execution** (below). The bag also stamps a `trace_format` past 3, so an older binary refuses it instead of mis-applying the lockstep contract (a bag this binary writes stamps 7, see [`docs/bag.md`](bag.md)) |
 | anything else | Nothing this binary knows: a newer recorder, or a hand-edited bag | **Refused, exit 2**, naming the value. Never inferred to lockstep: an unknown coordination is exactly the case where guessing is a silent mis-replay |
 
 **Why an unknown value is refused rather than tolerated.** A format-3 reader
@@ -878,9 +878,11 @@ cerulion graph run perception_stack --trace-limit 500000
 | Exit | Meaning |
 |---|---|
 | `0` | Clean shutdown (Ctrl-C or a clean worker exit → coordinated drain, every worker exits 0), OR a **degraded** `continue` run where at least one worker survived (the degraded summary is logged loudly). |
+| `3` | A node returned `NodeError::Fatal` and was stopped. Its worker kept running, exited `3` at the drain with an `Error:` line naming the node, and the supervisor reports the worker group and exits `3` too. A worker exit `3` is a clean exit, never a worker death: the run is not degraded. A failure that fails the run takes precedence (a worker death under `--peer-loss fail`, every worker crashing, a recording failure); a degraded `continue` run with a stopped node still exits `3`. |
 | non-zero | Fail-loud: a worker death under `--peer-loss fail`; ALL workers crashed under `continue`; a refused run (validation error, `--time-source external` × multi-process, a `HostDriven` external node on the live path); or an internal supervisor failure. |
 
-Individual **workers** exit `2` when terminally poisoned by a barrier
+Individual **workers** exit `3` after a clean drain when one of their nodes
+stopped on `NodeError::Fatal`, and exit `2` when terminally poisoned by a barrier
 boundary timeout (a peer stalled/crashed past the ~5s rendezvous deadline),
 which is reachable under the `lockstep` opt-out only, since a free-run worker
 maps no barrier; the supervisor's drain machinery tolerates and reports
