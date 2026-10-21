@@ -4590,13 +4590,7 @@ fn c5c_demand_authorizer_refuses_denied_topic_on_both_lan_paths() {
 
     // The refusal is LOUD (Principle #3 / the loud-over-silent rule) — a WARN,
     // level token included.
-    logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "demand REFUSED by the demand-authorization gate",
-        )
-    });
+    logs_assert(|lines: &[&str]| logged_at(lines, "WARN", "request=\"demand\""));
 
     // ANTI-TAUTOLOGY: re-install the deny-nothing default → a fresh live topic admits,
     // proving the deny was the authorizer's doing (not a MISS).
@@ -4806,16 +4800,8 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
     // The refusals are LOUD (Principle #3 / the loud-over-silent rule) — WARNs,
     // level token included.
     logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "catalog GET REFUSED by the demand-authorization gate",
-        )?;
-        logged_at(
-            lines,
-            "WARN",
-            "schema GET REFUSED by the demand-authorization gate",
-        )
+        logged_at(lines, "WARN", "request=\"catalog GET\"")?;
+        logged_at(lines, "WARN", "request=\"schema GET\"")
     });
 
     // --- ANTI-TAUTOLOGY: restore AllowAll → both serve again (the deny was the

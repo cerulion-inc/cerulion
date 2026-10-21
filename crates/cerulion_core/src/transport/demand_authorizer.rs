@@ -156,6 +156,59 @@ pub trait DemandAuthorizer: Send + Sync {
     /// [`AllowAllAuthorizer`] admits everything (the deny-nothing plumbing); the account-grant
     /// implementation resolves the subject to an account and returns `is_allowed`.
     fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision;
+
+    /// The flood latches a host logs this authorizer's LAN refusals through,
+    /// when it keeps them. The default keeps none, so every refusal is
+    /// logged loudly; [`LanAccessAuthorizer`] keeps one latch per request
+    /// kind, because a paired machine refuses every LAN request.
+    fn lan_refusal_latches(&self) -> Option<&LanRefusalLatches> {
+        None
+    }
+}
+
+/// One [`FailureRegimeLatch`](super::failure_regime_latch::FailureRegimeLatch)
+/// per kind of LAN request ("demand", "catalog GET", ...), so repeated
+/// refusals of one kind log one loud line while a first refusal of another
+/// kind is still loud.
+#[derive(Debug, Default)]
+pub struct LanRefusalLatches {
+    latches: std::sync::Mutex<
+        std::collections::BTreeMap<&'static str, super::failure_regime_latch::FailureRegimeLatch>,
+    >,
+}
+
+impl LanRefusalLatches {
+    /// Record one refused `request` and return how to log it.
+    pub fn on_refusal(&self, request: &'static str) -> super::failure_regime_latch::RegimeDecision {
+        self.latches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(request)
+            .or_default()
+            .on_failure()
+    }
+
+    /// Record one authorized `request`. Returns `Some(suppressed)` when it
+    /// closed a refusal regime that counted repeats (log recovery once).
+    pub fn on_authorized(&self, request: &'static str) -> Option<u64> {
+        self.latches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(request)
+            .and_then(super::failure_regime_latch::FailureRegimeLatch::on_success)
+    }
+
+    /// Every refusal of `request` recorded so far.
+    pub fn total_refusals(&self, request: &'static str) -> u64 {
+        self.latches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request)
+            .map_or(
+                0,
+                super::failure_regime_latch::FailureRegimeLatch::total_failures,
+            )
+    }
 }
 
 /// The DEFAULT authorizer — deny-nothing. Admits every demand on every plane, so a
@@ -267,12 +320,17 @@ impl LanAccess {
 pub struct LanAccessAuthorizer {
     access: LanAccess,
     inner: std::sync::Arc<dyn DemandAuthorizer>,
+    refusals: LanRefusalLatches,
 }
 
 impl LanAccessAuthorizer {
     /// Apply `access` in front of `inner`.
     pub fn new(access: LanAccess, inner: std::sync::Arc<dyn DemandAuthorizer>) -> Self {
-        Self { access, inner }
+        Self {
+            access,
+            inner,
+            refusals: LanRefusalLatches::default(),
+        }
     }
 
     /// The posture this authorizer applies.
@@ -293,6 +351,10 @@ impl DemandAuthorizer for LanAccessAuthorizer {
             )),
             _ => self.inner.authorize_demand(subject, topic),
         }
+    }
+
+    fn lan_refusal_latches(&self) -> Option<&LanRefusalLatches> {
+        Some(&self.refusals)
     }
 }
 

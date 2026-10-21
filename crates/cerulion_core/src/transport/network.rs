@@ -40,7 +40,7 @@ use super::demand_authorizer::{
 use super::discovery::{
     liveliness_prefix, query_announce_entries, query_live_topics_by_prefix, TopicToken,
 };
-use super::failure_regime_latch::{lock_regime_latch, FailureRegimeLatch, RegimeDecision};
+use super::failure_regime_latch::RegimeDecision;
 use super::gateway::is_reserved_topic;
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
@@ -1688,27 +1688,24 @@ fn handle_catalog_verb(
     }
 }
 
-/// One flood latch for every LAN request the demand-authorization gate
-/// refuses (topic demands, liveliness demands, catalog, schema and runs
-/// GETs). A paired machine refuses every LAN request, so a polling desk would
-/// otherwise log one warn per request forever.
-static LAN_REFUSAL_LATCH: Mutex<FailureRegimeLatch> = Mutex::new(FailureRegimeLatch::new());
-
-/// Log a LAN request the authorization gate refused, through `latch`: the
-/// first refusal of a regime is a loud warn, repeats are counted at debug,
-/// each decade of the running total re-announces loudly. `what` names the
-/// request ("demand", "catalog GET", ...); `resource` is the topic or verb
-/// resource it asked for. Returns the latch's decision.
-fn log_lan_refusal_with(
-    latch: &Mutex<FailureRegimeLatch>,
-    what: &'static str,
+/// Log a LAN `request` the authorization gate refused. With the
+/// authorizer's refusal latches (the live [`LanAccessAuthorizer`] keeps
+/// them; a paired machine refuses every LAN request) the first refusal of a
+/// regime is a loud warn, repeats are counted at debug, and each decade of
+/// the running total re-announces loudly. Without latches every refusal is
+/// loud. `resource` is the topic or verb resource the request named.
+fn log_lan_refusal(
+    authorizer: &dyn DemandAuthorizer,
+    request: &'static str,
     resource: &str,
     reason: &str,
 ) -> RegimeDecision {
-    let decision = lock_regime_latch(latch).on_failure();
+    let decision = authorizer
+        .lan_refusal_latches()
+        .map_or(RegimeDecision::Loud, |latches| latches.on_refusal(request));
     match decision {
         RegimeDecision::Loud => tracing::warn!(
-            request = what,
+            request,
             resource = %resource,
             plane = "zenoh-lan",
             reason = %reason,
@@ -1717,7 +1714,7 @@ fn log_lan_refusal_with(
              Repeated refusals are counted, not logged, until a request is authorized"
         ),
         RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
-            request = what,
+            request,
             resource = %resource,
             plane = "zenoh-lan",
             reason = %reason,
@@ -1726,7 +1723,7 @@ fn log_lan_refusal_with(
             "LAN requests are still refused by the demand-authorization gate"
         ),
         RegimeDecision::Suppressed { suppressed } => tracing::debug!(
-            request = what,
+            request,
             resource = %resource,
             reason = %reason,
             suppressed,
@@ -1736,16 +1733,15 @@ fn log_lan_refusal_with(
     decision
 }
 
-/// [`log_lan_refusal_with`] on the process-wide [`LAN_REFUSAL_LATCH`].
-fn log_lan_refusal(what: &'static str, resource: &str, reason: &str) {
-    log_lan_refusal_with(&LAN_REFUSAL_LATCH, what, resource, reason);
-}
-
-/// Record a LAN request the gate authorized: closes an open refusal regime,
-/// logging one recovery line when it counted repeats.
-fn note_lan_authorized() {
-    if let Some(suppressed) = lock_regime_latch(&LAN_REFUSAL_LATCH).on_success() {
+/// Record a LAN `request` the gate authorized: closes an open refusal
+/// regime of that kind, logging one recovery line when it counted repeats.
+fn note_lan_authorized(authorizer: &dyn DemandAuthorizer, request: &'static str) {
+    if let Some(suppressed) = authorizer
+        .lan_refusal_latches()
+        .and_then(|latches| latches.on_authorized(request))
+    {
         tracing::info!(
+            request,
             suppressed,
             "LAN requests are authorized again after refused requests"
         );
@@ -1773,10 +1769,10 @@ fn catalog_serve_decision(
         &DemandSubject::Lan { locator: None },
         CATALOG_QUERY_RESOURCE,
     ) {
-        log_lan_refusal("catalog GET", CATALOG_QUERY_RESOURCE, &reason);
+        log_lan_refusal(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE, &reason);
         return cerulion_q::CatalogReply::refused(robot, reason);
     }
-    note_lan_authorized();
+    note_lan_authorized(authorizer, "catalog GET");
     build_catalog_reply_from_bridge(bridge_mgr, catalog, robot)
 }
 
@@ -1835,10 +1831,10 @@ fn schema_serve_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, requested)
     {
-        log_lan_refusal("schema GET", requested, &reason);
+        log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
     }
-    note_lan_authorized();
+    note_lan_authorized(authorizer, "schema GET");
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
     // so a schema GET never mixes the old and new maps mid-closure.
     let _snapshot_guard = schema
@@ -1933,10 +1929,10 @@ fn runs_serve_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, RUNS_QUERY_RESOURCE)
     {
-        log_lan_refusal("runs GET", RUNS_QUERY_RESOURCE, &reason);
+        log_lan_refusal(authorizer, "runs GET", RUNS_QUERY_RESOURCE, &reason);
         return cerulion_q::RunsReply::refused(robot, reason);
     }
-    note_lan_authorized();
+    note_lan_authorized(authorizer, "runs GET");
     let gather = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
         Ok(gather) => gather,
         Err(e) => {
@@ -2249,11 +2245,11 @@ fn demand_grant_decision(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, canonical)
     {
-        log_lan_refusal("demand", canonical, &reason);
+        log_lan_refusal(authorizer, "demand", canonical, &reason);
         get_state.record_refusal();
         return ACK_REFUSED;
     }
-    note_lan_authorized();
+    note_lan_authorized(authorizer, "demand");
     // Permissive SHM probe FIRST - OUTSIDE the `last_get` critical
     // section (the SHM open + zenoh announce must not extend the FINDING-1 lock
     // scope). A demand for an UNregistered topic under AllowAll egress that is LIVE
@@ -2345,10 +2341,10 @@ fn apply_live_put_demand(
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, topic)
     {
-        log_lan_refusal("liveliness demand", topic, &reason);
+        log_lan_refusal(authorizer, "liveliness demand", topic, &reason);
         return Ok(false);
     }
-    note_lan_authorized();
+    note_lan_authorized(authorizer, "liveliness demand");
     // Same permissive SHM probe as the queryable path - a live unregistered
     // AllowAll topic is registered + announced here so the enable below flips its
     // (now-existing) egress flag. Self-gating (see `PermissiveShmProbe::try_serve`).
@@ -6338,15 +6334,16 @@ mod tests {
         );
     }
 
-    /// A paired machine refuses every LAN request: N refusals log ONE loud
-    /// warn, count every refusal, and the decade re-announces. Hand oracle:
-    /// nine refusals are one Loud and eight Suppressed (total 9); the tenth
-    /// is StillFailing; an authorized request closes the regime.
+    /// A paired machine refuses every LAN request: N refusals of one kind
+    /// log ONE loud warn and count every refusal, the decade re-announces,
+    /// a first refusal of another kind is loud again, and an authorized
+    /// request closes the regime. Hand oracle: nine catalog refusals are one
+    /// Loud and eight Suppressed (total 9); the tenth is StillFailing.
     #[test]
     fn repeated_lan_refusals_warn_once_and_count_every_refusal() {
-        let latch = Mutex::new(FailureRegimeLatch::new());
+        let paired = LanAccessAuthorizer::new(LanAccess::Paired, Arc::new(AllowAllAuthorizer));
         let decisions: Vec<RegimeDecision> = (0..9)
-            .map(|_| log_lan_refusal_with(&latch, "catalog GET", "catalog", "paired"))
+            .map(|_| log_lan_refusal(&paired, "catalog GET", "catalog", "paired"))
             .collect();
         let loud = decisions
             .iter()
@@ -6357,12 +6354,22 @@ mod tests {
             .filter(|d| matches!(d, RegimeDecision::Suppressed { .. }))
             .count();
         assert_eq!((loud, suppressed), (1, 8));
-        assert_eq!(lock_regime_latch(&latch).total_failures(), 9);
+        let latches = paired.lan_refusal_latches().expect("paired keeps latches");
+        assert_eq!(latches.total_refusals("catalog GET"), 9);
         assert!(matches!(
-            log_lan_refusal_with(&latch, "catalog GET", "catalog", "paired"),
+            log_lan_refusal(&paired, "catalog GET", "catalog", "paired"),
             RegimeDecision::StillFailing { total: 10, .. }
         ));
-        assert_eq!(lock_regime_latch(&latch).on_success(), Some(8));
+        assert_eq!(
+            log_lan_refusal(&paired, "schema GET", "std_msgs/String", "paired"),
+            RegimeDecision::Loud
+        );
+        assert_eq!(latches.on_authorized("catalog GET"), Some(8));
+        // An authorizer without latches logs every refusal loudly.
+        assert_eq!(
+            log_lan_refusal(&AllowAllAuthorizer, "demand", "/t", "denied"),
+            RegimeDecision::Loud
+        );
     }
 
     #[test]
