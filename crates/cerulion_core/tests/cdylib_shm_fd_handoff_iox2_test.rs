@@ -197,7 +197,10 @@ fn child_permissions() {
             .expect("set file permission through iceoryx2");
         let reported = file.permission().expect("read permission through iceoryx2");
         let kernel_mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
-        if kernel_mode != requested.bits() as u32 || reported != requested {
+        // `mode_t` is u16 on macOS and u32 on Linux, so the cast is a no-op on Linux only.
+        #[allow(clippy::unnecessary_cast)]
+        let requested_mode = requested.bits() as u32;
+        if kernel_mode != requested_mode || reported != requested {
             wrong.push(format!(
                 "f{i}: kernel mode {kernel_mode:o}, iceoryx2 reports {reported:?}, \
                  requested {:o}",
