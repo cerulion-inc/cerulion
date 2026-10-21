@@ -1344,72 +1344,77 @@ fn build_into(
 }
 
 /// Make a built run visible: open LAN access to the configured posture,
-/// replay the announces the paired build withheld, raise the beacon and
-/// report the run. The only step of a start that does so. On an error the
+/// replay the announces the paired build withheld, report the run and raise
+/// the beacon. The only step of a start that does so. On an error the
 /// caller shuts the run down, which closes LAN access first.
+///
+/// The status lock is held from the last worker-failure check through the
+/// posture write, the announce replay and the switch to Running. A worker
+/// records its failure under that same lock, so a failure either lands
+/// first (the commit refuses and LAN access never opens) or lands after the
+/// run is Running (a failure of a started run). A failed start never
+/// authorizes a LAN demand, even briefly. No other lock is taken while a
+/// worker holds the status lock, so holding it here cannot deadlock.
 fn commit(
     run: &mut Run,
     plan: &StartPlan,
     status: &Arc<Mutex<Status>>,
     robot: &str,
 ) -> Result<(), EmbedError> {
-    // A worker that failed after the barrier must not get an open LAN, even
-    // briefly.
     {
-        let status = lock_status(status);
+        let mut status = lock_status(status);
         if matches!(status.state, RuntimeState::Failed) {
             return Err(recorded_failure(&status));
         }
-    }
-    if let Some(gateway) = &plan.gateway {
-        let network = run.manager.network().ok_or_else(|| {
-            EmbedError::Network("the gateway's transport manager has no network".to_string())
-        })?;
-        // No status lock is held: a paired write waits out egress passes.
-        network.set_lan_access(gateway.lan_access);
-        if gateway.lan_access == LanAccess::Open {
-            // Read AFTER the posture opened: a topic registered before this
-            // read is replayed here, and one registered after it announces
-            // itself. A second announce of a topic is a no-op.
-            let registered = run
-                .manager
-                .bridge_manager()
-                .registered_topics()
-                .map_err(|error| EmbedError::Network(error.to_string()))?;
-            for (topic, _flag) in registered {
-                run.manager
-                    .announce_egress_topic(&topic)
+        if let Some(gateway) = &plan.gateway {
+            let network = run.manager.network().ok_or_else(|| {
+                EmbedError::Network("the gateway's transport manager has no network".to_string())
+            })?;
+            network.set_lan_access(gateway.lan_access);
+            if gateway.lan_access == LanAccess::Open {
+                // Read AFTER the posture opened: a topic registered before
+                // this read is replayed here, and one registered after it
+                // announces itself. A second announce of a topic is a no-op.
+                let registered = run
+                    .manager
+                    .bridge_manager()
+                    .registered_topics()
                     .map_err(|error| EmbedError::Network(error.to_string()))?;
+                for (topic, _flag) in registered {
+                    run.manager
+                        .announce_egress_topic(&topic)
+                        .map_err(|error| EmbedError::Network(error.to_string()))?;
+                }
             }
         }
+        // A graph that already finished on its own keeps Finished.
+        if !matches!(status.state, RuntimeState::Finished) {
+            status.state = RuntimeState::Running;
+            status.last_error = None;
+        }
+        status.graph = plan.graph_name.clone();
+        status.nodes = plan.nodes;
+        status.listen = plan.listen.clone();
+        status.lan_access = plan
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.lan_access.as_str().to_string());
+        status.record_path = plan
+            .recorder
+            .as_ref()
+            .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
+    }
+    // mDNS registration does I/O: raise it with no lock held. The beacon
+    // names only the device, never a topic, and a gateway that stops
+    // closes its slot, so a beacon raised after a failure is dropped.
+    if let Some(gateway) = &plan.gateway {
         if gateway.mdns {
-            // mDNS registration does I/O: raise it with no lock held.
             let beacon = advertise_beacon(robot, &plan.listen);
             if let Some(worker) = &run.gateway {
                 drop(install_beacon(&worker.beacon, status, beacon));
             }
         }
     }
-    let mut status = lock_status(status);
-    if matches!(status.state, RuntimeState::Failed) {
-        return Err(recorded_failure(&status));
-    }
-    // A graph that already finished on its own keeps Finished.
-    if !matches!(status.state, RuntimeState::Finished) {
-        status.state = RuntimeState::Running;
-        status.last_error = None;
-    }
-    status.graph = plan.graph_name.clone();
-    status.nodes = plan.nodes;
-    status.listen = plan.listen.clone();
-    status.lan_access = plan
-        .gateway
-        .as_ref()
-        .map(|gateway| gateway.lan_access.as_str().to_string());
-    status.record_path = plan
-        .recorder
-        .as_ref()
-        .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
     Ok(())
 }
 
@@ -2267,6 +2272,119 @@ mod tests {
             "a failed gateway construction must not leave its bridge enabled"
         );
         assert_baseline(&manager);
+    }
+
+    /// The commit holds the status lock from its last failure check through
+    /// opening LAN access and replaying announces, so a worker failure cannot
+    /// land between the check and the open. Hand oracle: during the replay
+    /// (the after-insert hook) the status lock is held, a worker failure
+    /// raised there waits, and it lands only after the run is Running, so
+    /// the commit succeeds and the failure is a started run's failure.
+    #[test]
+    fn a_worker_failure_cannot_land_between_the_commit_check_and_the_open() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("commitrace");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+        manager
+            .bridge_manager()
+            .register_topic("/commit_race/topic")
+            .expect("register bridge");
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let held_during_open = Arc::new(AtomicBool::new(false));
+        let failer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        {
+            let status = Arc::clone(&status);
+            let held = Arc::clone(&held_during_open);
+            let failer = Arc::clone(&failer);
+            network.set_after_announce_insert_for_test(Some(Arc::new(move || {
+                held.store(status.try_lock().is_err(), Ordering::SeqCst);
+                let status = Arc::clone(&status);
+                *failer.lock().unwrap() = Some(thread::spawn(move || {
+                    set_thread_error(&status, codes::NETWORK, "late worker failure");
+                }));
+            })));
+        }
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        let plan = StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            recorder: None,
+        };
+        let mut run = Run::empty(Arc::clone(&manager));
+
+        let result = commit(&mut run, &plan, &status, "t");
+        network.set_after_announce_insert_for_test(None);
+        let failer = failer.lock().unwrap().take().expect("the replay announced");
+        failer.join().expect("failer thread");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            held_during_open.load(Ordering::SeqCst),
+            "the status lock must be held while LAN access opens"
+        );
+        assert_eq!(network.lan_access(), LanAccess::Open);
+        assert_eq!(lock_status(&status).state, RuntimeState::Failed);
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A worker that failed before the commit keeps LAN access paired: the
+    /// commit refuses before it writes the posture.
+    #[test]
+    fn a_worker_failure_before_the_commit_keeps_lan_access_paired() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("commitfailed");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        set_thread_error(&status, codes::GRAPH, "early worker failure");
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        let plan = StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            recorder: None,
+        };
+        let mut run = Run::empty(Arc::clone(&manager));
+
+        let result = commit(&mut run, &plan, &status, "t");
+
+        assert!(matches!(result, Err(EmbedError::Graph(_))), "{result:?}");
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
     }
 
     #[test]
