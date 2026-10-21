@@ -1985,6 +1985,9 @@ with or without a default. A default never changes the wire layout or the schema
 and a loaned output slot still starts zeroed: the default applies when you build a
 value with `Default`.
 
+As in ROS 2, the first `#` on a line starts a comment, inside quotes too, so a
+constant or default cannot hold a `#`: `string s a#b` has the default `a`.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and

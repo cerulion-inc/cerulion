@@ -45,10 +45,10 @@ pub fn parse_rosmsg(
 
     for (idx, line) in msg_content.lines().enumerate() {
         let line_num = idx + 1;
-        let line = line.trim();
+        let line = strip_comment(line);
 
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
+        // Skip empty lines and comment-only lines
+        if line.is_empty() {
             continue;
         }
 
@@ -139,48 +139,15 @@ impl QuoteScan {
     }
 }
 
-/// Cut a trailing `# comment` that sits outside any quoted string, and
-/// trim the result.
+/// Cut `line` at its first `#` and trim the result.
 ///
-/// For a string value (`string_value`), a `#` in bare text starts a
-/// comment only as the first character or after whitespace or a closing
-/// quote, so `string TAG=a#b` keeps `a#b` while `string LABEL=it's # note`
-/// is `it's` and `string S="x"#note` is `x`. In an array value the `]` that
-/// closes the list is a boundary too, so `string[] v ["x"]#note` is `["x"]`.
-/// For any other type every `#`
-/// outside a quoted string starts a comment. (rosidl cuts at the first
-/// `#` anywhere, even inside quotes; a quoted `#` is kept here so a
-/// string can hold one.)
-fn strip_comment<'a>(text: &'a str, ft: &FieldType) -> &'a str {
-    let string_value = holds_strings(ft);
-    let array_value = matches!(
-        ft,
-        FieldType::FixedArray { .. } | FieldType::DynamicArray { .. }
-    );
-    let mut scan = QuoteScan::new();
-    let mut at_boundary = true;
-    for (i, c) in text.char_indices() {
-        let was_quoted = scan.quote.is_some();
-        let outside = scan.outside(c);
-        if outside && c == '#' && (!string_value || at_boundary) {
-            return text[..i].trim();
-        }
-        at_boundary = c.is_whitespace()
-            || (was_quoted && scan.quote.is_none())
-            || (array_value && outside && c == ']');
-    }
-    text.trim()
-}
-
-/// True when values of `ft` (or its array elements) are strings.
-fn holds_strings(ft: &FieldType) -> bool {
-    match ft {
-        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
-            holds_strings(element_type)
-        }
-        FieldType::String => true,
-        _ => false,
-    }
+/// rosidl treats the first `#` anywhere on a line as the start of a
+/// comment, inside a quoted string or bare text alike, before it reads
+/// any value. So `string s a#b` has the default `a`, and
+/// `string S="a#b"` is an unterminated string. Reading it the same way
+/// keeps a `.msg` file meaning the same thing here as in a ROS 2 build.
+fn strip_comment(line: &str) -> &str {
+    line.split_once('#').map_or(line, |(code, _)| code).trim()
 }
 
 /// Which kind of value a literal belongs to, for the error text.
@@ -224,7 +191,7 @@ fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantD
             "constant {name}: type {type_token} is not a primitive type or a string"
         ));
     }
-    let value = strip_comment(value, &field_type);
+    let value = value.trim();
     if value.is_empty() {
         return Err(format!("constant {name} has no value"));
     }
@@ -277,9 +244,8 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
 
     let mut field = FieldDef::new(field_name, field_type);
 
-    // Everything after the name, up to a comment, is the default value
-    // (`float64 w 1`, `string s "a b"`, `int32[] v [1, 2]`).
-    let default_text = strip_comment(default_text, &field.field_type);
+    // Everything after the name is the default value (`float64 w 1`,
+    // `string s "a b"`, `int32[] v [1, 2]`); the comment is already cut.
     if !default_text.is_empty() {
         let default = parse_default(&field.field_type, ros_type, default_text)
             .and_then(|d| refuse_wide_string_default(ros_type, d))
@@ -1136,7 +1102,7 @@ mod constant_and_default_tests {
              float64 RATE=2.5\n\
              bool ON=True\n\
              byte RAW=255\n\
-             string MODE = \"AUTO # not a comment\"  # but this is\n\
+             string MODE = \"AUTO\"  # a comment\n\
              string BARE=plain text\n\
              uint64 BIG=18446744073709551615\n\
              string name\n");
@@ -1150,11 +1116,7 @@ mod constant_and_default_tests {
                 constant("RATE", FieldType::F64, ScalarLiteral::Float(2.5)),
                 constant("ON", FieldType::Bool, ScalarLiteral::Bool(true)),
                 constant("RAW", FieldType::U8, ScalarLiteral::Int(255)),
-                constant(
-                    "MODE",
-                    FieldType::String,
-                    ScalarLiteral::Str("AUTO # not a comment".into())
-                ),
+                constant("MODE", FieldType::String, ScalarLiteral::Str("AUTO".into())),
                 constant(
                     "BARE",
                     FieldType::String,
@@ -1687,50 +1649,55 @@ mod literal_syntax_tests {
     }
 
     #[test]
-    fn a_hash_in_bare_string_text_starts_a_comment_only_after_whitespace() {
+    fn the_first_hash_on_a_line_starts_a_comment_as_rosidl_reads_it() {
         use ScalarLiteral::{Int, Str};
+        // rosidl cuts every line at its first `#`, so a bare string value
+        // ends there, with or without a space before it.
         assert_eq!(
-            constant_values("string TAG=a#b\nstring T2=a#b # note\n"),
-            vec![Str("a#b".into()), Str("a#b".into())]
+            constant_values("string TAG=a#b\nstring T2=a #b\n"),
+            vec![Str("a".into()), Str("a".into())]
         );
-        // A `#` as the value's first character is a comment, so nothing
-        // is left.
+        assert_eq!(
+            default_of("string s a#b\n"),
+            Some(DefaultLiteral::Scalar(Str("a".into())))
+        );
+        // A `#` as the value's first character leaves no value.
         assert_eq!(err("string T3=#x\n"), "line 1: constant T3 has no value");
+        assert_eq!(default_of("string s #x\n"), None);
+        // A `#` inside quotes is cut too, so the quote never closes.
         assert_eq!(
-            default_of("string s a#b # note\n"),
-            Some(DefaultLiteral::Scalar(Str("a#b".into())))
+            err("string S=\"a#b\"\n"),
+            "line 1: unterminated string constant: \"a"
         );
-        // The same rule holds for each item of a string array.
         assert_eq!(
-            default_of("string[] v [a#b, c] # note\n"),
-            Some(DefaultLiteral::Array(vec![
-                Str("a#b".into()),
-                Str("c".into())
-            ]))
+            err("string s 'a#b'\n"),
+            "line 1: unterminated string default: 'a"
         );
-        // Right after a closing quote a `#` is a comment too.
+        // Right after a closing quote.
         assert_eq!(
             constant_values("string S=\"x\"#note\n"),
             vec![Str("x".into())]
         );
-        // Right after the `]` that closes a string array a `#` is a
-        // comment, quoted or bare items alike; a `#` inside a bare item
-        // stays literal.
+        // In a string array the cut can land inside an item, which then
+        // leaves the list unclosed, or right after the closing `]`.
+        assert_eq!(
+            err("string[] v [a#b, c]\n"),
+            "line 1: array default must be written [a, b, ...]: [a"
+        );
         assert_eq!(
             default_of("string[] v [\"x\"]# note\n"),
             Some(DefaultLiteral::Array(vec![Str("x".into())]))
         );
         assert_eq!(
-            default_of("string[2] v [a#b, c]#note\n"),
+            default_of("string[2] v [a, c]#note\n"),
             Some(DefaultLiteral::Array(vec![
-                Str("a#b".into()),
+                Str("a".into()),
                 Str("c".into())
             ]))
         );
-        // A scalar string has no list to close, so `]` there is plain
-        // text and the `#` after it stays in the value.
-        assert_eq!(constant_values("string S=a]#b\n"), vec![Str("a]#b".into())]);
-        // A non-string value is cut at any `#`.
+        // A scalar string: `]` is plain text, the `#` after it still cuts.
+        assert_eq!(constant_values("string S=a]#b\n"), vec![Str("a]".into())]);
+        // A non-string value is cut the same way.
         assert_eq!(constant_values("uint8 X=1#c\n"), vec![Int(1)]);
     }
 
