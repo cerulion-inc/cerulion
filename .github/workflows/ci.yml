@@ -3913,6 +3913,17 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_tf (selected: $SELECTED)"
+      # HostShm runs the conformance suite on every runner; the vendor
+      # backends report SKIP where their library is absent.
+      - name: cerulion_device tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_device')
+        run: cargo test -p cerulion_device
+      - name: selection marker, cerulion_device
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_device') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_device (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
