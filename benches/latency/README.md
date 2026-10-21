@@ -33,6 +33,7 @@ post-processing. Published result packages live under
 | `README.md` (this file) | What is measured, the line inventory, how to reproduce, where results land |
 | `METHODOLOGY.md` | Pacing modes, schedules, timing rules, QoS pins, run-shape declarations, A/B discipline |
 | `PITFALLS.md` | Symptom → cause → fix catalog: 22 RMW + operational pitfalls that produced wrong or missing numbers in prior campaigns |
+| `crosshost/README.md` | Round trips between two machines: Cerulion over `tcp/` and `quic/`, ROS 2 on Fast DDS over TCP, every connection opened by one side |
 
 ## What this measures
 
@@ -84,7 +85,7 @@ line from plots (see `PITFALLS.md` § "Plot/prefix coupling").
 | raw_prefix | Tag | Binary | chrt | What it is |
 |---|---|---|---|---|
 | `iox2_chrt0` | **floor** | `raw_iceoryx2_round_trip` | off only | Raw iceoryx2 with zero Cerulion involvement, mirroring iceoryx2's upstream canonical publish-subscribe bench. The hardware/OS floor any iceoryx2-based middleware can hit. Spin-bound, so SCHED_FIFO adds nothing; no chrt-on cell. |
-| `zenoh_shm_chrt0` / `zenoh_shm_chrt1` | **comparison** | `zenoh_shm_round_trip` (+ `_pong`, two processes) | off + on | Raw zenoh with SHM engaged at every payload size (`message_size_threshold: 0`: zenoh's shipped default sends small payloads inline; forcing SHM keeps the `shm` label true at every size and mirrors zenoh's own `z_ping_shm`/`z_pong` two-process methodology). The zenoh crate is exact-pinned `=1.7.2`: the SHM config keys + allocator floor are 1.7.2-verified, and bumping it is a deliberate change that re-verifies those keys (`native/Cargo.toml`), disclosed here so nobody discovers the compared stack's version from the lockfile. |
+| `zenoh_shm_chrt0` / `zenoh_shm_chrt1` | **comparison** | `zenoh_shm_round_trip` (+ `_pong`, two processes) | off + on | Raw zenoh with SHM engaged at every payload size (`message_size_threshold: 0`: zenoh's shipped default sends small payloads inline; forcing SHM keeps the `shm` label true at every size and mirrors zenoh's own `z_ping_shm`/`z_pong` two-process methodology). The zenoh crate is exact-pinned `=1.10.1`, the release `cerulion_core` depends on: the SHM config keys and the 1 MiB allocator floor are checked against 1.10.1 (a unit test in `native/src/lib.rs` reads every key back), and moving the pin re-checks them (`native/Cargo.toml`). The version is stated here so nobody has to read it from the lockfile. |
 
 ### Workspace lines (the real `cerulion` CLI): `workspace/`
 

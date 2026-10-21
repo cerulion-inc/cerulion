@@ -277,6 +277,10 @@ the arms are additionally #[serial] within the binary because the drain tally is
 process-global static two concurrent arms would both bump",
     ),
     (
+        "local_transport_test",
+        "touches the process singleton in refusal and device-role arms",
+    ),
+    (
         "latest_value_input_has_no_listener_test",
         "default-namespace manager: the refusal pair stands up its own ports on the shared \
 root, and the window arms read a topic's live listener count, which a sibling attaching \
@@ -378,6 +382,10 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
         "toolchain",
         "nobody (on demand) — asserts rustc's UNSTABLE diagnostic rendering, so CI must never gate on it; re-blessed after toolchain bumps",
     ),
+    (
+        "android-device",
+        "nobody (on demand): requires an Android device for the local transport serving role",
+    ),
 ];
 
 /// Every `#[ignore]`d test arm in `cerulion_core/tests`, with the CLASS that
@@ -410,6 +418,8 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 /// * `toolchain` — asserts rustc's own unstable diagnostic rendering, so it is
 ///   deliberately on-demand and re-blessed after toolchain bumps. CI must not
 ///   gate on it.
+/// * `android-device`: the local-transport serving role needs an Android
+///   device and is run on demand.
 ///
 /// Compared BOTH directions by the test below, like the two inventories above:
 /// an arm added without an entry fails, and an entry naming an arm that no
@@ -488,6 +498,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "a standing cross-machine data-plane diagnostic, driven by env; never a gate",
     ),
     (
+        "local_transport_test.rs",
+        "loader_refuses_a_matching_local_transport_cdylib",
+        "unix-by-hand",
+        "needs a fixture built WITH cerulion_core/local-transport; the Local transport CI lane builds it and runs this arm with --ignored --exact",
+    ),
+    (
+        "local_transport_test.rs",
+        "serve_role",
+        "android-device",
+        "manual Android device E2E: exercises local pub/sub and gateway schema serving under the app sandbox",
+    ),
+    (
         "macro_compile_fail_test.rs",
         "compile_fail_rustc_diagnostic_tests",
         "toolchain",
@@ -522,6 +544,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_raw_ffi_level_probe",
         "child",
         "self-re-exec entry point for the raw-FFI half of the same contract",
+    ),
+    (
+        "cdylib_shm_fd_handoff_iox2_test.rs",
+        "subprocess_child_shm_fd_handoff",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` in a fresh process, since its descriptor table is the subject",
     ),
     (
         "cdylib_tracing_stopgap_test.rs",

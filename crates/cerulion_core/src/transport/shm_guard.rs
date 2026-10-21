@@ -154,12 +154,45 @@ pub(crate) fn map_count_verdict(current: usize, max: usize) -> MapCountVerdict {
     }
 }
 
+/// How many times the shared-memory safety probes actually ran. The local
+/// (in-process) transport maps no shared-memory pools, so the probes must
+/// never run for it: tests assert the counter does not move across manager
+/// init rather than relying on no warning happening to fire.
+static SHM_SAFETY_CHECKS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of shared-memory safety probe runs so far.
+#[doc(hidden)]
+pub fn shm_safety_checks_run() -> usize {
+    SHM_SAFETY_CHECKS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bumped by each `advise_shm_pools_no_hugepage` call that actually scans;
+/// the local-transport early return does not reach it.
+static SHM_POOL_ADVICE_SCANS_RUN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test seam: the number of MADV_NOHUGEPAGE pool scans run so far. Gives
+/// tests a deterministic signal that the scan ran - or did not - instead of
+/// relying on the warn-once side channel.
+#[doc(hidden)]
+pub fn shm_pool_advice_scans_run() -> usize {
+    SHM_POOL_ADVICE_SCANS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the operator-set Linux configs that break our
 /// oversize-freely assumption and emit a loud [`tracing::warn!`] for each
 /// unsafe one. Detect-and-warn only — never mutates a system setting, never
 /// aborts. Called ONCE at transport init (cold path).
 #[cfg(target_os = "linux")]
 pub(crate) fn check_and_warn_shm_safety() {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // every warning below describes a hazard it cannot hit (like the publisher
+    // pool scan in `advise_shm_pools_no_hugepage`, which skips the same way).
+    if cfg!(feature = "local-transport") {
+        return;
+    }
+    SHM_SAFETY_CHECKS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     warn_if_thp_unsafe();
     warn_if_rlimit_as_bounded();
     warn_if_map_count_approaching();
@@ -398,6 +431,15 @@ fn should_warn_scan_anomaly(site: PoolAdviseSite, found: usize) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn advise_shm_pools_no_hugepage(site: PoolAdviseSite, shm_prefix: &str) {
+    // The local (in-process) transport maps no shared-memory pools at all, so
+    // an empty scan is the NORMAL state, not an anomaly. At the publisher
+    // site it would trip the "broken scan" warn-once for nothing (and burn the
+    // one-shot token). There is no VMA to advise: skip the call.
+    if cfg!(feature = "local-transport") {
+        let _ = (site, shm_prefix);
+        return;
+    }
+    SHM_POOL_ADVICE_SCANS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
     };

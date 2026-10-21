@@ -101,6 +101,7 @@ filter = '''
 + binary(=latency_threshold_test)
 + binary(=latest_value_input_has_no_listener_test)
 + binary(=listener_drain_count_test)
++ binary(=local_transport_test)
 + binary(=log_sites_test)
 + binary(=log_sites_zero_alloc_test)
 + binary(=macro_cdylib_test)

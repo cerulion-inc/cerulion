@@ -2959,6 +2959,60 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
     });
 }
 
+/// Decide a cdylib load from its `cerulion_node_platform_check` export.
+///
+/// `check` is the resolved export, `None` when the cdylib does not export it.
+/// A missing export is refused on Android only, where the host cannot
+/// otherwise know whether the cdylib's own iceoryx2 copy has shared-memory
+/// support. A nonzero return is refused everywhere, with the cdylib's
+/// `LAST_ERROR` as the reason when it set one.
+fn check_cdylib_platform(
+    node_id: &str,
+    check: Option<unsafe extern "C" fn() -> i32>,
+    take_last_error: impl FnOnce() -> Option<String>,
+) -> TransportResult<()> {
+    let Some(check) = check else {
+        if cfg!(target_os = "android") {
+            return Err(TransportError::NodeError {
+                node_id: node_id.to_owned(),
+                reason: "missing symbol cerulion_node_platform_check: on Android a node \
+                         library must export it so its own iceoryx2 copy can be probed for \
+                         shared-memory support. Build the node with `#[cerulion_node]`, or \
+                         copy the export from the `cerulion node create --raw-ffi` template \
+                         (see docs/android.md)"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    };
+    // SAFETY: resolved by name and signature; a present symbol is trusted to
+    // match the ABI, exactly as every other lookup in `DylibNodeEntry::load`.
+    let ret = unsafe { check() };
+    if ret == 0 {
+        return Ok(());
+    }
+    Err(TransportError::NodeError {
+        node_id: node_id.to_owned(),
+        reason: take_last_error().unwrap_or_else(|| {
+            format!(
+                "cerulion_node_platform_check returned {ret} ({}, no detail provided)",
+                ffi_error_description(ret),
+            )
+        }),
+    })
+}
+
+/// The platform check behind a cdylib's `cerulion_node_platform_check`
+/// export. It runs inside the cdylib, so it probes the cdylib's own
+/// iceoryx2 copy. No-op off Android.
+#[doc(hidden)]
+pub fn cdylib_platform_check() -> Result<(), String> {
+    crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| match error {
+        TransportError::NodeCreation { reason, .. } => reason,
+        error => error.to_string(),
+    })
+}
+
 /// Interface between the graph runtime and node logic.
 ///
 /// Implementations must be `Send` for use with `Arc<Mutex<Box<dyn NodeEntry>>>`.
@@ -3671,7 +3725,10 @@ impl NodeEntry for ClosureNodeEntry {
 ///
 /// The cdylib must export these `extern "C"` functions:
 ///
-/// - `cerulion_abi_version() -> u32` — Must return `CERULION_ABI_VERSION`
+/// - `cerulion_abi_version() -> u32`: Returns
+///   `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for
+///   cross-process nodes, with the transport id above bit 16 for in-process
+///   nodes. A host built before the transport id refuses an in-process node.
 /// - `cerulion_rustc_fingerprint() -> *const c_char`: Must return
 ///   `RUSTC_FINGERPRINT` (ABI v22). Checked immediately after
 ///   `cerulion_abi_version`; a mismatch refuses the load even when the ABI
@@ -3684,6 +3741,7 @@ impl NodeEntry for ClosureNodeEntry {
 /// - `cerulion_node_shutdown(handle: u64) -> i32` — Clean shutdown for the given handle
 /// - `cerulion_take_last_error() -> *mut c_char`: Pulls the most recent error message off the cdylib's per-thread buffer; null if no error.
 /// - `cerulion_free_error(*mut c_char)` — Pairs with `cerulion_take_last_error`; allocator-paired free.
+/// - `cerulion_node_platform_check() -> i32`: Probes the cdylib's own iceoryx2 copy for platform support (0 = supported; nonzero sets `LAST_ERROR`). Required on Android, optional elsewhere.
 ///
 /// `cerulion_node_info()` carries no `node_type` field — the node
 /// type is the folder name and is resolved by the loader, not by
@@ -4107,6 +4165,23 @@ impl DylibNodeEntry {
     /// Returns `NodeError` if the library cannot be loaded or required
     /// symbols are missing.
     pub fn load(path: &std::path::Path) -> TransportResult<Self> {
+        // A `local-transport` host cannot deliver frames from a cdylib node:
+        // every cdylib statically links its own copy of `cerulion_core`, so its
+        // process-local service registry is a different registry than the
+        // host's and a matching ABI tag does not bridge them. Refuse the load
+        // rather than running a node whose frames silently never arrive.
+        if cfg!(feature = "local-transport") {
+            return Err(TransportError::NodeError {
+                node_id: path.display().to_string(),
+                reason: "native cdylib nodes are not supported under \
+                         `local-transport`: each node library carries its own \
+                         process-local registry, so its frames cannot reach the \
+                         host; drive the app's local topics through the \
+                         publish/subscribe API in this process instead, or run \
+                         a cross-process host"
+                    .to_string(),
+            });
+        }
         // Safety: We trust the library at the given path to export the expected symbols.
         let library =
             unsafe { libloading::Library::new(path) }.map_err(|e| TransportError::NodeError {
@@ -4124,7 +4199,17 @@ impl DylibNodeEntry {
             match abi_sym {
                 Ok(abi_fn) => {
                     let version = abi_fn();
-                    if version != crate::CERULION_ABI_VERSION {
+                    let expected_abi = crate::transport::TRANSPORT_KIND.cdylib_abi_version();
+                    if version != expected_abi {
+                        if let Some(reason) = crate::transport::kind::cdylib_transport_mismatch(
+                            crate::transport::TRANSPORT_KIND,
+                            version,
+                        ) {
+                            return Err(TransportError::NodeError {
+                                node_id: path_str.clone(),
+                                reason,
+                            });
+                        }
                         return Err(TransportError::NodeError {
                             node_id: path_str,
                             reason: format!(
@@ -4135,8 +4220,7 @@ impl DylibNodeEntry {
                                  structs it shares with the host at different offsets, so \
                                  loading it would CORRUPT state rather than merely miss a \
                                  feature — which is why this refuses instead of degrading.",
-                                version,
-                                crate::CERULION_ABI_VERSION
+                                version, expected_abi
                             ),
                         });
                     }
@@ -4228,6 +4312,20 @@ impl DylibNodeEntry {
             *sym
         };
 
+        // The Android stock-iceoryx2 guard on the HOST's own transport copy.
+        // It does not prove anything about the cdylib's separately linked
+        // iceoryx2 copy: that one is probed through the cdylib's own
+        // `cerulion_node_platform_check` export further below.
+        crate::transport::refuse_unsupported_android_shm("node library").map_err(|error| {
+            TransportError::NodeError {
+                node_id: path_str.clone(),
+                reason: match error {
+                    TransportError::NodeCreation { reason, .. } => reason,
+                    error => error.to_string(),
+                },
+            }
+        })?;
+
         let init_fn = unsafe {
             let sym: libloading::Symbol<unsafe extern "C" fn(*mut NodeContext) -> u64> = library
                 .get(b"cerulion_node_init\0")
@@ -4306,6 +4404,25 @@ impl DylibNodeEntry {
                 .ok()
                 .map(|sym| *sym)
         };
+
+        // The cdylib's OWN platform probe. The host check above probes the
+        // host's iceoryx2 copy only; a cdylib links its own `cerulion_core`
+        // and `iceoryx2`, so only a call into the cdylib can tell whether ITS
+        // copy has Android shared-memory support. On Android the export is
+        // REQUIRED (every Android build is new, so no old cdylib is refused):
+        // a hand-written raw-FFI node without it is refused here at load
+        // instead of reaching an unsupported transport. Off Android it is
+        // optional and, when present, a no-op that returns 0.
+        // Safety: same convention as the required symbol lookups.
+        let platform_check_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> i32>(b"cerulion_node_platform_check\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        check_cdylib_platform(&path_str, platform_check_fn, || {
+            take_last_error_via(take_last_error_fn, free_error_fn)
+        })?;
 
         // OPTIONAL snapshot symbols, resolved best-effort. An
         // older cdylib does NOT export them, and that MUST still load (the
@@ -6791,6 +6908,55 @@ mod tests {
         let mut node = ClosureNodeEntry::new(info, |_ctx| Ok(()));
         let result = node.tick();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn every_load_path_shares_the_android_shm_guard() {
+        // `DylibNodeEntry::load` probes the host's own iceoryx2 copy before
+        // any init symbol. The guard is Android-only, so on a host the shared
+        // decision is simply permissive.
+        crate::transport::refuse_unsupported_android_shm("test node")
+            .expect("non-Android hosts never refuse");
+    }
+
+    extern "C" fn platform_check_ok() -> i32 {
+        0
+    }
+
+    extern "C" fn platform_check_refuses() -> i32 {
+        -1
+    }
+
+    #[test]
+    fn cdylib_platform_check_export_decides_the_load() {
+        let no_detail = || None;
+        check_cdylib_platform("n", Some(platform_check_ok), no_detail)
+            .expect("a passing export loads");
+
+        let missing = check_cdylib_platform("n", None, no_detail);
+        if cfg!(target_os = "android") {
+            let reason = missing
+                .expect_err("Android requires the export")
+                .to_string();
+            assert!(reason.contains("cerulion_node_platform_check"), "{reason}");
+        } else {
+            missing.expect("the export is optional off Android");
+        }
+
+        let refused = check_cdylib_platform("n", Some(platform_check_refuses), || {
+            Some("node library: no shared memory".to_owned())
+        })
+        .expect_err("a nonzero return refuses the load")
+        .to_string();
+        assert!(refused.contains("no shared memory"), "{refused}");
+
+        let undetailed = check_cdylib_platform("n", Some(platform_check_refuses), no_detail)
+            .expect_err("a nonzero return refuses the load")
+            .to_string();
+        assert!(
+            undetailed.contains("cerulion_node_platform_check returned -1"),
+            "{undetailed}"
+        );
     }
 
     #[test]
