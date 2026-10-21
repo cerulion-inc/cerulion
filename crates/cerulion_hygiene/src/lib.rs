@@ -21,8 +21,10 @@
 //!   non-blocking `flock` on the pidfile beside the socket, taken before the socket
 //!   is touched, so two starts racing on one path can never both call the socket
 //!   stale and clobber each other. The kernel drops the lock when the process dies,
-//!   so a crashed daemon needs no PID liveness probe: a leftover socket under a free
-//!   lock is stale by construction and is recovered.
+//!   so a crashed daemon needs no PID liveness probe: a leftover pathname socket
+//!   under a free lock is stale by construction and is recovered.
+//! * **Android control sockets** use the abstract namespace; the pidfile and its
+//!   `flock` remain filesystem-backed. Other Unix targets use pathname sockets.
 //! * **The socket-directory rule** ([`socket_dir_verdict`]), below.
 //!
 //! The daemons keep a thin `hygiene` module each (their historical names and
@@ -118,12 +120,56 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 #[cfg(unix)]
 use std::io::{self, Seek, SeekFrom, Write};
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+use std::os::fd::BorrowedFd;
+#[cfg(target_os = "android")]
+use std::os::fd::OwnedFd;
+#[cfg(target_os = "android")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "android")]
+use std::os::unix::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(any(target_os = "android", test))]
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "android")]
+/// Outlast netd's five-second hard-exit watchdog but stay below the client's ten-second spawn-ready timeout.
+const ANDROID_ABSTRACT_BIND_WAIT: Duration = Duration::from_secs(6);
+#[cfg(target_os = "android")]
+/// Poll often enough to notice the listener closing promptly without busy-spinning.
+const ANDROID_ABSTRACT_BIND_POLL: Duration = Duration::from_millis(25);
+
+#[cfg(any(target_os = "android", test))]
+fn retry_while_addr_in_use<T>(
+    wait: Duration,
+    poll: Duration,
+    mut bind: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let started = Instant::now();
+    loop {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && started.elapsed() < wait => {
+                std::thread::sleep(poll);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn refuse_new_connections(fd: BorrowedFd<'_>) -> io::Result<()> {
+    rustix::net::shutdown(fd, rustix::net::Shutdown::Read).map_err(io::Error::from)
+}
 
 /// One daemon's socket identity: the pieces its clients and the daemon itself
 /// must agree on.
@@ -197,10 +243,14 @@ impl DaemonSocket {
     }
 
     /// Bind `socket` as THE daemon for that path: check/create its directory,
-    /// take the pidfile flock, recover a stale socket, bind, restrict the socket
-    /// to `0600`, and write our pid. The listener is returned OWNED (blocking;
-    /// a tokio daemon sets non-blocking and converts it); the [`SocketGuard`]
-    /// holds the lock and removes both files on drop.
+    /// take the pidfile flock, recover a stale pathname socket, bind, restrict
+    /// pathname sockets to `0600`, and write our pid. The listener is returned
+    /// OWNED (blocking; a tokio daemon sets non-blocking and converts it); the
+    /// [`SocketGuard`] holds the lock and removes filesystem entries on drop.
+    ///
+    /// Android binds the socket in the abstract namespace and waits briefly for
+    /// an exiting daemon's listener to close. Its guard refuses new connections
+    /// before releasing the filesystem-backed pidfile lock.
     ///
     /// A daemon already holding the lock is reported as
     /// [`io::ErrorKind::AddrInUse`] naming the socket, its pid and the env var
@@ -217,9 +267,9 @@ impl DaemonSocket {
     /// symlink planted where the directory should be, and the one verdict that
     /// can still fail on its own (a directory of ours whose bits could not be
     /// stripped) — because they all go through the same refusal. Every failure
-    /// AFTER it (the pidfile and socket ownership checks, the pidfile open, the
-    /// flock, the stale-socket removal, the bind, the `0600` chmod, the pidfile
-    /// write) keeps its `std` kind and reason but is given the operation it
+    /// AFTER it (the pidfile ownership check, the pidfile open, the flock,
+    /// stale pathname-socket removal, the bind, pathname-socket `0600` chmod,
+    /// the pidfile write) keeps its `std` kind and reason but is given the operation it
     /// failed, the path it failed on, and the env var that moves the socket: a
     /// daemon's `main` prints this error verbatim, and `File name too long (os
     /// error 63)` on its own names neither. That list is exhaustive by
@@ -235,6 +285,7 @@ impl DaemonSocket {
         }
         let pidfile = pidfile_for(&socket);
         self.require_ours(&pidfile, "pidfile")?;
+        #[cfg(not(target_os = "android"))]
         self.require_ours(&socket, "socket")?;
         // `require_ours` stats the pidfile and this opens it, but the open
         // carries `O_NOFOLLOW`, so a symlink swapped in after the stat fails
@@ -286,6 +337,7 @@ impl DaemonSocket {
         // an entry that appeared after the check — in a directory the rule
         // above has already established only root or we can create or replace
         // entries in.
+        #[cfg(not(target_os = "android"))]
         if fs::symlink_metadata(&socket).is_ok() {
             tracing::warn!(
                 daemon = self.binary,
@@ -296,9 +348,21 @@ impl DaemonSocket {
                 self.socket_error("could not remove the leftover control socket", &socket, e)
             })?;
         }
-        let listener = UnixListener::bind(&socket)
+        #[cfg(target_os = "android")]
+        let listener =
+            SocketAddr::from_abstract_name(socket.as_os_str().as_bytes()).and_then(|addr| {
+                retry_while_addr_in_use(
+                    ANDROID_ABSTRACT_BIND_WAIT,
+                    ANDROID_ABSTRACT_BIND_POLL,
+                    || UnixListener::bind_addr(&addr),
+                )
+            });
+        #[cfg(not(target_os = "android"))]
+        let listener = UnixListener::bind(&socket);
+        let listener = listener
             .map_err(|e| self.socket_error("could not bind the control socket", &socket, e))?;
         let cleanup = || {
+            #[cfg(not(target_os = "android"))]
             let _ = fs::remove_file(&socket);
             let _ = fs::remove_file(&pidfile);
         };
@@ -312,6 +376,7 @@ impl DaemonSocket {
         // can create or replace an entry in this directory — the same property
         // the `bind` one line up depends on. The window is also
         // narrowing-only: the mode goes from the umask's to `0600`.
+        #[cfg(not(target_os = "android"))]
         if let Err(error) = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)) {
             cleanup();
             return Err(self.socket_error(
@@ -324,11 +389,25 @@ impl DaemonSocket {
             cleanup();
             return Err(self.socket_error("could not write the daemon pidfile", &pidfile, error));
         }
+        #[cfg(target_os = "android")]
+        let guard_listener = match listener.try_clone() {
+            Ok(listener) => OwnedFd::from(listener),
+            Err(error) => {
+                cleanup();
+                return Err(self.socket_error(
+                    "could not retain the control socket",
+                    &socket,
+                    error,
+                ));
+            }
+        };
         Ok((
             listener,
             SocketGuard {
                 socket,
                 pidfile,
+                #[cfg(target_os = "android")]
+                listener: guard_listener,
                 _lock: lock,
             },
         ))
@@ -400,6 +479,36 @@ pub fn read_pidfile(pidfile: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Connect to a control socket resolved by [`DaemonSocket::default_socket_path`].
+///
+/// Android interprets the path bytes as an abstract-namespace socket name.
+#[cfg(unix)]
+pub fn connect_control_socket(path: &Path) -> io::Result<UnixStream> {
+    #[cfg(target_os = "android")]
+    {
+        let addr = SocketAddr::from_abstract_name(path.as_os_str().as_bytes())?;
+        let stream = UnixStream::connect_addr(&addr)?;
+        if !peer_is_same_user(&stream)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the control socket is served by a different user",
+            ));
+        }
+        Ok(stream)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        UnixStream::connect(path)
+    }
+}
+
+/// Whether a connected peer has the current effective user ID.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn peer_is_same_user(stream: impl AsFd) -> io::Result<bool> {
+    let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(io::Error::from)?;
+    Ok(credentials.uid.as_raw() == euid())
+}
+
 #[cfg(unix)]
 fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -411,15 +520,19 @@ fn euid() -> u32 {
     0
 }
 
-/// Removes the socket and pidfile on drop and OWNS the single-daemon flock for
-/// the daemon's lifetime. The files are unlinked WHILE the lock is still held
-/// (`_lock` drops last), so a guard only ever removes its own socket, never a
-/// live replacement's.
+/// Removes its pathname socket when applicable and the pidfile on drop. On
+/// Android it refuses new connections to the abstract name before releasing the
+/// flock. It OWNS the single-daemon lock for the daemon's lifetime. The pidfile
+/// and any pathname socket are unlinked WHILE the lock is still held (`_lock`
+/// drops last), so a guard only ever removes its own socket, never a live
+/// replacement's.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct SocketGuard {
     socket: PathBuf,
     pidfile: PathBuf,
+    #[cfg(target_os = "android")]
+    listener: OwnedFd,
     _lock: File,
 }
 
@@ -434,7 +547,18 @@ impl SocketGuard {
 #[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        for path in [&self.socket, &self.pidfile] {
+        #[cfg(target_os = "android")]
+        if let Err(error) = refuse_new_connections(self.listener.as_fd()) {
+            tracing::warn!(
+                error = %error,
+                "could not refuse new control socket connections during shutdown"
+            );
+        }
+        #[cfg(target_os = "android")]
+        let paths = [&self.pidfile];
+        #[cfg(not(target_os = "android"))]
+        let paths = [&self.socket, &self.pidfile];
+        for path in paths {
             if let Err(error) = fs::remove_file(path) {
                 if error.kind() != io::ErrorKind::NotFound {
                     // `warn!`: a `debug!` here is compiled out of every daemon
@@ -671,6 +795,111 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
+    #[test]
+    fn retry_while_addr_in_use_succeeds_after_two_failures() {
+        let mut calls = 0;
+        let value =
+            retry_while_addr_in_use(Duration::from_secs(1), Duration::from_millis(1), || {
+                calls += 1;
+                if calls <= 2 {
+                    Err(io::Error::new(io::ErrorKind::AddrInUse, "busy"))
+                } else {
+                    Ok(calls)
+                }
+            })
+            .unwrap();
+
+        assert_eq!(value, 3);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn retry_while_addr_in_use_returns_persistent_error_after_wait() {
+        let mut calls = 0;
+        let error = retry_while_addr_in_use(
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+            || -> io::Result<()> {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::AddrInUse, "busy"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(calls > 1);
+    }
+
+    #[test]
+    fn retry_while_addr_in_use_returns_other_errors_immediately() {
+        let mut calls = 0;
+        let error = retry_while_addr_in_use(
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || -> io::Result<()> {
+                calls += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "not permitted",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retry_while_addr_in_use_waits_for_abstract_listener_to_close() {
+        use std::os::linux::net::SocketAddrExt;
+
+        let name = format!("cerulion_retry_{}", std::process::id());
+        let addr =
+            <std::os::unix::net::SocketAddr as SocketAddrExt>::from_abstract_name(name.as_bytes())
+                .unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(listener);
+        });
+
+        let listener =
+            retry_while_addr_in_use(Duration::from_secs(2), Duration::from_millis(10), || {
+                UnixListener::bind_addr(&addr)
+            })
+            .unwrap();
+
+        closer.join().unwrap();
+        drop(listener);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusing_new_connections_on_an_abstract_listener_rejects_connects() {
+        use std::os::linux::net::SocketAddrExt;
+
+        let name = format!("cerulion_refuse_{}", std::process::id());
+        let addr =
+            <std::os::unix::net::SocketAddr as SocketAddrExt>::from_abstract_name(name.as_bytes())
+                .unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        let duplicate = listener.try_clone().unwrap();
+
+        refuse_new_connections(duplicate.as_fd()).unwrap();
+        let error = UnixStream::connect_addr(&addr).expect_err("listener refuses new connects");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        drop(duplicate);
+
+        let error = UnixListener::bind_addr(&addr).expect_err("listener still owns its name");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        drop(listener);
+
+        let replacement = UnixListener::bind_addr(&addr).expect("name released after close");
+        drop(replacement);
+    }
+
     /// Tests that touch the process env serialize here.
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -825,10 +1054,39 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn pathname_control_socket_connect_and_peer_credentials_work() {
+        let dir = tempdir_unique("client_connect");
+        let socket = dir.join("netd.sock");
+        let (listener, guard) = NETD.acquire_socket(socket.clone()).expect("acquire");
+        let client = connect_control_socket(&socket).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        assert!(
+            socket.exists(),
+            "non-Android sockets remain pathname-backed"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(peer_is_same_user(&server).expect("peer credentials"));
+        assert_eq!(
+            connect_control_socket(&dir.join("missing.sock"))
+                .expect_err("missing host socket")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        drop(client);
+        drop(server);
+        drop(listener);
+        drop(guard);
+        assert!(!socket.exists(), "pathname socket is removed on cleanup");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The NEGATIVE twin of the two tighten tests: the ordinary path — a
     /// missing directory created `0700` — must say NOTHING at `warn!`, so the
     /// "exactly one WARN" counts below cannot be met by a line the daemon
     /// emits on every start.
+    #[cfg(not(target_os = "android"))]
     #[tracing_test::traced_test]
     #[test]
     fn acquire_binds_writes_pidfile_restricts_the_socket_and_cleanup_removes_both() {
@@ -854,6 +1112,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "android")]
+    #[test]
+    fn acquire_binds_abstract_socket_checks_peer_and_cleanup_refuses_new_connections() {
+        let dir = tempdir_unique("acquire_android");
+        let socket = dir.join("netd.sock");
+        let pidfile = pidfile_for(&socket);
+        let (listener, guard) = NETD.acquire_socket(socket.clone()).expect("acquire");
+        let client = connect_control_socket(&socket).expect("connect");
+        assert!(peer_is_same_user(&client).expect("peer credentials"));
+        assert!(pidfile.exists(), "pidfile exists while the guard is alive");
+
+        drop(client);
+        drop(guard);
+        assert!(!pidfile.exists(), "pidfile removed on cleanup");
+        let error = connect_control_socket(&socket).expect_err("guard refuses new connects");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_second_acquire_while_the_lock_is_held_is_refused_naming_pid_and_env() {
         let dir = tempdir_unique("live_refuse");
@@ -870,6 +1148,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("CERULION_VIZD_SOCK"), "{message}");
+        #[cfg(not(target_os = "android"))]
         assert!(
             socket.exists(),
             "the refusal must not touch the live socket"
@@ -877,6 +1156,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn a_stale_socket_under_a_free_lock_is_recovered() {
         let dir = tempdir_unique("stale");
@@ -1334,6 +1614,7 @@ mod tests {
             .acquire_socket(socket.clone())
             .expect("temp dir accepted");
         drop(guard);
+        #[cfg(not(target_os = "android"))]
         assert!(!socket.exists());
     }
 
@@ -1461,6 +1742,7 @@ mod tests {
     /// `File name too long (os error 63)` with no path, no rung and no way
     /// out. The oracle is std's OWN error (produced independently, right
     /// here) PLUS the two things std cannot know: the path and the env var.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn a_bind_failure_names_the_operation_the_path_and_the_env_var() {
         let dir = tempdir_unique("longsock");
@@ -1541,6 +1823,7 @@ mod tests {
     /// at `warn!` — a `debug!` is compiled out of every daemon that links this
     /// crate. Both files fail, so the count is TWO, one naming each: a guard
     /// that gave up after the first would leave the pidfile silently behind.
+    #[cfg(not(target_os = "android"))]
     #[tracing_test::traced_test]
     #[test]
     fn a_cleanup_that_cannot_unlink_warns_once_per_file_it_leaves_behind() {

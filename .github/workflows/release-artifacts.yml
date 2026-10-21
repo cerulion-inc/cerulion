@@ -157,7 +157,7 @@ jobs:
             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           fi
           cargo build --release --locked \
-            -p cerulion_cli -p cerulion_netd -p cerulion_connectd \
+            -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
             --target "$TARGET"
           case "$TARGET" in
             *-unknown-linux-gnu)
@@ -220,7 +220,8 @@ jobs:
           python3 tools/scripts/check_release_glibc.py \
             "target/$TARGET/release/cerulion" \
             "target/$TARGET/release/cerulion-netd" \
-            "target/$TARGET/release/cerulion-connectd"
+            "target/$TARGET/release/cerulion-connectd" \
+            "target/$TARGET/release/cerulion-remoted"
 
       - name: Package archive
         env:
@@ -234,12 +235,13 @@ jobs:
           cp "target/$TARGET/release/cerulion" "$stage/cerulion"
           cp "target/$TARGET/release/cerulion-netd" "$stage/cerulion-netd"
           cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
+          cp "target/$TARGET/release/cerulion-remoted" "$stage/cerulion-remoted"
           cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
           rustc -vV > "$stage/rustc-version.txt"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
-          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd
+          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           case "$TARGET" in
             *-unknown-linux-gnu)
               rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
@@ -553,6 +555,20 @@ jobs:
           actual=$( "$RUNNER_TEMP/cerulion-bin/cerulion" --version )
           printf '%s\n' "$actual" | grep -F "$expected" >/dev/null ||
             { echo "::error::cerulion --version did not contain $expected"; exit 1; }
+          # The installer places every program beside the CLI. v1.0.0
+          # predates cerulion-remoted; every later release carries it.
+          programs="cerulion-netd cerulion-connectd"
+          if [ "$TAG" != v1.0.0 ]; then
+            programs="$programs cerulion-remoted"
+          fi
+          for program in $programs; do
+            [ -x "$RUNNER_TEMP/cerulion-bin/$program" ] ||
+              { echo "::error::the installer did not place $program beside the CLI"; exit 1; }
+          done
+          if [ "$TAG" != v1.0.0 ]; then
+            "$RUNNER_TEMP/cerulion-bin/cerulion-remoted" --version | grep -F "$expected" >/dev/null ||
+              { echo "::error::cerulion-remoted --version did not contain $expected"; exit 1; }
+          fi
           # The Linux archive carries the ROS 2 Jazzy rmw and the heap hook,
           # and the installer places both beside the CLI; macOS archives
           # carry neither by design.

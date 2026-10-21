@@ -4,7 +4,8 @@ The following runtime crates build for Android:
 
 `cerulion_core`, `native_ros2_messages`, `cerulion-wire`, `cerulion_pairing`,
 `cerulion_hygiene`, `cerulion_discovery`, `cerulion_mdns`, `cerud`,
-`cerulion_bag`, `cerulion_netd`, `cerulion_bagd`, `cerulion_wireclient`,
+`cerulion_bag`, `cerulion_netd`, `cerulion_bagd`, `cerulion_cli_engine`,
+`cerulion_cli`, `cerulion_wsd`, `cerulion_wireclient`,
 `cerulion_link`, `cerulion_connectd`, `cerulion_remoted`, `rmw_cerulion`,
 and `cerulion_dds`.
 
@@ -78,9 +79,99 @@ Android event-trigger datagram sockets use the abstract namespace and do not
 create socket files. SELinux governs their access rather than file permissions.
 
 Android does not provide robust mutexes. If a process exits while holding a
-shared lock, other processes cannot recover that lock. The CLI,
-`cerulion_cli_engine`, and `cerulion_wsd` do not build for Android. There is no
-app embedding API.
+shared lock, other processes cannot recover that lock. There is no app embedding
+API.
+
+## Single-process apps
+
+An Android app that owns all of its local publishers, subscribers, and gateway
+in one process can opt into `local-transport`. It uses an in-process service,
+so it does not require cross-process shared memory. The existing zero-copy
+publish and subscribe path remains in use across threads in that process. A
+gateway can still forward topics over TCP.
+
+Do not enable this feature for the CLI or daemons, or for a graph that uses
+`process_groups`. Explicit cross-process initialization, detached pre-creation
+for other processes, and non-empty process groups are refused. A
+`local-transport` host refuses every native cdylib node at load: each node
+library statically links its own copy of `cerulion_core`, so its process-local
+service registry is a different registry than the host's and its frames cannot
+be delivered. Drive the app's local topics through the publish and subscribe
+API in that process instead, or run a cross-process host.
+
+Enable the feature on the dependency used by the app:
+
+```toml
+[dependencies]
+cerulion_core = { version = "1", features = ["local-transport"] }
+```
+
+## CLI and node workspaces
+
+Build the CLI and network daemon on a host with the Android NDK:
+
+```sh
+cargo ndk -t arm64-v8a --platform 30 build -p cerulion_cli -p cerulion_netd
+```
+
+Use `-t x86_64` for an x86_64 device. Build node cdylibs from their workspace
+on the same host, with the same Rust compiler used for the CLI:
+
+```sh
+cd path/to/node-workspace
+cargo ndk -t arm64-v8a --platform 30 build
+```
+
+Run node builds on the host. When `cerulion node build` cannot find Cargo on
+Android, it directs you to cross-build the workspace with `cargo ndk`.
+
+`cargo-ndk` places libraries under `target/<target-triple>/<profile>`. The CLI
+prefers those paths when the requested node's cdylib is present there; otherwise
+it uses that node's library under `target/<profile>` when present. Missing
+libraries are reported under cargo-ndk's target directory. Keep the target-triple
+directory when copying the workspace to the device. Do not flatten its libraries
+into `target/<profile>`.
+
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block. A
+workspace written by hand must add the complete block from Cerulion's root
+`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
+the node cdylib can link an iceoryx2 build whose Android shared-memory calls
+return `ENOSYS`. Node initialization refuses that library with:
+
+```text
+node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+```
+
+The check runs in two places: the host-side loader probes the host's
+iceoryx2, and it then calls the library's own `cerulion_node_platform_check`
+export, because a cdylib statically links its own copy of iceoryx2 and the
+host's probe proves nothing about it. `#[cerulion_node]` and the generated
+`--raw-ffi` template both emit that export. On Android a library without it is
+refused at load, so a hand-written raw-FFI library must export it too (copy it
+from the template).
+
+For an adb shell session, provide writable home and temporary directories:
+
+```sh
+export HOME=/data/local/tmp/cer/home
+export TMPDIR=/data/local/tmp/cer/tmp
+export CERULION_LOGIN_GATE=off
+mkdir -p "$HOME" "$TMPDIR"
+```
+
+When configured, netd and wsd use abstract-namespace control sockets on
+Android. Their configured socket paths supply the abstract names and do not
+create filesystem socket entries. Both ends check that the peer's `SO_PEERCRED`
+UID matches their own effective UID; a different UID or unverifiable credentials
+are refused. The pidfile and singleton lock remain filesystem-backed.
+
+`cerulion viz` is not available on Android because its visualization daemon
+requires a desktop. Run it on a desktop host and connect that host to device
+topics over the network. For a forwarded TCP listener, create the host-side
+forward with `adb forward tcp:7683 tcp:7683`; configure the device's netd to
+listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
+`tcp/127.0.0.1:7683`.
 
 ## Run two processes
 

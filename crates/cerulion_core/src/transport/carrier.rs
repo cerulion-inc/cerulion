@@ -100,7 +100,8 @@ pub enum EgressReliability {
     BestEffort,
 }
 
-/// One topic's egress put policy. Only non-default entries are carried.
+/// One topic's egress put policy. A graph's `network:` block carries only its
+/// best-effort topics; a topic with no entry is put reliable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressQos {

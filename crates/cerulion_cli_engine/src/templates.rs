@@ -2,8 +2,9 @@
 //! Node source and Cargo.toml template generation.
 //!
 //! Generates cdylib node source for the handle-based FFI convention. The
-//! emitted `cerulion_abi_version()` tracks `cerulion_core::CERULION_ABI_VERSION`,
-//! and the emitted `cerulion_rustc_fingerprint()` (ABI v22) tracks
+//! emitted `cerulion_abi_version()` tracks the transport-tagged ABI value of
+//! the `cerulion_core` it is compiled against, and the emitted
+//! `cerulion_rustc_fingerprint()` (ABI v22) tracks
 //! `cerulion_core::rustc_fingerprint_cstr()`. Neither is pinned to a specific
 //! value here, so a host rebuild propagates to every future generated node
 //! crate with no template regeneration.
@@ -675,13 +676,11 @@ fn __cer_set_last_error(msg: ::std::string::String) {
 "#,
     );
 
-    // ABI version. Emit the CONST NAME (not its baked value) so a generated
-    // raw-FFI node auto-tracks the `cerulion_core` it is compiled against — a
-    // host ABI bump then needs no regeneration of the user's node (the prior
-    // `{value}` literal silently froze the version at `node create` time and
-    // failed to load after the next bump).
+    // Transport-tagged ABI value. Emit the core method call rather than a
+    // baked value, so a generated raw-FFI node tracks the version and
+    // transport kind of the `cerulion_core` it is compiled against.
     src.push_str("#[no_mangle]\npub extern \"C\" fn cerulion_abi_version() -> u32 {\n    ");
-    src.push_str("::cerulion_core::CERULION_ABI_VERSION\n");
+    src.push_str("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()\n");
     src.push_str("}\n\n");
 
     // ABI v22 rustc fingerprint. Required at every ABI 22 and later host: it
@@ -696,6 +695,29 @@ fn __cer_set_last_error(msg: ::std::string::String) {
     );
     src.push_str("::cerulion_core::rustc_fingerprint_cstr()\n");
     src.push_str("}\n\n");
+
+    // Platform check. The host loader calls it at load, before init, so the
+    // probe runs against THIS cdylib's own `cerulion_core` and `iceoryx2`
+    // copy: the host's probe proves nothing about a separately linked
+    // library. Required on Android, where a stock-iceoryx2 build has no
+    // `shm_open`; off Android it is a no-op that returns 0.
+    src.push_str(
+        r#"// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
+// build of this library is refused at load on Android (see docs/android.md).
+// A raw-FFI library without this export does not load on Android.
+#[no_mangle]
+pub extern "C" fn cerulion_node_platform_check() -> i32 {
+    match ::cerulion_core::graph::node::cdylib_platform_check() {
+        ::std::result::Result::Ok(()) => 0,
+        ::std::result::Result::Err(error) => {
+            __cer_set_last_error(::std::format!("node library: {error}"));
+            1
+        }
+    }
+}
+
+"#,
+    );
 
     // Node info function with marker comments
     src.push_str(&generate_info_fn(metadata));
@@ -1881,6 +1903,20 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_lib_rs_uses_transport_tagged_abi_value() {
+        let metadata = NodeMetadata {
+            throttle_ms: None,
+            node_type: "camera".to_string(),
+            policy: None,
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let src = generate_lib_rs(&metadata);
+        assert!(src.contains("TRANSPORT_KIND.cdylib_abi_version()"));
+        assert!(!src.contains("CERULION_ABI_VERSION"));
+    }
+
+    #[test]
     fn test_generate_lib_rs_has_marker_comments() {
         let metadata = NodeMetadata {
             throttle_ms: None,
@@ -2229,8 +2265,10 @@ mod tests {
         //   6. cerulion_node_pump_history: NODES mutex poisoned
         //   7. cerulion_node_shutdown:     NODES mutex poisoned
         //   8. cerulion_node_shutdown:     missing handle
+        //   9. cerulion_node_platform_check: unsupported SHM refusal
+        //                                (cdylib_platform_check)
         //
-        // Plus 1 definition (`fn __cer_set_last_error(...)`) — 9 total
+        // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
         // CODE occurrences in the generated source.
         //
         // Count only code occurrences, not mentions
@@ -2259,8 +2297,8 @@ mod tests {
             .map(|line| line.matches("__cer_set_last_error").count())
             .sum();
         assert_eq!(
-            count, 9,
-            "expected 9 code occurrences of __cer_set_last_error (1 definition + 8 error-path call sites); \
+            count, 10,
+            "expected 10 code occurrences of __cer_set_last_error (1 definition + 9 error-path call sites); \
              got {} — a new non-success return probably needs LAST_ERROR wiring, or one was removed unsafely",
             count
         );
@@ -2344,9 +2382,9 @@ mod tests {
                     - line.matches("::std::string::String::from(").count()
             })
             .sum();
-        // `pump_history` adds one more mutex-poison
-        // `::std::string::String::from(...)` call site (init null-ctx +
-        // init/tick/pump_history/shutdown mutex-poison = 5).
+        // `pump_history` adds one more mutex-poison (init null-ctx +
+        // init/tick/pump_history/shutdown mutex-poison = 5); the Android
+        // SHM-refusal arm formats its message directly.
         assert_eq!(
             qualified_count, 5,
             "expected 5 fully-qualified ::std::string::String::from call sites; got {}",

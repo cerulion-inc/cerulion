@@ -309,7 +309,7 @@ pub enum Commands {
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
         /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found by scouting with no configuration, and
+        /// typical LAN the robot is found over mDNS with no configuration, and
         /// no schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
@@ -317,11 +317,11 @@ pub enum Commands {
         /// A topic the robot does not serve is an error, not a silent skip.
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Additional zenoh gateway locator to CONNECT to, for a robot scouting
-        /// cannot reach, for example `tcp/192.0.2.10:7683`. Repeatable. Requires
-        /// `--robot`. Used when this command STARTS the daemon; a daemon that is
-        /// already running keeps the locators it started with (scouting covers
-        /// the LAN regardless, and the verb says so).
+        /// Additional zenoh gateway locator to CONNECT to, for a robot mDNS
+        /// discovery cannot reach, for example `tcp/192.0.2.10:7683`.
+        /// Repeatable. Requires `--robot`. Used when this command STARTS the
+        /// daemon; a daemon that is already running keeps the locators it
+        /// started with, and the verb says so.
         #[arg(long, value_name = "LOCATOR", requires = "robot")]
         connect: Vec<String>,
         /// Local zenoh locator to LISTEN on for remote discovery and ingress, for
@@ -1789,8 +1789,9 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (multicast and gossip scouting
-    /// on), so robots on the LAN show up with no flags and no pairing; when it
+    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
+    /// cache and the hostname rung), so robots on the LAN show up with no
+    /// flags and no pairing; when it
     /// finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
@@ -1799,7 +1800,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--local` to skip the remote
+    /// peers discovery cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1819,11 +1820,11 @@ pub enum TopicAction {
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// OPT-IN: also sweep the local /24 subnets, one address at a time, on
