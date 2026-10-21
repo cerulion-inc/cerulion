@@ -1136,8 +1136,8 @@ jobs:
   # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
   # except aarch64-linux trips `dead_code = deny` ONLY there — invisible to the
   # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
-  # aarch64-macOS machines). `cargo check` (no link, no cross C/C++ toolchain
-  # needed) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
+  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
+  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
   # cost on the critical path.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -1202,7 +1202,17 @@ jobs:
           restore-keys: |
             cargo-cross-aarch64-
 
+      # ring (through the QUIC link's rustls) compiles C in its build script,
+      # so the check needs the aarch64 C compiler that release-artifacts.yml
+      # installs for the same target.
+      - name: Install aarch64 C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
       - name: cargo check (aarch64-unknown-linux-gnu)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo check -p cerulion_core --target aarch64-unknown-linux-gnu
 
   # MSRV enforcement. Pins the toolchain to the declared MSRV
@@ -3948,8 +3958,10 @@ jobs:
       contents: read
       actions: write
     # The cargo cache for this job is restore-only (see the save step), so
-    # every run builds cold: about 30-44 minutes before pytest starts.
-    timeout-minutes: 60
+    # every run builds cold: about 30-46 minutes before pytest starts, and
+    # pytest itself takes up to 14 minutes on macOS. 60 minutes cancelled a
+    # run whose every step had passed, so the budget is 90.
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: crates/cerulion_py

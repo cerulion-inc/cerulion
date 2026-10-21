@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Graph commands: create, run.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +17,48 @@ use crate::workspace_lock::WorkspaceLock;
 use crate::yaml_splice::{
     line_numbers, render_scalar, scan_top_level_block, split_lines, BlockScan,
 };
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("aarch64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("x86_64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("armv7-linux-androideabi");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("i686-linux-android");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("arm64-v8a");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86_64");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("armeabi-v7a");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
 
 /// Which clock drives a `graph run`.
 ///
@@ -2918,8 +2960,8 @@ fn graph_validate_with_cache(
                             format!("{CDYLIB_CHECK_PREFIX}{}'", node_type),
                             detail,
                             format!(
-                                "node source is newer than this build; run `{}` to rebuild",
-                                rebuild_hint(node_type, lib.release)
+                                "node source is newer than this build; {}",
+                                rebuild_instruction(node_type, lib.release, "to rebuild")
                             ),
                         )
                     } else {
@@ -14514,11 +14556,28 @@ impl ResolvedCdylib {
 /// validation details, lookup errors) so the wording and the
 /// `--release` suffix can never drift between surfaces.
 fn rebuild_hint(node_type: &str, release: bool) -> String {
-    format!(
-        "cerulion node build {}{}",
-        node_type,
-        if release { " --release" } else { "" }
-    )
+    if cfg!(target_os = "android") {
+        let abi = ANDROID_CDYLIB_ABI.unwrap_or("unknown");
+        format!(
+            "cross-build the workspace on a host with `cargo ndk -t {abi} --platform 30 build{}` and push the workspace",
+            if release { " --release" } else { "" }
+        )
+    } else {
+        format!(
+            "cerulion node build {}{}",
+            node_type,
+            if release { " --release" } else { "" }
+        )
+    }
+}
+
+fn rebuild_instruction(node_type: &str, release: bool, ending: &str) -> String {
+    let hint = rebuild_hint(node_type, release);
+    if cfg!(target_os = "android") {
+        hint
+    } else {
+        format!("run `{hint}` {ending}")
+    }
 }
 
 /// Emit the stale-build warning for a resolved cdylib.
@@ -14684,6 +14743,304 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
     }
 }
 
+/// The cdylib candidates for one profile, cross-triple dir first then the
+/// plain target dir (cargo-ndk's layout), so a cross-built artifact for the
+/// SAME profile always wins over a host-built one.
+fn cdylib_profile_candidates(
+    base: &Path,
+    cross_triple: Option<&str>,
+    profile: &str,
+    lib_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(triple) = cross_triple {
+        candidates.push(base.join(triple).join(profile).join(lib_name));
+    }
+    candidates.push(base.join(profile).join(lib_name));
+    candidates
+}
+
+/// The ELF `e_machine` a node cdylib must carry to load for `triple`
+/// (EM_AARCH64 183, EM_X86_64 62, EM_ARM 40, EM_386 3). Unknown triples
+/// carry no expectation: their candidates are not filtered.
+fn expected_elf_machine(triple: &str) -> Option<u16> {
+    Some(match triple {
+        "aarch64-linux-android" => 183,
+        "x86_64-linux-android" => 62,
+        "armv7-linux-androideabi" => 40,
+        "i686-linux-android" => 3,
+        _ => return None,
+    })
+}
+
+/// The `e_machine` of an ELF file, honoring its `EI_DATA` endianness.
+/// `None` for a non-ELF, unreadable or truncated file: such a candidate
+/// cannot load for any target and is reported without a machine.
+fn elf_machine(path: &Path) -> Option<u16> {
+    let mut header = [0u8; 20];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut header).ok()?;
+    if header[0..4] != *b"\x7fELF" {
+        return None;
+    }
+    Some(match header[5] {
+        1 => u16::from_le_bytes([header[18], header[19]]),
+        2 => u16::from_be_bytes([header[18], header[19]]),
+        _ => return None,
+    })
+}
+
+/// Why a cross-triple candidate was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdylibRejection {
+    /// The ELF `e_machine` found (None when unreadable or not an ELF).
+    WrongMachine(Option<u16>),
+    /// Right machine but no NDK `.note.android.ident` note: a same-machine
+    /// host build (x86_64 matches the emulator) would otherwise load.
+    MissingAndroidIdent,
+}
+
+/// Total bytes the note scan may read: header-table entries plus note
+/// payloads stay under this even when the header lies about its counts.
+const ELF_NOTE_SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+
+/// Read `n` bytes at `off` of an open file (a bounded seek read - note
+/// sections can sit anywhere in a large artifact, so the whole file is never
+/// slurped), or None when out of bounds or unreadable.
+fn elf_read_at(file: &std::fs::File, off: u64, n: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = file.try_clone().ok()?;
+    file.seek(std::io::SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; usize::try_from(n).ok()?];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// A little- or big-endian `u16`/`u32`/`u64` reader selected once per file.
+fn elf_u16(data: &[u8], off: usize, be: bool) -> Option<u16> {
+    let b: [u8; 2] = data.get(off..off.checked_add(2)?)?.try_into().ok()?;
+    Some(if be {
+        u16::from_be_bytes(b)
+    } else {
+        u16::from_le_bytes(b)
+    })
+}
+fn elf_u32(data: &[u8], off: usize, be: bool) -> Option<u32> {
+    let b: [u8; 4] = data.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    Some(if be {
+        u32::from_be_bytes(b)
+    } else {
+        u32::from_le_bytes(b)
+    })
+}
+fn elf_u64(data: &[u8], off: usize, be: bool) -> Option<u64> {
+    let b: [u8; 8] = data.get(off..off.checked_add(8)?)?.try_into().ok()?;
+    Some(if be {
+        u64::from_be_bytes(b)
+    } else {
+        u64::from_le_bytes(b)
+    })
+}
+
+/// Scan a note region (the payload of an SHT_NOTE section or PT_NOTE
+/// segment) for an entry owned by `owner` (the note's NUL-terminated
+/// `n_namesz` name), returning on the first match. Entries are 4-byte
+/// aligned; a malformed run ends the scan, never the file.
+fn has_note_owner(data: &[u8], be: bool, owner: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos + 12 <= data.len() {
+        let namesz = elf_u32(data, pos, be).unwrap_or(u32::MAX) as usize;
+        let descsz = elf_u32(data, pos + 4, be).unwrap_or(u32::MAX) as usize;
+        pos += 12;
+        if namesz > data.len() || descsz > data.len() {
+            break;
+        }
+        let name_end = pos.saturating_add(namesz);
+        if let Some(name) = data.get(pos..name_end.min(data.len())) {
+            if name.strip_suffix(&[0]).unwrap_or(name) == owner {
+                return true;
+            }
+        }
+        let aligned = |n: usize| (n + 3) & !3;
+        pos = match pos
+            .checked_add(aligned(namesz))
+            .and_then(|p| p.checked_add(aligned(descsz)))
+        {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    false
+}
+
+/// True when the ELF file carries the NDK `.note.android.ident` marker:
+/// an SHT_NOTE section or PT_NOTE segment holding a note owned by
+/// "Android". Headers are parsed bounds-checked for 32/64-bit and either
+/// endianness; a truncated or corrupt file returns false, never panics.
+fn elf_has_android_ident(path: &Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let data: &[u8] = &match elf_read_at(&file, 0, 64) {
+        Some(h) => h,
+        None => return false,
+    };
+    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
+        return false;
+    }
+    let is64 = match data[4] {
+        1 => false,
+        2 => true,
+        _ => return false,
+    };
+    let be = match data[5] {
+        1 => false,
+        2 => true,
+        _ => return false,
+    };
+    let (phoff, phentsize, phnum, shoff, shentsize, shnum) = if is64 {
+        (
+            elf_u64(data, 32, be).unwrap_or(0),
+            elf_u16(data, 54, be).unwrap_or(0) as u64,
+            elf_u16(data, 56, be).unwrap_or(0) as u64,
+            elf_u64(data, 40, be).unwrap_or(0),
+            elf_u16(data, 58, be).unwrap_or(0) as u64,
+            elf_u16(data, 60, be).unwrap_or(0) as u64,
+        )
+    } else {
+        (
+            elf_u32(data, 28, be).unwrap_or(0) as u64,
+            elf_u16(data, 42, be).unwrap_or(0) as u64,
+            elf_u16(data, 44, be).unwrap_or(0) as u64,
+            elf_u32(data, 32, be).unwrap_or(0) as u64,
+            elf_u16(data, 46, be).unwrap_or(0) as u64,
+            elf_u16(data, 48, be).unwrap_or(0) as u64,
+        )
+    };
+    const PT_NOTE: u32 = 4;
+    const SHT_NOTE: u32 = 7;
+    let owner = b"Android";
+    // Untrusted counts and read totals are capped: a header can claim any
+    // phnum/shnum and any note size, so iteration and bytes read stay bounded.
+    let mut bytes_read = data.len() as u64;
+    // Program headers: PT_NOTE segments. Each entry is a bounded seek read;
+    // the note section can sit anywhere in a large artifact.
+    if phentsize > 0 {
+        let min_ph = if is64 { 56 } else { 32 };
+        for i in 0..phnum.min(4096) {
+            let Some(off) = phoff.checked_add(i.saturating_mul(phentsize)) else {
+                break;
+            };
+            let Some(ent) = elf_read_at(&file, off, phentsize) else {
+                break;
+            };
+            bytes_read += phentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || phentsize < min_ph {
+                break;
+            }
+            if elf_u32(&ent, 0, be) != Some(PT_NOTE) {
+                continue;
+            }
+            let (noff, nfilesz) = if is64 {
+                (elf_u64(&ent, 8, be), elf_u64(&ent, 32, be))
+            } else {
+                (
+                    elf_u32(&ent, 4, be).map(|v| v as u64),
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
+                )
+            };
+            if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
+                let want = nfilesz.min(1 << 20);
+                // Charge the ATTEMPTED read, not just a successful one: a
+                // crafted file can point every note entry at an unreadable
+                // offset, and failed reads must still count against the
+                // budget.
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    if has_note_owner(&region, be, owner) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Section headers: SHT_NOTE sections.
+    if shentsize > 0 {
+        let min_sh = if is64 { 64 } else { 40 };
+        for i in 0..shnum.min(4096) {
+            let Some(off) = shoff.checked_add(i.saturating_mul(shentsize)) else {
+                break;
+            };
+            let Some(ent) = elf_read_at(&file, off, shentsize) else {
+                break;
+            };
+            bytes_read += shentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || shentsize < min_sh {
+                break;
+            }
+            if elf_u32(&ent, 4, be) != Some(SHT_NOTE) {
+                continue;
+            }
+            let (noff, nsize) = if is64 {
+                (elf_u64(&ent, 24, be), elf_u64(&ent, 32, be))
+            } else {
+                (
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
+                    elf_u32(&ent, 20, be).map(|v| v as u64),
+                )
+            };
+            if let (Some(noff), Some(nsize)) = (noff, nsize) {
+                let want = nsize.min(1 << 20);
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    if has_note_owner(&region, be, owner) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Split existing candidates into those a cross run may load and those it
+/// may not. For a cross triple (`expected = Some`) a candidate must carry
+/// BOTH the matching `e_machine` and the NDK `.note.android.ident` note -
+/// the machine alone cannot tell an x86_64 host build from the emulator's.
+/// A candidate that fails to parse is rejected as a wrong-arch artifact.
+/// `None` expected means a host lookup, which keeps every candidate.
+fn arch_filter<'a>(
+    candidates: &[(&'a Path, bool)],
+    expected: Option<u16>,
+) -> (Vec<CdylibCandidate<'a>>, Vec<RejectedCandidate>) {
+    let mut matching = Vec::with_capacity(candidates.len());
+    let mut rejected = Vec::new();
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match expected {
+            Some(machine) if elf_machine(path) != Some(machine) => {
+                rejected.push((
+                    path.to_path_buf(),
+                    CdylibRejection::WrongMachine(elf_machine(path)),
+                ));
+            }
+            Some(_) if !elf_has_android_ident(path) => {
+                rejected.push((path.to_path_buf(), CdylibRejection::MissingAndroidIdent));
+            }
+            _ => matching.push((*path, *release)),
+        }
+    }
+    (matching, rejected)
+}
+
 /// Find the cdylib for a node type.
 ///
 /// Selection:
@@ -14701,8 +15058,13 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
 ///   a single-profile workspace still resolves. Lets a user pin the
 ///   release profile even when a debug build is newer.
 ///
-/// `<base>` is [`cdylib_target_base`] — `<ws_root>/target` unless
-/// `CARGO_TARGET_DIR` redirects it.
+/// `<base>` is [`cdylib_target_base`]. Candidates are chosen PER PROFILE: for
+/// the profile under consideration the Android target-triple dir is tried
+/// first, then the plain dir, so a cross-built artifact never shadows a
+/// requested-profile artifact that lives only in the other base (the earlier
+/// whole-dir choice could pick `<triple>/debug` over `target/release` on an
+/// explicit `--release` run). If neither profile has the library, the
+/// missing-artifact error names the triple's paths when a triple applies.
 ///
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
@@ -14715,20 +15077,16 @@ fn find_cdylib(
     let lib_name = cdylib_name(node_type);
 
     let base = cdylib_target_base(workspace_root);
-    let debug_path = base.join("debug").join(&lib_name);
-    let release_path = base.join("release").join(&lib_name);
-
-    let resolved = if prefer_release {
-        // Explicit override: force release-first, debug as fallback —
-        // the requested profile wins even if the debug build is newer.
-        first_existing(&[(&release_path, true), (&debug_path, false)])
-    } else {
-        // Default: auto-select the freshest built artifact. When both
-        // profiles exist, the newer mtime wins so a stale build of one
-        // profile never shadows a fresh build of the other; when only
-        // one exists, it wins as a single-profile fallback.
-        freshest_existing(&debug_path, &release_path)
-    };
+    let (resolved, rejected) =
+        resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
+    // Error text names the FIRST candidate per profile: the triple's paths
+    // when a cross triple applies, the plain ones otherwise, where
+    // `cargo ndk` (or cargo) would have put it.
+    let release_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "release", &lib_name);
+    let debug_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "debug", &lib_name);
+    let (debug_path, release_path) = (&debug_candidates[0], &release_candidates[0]);
 
     if let Some((path, release)) = resolved {
         let node_dir = workspace_root.join("nodes").join(node_type);
@@ -14740,67 +15098,132 @@ fn find_cdylib(
         });
     }
 
-    // Neither profile is built. The hint mirrors the selection mode:
-    // an explicit `--release` run hints at `--release`; the default
-    // freshest-wins mode hints at the plain debug build.
+    // Neither profile produced a loadable artifact. The hint mirrors the
+    // selection mode: an explicit `--release` run hints at `--release`;
+    // the default freshest-wins mode hints at the plain debug build.
+    let mut reason = if prefer_release {
+        format!(
+            "searched {} (preferred, release profile) and {} (fallback)",
+            release_path.display(),
+            debug_path.display(),
+        )
+    } else {
+        format!(
+            "searched {} and {} (debug profile)",
+            debug_path.display(),
+            release_path.display(),
+        )
+    };
+    for (path, rejection) in &rejected {
+        match rejection {
+            CdylibRejection::WrongMachine(machine) => {
+                let found = machine.map_or("unreadable/non-ELF".to_string(), |m| m.to_string());
+                reason.push_str(&format!(
+                    "; skipped {} (ELF e_machine {found} does not match the target)",
+                    path.display(),
+                ));
+            }
+            CdylibRejection::MissingAndroidIdent => {
+                reason.push_str(&format!(
+                    "; skipped {} (no Android NDK .note.android.ident note - a same-machine host build cannot load on the device)",
+                    path.display(),
+                ));
+            }
+        }
+    }
+    reason.push_str(&format!(
+        "; {}",
+        rebuild_instruction(node_type, prefer_release, "first"),
+    ));
     Err(CliError::CdylibNotFound {
         node_type: node_type.to_string(),
-        reason: if prefer_release {
-            format!(
-                "searched {} (preferred, release profile) and {} (fallback); run `{}` first",
-                release_path.display(),
-                debug_path.display(),
-                rebuild_hint(node_type, true),
-            )
-        } else {
-            format!(
-                "searched {} and {} (debug profile); run `{}` first",
-                debug_path.display(),
-                release_path.display(),
-                rebuild_hint(node_type, false),
-            )
-        },
+        reason,
     })
+}
+
+/// Resolve the cdylib under `base` honoring `prefer_release`: an explicit
+/// `--release` tries `release` candidates in BOTH dirs before the debug
+/// fallback; the default takes the freshest artifact across profiles and
+/// dirs. `cross_triple` is an argument (not the const) so the order is
+/// oracle-testable on host.
+/// A cdylib candidate: its path and whether it is a release-profile build.
+type CdylibCandidate<'a> = (&'a Path, bool);
+/// A candidate rejected by the cross filter: its path and why it cannot
+/// load for the target.
+type RejectedCandidate = (PathBuf, CdylibRejection);
+/// The resolution result: the chosen `(path, release)` artifact and every
+/// candidate skipped because its ELF machine did not match the target.
+type CdylibResolution = (Option<(std::path::PathBuf, bool)>, Vec<RejectedCandidate>);
+
+fn resolve_cdylib_in(
+    base: &Path,
+    cross_triple: Option<&str>,
+    lib_name: &str,
+    prefer_release: bool,
+) -> CdylibResolution {
+    let release_candidates = cdylib_profile_candidates(base, cross_triple, "release", lib_name);
+    let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
+    let all: Vec<CdylibCandidate<'_>> = release_candidates
+        .iter()
+        .map(|p| (p.as_path(), true))
+        .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
+        .collect();
+    // A cross lookup may only load a candidate whose ELF machine matches
+    // the triple: a host-arch artifact that happens to sit in the plain
+    // `target/<profile>` dir must never be picked up for the device.
+    let expected = cross_triple.and_then(expected_elf_machine);
+    let (matching, rejected) = arch_filter(&all, expected);
+    if prefer_release {
+        // Explicit override: force the requested profile first in BOTH dirs,
+        // debug as the per-dir fallback.
+        let ordered: Vec<CdylibCandidate<'_>> = matching
+            .iter()
+            .filter(|(_, release)| *release)
+            .copied()
+            .chain(matching.iter().filter(|(_, release)| !*release).copied())
+            .collect();
+        (first_existing(&ordered), rejected)
+    } else {
+        // Default: auto-select the freshest built artifact across both
+        // profiles and both dirs, so a stale build never shadows a fresh one.
+        (freshest_of(matching.into_iter()), rejected)
+    }
 }
 
 /// Return the first `(path, release)` pair whose path exists, in the
 /// given priority order. Used for the explicit `--release` override
 /// where preference, not freshness, picks the winner.
-fn first_existing(candidates: &[(&Path, bool)]) -> Option<(std::path::PathBuf, bool)> {
+fn first_existing(candidates: &[CdylibCandidate<'_>]) -> Option<(std::path::PathBuf, bool)> {
     candidates
         .iter()
         .find(|(path, _)| path.exists())
         .map(|(path, release)| (path.to_path_buf(), *release))
 }
 
-/// Auto-select the *freshest* of the debug and release artifacts.
-/// When both exist, the one with the newer mtime wins
-/// (ties go to release — an equal-mtime tie happens on coarse-grained
-/// filesystems OR when both mtimes are unreadable, and release is the
-/// more likely deploy target). When only one exists, it wins. `None`
-/// is returned *only* when neither file exists — when both exist the
-/// tie-break guarantees a `Some`, even if both mtimes are unreadable.
-fn freshest_existing(debug_path: &Path, release_path: &Path) -> Option<(std::path::PathBuf, bool)> {
-    let debug = debug_path.exists();
-    let release = release_path.exists();
-    match (debug, release) {
-        (true, true) => {
-            // Both built: pick the newer mtime. An unreadable mtime is
-            // treated as the oldest possible so the other profile wins;
-            // if BOTH are unreadable they're considered equal and the
-            // release tie-break applies.
-            let debug_mtime = mtime_or_min(debug_path);
-            let release_mtime = mtime_or_min(release_path);
-            if debug_mtime > release_mtime {
-                Some((debug_path.to_path_buf(), false))
-            } else {
-                Some((release_path.to_path_buf(), true))
-            }
+/// Auto-select the *freshest* existing artifact among `(path, release)`
+/// candidates: the one with the newest mtime wins (ties keep the FIRST
+/// candidate, so the release candidates listed first win an equal-mtime tie
+/// (the more likely deploy target). `None` only when none exists.
+fn freshest_of<'a>(
+    candidates: impl Iterator<Item = (&'a Path, bool)>,
+) -> Option<(std::path::PathBuf, bool)> {
+    let mut best: Option<(std::path::PathBuf, bool, std::time::SystemTime)> = None;
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
         }
-        (true, false) => Some((debug_path.to_path_buf(), false)),
-        (false, true) => Some((release_path.to_path_buf(), true)),
-        (false, false) => None,
+        let mtime = mtime_or_min(path);
+        // Strict `>` keeps the FIRST candidate on a tie: the release
+        // candidates listed before the debug ones win an equal-mtime race,
+        // and the cross-triple dir wins within a profile; both the
+        // preferred artifact on an ambiguous clock.
+        if best.as_ref().is_none_or(|(_, was_release, was_mtime)| {
+            mtime > *was_mtime || (mtime == *was_mtime && release && !*was_release)
+        }) {
+            best = Some((path.to_path_buf(), release, mtime));
+        }
     }
+    best.map(|(path, release, _)| (path, release))
 }
 
 /// The file's mtime, or `SystemTime::UNIX_EPOCH` (the oldest value the
@@ -19448,7 +19871,7 @@ fn sweep_worker_recording_rings(tags: &[String]) {
         };
         // SAFETY: shm_unlink(2) with a valid NUL-terminated name; removes the
         // SHM name only (no memory is touched; open mappings persist).
-        let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         if rc == 0 {
             tracing::debug!(
                 tag = %tag,
@@ -30902,6 +31325,355 @@ nodes:
     }
 
     #[test]
+    fn cdylib_profile_candidates_order_cross_first_then_plain() {
+        let base = Path::new("/t/target");
+        assert_eq!(
+            cdylib_profile_candidates(base, Some("aarch64-linux-android"), "debug", "libn.so"),
+            vec![
+                base.join("aarch64-linux-android/debug/libn.so"),
+                base.join("debug/libn.so"),
+            ]
+        );
+        assert_eq!(
+            cdylib_profile_candidates(base, None, "release", "libn.so"),
+            vec![base.join("release/libn.so")]
+        );
+    }
+
+    /// The profile is chosen PER PROFILE across both dirs: an explicit
+    /// `--release` run with only `<triple>/debug` and `target/release` on disk
+    /// must pick the requested-profile artifact in the plain dir, never the
+    /// triple's debug library (the earlier whole-dir choice did exactly that).
+    #[test]
+    fn find_cdylib_prefers_requested_profile_across_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_debug, 62);
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        write_android_test_elf(&plain_release, 62);
+
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        let found = found.unwrap();
+        assert_eq!(
+            found.0, plain_release,
+            "--release must pick the requested profile, not the triple's debug artifact"
+        );
+        assert!(found.1);
+    }
+
+    /// The same-dir cross preference survives per-profile resolution: with
+    /// both bases carrying the same profile, the triple's artifact wins.
+    #[test]
+    fn resolve_cdylib_prefers_cross_within_the_same_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        let cross_release = base
+            .join(triple)
+            .join("release")
+            .join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_release.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_release, 62);
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        // The same-machine HOST build in the plain dir carries no NDK note:
+        // the note check alone lets the cross artifact win.
+        write_test_elf(&plain_release, 62);
+
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        assert_eq!(found.unwrap().0, cross_release);
+    }
+
+    /// A minimal 64-bit little-endian ELF header whose `e_machine` is
+    /// `machine`: enough for `elf_machine` to read, nothing else. It
+    /// carries NO NDK note, so a cross lookup rejects it.
+    fn write_test_elf(path: &Path, machine: u16) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2; // ELFCLASS64
+        header[5] = 1; // ELFDATA2LSB
+        header[18..20].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// A minimal 64-bit little-endian ELF whose `e_machine` is `machine`
+    /// and whose one PT_NOTE segment holds a note owned by "Android" -
+    /// the NDK `.note.android.ident` marker a cross lookup requires.
+    fn write_android_test_elf(path: &Path, machine: u16) {
+        let mut elf = vec![0u8; 144];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+                                                          // The program header: PT_NOTE at offset 120, 24 bytes.
+        elf[64..68].copy_from_slice(&4u32.to_le_bytes()); // p_type
+        elf[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        elf[96..104].copy_from_slice(&24u64.to_le_bytes()); // p_filesz
+                                                            // The note: namesz 8 ("Android\0"), descsz 4, type 1.
+        elf[120..124].copy_from_slice(&8u32.to_le_bytes());
+        elf[124..128].copy_from_slice(&4u32.to_le_bytes());
+        elf[128..132].copy_from_slice(&1u32.to_le_bytes());
+        elf[132..140].copy_from_slice(b"Android\0");
+        std::fs::write(path, elf).unwrap();
+    }
+
+    /// A cross lookup never loads a host-arch artifact: an x86_64
+    /// (host) ELF in the plain dir is skipped for an aarch64 triple,
+    /// and the error path reports the path and the machine found.
+    #[test]
+    fn a_cross_lookup_skips_host_arch_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "aarch64-linux-android";
+        let base = tmp.path().join("target");
+        // The plain debug dir holds a HOST x86_64 artifact: it must not win.
+        let host_debug = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(host_debug.parent().unwrap()).unwrap();
+        write_test_elf(&host_debug, 62);
+        // The triple dir holds a matching aarch64 artifact.
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_debug, 183);
+
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert_eq!(found.unwrap().0, cross_debug);
+        assert_eq!(
+            rejected,
+            vec![(host_debug.clone(), CdylibRejection::WrongMachine(Some(62)))]
+        );
+
+        // With ONLY the host artifact on disk nothing resolves.
+        std::fs::remove_file(&cross_debug).unwrap();
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert!(found.is_none());
+        assert_eq!(
+            rejected,
+            vec![(host_debug, CdylibRejection::WrongMachine(Some(62)))]
+        );
+    }
+
+    /// The machine match alone is not enough: a same-machine host build
+    /// (x86_64 matches the emulator) without the NDK note is rejected,
+    /// and a matching artifact carrying `.note.android.ident` is accepted.
+    #[test]
+    fn a_cross_lookup_requires_the_ndk_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        // Right machine (x86_64) but a host build: no Android note.
+        let host_debug = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(host_debug.parent().unwrap()).unwrap();
+        write_test_elf(&host_debug, 62);
+
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert!(found.is_none());
+        assert_eq!(
+            rejected,
+            vec![(host_debug.clone(), CdylibRejection::MissingAndroidIdent)]
+        );
+
+        // The same machine WITH the NDK note loads.
+        write_android_test_elf(&host_debug, 62);
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert_eq!(found.unwrap().0, host_debug);
+        assert!(rejected.is_empty());
+    }
+
+    /// A truncated or corrupt note section is rejected without a panic:
+    /// header reads stay bounds-checked and a malformed note run ends the
+    /// scan rather than the process.
+    #[test]
+    fn the_ndk_note_check_rejects_corrupt_headers_without_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty.so", vec![]),
+            ("magic-only.so", b"\x7fELF".to_vec()),
+            ("header-only.so", vec![0u8; 64]),
+            ("wild-offsets.so", {
+                let mut h = vec![0u8; 64];
+                h[0..4].copy_from_slice(b"\x7fELF");
+                h[4] = 2;
+                h[5] = 1;
+                h[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+                h[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+                h[54..56].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[58..60].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[60..62].copy_from_slice(&u16::MAX.to_le_bytes());
+                h
+            }),
+            ("truncated-note.so", {
+                let mut e = vec![0u8; 144];
+                e[0..4].copy_from_slice(b"\x7fELF");
+                e[4] = 2;
+                e[5] = 1;
+                e[32..40].copy_from_slice(&64u64.to_le_bytes());
+                e[54..56].copy_from_slice(&56u16.to_le_bytes());
+                e[56..58].copy_from_slice(&1u16.to_le_bytes());
+                e[64..68].copy_from_slice(&4u32.to_le_bytes());
+                e[72..80].copy_from_slice(&120u64.to_le_bytes());
+                // p_filesz overruns the file: bounded reads must not panic.
+                e[96..104].copy_from_slice(&(1u64 << 40).to_le_bytes());
+                e.truncate(130);
+                e
+            }),
+        ] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            assert!(!elf_has_android_ident(&p), "{name} must not parse as NDK");
+        }
+    }
+
+    /// A header can claim absurd phnum/shnum: the scan iterates a bounded
+    /// count under a total read budget, returns false, never panics.
+    #[test]
+    fn the_ndk_note_check_bounds_declared_header_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        let mut h = vec![0u8; 64];
+        h[0..4].copy_from_slice(b"\x7fELF");
+        h[4] = 2;
+        h[5] = 1;
+        h[18..20].copy_from_slice(&62u16.to_le_bytes());
+        h[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff (past EOF)
+        h[40..48].copy_from_slice(&4096u64.to_le_bytes()); // e_shoff (past EOF)
+        h[54..56].copy_from_slice(&56u16.to_le_bytes());
+        h[56..58].copy_from_slice(&u16::MAX.to_le_bytes()); // e_phnum
+        h[58..60].copy_from_slice(&64u16.to_le_bytes());
+        h[60..62].copy_from_slice(&u16::MAX.to_le_bytes()); // e_shnum
+        std::fs::write(&p, &h).unwrap();
+        assert!(!elf_has_android_ident(&p));
+    }
+
+    /// A real NDK cdylib is tens of megabytes and its note section can sit
+    /// anywhere in the file: an artifact whose SHT_NOTE payload lives past a
+    /// whole-file read cap is still accepted (bounded seek reads, not a
+    /// slurp). Sparse writes keep this a few pages on disk.
+    #[test]
+    fn a_large_artifact_with_a_note_past_the_old_read_cap_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // 64-byte ELF64 LE header, e_machine = x86_64; section table at
+        // SHOFF (96 MiB - past the old 64 MiB whole-file cap) with one
+        // SHT_NOTE entry whose payload is at NOFF (SHOFF + 64).
+        let shoff: u64 = 96 * 1024 * 1024;
+        let noff: u64 = shoff + 64;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[40..48].copy_from_slice(&shoff.to_le_bytes()); // e_shoff
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&1u16.to_le_bytes()); // e_shnum
+        let mut sh = vec![0u8; 64];
+        sh[4..8].copy_from_slice(&7u32.to_le_bytes()); // sh_type = SHT_NOTE
+        sh[24..32].copy_from_slice(&noff.to_le_bytes()); // sh_offset
+        sh[32..40].copy_from_slice(&24u64.to_le_bytes()); // sh_size
+                                                          // The note payload: namesz 8, descsz 4, type 1, name "Android\0".
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::Write;
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.set_len(noff + 24).unwrap();
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(shoff)).unwrap();
+        f.write_all(&sh).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(elf_has_android_ident(&p));
+    }
+
+    /// A note entry pointing at an unreadable region is not free: the
+    /// attempted read charges the scan budget, so a crafted file cannot
+    /// drive unbounded failed reads or push a later real note inside.
+    #[test]
+    fn failed_note_reads_charge_the_scan_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // ELF64 LE, e_machine x86_64, six program headers. The first four
+        // PT_NOTE entries point past EOF (reads fail); the fifth carries a
+        // real "Android" note. Charging only successful reads would reach
+        // it; charging attempted reads exhausts the budget first.
+        let phoff: u64 = 64;
+        let noff: u64 = 1024;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&phoff.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&5u16.to_le_bytes());
+        let mut ph = vec![0u8; 56 * 5];
+        for i in 0..4 {
+            let b = i * 56;
+            ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes()); // p_type PT_NOTE
+            ph[b + 8..b + 16].copy_from_slice(&(1u64 << 40).to_le_bytes()); // p_offset past EOF
+            ph[b + 32..b + 40].copy_from_slice(&(1u64 << 20).to_le_bytes()); // p_filesz
+        }
+        let b = 4 * 56;
+        ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes());
+        ph[b + 8..b + 16].copy_from_slice(&noff.to_le_bytes());
+        ph[b + 32..b + 40].copy_from_slice(&24u64.to_le_bytes());
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::{Seek, Write};
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.write_all(&ph).unwrap();
+        f.set_len(noff + 24).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(!elf_has_android_ident(&p));
+    }
+
+    #[test]
+    fn elf_machine_reads_the_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elf = tmp.path().join("lib.so");
+        write_test_elf(&elf, 183);
+        assert_eq!(elf_machine(&elf), Some(183));
+        // Big-endian data is honored.
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 2; // ELFDATA2MSB
+        header[18..20].copy_from_slice(&40u16.to_be_bytes());
+        let be = tmp.path().join("lib-be.so");
+        std::fs::write(&be, header).unwrap();
+        assert_eq!(elf_machine(&be), Some(40));
+        // A non-ELF or truncated file carries no machine.
+        let text = tmp.path().join("not-elf");
+        std::fs::write(&text, b"#!/bin/sh\n").unwrap();
+        assert_eq!(elf_machine(&text), None);
+        let short = tmp.path().join("short.so");
+        std::fs::write(&short, b"\x7fELF").unwrap();
+        assert_eq!(elf_machine(&short), None);
+    }
+
+    #[test]
     fn test_find_cdylib_unset_resolves_at_ws_target() {
         let _env = unset_target_dir_for_test();
         let tmp = tempfile::tempdir().unwrap();
@@ -38860,7 +39632,7 @@ mod worker_tests {
         // SAFETY: `cname` is a NUL-terminated POSIX SHM name; the descriptor is
         // closed below on every path.
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 cname.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600 as libc::c_uint,
@@ -38889,7 +39661,7 @@ mod worker_tests {
             .expect_err("an unarmed segment must be refused");
         let elapsed = started.elapsed();
         // SAFETY: unlinking the name this test created; peers hold no mapping.
-        let unlinked = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let unlinked = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         assert_eq!(
             unlinked,
             0,

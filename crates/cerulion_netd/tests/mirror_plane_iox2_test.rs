@@ -370,7 +370,7 @@ struct Client {
 
 impl Client {
     fn connect(sock: &Path) -> Client {
-        let stream = UnixStream::connect(sock).expect("connect");
+        let stream = cerulion_hygiene::connect_control_socket(sock).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
