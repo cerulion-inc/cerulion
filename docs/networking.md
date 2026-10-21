@@ -84,10 +84,13 @@ default + gateway, the discovery ladder, and pairing.
 - **Open access is unauthenticated.** On non-Android platforms, a robot with
   no `network:` block is viewable by any peer on the LAN; restrict it with a
   `network:` block or `--network off`, or refuse every LAN peer with
-  `CERULION_LAN_ACCESS=paired`.
+  `CERULION_LAN_ACCESS=paired`, which also stops LAN peers publishing into
+  the robot's ingress topics.
 - **Android is paired by default.** On an Android device the gateway and
-  `cerulion-netd` refuse every LAN request (demand, catalog, schema) unless
-  `CERULION_LAN_ACCESS=open` is set; an Android app selects the same posture
+  `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
+  re-inject no frame a LAN peer publishes, so the LAN can neither read nor
+  write topics, unless `CERULION_LAN_ACCESS=open` is set. Commands from a
+  paired desk travel over the remote plane; an Android app selects the same posture
   with its `lan_access` key (see [Android](android.md)). The gateway keeps the
   posture in front of every installed demand authorizer; changing an inner
   authorizer does not disable it. Choose the posture at startup with

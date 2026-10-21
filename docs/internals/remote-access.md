@@ -171,10 +171,28 @@ and the reconcile belt all consult the layered gate, so no demand path enables
 egress the gate refused. `set_lan_access(Paired)` also closes the bridge manager
 with `TopicBridgeManager::set_lan_closed`, atomically revoking enabled egress
 and preventing every demand path from re-enabling it, then waits out any
-in-flight gateway forwarding pass so no frame leaves after the close returns. Oracle tests:
+in-flight gateway forwarding pass so no frame leaves after the close returns.
+The posture gates the write direction too. Under `Paired` an ingress
+registration declares no zenoh data subscriber and no demand token, and the
+receive callback refuses and counts (`IngressStats::lan_refused_drops`) any
+frame that still reaches it. `set_lan_access(Paired)` suspends every live
+ingress entry (undeclares both, keeps the injector and its counters) and waits
+out in-flight receive callbacks before it returns, so no LAN frame is
+re-injected after the close; reopening redeclares both. Writes from a paired
+desk travel over the remote plane, whose re-inject seam does not consult the
+LAN posture. Oracle tests:
 `demand_authorizer.rs` unit tests,
-`demand_reconcile_never_enables_a_refused_demand` in `network.rs` and
+`demand_reconcile_never_enables_a_refused_demand` in `network.rs`,
+`test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery` and
+`test_paired_receive_callback_refuses_and_counts_every_lan_frame` in
+`network_ingress_test.rs`, and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
+
+The LAN posture is a whole-plane switch: a LAN source address proves no
+identity, so per-peer LAN authorization is not supported. Per-peer, per-topic
+and per-direction (observe or command) access with revocation is what the
+paired remote plane provides, binding each session to its pairing key over an
+authenticated transport.
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
