@@ -421,6 +421,46 @@ impl SchemaServingHandles {
             .copied()
     }
 
+    /// TEST SEAM: whether these handles serve nothing - no topic binding,
+    /// hash binding, doc, boot topic or runtime hash.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn is_serving_nothing_for_test(&self) -> bool {
+        fn empty<T>(map: &Mutex<T>, is_empty: impl Fn(&T) -> bool) -> bool {
+            is_empty(
+                &map.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+        empty(&self.topic_schemas, HashMap::is_empty)
+            && empty(&self.hash_names, HashMap::is_empty)
+            && empty(&self.docs, std::collections::BTreeMap::is_empty)
+            && empty(&self.boot_topics, HashSet::is_empty)
+            && empty(&self.runtime_hashes, HashMap::is_empty)
+    }
+
+    /// TEST SEAM: the canonical boot topics and topic-bound names these
+    /// handles serve, each sorted.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn served_topics_for_test(&self) -> (Vec<String>, Vec<String>) {
+        let mut boot: Vec<String> = self
+            .boot_topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        boot.sort();
+        let mut bound: Vec<String> = self
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        bound.sort();
+        (boot, bound)
+    }
+
     /// Fold `serving` into the live maps. FIRST-WINS per key, which makes the
     /// merge IDEMPOTENT and keeps the boot seed authoritative (the boot serving's
     /// customs-first order is preserved: an already-bound topic, hash, or doc is

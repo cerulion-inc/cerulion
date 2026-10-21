@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,9 +16,9 @@ use cerulion_core::graph::{
     parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, TopicSchema,
+    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
 };
-use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
+use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
     recording_tap_buffer_depth, TopicServiceConfig, TransportConfig, TransportKind,
     TransportManager, RECORDING_SUBSCRIBER_MAX_BORROWED, TRANSPORT_KIND,
@@ -46,12 +46,11 @@ static GATEWAY_OWNED: AtomicBool = AtomicBool::new(false);
 /// Exclusive ownership of the gateway on the process-wide transport manager.
 ///
 /// Every runtime with the same identity shares one manager, and its
-/// announcements and bridge flags carry no owner. A start retires the prior
-/// run's topics, and a failed start retracts all of them. Both are correct
-/// only when no other runtime has a live gateway on that manager, so a second
-/// runtime with listen endpoints is refused while one holds this lease. The
-/// lease is released when its gateway stops (or, on a failed start, after
-/// the cleanup).
+/// announcements and bridge flags carry no owner. A gateway start resets
+/// all of them to the quiescent baseline (see [`quiesce`]), which is correct
+/// only when no other runtime has a live gateway on that manager, so a
+/// second runtime with listen endpoints is refused while one holds this
+/// lease.
 struct GatewayLease(());
 
 impl GatewayLease {
@@ -70,6 +69,64 @@ impl GatewayLease {
 impl Drop for GatewayLease {
     fn drop(&mut self) {
         GATEWAY_OWNED.store(false, Ordering::Release);
+    }
+}
+
+/// TEST SEAM: whether a runtime in this process holds the gateway lease.
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
+pub fn gateway_owned_for_test() -> bool {
+    GATEWAY_OWNED.load(Ordering::Acquire)
+}
+
+/// A gateway runtime's hold on the shared manager. Taking it claims the
+/// [`GatewayLease`] and then resets the manager to the quiescent baseline;
+/// dropping it resets the manager again and only then frees the lease, so
+/// no other runtime can start a gateway before the reset is done.
+struct GatewayOwnership {
+    manager: Arc<TransportManager>,
+    // Declared last: fields drop in declaration order, so the lease is
+    // released after everything else this hold owns.
+    _lease: GatewayLease,
+}
+
+impl GatewayOwnership {
+    fn acquire(manager: &Arc<TransportManager>) -> Result<Self, EmbedError> {
+        let lease = GatewayLease::acquire()?;
+        quiesce(manager);
+        Ok(Self {
+            manager: Arc::clone(manager),
+            _lease: lease,
+        })
+    }
+}
+
+impl Drop for GatewayOwnership {
+    fn drop(&mut self) {
+        quiesce(&self.manager);
+    }
+}
+
+/// Reset the manager-wide gateway state to the quiescent baseline: LAN
+/// access paired, no egress topic announced (the bare robot-identity token
+/// stays), no bridge flag registered and the latched schema serving empty.
+/// Idempotent; it logs a failure and never returns one, so it can run on
+/// every teardown path. Call it only while no gateway drives the manager.
+fn quiesce(manager: &TransportManager) {
+    if let Some(network) = manager.network() {
+        network.set_lan_access(LanAccess::Paired);
+        // Paired already withdraws every announce; this repairs a teardown
+        // that stopped part-way.
+        network.withdraw_announcements_except(&[]);
+    }
+    if let Err(error) = manager.bridge_manager().unregister_topics_except(&[]) {
+        tracing::warn!(error = %error, "could not drop the gateway's bridge flags");
+    }
+    if let Some(live) = manager
+        .network()
+        .and_then(|network| network.query_surface_serving_handles())
+    {
+        live.serve_nothing();
     }
 }
 
@@ -166,49 +223,131 @@ impl Status {
     }
 }
 
+/// A hook a test runs between a start's build and its commit.
+#[cfg(any(test, feature = "test-helpers"))]
+type BeforeCommitHook = Box<dyn FnOnce(&TransportManager) + Send>;
+
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
 /// Dropping it stops and joins whatever is still running.
 pub struct EmbeddedRuntime {
     files_dir: PathBuf,
     robot_name: String,
     status: Arc<Mutex<Status>>,
-    resources: Resources,
+    /// The committed run. A start builds its run off to the side and stores
+    /// it here only once the commit succeeds.
+    run: Option<Run>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    before_commit: Option<BeforeCommitHook>,
 }
 
-#[derive(Default)]
-struct Resources {
-    manager: Option<Arc<TransportManager>>,
+/// Every component one start owns. A start fills it step by step; the
+/// teardown in [`Run::shutdown`] (also run by `Drop`, so a panic mid-build
+/// tears down too) stops whatever was filled in a safe order.
+struct Run {
+    graph: Option<GraphWorker>,
+    gateway: Option<GatewayWorker>,
+    recorder: Option<RecorderWorker>,
     publishers: BTreeMap<String, PublisherState>,
-    graph_running: Option<Arc<AtomicBool>>,
-    graph_thread: Option<JoinHandle<Result<(), String>>>,
-    gateway_exit: Option<Arc<AtomicBool>>,
-    gateway_thread: Option<JoinHandle<Result<(), String>>>,
-    /// Set just before this start builds its gateway: construction registers
-    /// bridge topics and installs egress posture on the shared manager before
-    /// it can fail, so ownership must be known before `gateway_thread` exists
-    /// for teardown to revoke what a half-built gateway left behind.
-    gateway_owned: bool,
-    /// The token of the posture write this runtime's teardown made, so a
-    /// failed start's rollback can tell its own write from a newer caller's.
-    lan_access_write: Option<u64>,
-    recorder_shutdown: Option<Arc<AtomicBool>>,
-    recorder_thread: Option<JoinHandle<Result<BagdSummary, String>>>,
-    /// This runtime's hold on the process gateway, taken before a gateway
-    /// start touches any manager-wide state and released after its teardown.
-    gateway_lease: Option<GatewayLease>,
+    /// Only `ownership` must drop after the workers: `shutdown` takes it
+    /// last, and its own fields release the lease after the reset.
+    ownership: Option<GatewayOwnership>,
+    manager: Arc<TransportManager>,
 }
 
-/// The gateway thread's mDNS beacon; dropping it withdraws the beacon and
-/// clears `mdns_advertised`, on a normal return and on unwind alike.
-struct AdvertisedBeacon {
-    beacon: Option<MdnsAdvertiseGuard>,
+struct GraphWorker {
+    running: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    thread: JoinHandle<Result<(), String>>,
+}
+
+struct GatewayWorker {
+    exit: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    thread: JoinHandle<Result<(), String>>,
+    beacon: Arc<Mutex<BeaconSlot<MdnsAdvertiseGuard>>>,
+}
+
+struct RecorderWorker {
+    shutdown: Arc<AtomicBool>,
+    thread: JoinHandle<Result<BagdSummary, String>>,
+}
+
+/// The mDNS beacon of a gateway thread. The commit raises the beacon and
+/// stores it here unless the thread already exited (`closed`); the thread's
+/// exit closes the slot and withdraws whatever beacon it holds.
+struct BeaconSlot<G> {
+    closed: bool,
+    guard: Option<G>,
+}
+
+/// Held by the gateway thread: on a normal return or an unwind it closes the
+/// beacon slot, withdraws the beacon and clears `mdns_advertised`.
+struct BeaconRelease<G> {
+    slot: Arc<Mutex<BeaconSlot<G>>>,
     status: Arc<Mutex<Status>>,
 }
 
-impl Drop for AdvertisedBeacon {
+impl<G> Drop for BeaconRelease<G> {
     fn drop(&mut self) {
-        drop(self.beacon.take());
+        // Lock order: slot, then status (the commit's beacon step uses the
+        // same order).
+        let mut slot = lock_slot(&self.slot);
+        slot.closed = true;
+        drop(slot.guard.take());
         lock_status(&self.status).mdns_advertised = false;
+    }
+}
+
+/// Store a beacon the commit raised, unless the gateway thread already
+/// closed the slot. Returns the beacon when it was not stored, for the
+/// caller to drop outside the lock.
+fn install_beacon<G>(
+    slot: &Mutex<BeaconSlot<G>>,
+    status: &Arc<Mutex<Status>>,
+    beacon: Option<G>,
+) -> Option<G> {
+    let mut slot = lock_slot(slot);
+    if slot.closed {
+        return beacon;
+    }
+    let advertised = beacon.is_some();
+    slot.guard = beacon;
+    lock_status(status).mdns_advertised = advertised;
+    None
+}
+
+fn lock_slot<G>(slot: &Mutex<BeaconSlot<G>>) -> MutexGuard<'_, BeaconSlot<G>> {
+    slot.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// The recording file a start created. Dropping the reservation removes the
+/// file while it is still armed, so a start that fails before bagd owns the
+/// file leaves the name free; `disarm` hands the file to bagd.
+struct RecordingReservation {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RecordingReservation {
+    fn reserve(path: &Path, file: &str) -> Result<Self, EmbedError> {
+        reserve_recording_path(path, file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RecordingReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort cleanup of an already-failing start.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -239,6 +378,42 @@ struct GraphInputs {
     infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
 }
 
+/// Everything a start needs, resolved before it touches any shared state.
+struct StartPlan {
+    graph: Option<GraphInputs>,
+    graph_name: Option<String>,
+    nodes: usize,
+    schemas: SchemaSet,
+    publishes: Vec<ResolvedPublish>,
+    recorded_topics: Option<HashSet<String>>,
+    recorded_graph_topics: Option<HashSet<String>>,
+    listen: Vec<String>,
+    gateway: Option<GatewayStartPlan>,
+    recorder: Option<RecorderPlan>,
+}
+
+struct GatewayStartPlan {
+    plan: GatewayPlan,
+    /// The schema serving, with `served_topics` naming every served topic
+    /// (graph outputs and publish topics, schema-less ones included).
+    serving: SchemaServing,
+    lan_access: LanAccess,
+    mdns: bool,
+}
+
+struct RecorderPlan {
+    config: BagdConfig,
+    file: String,
+    record_path: PathBuf,
+    ready_file: PathBuf,
+}
+
+/// A failed build: the error, and the recorder totals its teardown wrote.
+struct StartFailure {
+    error: EmbedError,
+    summary: Option<RecorderSummary>,
+}
+
 impl EmbeddedRuntime {
     /// Create an idle runtime for an existing absolute app files directory.
     pub fn new(files_dir: PathBuf, robot_name: String) -> Result<Self, EmbedError> {
@@ -252,7 +427,9 @@ impl EmbeddedRuntime {
             files_dir,
             status: Arc::new(Mutex::new(Status::new(robot_name.clone()))),
             robot_name,
-            resources: Resources::default(),
+            run: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            before_commit: None,
         })
     }
 
@@ -269,15 +446,25 @@ impl EmbeddedRuntime {
         self.start_accepted(config_json)
     }
 
+    /// TEST SEAM: run `hook` once, on the next start, after every component
+    /// is built and ready and before the start commits (opens LAN access,
+    /// replays announces, raises the beacon and reports Running).
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_before_commit_hook_for_test(
+        &mut self,
+        hook: impl FnOnce(&TransportManager) + Send + 'static,
+    ) {
+        self.before_commit = Some(Box::new(hook));
+    }
+
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
         // A component of a failed run or a finished graph may have left
         // siblings running; tear them down BEFORE the new config is
         // validated, so a rejected retry cannot leave the old gateway or
-        // recorder active behind the refusal. A teardown failure is already
-        // recorded in status, so warn and continue.
-        if self.resources.has_any() {
-            let (_summary, teardown_error) =
-                stop_resource_set(&mut self.resources, &self.status, false);
+        // recorder active behind the refusal.
+        if let Some(mut run) = self.run.take() {
+            let (_summary, teardown_error) = run.shutdown();
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
@@ -306,13 +493,42 @@ impl EmbeddedRuntime {
             status.recorder = None;
             status.last_error = None;
         }
-        match self.start_inner(config) {
-            Ok(()) => Ok(()),
+        let planned = install_iceoryx_config(&self.files_dir)
+            .and_then(|()| self.plan_start(config))
+            .and_then(|plan| Ok((self.transport_manager(&plan.listen)?, plan)));
+        let (manager, mut plan) = match planned {
+            Ok(planned) => planned,
             Err(error) => {
                 set_error(&self.status, &error);
-                Err(error)
+                return Err(error);
             }
+        };
+        let mut run = match build(&mut plan, manager, &self.status) {
+            Ok(run) => run,
+            Err(failure) => {
+                let StartFailure { error, summary } = *failure;
+                // The recorder thread is joined, so a later `stop()` cannot
+                // recover its totals: keep them in status.
+                lock_status(&self.status).recorder = summary;
+                set_error(&self.status, &error);
+                return Err(error);
+            }
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(hook) = self.before_commit.take() {
+            hook(&run.manager);
         }
+        if let Err(error) = commit(&mut run, &plan, &self.status, &self.robot_name) {
+            let (summary, teardown_error) = run.shutdown();
+            if let Some(teardown_error) = teardown_error {
+                tracing::warn!(error = %teardown_error, "tearing down a start whose commit failed");
+            }
+            lock_status(&self.status).recorder = summary;
+            set_error(&self.status, &error);
+            return Err(error);
+        }
+        self.run = Some(run);
+        Ok(())
     }
 
     /// The publish-JSON length limit for `topic`, the bound `encode_json`
@@ -326,9 +542,9 @@ impl EmbeddedRuntime {
             ));
         }
         let state = self
-            .resources
-            .publishers
-            .get(topic)
+            .run
+            .as_ref()
+            .and_then(|run| run.publishers.get(topic))
             .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
         Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
     }
@@ -348,9 +564,9 @@ impl EmbeddedRuntime {
             ));
         }
         let state = self
-            .resources
-            .publishers
-            .get_mut(topic)
+            .run
+            .as_mut()
+            .and_then(|run| run.publishers.get_mut(topic))
             .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
         let timestamp = cerulion_core::clock::real_ns();
         let sequence = state.sequence;
@@ -406,17 +622,19 @@ impl EmbeddedRuntime {
             ));
         }
         set_state(&self.status, RuntimeState::Stopping);
-        let (summary, error) = self.stop_resources();
+        let Some(mut run) = self.run.take() else {
+            // A failed start already tore its run down and kept its recorder
+            // totals in status; leave them visible.
+            set_state(&self.status, RuntimeState::Stopped);
+            return Ok(None);
+        };
+        let (summary, error) = run.shutdown();
         // A teardown error keeps Failed: the stopped state must mean every
         // resource actually released, not that the teardown was attempted.
-        set_state(
-            &self.status,
-            if error.is_some() {
-                RuntimeState::Failed
-            } else {
-                RuntimeState::Stopped
-            },
-        );
+        match &error {
+            Some(error) => set_error(&self.status, error),
+            None => set_state(&self.status, RuntimeState::Stopped),
+        }
         // The summary is observable state (Principle #3): it is recorded even
         // when teardown itself reports an error.
         lock_status(&self.status).recorder = summary.clone();
@@ -426,8 +644,9 @@ impl EmbeddedRuntime {
         Ok(summary)
     }
 
-    fn start_inner(&mut self, config: EmbeddedConfig) -> Result<(), EmbedError> {
-        install_iceoryx_config(&self.files_dir)?;
+    /// Resolve the config into a [`StartPlan`]. Touches no shared state:
+    /// the only thing it creates is the app-local `bags/` directory.
+    fn plan_start(&self, config: EmbeddedConfig) -> Result<StartPlan, EmbedError> {
         let graph = config
             .graph_yaml
             .as_deref()
@@ -445,10 +664,10 @@ impl EmbeddedRuntime {
         }
         .map_err(|error| EmbedError::InvalidArgument(error.to_string()))?;
 
-        let mut graph_inputs = graph
+        let graph_inputs = graph
             .map(|graph| self.load_graph(graph, &config))
             .transpose()?;
-        let resolved_publish = config
+        let publishes = config
             .publish
             .iter()
             .map(|publish| {
@@ -480,7 +699,7 @@ impl EmbeddedRuntime {
             .map(|inputs| output_topics(&inputs.config))
             .unwrap_or_default();
         let graph_topic_set: HashSet<&str> = graph_topics.iter().map(String::as_str).collect();
-        if let Some(topic) = resolved_publish
+        if let Some(topic) = publishes
             .iter()
             .map(|publish| publish.topic.as_str())
             .find(|topic| graph_topic_set.contains(topic))
@@ -489,10 +708,8 @@ impl EmbeddedRuntime {
                 "publish topic '{topic}' is a graph output; graph topics are single-writer"
             )));
         }
-        let publish_topics: HashSet<&str> = resolved_publish
-            .iter()
-            .map(|item| item.topic.as_str())
-            .collect();
+        let publish_topics: HashSet<&str> =
+            publishes.iter().map(|item| item.topic.as_str()).collect();
         if let Some(record) = &config.record {
             let known: HashSet<&str> = graph_topics
                 .iter()
@@ -521,7 +738,7 @@ impl EmbeddedRuntime {
             graph_topics
                 .iter()
                 .cloned()
-                .chain(resolved_publish.iter().map(|item| item.topic.clone()))
+                .chain(publishes.iter().map(|item| item.topic.clone()))
                 .filter(|topic| {
                     selected
                         .as_ref()
@@ -536,402 +753,59 @@ impl EmbeddedRuntime {
                 .collect()
         });
 
-        let extra = resolved_publish
-            .iter()
-            .map(|publish| TopicSchema {
-                topic: publish.topic.clone(),
-                schema_name: publish.schema.clone(),
-            })
-            .collect::<Vec<_>>();
-        let serving = cerulion_cli_engine::schema_serve::build_app_schema_serving(
-            graph_inputs.as_ref().map(|inputs| &inputs.config),
-            &schema_dir,
-            &extra,
-        );
-        let manager = self.transport_manager(&config.listen)?;
-        // Only a start that creates the gateway may replace the serving
-        // snapshot or change manager-wide LAN state: a listen-less app start
-        // leaves the prior run's catalog and posture untouched. For a
-        // gateway start the new catalog/schema snapshot installs BEFORE LAN
-        // access opens - the process-wide query surface may still be serving
-        // the prior run's registry, and an open gate would otherwise answer
-        // a demand with a stale topic for the window between. The prior
-        // serving is kept for rollback if the start fails.
-        let mut prior_serving = None;
-        let mut first_surface = false;
-        // Posture this start replaced: restored when the start fails so a
-        // failed run cannot leave LAN access open on the process-wide
-        // surface.
-        let mut prior_lan_access = None;
-        // The token of this start's posture write: the rollback restores the
-        // prior posture only while this write is still the last one.
-        let mut applied_lan_write = None;
-        let mut gateway_lease = None;
-        // The applied posture exists only on a gateway start; a listen-less
-        // start reports no LAN access of its own.
-        let applied_lan_access =
-            (!config.listen.is_empty()).then(|| LanAccess::from(config.lan_access));
-        if !config.listen.is_empty() {
-            // Claimed before the serving snapshot or posture changes: a
-            // refused start must leave the owning runtime's state untouched.
-            gateway_lease = Some(GatewayLease::acquire()?);
-            if let Some(live) = manager
-                .network()
-                .and_then(|network| network.query_surface_serving_handles())
-            {
-                prior_serving = Some((live.snapshot_for_rollback(), live));
-            } else {
-                // FIRST gateway start: the query surface's handles exist only
-                // after `new_with_schema_serving` creates it, so there is no
-                // snapshot to take yet - roll back to EMPTY serving below.
-                first_surface = true;
-            }
+        // Only a start with listen endpoints builds the gateway and changes
+        // manager-wide LAN state; a listen-less start leaves both alone.
+        let gateway = (!config.listen.is_empty()).then(|| {
+            let extra = publishes
+                .iter()
+                .map(|publish| TopicSchema {
+                    topic: publish.topic.clone(),
+                    schema_name: publish.schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut serving = cerulion_cli_engine::schema_serve::build_app_schema_serving(
+                graph_inputs.as_ref().map(|inputs| &inputs.config),
+                &schema_dir,
+                &extra,
+            );
             // The served set names EVERY served topic, including schema-less
             // outputs, which carry no topic_schemas binding.
-            let mut served = serving.clone();
-            {
-                let mut announce = graph_topics.clone();
-                for publish in &resolved_publish {
-                    if !announce.contains(&publish.topic) {
-                        announce.push(publish.topic.clone());
-                    }
+            let mut announce = graph_topics.clone();
+            for publish in &publishes {
+                if !announce.contains(&publish.topic) {
+                    announce.push(publish.topic.clone());
                 }
-                served.served_topics = announce;
             }
-            if let Some((_, live)) = &prior_serving {
-                live.replace(&served);
-            }
-            if let Some(network) = manager.network() {
-                prior_lan_access = Some(network.lan_access());
-                applied_lan_write = Some(
-                    network.set_lan_access_tracked(applied_lan_access.unwrap_or(LanAccess::Paired)),
-                );
-            }
-        }
-
-        // The in-flight set lives in `self.resources` from the first
-        // component: a panic mid-start must leave whatever already spawned
-        // reachable to the teardown path, not orphaned in a dropped local.
-        self.resources = Resources {
-            manager: Some(Arc::clone(&manager)),
-            gateway_lease,
-            ..Resources::default()
-        };
-        let resources = &mut self.resources;
-        let gateway_planned = !config.listen.is_empty();
-        let result = (|| {
-            Self::create_publishers(
-                &resolved_publish,
-                &manager,
-                recorded_topics.as_ref(),
-                resources,
-            )?;
-
-            let mut graph_runtime = if let Some(inputs) = graph_inputs.as_mut() {
-                let clock: Arc<dyn Clock> = Arc::new(RealClock);
-                let schema_hashes = schema_hash_map(&schemas);
-                let mut graph_runtime =
-                    GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
-                        inputs.config.clone(),
-                        std::mem::take(&mut inputs.factories),
-                        &manager,
-                        Arc::clone(&clock),
-                        Some(&schema_hashes),
-                        cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
-                        recorded_graph_topics.as_ref(),
-                    )
-                    .map_err(|error| EmbedError::Graph(error.to_string()))?;
-                graph_runtime.set_live_transport(Arc::clone(&manager));
-                Some(graph_runtime)
-            } else {
-                None
-            };
-
-            // One readiness flag per spawned worker, set only once that
-            // worker's fallible startup checks have passed. The starter waits
-            // until every worker is ready or has exited before reporting
-            // success, so a worker that failed during startup has already
-            // recorded Failed before we check `status.state` below.
-            let mut gateway_ready: Option<Arc<AtomicBool>> = None;
-            let mut graph_ready: Option<Arc<AtomicBool>> = None;
-            if !config.listen.is_empty() {
-                let mut announce = graph_topics;
-                for publish in &resolved_publish {
-                    if !announce.contains(&publish.topic) {
-                        announce.push(publish.topic.clone());
-                    }
-                }
-                // The served set must name EVERY served topic - including
-                // schema-less outputs, which carry no topic_schemas binding -
-                // or the retirement below would drop them.
-                let mut serving_clone = serving.clone();
-                serving_clone.served_topics = announce.clone();
-                let plan = GatewayPlan {
+            serving.served_topics = announce.clone();
+            GatewayStartPlan {
+                plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
                     announce,
                     ingress: Vec::new(),
-                };
-                // The process-wide query surface may outlive the prior
-                // gateway: install the new schema serving BEFORE construction
-                // registers topics and exposes the restarted gateway, or the
-                // latched callback keeps naming topics from the prior run.
-                //
-                // The prior run's announcements and bridge flags are retired
-                // BEFORE the fallible gateway construction, so a failed start
-                // never leaves a prior-run topic announced without its flag.
-                // The flags are dropped inside the replace's snapshot critical
-                // section: a catalog GET lists the bridge registry under that
-                // lock, so it never pairs the new boot set with a prior-run
-                // bridge entry. The state `replace_then` hands back is not
-                // kept: `prior_serving` already holds the pre-start snapshot.
-                //
-                // Ownership starts here, not at the thread spawn: the
-                // retirement and the constructor mutate the shared manager
-                // before either can fail.
-                resources.gateway_owned = true;
-                let served = &serving_clone.served_topics;
-                withdraw_prior_run_announcements(&manager, served);
-                match manager
-                    .network()
-                    .and_then(|network| network.query_surface_serving_handles())
-                {
-                    Some(live) => {
-                        let (_, retired) = live.replace_then(&serving_clone, || {
-                            unregister_prior_run_flags(&manager, served)
-                        });
-                        retired?;
-                    }
-                    None => unregister_prior_run_flags(&manager, served)?,
-                }
-                let gateway =
-                    GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
-                        .map_err(|error| EmbedError::Network(error.to_string()))?;
-                let exit = Arc::new(AtomicBool::new(false));
-                let thread_exit = Arc::clone(&exit);
-                let beacon = if config.mdns {
-                    advertise_beacon(&self.robot_name, &config.listen)
-                } else {
-                    None
-                };
-                lock_status(&self.status).mdns_advertised = beacon.is_some();
-                let status = Arc::clone(&self.status);
-                let advertised = AdvertisedBeacon {
-                    beacon,
-                    status: Arc::clone(&status),
-                };
-                let ready = Arc::new(AtomicBool::new(false));
-                let thread_ready = Arc::clone(&ready);
-                resources.gateway_thread = Some(
-                    thread::Builder::new()
-                        .name("cerulion-gateway".to_string())
-                        .spawn(move || {
-                            // The gateway's fallible setup (session, topic
-                            // registration) ran in its synchronous
-                            // constructor above; `run` is the drive loop, so
-                            // entering it is ready.
-                            thread_ready.store(true, Ordering::Release);
-                            let mut gateway = gateway;
-                            // A panic must not leave the status reporting
-                            // Running: record it as a worker failure the same
-                            // way a returned error is recorded.
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    gateway.run(&thread_exit).map_err(|error| error.to_string())
-                                }))
-                                .unwrap_or_else(|_| Err("gateway worker panicked".to_string()));
-                            drop(advertised);
-                            if let Err(error) = &result {
-                                set_thread_error(&status, codes::NETWORK, error);
-                            }
-                            result
-                        })
-                        .map_err(|error| EmbedError::Network(error.to_string()))?,
-                );
-                resources.gateway_exit = Some(exit);
-                gateway_ready = Some(ready);
+                },
+                serving,
+                lan_access: LanAccess::from(config.lan_access),
+                mdns: config.mdns,
             }
-
-            let bagd_plan = Self::prepare_recorder(
-                &self.files_dir,
-                &config,
-                graph_inputs.as_ref(),
-                &resolved_publish,
-            )?;
-            if let Some((bagd_config, ready_file, record_path)) = bagd_plan {
-                let shutdown = Arc::new(AtomicBool::new(false));
-                let thread_shutdown = Arc::clone(&shutdown);
-                let recorder_manager = Arc::clone(&manager);
-                let status = Arc::clone(&self.status);
-                let spawn = thread::Builder::new()
-                    .name("cerulion-bagd".to_string())
-                    .spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_bagd(recorder_manager, bagd_config, thread_shutdown)
-                                .map_err(|error| error.to_string())
-                        }))
-                        .unwrap_or_else(|_| Err("recorder worker panicked".to_string()));
-                        if let Err(error) = &result {
-                            set_thread_error(&status, codes::RECORDER, error);
-                        }
-                        result
-                    });
-                match spawn {
-                    Ok(thread) => resources.recorder_thread = Some(thread),
-                    Err(error) => {
-                        // The reserved path would read as taken to the next
-                        // start, so release it before returning the error.
-                        // Best-effort cleanup of an already-failing start.
-                        let _ = std::fs::remove_file(&record_path);
-                        return Err(EmbedError::Recorder(error.to_string()));
-                    }
-                }
-                resources.recorder_shutdown = Some(shutdown);
-                lock_status(&self.status).record_path =
-                    Some(record_path.to_string_lossy().into_owned());
-                Self::wait_recorder_ready(&ready_file, resources)?;
-            }
-
-            if let Some(mut graph_runtime) = graph_runtime.take() {
-                let running = Arc::new(AtomicBool::new(true));
-                let thread_running = Arc::clone(&running);
-                let status = Arc::clone(&self.status);
-                let ready = Arc::new(AtomicBool::new(false));
-                let thread_ready = Arc::clone(&ready);
-                resources.graph_thread = Some(
-                    thread::Builder::new()
-                        .name("cerulion-graph".to_string())
-                        .spawn(move || {
-                            // A panic unwinds past `run_live`'s own exit
-                            // bookkeeping, so surface it as a worker error:
-                            // `record_graph_exit` then marks the runtime
-                            // Failed instead of leaving it Running.
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    // The launch checks (external sources,
-                                    // the inert-node refusal) run on this
-                                    // thread BEFORE it reports ready, so a
-                                    // refusal fails the start instead of
-                                    // landing after start returned Ok.
-                                    graph_runtime.prepare_live()?;
-                                    thread_ready.store(true, Ordering::Release);
-                                    graph_runtime.run_live(&thread_running)
-                                }))
-                                .map(|result| result.map_err(|error| error.to_string()))
-                                .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
-                            record_graph_exit(&status, &thread_running, &result);
-                            result
-                        })
-                        .map_err(|error| EmbedError::Graph(error.to_string()))?,
-                );
-                resources.graph_running = Some(running);
-                graph_ready = Some(ready);
-            }
-
-            {
-                let mut status = lock_status(&self.status);
-                status.graph = graph_inputs_name(&graph_inputs);
-                status.nodes = graph_inputs
-                    .as_ref()
-                    .map_or(0, |inputs| inputs.config.nodes.len());
-                status.listen = config.listen;
-                status.lan_access = applied_lan_access.map(|access| access.as_str().to_string());
-            }
-            // The startup barrier runs WITHOUT the status lock held: a
-            // worker's error path takes that same lock, and waiting here
-            // while holding it would deadlock the failure we are waiting
-            // to see. Every spawned worker must be ready (past its startup
-            // checks) or have exited before start returns success. The
-            // recorder needs no flag: `wait_recorder_ready` above already
-            // waited for its ready marker.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                // A worker that already exited finished past its error
-                // recording, so it counts as settled for this barrier. Each
-                // worker is counted once: ready OR exited, never both.
-                if worker_settled(gateway_ready.as_deref(), resources.gateway_thread.as_ref())
-                    && worker_settled(graph_ready.as_deref(), resources.graph_thread.as_ref())
-                {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    set_thread_error(
-                        &self.status,
-                        codes::SPAWN,
-                        "a worker did not finish its startup checks within the startup barrier",
-                    );
-                    let status = lock_status(&self.status);
-                    return Err(recorded_failure(&status));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            {
-                let mut status = lock_status(&self.status);
-                // A worker thread that failed during startup already
-                // flipped the state to Failed; returning Ok here would leave
-                // a half-started runtime reporting success, so surface the
-                // recorded failure and let the caller tear down below.
-                if matches!(status.state, RuntimeState::Failed) {
-                    return Err(recorded_failure(&status));
-                }
-                if matches!(status.state, RuntimeState::Finished) {
-                    return Ok(());
-                }
-                status.state = RuntimeState::Running;
-                status.last_error = None;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            // The claim outlives the teardown: the rollbacks below still
-            // write manager-wide state, so no other runtime may start a
-            // gateway until they finish.
-            let gateway_lease = self.resources.gateway_lease.take();
-            // The recorder is finalized here, and its thread is joined, so a
-            // later `stop()` cannot recover the totals: keep them in status.
-            let (summary, _) = stop_resource_set(&mut self.resources, &self.status, true);
-            lock_status(&self.status).recorder = summary;
-            // Teardown of an owned gateway closes LAN access itself; its
-            // write, not the applied one, is then the last write this start
-            // made.
-            let own_lan_write = self.resources.lan_access_write.take().or(applied_lan_write);
-            // The gateway thread is joined above, so no gateway drives the
-            // manager now. A gateway construction that failed part-way, or a
-            // gateway that booted before a later step failed, leaves its
-            // announcements and bridge flags on the process-wide manager:
-            // retract them all, or a remote `topic list` keeps listing topics
-            // of a run that never started.
-            if gateway_planned {
-                retire_failed_start_topics(&manager);
-            }
-            // Roll the serving snapshot back to the pre-start state: the
-            // failed start must not leave the query surface cataloging this
-            // run's topics.
-            if let Some((prior, live)) = prior_serving {
-                live.restore(prior);
-            } else if first_surface {
-                // The surface this start created survives the failure (the
-                // declaration latch keeps it). Roll it back to serving
-                // NOTHING - it must not keep cataloging the failed run's
-                // catalog and schema.
-                if let Some(live) = manager
-                    .network()
-                    .and_then(|network| network.query_surface_serving_handles())
-                {
-                    live.serve_nothing();
-                }
-            }
-            // Roll the posture back too: `set_lan_access` ran before the
-            // components that can fail, so without this a failed start
-            // leaves the process-wide query surface serving LAN peers.
-            if let (Some(prior), Some(write)) = (prior_lan_access, own_lan_write) {
-                if let Some(network) = manager.network() {
-                    restore_prior_lan_access(network, prior, write);
-                }
-            }
-            drop(gateway_lease);
-            return Err(error);
-        }
-        Ok(())
+        });
+        let recorder =
+            Self::plan_recorder(&self.files_dir, &config, graph_inputs.as_ref(), &publishes)?;
+        Ok(StartPlan {
+            graph_name: graph_inputs
+                .as_ref()
+                .map(|inputs| inputs.config.identity().to_string()),
+            nodes: graph_inputs
+                .as_ref()
+                .map_or(0, |inputs| inputs.config.nodes.len()),
+            graph: graph_inputs,
+            schemas,
+            publishes,
+            recorded_topics,
+            recorded_graph_topics,
+            listen: config.listen,
+            gateway,
+            recorder,
+        })
     }
 
     fn load_graph(
@@ -1016,61 +890,22 @@ impl EmbeddedRuntime {
             ..TransportConfig::default()
         })
         .map_err(|error| EmbedError::Network(error.to_string()))?;
+        // The manager takes its first posture from the environment (open
+        // on a desktop host, or when `CERULION_LAN_ACCESS=open` is set).
+        // Start it paired: LAN access opens only when a start commits.
+        if let Some(network) = manager.network() {
+            network.set_lan_access(LanAccess::Paired);
+        }
         *identity = Some((listen.to_vec(), self.robot_name.clone()));
         Ok(manager)
     }
 
-    fn create_publishers(
-        config: &[ResolvedPublish],
-        manager: &TransportManager,
-        recorded_topics: Option<&HashSet<String>>,
-        resources: &mut Resources,
-    ) -> Result<(), EmbedError> {
-        for item in config {
-            let slot_len = WireHeader::SIZE
-                .checked_add(item.max_payload_bytes)
-                .and_then(|length| u32::try_from(length).ok())
-                .and_then(MaxSliceLen::try_new)
-                .ok_or_else(|| {
-                    EmbedError::InvalidArgument(
-                        "publisher slot size exceeds the wire transport limit".to_string(),
-                    )
-                })?;
-            // A RECORDED app topic gets the same tap
-            // provisioning the graph build applies to recorded graph outputs;
-            // a non-recorded publisher keeps the default config.
-            let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
-                manager.create_publisher_with_topic_config(
-                    &item.topic,
-                    slot_len,
-                    0,
-                    recorded_publisher_config(manager.default_topic_config(), slot_len),
-                )
-            } else {
-                manager.create_publisher(&item.topic, slot_len, 0)
-            }
-            .map_err(|error| EmbedError::Publish(error.to_string()))?;
-            resources.publishers.insert(
-                item.topic.clone(),
-                PublisherState {
-                    publisher,
-                    layout: item.layout.clone(),
-                    max_payload_bytes: item.max_payload_bytes,
-                    sequence: 0,
-                    frame: Vec::new(),
-                    lengths: Vec::new(),
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn prepare_recorder(
+    fn plan_recorder(
         files_dir: &Path,
         embedded: &EmbeddedConfig,
         graph: Option<&GraphInputs>,
         publishes: &[ResolvedPublish],
-    ) -> Result<Option<(BagdConfig, PathBuf, PathBuf)>, EmbedError> {
+    ) -> Result<Option<RecorderPlan>, EmbedError> {
         let Some(record) = &embedded.record else {
             return Ok(None);
         };
@@ -1143,89 +978,521 @@ impl EmbeddedRuntime {
             schema_dir.is_dir().then_some(schema_dir.as_path()),
             None,
         );
-        reserve_recording_path(&record_path, &record.file)?;
-        if let Err(error) = clear_ready_marker(&ready_file) {
-            // The reservation belongs to this start, so leave the name
-            // available when marker cleanup prevents startup.
-            let _ = std::fs::remove_file(&record_path);
-            return Err(error);
-        }
-        Ok(Some((config, ready_file, record_path)))
-    }
-
-    fn wait_recorder_ready(ready_file: &Path, resources: &mut Resources) -> Result<(), EmbedError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if ready_file.exists() {
-                return Ok(());
-            }
-            if resources
-                .recorder_thread
-                .as_ref()
-                .is_some_and(JoinHandle::is_finished)
-            {
-                let Some(thread) = resources.recorder_thread.take() else {
-                    return Err(EmbedError::Recorder(
-                        "bagd exited before signaling readiness".to_string(),
-                    ));
-                };
-                return match thread.join() {
-                    Ok(Err(error)) => Err(EmbedError::Recorder(error)),
-                    Ok(Ok(_)) => Err(EmbedError::Recorder(
-                        "bagd exited before signaling readiness".to_string(),
-                    )),
-                    Err(error) => Err(EmbedError::Recorder(format!(
-                        "bagd thread panicked before signaling readiness: {error:?}"
-                    ))),
-                };
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Err(EmbedError::Recorder(
-            "bagd did not signal readiness within 10 seconds".to_string(),
-        ))
-    }
-
-    fn stop_resources(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
-        stop_resource_set(&mut self.resources, &self.status, false)
+        Ok(Some(RecorderPlan {
+            config,
+            file: record.file.clone(),
+            record_path,
+            ready_file,
+        }))
     }
 }
 
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
-        if !self.resources.has_any() {
+        let Some(mut run) = self.run.take() else {
             return;
-        }
+        };
         set_state(&self.status, RuntimeState::Stopping);
-        let (summary, error) = self.stop_resources();
+        let (summary, error) = run.shutdown();
         match error {
             None => {
                 set_state(&self.status, RuntimeState::Stopped);
                 lock_status(&self.status).recorder = summary;
             }
-            // A failure here already recorded its own status through
-            // `set_thread_error`; do not overwrite it with Stopped.
             Some(error) => {
+                set_error(&self.status, &error);
                 tracing::warn!(error = %error, "embedded runtime: stop on drop failed");
             }
         }
     }
 }
 
-impl Resources {
-    /// Whether any component or handle from a previous start survives.
-    fn has_any(&self) -> bool {
-        self.manager.is_some()
-            || !self.publishers.is_empty()
-            || self.graph_running.is_some()
-            || self.graph_thread.is_some()
-            || self.gateway_exit.is_some()
-            || self.gateway_thread.is_some()
-            || self.gateway_owned
-            || self.recorder_shutdown.is_some()
-            || self.recorder_thread.is_some()
-            || self.gateway_lease.is_some()
+impl Run {
+    fn empty(manager: Arc<TransportManager>) -> Self {
+        Self {
+            graph: None,
+            gateway: None,
+            recorder: None,
+            publishers: BTreeMap::new(),
+            ownership: None,
+            manager,
+        }
     }
+
+    /// Stop every component and join its thread. Returns the recorder
+    /// summary (if any) and the first teardown error separately, so the
+    /// caller can store the summary in status BEFORE propagating the error.
+    /// Idempotent: each step empties what it stopped.
+    fn shutdown(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
+        // Close LAN access before any join: a join that blocks must not
+        // leave an open gateway serving LAN peers. Only the gateway owner
+        // may: a listen-less runtime sharing the manager leaves the owner's
+        // posture alone.
+        if self.ownership.is_some() {
+            if let Some(network) = self.manager.network() {
+                network.set_lan_access(LanAccess::Paired);
+            }
+        }
+        let mut first_error = None;
+        if let Some(graph) = self.graph.take() {
+            graph.running.store(false, Ordering::Relaxed);
+            match graph.thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(EmbedError::Graph(error));
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        EmbedError::Graph(format!("graph thread panicked: {error:?}"))
+                    });
+                }
+            }
+        }
+        if let Some(gateway) = self.gateway.take() {
+            gateway.exit.store(true, Ordering::Relaxed);
+            self.manager.bridge_manager().demand_signal().signal();
+            // The beacon is withdrawn on the gateway thread as it exits.
+            match gateway.thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(EmbedError::Network(error));
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        EmbedError::Network(format!("gateway thread panicked: {error:?}"))
+                    });
+                }
+            }
+        }
+        // The recorder joins BEFORE the ownership drops: once the lease is
+        // free another gateway runtime may start publishing, and a live tap
+        // of this run must not record its frames.
+        let summary = self
+            .recorder
+            .take()
+            .and_then(|recorder| recorder.stop(&mut first_error));
+        self.publishers.clear();
+        // Resets the manager to the quiescent baseline, then frees the lease.
+        drop(self.ownership.take());
+        (summary, first_error)
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+impl RecorderWorker {
+    fn stop(self, first_error: &mut Option<EmbedError>) -> Option<RecorderSummary> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        match self.thread.join() {
+            Ok(Ok(summary)) => {
+                let bag_paths = summary
+                    .bag_paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                Some(RecorderSummary {
+                    messages: summary.messages,
+                    channels: summary.per_topic.len(),
+                    bytes: summary.bytes,
+                    per_topic: summary.per_topic,
+                    out_path: bag_paths.first().cloned(),
+                    bag_paths,
+                })
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert_with(|| EmbedError::Recorder(error));
+                None
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    EmbedError::Recorder(format!("bagd thread panicked: {error:?}"))
+                });
+                None
+            }
+        }
+    }
+}
+
+/// Build every component of `plan` into one owned [`Run`] while LAN access
+/// stays paired. On an error the partial run is shut down, which returns
+/// the manager to the quiescent baseline; a panic does the same through
+/// `Drop for Run`.
+fn build(
+    plan: &mut StartPlan,
+    manager: Arc<TransportManager>,
+    status: &Arc<Mutex<Status>>,
+) -> Result<Run, Box<StartFailure>> {
+    let mut run = Run::empty(manager);
+    match build_into(&mut run, plan, status) {
+        Ok(()) => Ok(run),
+        Err(error) => {
+            let (summary, teardown_error) = run.shutdown();
+            if let Some(teardown_error) = teardown_error {
+                tracing::warn!(error = %teardown_error, "tearing down a start whose build failed");
+            }
+            Err(Box::new(StartFailure { error, summary }))
+        }
+    }
+}
+
+fn build_into(
+    run: &mut Run,
+    plan: &mut StartPlan,
+    status: &Arc<Mutex<Status>>,
+) -> Result<(), EmbedError> {
+    let manager = Arc::clone(&run.manager);
+    // 1. Own the gateway: the manager is now at the baseline and paired.
+    //    A latched query surface (an earlier start created it) gets this
+    //    run's serving before the constructor records any runtime hash;
+    //    a first start seeds the surface through the constructor.
+    if let Some(gateway) = &plan.gateway {
+        run.ownership = Some(GatewayOwnership::acquire(&manager)?);
+        if let Some(live) = manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+        {
+            live.replace(&gateway.serving);
+        }
+    }
+
+    // 2. App publishers.
+    create_publishers(
+        &plan.publishes,
+        &manager,
+        plan.recorded_topics.as_ref(),
+        &mut run.publishers,
+    )?;
+
+    // 3. The graph, built but not yet running.
+    let graph_runtime = if let Some(inputs) = plan.graph.as_mut() {
+        let clock: Arc<dyn Clock> = Arc::new(RealClock);
+        let schema_hashes = schema_hash_map(&plan.schemas);
+        let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
+            inputs.config.clone(),
+            std::mem::take(&mut inputs.factories),
+            &manager,
+            Arc::clone(&clock),
+            Some(&schema_hashes),
+            cerulion_cli_engine::graph_cmd::embedded_live_monitor_wait_policy(),
+            plan.recorded_graph_topics.as_ref(),
+        )
+        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        graph_runtime.set_live_transport(Arc::clone(&manager));
+        Some(graph_runtime)
+    } else {
+        None
+    };
+
+    // 4. The recorder runs before any producer, as `armed_before_producers`
+    //    requires.
+    if let Some(recorder) = &plan.recorder {
+        let mut reservation = RecordingReservation::reserve(&recorder.record_path, &recorder.file)?;
+        clear_ready_marker(&recorder.ready_file)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let recorder_manager = Arc::clone(&manager);
+        let bagd_config = recorder.config.clone();
+        let thread_status = Arc::clone(status);
+        let thread = thread::Builder::new()
+            .name("cerulion-bagd".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_bagd(recorder_manager, bagd_config, thread_shutdown)
+                        .map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("recorder worker panicked".to_string()));
+                if let Err(error) = &result {
+                    set_thread_error(&thread_status, codes::RECORDER, error);
+                }
+                result
+            })
+            .map_err(|error| EmbedError::Recorder(error.to_string()))?;
+        run.recorder = Some(RecorderWorker { shutdown, thread });
+        // bagd owns the file now: a failure from here on keeps the bag.
+        reservation.disarm();
+        wait_recorder_ready(&recorder.ready_file, &mut run.recorder)?;
+    }
+
+    // 5. The gateway. Under the paired posture its constructor registers
+    //    the bridge flags, installs egress, starts the watch, latches the
+    //    query surface and declares the identity token, and withholds every
+    //    topic announce.
+    if let Some(gateway) = &plan.gateway {
+        let runtime = GatewayRuntime::new_with_schema_serving(
+            Arc::clone(&manager),
+            gateway.plan.clone(),
+            gateway.serving.clone(),
+        )
+        .map_err(|error| EmbedError::Network(error.to_string()))?;
+        let exit = Arc::new(AtomicBool::new(false));
+        let thread_exit = Arc::clone(&exit);
+        let ready = Arc::new(AtomicBool::new(false));
+        let thread_ready = Arc::clone(&ready);
+        let beacon = Arc::new(Mutex::new(BeaconSlot {
+            closed: false,
+            guard: None,
+        }));
+        let release = BeaconRelease {
+            slot: Arc::clone(&beacon),
+            status: Arc::clone(status),
+        };
+        let thread_status = Arc::clone(status);
+        let thread = thread::Builder::new()
+            .name("cerulion-gateway".to_string())
+            .spawn(move || {
+                // The gateway's fallible setup ran in its synchronous
+                // constructor above; `run` is the drive loop, so entering it
+                // is ready.
+                thread_ready.store(true, Ordering::Release);
+                let mut runtime = runtime;
+                // A panic must not leave the status reporting Running:
+                // record it as a worker failure the same way a returned
+                // error is recorded.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.run(&thread_exit).map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("gateway worker panicked".to_string()));
+                drop(release);
+                if let Err(error) = &result {
+                    set_thread_error(&thread_status, codes::NETWORK, error);
+                }
+                result
+            })
+            .map_err(|error| EmbedError::Network(error.to_string()))?;
+        run.gateway = Some(GatewayWorker {
+            exit,
+            ready,
+            thread,
+            beacon,
+        });
+    }
+
+    // 6. The graph thread.
+    if let Some(mut graph_runtime) = graph_runtime {
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let ready = Arc::new(AtomicBool::new(false));
+        let thread_ready = Arc::clone(&ready);
+        let thread_status = Arc::clone(status);
+        let thread = thread::Builder::new()
+            .name("cerulion-graph".to_string())
+            .spawn(move || {
+                // A panic unwinds past `run_live`'s own exit bookkeeping, so
+                // surface it as a worker error: `record_graph_exit` then
+                // marks the runtime Failed instead of leaving it Running.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The launch checks (external sources, the inert-node
+                    // refusal) run on this thread BEFORE it reports ready,
+                    // so a refusal fails the start instead of landing after
+                    // start returned Ok.
+                    graph_runtime.prepare_live()?;
+                    thread_ready.store(true, Ordering::Release);
+                    graph_runtime.run_live(&thread_running)
+                }))
+                .map(|result| result.map_err(|error| error.to_string()))
+                .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
+                record_graph_exit(&thread_status, &thread_running, &result);
+                result
+            })
+            .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        run.graph = Some(GraphWorker {
+            running,
+            ready,
+            thread,
+        });
+    }
+
+    // 7. The startup barrier runs WITHOUT the status lock held: a worker's
+    //    error path takes that same lock, and waiting here while holding it
+    //    would deadlock the failure we are waiting to see. Every spawned
+    //    worker must be ready (past its startup checks) or have exited. The
+    //    recorder needs no flag: `wait_recorder_ready` already waited for
+    //    its ready marker.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let gateway_settled = run
+            .gateway
+            .as_ref()
+            .is_none_or(|worker| worker_settled(&worker.ready, &worker.thread));
+        let graph_settled = run
+            .graph
+            .as_ref()
+            .is_none_or(|worker| worker_settled(&worker.ready, &worker.thread));
+        if gateway_settled && graph_settled {
+            break;
+        }
+        if Instant::now() >= deadline {
+            set_thread_error(
+                status,
+                codes::SPAWN,
+                "a worker did not finish its startup checks within the startup barrier",
+            );
+            return Err(recorded_failure(&lock_status(status)));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    // A worker that failed during startup already recorded Failed.
+    let status = lock_status(status);
+    if matches!(status.state, RuntimeState::Failed) {
+        return Err(recorded_failure(&status));
+    }
+    Ok(())
+}
+
+/// Make a built run visible: open LAN access to the configured posture,
+/// replay the announces the paired build withheld, raise the beacon and
+/// report the run. The only step of a start that does so. On an error the
+/// caller shuts the run down, which closes LAN access first.
+fn commit(
+    run: &mut Run,
+    plan: &StartPlan,
+    status: &Arc<Mutex<Status>>,
+    robot: &str,
+) -> Result<(), EmbedError> {
+    // A worker that failed after the barrier must not get an open LAN, even
+    // briefly.
+    {
+        let status = lock_status(status);
+        if matches!(status.state, RuntimeState::Failed) {
+            return Err(recorded_failure(&status));
+        }
+    }
+    if let Some(gateway) = &plan.gateway {
+        let network = run.manager.network().ok_or_else(|| {
+            EmbedError::Network("the gateway's transport manager has no network".to_string())
+        })?;
+        // No status lock is held: a paired write waits out egress passes.
+        network.set_lan_access(gateway.lan_access);
+        if gateway.lan_access == LanAccess::Open {
+            // Read AFTER the posture opened: a topic registered before this
+            // read is replayed here, and one registered after it announces
+            // itself. A second announce of a topic is a no-op.
+            let registered = run
+                .manager
+                .bridge_manager()
+                .registered_topics()
+                .map_err(|error| EmbedError::Network(error.to_string()))?;
+            for (topic, _flag) in registered {
+                run.manager
+                    .announce_egress_topic(&topic)
+                    .map_err(|error| EmbedError::Network(error.to_string()))?;
+            }
+        }
+        if gateway.mdns {
+            // mDNS registration does I/O: raise it with no lock held.
+            let beacon = advertise_beacon(robot, &plan.listen);
+            if let Some(worker) = &run.gateway {
+                drop(install_beacon(&worker.beacon, status, beacon));
+            }
+        }
+    }
+    let mut status = lock_status(status);
+    if matches!(status.state, RuntimeState::Failed) {
+        return Err(recorded_failure(&status));
+    }
+    // A graph that already finished on its own keeps Finished.
+    if !matches!(status.state, RuntimeState::Finished) {
+        status.state = RuntimeState::Running;
+        status.last_error = None;
+    }
+    status.graph = plan.graph_name.clone();
+    status.nodes = plan.nodes;
+    status.listen = plan.listen.clone();
+    status.lan_access = plan
+        .gateway
+        .as_ref()
+        .map(|gateway| gateway.lan_access.as_str().to_string());
+    status.record_path = plan
+        .recorder
+        .as_ref()
+        .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn create_publishers(
+    config: &[ResolvedPublish],
+    manager: &TransportManager,
+    recorded_topics: Option<&HashSet<String>>,
+    publishers: &mut BTreeMap<String, PublisherState>,
+) -> Result<(), EmbedError> {
+    for item in config {
+        let slot_len = WireHeader::SIZE
+            .checked_add(item.max_payload_bytes)
+            .and_then(|length| u32::try_from(length).ok())
+            .and_then(MaxSliceLen::try_new)
+            .ok_or_else(|| {
+                EmbedError::InvalidArgument(
+                    "publisher slot size exceeds the wire transport limit".to_string(),
+                )
+            })?;
+        // A RECORDED app topic gets the same tap
+        // provisioning the graph build applies to recorded graph outputs;
+        // a non-recorded publisher keeps the default config.
+        let publisher = if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
+            manager.create_publisher_with_topic_config(
+                &item.topic,
+                slot_len,
+                0,
+                recorded_publisher_config(manager.default_topic_config(), slot_len),
+            )
+        } else {
+            manager.create_publisher(&item.topic, slot_len, 0)
+        }
+        .map_err(|error| EmbedError::Publish(error.to_string()))?;
+        publishers.insert(
+            item.topic.clone(),
+            PublisherState {
+                publisher,
+                layout: item.layout.clone(),
+                max_payload_bytes: item.max_payload_bytes,
+                sequence: 0,
+                frame: Vec::new(),
+                lengths: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Wait for bagd's ready marker. A recorder that exits first is joined here
+/// and its error returned.
+fn wait_recorder_ready(
+    ready_file: &Path,
+    recorder: &mut Option<RecorderWorker>,
+) -> Result<(), EmbedError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ready_file.exists() {
+            return Ok(());
+        }
+        if recorder
+            .as_ref()
+            .is_some_and(|worker| worker.thread.is_finished())
+        {
+            let Some(worker) = recorder.take() else {
+                return Err(EmbedError::Recorder(
+                    "bagd exited before signaling readiness".to_string(),
+                ));
+            };
+            return match worker.thread.join() {
+                Ok(Err(error)) => Err(EmbedError::Recorder(error)),
+                Ok(Ok(_)) => Err(EmbedError::Recorder(
+                    "bagd exited before signaling readiness".to_string(),
+                )),
+                Err(error) => Err(EmbedError::Recorder(format!(
+                    "bagd thread panicked before signaling readiness: {error:?}"
+                ))),
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(EmbedError::Recorder(
+        "bagd did not signal readiness within 10 seconds".to_string(),
+    ))
 }
 
 /// The topic service config an app publisher on a
@@ -1233,59 +1500,6 @@ impl Resources {
 /// raise applied to a default-opener base, so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
-/// Retires every topic of a prior run that `served` does not name. The
-/// process-wide manager outlives the prior gateway and keeps both its announce
-/// tokens and its bridge flags.
-///
-/// - Announcements are withdrawn FIRST, or a remote `topic list` keeps listing
-///   the prior run's topics (and would list them with no bridge flag behind
-///   them if the flag removal or the gateway construction then failed).
-/// - Bridge flags are then dropped: a new gateway drives EVERY registered flag,
-///   so a prior-run topic whose demand flag is still on would keep egressing.
-///   The prior gateway was stopped before this start, so no drive loop
-///   observes the removal.
-fn retire_prior_run_topics(
-    manager: &TransportManager,
-    served: &[String],
-) -> Result<(), EmbedError> {
-    withdraw_prior_run_announcements(manager, served);
-    unregister_prior_run_flags(manager, served)
-}
-
-/// The announcement half of [`retire_prior_run_topics`].
-fn withdraw_prior_run_announcements(manager: &TransportManager, served: &[String]) {
-    if let Some(network) = manager.network() {
-        network.withdraw_announcements_except(served);
-    }
-}
-
-/// The bridge-flag half of [`retire_prior_run_topics`]. It takes only the
-/// bridge registry lock, so it can run inside the schema serving's snapshot
-/// critical section.
-fn unregister_prior_run_flags(
-    manager: &TransportManager,
-    served: &[String],
-) -> Result<(), EmbedError> {
-    manager
-        .bridge_manager()
-        .unregister_topics_except(served)
-        .map(drop)
-        .map_err(|error| EmbedError::Network(error.to_string()))
-}
-
-/// Retracts every announcement and bridge flag a failed start left on the
-/// process-wide manager. Call it only after the start's gateway thread is
-/// joined and while the start still holds its [`GatewayLease`]: with no
-/// gateway driving the manager and no other runtime able to start one, every
-/// egress topic on it belongs to the failed run (the prior run was retired
-/// before this start's gateway was built). The bare identity token stays. A cleanup error is
-/// logged and dropped so the start's own error reaches the caller.
-fn retire_failed_start_topics(manager: &TransportManager) {
-    if let Err(error) = retire_prior_run_topics(manager, &[]) {
-        tracing::warn!(%error, "failed-start cleanup could not drop the bridge flags");
-    }
-}
-
 fn recorded_publisher_config(
     base: TopicServiceConfig,
     slot_len: MaxSliceLen,
@@ -1322,18 +1536,10 @@ fn recorded_failure(status: &Status) -> EmbedError {
     }
 }
 
-fn graph_inputs_name(graph: &Option<GraphInputs>) -> Option<String> {
-    graph
-        .as_ref()
-        .map(|inputs| inputs.config.identity().to_string())
-}
-
 /// Claim the recording path atomically so no second runtime can pass the
 /// same `record.file` and have bagd truncate the first bag: `create_new`
 /// refuses an existing path, and `BagWriter::create` later truncates only
-/// the empty file reserved here. Called only after every fallible
-/// validation step, so a refused config leaves the name free; the one
-/// failure after it (the bagd spawn) releases the file.
+/// the empty file reserved here.
 fn reserve_recording_path(path: &Path, file: &str) -> Result<(), EmbedError> {
     match std::fs::OpenOptions::new()
         .write(true)
@@ -1441,183 +1647,19 @@ fn advertise_beacon(robot: &str, listen: &[String]) -> Option<MdnsAdvertiseGuard
     }
 }
 
-/// Stop every component and join its thread. Returns the recorder summary
-/// (if any) and the first teardown error separately, so the caller can store
-/// the summary in status BEFORE propagating the error.
-fn stop_resource_set(
-    resources: &mut Resources,
-    status: &Arc<Mutex<Status>>,
-    starting_failure: bool,
-) -> (Option<RecorderSummary>, Option<EmbedError>) {
-    // Only a runtime that created the gateway may close LAN access on
-    // shutdown: `gateway_owned` is set exactly when this start began building
-    // the gateway (even if construction then failed), so a local-only runtime
-    // sharing the manager's network leaves the owner's posture and gateway
-    // alone.
-    let owned_gateway = std::mem::take(&mut resources.gateway_owned);
-    if owned_gateway {
-        if let Some(network) = resources
-            .manager
-            .as_ref()
-            .and_then(|manager| manager.network())
-        {
-            // Close LAN access before any join: a join that blocks must not leave
-            // an open gateway serving LAN peers. Process-global demand workers
-            // outlive this runtime; the closed posture revokes grants until the next
-            // start applies its configured posture.
-            resources.lan_access_write = Some(network.set_lan_access_tracked(LanAccess::Paired));
-        }
-    }
-    let mut first_error = None;
-    if let Some(running) = resources.graph_running.take() {
-        running.store(false, Ordering::Relaxed);
-    }
-    if let Some(thread) = resources.graph_thread.take() {
-        match thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                first_error.get_or_insert(EmbedError::Graph(error));
-            }
-            Err(error) => {
-                first_error.get_or_insert_with(|| {
-                    EmbedError::Graph(format!("graph thread panicked: {error:?}"))
-                });
-            }
-        }
-    }
-
-    let mut summary = None;
-    if starting_failure {
-        summary = stop_recorder(resources, &mut first_error);
-    }
-    if let Some(exit) = resources.gateway_exit.take() {
-        exit.store(true, Ordering::Relaxed);
-        if let Some(manager) = &resources.manager {
-            manager.bridge_manager().demand_signal().signal();
-        }
-    }
-    if let Some(thread) = resources.gateway_thread.take() {
-        match thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                first_error.get_or_insert(EmbedError::Network(error));
-            }
-            Err(error) => {
-                first_error.get_or_insert_with(|| {
-                    EmbedError::Network(format!("gateway thread panicked: {error:?}"))
-                });
-            }
-        }
-    }
-    // Bridge grants belong to the gateway owner: a listen-less runtime
-    // sharing the manager must leave every registered bridge flag alone.
-    if owned_gateway {
-        if let Some(manager) = &resources.manager {
-            let bridges = manager.bridge_manager();
-            match bridges.registered_topics() {
-                Ok(topics) => {
-                    for (topic, _) in topics {
-                        if let Err(error) = bridges.disable_bridge(&topic) {
-                            tracing::warn!(
-                                topic = %topic,
-                                error = %error,
-                                "could not disable the network bridge while stopping the runtime"
-                            );
-                        }
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "could not enumerate network bridges while stopping the runtime"
-                ),
-            }
-        }
-    }
-    // Every manager-wide grant this runtime owned is revoked: another
-    // runtime may now own the gateway. A failed start took its lease out
-    // first and keeps it until its own cleanup has retracted its topics.
-    resources.gateway_lease = None;
-    lock_status(status).mdns_advertised = false;
-    if !starting_failure {
-        summary = stop_recorder(resources, &mut first_error);
-    }
-    resources.publishers.clear();
-    resources.manager = None;
-    if let Some(error) = first_error {
-        set_error(status, &error);
-        if starting_failure {
-            return (summary, None);
-        }
-        return (summary, Some(error));
-    }
-    (summary, None)
-}
-
-fn stop_recorder(
-    resources: &mut Resources,
-    first_error: &mut Option<EmbedError>,
-) -> Option<RecorderSummary> {
-    if let Some(shutdown) = resources.recorder_shutdown.take() {
-        shutdown.store(true, Ordering::Relaxed);
-    }
-    let thread = resources.recorder_thread.take()?;
-    match thread.join() {
-        Ok(Ok(summary)) => {
-            let bag_paths = summary
-                .bag_paths
-                .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            Some(RecorderSummary {
-                messages: summary.messages,
-                channels: summary.per_topic.len(),
-                bytes: summary.bytes,
-                per_topic: summary.per_topic,
-                out_path: bag_paths.first().cloned(),
-                bag_paths,
-            })
-        }
-        Ok(Err(error)) => {
-            first_error.get_or_insert_with(|| EmbedError::Recorder(error));
-            None
-        }
-        Err(error) => {
-            first_error.get_or_insert_with(|| {
-                EmbedError::Recorder(format!("bagd thread panicked: {error:?}"))
-            });
-            None
-        }
-    }
-}
-
 /// Whether a spawned worker is past the startup barrier: it reported ready
 /// (its startup checks passed) or it already exited (so any failure is
-/// recorded). A worker that was never spawned (`ready` is `None`) is settled.
-fn worker_settled(
-    ready: Option<&AtomicBool>,
-    thread: Option<&JoinHandle<Result<(), String>>>,
-) -> bool {
-    ready.is_none_or(|ready| {
-        ready.load(Ordering::Acquire) || thread.is_some_and(JoinHandle::is_finished)
-    })
+/// recorded).
+fn worker_settled(ready: &AtomicBool, thread: &JoinHandle<Result<(), String>>) -> bool {
+    ready.load(Ordering::Acquire) || thread.is_finished()
 }
 
-fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
+fn lock_status(status: &Arc<Mutex<Status>>) -> MutexGuard<'_, Status> {
     status.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn set_state(status: &Arc<Mutex<Status>>, state: RuntimeState) {
     lock_status(status).state = state;
-}
-
-/// Roll a failed start's LAN posture back to `prior`, but only while this
-/// start's own write (`write`) is still the last posture write: any newer
-/// write - even one that stored the same value, such as a caller closing
-/// access while teardown also closed it - belongs to another caller, and
-/// restoring `prior` would overwrite it. The check and the restore are one
-/// atomic step.
-fn restore_prior_lan_access(network: &NetworkManager, prior: LanAccess, write: u64) {
-    let _ = network.set_lan_access_if_current(write, prior);
 }
 
 fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
@@ -1694,102 +1736,341 @@ mod tests {
         }
     }
 
-    /// A failed gateway construction must not leave a prior-run topic
-    /// announced after its bridge flag is gone: the retirement that runs
-    /// BEFORE construction withdraws the announcement AND drops the flag
-    /// together. Hand oracle: the prior run served `kept` and `dropped`, the
-    /// new run serves only `kept`.
-    #[test]
-    fn retiring_prior_run_topics_withdraws_announcements_with_their_flags() {
-        let id = std::process::id();
-        let manager = TransportManager::init_for_test(
+    /// Serializes the tests that take the process-wide gateway lease.
+    static GATEWAY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gateway_test_lock() -> MutexGuard<'static, ()> {
+        GATEWAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// A private manager (not the process singleton) with a network plane
+    /// and a robot identity, so announces and the query surface work.
+    fn network_manager(name: &str) -> Arc<TransportManager> {
+        TransportManager::init_for_test(
             TransportConfig {
-                node_name: format!("retire_prior_{id}"),
+                node_name: format!("{name}_{}", std::process::id()),
                 network: Some(NetworkConfig {
-                    robot_identity: Some("retiretest".to_string()),
+                    robot_identity: Some(name.to_string()),
                     ..NetworkConfig::default()
                 }),
                 ..TransportConfig::default()
             },
             cerulion_core::testing::iceoryx_test_config(),
         )
-        .expect("init gateway manager");
-        let kept = format!("/rt/retire/kept/{id}");
-        let dropped = format!("/rt/retire/dropped/{id}");
-        let prior = GatewayRuntime::new(
+        .expect("init test manager")
+    }
+
+    fn local_manager(name: &str) -> Arc<TransportManager> {
+        TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("{name}_{}", std::process::id()),
+                network: None,
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init test manager")
+    }
+
+    /// The quiescent baseline: paired, nothing announced, no bridge flag,
+    /// the latched serving empty and the gateway lease free.
+    fn assert_baseline(manager: &TransportManager) {
+        let network = manager.network().expect("network");
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        assert!(
+            network.announced_topics().is_empty(),
+            "announced: {:?}",
+            network.announced_topics()
+        );
+        assert_eq!(
+            manager
+                .bridge_manager()
+                .registered_topic_count()
+                .expect("count"),
+            0
+        );
+        if let Some(live) = network.query_surface_serving_handles() {
+            assert!(live.is_serving_nothing_for_test());
+        }
+        assert!(!GATEWAY_OWNED.load(Ordering::Acquire));
+    }
+
+    fn bagd_summary(messages: u64) -> BagdSummary {
+        BagdSummary {
+            bag_paths: vec![std::path::PathBuf::from("first.mcap")],
+            messages,
+            bytes: 0,
+            chunks: 0,
+            per_topic: BTreeMap::new(),
+            ring_records: 0,
+            rings_unavailable: vec![],
+            frozen_burst_markers: 0,
+            dropped_unwritten: 0,
+            headerless: 0,
+            status_unavailable: false,
+            frames_lost: 0,
+            record_health: cerulion_bagd::RecordHealth {
+                version: cerulion_bagd::RECORD_HEALTH_VERSION,
+                dropped_unwritten: 0,
+                drive_passes: 0,
+                max_pass_duration_us: 0,
+                drive_span_us: 0,
+                drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+                loss_counting_basis: None,
+                topics: BTreeMap::new(),
+            },
+            record_coverage: cerulion_bagd::RecordCoverage::default(),
+            channel_set_closed_after: None,
+            drive_passes: 0,
+            max_pass_duration: std::time::Duration::ZERO,
+            drive_span: std::time::Duration::ZERO,
+            drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
+            run_ended: None,
+            run_vanished_captures_lost: 0,
+            state_records: 0,
+            state_coverage: None,
+            shm_pinned_bytes: 0,
+            unpriced_taps: 0,
+            capture_close_max: std::time::Duration::ZERO,
+            captures_closed: 0,
+        }
+    }
+
+    /// A gateway plan with nothing to announce: the build takes the
+    /// ownership (step 1) and the test fails a later step.
+    fn recorder_only_gateway_plan(recorder: RecorderPlan) -> StartPlan {
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            recorder: Some(recorder),
+        }
+    }
+
+    /// Put stray gateway state on `manager`: an open posture, an enabled
+    /// bridge flag and an announce for `topic`.
+    fn leave_stray_state(manager: &TransportManager, topic: &str) {
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Open);
+        let flag = manager
+            .bridge_manager()
+            .register_topic(topic)
+            .expect("register stray flag");
+        flag.store(true, Ordering::Relaxed);
+        manager.announce_egress_topic(topic).expect("announce");
+        assert!(network.announced_topics().contains(&topic.to_string()));
+    }
+
+    /// The teardown releases the lease only after the recorder joined: a
+    /// second gateway runtime that starts once the lease is free must never
+    /// share the manager with a live tap of the stopped run. Oracle: the
+    /// stub recorder sees the lease still held when it is told to stop.
+    #[test]
+    fn shutdown_releases_the_lease_only_after_the_recorder_joins() {
+        let _serial = gateway_test_lock();
+        let manager = local_manager("lease_order");
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        run.recorder = Some(RecorderWorker {
+            shutdown,
+            thread: std::thread::spawn(move || {
+                while !thread_shutdown.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                if GATEWAY_OWNED.load(Ordering::Acquire) {
+                    Ok(bagd_summary(1))
+                } else {
+                    Err("the lease was released before the recorder joined".to_string())
+                }
+            }),
+        });
+
+        let (summary, error) = run.shutdown();
+
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(summary.expect("recorder summary").messages, 1);
+        assert!(!GATEWAY_OWNED.load(Ordering::Acquire));
+    }
+
+    /// The ready marker cannot be cleared (it is a non-empty directory):
+    /// the build fails after the recording file was reserved, so the file
+    /// is removed and the manager is back at the baseline.
+    #[test]
+    fn a_failed_ready_marker_clear_releases_the_reserved_file_and_restores_baseline() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("readyclear");
+        leave_stray_state(&manager, "/ready_clear/stray");
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let record_path = temp.path().join("blocked.mcap");
+        let ready_file = temp.path().join("blocked.mcap.ready");
+        std::fs::create_dir(&ready_file).expect("create marker directory");
+        std::fs::write(ready_file.join("child"), b"content").expect("make directory non-empty");
+        let mut plan = recorder_only_gateway_plan(RecorderPlan {
+            config: BagdConfig::new(&record_path, Vec::new()),
+            file: "blocked.mcap".to_string(),
+            record_path: record_path.clone(),
+            ready_file,
+        });
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+
+        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+            Ok(_) => panic!("a ready marker that cannot be cleared fails the build"),
+            Err(failure) => failure,
+        };
+
+        assert!(
+            failure
+                .error
+                .to_string()
+                .starts_with("failed to clear recorder readiness marker:"),
+            "{}",
+            failure.error
+        );
+        assert!(!record_path.exists(), "the reserved file must be released");
+        assert_baseline(&manager);
+    }
+
+    /// bagd exits before it reports ready (it refuses a tap-less config):
+    /// the file was handed to bagd at spawn, so it stays, and the manager
+    /// is back at the baseline.
+    #[test]
+    fn a_recorder_that_exits_before_ready_keeps_its_bag_and_restores_baseline() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("earlyexit");
+        leave_stray_state(&manager, "/early_exit/stray");
+        let temp = tempfile::tempdir().expect("temporary files directory");
+        let record_path = temp.path().join("early.mcap");
+        let ready_file = temp.path().join("early.mcap.ready");
+        let mut config = BagdConfig::new(&record_path, Vec::new());
+        config.ready_file = Some(ready_file.clone());
+        let mut plan = recorder_only_gateway_plan(RecorderPlan {
+            config,
+            file: "early.mcap".to_string(),
+            record_path: record_path.clone(),
+            ready_file,
+        });
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+
+        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+            Ok(_) => panic!("a recorder that exits before ready fails the build"),
+            Err(failure) => failure,
+        };
+
+        assert!(
+            matches!(failure.error, EmbedError::Recorder(_)),
+            "{}",
+            failure.error
+        );
+        assert!(record_path.exists(), "bagd owned the file once it spawned");
+        assert_baseline(&manager);
+    }
+
+    /// `quiesce` brings a manager with a stopped gateway's leftovers (an
+    /// open posture, flags, announces and a latched serving) to the
+    /// baseline, and a second call changes nothing.
+    #[test]
+    fn quiesce_is_idempotent_and_repairs_a_partial_teardown() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("quiescetest");
+        let served = format!("/quiesce/served/{}", std::process::id());
+        let gateway = GatewayRuntime::new_with_schema_serving(
             Arc::clone(&manager),
             GatewayPlan {
                 egress_policy: GatewayEgressPolicy::AllowAll,
-                announce: vec![kept.clone(), dropped.clone()],
+                announce: vec![served.clone()],
                 ingress: Vec::new(),
             },
+            SchemaServing {
+                topic_schemas: vec![TopicSchema {
+                    topic: served.clone(),
+                    schema_name: "std_msgs/String".to_string(),
+                }],
+                served_topics: vec![served.clone()],
+                ..SchemaServing::default()
+            },
         )
-        .expect("prior gateway boot");
-        drop(prior);
-
-        retire_prior_run_topics(&manager, std::slice::from_ref(&kept)).expect("retire");
-
+        .expect("gateway boot latches the query surface");
+        drop(gateway);
+        leave_stray_state(&manager, "/quiesce/stray");
         let network = manager.network().expect("network");
-        assert_eq!(network.announced_topics(), vec![kept.clone()]);
-        let bridges = manager.bridge_manager();
-        assert!(bridges.is_registered(&kept).expect("registered"));
-        assert!(!bridges.is_registered(&dropped).expect("registered"));
+        let live = network
+            .query_surface_serving_handles()
+            .expect("the gateway latched the query surface");
+        assert!(!live.is_serving_nothing_for_test());
+
+        quiesce(&manager);
+        assert_baseline(&manager);
+        quiesce(&manager);
+        assert_baseline(&manager);
     }
 
-    /// A gateway construction that fails part-way has already committed some
-    /// bridge flags and announcements. The failed-start cleanup must retract
-    /// them all, so a remote `topic list` names no topic of the failed run.
-    /// Hand oracle: the failed run committed `announced` (flag + token) and
-    /// `registered` (flag only, its announce never ran); afterwards the
-    /// manager announces nothing and has no flag registered.
+    /// The commit raises the beacon with no lock held; when the gateway
+    /// thread exited in between, the beacon is handed back for dropping and
+    /// the status keeps reporting no beacon.
     #[test]
-    fn a_failed_start_retracts_the_announcements_its_gateway_committed() {
-        let id = std::process::id();
-        let manager = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: format!("failed_start_{id}"),
-                network: Some(NetworkConfig {
-                    robot_identity: Some("failedstart".to_string()),
-                    ..NetworkConfig::default()
-                }),
-                ..TransportConfig::default()
-            },
-            cerulion_core::testing::iceoryx_test_config(),
-        )
-        .expect("init gateway manager");
-        let announced = format!("/rt/failed/announced/{id}");
-        let registered = format!("/rt/failed/registered/{id}");
-        // The state a construction leaves when it fails mid announce loop.
-        let bridges = manager.bridge_manager();
-        bridges.register_topic(&announced).expect("register");
-        bridges.register_topic(&registered).expect("register");
-        manager.announce_egress_topic(&announced).expect("announce");
-        let network = manager.network().expect("network");
-        assert_eq!(network.announced_topics(), vec![announced.clone()]);
+    fn a_beacon_raised_after_the_gateway_exited_is_dropped_and_not_reported() {
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let closed = Mutex::new(BeaconSlot::<()> {
+            closed: true,
+            guard: None,
+        });
+        assert_eq!(install_beacon(&closed, &status, Some(())), Some(()));
+        assert!(lock_slot(&closed).guard.is_none());
+        assert!(!lock_status(&status).mdns_advertised);
 
-        retire_failed_start_topics(&manager);
-
-        assert!(network.announced_topics().is_empty());
-        assert_eq!(bridges.registered_topic_count().expect("count"), 0);
+        let open = Mutex::new(BeaconSlot::<()> {
+            closed: false,
+            guard: None,
+        });
+        assert_eq!(install_beacon(&open, &status, Some(())), None);
+        assert!(lock_slot(&open).guard.is_some());
+        assert!(lock_status(&status).mdns_advertised);
     }
 
     #[test]
     fn a_panicking_gateway_thread_clears_mdns_advertised() {
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
         lock_status(&status).mdns_advertised = true;
-        let guard = AdvertisedBeacon {
-            beacon: None,
+        let slot = Arc::new(Mutex::new(BeaconSlot {
+            closed: false,
+            guard: Some(()),
+        }));
+        let release = BeaconRelease {
+            slot: Arc::clone(&slot),
             status: Arc::clone(&status),
         };
 
         let result = std::thread::spawn(move || {
-            let _held = guard;
+            let _held = release;
             panic!("gateway unwound");
         })
         .join();
 
         assert!(result.is_err());
         assert!(!lock_status(&status).mdns_advertised);
+        let slot = lock_slot(&slot);
+        assert!(slot.closed);
+        assert!(slot.guard.is_none());
     }
 
     #[test]
@@ -1961,157 +2242,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_prior_posture_rollback_leaves_any_newer_write_alone() {
-        let manager = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: "rollback_guard_test".to_string(),
-                network: Some(NetworkConfig {
-                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
-                    ..NetworkConfig::default()
-                }),
-                ..TransportConfig::default()
-            },
-            cerulion_core::testing::iceoryx_test_config(),
-        )
-        .expect("init test manager");
-        let network = manager.network().expect("network");
-
-        // This start's own write is still the last one: the prior posture
-        // comes back.
-        let write = network.set_lan_access_tracked(LanAccess::Paired);
-        restore_prior_lan_access(network, LanAccess::Open, write);
-        assert_eq!(network.lan_access(), LanAccess::Open);
-
-        // Another caller closed access after teardown's own close: the value
-        // is the same, but the write is not this start's, so it stays.
-        let teardown_write = network.set_lan_access_tracked(LanAccess::Paired);
-        network.set_lan_access(LanAccess::Paired);
-        restore_prior_lan_access(network, LanAccess::Open, teardown_write);
-        assert_eq!(
-            network.lan_access(),
-            LanAccess::Paired,
-            "the rollback must not reopen access a newer caller closed"
-        );
-
-        // A different value set after the snapshot is kept too.
-        let write = network.set_lan_access_tracked(LanAccess::Paired);
-        network.set_lan_access(LanAccess::Open);
-        restore_prior_lan_access(network, LanAccess::Paired, write);
-        assert_eq!(
-            network.lan_access(),
-            LanAccess::Open,
-            "the rollback must not overwrite a posture set after the snapshot"
-        );
-    }
-
+    /// What a gateway constructor leaves when it fails after registering its
+    /// announce topics: an enabled flag, an open posture and no thread. The
+    /// teardown closes the posture and drops the flag.
     #[test]
     fn a_half_built_gateway_teardown_revokes_its_bridges_and_posture() {
-        let manager = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: "half_built_gateway_test".to_string(),
-                network: Some(NetworkConfig {
-                    listen_endpoints: vec!["tcp/127.0.0.1:0".to_string()],
-                    ..NetworkConfig::default()
-                }),
-                ..TransportConfig::default()
-            },
-            cerulion_core::testing::iceoryx_test_config(),
-        )
-        .expect("init test manager");
+        let _serial = gateway_test_lock();
+        let manager = network_manager("halfbuilt");
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
         let network = manager.network().expect("network");
         network.set_lan_access(LanAccess::Open);
-        // What a gateway constructor leaves behind when it fails after
-        // registering its announce topics: an enabled flag, no thread.
         let flag = manager
             .bridge_manager()
             .register_topic("/half_built/topic")
             .expect("register bridge");
         flag.store(true, Ordering::Relaxed);
-        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
-        let mut resources = Resources {
-            manager: Some(Arc::clone(&manager)),
-            gateway_owned: true,
-            ..Resources::default()
-        };
-        let _ = stop_resource_set(&mut resources, &status, true);
-        assert_eq!(network.lan_access(), LanAccess::Paired);
-        assert!(
-            resources.lan_access_write.is_some(),
-            "the teardown close must hand its write token to the rollback"
-        );
+
+        let (_, error) = run.shutdown();
+
+        assert!(error.is_none(), "{error:?}");
         assert!(
             !flag.load(Ordering::Relaxed),
             "a failed gateway construction must not leave its bridge enabled"
         );
-        assert!(!resources.has_any());
+        assert_baseline(&manager);
     }
 
     #[test]
-    fn a_panicked_worker_still_yields_the_recorder_summary_and_failed_status() {
-        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
-        let mut resources = Resources {
-            manager: None,
-            publishers: BTreeMap::new(),
-            graph_running: Some(Arc::new(AtomicBool::new(true))),
-            graph_thread: Some(std::thread::spawn(|| -> Result<(), String> {
+    fn a_panicked_worker_still_yields_the_recorder_summary() {
+        let mut run = Run::empty(local_manager("panicked_worker"));
+        run.graph = Some(GraphWorker {
+            running: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(AtomicBool::new(true)),
+            thread: std::thread::spawn(|| -> Result<(), String> {
                 panic!("graph worker unwound");
-            })),
-            gateway_exit: None,
-            gateway_thread: None,
-            gateway_owned: false,
-            gateway_lease: None,
-            lan_access_write: None,
-            recorder_shutdown: Some(Arc::new(AtomicBool::new(false))),
-            recorder_thread: Some(std::thread::spawn(|| {
-                Ok(BagdSummary {
-                    bag_paths: vec![std::path::PathBuf::from("first.mcap")],
-                    messages: 3,
-                    bytes: 0,
-                    chunks: 0,
-                    per_topic: BTreeMap::new(),
-                    ring_records: 0,
-                    rings_unavailable: vec![],
-                    frozen_burst_markers: 0,
-                    dropped_unwritten: 0,
-                    headerless: 0,
-                    status_unavailable: false,
-                    frames_lost: 0,
-                    record_health: cerulion_bagd::RecordHealth {
-                        version: cerulion_bagd::RECORD_HEALTH_VERSION,
-                        dropped_unwritten: 0,
-                        drive_passes: 0,
-                        max_pass_duration_us: 0,
-                        drive_span_us: 0,
-                        drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
-                        loss_counting_basis: None,
-                        topics: BTreeMap::new(),
-                    },
-                    record_coverage: cerulion_bagd::RecordCoverage::default(),
-                    channel_set_closed_after: None,
-                    drive_passes: 0,
-                    max_pass_duration: std::time::Duration::ZERO,
-                    drive_span: std::time::Duration::ZERO,
-                    drain_gaps: cerulion_bagd::DrainGapHistogram::default(),
-                    run_ended: None,
-                    run_vanished_captures_lost: 0,
-                    state_records: 0,
-                    state_coverage: None,
-                    shm_pinned_bytes: 0,
-                    unpriced_taps: 0,
-                    capture_close_max: std::time::Duration::ZERO,
-                    captures_closed: 0,
-                })
-            })),
-        };
+            }),
+        });
+        run.recorder = Some(RecorderWorker {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread: std::thread::spawn(|| Ok(bagd_summary(3))),
+        });
 
-        let (summary, error) = stop_resource_set(&mut resources, &status, false);
+        let (summary, error) = run.shutdown();
 
         let summary = summary.expect("a worker panic must not lose the recorder summary");
         assert_eq!(summary.messages, 3);
         assert!(matches!(error, Some(EmbedError::Graph(_))));
-        let status = lock_status(&status);
-        assert_eq!(status.state, RuntimeState::Failed);
     }
 
     #[test]
