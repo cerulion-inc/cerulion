@@ -17,8 +17,8 @@
 
 use super::types::{field_type_to_rust, field_type_to_rust_shm};
 use super::{
-    escape_keyword, field_has_nonzero_default, has_direct_large_array, has_large_array,
-    needs_manual_default,
+    escape_keyword, field_has_direct_large_array, field_has_large_array, field_has_nonzero_default,
+    has_large_array, needs_manual_default,
 };
 use crate::codegen::schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema, ScalarLiteral};
 use std::fmt::Write;
@@ -799,11 +799,22 @@ fn shm_default_literal_expr(d: &DefaultLiteral) -> String {
 }
 
 /// True when the `<Name>FixedSection` overlay of a VARIABLE schema needs a
-/// manual `Default`: a direct large array, or a non-zero default on one of
-/// its OWN fields. A default on a variable field (a string, a `T[]`) lives
-/// only in the snapshot, so it must not force a manual overlay impl.
+/// manual `Default`: a direct large array, or a non-zero default, on one of
+/// its OWN fields. A variable field (a string, a `T[]`, a `Header[33]` of a
+/// variable `Header`) lives only in the snapshot and the payload region, so
+/// it must not force a manual overlay impl: clippy `derivable_impls` rejects
+/// a manual `Default` that derive could produce.
 fn fixed_section_needs_manual_default(schema: &MessageSchema) -> bool {
-    has_direct_large_array(schema) || fixed_section_fields(schema).any(field_has_nonzero_default)
+    fixed_section_fields(schema)
+        .any(|f| field_has_direct_large_array(&f.field_type) || field_has_nonzero_default(f))
+}
+
+/// True when a field of the `<Name>FixedSection` overlay holds a large
+/// array (directly or inside an embedded resolved-fixed nested type), so
+/// the overlay cannot derive `Debug`. Variable fields are not in the
+/// overlay, so they do not count.
+fn fixed_section_has_large_array(schema: &MessageSchema) -> bool {
+    fixed_section_fields(schema).any(|f| field_has_large_array(&f.field_type))
 }
 
 /// Default-value expression for an SHM-backed field. Like
@@ -2103,7 +2114,7 @@ fn generate_variable_fixed_section_struct(
     // disallow them.
     match (
         fixed_section_needs_manual_default(schema),
-        has_large_array(schema),
+        fixed_section_has_large_array(schema),
     ) {
         (true, true) => writeln!(out, "#[derive(Clone, Copy, PartialEq)]").unwrap(),
         (true, false) => writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap(),

@@ -78,7 +78,7 @@ fn has_large_array(schema: &MessageSchema) -> bool {
         .any(|f| field_has_large_array(&f.field_type))
 }
 
-fn field_has_large_array(ft: &FieldType) -> bool {
+pub(super) fn field_has_large_array(ft: &FieldType) -> bool {
     match ft {
         FieldType::FixedArray {
             length,
@@ -106,14 +106,14 @@ fn field_has_large_array(ft: &FieldType) -> bool {
 /// manual `Default` impl, so the parent can still `#[derive(Default)]` —
 /// deriving is preferred (clippy `derivable_impls` rejects a manual impl
 /// that derive could produce).
-pub(super) fn has_direct_large_array(schema: &MessageSchema) -> bool {
+fn has_direct_large_array(schema: &MessageSchema) -> bool {
     schema
         .fields
         .iter()
         .any(|f| field_has_direct_large_array(&f.field_type))
 }
 
-fn field_has_direct_large_array(ft: &FieldType) -> bool {
+pub(super) fn field_has_direct_large_array(ft: &FieldType) -> bool {
     match ft {
         FieldType::FixedArray {
             length,

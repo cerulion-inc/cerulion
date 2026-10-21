@@ -90,12 +90,13 @@ pub fn srv_response_name(srv_name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SrvErrorKind {
     /// No `---` line in the file.
-    #[error("missing `{SRV_SEPARATOR}` line between the request and the response")]
+    #[error("missing `{sep}` line between the request and the response", sep = SRV_SEPARATOR)]
     MissingSeparator,
     /// A second `---` line; `first_line` is where the first one is.
     #[error(
-        "a second `{SRV_SEPARATOR}` line (the first is on line {first_line}); \
-         a service has exactly one"
+        "a second `{sep}` line (the first is on line {first_line}); \
+         a service has exactly one",
+        sep = SRV_SEPARATOR
     )]
     ExtraSeparator { first_line: usize },
     /// A line in the request or response part is not a valid `.msg` line.

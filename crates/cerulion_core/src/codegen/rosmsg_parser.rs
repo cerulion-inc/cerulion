@@ -1189,6 +1189,10 @@ mod constant_and_default_tests {
                 format!("line 2: invalid constant name: {bad}")
             );
         }
+        // rosidl reads any `=` after the name as a constant separator, so a
+        // bare string default that starts with `=` is a constant named `s`,
+        // and that name is refused (rosidl raises the same error).
+        assert_eq!(err("string s =foo\n"), "line 1: invalid constant name: s");
         let ok = one("uint8 A=1\nuint8 A_B2=2\nuint8 X9_Y_Z=3\nuint8 B1=4\n");
         assert_eq!(
             ok.constants

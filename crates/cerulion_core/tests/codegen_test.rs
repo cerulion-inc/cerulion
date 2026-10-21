@@ -2309,6 +2309,30 @@ fn a_string_only_default_leaves_the_fixed_overlay_derived() {
     ));
 }
 
+/// A large array whose element is variable (`string[33]`, or a nested
+/// type that did not resolve as fixed) lives in the payload region, not in
+/// the fixed overlay. It must not force a manual overlay `Default`, which
+/// clippy `derivable_impls` would reject, and must not drop `Debug`.
+#[test]
+fn a_variable_large_array_leaves_the_fixed_overlay_derived() {
+    for (msg, name) in [
+        ("string[33] names\nint32 plain\n", "BigStr"),
+        ("q/Header[33] stamps\nint32 plain\n", "BigHdr"),
+    ] {
+        let code = generate_from_msg(msg, name);
+        let decl = format!("pub struct {name}FixedSection {{");
+        assert_eq!(
+            derive_above(&code, &decl),
+            "#[derive(Debug, Clone, Copy, PartialEq, Default)]",
+            "{name}"
+        );
+        assert!(
+            !code.contains(&format!("impl Default for {name}FixedSection")),
+            "{name}"
+        );
+    }
+}
+
 /// A `string[]` snapshot field holds the raw wire payload, so its default
 /// is the canonical encoding: u32 count, then per string a u32 length and
 /// its bytes, little-endian. Hand-assembled oracle for `["ab", ""]`.
