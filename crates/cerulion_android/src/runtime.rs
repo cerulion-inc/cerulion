@@ -679,25 +679,13 @@ impl EmbeddedRuntime {
                 // Ownership starts here, not at the thread spawn: the
                 // constructor mutates the shared manager before it can fail.
                 resources.gateway_owned = true;
-                // The manager outlives the prior gateway and keeps its bridge
-                // flags: a new gateway drives EVERY registered flag, so drop
-                // the topics the new run does not serve, or a prior-run topic
-                // whose demand flag is still on keeps egressing. The prior
-                // gateway was stopped before this start, so no drive loop
-                // observes the removal.
-                manager
-                    .bridge_manager()
-                    .unregister_topics_except(&serving_clone.served_topics)
-                    .map_err(|error| EmbedError::Network(error.to_string()))?;
+                // Retire the prior run's announcements and bridge flags BEFORE
+                // the fallible gateway construction, so a failed start never
+                // leaves a prior-run topic announced without its flag.
+                retire_prior_run_topics(&manager, &serving_clone.served_topics)?;
                 let gateway =
                     GatewayRuntime::new_with_schema_serving(Arc::clone(&manager), plan, serving)
                         .map_err(|error| EmbedError::Network(error.to_string()))?;
-                // The manager outlives the prior gateway and keeps its announce
-                // tokens: withdraw every topic the new run does not serve, or a
-                // remote `topic list` keeps listing the prior run's topics.
-                if let Some(network) = manager.network() {
-                    network.withdraw_announcements_except(&serving_clone.served_topics);
-                }
                 let exit = Arc::new(AtomicBool::new(false));
                 let thread_exit = Arc::clone(&exit);
                 let beacon = if config.mdns {
@@ -1216,6 +1204,31 @@ impl Resources {
 /// raise applied to a default-opener base, so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
+/// Retires every topic of a prior run that `served` does not name. The
+/// process-wide manager outlives the prior gateway and keeps both its announce
+/// tokens and its bridge flags.
+///
+/// - Announcements are withdrawn FIRST, or a remote `topic list` keeps listing
+///   the prior run's topics (and would list them with no bridge flag behind
+///   them if the flag removal or the gateway construction then failed).
+/// - Bridge flags are then dropped: a new gateway drives EVERY registered flag,
+///   so a prior-run topic whose demand flag is still on would keep egressing.
+///   The prior gateway was stopped before this start, so no drive loop
+///   observes the removal.
+fn retire_prior_run_topics(
+    manager: &TransportManager,
+    served: &[String],
+) -> Result<(), EmbedError> {
+    if let Some(network) = manager.network() {
+        network.withdraw_announcements_except(served);
+    }
+    manager
+        .bridge_manager()
+        .unregister_topics_except(served)
+        .map_err(|error| EmbedError::Network(error.to_string()))?;
+    Ok(())
+}
+
 fn recorded_publisher_config(
     base: TopicServiceConfig,
     slot_len: MaxSliceLen,
@@ -1621,6 +1634,48 @@ mod tests {
                 .transport_manager(&[])
                 .expect("a listen-less start shares the existing manager");
         }
+    }
+
+    /// A failed gateway construction must not leave a prior-run topic
+    /// announced after its bridge flag is gone: the retirement that runs
+    /// BEFORE construction withdraws the announcement AND drops the flag
+    /// together. Hand oracle: the prior run served `kept` and `dropped`, the
+    /// new run serves only `kept`.
+    #[test]
+    fn retiring_prior_run_topics_withdraws_announcements_with_their_flags() {
+        let id = std::process::id();
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("retire_prior_{id}"),
+                network: Some(NetworkConfig {
+                    robot_identity: Some("retiretest".to_string()),
+                    ..NetworkConfig::default()
+                }),
+                ..TransportConfig::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("init gateway manager");
+        let kept = format!("/rt/retire/kept/{id}");
+        let dropped = format!("/rt/retire/dropped/{id}");
+        let prior = GatewayRuntime::new(
+            Arc::clone(&manager),
+            GatewayPlan {
+                egress_policy: GatewayEgressPolicy::AllowAll,
+                announce: vec![kept.clone(), dropped.clone()],
+                ingress: Vec::new(),
+            },
+        )
+        .expect("prior gateway boot");
+        drop(prior);
+
+        retire_prior_run_topics(&manager, std::slice::from_ref(&kept)).expect("retire");
+
+        let network = manager.network().expect("network");
+        assert_eq!(network.announced_topics(), vec![kept.clone()]);
+        let bridges = manager.bridge_manager();
+        assert!(bridges.is_registered(&kept).expect("registered"));
+        assert!(!bridges.is_registered(&dropped).expect("registered"));
     }
 
     #[test]
