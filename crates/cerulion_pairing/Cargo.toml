@@ -81,3 +81,14 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # (proving the structural magic/version checks run AFTER the MAC verifies).
 hmac = "0.12"
 sha2 = "0.10"
+# Independent checks of the team X.509 profile: x509-parser reads the issued
+# DER field by field, rustls-webpki (the verifier the network links use)
+# accepts it for client and server authentication, rcgen builds certificates
+# that leave the profile for the refusal tests, and data-encoding is the
+# base32 oracle for the alt name URIs.
+x509-parser = "0.18"
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.14"
+data-encoding = "2"
+time = "0.3"

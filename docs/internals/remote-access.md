@@ -149,6 +149,18 @@ axes postcard is lenient about: a wrong leading version is refused BY NAME, and
 trailing bytes are a loud error (`format_vectors_test.rs`, including
 `an_unversioned_epoch_envelope_is_refused_loudly`).
 
+- **Team trust formats** (`cerulion_pairing::team`, pure, nothing calls them
+  yet): the X.509 profile for machine leaves (`<role>.g<N>.<team>.cerulion.invalid`,
+  ed25519, extKeyUsage serverAuth plus clientAuth always written, robot leaves
+  with notAfter `99991231235959Z`) and team issuing CAs (self-signed, CA with
+  path length 0), written by a hand-rolled DER encoder and read back by the strict
+  `check_leaf` / `check_team_ca`; the intermediate-signed `TeamTrustBundle`
+  (`cerulion-pairing:team-trust:v1`), `TeamStatusList` and `StatusFreshness`
+  (`cerulion-pairing:team-status:v1`, told apart by a kind byte); and the pure
+  anti-rollback decisions in `team::rollback`. Pinned by `team_formats_test.rs`
+  against x509-parser, rustls-webpki, rcgen-built refusals and hand-built
+  signing bytes.
+
 ## 5. The robot accept gate (`cerulion_remoted`)
 
 `PairingAuthorizer` (`authorizer.rs`) is pure over the live `SharedTrust`: map
@@ -411,6 +423,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_pairing/tests/owner_grant_verify_test.rs` | Offline owner-grant verification, one-flip negative matrix |
 | `crates/cerulion_pairing/tests/pake_test.rs` | CPace agree-iff-code-and-identities-match, attempts/TTL/burn policy |
 | `crates/cerulion_pairing/tests/client_test.rs` | Device-identity seam + the two end-to-end pairing flows across all modules |
+| `crates/cerulion_pairing/tests/team_formats_test.rs` | Team X.509 leaf and CA profile read back by x509-parser and accepted by rustls-webpki, rcgen-built refusals, bundle and status signing bytes, anti-rollback order |
 | `crates/cerulion_link/tests/loopback_test.rs` | Dial-by-key + mutual key auth against independently-derived oracle keys; framing round-trips |
 | `crates/cerulion_link/tests/uni_and_ops_stream_test.rs` | Uni-stream helpers + the synchronous `QuicOpsStream` adapter, literal byte oracles |
 | `crates/cerulion_remoted/tests/authorizer_matrix_test.rs` | Every cell of the sacred verb table, real-crypto access rows |

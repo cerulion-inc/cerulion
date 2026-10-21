@@ -17,6 +17,14 @@ pub enum CertKind {
     /// An OWNER-signed access grant — signed by the robot owner's
     /// device key and verified offline against the robot's own owner chain.
     AccessGrant,
+    /// A team X.509 certificate (a machine leaf or a team issuing CA).
+    TeamCert,
+    /// A team trust bundle.
+    TeamTrustBundle,
+    /// A team status list.
+    TeamStatusList,
+    /// A status freshness proof.
+    StatusFreshness,
 }
 
 impl core::fmt::Display for CertKind {
@@ -27,6 +35,10 @@ impl core::fmt::Display for CertKind {
             CertKind::Grant => "grant",
             CertKind::Epoch => "epoch",
             CertKind::AccessGrant => "owner-signed access grant",
+            CertKind::TeamCert => "team certificate",
+            CertKind::TeamTrustBundle => "team trust bundle",
+            CertKind::TeamStatusList => "team status list",
+            CertKind::StatusFreshness => "status freshness proof",
         };
         f.write_str(s)
     }
@@ -240,6 +252,74 @@ pub enum PairingError {
     /// The underlying CPace primitive rejected a message.
     #[error("CPace protocol error: {0}")]
     PakeProtocol(&'static str),
+
+    // ---- team trust formats ------------------------------------------------
+    /// A team short name is not one DNS label of `[a-z0-9-]`, 1 to 63
+    /// characters, not starting or ending with `-`.
+    #[error("team short name must be one DNS label: 1 to 63 characters of a-z, 0-9 and '-', not starting or ending with '-'")]
+    InvalidTeamShort,
+    /// A common name is not `<role>.g<N>.<team>.cerulion.invalid` (or, for a
+    /// CA, `ca.g<N>.<team>.cerulion.invalid`).
+    #[error("common name is not a team name of the form <role>.g<N>.<team>.cerulion.invalid")]
+    TeamNameMismatch,
+    /// A team certificate is not well formed DER or leaves the profile.
+    #[error("team certificate is malformed: {0}")]
+    TeamCertMalformed(&'static str),
+    /// A team certificate's key or signature algorithm is not ed25519.
+    #[error("team certificate key or signature algorithm is not ed25519")]
+    TeamCertNotEd25519,
+    /// A certificate presented as a machine leaf is a CA certificate.
+    #[error("machine leaf is a CA certificate")]
+    TeamCertIsCa,
+    /// A machine leaf's keyUsage is absent, lacks digitalSignature or has
+    /// keyCertSign.
+    #[error("machine leaf keyUsage must be digitalSignature without keyCertSign")]
+    TeamCertKeyUsage,
+    /// A machine leaf has no extKeyUsage extension.
+    #[error("machine leaf has no extKeyUsage; it must list serverAuth and clientAuth")]
+    TeamCertMissingEku,
+    /// A machine leaf's extKeyUsage lacks serverAuth or clientAuth.
+    #[error("machine leaf extKeyUsage must list both serverAuth and clientAuth")]
+    TeamCertIncompleteEku,
+    /// A machine leaf's validity does not match its role: a robot leaf must
+    /// not expire, any other leaf must not outlive the role lifetime.
+    #[error("{role} leaf validity does not match the role lifetime")]
+    TeamCertLifetime { role: crate::team::TeamRole },
+    /// A certificate time is outside what X.509 can express.
+    #[error("certificate time is beyond 9999-12-31T23:59:59Z")]
+    TeamCertTimeOutOfRange,
+    /// A certificate's issuer name is not the team CA name it must be.
+    #[error("certificate issuer name is not the team CA name of the same team and generation")]
+    TeamCertIssuerName,
+    /// A machine leaf's device URI is missing, repeated, or names a key other
+    /// than the subject key.
+    #[error("machine leaf must carry exactly one device URI naming its own key")]
+    TeamCertDeviceUriMismatch,
+    /// A team certificate carries a critical extension outside the profile.
+    #[error("team certificate carries an unknown critical extension")]
+    TeamCertUnknownCriticalExtension,
+    /// A team issuing CA certificate leaves the CA profile.
+    #[error("team CA certificate: {0}")]
+    TeamCaProfile(&'static str),
+    /// A leaf names a different team or generation than the CA checking it.
+    #[error("leaf names a different team or generation than its issuing CA")]
+    TeamCertIssuerMismatch,
+    /// A team statement is structurally invalid.
+    #[error("team statement is invalid: {0}")]
+    TeamStatementInvalid(&'static str),
+    /// A team statement is for a different team than expected.
+    #[error("team statement is for a different team")]
+    TeamMismatch,
+    /// A freshness proof answers a different asker or nonce.
+    #[error("status freshness proof answers a different device or nonce")]
+    FreshnessMismatch,
+    /// A team statement is older than the one already held.
+    #[error("{what} rolled back: held {held}, offered {offered}")]
+    TeamRollback {
+        what: &'static str,
+        held: u64,
+        offered: u64,
+    },
 }
 
 pub(crate) fn ser_err(e: postcard::Error) -> PairingError {
