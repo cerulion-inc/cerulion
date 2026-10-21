@@ -1,0 +1,17 @@
+[package]
+name = "gpu-probe-hip"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone scratch probe (design slice S0, AMD). Not a member of the root workspace.
+[workspace]
+
+[dependencies]
+cerulion_device = { path = "../../crates/cerulion_device" }
+iceoryx2 = "=0.10.0"
+libc = "0.2"
+libloading = "0.8"
+
+[profile.release]
+debug = 1

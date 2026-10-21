@@ -41,6 +41,7 @@ members = [
     "crates/cerulion_pairing",
     "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
     "crates/cerulion_tf",        # pure SE(3) transform math (std + thiserror; no cerulion_core dep)
+    "crates/cerulion_device",    # GPU residence backends (dlopen CUDA/HIP/Metal); snapshot for the HIP S0 probe
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
