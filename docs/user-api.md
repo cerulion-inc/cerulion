@@ -1991,6 +1991,14 @@ value with `Default`.
 As in ROS 2, the first `#` on a line starts a comment, inside quotes too, so a
 constant or default cannot hold a `#`: `string s a#b` has the default `a`.
 
+### Service files
+
+A `.srv` file is a request body and a response body split by one `---` line. Each
+part parses as its own message in the package of the service, named as ROS 2 names
+it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
+`std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and
