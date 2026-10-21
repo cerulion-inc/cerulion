@@ -59,6 +59,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "android")]
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+
 use crate::catalog_events::{AnnounceWatchPlane, CatalogEventHub, NoopAnnounceWatchPlane};
 use crate::egress::{EgressPlane, NoopEgressPlane};
 use crate::hygiene::{acquire_socket, SocketGuard};
@@ -1134,8 +1137,9 @@ pub fn start_with_planes_and_events(
     })
 }
 
-/// The idle-watch loop: on a grace-elapsed idle state, commit `self_exit`, UNLINK
-/// the control socket, and exit.
+/// The idle-watch loop: on a grace-elapsed idle state, commit `self_exit`, unlink
+/// the Linux pathname socket or refuse new Android abstract-name connections,
+/// and exit.
 fn idle_watch(
     registry: Arc<Mutex<DemandRegistry>>,
     shutdown: Arc<AtomicBool>,
@@ -1149,23 +1153,24 @@ fn idle_watch(
         if shutdown.load(Ordering::Acquire) {
             return;
         }
-        // Decide, commit self_exit, AND unlink the socket ALL UNDER the
+        // Decide, commit self_exit, AND close the socket to new clients ALL UNDER the
         // registry lock, so the whole commit is atomic with a racing connection's
         // `connect` ([`Ctx::connect_unless_exiting`]). A connection that grabbed the
         // lock first made the registry busy → `should_self_exit` returns false here
         // and we do NOT commit (the connection is served, exit cancelled). If we grab
-        // the lock first and commit, we drop the guard (unlink the socket + pidfile,
-        // release the flock) so a racing client finds NO socket → `is_not_running` →
-        // respawns a fresh daemon, and any already-queued backlog connection is
-        // refused by `connect_unless_exiting` (self_exit is set). Never hold the loud
-        // `info!` under the lock. main.rs's shutdown then just stops the threads.
+        // the lock first and commit, we drop the guard (unlink the Linux pathname
+        // socket, refuse new Android abstract-name connections, remove the pidfile,
+        // then release the flock) so a racing client finds NO usable socket →
+        // `is_not_running` → respawns a fresh daemon, and any already-queued
+        // backlog connection is refused by `connect_unless_exiting` (self_exit is
+        // set). Never hold the loud `info!` under the lock. main.rs's shutdown then
+        // just stops the threads.
         let committed = {
             let reg = lock_registry(&registry);
             if reg.should_self_exit(Instant::now(), idle_grace) {
                 self_exit.store(true, Ordering::Release);
-                // Drop the guard AT the commit (unlink now, not ~200ms later when
-                // main notices self_exit) — closes the commit→unlink race window a
-                // client retry could not otherwise bridge.
+                // Drop the guard AT the commit (close to new clients now, not ~200ms
+                // later when main notices self_exit) to close the race window.
                 lock_guard(&guard).take();
                 true
             } else {
@@ -1175,8 +1180,8 @@ fn idle_watch(
         if committed {
             tracing::info!(
                 idle_grace_secs = idle_grace.as_secs(),
-                "cerulion-netd: idle (no consumers) for the grace period — self-exiting \
-                 (control socket unlinked)"
+                "cerulion-netd: idle (no consumers) for the grace period; self-exiting \
+                 (control socket unavailable)"
             );
             return;
         }
@@ -1231,10 +1236,72 @@ fn accept_loop(
 ) {
     let mut accept_latch = FloodLatch::default();
     let mut spawn_latch = FloodLatch::default();
+    #[cfg(target_os = "android")]
+    let mut peer_latch = FailureRegimeLatch::new();
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 accept_latch.on_success(); // a successful accept ends an accept-error regime.
+                #[cfg(target_os = "android")]
+                match cerulion_hygiene::peer_is_same_user(&stream) {
+                    Ok(true) => {
+                        if let Some(suppressed) = peer_latch.on_success() {
+                            tracing::info!(
+                                suppressed_count = suppressed,
+                                "netd: control peer credential checks recovered"
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        match peer_latch.on_failure() {
+                            RegimeDecision::Loud => {
+                                tracing::warn!(
+                                    "netd: dropped a control peer with a different user ID"
+                                );
+                            }
+                            RegimeDecision::Suppressed { suppressed } => {
+                                tracing::debug!(
+                                    suppressed_count = suppressed,
+                                    "netd: still dropping control peers with a different user ID"
+                                );
+                            }
+                            RegimeDecision::StillFailing { total, suppressed } => {
+                                tracing::warn!(
+                                    total_failures = total,
+                                    suppressed_count = suppressed,
+                                    "netd: still dropping control peers with a different user ID"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        match peer_latch.on_failure() {
+                            RegimeDecision::Loud => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "netd: could not verify control peer credentials; dropping connection"
+                                );
+                            }
+                            RegimeDecision::Suppressed { suppressed } => {
+                                tracing::debug!(
+                                    error = %error,
+                                    suppressed_count = suppressed,
+                                    "netd: still unable to verify control peer credentials; dropping connection"
+                                );
+                            }
+                            RegimeDecision::StillFailing { total, suppressed } => {
+                                tracing::warn!(
+                                    error = %error,
+                                    total_failures = total,
+                                    suppressed_count = suppressed,
+                                    "netd: still unable to verify control peer credentials; dropping connection"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let ctx = ctx.clone();
                 let sd = Arc::clone(&shutdown);
                 match std::thread::Builder::new()
