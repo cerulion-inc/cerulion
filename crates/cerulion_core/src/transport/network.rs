@@ -3324,7 +3324,11 @@ pub struct NetworkManager {
     /// posture check. Always present and unset in production; the test-gated
     /// setter lets a test switch posture at that exact point.
     after_announce_posture_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    before_announce_gate_write: Mutex<Option<TestHook>>,
+    /// TEST SEAM: callback fired inside [`Self::set_lan_access`] when its
+    /// write lock on the announce gate is contended (another caller holds a
+    /// read guard), just before it blocks. Always present and unset in
+    /// production.
+    on_announce_gate_contended: Mutex<Option<TestHook>>,
     /// TEST SEAM: callback after [`Self::announce_egress_topic`] retains its
     /// token, still inside the announce gate's read guard. Always present and
     /// unset in production.
@@ -3416,7 +3420,7 @@ impl NetworkManager {
             retain_ingress_subscriber: AtomicBool::new(false),
             announce_gate: Arc::new(std::sync::RwLock::new(())),
             after_announce_posture_check: Mutex::new(None),
-            before_announce_gate_write: Mutex::new(None),
+            on_announce_gate_contended: Mutex::new(None),
             after_announce_insert: Mutex::new(None),
             after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
@@ -3482,27 +3486,31 @@ impl NetworkManager {
 
     fn apply_lan_access(&self, access: LanAccess) {
         let (bridges, released) = {
-            // Test seam: the announce/demand race tests place the closer
-            // HERE - proven to be at the write lock's threshold, so the
-            // 100 ms blocked check measures the gate, not a spawn delay.
-            if let Some(hook) = self
-                .before_announce_gate_write
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-            {
-                hook();
-            }
             // The WRITE guard wraps the flag store and the `announced`
             // clear: every in-flight announce holds a READ guard from its
             // posture check through its insert, so this waits out each one
             // before revoking; no token an announce declared can outlive
             // the close. Taken before `demand_authorizer_parts` to match
-            // the announce path's lock order.
-            let _announce_write = self
-                .announce_gate
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // the announce path's lock order. A contended gate fires the
+            // test hook before blocking, so a race test learns the close
+            // really is waiting on the gate.
+            let _announce_write = match self.announce_gate.try_write() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let hook = self
+                        .on_announce_gate_contended
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    self.announce_gate
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+            };
             let mut parts = self
                 .demand_authorizer_parts
                 .lock()
@@ -5485,21 +5493,17 @@ impl NetworkManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
-    /// TEST SEAM: hook fired inside the demand queryable callback right after
-    /// the live authorizer is read (under the announce gate's read guard).
-    /// A test uses it to overlap a [`Self::set_lan_access`] close with an
-    /// in-flight query reply.
+    /// TEST SEAM: install a callback fired inside [`Self::set_lan_access`]
+    /// when its announce-gate write lock is contended, just before it blocks:
+    /// a race test waits on it to know the close is parked on the gate.
     #[cfg(any(test, feature = "test-helpers"))]
-    /// Install the `before_announce_gate_write` hook fired inside
-    /// `set_lan_access` immediately before the announce gate's write lock is
-    /// taken. Test-only.
     #[doc(hidden)]
-    pub fn set_before_announce_gate_write_for_test(
+    pub fn set_on_announce_gate_contended_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
     ) {
         *self
-            .before_announce_gate_write
+            .on_announce_gate_contended
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
