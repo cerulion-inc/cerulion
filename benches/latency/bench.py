@@ -30,7 +30,8 @@ Pacing variants (METHODOLOGY §1 + § "The rate axis"):
 Subcommands
 -----------
     native       Build + run native host binaries (no docker)
-    workspace    Run the real `cerulion graph run` workspace legs (split/mono)
+    workspace    Run the real `cerulion graph run` workspace legs
+                 (split/split3/mono; --execution-mode free_run|lockstep|both)
     ros2         Build + run dockerized ROS 2 comparison cells
     compile-csv  Convert raw .bin samples to per-cell results_<prefix>.csv
     plots        Regenerate plot PNGs from CSVs (delegates to plot.py)
@@ -56,7 +57,15 @@ one place):
             measured ~25.9 µs p50 in the historical retirement investigation
             because of the park-wake bug; this suite keeps the declared split
             as its headline until that inventory is deliberately revised)
+        cerulion_workspace_split3_chrt{0,1}  graph run rtt_bench_split3 (declared
+            3-group process_groups, one node per group: both edges cross
+            processes, the ROS 2 3-process shape hop for hop)
         cerulion_workspace_mono_chrt{0,1}   graph run rtt_bench --single-process
+        Execution-mode axis (opt-in, `workspace --execution-mode`; not in
+        `full`): the default free_run rows above carry no token;
+        cerulion_workspace_{split,split3}_lockstep[_pod]_chrt{0,1} are the
+        same legs under CERULION_EXECUTION_MODE=lockstep. mono has no
+        lockstep row (no ranks).
 
     ROS 2 cells: {distro}_{rmw}_{shmmode}_{recv}_{qos}_chrt{N}
         distro ∈ {humble, jazzy, lyrical}
@@ -128,6 +137,10 @@ and ros2/run_bench.sh):
                                                   get no --device) — see
                                                   dma_lock_enabled()
     CER_BENCH_WALL_STAMP=1                        workspace legs (wall stamps)
+    CER_BENCH_EXECUTION_MODE ∈ {free_run,         workspace legs, set from
+                                lockstep}         --execution-mode (the
+                                                  runner unsets / exports
+                                                  CERULION_EXECUTION_MODE)
     CER_BENCH_USAGE ∈ {0 (default), 1}            per-cell CPU+memory usage
                                                   sidecars (<cell>_<size>
                                                   .usage.csv via
@@ -933,13 +946,28 @@ NATIVE_BENCHES: Tuple[NativeBench, ...] = (
 # reads ~25.9 µs p50 where split measures 4.92 µs — the representative
 # multi-process number. The flagless default returns as the headline
 # when the park-wake fix lands; until then run_workspace.sh REFUSES a requested
-# `default` leg loudly. mono = --single-process, nothing else.
-WORKSPACE_LEGS = ("split", "mono")
+# `default` leg loudly. split3 = the same chain declared as THREE groups, one
+# node each (`graph run rtt_bench_split3`, zero flags), so both edges cross
+# processes. mono = --single-process, nothing else.
+WORKSPACE_LEGS = ("split", "split3", "mono")
+
+# The legs that run process groups, i.e. the ones an execution mode applies
+# to. mono runs --single-process: one rank, the degenerate lockstep timeline
+# whatever is asked.
+WORKSPACE_MULTI_PROCESS_LEGS = ("split", "split3")
+
+# EXECUTION-MODE axis (run_workspace.sh's CER_BENCH_EXECUTION_MODE):
+# "free_run" is the shipped multi-process default and the INCUMBENT row (its
+# names carry no token, byte-identical to the pre-axis prefixes);
+# "lockstep" is the CERULION_EXECUTION_MODE=lockstep opt-out, minted with a
+# `_lockstep` token between the leg and the optional `_pod` class token, so
+# plot.py's `_pod` SUFFIX rule on the leg group still reads the class.
+WORKSPACE_EXEC_MODES = ("free_run", "lockstep")
 
 # TYPE-CLASS axis (METHODOLOGY § "The type-class axis"): "variable" is
 # the INCUMBENT class — the shipped workspace legs already ride
 # sensor_msgs/Image with the unbounded `data` field loaned per tick, so
-# their pinned prefixes (cerulion_workspace_{split,mono}_chrt{N}) carry
+# their pinned prefixes (cerulion_workspace_{split,split3,mono}_chrt{N}) carry
 # NO class token and stay byte-identical (renaming a pinned prefix
 # silently drops the line from plots and orphans per-host smoke
 # baselines). "pod" is the NEW fixed-PodPayload twin — its rows carry a
@@ -947,33 +975,73 @@ WORKSPACE_LEGS = ("split", "mono")
 # headline class).
 WORKSPACE_MSG_CLASSES = ("variable", "pod")
 
-def workspace_raw_name(leg: str, chrt: int, msg: str = "variable") -> str:
+def _workspace_name_unchecked(leg: str, chrt: int, msg: str,
+                              mode: str) -> str:
+    """The raw-prefix GRAMMAR, unvalidated:
+    cerulion_workspace_<leg>[_lockstep][_pod]_chrt<N>. Only
+    workspace_raw_name (which validates) and the skip-inventory scope of a
+    combination the mint refuses may call it."""
+    mode_tok = "_lockstep" if mode == "lockstep" else ""
+    msg_tok = "_pod" if msg == "pod" else ""
+    return f"cerulion_workspace_{leg}{mode_tok}{msg_tok}_chrt{chrt}"
+
+def workspace_raw_name(leg: str, chrt: int, msg: str = "variable",
+                       mode: str = "free_run") -> str:
     # An unknown class must NOT fall through to the incumbent pinned
     # prefix: that silently maps it onto the VARIABLE class's name, which
     # is what every downstream consumer classifies on. (Ros2Cell.name has
-    # the opposite failure mode for the same mistake — it appends the
-    # unknown value as a token — so neither is left to inference.)
+    # the opposite failure mode for the same mistake: it appends the
+    # unknown value as a token, so neither is left to inference.)
     if msg not in WORKSPACE_MSG_CLASSES:
         raise ValueError(
             f"workspace_raw_name: msg={msg!r} is not one of "
             f"{WORKSPACE_MSG_CLASSES}")
-    if msg == "pod":
-        return f"cerulion_workspace_{leg}_pod_chrt{chrt}"
-    return f"cerulion_workspace_{leg}_chrt{chrt}"
+    # Same rule for the execution mode: an unknown one must not mint the
+    # free-run (token-less) name.
+    if mode not in WORKSPACE_EXEC_MODES:
+        raise ValueError(
+            f"workspace_raw_name: mode={mode!r} is not one of "
+            f"{WORKSPACE_EXEC_MODES}")
+    # mono has no ranks: a lockstep mono row would be the free-run mono row
+    # under a second name (run_workspace.sh refuses it, exit 2).
+    if mode == "lockstep" and leg not in WORKSPACE_MULTI_PROCESS_LEGS:
+        raise ValueError(
+            f"workspace_raw_name: leg={leg!r} runs no process groups, so it "
+            f"has no lockstep row (lockstep legs: "
+            f"{WORKSPACE_MULTI_PROCESS_LEGS})")
+    return _workspace_name_unchecked(leg, chrt, msg, mode)
 
-def workspace_leg_skip_reason(leg: str, variant: str = "quiescent") -> Optional[str]:
+def workspace_cell_scope(leg: str, chrt: int, msg: str, mode: str) -> str:
+    """The name a skip line and the manifest's skip inventory carry: the
+    minted raw name, or, for a combination the mint refuses (mono x
+    lockstep), the name the grammar WOULD give it. Never a .bin prefix."""
+    try:
+        return workspace_raw_name(leg, chrt, msg, mode)
+    except ValueError:
+        return _workspace_name_unchecked(leg, chrt, msg, mode)
+
+def workspace_leg_skip_reason(leg: str, variant: str = "quiescent",
+                              mode: str = "free_run") -> Optional[str]:
     """Structural gate for a workspace leg (None = runnable).
 
-    split x backtoback: --time-source virtual on a process_groups graph
-    dispatches to the supervisor with the time-source IGNORED (real-clock
-    mp has no uncapped mode; the period floor is 1 ms), so a "backtoback"
-    split row would really be a 1 kHz-capped line masquerading as
-    saturation (run_workspace.sh exits 77 on it; we skip it up front)."""
-    if leg == "split" and variant == "backtoback":
-        return ("split x backtoback is structurally unmeasurable — the "
+    split / split3 x backtoback: --time-source virtual on a process_groups
+    graph dispatches to the supervisor with the time-source IGNORED
+    (real-clock mp has no uncapped mode; the period floor is 1 ms), so a
+    "backtoback" row would really be a 1 kHz-capped line masquerading as
+    saturation (run_workspace.sh exits 77 on it; we skip it up front).
+
+    mono x lockstep: a --single-process run has no ranks to lock together
+    (run_workspace.sh refuses it, exit 2; workspace_raw_name refuses to
+    mint it)."""
+    if leg in WORKSPACE_MULTI_PROCESS_LEGS and variant == "backtoback":
+        return (f"{leg} x backtoback is structurally unmeasurable: the "
                 "supervisor ignores --time-source (no uncapped mp mode; "
                 "a 1 kHz-capped line would masquerade as saturation); "
                 "use the mono leg")
+    if mode == "lockstep" and leg not in WORKSPACE_MULTI_PROCESS_LEGS:
+        return (f"{leg} x lockstep has no row: a --single-process run has "
+                "no ranks to lock together, so it would be the free_run "
+                f"{leg} row under a second name")
     return None
 
 # ============================================================================
@@ -3214,14 +3282,21 @@ class RunManifest:
         return data
 
     def record_cell(self, cell: str, payload: Optional[int], outcome: str,
-                    started_at: str) -> None:
-        self.entry["cells"].append({
+                    started_at: str,
+                    execution_mode: Optional[str] = None) -> None:
+        record = {
             "cell": cell,
             "payload": payload,   # None = the process sweeps all sizes itself
             "outcome": outcome,   # ok | fail | skip
             "started_at": started_at,
             "ended_at": _now_iso(),
-        })
+        }
+        # Workspace cells only: the execution mode the runner was handed
+        # (CER_BENCH_EXECUTION_MODE). The cell name carries it too, as the
+        # `_lockstep` token; this field records it without a parse.
+        if execution_mode is not None:
+            record["execution_mode"] = execution_mode
+        self.entry["cells"].append(record)
 
     def record_skip(self, scope: str, reason: str) -> None:
         self.entry["skips"].append({"scope": scope, "reason": reason})
@@ -3695,15 +3770,20 @@ def cmd_native(args: argparse.Namespace) -> int:
 
 def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
                       log_dir: Path, sizes: Sequence[int],
-                      msg: str = "variable") -> str:
-    """Drive workspace/run_workspace.sh for one (leg, chrt, msg class).
+                      msg: str = "variable", mode: str = "free_run") -> str:
+    """Drive workspace/run_workspace.sh for one (leg, chrt, msg class,
+    execution mode).
     Returns "ok", "skip" (runner exited rc=77 = self-declared structural
     skip, e.g. split x backtoback), or "fail".
 
     Interface contract with the runner:
-      - invoked as `bash run_workspace.sh <leg>` with leg ∈ {split, mono}
-        (a requested `default` leg is REFUSED loudly by the runner —
-        because of the park-wake bug);
+      - invoked as `bash run_workspace.sh <leg>` with leg in
+        {split, split3, mono} (a requested `default` leg is REFUSED loudly
+        by the runner, because of the park-wake bug);
+      - CER_BENCH_EXECUTION_MODE = `mode` (free_run: the runner UNSETS
+        CERULION_EXECUTION_MODE for the graph; lockstep: it exports
+        CERULION_EXECUTION_MODE=lockstep), and the raw prefix carries the
+        matching `_lockstep` token or none (workspace_raw_name);
       - reads CER_BENCH_RAW_DUMP_DIR / CER_BENCH_RAW_NAME (set here),
         CER_BENCH_PACING, CER_BENCH_CHRT ∈ {0,1} (runner applies the chrt
         wrap around the cerulion CLI itself — sudo would strip the env
@@ -3717,7 +3797,7 @@ def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
         schedule_for copy (the four-place schedule lockstep: native/src/
         lib.rs::quiescent_schedule, ros2/run_bench.sh, bench.py::
         quiescent_schedule, workspace/run_workspace.sh::schedule_for);
-      - deliberately does NOT set CERULION_NETWORK (both legs run the product's
+      - deliberately does NOT set CERULION_NETWORK (every leg runs the product's
         default permissive posture
         — the network gateway spawns, parks at zero demand, and sits
         outside the measured SHM chain), rebuilds binary + cdylibs, runs
@@ -3731,7 +3811,7 @@ def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
     if not runner.exists():
         print(f"  ! FAIL workspace leg {leg}: runner missing at {_short(runner)}")
         return "fail"
-    raw_name = workspace_raw_name(leg, chrt, msg)
+    raw_name = workspace_raw_name(leg, chrt, msg, mode)
 
     # BEFORE cleanup_iceoryx(), which unlinks every iceoryx/zenoh segment in
     # /dev/shm -- state SHARED with any other tenant on this box, and not
@@ -3763,6 +3843,9 @@ def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
     # the runner rebuilds the pod crates per size with the baked array
     # length). See METHODOLOGY § "The type-class axis".
     env["CER_BENCH_MSG"] = msg
+    # EXECUTION-MODE axis: set on every leg, never inherited, so the runner's
+    # mode always agrees with the raw prefix minted above.
+    env["CER_BENCH_EXECUTION_MODE"] = mode
     env[PACING_ENV] = variant
     env["CER_BENCH_CHRT"] = str(chrt)
     env["CER_BENCH_WALL_STAMP"] = "1"
@@ -3848,8 +3931,8 @@ def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
 
     log_path = log_dir / f"{raw_name}.log"
     log_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  → workspace leg={leg} msg={msg} chrt={chrt}  "
-          f"(log: {_short(log_path)})")
+    print(f"  → workspace leg={leg} msg={msg} execution_mode={mode} "
+          f"chrt={chrt}  (log: {_short(log_path)})")
     start = time.monotonic()
     with log_path.open("wb") as logf:
         try:
@@ -3908,6 +3991,29 @@ def run_workspace_leg(leg: str, chrt: int, variant: str, raw_dir: Path,
               f"{want} measured samples", file=sys.stderr)
     return "ok" if ok else "fail"
 
+def refuse_contradictory_execution_mode(modes: Sequence[str]) -> None:
+    """Refuse an exported CERULION_EXECUTION_MODE that names a mode other
+    than one this invocation will run.
+
+    run_workspace.sh sets or unsets the variable for the graph itself, so an
+    ambient value never REACHES a measurement; but the runner also refuses
+    the contradiction per leg (exit 2), and finding that out one failed leg
+    at a time, after a run directory and a manifest exist, is the ordering
+    the other preflights here avoid. An empty value reads as the default
+    (free_run), as the CLI reads it."""
+    raw = os.environ.get("CERULION_EXECUTION_MODE")
+    if raw is None:
+        return
+    exported = raw if raw else "free_run"
+    wrong = [m for m in modes if m != exported]
+    if wrong:
+        raise SystemExit(
+            f"CERULION_EXECUTION_MODE={raw!r} is exported, but this "
+            f"invocation runs execution mode(s) {', '.join(wrong)}: a "
+            f"contradictory declaration, refused before any leg runs. Unset "
+            f"it (`unset CERULION_EXECUTION_MODE`) and choose the mode with "
+            f"--execution-mode.")
+
 def cmd_workspace(args: argparse.Namespace) -> int:
     check_ambient_pacing(args.variant)
     set_dma_basis("host")
@@ -3928,6 +4034,10 @@ def cmd_workspace(args: argparse.Namespace) -> int:
               "by run_workspace.sh. Refusing before creating a run "
               "directory or a manifest.", file=sys.stderr)
         return 3
+    # Same placement rule: before a run directory or a manifest exists.
+    refuse_contradictory_execution_mode(
+        WORKSPACE_EXEC_MODES if args.execution_mode == "both"
+        else (args.execution_mode,))
 
     run_dir = resolve_run_dir(args)
     raw_dir = raw_dir_of(rep_dir_of(run_dir, args.rep))
@@ -3949,6 +4059,8 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     legs = WORKSPACE_LEGS if args.leg == "both" else (args.leg,)
     msg_classes = (WORKSPACE_MSG_CLASSES if args.msg_class == "both"
                    else (args.msg_class,))
+    exec_modes = (WORKSPACE_EXEC_MODES if args.execution_mode == "both"
+                  else (args.execution_mode,))
     chrt_modes: List[int] = []
     if args.chrt in ("0", "both"):
         chrt_modes.append(0)
@@ -3979,17 +4091,20 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                   f"###############")
             for leg in legs:
               for msg in msg_classes:
-                name = workspace_raw_name(leg, chrt, msg)
-                reason = workspace_leg_skip_reason(leg, args.variant)
+               for mode in exec_modes:
+                reason = workspace_leg_skip_reason(leg, args.variant, mode)
                 if reason is not None:
-                    print(f"  ! skip {name} ({reason})")
-                    manifest.record_skip(name, reason)
+                    scope = workspace_cell_scope(leg, chrt, msg, mode)
+                    print(f"  ! skip {scope} ({reason})")
+                    manifest.record_skip(scope, reason)
                     n_skip += 1
                     continue
+                name = workspace_raw_name(leg, chrt, msg, mode)
                 started = _now_iso()
                 outcome = run_workspace_leg(leg, chrt, args.variant, raw_dir,
-                                            log_dir, sizes, msg)
-                manifest.record_cell(name, None, outcome, started)
+                                            log_dir, sizes, msg, mode)
+                manifest.record_cell(name, None, outcome, started,
+                                     execution_mode=mode)
                 if outcome == "ok":
                     n_ok += 1
                 elif outcome == "skip":
@@ -4714,6 +4829,7 @@ def cmd_plots(args: argparse.Namespace) -> int:
         cmd.extend(["--group", g])
     if args.skip_missing:
         cmd.append("--skip-missing")
+    cmd.extend(["--execution-mode", args.execution_mode])
     return subprocess.run(cmd).returncode
 
 # ============================================================================
@@ -4750,6 +4866,22 @@ def cmd_list_cells(args: argparse.Namespace) -> int:
                     continue
                 print(f"  {name}")
                 total += 1
+
+    # The execution-mode axis is OPT-IN (`workspace --execution-mode
+    # lockstep|both`; `full` runs free_run only), so its rows are listed but
+    # not counted in the total, which is the `full` matrix.
+    print("\nworkspace lockstep rows (opt-in: `workspace --execution-mode "
+          "lockstep|both`; not part of `full`, not counted below):")
+    for chrt in chrt_modes:
+        for leg in WORKSPACE_LEGS:
+            for msg in WORKSPACE_MSG_CLASSES:
+                reason = workspace_leg_skip_reason(leg, args.variant,
+                                                   "lockstep")
+                if reason is not None:
+                    scope = workspace_cell_scope(leg, chrt, msg, "lockstep")
+                    print(f"  ! skip {scope} ({reason})")
+                    continue
+                print(f"  {workspace_raw_name(leg, chrt, msg, 'lockstep')}")
 
     for distro in distros:
         for chrt in chrt_modes:
@@ -4809,6 +4941,8 @@ def cmd_full(args: argparse.Namespace) -> int:
     # and invisible. Calling the parsers directly makes it neither.
     dma_lock_enabled()
     ambient_payload_restriction()
+    # `full` runs the free_run workspace rows only.
+    refuse_contradictory_execution_mode(("free_run",))
     run_dir = resolve_run_dir(args)
     print(f"=== full bench variant={args.variant} reps={args.reps} on "
           f"{PLATFORM_LABEL} → {_short(run_dir)} ===")
@@ -4823,7 +4957,7 @@ def cmd_full(args: argparse.Namespace) -> int:
             run_dir=str(run_dir), rep=rep))
         rc2 = cmd_workspace(argparse.Namespace(
             variant=args.variant, chrt=args.chrt, leg="both",
-            msg_class="both", sizes=None,
+            msg_class="both", execution_mode="free_run", sizes=None,
             run_dir=str(run_dir), rep=rep))
         rc3 = cmd_ros2(argparse.Namespace(
             variant=args.variant, distro=args.distro, chrt=args.chrt,
@@ -4846,7 +4980,7 @@ def cmd_full(args: argparse.Namespace) -> int:
     # accounted for loudly. The standalone `plots` subcommand stays strict.
     rc5 = cmd_plots(argparse.Namespace(
         variant=args.variant, run_dir=str(run_dir), group=["all"],
-        chrt=args.chrt, skip_missing=True))
+        chrt=args.chrt, skip_missing=True, execution_mode="free_run"))
 
     print(f"\n=== full bench summary: sweeps({args.reps} rep(s))="
           f"{max(sweep_rcs)} csv={rc4} plots={rc5} ===")
@@ -5407,6 +5541,9 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     # above the no-baseline classification that would otherwise swallow it
     # as a 4 (`run_benchmarks.sh` deliberately continues past a 4).
     refuse_foreign_cerulion_override("smoke")
+    # Same class: an exported CERULION_EXECUTION_MODE contradicting the
+    # free_run cells smoke runs is a malformed ask (exit 1 on every path).
+    refuse_contradictory_execution_mode(("free_run",))
     variant = args.variant
 
     # IDENTITY ONLY, ahead of every data-producing preflight. Everything
@@ -5807,9 +5944,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_ws)
     p_ws.add_argument("--rep", type=int, default=1, help=REP_HELP)
     p_ws.add_argument("--leg", choices=WORKSPACE_LEGS + ("both",), default="both",
-                      help="Workspace leg: split (graph run rtt_bench_split — "
+                      help="Workspace leg: split (graph run rtt_bench_split, "
                            "the declared 2-group process_groups multi-process "
-                           "headline row), mono (--single-process), or both")
+                           "headline row), split3 (graph run "
+                           "rtt_bench_split3, one node per group), mono "
+                           "(--single-process), or both (= every leg)")
     p_ws.add_argument("--msg-class", dest="msg_class",
                       choices=WORKSPACE_MSG_CLASSES + ("both",),
                       default="both",
@@ -5818,6 +5957,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "legs — unbounded data, loaned per tick; pinned "
                            "token-less prefixes), pod (the fixed-PodPayload "
                            "twin chain — `_pod` prefixes), or both (default)")
+    p_ws.add_argument("--execution-mode", dest="execution_mode",
+                      choices=WORKSPACE_EXEC_MODES + ("both",),
+                      default="free_run",
+                      help="Execution-mode axis of the multi-process legs: "
+                           "free_run (default: the shipped default, "
+                           "CERULION_EXECUTION_MODE unset for the graph; "
+                           "token-less prefixes), lockstep "
+                           "(CERULION_EXECUTION_MODE=lockstep; `_lockstep` "
+                           "prefixes; mono has no lockstep row and is "
+                           "skipped), or both")
     p_ws.set_defaults(func=cmd_workspace, sizes=None)
 
     p_ros2 = sub.add_parser("ros2", help="Build + run dockerized ROS 2 cells")
@@ -5877,6 +6026,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_plots.add_argument("--skip-missing", action="store_true",
                          help="Warn (loudly) instead of failing when an "
                               "expected CSV is missing")
+    p_plots.add_argument("--execution-mode", dest="execution_mode",
+                         choices=WORKSPACE_EXEC_MODES + ("both",),
+                         default="free_run",
+                         help="Which execution modes' workspace rows the "
+                              "plots expect (default: free_run, the rows "
+                              "`full` produces); pass the value the "
+                              "`workspace --execution-mode` sweep ran with")
     p_plots.set_defaults(func=cmd_plots)
 
     p_smoke = sub.add_parser(
