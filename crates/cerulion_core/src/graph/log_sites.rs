@@ -45,9 +45,14 @@
 //! # State
 //!
 //! Each call site has a stable id, fixed when the node is compiled: a hash of
-//! its module path, file, line, column, macro name and arguments. The same
-//! source gives the same id in every run and every build, so a checkpoint
-//! names each site by id. Two log calls that one invocation of a user's own
+//! its module path, line, column, macro name and arguments. The same source
+//! gives the same id in every run and every build, so a checkpoint names each
+//! site by id. The file path is not part of the id: a build that remaps its
+//! source paths (`--remap-path-prefix`, a different checkout directory) gives
+//! the same ids, so a checkpoint from one build restores into the other.
+//! A module is one file, so the module path already tells two files apart;
+//! the one exception is two files that `include!` puts in one module, whose
+//! sites share an id only when they also share line, column and arguments. Two log calls that one invocation of a user's own
 //! macro produces with the same arguments get the same id, so they count as
 //! one site.
 //!
@@ -103,18 +108,19 @@ const fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The stable id of the call site at `file:line:column` in `module`, where
-/// `call` is the macro name and its arguments as written. A pure function of
-/// the source, computed at compile time. Never [`EMPTY`].
+/// The stable id of the call site at `line:column` in `module`, where `call`
+/// is the macro name and its arguments as written. A pure function of the
+/// source, computed at compile time. Never [`EMPTY`].
 ///
-/// A `0xff` byte separates the text parts: it never occurs in UTF-8, so no
-/// two different sites hash the same bytes.
+/// The file path is left out on purpose: it changes with the build directory
+/// and `--remap-path-prefix`, and an id must not.
+///
+/// A `0xff` byte ends the module path: it never occurs in UTF-8, so no byte
+/// moves between the module and the parts after it.
 #[doc(hidden)]
-pub const fn site_id(module: &str, file: &str, line: u32, column: u32, call: &str) -> u64 {
+pub const fn site_id(module: &str, line: u32, column: u32, call: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     hash = fnv1a(hash, module.as_bytes());
-    hash = fnv1a(hash, &[0xff]);
-    hash = fnv1a(hash, file.as_bytes());
     hash = fnv1a(hash, &[0xff]);
     hash = fnv1a(hash, &line.to_le_bytes());
     hash = fnv1a(hash, &column.to_le_bytes());
@@ -340,7 +346,7 @@ impl LogSite {
         call: &'static str,
     ) -> Self {
         Self {
-            id: site_id(module, file, line, column, call),
+            id: site_id(module, line, column, call),
             file,
             line,
             module,
@@ -720,23 +726,35 @@ mod tests {
     #[test]
     fn a_site_id_is_a_pure_function_of_the_source_and_each_part_counts() {
         use super::site_id;
-        let base = site_id("m", "f.rs", 10, 5, "warn_once(\"x\")");
-        assert_eq!(base, site_id("m", "f.rs", 10, 5, "warn_once(\"x\")"));
+        let base = site_id("m", 10, 5, "warn_once(\"x\")");
+        assert_eq!(base, site_id("m", 10, 5, "warn_once(\"x\")"));
         for other in [
-            site_id("m2", "f.rs", 10, 5, "warn_once(\"x\")"),
-            site_id("m", "g.rs", 10, 5, "warn_once(\"x\")"),
-            site_id("m", "f.rs", 11, 5, "warn_once(\"x\")"),
-            site_id("m", "f.rs", 10, 6, "warn_once(\"x\")"),
-            site_id("m", "f.rs", 10, 5, "warn_once(\"y\")"),
-            // The separator keeps a byte from moving between two parts.
-            site_id("mf", ".rs", 10, 5, "warn_once(\"x\")"),
+            site_id("m2", 10, 5, "warn_once(\"x\")"),
+            site_id("m", 11, 5, "warn_once(\"x\")"),
+            site_id("m", 10, 6, "warn_once(\"x\")"),
+            site_id("m", 10, 5, "warn_once(\"y\")"),
         ] {
             assert_ne!(base, other);
         }
         // Computed at compile time, as the macros use it.
-        const AT_COMPILE_TIME: u64 = super::site_id("m", "f.rs", 10, 5, "warn_once(\"x\")");
+        const AT_COMPILE_TIME: u64 = super::site_id("m", 10, 5, "warn_once(\"x\")");
         assert_eq!(AT_COMPILE_TIME, base);
         assert_ne!(base, super::EMPTY);
+    }
+
+    /// A build that remaps its source paths sees a different `file!()` for
+    /// the same site. The id does not change, so a checkpoint from one build
+    /// names the same sites in the other.
+    #[test]
+    fn a_site_keeps_its_id_when_the_build_remaps_its_file_path() {
+        use super::LogSite;
+        let call = "warn_once(\"x\")";
+        let here = LogSite::new("node/src/lib.rs", 10, 5, "node", call);
+        let remapped = LogSite::new("/build/src/lib.rs", 10, 5, "node", call);
+        assert_eq!(here.id(), remapped.id());
+        assert_eq!(here.id(), super::site_id("node", 10, 5, call));
+        let elsewhere = LogSite::new("/build/src/lib.rs", 10, 5, "node::inner", call);
+        assert_ne!(here.id(), elsewhere.id());
     }
 
     /// Sixteen threads make the FIRST call at one site on one table at the

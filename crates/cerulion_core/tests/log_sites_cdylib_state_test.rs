@@ -12,7 +12,9 @@
 //! - before any tick the capture is the field alone: `ticks` 0, 4 bytes;
 //! - after one tick it is `ticks` 1, then tag `CLOG`, count 2, and two
 //!   `(id, word)` pairs in ascending id order: the once word is 1, the
-//!   throttle word is the graph time of that tick plus one, so it is never 0;
+//!   throttle word is the graph time of that tick plus one. The runtime's
+//!   virtual clock starts at 0 and one `step(10 ms)` advances it once to
+//!   10 ms before the tick runs, so the throttle word is 10_000_001;
 //! - a fresh instance restored from those bytes captures them back byte for
 //!   byte: the section crossed the wall in both directions;
 //! - an instance that ticked, restored from the field-only bytes, captures
@@ -37,28 +39,7 @@ use indexmap::IndexMap;
 use serial_test::serial;
 
 fn fixture() -> std::path::PathBuf {
-    let mut path = match std::env::var("CARGO_TARGET_DIR") {
-        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => {
-            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop();
-            p.pop();
-            p.push("target");
-            p
-        }
-    };
-    path.push("debug");
-    let name = "test_node_macro_log_throttle_cdylib";
-    if cfg!(target_os = "macos") {
-        path.push(format!("lib{name}.dylib"));
-    } else {
-        path.push(format!("lib{name}.so"));
-    }
-    assert!(
-        path.exists(),
-        "test cdylib not found at {path:?}. Run `cargo build -p {name}` first."
-    );
-    path
+    cerulion_core::testing::find_fixture_cdylib("test_node_macro_log_throttle_cdylib")
 }
 
 fn graph(tag: &str) -> GraphConfig {
@@ -134,6 +115,10 @@ fn restore(runtime: &mut GraphRuntime, node: &Arc<Mutex<Box<dyn NodeEntry>>>, pa
     assert_eq!(report.restored, vec!["chatter".to_string()]);
 }
 
+/// The graph time of the first tick: one `step(10 ms)` from a virtual clock
+/// at 0.
+const TICK_NS: u64 = 10_000_000;
+
 #[test]
 #[serial]
 fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_bytes() {
@@ -144,7 +129,7 @@ fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_byt
         "no tick, no log section"
     );
 
-    ticked_rt.step(Duration::from_millis(10));
+    ticked_rt.step(Duration::from_nanos(TICK_NS));
     let after_one_tick = capture(&ticked);
     assert_eq!(
         after_one_tick.len(),
@@ -162,10 +147,10 @@ fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_byt
     assert!(id_a < id_b, "ascending ids");
     let mut words = [word_a, word_b];
     words.sort_unstable();
-    assert_eq!(words[0], 1, "the once word");
-    assert!(
-        words[1] >= 1,
-        "the throttle word is a time plus one: {words:?}"
+    assert_eq!(
+        words,
+        [1, TICK_NS + 1],
+        "the once word, then the throttle word: the tick's graph time plus one"
     );
 
     // A fresh instance takes the section from the bytes, and gives it back.
