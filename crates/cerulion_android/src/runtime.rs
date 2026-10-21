@@ -533,9 +533,9 @@ impl EmbeddedRuntime {
                         announce.push(publish.topic.clone());
                     }
                 }
-                // The replace snapshot must cover EVERY served topic -
-                // including schema-less outputs, which carry no topic_schemas
-                // binding - or the filtered catalog would drop them.
+                // The served set must name EVERY served topic - including
+                // schema-less outputs, which carry no topic_schemas binding -
+                // or the retirement below would drop them.
                 let mut serving_clone = serving.clone();
                 serving_clone.served_topics = announce.clone();
                 let plan = GatewayPlan {
@@ -544,9 +544,9 @@ impl EmbeddedRuntime {
                     ingress: Vec::new(),
                 };
                 // The process-wide query surface may outlive the prior
-                // gateway: install the new snapshot BEFORE construction
+                // gateway: install the new schema serving BEFORE construction
                 // registers topics and exposes the restarted gateway, or the
-                // latched callback keeps filtering through the prior snapshot.
+                // latched callback keeps naming topics from the prior run.
                 // The replaced state is kept in `replaced_serving` and put back
                 // on every startup failure below.
                 replaced_serving = manager

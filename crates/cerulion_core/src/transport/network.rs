@@ -1895,12 +1895,6 @@ pub struct CatalogSource {
     /// bindings (built-in corpus included); a later registration's
     /// serving MERGES in through the gateway's `SchemaServingHandles`.
     pub hash_names: Arc<Mutex<HashMap<u64, String>>>,
-    /// The current run's catalog topic set when a `SchemaServingHandles::replace`
-    /// has installed a snapshot: the bridge registry is add-only for the process
-    /// lifetime, so a restart with a different topic set must not keep listing
-    /// the prior run's routes. `None` = unfiltered (no replace has run).
-    /// Shared with the serving handles so `replace` narrows this serve.
-    pub snapshot_topics: Arc<Mutex<Option<HashSet<String>>>>,
     /// The whole-operation mutex `merge`/`replace` hold (shared with the
     /// serving handles so the two can never interleave).
     pub snapshot_lock: Arc<Mutex<()>>,
@@ -2032,21 +2026,11 @@ fn build_catalog_reply_from_bridge(
         .snapshot_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The bridge registry is the one source of truth for the listed set: a
+    // host restarting its gateway unregisters the prior run's topics
+    // (`TopicBridgeManager::unregister_topics_except`), and a topic registered
+    // later (a runtime registration, a probe serve) lists at once.
     let registered = bridge_mgr.registered_topics().unwrap_or_default();
-    let registered: Vec<(String, _)> = match &*catalog
-        .snapshot_topics
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        // A replaced snapshot narrows the catalog to the current run's set:
-        // the bridge registry is add-only and would otherwise keep serving
-        // a prior run's topics.
-        Some(snapshot) => registered
-            .into_iter()
-            .filter(|(topic, _flag)| snapshot.contains(topic))
-            .collect(),
-        None => registered,
-    };
     let hashes = catalog
         .hashes
         .lock()
@@ -4525,7 +4509,6 @@ impl NetworkManager {
             Arc::clone(&catalog.hash_names),
             Arc::clone(&schema.docs),
             Arc::clone(&catalog.snapshot_lock),
-            Arc::clone(&catalog.snapshot_topics),
             Arc::clone(&catalog.hashes),
         );
         let queryable = session
@@ -5338,7 +5321,6 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
         };
 
@@ -5389,7 +5371,6 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
         };
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
@@ -5401,19 +5382,21 @@ mod tests {
         assert_eq!(entry.schema_name.as_deref(), Some("sensor_msgs/Image"));
     }
 
-    /// After `SchemaServingHandles::replace` installs a snapshot, the catalog
-    /// lists only the current run's topics: the add-only bridge registry
-    /// cannot resurrect a prior run's route. Pure. Hand oracle.
+    /// After a restart the catalog lists exactly the bridge registry: the
+    /// host's `unregister_topics_except` drops the prior run's topic, and a
+    /// topic registered AFTER `replace` (a runtime registration, which never
+    /// passes through the serving) still lists. Pure. Hand oracle.
     #[test]
-    fn a_replaced_snapshot_drops_the_prior_run_catalog_topics() {
-        use std::collections::{HashMap, HashSet};
+    fn a_restarted_catalog_lists_the_registry_including_later_registrations() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
         use std::sync::{Arc, Mutex};
 
         let bridge = TopicBridgeManager::new();
         bridge.register_topic("/run_one/cam").expect("register old");
         bridge.register_topic("/run_two/cam").expect("register new");
 
-        let make_catalog = |snapshot: Option<HashSet<String>>| CatalogSource {
+        let snapshot_lock = Arc::new(Mutex::new(()));
+        let catalog = CatalogSource {
             hashes: Arc::new(Mutex::new(HashMap::new())),
             boot_topics: Arc::new(HashSet::new()),
             topic_schemas: Arc::new(Mutex::new(HashMap::new())),
@@ -5421,144 +5404,33 @@ mod tests {
             producer_probe: None,
             liveness: None,
             liveness_clock: None,
-            snapshot_topics: Arc::new(Mutex::new(snapshot)),
-            snapshot_lock: Arc::new(Mutex::new(())),
+            snapshot_lock: Arc::clone(&snapshot_lock),
         };
-
-        // Before any replace the catalog is unfiltered: both routes list.
-        let reply = build_catalog_reply_from_bridge(&bridge, &make_catalog(None), "go2");
-        assert_eq!(reply.entries.len(), 2);
-
-        // After replace with the run-two set, the old topic is gone.
-        let reply = build_catalog_reply_from_bridge(
-            &bridge,
-            &make_catalog(Some(HashSet::from(["/run_two/cam".to_string()]))),
-            "go2",
+        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_lock,
+            Arc::clone(&catalog.hashes),
         );
+
+        // The restart: the next run serves /run_two/cam only.
+        handles.replace(&crate::transport::gateway::SchemaServing {
+            served_topics: vec!["/run_two/cam".to_string()],
+            ..Default::default()
+        });
+        bridge
+            .unregister_topics_except(&["/run_two/cam".to_string()])
+            .expect("unregister");
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
         assert_eq!(topics, ["/run_two/cam"]);
-    }
 
-    /// A `merge` AFTER a `replace` registers its topics in the snapshot: the
-    /// gateway can backfill schema data for a topic that was not in the
-    /// replaced set, and the catalog must list it alongside the replaced set
-    /// instead of filtering it out. Pure. Hand oracle.
-    #[test]
-    fn a_merge_after_replace_adds_its_topics_to_the_catalog_snapshot() {
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        use std::sync::{Arc, Mutex};
-
-        let bridge = TopicBridgeManager::new();
-        bridge.register_topic("/run_one/cam").expect("register old");
-        bridge.register_topic("/a").expect("register a");
-        bridge.register_topic("/b").expect("register b");
-
-        let snapshot_topics: Arc<Mutex<Option<HashSet<String>>>> = Arc::new(Mutex::new(None));
-        let snapshot_lock = Arc::new(Mutex::new(()));
-        let catalog = CatalogSource {
-            hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
-            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
-            hash_names: Arc::new(Mutex::new(HashMap::new())),
-            producer_probe: None,
-            liveness: None,
-            liveness_clock: None,
-            snapshot_topics: Arc::clone(&snapshot_topics),
-            snapshot_lock: Arc::clone(&snapshot_lock),
-        };
-        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            snapshot_lock,
-            snapshot_topics,
-            Arc::new(Mutex::new(HashMap::new())),
-        );
-
-        let serving = |topic: &str| crate::transport::gateway::SchemaServing {
-            topic_schemas: vec![crate::transport::gateway::TopicSchema {
-                topic: topic.to_string(),
-                schema_name: "std_msgs/String".to_string(),
-            }],
-            schema_docs: vec![],
-            schema_hashes: vec![],
-            served_topics: vec![],
-        };
-
-        // Replace with {/a}: the catalog drops the prior-run topic.
-        handles.replace(&serving("/a"));
-        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: Vec<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(
-            topics,
-            ["/a"],
-            "replace narrows the snapshot to the new run"
-        );
-
-        // A later merge registers /b in the SAME snapshot, not a filtered-out one.
-        handles.merge(&serving("/b"));
+        // A runtime registration after the restart lists alongside it.
+        bridge.register_topic("/host/late").expect("register late");
         let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
         let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(
-            topics,
-            HashSet::from(["/a", "/b"]),
-            "merge after replace must add its topic to the snapshot"
-        );
-    }
-
-    /// A schema-LESS output (no `topic_schemas` binding) stays in the catalog
-    /// after `replace`: the snapshot is built from `served_topics`, not the
-    /// schema bindings, or every untyped route a run serves would be filtered
-    /// out of its own catalog. Pure. Hand oracle.
-    #[test]
-    fn a_schema_less_output_survives_the_replace_snapshot() {
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        use std::sync::{Arc, Mutex};
-
-        let bridge = TopicBridgeManager::new();
-        bridge.register_topic("/typed").expect("register typed");
-        bridge.register_topic("/untyped").expect("register untyped");
-
-        let snapshot_topics: Arc<Mutex<Option<HashSet<String>>>> = Arc::new(Mutex::new(None));
-        let snapshot_lock = Arc::new(Mutex::new(()));
-        let catalog = CatalogSource {
-            hashes: Arc::new(Mutex::new(HashMap::new())),
-            boot_topics: Arc::new(HashSet::new()),
-            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
-            hash_names: Arc::new(Mutex::new(HashMap::new())),
-            producer_probe: None,
-            liveness: None,
-            liveness_clock: None,
-            snapshot_topics: Arc::clone(&snapshot_topics),
-            snapshot_lock: Arc::clone(&snapshot_lock),
-        };
-        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(BTreeMap::new())),
-            snapshot_lock,
-            snapshot_topics,
-            Arc::new(Mutex::new(HashMap::new())),
-        );
-
-        let serving = crate::transport::gateway::SchemaServing {
-            topic_schemas: vec![crate::transport::gateway::TopicSchema {
-                topic: "/typed".to_string(),
-                schema_name: "std_msgs/String".to_string(),
-            }],
-            schema_docs: vec![],
-            schema_hashes: vec![],
-            // The app serves /untyped too - it just has no schema binding.
-            served_topics: vec!["/typed".to_string(), "/untyped".to_string()],
-        };
-        handles.replace(&serving);
-        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
-        let topics: HashSet<&str> = reply.entries.iter().map(|e| e.topic.as_str()).collect();
-        assert_eq!(
-            topics,
-            HashSet::from(["/typed", "/untyped"]),
-            "a schema-less output must survive the replace snapshot"
-        );
+        assert_eq!(topics, HashSet::from(["/run_two/cam", "/host/late"]));
     }
 
     #[test]
