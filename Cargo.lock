@@ -1564,11 +1564,13 @@ dependencies = [
 name = "cerulion_rcpd"
 version = "1.0.0"
 dependencies = [
+ "cerud",
  "cerulion_core",
  "clap",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "native_ros2_messages",
  "rmcp",
  "serde",
  "serde_json",

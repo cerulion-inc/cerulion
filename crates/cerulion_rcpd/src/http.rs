@@ -85,6 +85,19 @@ impl HttpServer {
         token: BearerToken,
         feed: GraphFeed,
     ) -> Result<Self, RcpdError> {
+        Self::bind_serving(addr, token, move || RcpServer::new(feed.clone())).await
+    }
+
+    /// [`Self::bind`], with each session's handler made by `make_server`.
+    ///
+    /// # Errors
+    ///
+    /// [`RcpdError::Bind`] when the address cannot be bound.
+    pub async fn bind_serving(
+        addr: SocketAddr,
+        token: BearerToken,
+        make_server: impl Fn() -> RcpServer + Send + Sync + 'static,
+    ) -> Result<Self, RcpdError> {
         if !addr.ip().is_loopback() {
             tracing::warn!(addr = %addr, "HTTP transport bound beyond loopback");
         }
@@ -92,7 +105,7 @@ impl HttpServer {
             .await
             .map_err(|source| RcpdError::Bind { addr, source })?;
         let mcp = StreamableHttpService::new(
-            move || Ok(RcpServer::new(feed.clone())),
+            move || Ok(make_server()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );

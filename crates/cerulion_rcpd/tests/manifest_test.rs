@@ -24,8 +24,72 @@ fn robot_and_graph_parse() {
 
 #[test]
 fn an_unknown_key_is_refused() {
-    let err = RcpManifest::parse("robot: go2\ntools: []\n").expect_err("unknown key");
-    assert!(err.contains("tools"), "{err}");
+    let err = RcpManifest::parse("robot: go2\nskills: []\n").expect_err("unknown key");
+    assert!(err.contains("skills"), "{err}");
+}
+
+const STEP_TOOL: &str = "
+tools:
+  - name: arm.step
+    description: one period
+    safety_class: reversible
+    input_schema:
+      type: object
+      properties:
+        q: { type: array, items: { type: number }, minItems: 6, maxItems: 6 }
+      required: [q]
+";
+
+#[test]
+fn tools_state_and_journal_parse_with_defaults() {
+    let m = RcpManifest::parse(&format!(
+        "{STEP_TOOL}state:\n  - name: arm\n    topic: /arm/state\n"
+    ))
+    .expect("parse");
+    assert_eq!(m.tools.len(), 1);
+    assert_eq!(m.tools[0].timeout_ms, 2000);
+    assert!(m.tools[0].safety_class.is_mutating());
+    assert_eq!(m.journal.calls_topic, "/rcp/calls");
+    assert_eq!(m.journal.results_topic, "/rcp/results");
+    assert_eq!(m.state[0].name, "arm");
+}
+
+#[test]
+fn a_tool_surface_the_daemon_cannot_serve_is_refused() {
+    let cases = [
+        (STEP_TOOL.replace("arm.step", "estop"), "built in"),
+        (
+            format!("{STEP_TOOL}{}", &STEP_TOOL["\ntools:\n".len()..]),
+            "declared twice",
+        ),
+        (
+            STEP_TOOL.replace("reversible", "irreversible"),
+            "irreversible",
+        ),
+        (STEP_TOOL.replace("minItems: 6", "pattern: x"), "pattern"),
+        (STEP_TOOL.replace("safety_class", "safety"), "safety"),
+        (
+            format!("{STEP_TOOL}journal:\n  calls_topic: rcp/calls\n"),
+            "absolute",
+        ),
+        (
+            format!("{STEP_TOOL}state:\n  - name: a/b\n    topic: /s\n"),
+            "state name",
+        ),
+        (
+            format!("{STEP_TOOL}state:\n  - name: s\n    topic: /rcp/calls\n"),
+            "journal topic",
+        ),
+        (
+            format!("{STEP_TOOL}journal:\n  calls_topic: /x\n  results_topic: /x\n"),
+            "must differ",
+        ),
+        (STEP_TOOL.replace("arm.step", "arm step"), "tool name"),
+    ];
+    for (yaml, expected) in cases {
+        let err = RcpManifest::parse(&yaml).expect_err(expected);
+        assert!(err.contains(expected), "{expected}: {err}");
+    }
 }
 
 #[test]

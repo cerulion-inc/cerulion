@@ -61,6 +61,14 @@ pub enum RcpdError {
         /// What failed.
         reason: String,
     },
+    /// The receipt log could not be opened.
+    #[error("cannot open receipt log {}: {reason}", path.display())]
+    Receipts {
+        /// The receipt log path.
+        path: PathBuf,
+        /// What failed.
+        reason: String,
+    },
     /// The graph observer thread could not be spawned.
     #[error("cannot start the graph observer thread: {0}")]
     ObserverSpawn(std::io::Error),

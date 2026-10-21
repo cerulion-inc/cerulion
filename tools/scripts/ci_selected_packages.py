@@ -386,7 +386,7 @@ LIVE_ORACLE = {
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (55, 42),
+    'native_ros2_messages': (55, 43),
 }
 
 

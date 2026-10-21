@@ -11,6 +11,11 @@
 //! - [`graph`]: the `robot://graph` JSON document and its pure composer.
 //! - [`observer`]: the std thread that samples the transport and refreshes the
 //!   cached document at most once per [`observer::GRAPH_REFRESH_INTERVAL_NS`].
+//! - [`schema`]: the JSON Schema subset tool arguments are checked against.
+//! - [`journal`]: the thread that publishes tool calls into the graph and
+//!   waits for the graph's answers.
+//! - [`tools`]: deny-by-default tools, hash-chained receipts, the e-stop.
+//! - [`audit`]: the receipt chain check behind `--verify-receipts`.
 //! - [`server`]: the MCP handler.
 //! - [`http`]: the bearer-token streamable HTTP transport.
 //!
@@ -19,12 +24,16 @@
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod audit;
 pub mod error;
 pub mod graph;
 pub mod http;
+pub mod journal;
 pub mod manifest;
 pub mod observer;
+pub mod schema;
 pub mod server;
+pub mod tools;
 
 pub use error::RcpdError;
 
@@ -33,6 +42,9 @@ pub const SERVER_NAME: &str = "cerulion-rcp";
 
 /// The URI of the robot graph resource.
 pub const GRAPH_URI: &str = "robot://graph";
+
+/// The prefix of the `robot://state/{name}` resources.
+pub const STATE_URI_PREFIX: &str = "robot://state/";
 
 /// The address `--http` binds when given no value: loopback only.
 pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7801";

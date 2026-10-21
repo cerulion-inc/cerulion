@@ -24,6 +24,9 @@ path = "src/main.rs"
 
 [dependencies]
 cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# The hash-chained receipt log.
+cerud = { path = "../cerud" }
 # The MCP server SDK. No `macros`: the handler is written by hand, so the
 # proc-macro tree stays out of the build.
 rmcp = { version = "3.5.1", default-features = false, features = [
