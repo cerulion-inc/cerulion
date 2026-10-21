@@ -462,10 +462,10 @@ impl TopicBridgeManager {
 
     /// The number of registered egress bridge flags (Principle #3:
     /// observable state). While a gateway drives this manager the `bridges`
-    /// map is ADD-ONLY — [`Self::register_topic`] inserts, and only
+    /// map is ADD-ONLY - [`Self::register_topic`] inserts, and only
     /// [`Self::unregister_topics_except`] (a between-runs call) removes a key
     /// ([`Self::enable_bridge`] / [`Self::disable_bridge`] only flip existing
-    /// flags) — so this count is MONOTONIC for a gateway's lifetime. The gateway's [`crate::transport::gateway::GatewayRuntime`] uses
+    /// flags) - so this count is MONOTONIC for a gateway's lifetime. The gateway's [`crate::transport::gateway::GatewayRuntime`] uses
     /// that monotonicity as a cheap dirty-check: a count change is a reliable
     /// "a new egress topic was registered" signal driving its per-pass tap
     /// reconciliation, without snapshotting the whole map every pass.
