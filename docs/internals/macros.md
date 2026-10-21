@@ -46,8 +46,17 @@ Node-level `#[cerulion_node(...)]`, all optional; at most one trigger-policy hin
 
 With no node-level hint, the trigger is inferred from a field-level `#[input(trigger)]`.
 Field-level grammar: `#[input(trigger, depth = N, backpressure =
-drop_oldest|block|sample(N), expect_within_ms = N)]` and
-`#[output(promise_within_ms = N)]`. Deadlines must be `> 0`; duplicate port names
+drop_oldest|block|sample(N), expect_within_ms = N)]`,
+`#[input(accumulate, cap = N)]` and `#[output(promise_within_ms = N)]`. The accumulate
+keys parse, validate and generate in `input_accumulate.rs`: the cap is written into
+`depth`, `init` registers the input on the entry's `AccumulatorSet`, the entry's freeze
+(in-process `snapshot_inputs` and the cdylib `cerulion_node_snapshot_inputs` export)
+goes through `AccumulatorSet::snapshot`, the tick serves the port as
+`&Accumulated<'_, T>` outside the latest-value `try_view` chain, and both state seams
+(`capture_state`/`restore_state` and the cdylib `cerulion_node_{capture,restore}_state`
+exports) append `AccumulatorSet::{capture,restore}` after the user's fields (nothing for
+a node without one). The CLI mirror of the grammar is `cerulion_cli_engine`'s
+`node_metadata_accumulate.rs`. Deadlines must be `> 0`; duplicate port names
 reject. The `inputs(...)`/`outputs(...)` args are rejected at parse
 time with a hint pointing at field attributes (`PORT_ARGS_NOT_ACCEPTED_HINT` in
 `parse.rs` centralizes that wording); `type_name` is rejected separately with a
@@ -152,11 +161,14 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 | `cerulion_node_external_source` | External-trigger source classification (external nodes). |
 | `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
 | `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
+| `cerulion_take_last_error_kind` | OPTIONAL typed error kind: the `NodeErrorKind` wire code of the last error (`0` = none), read by the host after a code-1 / handle-0 return so a node error arrives as `TransportError::NodeFailed`. Absent: the error stays the untyped `NodeError` (and a `Fatal` does not stop the node). |
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
 panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex is poisoned; `4`
-handle not found.
+handle not found. The macros convert a user `NodeError` at the boundary with
+`NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
+part of the same contract (never renumber one).
 
 **The ABI rule**: any change to a generated FFI signature or to these return-code
 semantics MUST bump `CERULION_ABI_VERSION` (`crates/cerulion_core/src/lib.rs`; name the

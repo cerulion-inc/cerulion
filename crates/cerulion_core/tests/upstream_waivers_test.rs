@@ -34,12 +34,12 @@
 //! That is why this inventory has TWO units. Where the arms run under
 //! `cargo nextest`, which gives each its own process, the arm is the unit and the
 //! ones that build more than one plugin graph inside themselves are declared one by
-//! one: 26 arms across 13 binaries in two crates. Where the arms run under plain
+//! one: 27 arms across 14 binaries in two crates. Where the arms run under plain
 //! `cargo test`, many arms share one process and the victim is whichever reaches
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole: 20, all of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 22, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
 //!
 //! A process-per-arm runner shortens that list, it does not empty it. The process
@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 
 /// Every arm carrying the 2034 macOS waiver, as `(path from the workspace root,
-/// test name)`. 26 arms across 13 binaries in two crates, with the binaries that
+/// test name)`. 27 arms across 14 binaries in two crates, with the binaries that
 /// are gated whole declared separately below; the counts are checked, not just
 /// written down, by the both-directions inventory further down.
 ///
@@ -96,6 +96,10 @@ const WAIVER_2034_MARKER: &str = "upstream iceoryx2 0.10.0 defect 2034";
 /// engine, whose profile runs build several plugin graphs in one process, which
 /// is the defect's exact trigger.
 const WAIVED_2034: &[(&str, &str)] = &[
+    (
+        "crates/cerulion_core/tests/cdylib_accumulate_parity_test.rs",
+        "two_cdylib_runs_receive_identical_frames",
+    ),
     (
         "crates/cerulion_core/tests/cdylib_block_degrade_test.rs",
         "dylib_block_degrade_is_deterministic",
@@ -256,6 +260,10 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
     ),
     (
+        "crates/cerulion_cli/tests/node_fatal_e2e_test.rs",
+        "spawns `graph run --single-process` (plain and `--record`); its 3 macOS arms passed",
+    ),
+    (
         "crates/cerulion_cli/tests/telemetry_verb_e2e_test.rs",
         "spawns `graph run no_such_graph` in a workspace with no graphs: the run is \
          rejected before any node plugin loads, so no process asks for a second \
@@ -277,8 +285,8 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 21 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Three of the 21,
+/// THE COVERAGE THIS COSTS, stated once: 22 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Three of the 22,
 /// `ros2_graph_e2e_test`, `network_gateway_e2e_test` and `mp_supervisor_box_test`,
 /// are in the set BY THE RULE rather than by measurement: no run has observed them
 /// failing. Of those three, every arm of `mp_supervisor_box_test` is `#[ignore]`d, so
@@ -368,20 +376,28 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
+        "crates/cerulion_cli/tests/node_fatal_mp_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
         "crates/cerulion_cli/tests/wedge_alarm_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
-/// with the number of SUBTRACTION SITES each carries: ten sites across nine
-/// arms in four binaries, because the wide level arm subtracts once per width.
+/// with the number of SUBTRACTION SITES each carries: eleven sites across
+/// ten arms in five binaries, because the wide level arm subtracts once per width.
 ///
 /// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
 /// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
 /// missed it. A waiver inventory scoped to one crate is a waiver inventory that
 /// will be incomplete again.
 const WAIVED_2035: &[(&str, usize)] = &[
+    (
+        "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
+        1,
+    ),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
@@ -1637,8 +1653,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 10,
-        "the 2035 waiver covers ten subtraction sites across nine arms (the wide level arm \
+        total, 11,
+        "the 2035 waiver covers eleven subtraction sites across ten arms (the wide level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit."
     );

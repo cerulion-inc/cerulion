@@ -250,6 +250,110 @@ impl PassRestore {
     }
 }
 
+/// Where each node the pass re-executed was STOPPED: `node id -> the step`
+/// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker),
+/// with the stopping fire's position in that step's burst.
+///
+/// A stopped node never fires again, so the recording holds no fire of it
+/// after that step, and every decider must stop predicting there: the clock
+/// still passes Period deadlines, and the boundary drain still pops a stopped
+/// node's FIFO inputs and aligns its Sync heads, none of which is an owed fire
+/// any more. The step comes from the RE-EXECUTION, not from the
+/// recording, so a recording that kept firing past the stop is still a
+/// finding. Replay = Live puts the re-executed stop on the recorded one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PassStops {
+    stopped_at: BTreeMap<String, StopPoint>,
+}
+
+/// Where ONE node was stopped: the step, and how many fires of the node that
+/// step's re-execution performed, the stopping fire included (`1` = the first
+/// fire of the burst stopped it). Both come from the re-execution.
+///
+/// The position is what holds a stop INSIDE a burst to the recording: a
+/// replay that stops on the first of three recorded fires skips the other two,
+/// and the step alone cannot tell that from a replay that stopped on the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StopPoint {
+    step: u64,
+    fires: u32,
+}
+
+impl PassStops {
+    /// No node stopped.
+    pub(crate) const fn none() -> Self {
+        Self {
+            stopped_at: BTreeMap::new(),
+        }
+    }
+
+    /// Note that `node_id` was stopped by a fire at `step`, the `fires`-th
+    /// fire of the node in that step (the stopping fire included). The FIRST
+    /// note wins: a node is stopped once.
+    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32) {
+        self.stopped_at
+            .entry(node_id.to_string())
+            .or_insert(StopPoint { step, fires });
+    }
+
+    /// Has `node_id` been noted as stopped?
+    pub(crate) fn contains(&self, node_id: &str) -> bool {
+        self.stopped_at.contains_key(node_id)
+    }
+
+    /// Where `node_id` was stopped, if it was.
+    fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
+        self.stopped_at.get(node_id).copied()
+    }
+}
+
+/// At the step a node was stopped, the recording holds the predicted burst
+/// up to and including the stopping fire: the PREFIX of `expected` whose
+/// length is the stopping fire's position, `stop.fires`. A recording that
+/// stopped earlier or later in the burst, or at other instants, or past the
+/// prediction, is a divergence.
+fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, stop: StopPoint) -> bool {
+    let n = recorded.fire_count();
+    if n == 0 || n != stop.fires || n > expected.fire_count() {
+        return false;
+    }
+    // Both sides were built with the same `render_instants` flag, so either
+    // both carry instants or neither does.
+    let want = expected.instants();
+    want.is_empty() || want.get(..n as usize) == Some(recorded.instants())
+}
+
+/// After the step that stopped `node`, it fires no more: the expectation is
+/// NO fire, whatever its rule would derive, and a recorded fire there is a
+/// finding under `decider`. Returns `true` when it pushed that finding (the
+/// rule then stops judging the node, as on any other finding).
+///
+/// Every rule asks this before its own arithmetic, because the inputs keep
+/// moving after the stop: the boundary drain still pops a stopped node's
+/// trigger inputs (FIFO would read each pop as an owed fire) and still aligns
+/// its Sync heads (arm C would read an aligned head as an owed fire), and the
+/// clock still passes its Period deadlines.
+fn recorded_fire_after_stop(
+    node: &NodeDecl,
+    step: &RecordedStep,
+    decider: Decider,
+    with_instants: bool,
+    report: &mut RederivationReport,
+) -> bool {
+    let recorded = recorded_fires(step, &node.node_id, with_instants);
+    if recorded.fire_count() == 0 {
+        return false;
+    }
+    report.findings.push(ScheduleFinding {
+        node_id: node.node_id.clone(),
+        step: step.step,
+        decider,
+        expected: StepFires::none(),
+        recorded,
+    });
+    true
+}
+
 /// May THIS BAG's kind-6 role bits be read as roles?
 ///
 /// A named two-state rather than a `bool`, because every consumer in this
@@ -269,7 +373,14 @@ impl PassRestore {
 pub(crate) enum RoleTrust {
     /// `trace_format >= replay_engine::ROLE_STAMPED_MIN_TRACE_FORMAT`: a
     /// record whose role NAMES a site (`Drain` / `Body`) may be steered on.
-    Believed,
+    Believed {
+        /// `trace_format >= replay_engine::EVERY_CONSULT_MIN_TRACE_FORMAT`:
+        /// every gated consult of this bag wrote a record, so a `NoFrame`
+        /// under the `Drain` role is the empty drain's own record and not a
+        /// shape no recorder writes. `false` on formats 5 and 6, whose empty
+        /// drains wrote nothing.
+        consults_recorded: bool,
+    },
     /// Every archived bag, and any bag whose stamp forbids reading the bits.
     /// Every rule below takes its pre-roles arm, byte for byte.
     Declined,
@@ -278,22 +389,41 @@ pub(crate) enum RoleTrust {
 impl RoleTrust {
     /// Whether roles may be steered on.
     pub fn believed(self) -> bool {
-        matches!(self, Self::Believed)
+        matches!(self, Self::Believed { .. })
+    }
+
+    /// Whether every gated consult of this bag wrote a record. `false` under
+    /// [`Self::Declined`]: the consult format sits above the role format, so
+    /// a bag whose roles cannot be read wrote no consult records either.
+    pub fn consults_recorded(self) -> bool {
+        matches!(
+            self,
+            Self::Believed {
+                consults_recorded: true
+            }
+        )
     }
 }
 
 impl RoleTrust {
-    /// The ONE conversion, from the boundary's `roles_stamped` flag.
+    /// The ONE conversion, from the boundary's two bag terms: `roles_stamped`
+    /// (`trace_format >= 5`) and `consults_recorded` (`trace_format >= 7`).
     ///
     /// A NAMED constructor rather than `impl From<bool>`, because every
-    /// flag threaded beside this one is also a `bool` —
-    /// `block_gated`, `suppressible`, `is_last_pass` — and `RoleTrust::from(x)`
-    /// reads as a conversion whatever `x` means, so the wrong one compiles and
-    /// silently declares an archived bag's zeroed bits trustworthy. The name
-    /// says which truth is being asserted.
-    pub(crate) fn from_stamped(roles_stamped: bool) -> Self {
+    /// flag threaded beside these is also a `bool` (`block_gated`,
+    /// `suppressible`, `is_last_pass`) and `RoleTrust::from(x)` reads as a
+    /// conversion whatever `x` means, so the wrong one compiles and silently
+    /// declares an archived bag's zeroed bits trustworthy. The name says which
+    /// truths are being asserted, in the order the formats arrived.
+    pub(crate) fn from_stamped(roles_stamped: bool, consults_recorded: bool) -> Self {
+        // The consult format is above the role format, so the pair
+        // (false, true) names no bag a reader can meet.
+        debug_assert!(
+            roles_stamped || !consults_recorded,
+            "a bag cannot record every consult without stamping roles"
+        );
         if roles_stamped {
-            Self::Believed
+            Self::Believed { consults_recorded }
         } else {
             Self::Declined
         }
@@ -366,6 +496,15 @@ pub enum TriggerDecl {
     },
     /// A data-trigger node.
     Data {
+        /// The `#[input(trigger)]`-marked inputs, in declaration order.
+        trigger_inputs: Vec<String>,
+    },
+    /// A `sync_window_ms` node that aligns its trigger inputs on each
+    /// message's `header.stamp` (capture time) instead of its wire stamp. The
+    /// read log carries wire stamps only, so the Sync rule cannot re-derive
+    /// this node's sets and stands down on it
+    /// ([`StandDownReason::CaptureTimeSync`]).
+    SyncOnCaptureTime {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
     },
@@ -865,6 +1004,11 @@ pub enum StandDownReason {
     /// queue leaves a spent LOW stamp in the map, and only per-input
     /// monotonicity keeps the resulting spread above the window.
     SyncHeadStampRegressed,
+    /// A Sync node aligns its trigger inputs on `header.stamp` (capture
+    /// time), and the read log carries only WIRE stamps, so the sets the
+    /// scheduler picked cannot be re-derived from it. Judging such a node on
+    /// wire stamps would convict a healthy run.
+    CaptureTimeSync,
 }
 
 impl StandDownReason {
@@ -896,6 +1040,9 @@ impl StandDownReason {
             Self::SyncHeadStampRegressed => {
                 "a trigger input's head stamps move backward across the run"
             }
+            Self::CaptureTimeSync => {
+                "the node aligns on header.stamp, and the read log carries wire stamps only"
+            }
         }
     }
 
@@ -923,6 +1070,7 @@ impl StandDownReason {
             Self::ImpossibleReadShape => "impossible_read_shape",
             Self::UnattributableCredit => "unattributable_credit",
             Self::SyncHeadStampRegressed => "sync_head_stamp_regressed",
+            Self::CaptureTimeSync => "capture_time_sync",
         }
     }
 }
@@ -1370,6 +1518,7 @@ pub(crate) fn verify(
     block_edges: &[BlockEdgeObservation],
     trust: RoleTrust,
     restore: &PassRestore,
+    stops: &PassStops,
 ) -> RederivationReport {
     let mut report = RederivationReport::default();
 
@@ -1420,6 +1569,7 @@ pub(crate) fn verify(
                         *max_catchup,
                         *arm_onset,
                         block_gated,
+                        stops.stop_point(&node.node_id),
                         &mut report,
                     );
                 }
@@ -1435,11 +1585,29 @@ pub(crate) fn verify(
                         block_gated,
                         trust,
                         restore.sync_heads_for(&node.node_id),
+                        stops.stop_point(&node.node_id),
                         &mut report,
                     );
                 }
                 TriggerDecl::Data { trigger_inputs } => {
-                    verify_fifo(node, steps, trigger_inputs, block_gated, trust, &mut report);
+                    verify_fifo(
+                        node,
+                        steps,
+                        trigger_inputs,
+                        block_gated,
+                        trust,
+                        stops.stop_point(&node.node_id),
+                        &mut report,
+                    );
+                }
+                // Judged on wire stamps, a node aligned on capture stamps
+                // would be convicted on a healthy run: decline, loudly.
+                TriggerDecl::SyncOnCaptureTime { .. } => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::Sync,
+                        reason: StandDownReason::CaptureTimeSync,
+                    });
                 }
                 TriggerDecl::Unmodelled => {}
             }
@@ -1514,9 +1682,9 @@ fn census_read_sites(
             continue;
         };
         let inputs = match &node.trigger {
-            TriggerDecl::Sync { trigger_inputs, .. } | TriggerDecl::Data { trigger_inputs } => {
-                trigger_inputs.clone()
-            }
+            TriggerDecl::Sync { trigger_inputs, .. }
+            | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
+            | TriggerDecl::Data { trigger_inputs } => trigger_inputs.clone(),
             _ => continue,
         };
         pending.push((f.node_id.clone(), f.decider, inputs));
@@ -1599,6 +1767,10 @@ fn recorded_fires(step: &RecordedStep, node_id: &str, with_instants: bool) -> St
     }
 }
 
+// Eight inputs, each a distinct fact about ONE node's Period rule: the
+// declaration's three fields, the block gate, and where the re-execution
+// stopped the node. Bundling them would only rename the list.
+#[allow(clippy::too_many_arguments)]
 fn verify_period(
     node: &NodeDecl,
     steps: &[RecordedStep],
@@ -1606,6 +1778,7 @@ fn verify_period(
     max_catchup: Option<u32>,
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     block_gated: bool,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -1650,6 +1823,15 @@ fn verify_period(
         .expect("the anchor step contains a fire of this node (position() found one)");
 
     for step in &steps[anchor_idx..] {
+        // After the step that stopped the node, it fires no more: the
+        // expectation is NO fire, whatever the clock says, and a recorded
+        // fire there is a finding.
+        if stop.is_some_and(|s| step.step > s.step) {
+            if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
+                return;
+            }
+            continue;
+        }
         // The clamp the live scheduler ran under at THIS step: the
         // armed plane's cap from its onset step on, the declared cap always.
         let cap = effective_max_catchup(
@@ -1677,8 +1859,13 @@ fn verify_period(
             StepFires::count(derived.fire_count)
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
+        // The stopping step's burst ends at the stopping fire.
+        let agrees = match stop.filter(|s| s.step == step.step) {
+            Some(s) => is_stop_step_burst(&expected, &recorded, s),
+            None => expected == recorded,
+        };
 
-        if expected != recorded {
+        if !agrees {
             report.findings.push(ScheduleFinding {
                 node_id: node.node_id.clone(),
                 step: step.step,
@@ -1896,7 +2083,8 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///
 /// | kind | minted at |
 /// |---|---|
-/// | `Served` / `Held` / `NoFrame` | the node BODY's read paths ONLY (`try_view`, `snapshot_latest`) — always [`ReadSiteRole::Body`] |
+/// | `Served` / `Held` | the node BODY's read paths ONLY (`try_view`, `snapshot_latest`), always [`ReadSiteRole::Body`] |
+/// | `NoFrame` | the body's latest-value read paths (`try_view`, `snapshot_latest`) under [`ReadSiteRole::Body`] on every format; from trace format 7 on ALSO every consult that found the queue empty AND that a replay of the bag also makes, under the CALL SITE's role: `drain_samples` under either role (the `DrainedBatch` row below says why), `drain_for_trigger` AT THE BOUNDARY SITE and the per-set Sync matcher's empty peek and head-advance refill under [`ReadSiteRole::Drain`]. A between-fires refill's empty answer is the probe that ended a burst and stages nothing |
 /// | `DrainedBatch` / `Decimated` | BOTH sites (`DrainedBatch` via `drain_samples` under either role; `Decimated` via `try_view` / `snapshot_latest` under `Body` and via the three drain fns under `Drain`) |
 /// | `Truncated` | the STAGE, so it carries the stage's role — and a `Body` stage genuinely holds drain-SITE records under the unified discipline |
 /// | `Producer` | its PAIRED read's role, whichever that was |
@@ -1916,10 +2104,13 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///   whose `From` impl is total over two variants and maps to `Body`/`Drain`.
 ///
 /// So the unproducible pairings are `Drain` on a body-only kind, and `Peek` on
-/// anything but `DrainedBatch`/`Producer`. Neither is an inference that could
-/// be wrong: the format says the bits may be read, the bits name a site, and no
-/// code path in the recorder can write those records. CORRUPTION, reported as
-/// [`StandDownReason::ImpossibleReadShape`].
+/// anything but `DrainedBatch`/`Producer`. Which kinds are body-only depends on
+/// the format: `NoFrame` is body-only on formats 5 and 6, where an empty drain
+/// wrote nothing, and a drain-site kind from 7 on, judged through
+/// [`RoleTrust::consults_recorded`]. Neither is an inference that could be
+/// wrong: the format says the bits may be read, the bits name a site, and no
+/// code path in the recorder of that format can write those records.
+/// CORRUPTION, reported as [`StandDownReason::ImpossibleReadShape`].
 ///
 /// Deliberately NOT judged: `Body` on `DrainedBatch`/`Decimated` (legitimate —
 /// the accumulate-all `try_receive` this whole rule exists to fend off),
@@ -1931,10 +2122,16 @@ fn unproducible_read_shape(read: &RecordedRead, trust: RoleTrust) -> bool {
         return false;
     }
     match read.role {
-        ReadSiteRole::Drain => matches!(
-            read.kind,
-            ReadOutcomeKind::Served | ReadOutcomeKind::Held | ReadOutcomeKind::NoFrame
-        ),
+        ReadSiteRole::Drain => match read.kind {
+            ReadOutcomeKind::Served | ReadOutcomeKind::Held => true,
+            // The empty drain's own record from format 7 on, a body kind
+            // below it.
+            ReadOutcomeKind::NoFrame => !trust.consults_recorded(),
+            ReadOutcomeKind::DrainedBatch
+            | ReadOutcomeKind::Decimated
+            | ReadOutcomeKind::Truncated
+            | ReadOutcomeKind::Producer => false,
+        },
         ReadSiteRole::Peek => !matches!(
             read.kind,
             ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Producer
@@ -2151,15 +2348,14 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 ///
 /// # Residuals
 ///
-/// * a node the panic circuit breaker DISABLED mid-run stops firing while its
-///   heads stay filled, so arm C would call the quiet steps owed fires — loud
-///   on the recording side;
 /// * an align pass that exhausts its op budget (a loud wiring desync) skips one
-///   step's fire, likewise;
+///   step's fire while its heads stay filled, so arm C calls that quiet step
+///   an owed fire (loud on the recording side). A node STOPPED mid-run is not
+///   a residual: [`PassStops`] ends the judging at its stop step;
 /// * [`ReadOutcomeKind::Decimated`] on a trigger input is ignored — a decimated
 ///   pop installs no head, so it moves none of the three arms (`verify_fifo`
 ///   declines on it for a different reason: pop counts).
-// Seven arguments. Bundling any subset into a struct would break the shape it
+// Nine arguments. Bundling any subset into a struct would break the shape it
 // shares with `verify_period` / `verify_fifo` / `verify_throttle` — every one of
 // them is `(node, steps, its own declared parameters, the gates, report)` — and
 // a per-rule parameter bag for exactly ONE of the four is a worse boundary than
@@ -2175,6 +2371,7 @@ fn verify_sync(
     block_gated: bool,
     trust: RoleTrust,
     restored: Option<&BTreeMap<String, u64>>,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     // Asked BEFORE any stamp is folded: an edge carrying both sites' reads has
@@ -2288,6 +2485,14 @@ fn verify_sync(
     }
 
     for step in steps {
+        // After the step that stopped the node, no rule below applies: the
+        // drain still aligns its heads, but a stopped node owes no fire.
+        if stop.is_some_and(|s| step.step > s.step) {
+            if recorded_fire_after_stop(node, step, Decider::Sync, false, report) {
+                return;
+            }
+            continue;
+        }
         // Per-step WIDE evidence. `records` is the SUPPLY scale (a count, never
         // stored) and `candidates` the FEASIBILITY scale (bounded by
         // `SYNC_CANDIDATE_CAP`).
@@ -2662,6 +2867,7 @@ fn verify_fifo(
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
+    stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -2676,6 +2882,14 @@ fn verify_fifo(
     }
 
     for step in steps {
+        // After the step that stopped the node, the drain still pops its
+        // inputs, but a stopped node owes no fire for them.
+        if stop.is_some_and(|s| step.step > s.step) {
+            if recorded_fire_after_stop(node, step, Decider::FifoPop, false, report) {
+                return;
+            }
+            continue;
+        }
         let mut popped = 0u32;
         for read in step
             .reads
@@ -2726,7 +2940,14 @@ fn verify_fifo(
         }
 
         let recorded = recorded_fires(step, &node.node_id, false);
-        if recorded.count != popped {
+        // The stopping step's burst ends at the stopping fire: one fire per
+        // pop up to it, so exactly as many as the re-execution performed, at
+        // least one and at most `popped`.
+        let agrees = match stop.filter(|s| s.step == step.step) {
+            Some(s) => recorded.count == s.fires && (1..=popped).contains(&recorded.count),
+            None => recorded.count == popped,
+        };
+        if !agrees {
             report.findings.push(ScheduleFinding {
                 node_id: node.node_id.clone(),
                 step: step.step,
@@ -2828,6 +3049,16 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
             if trigger_inputs.contains(&edge.consumer_input) =>
         {
             CreditBasis::Undecidable
+        }
+        // Capture-time matching builds ONLY on a per-set Sync node
+        // (`graph/sync_capture.rs` refuses it otherwise), so its trigger
+        // drain is unified onto the probed body subscriber and both roles'
+        // pops are pops of that one port. The legacy reading does not exist
+        // for it, so there is no fork to decline.
+        TriggerDecl::SyncOnCaptureTime { trigger_inputs }
+            if trigger_inputs.contains(&edge.consumer_input) =>
+        {
+            CreditBasis::AllPops
         }
         // A non-trigger input of ANY node, and every input of a Period /
         // External / Unmodelled node: one probed subscriber, no drain sub.
@@ -3177,7 +3408,14 @@ mod tests {
         block_edges: &[BlockEdgeObservation],
         trust: RoleTrust,
     ) -> RederivationReport {
-        verify(nodes, steps, block_edges, trust, &PassRestore::none())
+        verify(
+            nodes,
+            steps,
+            block_edges,
+            trust,
+            &PassRestore::none(),
+            &PassStops::none(),
+        )
     }
 
     // -- the PassRestore seed ------------------------------------------------
@@ -3243,8 +3481,11 @@ mod tests {
             std::slice::from_ref(&n),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
             &restored_cam_at(EPOCH + 1000 * MS),
+            &PassStops::none(),
         );
         assert!(
             restored.is_clean(),
@@ -3257,7 +3498,14 @@ mod tests {
             restored.stand_downs
         );
 
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(bare.findings.len(), 1, "{:?}", bare.findings);
         let f = &bare.findings[0];
         assert_eq!(f.node_id, "fuse");
@@ -3290,8 +3538,11 @@ mod tests {
             std::slice::from_ref(&n),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
             &restored_cam_at(EPOCH + 1000 * MS),
+            &PassStops::none(),
         );
         assert_eq!(
             restored.stand_downs,
@@ -3303,7 +3554,14 @@ mod tests {
         );
         assert!(restored.is_clean(), "a stand-down is not a finding");
 
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(bare.is_clean() && bare.stand_downs.is_empty(), "{bare:?}");
     }
 
@@ -3315,7 +3573,14 @@ mod tests {
         // one: the same arm-B finding on the same step.
         let n = fuse_node();
         let steps = first_resumed_step_with_lidar_at(1010 * MS);
-        let bare = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let bare = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(bare.findings.len(), 1);
 
         let mut other_node = BTreeMap::new();
@@ -3342,8 +3607,11 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
                 &restore,
+                &PassStops::none(),
             );
             assert_eq!(
                 report.findings, bare.findings,
@@ -3409,6 +3677,400 @@ mod tests {
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
         assert_eq!(report.divergence_class(), None);
         assert!(report.stand_downs.is_empty());
+    }
+
+    /// A 10 ms ticker whose 3rd fire (step 2) stopped it: steps 3 and 4 hold
+    /// no fire unless `step3_fires` puts one there.
+    fn stopped_ticker_steps(step3_fires: Vec<RecordedFire>) -> Vec<RecordedStep> {
+        vec![
+            step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+            step(1, EPOCH + 10 * MS, vec![fire("ticker", EPOCH + 10 * MS)]),
+            step(2, EPOCH + 20 * MS, vec![fire("ticker", EPOCH + 20 * MS)]),
+            step(3, EPOCH + 30 * MS, step3_fires),
+            step(4, EPOCH + 40 * MS, vec![]),
+        ]
+    }
+
+    /// `node_id` stopped by the FIRST fire of its burst at `step`.
+    fn stopped_at(node_id: &str, step: u64) -> PassStops {
+        stopped_at_fire(node_id, step, 1)
+    }
+
+    /// `node_id` stopped by the `fires`-th fire of its burst at `step`.
+    fn stopped_at_fire(node_id: &str, step: u64, fires: u32) -> PassStops {
+        let mut stops = PassStops::none();
+        stops.note(node_id, step, fires);
+        stops
+    }
+
+    fn verify_with_stops(
+        nodes: &[NodeDecl],
+        steps: &[RecordedStep],
+        stops: &PassStops,
+    ) -> RederivationReport {
+        verify(
+            nodes,
+            steps,
+            &[],
+            RoleTrust::Declined,
+            &PassRestore::none(),
+            stops,
+        )
+    }
+
+    /// A node stopped at step 2 fires no more, and the verifier stops
+    /// predicting there. The mutant (no stop carried) is the false finding a
+    /// fatal node used to raise: step 3 expected at 30 ms, recorded nothing.
+    #[test]
+    fn a_period_node_stopped_by_its_fire_expects_no_later_fire() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = stopped_ticker_steps(vec![]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        assert_eq!(unaware.findings[0].step, 3);
+        assert_eq!(
+            unaware.findings[0].expected,
+            StepFires::at(vec![EPOCH + 30 * MS])
+        );
+        assert_eq!(unaware.findings[0].recorded, StepFires::none());
+    }
+
+    /// A recorded fire AFTER the stop is a finding: the re-executed node
+    /// stopped, the recording kept firing.
+    #[test]
+    fn a_recorded_fire_after_the_stop_is_caught_and_named() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = stopped_ticker_steps(vec![fire("ticker", EPOCH + 30 * MS)]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!(f.node_id, "ticker");
+        assert_eq!(f.step, 3);
+        assert_eq!(f.decider, Decider::Period);
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::at(vec![EPOCH + 30 * MS]));
+    }
+
+    /// A fire missing BEFORE the stop is still a finding.
+    #[test]
+    fn a_missing_fire_before_the_stop_is_still_caught() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let steps = vec![
+            step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+            step(1, EPOCH + 10 * MS, vec![]),
+            step(2, EPOCH + 20 * MS, vec![fire("ticker", EPOCH + 20 * MS)]),
+        ];
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("ticker", 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].expected,
+            StepFires::at(vec![EPOCH + 10 * MS])
+        );
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// A stop inside a catch-up burst: three deadlines are owed at step 1 and
+    /// the 2nd fire stopped the node, so the recording holds the first two.
+    /// That prefix is clean; a burst with a wrong instant, or no fire at all
+    /// at the stopping step, is not.
+    #[test]
+    fn a_stop_inside_a_burst_accepts_only_the_burst_prefix() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let burst = |fires: Vec<RecordedFire>| {
+            vec![
+                step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+                step(1, EPOCH + 30 * MS, fires),
+                step(2, EPOCH + 40 * MS, vec![]),
+            ]
+        };
+        let stops = stopped_at_fire("ticker", 1, 2);
+
+        let prefix = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 20 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &prefix, &stops);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let skewed = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 30 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &skewed, &stops);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].recorded,
+            StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 30 * MS])
+        );
+
+        let empty = burst(vec![]);
+        let report = verify_with_stops(&nodes, &empty, &stops);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// The recording holds all three fires of a catch-up burst, but the
+    /// re-execution stopped on the FIRST and skipped the other two: the stop
+    /// is at a different fire of the same burst, and that is a finding even
+    /// where the node publishes nothing for the data check to catch. The
+    /// mirror (recording stopped on the first, replay on the third) is one too.
+    #[test]
+    fn a_replay_that_stops_at_another_fire_of_the_burst_is_caught() {
+        let nodes = vec![node("ticker", period(10 * MS, None))];
+        let burst = |fires: Vec<RecordedFire>| {
+            vec![
+                step(0, EPOCH, vec![fire("ticker", EPOCH)]),
+                step(1, EPOCH + 30 * MS, fires),
+                step(2, EPOCH + 40 * MS, vec![]),
+            ]
+        };
+        let all_three = burst(vec![
+            fire("ticker", EPOCH + 10 * MS),
+            fire("ticker", EPOCH + 20 * MS),
+            fire("ticker", EPOCH + 30 * MS),
+        ]);
+        let report = verify_with_stops(&nodes, &all_three, &stopped_at_fire("ticker", 1, 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Period));
+        assert_eq!(
+            f.recorded,
+            StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 20 * MS, EPOCH + 30 * MS])
+        );
+
+        // The control: the same recording against a replay that stopped on
+        // the third fire is clean.
+        let report = verify_with_stops(&nodes, &all_three, &stopped_at_fire("ticker", 1, 3));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let first_only = burst(vec![fire("ticker", EPOCH + 10 * MS)]);
+        let report = verify_with_stops(&nodes, &first_only, &stopped_at_fire("ticker", 1, 3));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(
+            report.findings[0].recorded,
+            StepFires::at(vec![EPOCH + 10 * MS])
+        );
+    }
+
+    /// The stop-step rule, on its own: the predicted burst's prefix whose
+    /// length is the stopping fire's position, by count and instants.
+    #[test]
+    fn the_stop_step_burst_rule_matches_hand_cases() {
+        let three = StepFires::at(vec![10, 20, 30]);
+        let at = |fires: u32| StopPoint { step: 0, fires };
+        let rows: &[(StepFires, u32, bool)] = &[
+            (StepFires::at(vec![10]), 1, true),
+            (StepFires::at(vec![10, 20]), 2, true),
+            (StepFires::at(vec![10, 20, 30]), 3, true),
+            (StepFires::at(vec![10, 20, 30]), 1, false),
+            (StepFires::at(vec![10]), 2, false),
+            (StepFires::none(), 1, false),
+            (StepFires::none(), 0, false),
+            (StepFires::at(vec![20]), 1, false),
+            (StepFires::at(vec![10, 20, 30, 40]), 4, false),
+        ];
+        for (recorded, fires, want) in rows {
+            assert_eq!(
+                is_stop_step_burst(&three, recorded, at(*fires)),
+                *want,
+                "{recorded:?} stopped at fire {fires} against {three:?}"
+            );
+        }
+        // Count-only (a burst above the render cap): the count decides.
+        assert!(is_stop_step_burst(
+            &StepFires::count(40),
+            &StepFires::count(7),
+            at(7)
+        ));
+        assert!(!is_stop_step_burst(
+            &StepFires::count(40),
+            &StepFires::count(7),
+            at(8)
+        ));
+        assert!(!is_stop_step_burst(
+            &StepFires::count(40),
+            &StepFires::count(41),
+            at(41)
+        ));
+        assert!(!is_stop_step_burst(
+            &StepFires::count(40),
+            &StepFires::count(0),
+            at(0)
+        ));
+    }
+
+    /// The first note wins, and an unnoted node has no stop.
+    #[test]
+    fn pass_stops_keeps_the_first_stop_of_a_node() {
+        let mut stops = PassStops::none();
+        stops.note("a", 4, 2);
+        stops.note("a", 9, 1);
+        assert_eq!(stops.stop_point("a"), Some(StopPoint { step: 4, fires: 2 }));
+        assert!(stops.contains("a"));
+        assert!(!stops.contains("b"));
+        assert_eq!(stops.stop_point("b"), None);
+        assert_eq!(PassStops::none(), PassStops::default());
+    }
+
+    fn drained(node_id: &str, input: &str, stamp: Option<u64>) -> RecordedRead {
+        read(node_id, input, ReadOutcomeKind::DrainedBatch, 1, stamp)
+    }
+
+    /// A Data node whose fire at step 1 stopped it. Step 1 drained two frames
+    /// and fired once (the burst ended at the stopping fire); step 2 drained
+    /// one more frame and, stopped, fired `step2_fires`.
+    fn stopped_fifo_steps(step2_fires: Vec<RecordedFire>) -> Vec<RecordedStep> {
+        let at = |n: u64| EPOCH + n * 10 * MS;
+        vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: at(0),
+                fires: vec![fire("sink", at(0))],
+                reads: vec![drained("sink", "inp", None)],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: at(1),
+                fires: vec![fire("sink", at(1))],
+                reads: vec![drained("sink", "inp", None), drained("sink", "inp", None)],
+            },
+            RecordedStep {
+                step: 2,
+                clock_ns: at(2),
+                fires: step2_fires,
+                reads: vec![drained("sink", "inp", None)],
+            },
+        ]
+    }
+
+    fn fifo_node() -> Vec<NodeDecl> {
+        vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        )]
+    }
+
+    /// The drain keeps popping a stopped Data node's input, so FIFO must not
+    /// read those pops as owed fires. The mutant (no stop carried) is the
+    /// false finding a fatal node used to raise at its stopping step.
+    #[test]
+    fn a_fifo_node_stopped_by_its_fire_owes_no_fire_for_later_pops() {
+        let steps = stopped_fifo_steps(vec![]);
+        let report = verify_with_stops(&fifo_node(), &steps, &stopped_at("sink", 1));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&fifo_node(), &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        assert_eq!(unaware.findings[0].step, 1);
+        assert_eq!(unaware.findings[0].decider, Decider::FifoPop);
+        assert_eq!(unaware.findings[0].expected, StepFires::count(2));
+        assert_eq!(unaware.findings[0].recorded, StepFires::count(1));
+    }
+
+    /// Step 1 drained two frames and the recording fired once. A replay that
+    /// stopped on its SECOND fire of that step disagrees with the recording
+    /// about where the burst ended, and that is a finding.
+    #[test]
+    fn a_fifo_replay_that_stops_at_another_fire_of_the_burst_is_caught() {
+        let steps = stopped_fifo_steps(vec![]);
+        let report = verify_with_stops(&fifo_node(), &steps, &stopped_at_fire("sink", 1, 2));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::FifoPop));
+        assert_eq!(f.expected, StepFires::count(2));
+        assert_eq!(f.recorded, StepFires::count(1));
+    }
+
+    /// A recorded fire after the FIFO stop is caught, and a stopping step
+    /// with no fire at all is not a stop.
+    #[test]
+    fn a_fifo_fire_after_the_stop_or_an_empty_stop_step_is_caught() {
+        let late = stopped_fifo_steps(vec![fire("sink", EPOCH + 20 * MS)]);
+        let report = verify_with_stops(&fifo_node(), &late, &stopped_at("sink", 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (2, Decider::FifoPop));
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::count(1));
+
+        let mut empty = stopped_fifo_steps(vec![]);
+        empty[1].fires.clear();
+        let report = verify_with_stops(&fifo_node(), &empty, &stopped_at("sink", 1));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].step, 1);
+        assert_eq!(report.findings[0].expected, StepFires::count(2));
+        assert_eq!(report.findings[0].recorded, StepFires::none());
+    }
+
+    /// A Sync node whose fire at step 0 stopped it. Step 1 drains a fresh
+    /// aligned pair, which the stopped node does not fire on.
+    fn stopped_sync_steps(step1_fires: Vec<RecordedFire>) -> (Vec<NodeDecl>, Vec<RecordedStep>) {
+        let nodes = vec![node(
+            "fusion",
+            TriggerDecl::Sync {
+                window_ns: Some(5 * MS),
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: EPOCH,
+                fires: vec![fire("fusion", EPOCH)],
+                reads: vec![
+                    drained("fusion", "cam", Some(EPOCH)),
+                    drained("fusion", "lidar", Some(EPOCH + MS)),
+                ],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: EPOCH + 10 * MS,
+                fires: step1_fires,
+                reads: vec![
+                    drained("fusion", "cam", Some(EPOCH + 10 * MS)),
+                    drained("fusion", "lidar", Some(EPOCH + 11 * MS)),
+                ],
+            },
+        ];
+        (nodes, steps)
+    }
+
+    /// The drain keeps aligning a stopped Sync node's heads, so arm C must not
+    /// read the aligned pair as an owed fire. The mutant (no stop carried)
+    /// raises exactly that finding.
+    #[test]
+    fn a_sync_node_stopped_by_its_fire_owes_no_fire_for_later_aligned_heads() {
+        let (nodes, steps) = stopped_sync_steps(vec![]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("fusion", 0));
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unaware = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(unaware.findings.len(), 1, "{:?}", unaware.findings);
+        let f = &unaware.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Sync));
+        assert_eq!(f.expected, StepFires::count(1));
+        assert_eq!(f.recorded, StepFires::none());
+    }
+
+    /// A recorded Sync fire after the stop is caught and named.
+    #[test]
+    fn a_sync_fire_after_the_stop_is_caught() {
+        let (nodes, steps) = stopped_sync_steps(vec![fire("fusion", EPOCH + 10 * MS)]);
+        let report = verify_with_stops(&nodes, &steps, &stopped_at("fusion", 0));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!((f.step, f.decider), (1, Decider::Sync));
+        assert_eq!(f.expected, StepFires::none());
+        assert_eq!(f.recorded, StepFires::count(1));
     }
 
     /// A catch-up burst: the step clock jumps 3 intervals, so the recording
@@ -3720,6 +4382,64 @@ mod tests {
     }
 
     // -- Sync --------------------------------------------------------------
+
+    /// A node aligned on `header.stamp` is judged by no wire-stamp rule. The
+    /// same fire over WIRE stamps 300 ms apart, which convicts a publish-time
+    /// node on a 50 ms window, is declined by name on a capture-time node:
+    /// its capture stamps may well have matched.
+    #[test]
+    fn a_capture_time_sync_node_stands_down_instead_of_being_judged_on_wire_stamps() {
+        let steps = || {
+            vec![RecordedStep {
+                step: 0,
+                clock_ns: EPOCH + 400 * MS,
+                fires: vec![fire("fusion", EPOCH + 400 * MS)],
+                reads: vec![
+                    read(
+                        "fusion",
+                        "cam",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        Some(EPOCH + 100 * MS),
+                    ),
+                    read(
+                        "fusion",
+                        "lidar",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        Some(EPOCH + 400 * MS),
+                    ),
+                ],
+            }]
+        };
+        // The control: on publish time this fire is misaligned and convicted.
+        let wire = vec![node(
+            "fusion",
+            TriggerDecl::Sync {
+                window_ns: Some(50 * MS),
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let report = verify_unrestored(&wire, &steps(), &[], RoleTrust::Declined);
+        assert!(!report.findings.is_empty(), "the control must convict");
+
+        let capture = vec![node(
+            "fusion",
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: inputs(&["cam", "lidar"]),
+            },
+        )];
+        let report = verify_unrestored(&capture, &steps(), &[], RoleTrust::Declined);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(
+            report
+                .stand_downs
+                .iter()
+                .map(|s| (s.node_id.as_str(), s.decider, s.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![("fusion", Decider::Sync, StandDownReason::CaptureTimeSync)]
+        );
+    }
 
     /// **The clock-domain arm.** Two trigger inputs stamped by TWO DIFFERENT
     /// producing ranks, 30 ms apart, against a 50 ms window — aligned. The
@@ -4177,7 +4897,14 @@ mod tests {
                 drain("b", b + 5 * MS),
             ],
         }];
-        let clean = verify_unrestored(&nodes, &burst, &[], RoleTrust::Believed);
+        let clean = verify_unrestored(
+            &nodes,
+            &burst,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             clean.is_clean(),
             "two arrivals per input SUPPLY two sets — the per-set burst: {clean:?}"
@@ -4779,11 +5506,123 @@ mod tests {
         for (kind, role, stamped, expected) in table {
             let r = read_with_role("n", "i", kind, 1, Some(EPOCH), role);
             assert_eq!(
-                is_drain_site_read(&r, RoleTrust::from_stamped(stamped)),
+                is_drain_site_read(&r, RoleTrust::from_stamped(stamped, false)),
                 expected,
                 "is_drain_site_read({kind:?}, {role:?}, roles_stamped={stamped})"
             );
         }
+    }
+
+    /// The impossible shape predicate's FORMAT row: a `Drain` role on a
+    /// `NoFrame` is the empty drain's own record from trace format 7 on and a
+    /// shape no recorder wrote below it; `Served` and `Held` under `Drain` are
+    /// convicted on every believed bag; `Peek` on a `NoFrame` is convicted on
+    /// both; nothing is convicted on a declined one. The conversion from the
+    /// two bag terms is pinned beside it.
+    #[test]
+    fn the_impossible_shape_predicate_branches_on_the_consult_format() {
+        let believed_pre7 = RoleTrust::Believed {
+            consults_recorded: false,
+        };
+        let believed_v7 = RoleTrust::Believed {
+            consults_recorded: true,
+        };
+        let table = [
+            // (kind, role, trust, unproducible)
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Drain,
+                RoleTrust::Declined,
+                false,
+            ),
+            (
+                ReadOutcomeKind::Served,
+                ReadSiteRole::Drain,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::Served,
+                ReadSiteRole::Drain,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::Held,
+                ReadSiteRole::Drain,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::DrainedBatch,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::Decimated,
+                ReadSiteRole::Drain,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Body,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Peek,
+                believed_pre7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Peek,
+                believed_v7,
+                true,
+            ),
+            (
+                ReadOutcomeKind::DrainedBatch,
+                ReadSiteRole::Peek,
+                believed_v7,
+                false,
+            ),
+            (
+                ReadOutcomeKind::NoFrame,
+                ReadSiteRole::Unstamped,
+                believed_v7,
+                false,
+            ),
+        ];
+        for (kind, role, trust, want) in table {
+            let r = read_with_role("n", "i", kind, 0, None, role);
+            assert_eq!(
+                unproducible_read_shape(&r, trust),
+                want,
+                "unproducible_read_shape({kind:?}, {role:?}, {trust:?})"
+            );
+        }
+        // The accessors the predicate reads, and the conversion that feeds them.
+        assert!(believed_pre7.believed() && !believed_pre7.consults_recorded());
+        assert!(believed_v7.believed() && believed_v7.consults_recorded());
+        assert!(!RoleTrust::Declined.believed() && !RoleTrust::Declined.consults_recorded());
+        assert_eq!(RoleTrust::from_stamped(true, true), believed_v7);
+        assert_eq!(RoleTrust::from_stamped(true, false), believed_pre7);
+        assert_eq!(RoleTrust::from_stamped(false, false), RoleTrust::Declined);
     }
 
     /// The detector's THREE verdicts, as a hand table over the two shapes that
@@ -4840,7 +5679,12 @@ mod tests {
         // they are drain-site reads BY KIND, the collision is real, and nothing
         // on the wire named a site.
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Ambiguous,
             "a stamped bag whose colliding records carry an unnamed role must \
              report the collision it really has — never nothing"
@@ -4850,7 +5694,9 @@ mod tests {
         assert_eq!(
             verdict(
                 &two_batches(ReadSiteRole::Drain, ReadSiteRole::Unstamped),
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             ReadSiteVerdict::Ambiguous,
             "MIXED sets take the weaker reading"
@@ -4862,7 +5708,9 @@ mod tests {
         assert_eq!(
             verdict(
                 &two_batches(ReadSiteRole::Drain, ReadSiteRole::Drain),
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             ReadSiteVerdict::Attributable,
             "ONE healthy per-set Sync align() mints a FillBoundary drain PLUS a \
@@ -4874,7 +5722,12 @@ mod tests {
             (0..5).map(|_| batch(ReadSiteRole::Drain)).collect(),
         )];
         assert_eq!(
-            verdict(&five_drains, RoleTrust::Believed),
+            verdict(
+                &five_drains,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Attributable,
             "a deeper descent is more of the same, not more corrupt"
         );
@@ -4883,10 +5736,24 @@ mod tests {
         //    identical record stream stands the node down on an archived bag.
         let steps = two_batches(ReadSiteRole::Drain, ReadSiteRole::Body);
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Attributable
         );
-        assert_eq!(verdict(&steps, RoleTrust::Believed).stand_down(), None);
+        assert_eq!(
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            )
+            .stand_down(),
+            None
+        );
         assert_eq!(
             verdict(&steps, RoleTrust::Declined),
             ReadSiteVerdict::Ambiguous,
@@ -4901,13 +5768,24 @@ mod tests {
         ] {
             let steps = vec![step_of(0, vec![rec(kind, ReadSiteRole::Drain)])];
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
                 ReadSiteVerdict::Corrupt,
                 "{kind:?} is staged ONLY by the node body's own read paths, so a \
                  believed Drain role on it names a site that cannot have written it"
             );
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed).stand_down(),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                )
+                .stand_down(),
                 Some(StandDownReason::ImpossibleReadShape)
             );
             // The SAME record on a bag whose bits are declined proves nothing:
@@ -4921,7 +5799,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Body)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} at the BODY site is the ordinary shape"
@@ -4939,7 +5819,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Drain)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} carries a legitimate Drain role"
@@ -4955,7 +5837,9 @@ mod tests {
             assert_eq!(
                 verdict(
                     &[step_of(0, vec![rec(kind, ReadSiteRole::Peek)])],
-                    RoleTrust::Believed
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
                 ),
                 ReadSiteVerdict::Attributable,
                 "{kind:?} at the PEEK site is what the matcher really writes"
@@ -4975,7 +5859,12 @@ mod tests {
         ] {
             let steps = vec![step_of(0, vec![rec(kind, ReadSiteRole::Peek)])];
             assert_eq!(
-                verdict(&steps, RoleTrust::Believed),
+                verdict(
+                    &steps,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
                 ReadSiteVerdict::Corrupt,
                 "{kind:?} under a believed PEEK role names a site that cannot \
                  have written it"
@@ -5001,7 +5890,12 @@ mod tests {
             step_of(1, vec![rec(ReadOutcomeKind::Served, ReadSiteRole::Drain)]),
         ];
         assert_eq!(
-            verdict(&steps, RoleTrust::Believed),
+            verdict(
+                &steps,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             ReadSiteVerdict::Corrupt,
             "an early ambiguity must not mask a later PROVEN impossible shape"
         );
@@ -5048,6 +5942,7 @@ mod tests {
             StandDownReason::ImpossibleReadShape,
             StandDownReason::UnattributableCredit,
             StandDownReason::SyncHeadStampRegressed,
+            StandDownReason::CaptureTimeSync,
         ];
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "every reason's token is distinct");
@@ -5116,7 +6011,9 @@ mod tests {
             std::slice::from_ref(&n),
             &corrupt_stream,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             believed
@@ -5174,7 +6071,14 @@ mod tests {
                 ),
             ],
         }];
-        let ok = verify_unrestored(std::slice::from_ref(&n), &healthy, &[], RoleTrust::Believed);
+        let ok = verify_unrestored(
+            std::slice::from_ref(&n),
+            &healthy,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             ok.stand_downs.is_empty() && ok.is_clean(),
             "a body-role `Served` beside a drain-role batch is the ORDINARY \
@@ -5236,7 +6140,9 @@ mod tests {
             std::slice::from_ref(&n),
             &body_heavy,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             believed.findings.len(),
@@ -5293,7 +6199,14 @@ mod tests {
             fires: vec![fire("sink", EPOCH), fire("sink", EPOCH)],
             reads: vec![batch(ReadSiteRole::Drain), batch(ReadSiteRole::Body)],
         }];
-        let d = verify_unrestored(&[n], &drain_heavy, &[], RoleTrust::Believed);
+        let d = verify_unrestored(
+            &[n],
+            &drain_heavy,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(d.findings.len(), 1, "still a finding: {:?}", d.findings);
         assert!(
             d.read_site_census.is_empty(),
@@ -5355,7 +6268,14 @@ mod tests {
             ],
         }];
 
-        let stamped = verify_unrestored(&nodes, &steps, &[], RoleTrust::Believed);
+        let stamped = verify_unrestored(
+            &nodes,
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             stamped.is_clean(),
             "the DRAIN stamps are 10 ms apart — aligned: {:?}",
@@ -5419,8 +6339,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "one DRAIN pop, one fire"
         );
         let archived =
@@ -5444,7 +6371,14 @@ mod tests {
             depth: 1,
             published_frames: 3,
         }];
-        let stamped = verify_unrestored(&[], &steps, &edges, RoleTrust::Believed);
+        let stamped = verify_unrestored(
+            &[],
+            &steps,
+            &edges,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             stamped.conservation.is_empty(),
             "a two-site stream yields no credit number at all: {:?}",
@@ -5517,7 +6451,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a Period node's corrupt read is reported"
@@ -5543,7 +6479,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &steps,
                 &gating,
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a block-gated Data node's corrupt read is reported"
@@ -5561,7 +6499,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &non_trigger,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )),
             vec![Decider::ReadLog],
             "a corrupt read on a NON-trigger input is reported"
@@ -5598,7 +6538,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &healthy,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             ))
             .is_empty(),
             "a healthy believed stream is not corrupt"
@@ -5668,7 +6610,12 @@ mod tests {
         // UNIFIED per-set Sync: the boundary drain runs on the BODY (probed)
         // subscriber, so its Drain-role pops ARE the mirror's decrements.
         assert_eq!(
-            run(vec![r(K::DrainedBatch, 2, R::Drain)], RoleTrust::Believed),
+            run(
+                vec![r(K::DrainedBatch, 2, R::Drain)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (None, None, vec![]),
             "2 of 3 drained at depth 1 is clean"
         );
@@ -5678,7 +6625,12 @@ mod tests {
         // `DrainedBatch`. The pre-roles rule reads `drained == 0` here and
         // reports an over-run on a healthy edge; this is THE headline case.
         assert_eq!(
-            run(vec![r(K::Served, 2, R::Body)], RoleTrust::Believed),
+            run(
+                vec![r(K::Served, 2, R::Body)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (None, None, vec![]),
             "a Served-only edge's pops are real credit"
         );
@@ -5694,7 +6646,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 1, R::Body), r(K::NoFrame, 1, R::Body)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a body batch and a junk-skipping NoFrame both returned credit"
@@ -5702,7 +6656,12 @@ mod tests {
 
         // A REAL over-run still reports, with the exact drained count.
         assert_eq!(
-            run(vec![r(K::Served, 1, R::Body)], RoleTrust::Believed),
+            run(
+                vec![r(K::Served, 1, R::Body)],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
+            ),
             (
                 Some(1),
                 Some(ConservationBreach::OverRun { outstanding: 2 }),
@@ -5719,7 +6678,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 2, R::Drain), r(K::Served, 1, R::Body)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "one probed port, so every pop is credit"
@@ -5730,7 +6691,9 @@ mod tests {
         assert_eq!(
             run(
                 vec![r(K::DrainedBatch, 2, R::Unstamped)],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::UnattributableCredit]),
         );
@@ -5742,7 +6705,9 @@ mod tests {
                     r(K::DrainedBatch, 2, R::Drain),
                     r(K::NoFrame, 0, R::Unstamped)
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a zero-pop unstamped record is not evidence of a second port"
@@ -5756,7 +6721,9 @@ mod tests {
                     r(K::DrainedBatch, 2, R::Drain),
                     r(K::Producer, 4_000_000, R::Drain)
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![]),
             "a producer annotation is not a pop"
@@ -5771,7 +6738,9 @@ mod tests {
                     r(K::DrainedBatch, 1, R::Drain),
                     r(K::Served, 1, R::Body),
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::ImpossibleReadShape]),
         );
@@ -5782,7 +6751,9 @@ mod tests {
                     r(K::DrainedBatch, 1, R::Drain),
                     r(K::Served, 1, R::Body),
                 ],
-                RoleTrust::Believed
+                RoleTrust::Believed {
+                    consults_recorded: false
+                }
             ),
             (None, None, vec![StandDownReason::TruncatedReadLog]),
         );
@@ -5823,7 +6794,14 @@ mod tests {
                 fires: Vec::new(),
                 reads,
             }];
-            let report = verify_unrestored(decls, &steps, &edges, RoleTrust::Believed);
+            let report = verify_unrestored(
+                decls,
+                &steps,
+                &edges,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             (
                 report.conservation.iter().map(|c| c.drained).next(),
                 report.conservation.iter().map(|c| c.breach).next(),
@@ -5900,6 +6878,35 @@ mod tests {
             (None, None, vec![StandDownReason::UnattributableCredit]),
             "the Sync fork is not on the wire, and the two readings differ by 5 \
              frames on this very stream"
+        );
+
+        // …but a CAPTURE-TIME Sync node only builds per-set, so the same
+        // two-role stream is one port and sums exactly: 5 + 1 = 6 of 6, clean.
+        let capture = node(
+            "sink",
+            TriggerDecl::SyncOnCaptureTime {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 5, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (None, None, vec![]),
+            "capture-time Sync has no legacy reading, so both roles are credit"
+        );
+        assert_eq!(
+            run(
+                std::slice::from_ref(&capture),
+                vec![r(K::DrainedBatch, 3, R::Drain), r(K::Served, 1, R::Body)]
+            ),
+            (
+                Some(4),
+                Some(ConservationBreach::OverRun { outstanding: 2 }),
+                vec![]
+            ),
+            "summed, not declined: 2 outstanding against depth 1 is judged an over-run"
         );
 
         // ── (c) A NON-TRIGGER `block` input has NO drain subscriber at all
@@ -6032,7 +7039,9 @@ mod tests {
             std::slice::from_ref(&sink),
             &steps,
             &edges,
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             report
@@ -6139,7 +7148,14 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &peeked, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &peeked,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "THE HEADLINE: a peeked frame is not the head, so a step the \
@@ -6168,7 +7184,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &promoted,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "the PROMOTION names the head, so the fold moves to it — without \
@@ -6187,8 +7205,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &single, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &single,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "the ordinary shape is unaffected"
         );
 
@@ -6256,7 +7281,14 @@ mod tests {
                 at("lidar", EPOCH + 15 * MS, ReadSiteRole::Drain, 1),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &two, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &two,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "THE HEADLINE: two arrivals per input SUPPLY two sets, so a per-set \
@@ -6284,8 +7316,15 @@ mod tests {
             ],
         }];
         assert!(
-            verify_unrestored(std::slice::from_ref(&n), &three, &[], RoleTrust::Believed,)
-                .is_clean(),
+            verify_unrestored(
+                std::slice::from_ref(&n),
+                &three,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
+            )
+            .is_clean(),
             "three supplied sets, three fires"
         );
 
@@ -6326,7 +7365,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &peek_supplied,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "a peeked frame silently promoted into the head is a set the burst \
@@ -6384,7 +7425,14 @@ mod tests {
                 at("lidar", EPOCH + 2000 * MS),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "the fired set (0, 20 ms) is among the candidates, so the step is \
@@ -6410,7 +7458,9 @@ mod tests {
             std::slice::from_ref(&n),
             &infeasible,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!bad.is_clean(), "no tuple fits the window: {bad:?}");
         assert_eq!(bad.findings[0].expected, StepFires::none());
@@ -6461,7 +7511,14 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean());
         let f = &report.findings[0];
         assert_eq!(f.step, 7);
@@ -6525,7 +7582,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &at_ceiling,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "exactly `SYNC_BURST_MAX_SETS` sets is what the scheduler allows"
@@ -6537,7 +7596,14 @@ mod tests {
             fires: vec![fire("fusion", EPOCH); SYNC_BURST_MAX_SETS as usize + 1],
             reads,
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &over, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &over,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean());
         assert_eq!(
             report.findings[0].expected,
@@ -6604,7 +7670,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 10 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             report.is_clean(),
@@ -6617,7 +7685,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_steps(EPOCH + 400 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!bad.is_clean(), "400 ms apart against a 50 ms window");
         assert_eq!(bad.findings[0].step, 1);
@@ -6666,7 +7736,14 @@ mod tests {
                 at("lidar", EPOCH, ReadSiteRole::Drain),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(!report.is_clean(), "an aligned set owed a fire: {report:?}");
         let f = &report.findings[0];
         assert_eq!(f.step, 2);
@@ -6747,7 +7824,9 @@ mod tests {
             std::slice::from_ref(&n),
             &run(EPOCH + 50 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             reset.stand_downs.contains(&StandDown {
@@ -6770,7 +7849,9 @@ mod tests {
             std::slice::from_ref(&n),
             &run(EPOCH + 300 * MS),
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             judged
@@ -6845,7 +7926,9 @@ mod tests {
             std::slice::from_ref(&with_context),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             widened.is_clean(),
@@ -6864,7 +7947,9 @@ mod tests {
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             !narrow.is_clean(),
@@ -6953,7 +8038,9 @@ mod tests {
                 std::slice::from_ref(&widened),
                 &steps,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
             )
         };
 
@@ -7045,7 +8132,9 @@ mod tests {
             std::slice::from_ref(&with_context),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(
             widened.is_clean(),
@@ -7063,7 +8152,9 @@ mod tests {
             std::slice::from_ref(&trigger_only),
             &steps,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert!(!narrow.is_clean(), "CONTROL: a real fire consumed `H`");
         assert_eq!(narrow.findings[0].step, 1);
@@ -7119,7 +8210,9 @@ mod tests {
             std::slice::from_ref(&n),
             &truncated,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(
             stood_down
@@ -7141,7 +8234,14 @@ mod tests {
             fires: vec![fire("fusion", EPOCH)],
             reads: vec![drain("cam", EPOCH), drain("lidar", EPOCH + 5 * MS)],
         }];
-        let judged = verify_unrestored(std::slice::from_ref(&n), &intact, &[], RoleTrust::Believed);
+        let judged = verify_unrestored(
+            std::slice::from_ref(&n),
+            &intact,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(judged.stand_downs.is_empty());
         assert_eq!(
             judged.carried_heads.len(),
@@ -7199,7 +8299,14 @@ mod tests {
                 ),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report
                 .stand_downs
@@ -7361,7 +8468,9 @@ mod tests {
                 std::slice::from_ref(&n),
                 &one_fire,
                 &[],
-                RoleTrust::Believed,
+                RoleTrust::Believed {
+                    consults_recorded: false
+                },
             )
             .is_clean(),
             "the cap bit, so no feasibility claim is made — a verifier must not \
@@ -7380,7 +8489,9 @@ mod tests {
             std::slice::from_ref(&n),
             &two_fires,
             &[],
-            RoleTrust::Believed,
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
         );
         assert_eq!(report.findings.len(), 1, "{report:?}");
         assert_eq!(report.findings[0].expected, StepFires::count(1));
@@ -7470,8 +8581,14 @@ mod tests {
                     )],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             assert!(
                 report.is_clean(),
                 "{a_records} records on `a` in one step: the carried head must be the LAST \
@@ -7573,8 +8690,14 @@ mod tests {
                         )],
                     },
                 ];
-                let report =
-                    verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+                let report = verify_unrestored(
+                    std::slice::from_ref(&n),
+                    &steps,
+                    &[],
+                    RoleTrust::Believed {
+                        consults_recorded: false,
+                    },
+                );
                 assert_eq!(
                 report.is_clean(),
                 clean,
@@ -7661,8 +8784,14 @@ mod tests {
                     )],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             let stood_down = report
                 .stand_downs
                 .iter()
@@ -7736,8 +8865,14 @@ mod tests {
                     ),
                 ],
             }];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             let room_stand_downs = report
                 .stand_downs
                 .iter()
@@ -7820,8 +8955,14 @@ mod tests {
                 fires: vec![fire("fusion", EPOCH)],
                 reads,
             }];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             if convicts {
                 assert_eq!(
                     report.findings.len(),
@@ -7932,8 +9073,14 @@ mod tests {
                     reads: vec![drain("lidar", 5010 * MS, 1)],
                 },
             ];
-            let report =
-                verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+            let report = verify_unrestored(
+                std::slice::from_ref(&n),
+                &steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+            );
             assert!(
                 report.is_clean(),
                 "recorded_promotion={recorded_promotion}: the head beside the parked peek \
@@ -8019,7 +9166,14 @@ mod tests {
                 reads: vec![drain("lidar", 215 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             report.is_clean(),
             "the spent head must not survive the step-2 fire as a phantom — {report:?}"
@@ -8031,7 +9185,14 @@ mod tests {
         let mut owed = steps.clone();
         owed[2].fires.clear();
         owed.truncate(3);
-        let report = verify_unrestored(std::slice::from_ref(&n), &owed, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &owed,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(report.findings.len(), 1, "{report:?}");
         assert_eq!(report.findings[0].step, 2);
         assert_eq!(report.findings[0].expected, StepFires::count(1));
@@ -8093,7 +9254,14 @@ mod tests {
                 reads: vec![drain("cam", 310 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(report.is_clean(), "{report:?}");
     }
 
@@ -8130,7 +9298,9 @@ mod tests {
                 Some(EPOCH),
                 role,
             );
-            let trust = RoleTrust::from_stamped(stamped);
+            // Both site predicates read roles only, so the consult term does
+            // not enter: the pre-7 arm keeps this table's meaning.
+            let trust = RoleTrust::from_stamped(stamped, false);
             assert_eq!(
                 is_drain_site_read(&r, trust),
                 site,
@@ -8155,8 +9325,24 @@ mod tests {
             ReadOutcomeKind::Truncated,
         ] {
             let r = read_with_role("n", "i", kind, 1, Some(EPOCH), ReadSiteRole::Drain);
-            assert!(!is_drain_site_read(&r, RoleTrust::Believed), "{kind:?}");
-            assert!(!is_sync_head_record(&r, RoleTrust::Believed), "{kind:?}");
+            assert!(
+                !is_drain_site_read(
+                    &r,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
+                "{kind:?}"
+            );
+            assert!(
+                !is_sync_head_record(
+                    &r,
+                    RoleTrust::Believed {
+                        consults_recorded: false
+                    }
+                ),
+                "{kind:?}"
+            );
         }
     }
 
@@ -8218,7 +9404,14 @@ mod tests {
                 reads: vec![cam(ReadSiteRole::Body, EPOCH + 400 * MS)],
             },
         ];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report
                 .findings
@@ -8292,7 +9485,14 @@ mod tests {
                 batch(100, ReadSiteRole::Body),
             ],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &steps, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &steps,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert_eq!(
             report.findings.len(),
             1,
@@ -8329,7 +9529,14 @@ mod tests {
             // records 1/1 and pops 2/2, so neither scale is body-heavy.
             reads: vec![batch(2, ReadSiteRole::Drain), batch(2, ReadSiteRole::Body)],
         }];
-        let report = verify_unrestored(std::slice::from_ref(&n), &even, &[], RoleTrust::Believed);
+        let report = verify_unrestored(
+            std::slice::from_ref(&n),
+            &even,
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+        );
         assert!(
             !report.findings.is_empty(),
             "the finding is still there to annotate"

@@ -3891,6 +3891,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_mdns (selected: $SELECTED)"
+      - name: cerulion_tf tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_tf')
+        run: cargo test -p cerulion_tf
+      - name: selection marker, cerulion_tf
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_tf') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_tf (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
       # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
@@ -4024,12 +4033,22 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 45
+    # The cargo cache for this job is restore-only (see the save step), so
+    # every run builds cold: about 30-46 minutes before pytest starts, and
+    # pytest itself takes up to 14 minutes on macOS. 60 minutes cancelled a
+    # run whose every step had passed, so the budget is 90.
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: crates/cerulion_py
     env:
       RUSTUP_TOOLCHAIN: 1.95.0
+      # pyo3 must link the Python-node fixtures against the SAME interpreter
+      # the pytest venv is made from (`python3 -m venv` below). Unset, pyo3
+      # tries `python` first, which on macOS runners can be a different
+      # version than `python3`; the embedded interpreter then cannot load
+      # the venv's compiled extensions (numpy).
+      PYO3_PYTHON: python3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -4094,7 +4113,7 @@ jobs:
           set -eu
           python3 -m venv "$RUNNER_TEMP/pyvenv"
           "$RUNNER_TEMP/pyvenv/bin/pip" install -q --no-deps dist/cerulion-*.whl
-          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9'
+          "$RUNNER_TEMP/pyvenv/bin/pip" install -q 'numpy>=1.26' 'pytest>=8,<9' 'pyright==1.1.414'
           export CERULION_PY_FIXTURE="$PWD/target/release/cerulion_py_fixture"
           export CERULION_PYNODE_DIR="$PWD/target/pynodes"
           export CERULION_CLI_BIN="$GITHUB_WORKSPACE/target/release/cerulion"

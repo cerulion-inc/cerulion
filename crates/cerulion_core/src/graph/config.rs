@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::transport::carrier::{EgressQos, EgressReliability, NetworkTls};
+
 /// The identity served for a config nothing could name.
 ///
 /// Reachable only when a YAML string is parsed with NO file to stem it from
@@ -356,17 +358,121 @@ pub struct NetworkBlock {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<String>,
     /// Canonical absolute topics this graph EXPORTS to the network. Each
-    /// must be produced by an in-graph node (validated at graph-load).
+    /// must be produced by an in-graph node (validated at graph-load). An
+    /// entry is a topic name, or a map naming the topic and its put policy
+    /// (see [`EgressTopic`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub egress: Vec<String>,
+    pub egress: Vec<EgressTopic>,
     /// Canonical absolute topics this graph IMPORTS from the network. Each
     /// must NOT have an in-graph producer — they are external sources
     /// (validated at graph-load).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<String>,
+    /// Certificate files for `quic/` locators in `listen` / `connect`.
+    /// Graph-load validation refuses the block on a graph with no `quic/`
+    /// locator, and a `quic/` locator without the files it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<NetworkTls>,
+}
+
+/// One `network: egress:` entry. Two spellings, one meaning:
+///
+/// ```yaml
+/// egress:
+///   - /robot/cmd                      # reliable, the default
+///   - topic: /robot/lidar/points
+///     reliability: best_effort        # datagrams on a mixed_rel QUIC link
+/// ```
+///
+/// The bare string is the map with every key at its default, and a default
+/// entry serializes back to the bare string. Unknown map keys are a parse
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressTopic {
+    /// Canonical absolute topic name.
+    pub topic: String,
+    /// How the topic's frames are put on the network.
+    pub reliability: EgressReliability,
+}
+
+impl EgressTopic {
+    /// A reliable entry for `topic`.
+    pub fn reliable(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            reliability: EgressReliability::Reliable,
+        }
+    }
+}
+
+impl From<&str> for EgressTopic {
+    fn from(topic: &str) -> Self {
+        Self::reliable(topic)
+    }
+}
+
+impl From<String> for EgressTopic {
+    fn from(topic: String) -> Self {
+        Self::reliable(topic)
+    }
+}
+
+/// The map spelling of [`EgressTopic`].
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EgressTopicMap {
+    topic: String,
+    #[serde(default)]
+    reliability: EgressReliability,
+}
+
+impl Serialize for EgressTopic {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.reliability == EgressReliability::default() {
+            serializer.serialize_str(&self.topic)
+        } else {
+            EgressTopicMap {
+                topic: self.topic.clone(),
+                reliability: self.reliability,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EgressTopic {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = EgressTopic;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a topic name, or a map with `topic` and optional `reliability`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EgressTopic, E> {
+                Ok(EgressTopic::reliable(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<EgressTopic, A::Error> {
+                let m =
+                    EgressTopicMap::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(EgressTopic {
+                    topic: m.topic,
+                    reliability: m.reliability,
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 impl NetworkBlock {
+    /// The declared egress topic names, in declaration order.
+    pub fn egress_topics(&self) -> impl Iterator<Item = &str> {
+        self.egress.iter().map(|e| e.topic.as_str())
+    }
+
     /// True when the block's `mode` actually enables the
     /// network (`peer` / `client`). A `disabled` block is parsed but INERT
     /// — validation additionally rejects declared `egress`/`ingress` lists
@@ -388,6 +494,8 @@ impl NetworkBlock {
     /// | `mode: disabled` | `None` (no transport network at all) |
     /// | `connect` | `connect_endpoints` (1:1) |
     /// | `listen` | `listen_endpoints` (1:1) |
+    /// | `tls` | `tls` (1:1) |
+    /// | `egress` entries with a non-default `reliability` | `egress_qos` |
     /// | — | scouting knobs: NOT exposed in v1 — both stay the transport default OFF (nothing is discovered by accident) |
     pub fn to_network_config(&self) -> Option<crate::transport::network::NetworkConfig> {
         use crate::transport::network::{NetworkConfig, ZenohMode};
@@ -400,6 +508,16 @@ impl NetworkBlock {
             mode,
             connect_endpoints: self.connect.clone(),
             listen_endpoints: self.listen.clone(),
+            tls: self.tls.clone(),
+            egress_qos: self
+                .egress
+                .iter()
+                .filter(|e| e.reliability != EgressReliability::default())
+                .map(|e| EgressQos {
+                    topic: e.topic.clone(),
+                    reliability: e.reliability,
+                })
+                .collect(),
             // Scouting deliberately rides the transport default (OFF) —
             // v1 exposes no scouting knobs in graph YAML.
             ..NetworkConfig::default()
@@ -789,8 +907,9 @@ network:
             mode: NetworkMode::Peer,
             connect: vec!["tcp/192.168.123.99:7447".to_string()],
             listen: vec!["tcp/0.0.0.0:7447".to_string()],
-            egress: vec!["/go2/utlidar/cloud".to_string()],
+            egress: vec!["/go2/utlidar/cloud".into()],
             ingress: vec!["/go2/cmd_vel/keyboard".to_string()],
+            tls: None,
         };
         assert_eq!(net, expected);
     }
@@ -1039,7 +1158,7 @@ network:
         assert_eq!(config.nodes[0].outputs[0].history_size, 4);
         let net = config.network.expect("block present");
         assert_eq!(net.mode, NetworkMode::Peer);
-        assert_eq!(net.egress, vec!["/p/n/o".to_string()]);
+        assert_eq!(net.egress, vec![EgressTopic::reliable("/p/n/o")]);
     }
 
     /// Round-trip: a serialized-then-parsed block is byte-stable, and an
@@ -1075,8 +1194,9 @@ nodes:
             mode: NetworkMode::Peer,
             connect: vec!["tcp/192.168.123.99:7447".to_string()],
             listen: vec!["tcp/0.0.0.0:7447".to_string()],
-            egress: vec!["/go2/utlidar/cloud".to_string()],
+            egress: vec!["/go2/utlidar/cloud".into()],
             ingress: vec!["/go2/cmd_vel/keyboard".to_string()],
+            tls: None,
         };
         let cfg = block.to_network_config().expect("peer mode is enabled");
         assert_eq!(cfg.mode, ZenohMode::Peer);
@@ -1087,6 +1207,110 @@ nodes:
         assert_eq!(cfg.listen_endpoints, vec!["tcp/0.0.0.0:7447".to_string()]);
         assert!(!cfg.multicast_scouting, "scouting must stay OFF (v1)");
         assert!(!cfg.gossip_scouting, "gossip scouting must stay OFF (v1)");
+    }
+
+    /// The two `egress:` spellings: a bare name is a reliable entry, a map
+    /// carries `reliability`; a default map entry serializes back to the bare
+    /// name, a best-effort one stays a map, and both round-trip.
+    #[test]
+    fn egress_entry_string_or_map_parses_and_round_trips() {
+        let yaml = r#"
+mode: peer
+listen:
+  - quic/0.0.0.0:7447?mixed_rel=1
+egress:
+  - /r/cmd
+  - topic: /r/scan
+    reliability: best_effort
+  - topic: /r/odom
+tls:
+  certificate: /etc/cerulion/r.pem
+  private_key: /etc/cerulion/r.key
+"#;
+        let net: NetworkBlock = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            net.egress,
+            vec![
+                EgressTopic::reliable("/r/cmd"),
+                EgressTopic {
+                    topic: "/r/scan".to_string(),
+                    reliability: EgressReliability::BestEffort,
+                },
+                EgressTopic::reliable("/r/odom"),
+            ]
+        );
+        assert_eq!(
+            net.egress_topics().collect::<Vec<_>>(),
+            vec!["/r/cmd", "/r/scan", "/r/odom"]
+        );
+        let tls = net.tls.as_ref().expect("tls block");
+        assert_eq!(
+            tls.certificate.as_deref(),
+            Some(std::path::Path::new("/etc/cerulion/r.pem"))
+        );
+        let out = serde_yaml::to_string(&net).unwrap();
+        assert!(out.contains("- /r/cmd\n"), "{out}");
+        assert!(out.contains("- /r/odom\n"), "{out}");
+        assert!(out.contains("reliability: best_effort"), "{out}");
+        let back: NetworkBlock = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(back, net);
+    }
+
+    /// A misspelled map key or reliability value is a parse error naming it.
+    #[test]
+    fn egress_map_refuses_unknown_keys_and_values() {
+        let err = serde_yaml::from_str::<NetworkBlock>(
+            "egress:\n  - topic: /r/scan\n    reliablity: best_effort\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reliablity"), "{err}");
+        let err = serde_yaml::from_str::<NetworkBlock>(
+            "egress:\n  - topic: /r/scan\n    reliability: besteffort\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("besteffort"), "{err}");
+        let err = serde_yaml::from_str::<NetworkBlock>("egress:\n  - reliability: best_effort\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("topic"), "{err}");
+    }
+
+    /// `tls` maps 1:1 and only non-default egress entries reach `egress_qos`.
+    #[test]
+    fn to_network_config_carries_tls_and_best_effort_topics() {
+        let tls = NetworkTls {
+            root_ca: Some("/c/ca.pem".into()),
+            ..NetworkTls::default()
+        };
+        let block = NetworkBlock {
+            mode: NetworkMode::Peer,
+            connect: vec!["quic/10.0.0.1:7447?mixed_rel=1".to_string()],
+            egress: vec![
+                "/r/cmd".into(),
+                EgressTopic {
+                    topic: "/r/scan".to_string(),
+                    reliability: EgressReliability::BestEffort,
+                },
+            ],
+            tls: Some(tls.clone()),
+            ..NetworkBlock::default()
+        };
+        let cfg = block.to_network_config().expect("peer mode is enabled");
+        assert_eq!(cfg.tls, Some(tls));
+        assert_eq!(
+            cfg.egress_qos,
+            vec![EgressQos {
+                topic: "/r/scan".to_string(),
+                reliability: EgressReliability::BestEffort,
+            }]
+        );
+        let plain = NetworkBlock {
+            mode: NetworkMode::Peer,
+            egress: vec!["/r/cmd".into()],
+            ..NetworkBlock::default()
+        };
+        let cfg = plain.to_network_config().unwrap();
+        assert!(cfg.egress_qos.is_empty());
+        assert!(cfg.tls.is_none());
     }
 
     /// Client mode maps to `ZenohMode::Client`.

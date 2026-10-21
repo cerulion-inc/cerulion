@@ -195,6 +195,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `android_device_smoke_test.rs` | In-process publish/receive delivers every message in order, and a named POSIX shared-memory object round-trips through `posix_shm` (on Android also through its backing file). Cross-built with `cargo ndk` and run on an Android device with `--test-threads=1`; runs on the host too. | parallel (unique names) | none |
 | `context_transport_test.rs` | Every runtime-built `NodeContext` carries the HOST's `TransportManager` (`Arc::ptr_eq`). | `#[serial]` | none |
 | `dead_node_cleanup_config_test.rs` | Every `TransportManager` config disables iceoryx2 auto dead-node cleanup (the cdylib same-PID reap hazard). | `#[serial]` | none |
+| `open_file_limit_raise_test.rs` | A child process started at a soft `RLIMIT_NOFILE` of 256 builds its transport on the raised limit (the hard limit on Linux, at most 1048576 there, at most 1024 elsewhere); a child whose hard limit equals its soft limit keeps both. | parallel (spawns child processes, isolated iceoryx2 root) | none |
 | `iceoryx2_version_lockstep_test.rs` | iceoryx2 family exact-pinned + single lockfile version (pure file-parse). | parallel | none |
 | `shm_footprint_probe.rs` | SHM pools are lazy/demand-paged; oversizing is latency-free (floor/p50/p99). | hardware-only `#[serial]` | none |
 | `shm_guard_madvise_iox2_test.rs` | The MADV_NOHUGEPAGE mitigation applies to every pool mapping (Linux smaps proof). | hardware-only tt1 | none |
@@ -224,6 +225,10 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `e2e_cli_test.rs` | Full user journey: create workspace → add nodes → build → run, through the CLI surface. | tt1 | built workspace |
 | `runtime_shutdown_lifecycle_test.rs` / `chunk_j_pass2_test.rs` | `NodeEntry::shutdown()` invoked on every teardown path; plus cases the first file cannot distinguish (explicit shutdown vs `Drop`). | parallel | none |
 | `step_zero_alloc_test.rs` | Zero allocations per `step()` at steady state, incl. multi-node and serial-gated levels. | `#[serial]` tt1 | none |
+| `accumulate_input_iox2_test.rs` | `#[input(accumulate)]` through the generated tick: two writers on a listed topic, documented order, cap drops and queue evictions as one count and one event, carry-over while a latest-value input has not delivered, one fire per trigger frame, the cap above the multi-publisher ceiling refused at build, a node resumed from captured state serving the same frames and counts, an over-cap restore refused. | `#[serial]` | none |
+| `accumulate_set_iox2_test.rs` | `AccumulatorSet` over a hand-built pair: refused foreign-schema frames, a receive fault ending a collect, registration refusals, the event latch while an event is still pending, the overflow regime's loud, repeat and recovery lines, the held-slot read bound. | `#[serial]` tt1, fenced | none |
+| `accumulate_zero_alloc_test.rs` | Zero allocations on the accumulate collect, serve and read at steady state (minus the per-loan upstream waiver). | `#[serial]` tt1, fenced | none |
+| `cdylib_accumulate_parity_test.rs` | A cdylib accumulate reader receives the same frames as its in-process twin, against a hand oracle; two cdylib runs identical. | `#[serial]` | `test_node_macro_accumulate_cdylib` |
 | `rayon_fire_iox2_test.rs` | Within-level parallel fire: parallel==serial==flat byte-identity; panic isolation; decision-order merge (any other merge order fails it). | `#[serial]` | none |
 | `rayon_fire_cdylib_serial_test.rs` | A cdylib with non-trigger inputs routes OFF the rayon path (fired serially). | `#[serial]` | `test_node_macro_period_input_cdylib` |
 | `fire_threads_env_test.rs` | `CERULION_FIRE_THREADS` bad-value warn; snapshot-loop desync else-arm. | `#[serial]` | none |
@@ -250,6 +255,8 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `sync_fire_iox2_test.rs` | Trigger-scoped Sync fire semantics: alignment, stale plain input never gates, starved-trigger watchdog. | `#[serial]` | none |
 | `sync_per_set_iox2_test.rs` | PER-SET Sync delivery: one fire per COMPLETE aligned set, in set order, each trigger message consumed by at most one set; members are READ into a sink and compared against hand-written tuples, because a fire COUNT cannot see which frames a fire observed. | `#[serial]` | none |
 | `sync_per_set_backpressure_iox2_test.rs` | Per-set Sync composed with the input backpressure policies. | `#[serial]` | none |
+| `sync_capture_stamp_iox2_test.rs` | Capture-time (`header.stamp`) Sync: generated `PoseStamped` frames whose wire and capture stamps differ fuse the hand-written capture pairs, a publish-time control on the same frames fuses nothing, backwards and undecodable stamps are dropped, counted and flood-latched (one `warn!`, one recovery line), a resumed run drops the same backwards frame as the live run, a run resumed between a capture clock restart and the partner's first new-epoch frame discards the same stale frame and fires the same set as live, two runs agree, and a missing stamp location refuses the build by name. | `#[serial]` | none |
+| `sync_capture_stamp_zero_alloc_test.rs` | Capture-time Sync steps allocate exactly as often as publish-time steps on the same stimulus, a run that discards a backwards and an undecodable frame every step allocates exactly as often as the clean run, and the pure stamp decode and head op allocate nothing on their own (thread-scoped counting allocator). | `#[serial]` | none |
 | `sync_trigger_wiring_guard_test.rs` | Build-time loud guards for unwired/degenerate/absent sync triggers; anti-tautology clean-build control. | parallel | none |
 | `macro_sync_threading_test.rs` | Sync policy threads YAML-wired inputs through the policy conversion. | parallel | none |
 | `data_trigger_macro_binding_test.rs` | Runtime synthesizes the data-trigger binding from macro-reported trigger fields. | parallel | none |
@@ -263,6 +270,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 |---|---|---|---|
 | `external_fire_iox2_test.rs` | `trigger_external` + `step` fires an External node. | `#[serial]` | none |
 | `external_live_fire_iox2_test.rs` | The external fire seam: fd/Blocking/HostDriven sources, wake coalescing, level-trigger refire, launch refusals, wake-storm no-lost-tail, eventfd arm (Linux). | `#[serial]` | none |
+| `node_fatal_external_wake_iox2_test.rs` | A fatally stopped `external` node with a hung-up device fd no longer wakes the live wait: the reactor wait and three live steps last their full timeouts, the node never fires again, and its binding is kept for a reset. | `#[serial]` | none |
 | `external_gating_replay_iox2_test.rs` | Polled path never queries `external_source()`; sticky aggregated launch refusal; replay firewall (source never touched). | `#[serial]` | none |
 | `waitset_fd_source_iox2_test.rs` | Mixed listener + raw-fd wake sources; declaration-order reporting; invalid/stale fd guards (host-side EBADF-abort protection). | `#[serial]` | none |
 | `waitset_capacity_test.rs` | WaitSet attachment-capacity guard boundary. | parallel | none |
@@ -318,6 +326,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 |---|---|---|---|
 | `network_test.rs` | Network transport basics over the SHM-backed API. | tt1 | none |
 | `network_graph_wiring_test.rs` | `network:` block → `GatewayPlan` derivation; a graph build starts nothing network. | parallel | none |
+| `network_quic_carrier_test.rs` | The `quic/` carrier on loopback with a self-signed certificate as its own trust anchor (ECDSA P-256 and Ed25519): a frame arrives, a `best_effort` topic arrives with zenoh's best-effort marker while others stay reliable, a connector trusting a different certificate receives nothing, and a missing `tls` path, a file with no PEM block, or a listener certificate marked `CA:TRUE` fails the session open. | parallel | none |
 | `network_ingress_test.rs` | Byte-identical re-injection; schema-mismatch counted-not-delivered; structural loop exclusion; lazy session; teardown release. | `#[serial]` tt1 | none |
 | `mirror_origin_test.rs` | Required network identity despite failed robot attribution; consumer-first attach; multiple-owner rollback; local replacement; malformed identity refusals. | per-test SHM | none |
 | `network_ingress_e2e_test.rs` | Cross-session producer→gateway→zenoh-TCP→re-inject→subscriber, byte-identical vs hand-stamped headers. | `#[serial]` | none |
@@ -375,7 +384,7 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 | `state_fork_panic_hook_test.rs` | The parent-installed, pid-branching panic hook over real `fork(2)` children, including a fork taken while std's hook lock is genuinely READ-HELD, the precondition it exists for. ONE test body, because everything here is process-global. | parallel (ONE test body in its OWN binary; the hook is process-global) | none |
 | `state_reaper_fork_test.rs` | The reaper over real children, and the `kill(pid, 0)` liveness predicate driven through the PRODUCTION arm-word sweep. | parallel | none |
 | `state_dontfork_test.rs` | An excluded mapping is genuinely ABSENT from a `fork` child, over a real child on both shipping platforms. | parallel | none |
-| `node_death_trigger_iox2_test.rs` | The NODE-DEATH mint through a real `GraphRuntime`: the mint site the scheduler's circuit-breaker arms cannot reach. | parallel | none |
+| `node_death_trigger_iox2_test.rs` | The NODE-DEATH mint through a real `GraphRuntime`: the mint site the scheduler's circuit-breaker arms cannot reach. Also a `NodeError::Fatal` stop: one capture, detail `returned_fatal_error`. | parallel | none |
 | `flashback_producer_fault_warn_test.rs` | The node-death producer's three failure branches (no transport, the trigger channel will not open, the request will not publish), each LOUD, because a robot binary compiles `debug!` out. | parallel | none |
 
 ### Latency and flatness gates
@@ -423,6 +432,9 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 | `dylib_corrupt_info_test.rs` | Corrupted info JSON refuses to load with a rich diagnostic. | `#[serial]` tt1 | `test_node_corrupt_info_cdylib` |
 | `node_raw_ffi_template_test.rs` | The raw-FFI scaffolding template's emit loads; LAST_ERROR semantics. The `local-transport` CI job rebuilds its fixture with the feature and reruns the load and init/tick/shutdown happy-path arms against the matching host. | parallel | `test_node_raw_ffi_template_cdylib` |
 | `chunk_c_ffi_error_test.rs` / `chunk_c_ffi_codes_3_4_test.rs` | FFI error codes end-to-end (rich message threading; poisoned-registry + missing-handle codes; single-body lifecycle ordering). | `#[serial]` | failing-mode cdylib fixtures (headers) |
+| `node_error_kind_boundary_test.rs` | Every `NodeError` arm from `init`/`tick`/`shutdown` crosses the macro boundary as `TransportError::NodeFailed` with its `NodeErrorKind` (hand vectors). | parallel | none |
+| `node_error_kind_cdylib_test.rs` | The same vectors across the cdylib FFI (`cerulion_take_last_error_kind`); a cdylib without the export still loads and reports an untyped `NodeError`. Own binary: all iceoryx2 contexts are built before the first cdylib call (macOS iceoryx2 2034). | `#[serial]` | `test_node_error_kind_cdylib`, `test_node_cdylib` |
+| `node_fatal_stop_test.rs` | `NodeError::Fatal` stops the node after the fatal step (no more fires, no more publishes) for a Period source, a data-triggered relay, a Sync node, a wide rayon level and a fire inside a catch-up burst; the rest of the graph runs; a downstream `expect_within_ms` counts the exact hand-derived misses and raises its event exactly as for a silent (`Logic`) upstream; non-fatal kinds keep firing; two-run trace identity; fatal `init` refuses the build; fatal `shutdown` is no stop. | parallel (`build_for_test`) | none |
 | `env_snapshot_isolation_test.rs` | `NodeContext::env_snapshot` isolates nodes from post-build env mutation. | `#[serial]` | none |
 | `cdylib_non_trigger_hold_test.rs` | Cross-step hold through the optional snapshot FFI pair; symbol-less back-compat is a safe no-op. | `#[serial]` tt1 | `test_node_macro_period_input_cdylib`, `test_node_cdylib` |
 | `cdylib_snapshot_set_failure_test.rs` | A failed snapshot-set is TERMINAL: the per-step snapshot FFI is never called (counter 0 under fault; anti-tautology control). | `#[serial]` tt1 | `test_node_snapshot_fail_cdylib` |

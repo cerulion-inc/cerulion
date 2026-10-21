@@ -113,6 +113,10 @@ pub mod dma_lock;
 pub mod doorbell;
 #[allow(missing_docs)]
 pub mod error;
+// The open-file limit of a node-hosting process: the once-per-process raise
+// every transport constructor makes, and the pure start-up check `graph run`
+// refuses a graph with. `pub` because that check lives in `cerulion_cli_engine`.
+pub mod fd_limit;
 #[allow(missing_docs)]
 pub mod graph;
 #[allow(missing_docs)]
@@ -753,7 +757,23 @@ pub mod wire;
 ///   target all the same.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 26;
+///
+/// - v27: the replay read gate carries the RECORDING's consult rule.
+///   `PlanInner` gains `rule: ConsultRule` and `ReplayReadViolationKind` gains
+///   `UnplannedConsult { consult, planned }`, both reached through the
+///   crate-owned `Arc` on `CerulionSubscriber::replay_plan`; the capture twin
+///   `ReadOutcomeStage` gains `records_every_consult: AtomicBool`, the same
+///   question on the staging side. The rule decides what a consult the step's
+///   plan holds no position for IS: a recording whose empty drains wrote no
+///   record is short of positions by construction, so an over-run is a counted
+///   number, while a recording that holds a record at every consult makes the
+///   same over-run a schedule the recording never took. `PlanInner` is pinned
+///   by offset and the violation enum by variant set, so a cdylib built against
+///   an earlier core reads both at stale places and the two halves disagree
+///   about whether a replay diverged.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 27;
 
 // Re-export commonly used types
 #[cfg(unix)]
@@ -775,9 +795,12 @@ pub use monitor_wait::MonitorWaitPolicy;
 pub use rustc_fingerprint::{rustc_fingerprint_cstr, RUSTC_FINGERPRINT, RUSTC_RELEASE};
 pub use scheduler::{
     merge_partition_traces, AlignOutcome, NodeConfig, NodeHandle, ProcessTrace, RefillEmptyCause,
-    RefillOutcome, Scheduler, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
+    RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
+pub use transport::carrier::{
+    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+};
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,

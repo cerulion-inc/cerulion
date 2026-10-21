@@ -30,6 +30,10 @@ pub mod drain_latch;
 pub mod node;
 pub mod partition;
 pub mod runtime;
+// The two sibling topic sets a split worker is told about, one type per
+// direction, so the producer gate cannot be handed the set it reads.
+pub mod sibling_topics;
+pub(crate) mod sync_capture;
 // Replay exit-3 widening: per-node tick-failure flood-suppression latch
 // (the DrainWarnLatch sibling — pure state machine, mapped to tracing
 // levels in runtime.rs).
@@ -70,6 +74,7 @@ pub use runtime::{
     CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime, BARRIER_BOUNDARY_TIMEOUT,
     EXTERNAL_TOPIC_SILENCE_GRACE_MS,
 };
+pub use sibling_topics::{SiblingConsumedTopics, SiblingProducedTopics};
 pub use topology::{
     resolve_levels, CreditBar, CycleError, GraphTopology, Level, LevelGrowth, Levels, RefineInputs,
     TriggerEdges,

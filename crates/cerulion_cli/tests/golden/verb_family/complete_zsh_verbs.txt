@@ -1,0 +1,4 @@
+exit: Some(0)
+--- stdout
+create:Create a new schemadelete:Delete a schemainfo:Show info about a schemalist:List all schemas: workspace-local (schemas/*.yaml) and built-in ROS 2 types by packagehelp:Print this message or the help of the given subcommand(s)--verbose:Enable verbose (debug-level) logging (`-v` or `--verbose`)--help:Print help
+--- stderr
