@@ -16,6 +16,8 @@
 # as the variable pair). The variable-vs-pod A/B additionally depends on
 # THIS file staying wiring-identical to rtt_bench.yaml (ids, sources,
 # history_size) — only `type:` and `schema:` differ.
+# graphs/rtt_bench_pod_split3.yaml is the three-group sibling under the
+# same faithful-mirror rule.
 prefix: rtt_bench_pod
 nodes:
 - id: ping
