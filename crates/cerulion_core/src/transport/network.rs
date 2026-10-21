@@ -3241,6 +3241,10 @@ pub struct NetworkManager {
     /// test-gated setter). Lets the gateway's `register_runtime_topic`
     /// announce-failure path be pinned WITHOUT a broken zenoh session.
     fail_next_announce_egress: AtomicBool,
+    /// TEST-SEAM fire-once flag: when set, the NEXT ingress demand token
+    /// declaration fails. Written only by
+    /// [`NetworkManager::fault_inject_ingress_token_once`].
+    fail_next_ingress_token: AtomicBool,
     /// True while LAN access is [`LanAccess::Paired`]. Shared with every
     /// ingress receive callback, which refuses frames while it is set.
     lan_paired: Arc<AtomicBool>,
@@ -3371,6 +3375,7 @@ impl NetworkManager {
             suppress_live_demand: Arc::new(AtomicBool::new(false)),
             suppress_ingress_token: Arc::new(AtomicBool::new(false)),
             fail_next_announce_egress: AtomicBool::new(false),
+            fail_next_ingress_token: AtomicBool::new(false),
             lan_paired: Arc::new(AtomicBool::new(lan_access == LanAccess::Paired)),
             ingress_gate: Arc::new(std::sync::RwLock::new(())),
             ingress_posture: Mutex::new(()),
@@ -4039,6 +4044,17 @@ impl NetworkManager {
         session: &zenoh::Session,
         canonical: &str,
     ) -> TransportResult<Option<TopicToken>> {
+        // TEST SEAM (fire-once): `fault_inject_ingress_token_once` fails the
+        // NEXT declaration, as a broken liveliness declare would. One relaxed
+        // load on the cold registration path, always `false` in production.
+        if self.fail_next_ingress_token.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::Publish {
+                topic: canonical.to_string(),
+                reason: "test seam: injected ingress demand token failure \
+                         (fault_inject_ingress_token_once)"
+                    .to_string(),
+            });
+        }
         if self.suppress_ingress_token.load(Ordering::Relaxed) {
             tracing::debug!(
                 topic = %canonical,
@@ -4081,9 +4097,11 @@ impl NetworkManager {
                 }
                 return released;
             }
+            // A suspended entry, or an open one whose demand token failed to
+            // declare on an earlier open: declare only the missing parts.
             ingress
                 .iter()
-                .filter(|(_, entry)| entry.suspended)
+                .filter(|(_, entry)| entry.suspended || entry.token.is_none())
                 .map(|(topic, entry)| {
                     (
                         topic.clone(),
@@ -4120,7 +4138,8 @@ impl NetworkManager {
                         topic = %topic,
                         error = %e,
                         "ingress demand token declaration failed after opening LAN access; \
-                         the demand GET path still requests the topic"
+                         the demand GET path still requests the topic, and the next open \
+                         retries the token"
                     );
                     None
                 }
@@ -4130,12 +4149,27 @@ impl NetworkManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match ingress.get_mut(&topic) {
-                Some(entry) if entry.suspended && Arc::ptr_eq(&entry.injector, &injector) => {
-                    if subscriber.is_some() {
+                Some(entry) if Arc::ptr_eq(&entry.injector, &injector) => {
+                    let mut unused = IngressHandles {
+                        _token: None,
+                        _subscriber: None,
+                    };
+                    if entry.subscriber.is_none() {
                         entry.subscriber = subscriber;
+                    } else {
+                        unused._subscriber = subscriber;
                     }
-                    entry.token = token;
-                    entry.suspended = false;
+                    if entry.token.is_none() {
+                        entry.token = token;
+                    } else {
+                        unused._token = token;
+                    }
+                    // Frames flow once the data subscriber exists; a missing
+                    // token stays retryable (`token.is_none()` above).
+                    if entry.subscriber.is_some() {
+                        entry.suspended = false;
+                    }
+                    released.push(unused);
                 }
                 // Unregistered while the declarations ran: drop them.
                 _ => released.push(IngressHandles {
@@ -5383,6 +5417,25 @@ impl NetworkManager {
     pub fn fault_inject_announce_egress_once(&self) {
         self.fail_next_announce_egress
             .store(true, Ordering::Relaxed);
+    }
+
+    /// TEST SEAM: arm fire-once fault injection on the ingress demand token
+    /// declaration: the NEXT declaration fails, as a broken liveliness
+    /// declare would, and disarms the flag.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn fault_inject_ingress_token_once(&self) {
+        self.fail_next_ingress_token.store(true, Ordering::Relaxed);
+    }
+
+    /// TEST SEAM: whether `topic`'s ingress entry holds its demand token,
+    /// or `None` when no ingress is registered for it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn ingress_token_declared_for_test(&self, topic: &str) -> Option<bool> {
+        self.ingress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(canonical_topic(topic).as_ref())
+            .map(|entry| entry.token.is_some())
     }
 
     /// TEST SEAM: install a callback after [`Self::announce_egress_topic`] passes
