@@ -1,0 +1,103 @@
+exit: Some(0)
+--- stdout
+Workspace schemas (schemas/*.yaml): 0
+
+Schemas from the .msg store (schemas/<pkg>/msg): 0 in 0 packages
+
+Built-in ROS 2 messages: 254 in 22 packages
+  action_msgs (3):
+    GoalInfo, GoalStatus, GoalStatusArray
+  autoware_perception_msgs (6):
+    ObjectClassification, PredictedObject, PredictedObjectKinematics
+    PredictedObjects, PredictedPath, Shape
+  autoware_planning_msgs (5):
+    LaneletPrimitive, LaneletRoute, LaneletSegment, Trajectory
+    TrajectoryPoint
+  builtin_interfaces (2):
+    Duration, Time
+  control_msgs (39):
+    AdmittanceControllerState, BatteryStateArray, CANopenState
+    DynamicInterfaceGroupValues, DynamicInterfaceValues, DynamicJointState
+    EtherCATState, Float64Values, GenericHardwareState, GripperCommand
+    HardwareDeviceDiagnostics, HardwareDeviceStatus, HardwareDiagnostics
+    HardwareStatus, InterfaceValue, JointCommand, JointComponentTolerance
+    JointControllerState, JointJog, JointTolerance
+    JointTrajectoryControllerState, JointWrenchTrajectory
+    JointWrenchTrajectoryPoint, Keys, MecanumDriveControllerState
+    MotionArgument, MotionPrimitive, MotionPrimitiveSequence
+    MultiDOFCommand, MultiDOFStateStamped, PidState, SingleDOFState
+    SingleDOFStateStamped, SpeedScalingFactor, SteeringControllerCommand
+    SteeringControllerStatus, VDA5050SafetyState, VDA5050State, WrenchFramed
+  diagnostic_msgs (3):
+    DiagnosticArray, DiagnosticStatus, KeyValue
+  geometry_msgs (32):
+    Accel, AccelStamped, AccelWithCovariance, AccelWithCovarianceStamped
+    Inertia, InertiaStamped, Point, Point32, PointStamped, Polygon
+    PolygonInstance, PolygonInstanceStamped, PolygonStamped, Pose, Pose2D
+    PoseArray, PoseStamped, PoseWithCovariance, PoseWithCovarianceStamped
+    Quaternion, QuaternionStamped, Transform, TransformStamped, Twist
+    TwistStamped, TwistWithCovariance, TwistWithCovarianceStamped, Vector3
+    Vector3Stamped, VelocityStamped, Wrench, WrenchStamped
+  grid_map_msgs (2):
+    GridMap, GridMapInfo
+  moveit_msgs (46):
+    AllowedCollisionEntry, AllowedCollisionMatrix, AttachedCollisionObject
+    BoundingVolume, CartesianPoint, CartesianTrajectory
+    CartesianTrajectoryPoint, CollisionObject, ConstraintEvalResult
+    Constraints, ContactInformation, CostSource, DisplayRobotState
+    DisplayTrajectory, GenericTrajectory, Grasp, GripperTranslation
+    JointConstraint, JointLimits, KinematicSolverInfo, LinkPadding
+    LinkScale, MotionPlanDetailedResponse, MotionPlanRequest
+    MotionPlanResponse, MotionSequenceItem, MotionSequenceRequest
+    MotionSequenceResponse, MoveItErrorCodes, ObjectColor
+    OrientationConstraint, OrientedBoundingBox, PlaceLocation
+    PlannerInterfaceDescription, PlannerParams, PlanningOptions
+    PlanningScene, PlanningSceneComponents, PlanningSceneWorld
+    PositionConstraint, PositionIKRequest, RobotState, RobotTrajectory
+    TrajectoryConstraints, VisibilityConstraint, WorkspaceParameters
+  nav_msgs (5):
+    GridCells, MapMetaData, OccupancyGrid, Odometry, Path
+  object_recognition_msgs (6):
+    ObjectInformation, ObjectType, RecognizedObject, RecognizedObjectArray
+    Table, TableArray
+  octomap_msgs (2):
+    Octomap, OctomapWithPose
+  radar_msgs (4):
+    RadarReturn, RadarScan, RadarTrack, RadarTracks
+  sensor_msgs (27):
+    BatteryState, CameraInfo, ChannelFloat32, CompressedImage, FluidPressure
+    Illuminance, Image, Imu, JointState, Joy, JoyFeedback, JoyFeedbackArray
+    LaserEcho, LaserScan, MagneticField, MultiDOFJointState
+    MultiEchoLaserScan, NavSatFix, NavSatStatus, PointCloud, PointCloud2
+    PointField, Range, RegionOfInterest, RelativeHumidity, Temperature
+    TimeReference
+  shape_msgs (4):
+    Mesh, MeshTriangle, Plane, SolidPrimitive
+  statistics_msgs (3):
+    MetricsMessage, StatisticDataPoint, StatisticDataType
+  std_msgs (30):
+    Bool, Byte, ByteMultiArray, Char, ColorRGBA, Empty, Float32
+    Float32MultiArray, Float64, Float64MultiArray, Header, Int16
+    Int16MultiArray, Int32, Int32MultiArray, Int64, Int64MultiArray, Int8
+    Int8MultiArray, MultiArrayDimension, MultiArrayLayout, String, UInt16
+    UInt16MultiArray, UInt32, UInt32MultiArray, UInt64, UInt64MultiArray
+    UInt8, UInt8MultiArray
+  tf2_msgs (2):
+    TF2Error, TFMessage
+  trajectory_msgs (4):
+    JointTrajectory, JointTrajectoryPoint, MultiDOFJointTrajectory
+    MultiDOFJointTrajectoryPoint
+  unique_identifier_msgs (1):
+    UUID
+  vision_msgs (16):
+    BoundingBox2D, BoundingBox2DArray, BoundingBox3D, BoundingBox3DArray
+    Classification, Detection2D, Detection2DArray, Detection3D
+    Detection3DArray, LabelInfo, ObjectHypothesis, ObjectHypothesisWithPose
+    Point2D, Pose2D, VisionClass, VisionInfo
+  visualization_msgs (12):
+    ImageMarker, InteractiveMarker, InteractiveMarkerControl
+    InteractiveMarkerFeedback, InteractiveMarkerInit, InteractiveMarkerPose
+    InteractiveMarkerUpdate, Marker, MarkerArray, MenuEntry, MeshFile
+    UVCoordinate
+
+--- stderr

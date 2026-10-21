@@ -47,7 +47,7 @@ def _decode_probe(session, schemas, body, *, count=2, offset=36):
 
 
 def test_typed_publisher_requires_schema_set():
-    with pytest.raises(TypeError, match="requires schemas"):
+    with pytest.raises(TypeError, match="a schema name needs schemas="):
         cerulion.connect().publisher("typed-error-no-set", schema="Probe")
 
 
@@ -92,7 +92,7 @@ def test_schema_mismatch_is_typed(session):
     frame = sub.receive(1000)
     assert frame is not None
     with pytest.raises(cerulion.SchemaMismatch) as exc:
-        frame.view(schemas, "Other")
+        frame.view("Other", schemas=schemas)
     assert exc.value.kind == "SchemaMismatch"
     frame.release()
 
@@ -274,7 +274,7 @@ def test_view_cache_is_keyed_on_schema_and_generation(session):
     assert newer.v == 7
     assert frame.view() is newer
     with pytest.raises(cerulion.SchemaMismatch):
-        frame.view(schemas, "B")
+        frame.view("B", schemas=schemas)
     frame.release()
 
 
@@ -293,7 +293,7 @@ def test_string_field_rejects_a_non_string_value(session):
     pub.publish({"id": 1, "values": [2], "name": b"raw"})
     frame = sub.receive(1000)
     assert frame is not None
-    assert frame.view(schemas, "Probe").name == "raw"
+    assert frame.view("Probe", schemas=schemas).name == "raw"
     frame.release()
 
 

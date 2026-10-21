@@ -1,0 +1,5 @@
+exit: Some(0)
+--- stdout
+schema	Schema management
+
+--- stderr

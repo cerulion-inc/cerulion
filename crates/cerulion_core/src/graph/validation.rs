@@ -24,6 +24,36 @@ use super::config::{GraphConfig, NetworkMode};
 use super::topology::MAX_CONSUMER_DEPTH;
 use super::{malformed_absolute_name, resolve_output_topic, resolve_source};
 
+/// Resolve the `header.stamp` location of every trigger input of a node that
+/// matches its Sync trigger on capture time, in the order given.
+///
+/// `inputs` pairs each trigger input's name with its schema's qualified name.
+/// The first input whose schema has no usable `header.stamp` refuses the
+/// whole node with [`TransportError::SyncCaptureStamp`], naming the node and
+/// that input, so a graph that cannot match on capture time fails at load
+/// rather than at its first frame.
+///
+/// Hidden: capture-time matching has no user-facing opt-in yet.
+#[doc(hidden)]
+pub fn resolve_capture_sync_stamps(
+    node_id: &str,
+    inputs: &[(&str, &str)],
+    resolver: &mut crate::codegen::layout::LayoutResolver,
+) -> TransportResult<Vec<crate::scheduler::sync_stamp::HeaderStampLocation>> {
+    inputs
+        .iter()
+        .map(|(input, schema)| {
+            crate::codegen::header_stamp_location(resolver, schema).map_err(|e| {
+                TransportError::SyncCaptureStamp {
+                    node_id: node_id.to_string(),
+                    input: (*input).to_string(),
+                    reason: e.to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
 /// Diagnostic message fragment emitted when `max_slice_len` exceeds
 /// `u32::MAX`. Hoisted into a `pub(crate) const` so the
 /// `format!` site and the test's `err.contains(...)` assertion
@@ -161,7 +191,7 @@ pub struct ValidationOptions<'a> {
     /// graph the full validation had just passed. The supervisor, which holds
     /// the whole graph, names those topics here. Anything NOT in the set still
     /// warns, so a genuine unknown in-prefix source stays loud in a worker.
-    pub sibling_topics: Option<&'a std::collections::BTreeSet<String>>,
+    pub sibling_topics: Option<&'a super::SiblingProducedTopics>,
 }
 
 impl Default for ValidationOptions<'_> {
@@ -806,6 +836,8 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
 ///    `topic:` override or an absolute derived name both count).
 /// 6. **Ingress is external** (rule 3): every `ingress` topic must NOT have
 ///    an in-graph producer — ingress topics are external sources.
+/// 7. **Carriers** (rules 7-10): locators, certificate files and per-topic
+///    reliability, in [`validate_network_carriers`].
 fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
     let Some(net) = &config.network else {
         return Ok(());
@@ -825,11 +857,15 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
     }
 
     // Rules 4 + 6, per list: canonical-absolute shape + no intra-list dups.
-    validate_network_topic_list("egress", &net.egress)?;
+    let egress: Vec<String> = net.egress_topics().map(str::to_string).collect();
+    validate_network_topic_list("egress", &egress)?;
     validate_network_topic_list("ingress", &net.ingress)?;
 
+    // Rules 7-10: carriers, certificate files and per-topic reliability.
+    validate_network_carriers(net)?;
+
     // Rule 1: a topic cannot be both exported and imported.
-    for t in &net.egress {
+    for t in &egress {
         if net.ingress.contains(t) {
             return Err(TransportError::GraphError {
                 reason: format!(
@@ -855,7 +891,7 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
     }
 
     // Rule 2: egress topics must be produced by an in-graph node.
-    for t in &net.egress {
+    for t in &egress {
         if !produced.contains_key(t) {
             return Err(TransportError::GraphError {
                 reason: format!(
@@ -882,6 +918,139 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// The carrier rules of [`validate_network_block`], on an enabled or inert
+/// block alike (a locator or certificate setting that cannot work is wrong
+/// whatever the mode):
+///
+/// 7. **Known carrier**: every `listen` / `connect` locator classifies under
+///    [`classify_locator`] (`tcp/`, `quic/`, `udp/`, with zenoh-valid `rel` and
+///    `mixed_rel` values).
+/// 8. **`quic/` has its certificate files**: a `quic/` LISTEN locator needs
+///    `tls.certificate` and `tls.private_key`; a `quic/` CONNECT locator needs
+///    `tls.root_ca`. A certificate without its key (or a key without its
+///    certificate) is refused, and every `tls` path must be absolute.
+/// 9. **No inert `tls` setting**: `root_ca` is read only by a `quic/` connect
+///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
+///    a connecting peer for no certificate), so each is refused without the
+///    locator that reads it.
+/// 10. **Best effort needs a datagram link**: `default_reliability:
+///     best_effort`, and a `reliability: best_effort` egress topic, each need
+///     at least one `listen` or `connect` locator with `mixed_rel=1`
+///     (`quic/...?mixed_rel=1` or `udp/...?rel=1;mixed_rel=1`);
+///     `mixed_rel=auto` does not count, because it falls back to streams only.
+///     Without one the topics would ride the reliable link with nothing saying
+///     so. The default is refused even when every egress entry sets its own
+///     `reliability`.
+fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> TransportResult<()> {
+    use crate::transport::carrier::{classify_locator, Carrier, EgressReliability};
+    let err = |reason: String| TransportError::GraphError { reason };
+
+    let mut quic_listen = false;
+    let mut quic_connect = false;
+    let mut datagram_link = false;
+    for (list, locators) in [("listen", &net.listen), ("connect", &net.connect)] {
+        for loc in locators {
+            let carrier =
+                classify_locator(loc).map_err(|reason| err(format!("network {list}: {reason}")))?;
+            if matches!(carrier, Carrier::Quic { .. }) {
+                if list == "listen" {
+                    quic_listen = true;
+                } else {
+                    quic_connect = true;
+                }
+            }
+            datagram_link |= carrier.has_datagram_link();
+        }
+    }
+
+    let tls = net.tls.as_ref();
+    if let Some(tls) = tls {
+        if tls.root_ca.is_some() && !quic_connect {
+            return Err(err(
+                "network tls.root_ca is set but no connect locator is quic/, so it would \
+                 change nothing (a quic/ listener asks a connecting peer for no certificate); \
+                 remove it or add a quic/ connect locator"
+                    .to_string(),
+            ));
+        }
+        if (tls.certificate.is_some() || tls.private_key.is_some()) && !quic_listen {
+            return Err(err(
+                "network tls.certificate / tls.private_key are set but no listen locator is \
+                 quic/, so they would change nothing (only a quic/ listener presents them); \
+                 remove them or add a quic/ listen locator"
+                    .to_string(),
+            ));
+        }
+        for (key, path) in [
+            ("root_ca", &tls.root_ca),
+            ("certificate", &tls.certificate),
+            ("private_key", &tls.private_key),
+        ] {
+            if let Some(p) = path {
+                if !p.is_absolute() {
+                    return Err(err(format!(
+                        "network tls.{key} '{}' is not an absolute path; tls paths are read by \
+                         the gateway process, whose working directory is not the graph's",
+                        p.display()
+                    )));
+                }
+            }
+        }
+        if tls.certificate.is_some() != tls.private_key.is_some() {
+            return Err(err(
+                "network tls sets one of certificate / private_key without the other; a quic/ \
+                 listener presents the certificate and signs with its key, so set both"
+                    .to_string(),
+            ));
+        }
+    }
+    if quic_listen && tls.is_none_or(|t| t.certificate.is_none()) {
+        return Err(err(
+            "network listen has a quic/ locator but no tls.certificate / tls.private_key; a \
+             quic/ listener must present a certificate (or use tcp/, or \
+             udp/<ip>:<port>?rel=1;mixed_rel=1 on a WireGuard overlay)"
+                .to_string(),
+        ));
+    }
+    if quic_connect && tls.is_none_or(|t| t.root_ca.is_none()) {
+        return Err(err(
+            "network connect has a quic/ locator but no tls.root_ca; set it to the PEM \
+             certificate(s) the peer's certificate chains to (a self-signed peer certificate is \
+             its own root)"
+                .to_string(),
+        ));
+    }
+
+    if net.default_reliability == EgressReliability::BestEffort && !datagram_link {
+        return Err(err(
+            "network default_reliability is best_effort, but no listen or connect locator is \
+             certain to have a datagram link (mixed_rel=auto falls back to streams when the peer \
+             does not offer it), so every egress topic without its own reliability would ride \
+             the reliable link; add mixed_rel=1 to a quic/ locator \
+             ('quic/<host>:<port>?mixed_rel=1'), use 'udp/<host>:<port>?rel=1;mixed_rel=1', or \
+             remove default_reliability"
+                .to_string(),
+        ));
+    }
+    if let Some(be) = net
+        .egress
+        .iter()
+        .find(|e| e.reliability == Some(EgressReliability::BestEffort))
+    {
+        if !datagram_link {
+            return Err(err(format!(
+                "network egress topic '{}' is reliability: best_effort, but no listen or \
+                 connect locator is certain to have a datagram link (mixed_rel=auto falls back to \
+                 streams when the peer does not offer it), so it would ride the reliable link; add \
+                 mixed_rel=1 to a quic/ locator ('quic/<host>:<port>?mixed_rel=1') or use \
+                 'udp/<host>:<port>?rel=1;mixed_rel=1'",
+                be.topic
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1509,6 +1678,176 @@ nodes:
         assert!(validate_graph(&config).is_ok());
     }
 
+    /// Rules 7-10, accepted shapes: a `quic/` listener with its certificate
+    /// and key and a best-effort topic on a mixed-reliability locator; the
+    /// unsecure `udp/...?rel=1;mixed_rel=1` spelling needs no tls block; a
+    /// best-effort entry on a mixed-rel CONNECT locator counts too; a
+    /// `best_effort` default on a mixed-rel locator, with or without a topic
+    /// that opts back to `reliable`; a `reliable` default and topic need no
+    /// datagram link.
+    #[test]
+    fn test_network_carriers_accepted_shapes() {
+        for block in [
+            r#"network:
+  mode: peer
+  listen:
+    - quic/0.0.0.0:7447?mixed_rel=1
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: best_effort
+  tls:
+    certificate: /etc/cerulion/robo.pem
+    private_key: /etc/cerulion/robo.key
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - udp/0.0.0.0:7684?rel=1;mixed_rel=1
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: best_effort
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  connect:
+    - quic/10.0.0.2:7447?mixed_rel=1
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: best_effort
+  tls:
+    root_ca: /etc/cerulion/peers.pem
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - udp/0.0.0.0:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - /robo/cam/cloud
+"#,
+            r#"network:
+  mode: peer
+  connect:
+    - udp/10.0.0.2:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  default_reliability: reliable
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
+"#,
+        ] {
+            let config = parse_graph(&graph_with_network(block)).unwrap();
+            assert!(
+                validate_graph(&config).is_ok(),
+                "{block}: {:?}",
+                validate_graph(&config).err()
+            );
+        }
+    }
+
+    /// Rules 7-10, refused shapes, each naming what to fix.
+    #[test]
+    fn test_network_carriers_refused_shapes() {
+        for (block, needles) in [
+            (
+                "network:\n  mode: peer\n  listen:\n    - tls/0.0.0.0:7447\n",
+                &["network listen", "tls/ carrier"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - 10.0.0.2:7447\n",
+                &["network connect", "no carrier"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n",
+                &["quic/ locator but no tls.certificate"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n",
+                &["no tls.root_ca"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: /c/a.pem\n",
+                &["without the other"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: certs/a.pem\n    private_key: /c/a.key\n",
+                &["tls.certificate 'certs/a.pem' is not an absolute path"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  tls:\n    root_ca: /c/ca.pem\n",
+                &["tls.root_ca is set but no connect locator is quic/"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n    root_ca: /c/ca.pem\n",
+                &["tls.root_ca is set but no connect locator is quic/"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n  tls:\n    root_ca: /c/ca.pem\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
+                &["no listen locator is quic/"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
+                &["/robo/cam/cloud", "best_effort", "mixed_rel=1"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
+                &["no listen or connect locator is certain to have a datagram link"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
+                &["mixed_rel=auto falls back"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - /robo/cam/cloud\n",
+                &["network default_reliability is best_effort", "mixed_rel=1", "remove default_reliability"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: reliable\n",
+                &["network default_reliability is best_effort"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  default_reliability: best_effort\n",
+                &["network default_reliability is best_effort", "mixed_rel=auto falls back"][..],
+            ),
+        ] {
+            let config = parse_graph(&graph_with_network(block)).unwrap();
+            let err = validate_graph(&config).expect_err(block).to_string();
+            for needle in needles {
+                assert!(err.contains(needle), "{block}\nwant '{needle}' in: {err}");
+            }
+        }
+    }
+
+    /// Duplicate detection reads the topic name whatever the entry spelling.
+    #[test]
+    fn test_network_egress_duplicate_across_spellings_rejected() {
+        let yaml = graph_with_network(
+            r#"network:
+  mode: peer
+  listen:
+    - udp/0.0.0.0:7684?rel=1;mixed_rel=1
+  egress:
+    - /robo/cam/cloud
+    - topic: /robo/cam/cloud
+      reliability: best_effort
+"#,
+        );
+        let config = parse_graph(&yaml).unwrap();
+        let err = validate_graph(&config).unwrap_err().to_string();
+        assert!(err.contains("/robo/cam/cloud"), "{err}");
+        assert!(err.contains("egress"), "{err}");
+    }
+
     /// Rule 1: a topic in BOTH egress and ingress is rejected, naming the
     /// topic + the fix.
     #[test]
@@ -1682,5 +2021,92 @@ nodes:
         let config = parse_graph(&yaml).unwrap();
         assert!(config.network.is_none());
         assert!(validate_graph(&config).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod capture_sync_stamp_tests {
+    use super::*;
+    use crate::codegen::layout::LayoutResolver;
+    use crate::codegen::parse_rosmsg;
+    use crate::scheduler::sync_stamp::HeaderStampLocation;
+
+    fn builtin_resolver() -> LayoutResolver {
+        let mut schemas = Vec::new();
+        for (pkg, name, text) in native_ros2_messages::BUILTIN_MSGS {
+            if let Ok(s) = parse_rosmsg(text, name, Some(pkg)) {
+                schemas.push(s);
+            }
+        }
+        LayoutResolver::new(schemas).0
+    }
+
+    #[test]
+    fn every_stamped_trigger_input_resolves_in_declaration_order() {
+        let got = resolve_capture_sync_stamps(
+            "fuse",
+            &[
+                ("cam", "sensor_msgs/Image"),
+                ("pose", "geometry_msgs/PoseStamped"),
+            ],
+            &mut builtin_resolver(),
+        )
+        .expect("both inputs carry header.stamp");
+        assert_eq!(
+            got,
+            vec![
+                HeaderStampLocation::Table {
+                    fixed_size: 16,
+                    index: 0,
+                    stamp_offset: 0,
+                    data_floor: 40
+                },
+                HeaderStampLocation::Table {
+                    fixed_size: 56,
+                    index: 0,
+                    stamp_offset: 0,
+                    data_floor: 64
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_input_without_a_stamp_refuses_the_node_and_names_node_and_input() {
+        let err = resolve_capture_sync_stamps(
+            "fuse",
+            &[
+                ("cam", "sensor_msgs/Image"),
+                ("imu_raw", "geometry_msgs/Vector3"),
+            ],
+            &mut builtin_resolver(),
+        )
+        .expect_err("Vector3 has no header");
+        match &err {
+            TransportError::SyncCaptureStamp {
+                node_id,
+                input,
+                reason,
+            } => {
+                assert_eq!(node_id, "fuse");
+                assert_eq!(input, "imu_raw");
+                assert_eq!(
+                    reason,
+                    "schema `geometry_msgs/Vector3` has no `header` field"
+                );
+            }
+            other => panic!("expected SyncCaptureStamp, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("node 'fuse'"), "{text}");
+        assert!(text.contains("input 'imu_raw'"), "{text}");
+    }
+
+    #[test]
+    fn a_node_with_no_trigger_inputs_resolves_to_nothing() {
+        assert_eq!(
+            resolve_capture_sync_stamps("fuse", &[], &mut builtin_resolver()).expect("empty"),
+            vec![]
+        );
     }
 }

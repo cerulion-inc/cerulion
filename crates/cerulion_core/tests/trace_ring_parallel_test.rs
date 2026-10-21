@@ -676,7 +676,10 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
     // each data-trigger consumer's unified drain additionally logs ONE kind-6
     // DrainedBatch record at its level's end (input 0, popped 1, served-seq =
     // the step index — both producers' commit counters start at 0), so the
-    // relay/sink levels carry [FIRE, READ_OUTCOME] pairs.
+    // relay/sink levels carry [FIRE, READ_OUTCOME] pairs. The Data burst's
+    // refill after the fire finds the queue empty and stages nothing: a
+    // plan-driven replay asks no consult for that probe, so recording it would
+    // leave a position no replayed log could fill.
     let mut oracle = Vec::new();
     for k in 0..STEPS {
         let t = (k + 1) * 10_000_000;

@@ -660,12 +660,12 @@ pub const fn derive_stage_capacity(role: ReadStageRole, sizing: ReadStageSizing)
     // ONE record per consumed frame. An ORDINARY Body can out-run `depth` under
     // a refill, but its node's `burst` term is the same
     // `DATA_PENDING_CARRY_CLAMP`, so `depth + burst >= max_sets` already covers
-    // it. A `Drain` stage stages ONE `DrainedBatch` per NON-EMPTY drain whatever
-    // the batch popped (`drain_samples`: `if capture && count > 0` stages once,
-    // with `popped` as a FIELD), so a queue provisioned deeper than the
-    // declaration by another consumer — the legacy-`Sync` site's
-    // `depth.max(sub_buf)` — yields a bigger `popped`, never more records. That
-    // is pinned by
+    // it. A `Drain` stage stages ONE record per drain whatever the batch
+    // popped (`drain_samples`: a `DrainedBatch` with `popped` as a FIELD when
+    // the drain delivered, one `NoFrame` when it delivered nothing), so a queue
+    // provisioned deeper than the declaration by another consumer (the
+    // legacy-`Sync` site's `depth.max(sub_buf)`) yields a bigger `popped`,
+    // never more records. That is pinned by
     // `a_drain_stage_holds_a_batch_deeper_than_its_declared_depth`.
     let consuming = sizing.depth as u64;
     // Run-length encoding folds a maximal run of identical non-consuming
@@ -790,8 +790,10 @@ fn records_fold(last: &StagedReadOutcome, incoming: &StagedReadOutcome) -> bool 
 
 /// The fold kill switch, `CERULION_READ_LOG_FOLD=off`.
 ///
-/// Read once per process. A run with folding OFF stamps `trace_format` 5 rather
-/// than 6, so a bag never claims a format whose encoding it did not use.
+/// Read once per process. The `trace_format` stamp does not move with it: the
+/// every-consult record stamps 7 above the fold term, and a fold-off stream's
+/// structurally zero run words contradict no stamp (`0` and `1` both decode to
+/// one occurrence).
 ///
 /// The CAPACITY does not depend on this switch, and the reason is NOT that
 /// folding shrinks the worst case: the derivation keeps its
@@ -995,13 +997,34 @@ pub enum ReadSiteRole {
     /// The bits were never written (a format <= 4 bag). Takes the pre-roles arm
     /// at every consumer.
     Unstamped = 0,
-    /// The read was performed by a DRAIN — a read that CONSUMES from the
-    /// input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD:
-    /// `try_receive_for_drain` (the Separate/Sync trigger drain),
-    /// `drain_for_trigger` (the unified boundary drain), the Data burst refill,
-    /// the per-set Sync matcher's `Advance`/`DiscardTie` REFILL, and the
+    /// The read was performed by a DRAIN: a read that CONSUMES from the
+    /// input's queue on the scheduler's behalf AND whose frame BECAME THE HEAD,
+    /// or whose consult at one of those sites found the queue empty and
+    /// recorded `NoFrame`. The sites: `try_receive_for_drain` (the
+    /// Separate/Sync trigger drain), `drain_for_trigger` (the unified boundary
+    /// drain), the Data burst refill, the per-set Sync matcher's
+    /// `Advance`/`DiscardTie` REFILL and its empty `NeedStamp` peek, and the
     /// matcher's PROMOTION of an already-peeked frame. That enumeration IS the
-    /// definition. Its stamps are what reached `sync_input_timestamps`.
+    /// definition. The empty-consult record covers every one of those sites
+    /// except the ones a POST-FIRE REFILL align pass reaches, which is a pass
+    /// that runs on the recording side only: a planned `Data` fire asks the
+    /// refill hook between its fires and never makes the terminal probe
+    /// (`Scheduler::tick_replay_burst`), and a planned Sync fire runs no refill
+    /// align pass at all (`Scheduler::set_trigger_refill` refuses any non-`Data`
+    /// policy, so a Sync node has no refill hook installed). Four sites take
+    /// that carve-out: `drain_for_trigger` under `TriggerDrainSite::Refill` (the
+    /// Data burst's hook, and the align pass's `SyncHeadOp::FillRefill`), and
+    /// the matcher's own `sync_peek_next_stamp` and `sync_discard_head` under
+    /// `SyncAlignSite::Refill` (the empty `NeedStamp` peek, and the
+    /// `Advance`/`DiscardTie` refill that found the queue empty). Each takes its
+    /// site as an argument from its caller; see each fn's `FrozenSlot::Empty`
+    /// arm. The BOUNDARY align pass runs on both sides, unconditionally inside
+    /// `GraphRuntime::drain_level`, so its empty consults record. The matcher's
+    /// non-empty reads are unaffected at either site: its frame stamps are what
+    /// reached `sync_input_timestamps`. A non-empty read a REFILL pass makes is
+    /// recorded, as it has been since trace format 5, and has no replayed twin;
+    /// the `NeedStamp` pop records `Peek` and the promotion and the queue
+    /// refill record `Drain`.
     ///
     /// "Performed by the scheduler" would NOT separate the roles, and the
     /// carve-out is not an exception to a rule: the step-boundary snapshot is
@@ -1126,8 +1149,10 @@ pub enum ReadOutcomeKind {
     /// The HELD sample was replayed (no new arrival); `served_seq`
     /// carries the HELD frame's wire sequence.
     Held = 2,
-    /// No frame has ever been delivered on this input — the read observed
-    /// nothing (wire kind "none").
+    /// The read served nothing and took nothing (wire kind "none"): a
+    /// latest-value body read on an input no frame has reached, or, from trace
+    /// format 7 on, any consult that found the queue empty, at a drain site
+    /// under `Drain` and at the accumulate-all tick-body read under `Body`.
     NoFrame = 3,
     /// A trigger/batch drain: `served_seq` = the NEWEST sequence in the
     /// batch, `popped` = the batch size. Per-message FIFO (52125241e): an
@@ -1413,6 +1438,19 @@ pub struct ReadOutcomeStage {
     /// Armed by `GraphRuntime::set_trace_ring_producer` (recording runs
     /// only). Disarmed = every `record` is a load+branch no-op.
     armed: AtomicBool,
+    /// Does a consult that found its queue EMPTY stage a record (`NoFrame`,
+    /// popped 0 at an empty queue, the call site's role)? `true` at creation,
+    /// the shape every trace format 7 recorder writes. It is the per-BAG rule;
+    /// which sites it covers is the subscriber's, and the one site it never
+    /// reaches is a burst's between-fires refill (see
+    /// `CerulionSubscriber::drain_for_trigger`). A REPLAY adopts the
+    /// recording's own rule through [`Self::adopt_consult_records`]: a bag
+    /// declared below format 7 holds no record at its empty consults, and a
+    /// replay that staged one there would hand the redundant read log
+    /// verifier a replayed position with no recorded partner at every quiet
+    /// step. Read by the subscriber beside `armed` at each consult site that
+    /// found nothing, one `Acquire` load.
+    records_every_consult: AtomicBool,
     /// Staged-record count mirror — lets the merge skip empty stages without
     /// taking the lock (one `Acquire` load per stage per level).
     pending: AtomicU32,
@@ -1437,6 +1475,7 @@ impl ReadOutcomeStage {
             role,
             capacity: AtomicU32::new(derive_stage_capacity(role, sizing)),
             armed: AtomicBool::new(false),
+            records_every_consult: AtomicBool::new(true),
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
         }
@@ -1536,6 +1575,27 @@ impl ReadOutcomeStage {
     #[inline]
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Acquire)
+    }
+
+    /// Adopt the RECORDING's consult rule: does a consult that found its queue
+    /// empty stage a record? Called once per stage, before step 0, from
+    /// `GraphRuntime::set_read_log_records_every_consult` with the answer the
+    /// bag's `trace_format` gives; a recording run never calls it and keeps the
+    /// creation value `true`.
+    pub(crate) fn adopt_consult_records(&self, every: bool) {
+        self.records_every_consult.store(every, Ordering::Release);
+    }
+
+    /// Whether a consult that found its queue empty stages a record on this
+    /// stage.
+    ///
+    /// `true` at creation, the shape every trace format 7 recorder writes. A
+    /// replay adopts the recording's own answer before step 0, through
+    /// `GraphRuntime::set_read_log_records_every_consult` over every wired
+    /// stage; a recording run never moves it.
+    #[inline]
+    pub fn records_every_consult(&self) -> bool {
+        self.records_every_consult.load(Ordering::Acquire)
     }
 
     /// Stage one read outcome. `served_seq` is the served frame's wire
@@ -2169,11 +2229,12 @@ pub struct ReadEdgeCapability {
 
 /// A recorded read the re-execution did not reproduce.
 ///
-/// Three kinds for what an operator reads as one story, kept apart because
+/// Four kinds for what an operator reads as one story, kept apart because
 /// they distinguish "the drain never ran" from "the drain ran and the queue
-/// was short" from "the drain ran and the head was a different frame", which
-/// is the difference between a missing fire, a missing frame and a reordered
-/// stream.
+/// was short" from "the drain ran and the head was a different frame" from
+/// "a drain ran where the recording holds no read", which is the difference
+/// between a missing fire, a missing frame, a reordered stream and an extra
+/// consult.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayReadViolationKind {
     /// A [`DueRead`] with `pops > 0` that no drain consulted this step.
@@ -2195,6 +2256,17 @@ pub enum ReplayReadViolationKind {
         /// The sequence the replay's surviving frame carried.
         observed: Option<u32>,
     },
+    /// A consult the step's plan held no position for, under
+    /// [`ConsultRule::Recorded`]: the recording holds a record for every
+    /// consult it made at this stage, so a consult past them is one it did not
+    /// make.
+    UnplannedConsult {
+        /// The ordinal of this consult within the step at this stage, from 1.
+        consult: u32,
+        /// How many reads the recording holds at this stage this step (0 when
+        /// the step installed no plan for it).
+        planned: u32,
+    },
 }
 
 impl ReplayReadViolationKind {
@@ -2205,6 +2277,7 @@ impl ReplayReadViolationKind {
             Self::NeverArrived { .. } => "never_arrived",
             Self::PoppedShortfall { .. } => "popped_shortfall",
             Self::SequenceMismatch { .. } => "sequence_mismatch",
+            Self::UnplannedConsult { .. } => "unplanned_consult",
         }
     }
 }
@@ -2219,6 +2292,31 @@ pub struct ReplayReadViolation {
     pub step: u64,
     /// How it diverged.
     pub kind: ReplayReadViolationKind,
+}
+
+/// How the gate reads a consult the step's plan holds no position for,
+/// decided ONCE at arm time from the bag's trace format and never per consult.
+///
+/// `Counted` is a recording whose empty drains wrote no record (trace formats
+/// 1 to 6): the plan is short of the positions the replay's empty consults
+/// spend, so a consult past it is a REPORTED NUMBER
+/// ([`ReadPlanStage::unplanned_consults`]) and never a verdict. `Recorded` is a
+/// recording where every gated consult A REPLAY OF IT ALSO MAKES left a record
+/// (trace format 7 on): the plan holds one position per consult the replay
+/// makes, so a consult past it, and a consult against a step the plan declares
+/// consult-free, is a schedule the recording did not take and mints
+/// [`ReplayReadViolationKind::UnplannedConsult`]. The qualifier costs the plan
+/// no position: the one consult the recorder omits is a burst's between-fires
+/// refill when its answer is empty, which is the probe that ended a burst a
+/// plan-driven replay does not re-derive, so neither side holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ConsultRule {
+    /// An over-run of the plan is counted and reported.
+    #[default]
+    Counted = 0,
+    /// An over-run of the plan is a divergence.
+    Recorded = 1,
 }
 
 /// What one gate consult answers.
@@ -2330,6 +2428,9 @@ struct PlanInner {
     /// Set when the mutex was found poisoned. The stage then refuses every
     /// later admission instead of falling back to a live pop.
     unusable: bool,
+    /// How a consult the plan holds no position for is read, written at
+    /// `arm` from the bag's trace format and reset to `Counted` at `disarm`.
+    rule: ConsultRule,
 }
 
 impl ReadPlanStage {
@@ -2375,10 +2476,14 @@ impl ReadPlanStage {
         self.rim
     }
 
-    /// Can this edge be gated, and why not. Read BEFORE step 0.
+    /// Can this edge be gated under `rule`, and why not. Read BEFORE step 0,
+    /// under the rule the bag's trace format selects: the wiring refusal takes
+    /// the rule and names, per blocker, which rules it refuses under, and both
+    /// blockers refuse under either rule in this build. The census and the arm
+    /// pass the same rule, so both read ONE answer.
     #[must_use]
-    pub fn capability(&self) -> ReadEdgeCapability {
-        let reason = self.wiring_refusal();
+    pub fn capability_under(&self, rule: ConsultRule) -> ReadEdgeCapability {
+        let reason = self.wiring_refusal(rule);
         ReadEdgeCapability {
             key: self.key.clone(),
             enforceable: reason.is_none(),
@@ -2386,11 +2491,18 @@ impl ReadPlanStage {
         }
     }
 
-    /// Arm the gate. An unarmed stage is UNGATED for the whole run.
-    pub(crate) fn arm(&self) -> Result<(), ReadPlanRefusal> {
-        if let Some(reason) = self.wiring_refusal() {
+    /// Arm the gate under `rule`. An unarmed stage is UNGATED for the whole
+    /// run; the rule is stored once here and read at every consult the plan
+    /// holds no position for.
+    pub(crate) fn arm(&self, rule: ConsultRule) -> Result<(), ReadPlanRefusal> {
+        if let Some(reason) = self.wiring_refusal(rule) {
             return Err(reason);
         }
+        let mut inner = self
+            .lock_plan()
+            .map_err(|_| ReadPlanRefusal::GateUnusable(self.key.clone()))?;
+        inner.rule = rule;
+        drop(inner);
         self.armed.store(true, Ordering::Release);
         Ok(())
     }
@@ -2401,6 +2513,7 @@ impl ReadPlanStage {
         self.armed.store(false, Ordering::Release);
         if let Ok(mut inner) = self.inner.lock() {
             inner.installed = false;
+            inner.rule = ConsultRule::Counted;
             inner.due.clear();
             inner.cursor = 0;
             inner.admitted_this_step = 0;
@@ -2495,7 +2608,38 @@ impl ReadPlanStage {
         // only meaningful while one IS installed.
         if !inner.installed {
             inner.refused_consults = inner.refused_consults.saturating_add(1);
-            inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+            match inner.rule {
+                ConsultRule::Counted => {
+                    inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+                }
+                // The omission declares that this stage reads nothing this
+                // step, and under a recording that holds a record for every
+                // consult, a consult against that declaration is one the
+                // recording did not make: the same divergence an empty step
+                // plan mints below, minted the same way so the two arms the
+                // plan rules identical really are. `cursor` is the ordinal
+                // because `sweep` resets it to zero at the end of every step
+                // for every armed stage, so the first consult of an omitted
+                // step reads 0 and each one past it reads one more; a constant
+                // 1 would report the second and the tenth consult alike and
+                // spend the stage's violation rim on duplicates. Nothing else
+                // reads a cursor with no plan under it: `sweep` walks
+                // `due[cursor..]`, empty here, and `install_step` resets it.
+                ConsultRule::Recorded => {
+                    let consult = u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
+                    inner.cursor = inner.cursor.saturating_add(1);
+                    Self::retain_violation(
+                        &mut inner,
+                        &self.key,
+                        self.rim,
+                        now,
+                        ReplayReadViolationKind::UnplannedConsult {
+                            consult,
+                            planned: 0,
+                        },
+                    );
+                }
+            }
             return GateAnswer::Withhold;
         }
         if inner.step != now {
@@ -2512,15 +2656,47 @@ impl ReadPlanStage {
         loop {
             let Some(due) = inner.due.get(inner.cursor).copied() else {
                 inner.refused_consults = inner.refused_consults.saturating_add(1);
-                // An EMPTY step plan is a DECLARATION ("this stage reads nothing
-                // this step"), and it is the ORDINARY shape: a drain that found
-                // its queue empty writes no record at all, so most steps of a
-                // gated stage name no read. A consult past a plan that DID hold
-                // positions is the other fact: the step's records are spent and a
-                // drain asked for one more, which is the plan and the drain
-                // disagreeing about how many reads the step holds.
-                if !inner.due.is_empty() {
-                    inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+                match inner.rule {
+                    // Under a recording whose empty drains wrote nothing, an
+                    // EMPTY step plan is the ORDINARY shape (most steps of a
+                    // gated stage name no read) and a consult against it is the
+                    // enforcement working; a consult past a plan that DID hold
+                    // positions is the plan and the drain disagreeing about how
+                    // many reads the step holds, counted and reported.
+                    ConsultRule::Counted => {
+                        if !inner.due.is_empty() {
+                            inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+                        }
+                    }
+                    // Under a recording that holds a record for every consult,
+                    // the plan has one position per consult the recording made,
+                    // an empty plan included (it consulted zero times here), so
+                    // a consult with no position left is a schedule the
+                    // recording did not take. One position per consult stays
+                    // the invariant: the divergence is minted and the consult
+                    // withholds.
+                    ConsultRule::Recorded => {
+                        let consult =
+                            u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
+                        let planned = u32::try_from(inner.due.len()).unwrap_or(u32::MAX);
+                        // The cursor keeps COUNTING past the plan under this
+                        // rule, which is what makes `consult` the ordinal of
+                        // this consult within the step rather than the same
+                        // number on every over-run: the recording holds one
+                        // position per consult it made, so a cursor that
+                        // stopped at the end would name the second and the
+                        // tenth over-run alike. Nothing else reads a cursor
+                        // past the plan: `sweep` walks `due[cursor..]`, which
+                        // is already empty here, and `install_step` resets it.
+                        inner.cursor = inner.cursor.saturating_add(1);
+                        Self::retain_violation(
+                            &mut inner,
+                            &self.key,
+                            self.rim,
+                            now,
+                            ReplayReadViolationKind::UnplannedConsult { consult, planned },
+                        );
+                    }
                 }
                 return GateAnswer::Withhold;
             };
@@ -2668,9 +2844,11 @@ impl ReadPlanStage {
         self.lock_for_report().refused_consults
     }
 
-    /// Consults the installed plan held no position for: no install for the
-    /// step, or past the step's last recorded read. A harness fault, reported
-    /// beside the verdict and never part of it.
+    /// Consults the installed plan held no position for under
+    /// [`ConsultRule::Counted`]: no install for the step, or past a non-empty
+    /// step plan's last recorded read. Reported beside the verdict and never
+    /// part of it; structurally zero under [`ConsultRule::Recorded`], where
+    /// the same consult mints [`ReplayReadViolationKind::UnplannedConsult`].
     #[must_use]
     pub fn unplanned_consults(&self) -> u64 {
         self.lock_for_report().unplanned_consults
@@ -2704,15 +2882,20 @@ impl ReadPlanStage {
     }
 
     /// The wiring refusal, or the poison one, or none.
-    fn wiring_refusal(&self) -> Option<ReadPlanRefusal> {
-        match self.blocker {
-            Some(GateBlocker::PerSetSyncEdge) => {
+    fn wiring_refusal(&self, rule: ConsultRule) -> Option<ReadPlanRefusal> {
+        match (self.blocker, rule) {
+            // The matcher's ops pop outside the two gated drain bodies, so a
+            // gate here is bypassed under either rule until those ops consult
+            // it.
+            (Some(GateBlocker::PerSetSyncEdge), ConsultRule::Counted | ConsultRule::Recorded) => {
                 return Some(ReadPlanRefusal::PerSetSyncEdge(self.key.clone()))
             }
-            Some(GateBlocker::MultiPublisherEdge) => {
-                return Some(ReadPlanRefusal::MultiPublisherEdge(self.key.clone()))
-            }
-            None => {}
+            // The wire sequence is per publisher under either rule.
+            (
+                Some(GateBlocker::MultiPublisherEdge),
+                ConsultRule::Counted | ConsultRule::Recorded,
+            ) => return Some(ReadPlanRefusal::MultiPublisherEdge(self.key.clone())),
+            (None, _) => {}
         }
         match self.lock_plan() {
             Ok(inner) if inner.unusable => Some(ReadPlanRefusal::GateUnusable(self.key.clone())),
@@ -2723,16 +2906,27 @@ impl ReadPlanStage {
 
     /// Retain one divergence, or count it against the rim.
     fn mint(&self, step: u64, kind: ReplayReadViolationKind) {
-        let rim = self.rim as usize;
         let Ok(mut inner) = self.lock_plan() else {
             return;
         };
-        if inner.violations.len() >= rim {
+        Self::retain_violation(&mut inner, &self.key, self.rim, step, kind);
+    }
+
+    /// [`Self::mint`]'s body over a guard the caller already holds, for the
+    /// consult that mints while it walks the plan (the lock is not reentrant).
+    fn retain_violation(
+        inner: &mut PlanInner,
+        key: &StageKey,
+        rim: u32,
+        step: u64,
+        kind: ReplayReadViolationKind,
+    ) {
+        if inner.violations.len() >= rim as usize {
             inner.violations_dropped = inner.violations_dropped.saturating_add(1);
             return;
         }
         inner.violations.push(ReplayReadViolation {
-            key: self.key.clone(),
+            key: key.clone(),
             step,
             kind,
         });
@@ -2852,6 +3046,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             role,
             capacity,
             armed,
+            records_every_consult,
             pending,
             inner
         }),
@@ -2879,12 +3074,15 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
-        // ABI v24: the ENFORCEMENT side. The subscriber owns a
+        // ABI v27: the ENFORCEMENT side. The subscriber owns a
         // `ReadPlanStage` through a crate-owned `Arc`, which `abi_layout`'s
         // covered closure reaches, so the plan's own chain is pinned on the
         // same rule the capture chain above is: the records a cdylib's code can
         // index are pinned by FIELD SET and by offset, and the stage that holds
-        // them by field set alone (it embeds a `std::sync::Mutex`).
+        // them by field set alone (it embeds a `std::sync::Mutex`). What 27
+        // carries here is `PlanInner::rule` and the `ConsultRule` enum beside
+        // it, so a cdylib built against a core below 27 reads the plan's tail at
+        // offsets this core does not write.
         abi_pin_struct!(ReadPlanStage {
             key,
             rim,
@@ -2905,7 +3103,12 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             violations,
             violations_dropped,
             mismatches,
-            unusable
+            unusable,
+            rule
+        }),
+        abi_pin_enum!(ConsultRule {
+            ConsultRule::Counted,
+            ConsultRule::Recorded
         }),
         abi_pin_struct!(DueRead { shape, served_seq }),
         abi_pin_enum!(DueShape {
@@ -2917,7 +3120,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
         abi_pin_enum!(ReplayReadViolationKind {
             ReplayReadViolationKind::NeverArrived { .. },
             ReplayReadViolationKind::PoppedShortfall { .. },
-            ReplayReadViolationKind::SequenceMismatch { .. }
+            ReplayReadViolationKind::SequenceMismatch { .. },
+            ReplayReadViolationKind::UnplannedConsult { .. }
         }),
         abi_pin_enum!(GateBlocker {
             GateBlocker::PerSetSyncEdge,
@@ -5155,9 +5359,18 @@ mod tests {
         }
     }
 
-    /// An ARMED plan stage at the ordinary rim, plus the step cell a runtime
+    /// An ARMED plan stage at the ordinary rim under [`ConsultRule::Counted`]
+    /// (the rule every format 1 to 6 bag arms), plus the step cell a runtime
     /// would own, so an arm can drive the step the way `step_live` does.
     fn armed_plan(blocker: Option<GateBlocker>) -> (Arc<ReadPlanStage>, Arc<AtomicU64>) {
+        armed_plan_under(blocker, ConsultRule::Counted)
+    }
+
+    /// [`armed_plan`] under an explicit consult rule.
+    fn armed_plan_under(
+        blocker: Option<GateBlocker>,
+        rule: ConsultRule,
+    ) -> (Arc<ReadPlanStage>, Arc<AtomicU64>) {
         let now = Arc::new(AtomicU64::new(0));
         let plan = Arc::new(ReadPlanStage::new(
             plan_key("relay", 0, ReadStageRole::Body),
@@ -5165,8 +5378,17 @@ mod tests {
             blocker,
             Arc::clone(&now),
         ));
-        plan.arm().expect("an ordinary body stage arms");
+        plan.arm(rule).expect("an ordinary body stage arms");
         (plan, now)
+    }
+
+    /// The one divergence an over-run mints under [`ConsultRule::Recorded`].
+    fn unplanned(step: u64, consult: u32, planned: u32) -> ReplayReadViolation {
+        ReplayReadViolation {
+            key: plan_key("relay", 0, ReadStageRole::Body),
+            step,
+            kind: ReplayReadViolationKind::UnplannedConsult { consult, planned },
+        }
     }
 
     fn at_step(now: &AtomicU64, step: u64) {
@@ -5204,17 +5426,46 @@ mod tests {
         plan.settle(served(1, 7), 1, Some(7));
         assert_eq!(plan.admitted(), 1);
 
-        // An EMPTY step plan is the same declaration, and it is the ORDINARY
-        // shape: a drain that found its queue empty writes no record, so most
-        // steps of a gated stage name no read at all. It refuses the consult
-        // WITHOUT counting it as one the plan held no position for, which is
-        // what keeps that harness-fault witness meaningful.
+        // An EMPTY step plan is the same declaration, and under `Counted` (a
+        // recording whose empty drains wrote no record) it is the ORDINARY
+        // shape: most steps of a gated stage name no read at all. It refuses
+        // the consult WITHOUT counting it as one the plan held no position
+        // for, which is what keeps that witness meaningful.
         plan.sweep(5);
         at_step(&now, 6);
         plan.install_step(6, &[]).unwrap();
         assert_eq!(plan.admit(), GateAnswer::Withhold);
         assert_eq!(plan.refused_consults(), 2);
         assert_eq!(plan.unplanned_consults(), 0);
+        plan.sweep(6);
+        assert!(plan.take_violations().is_empty());
+
+        // THE `Recorded` LEG, same stimulus: a recording that holds a record
+        // for every consult installs an empty plan only where it consulted
+        // zero times, so the consult at step 6 is one the recording did not
+        // make. Hand table: `UnplannedConsult { consult: 1, planned: 0 }` at
+        // step 6, withheld, refused; the counted witness stays at zero.
+        let (plan, now) = armed_plan_under(None, ConsultRule::Recorded);
+        at_step(&now, 4);
+        plan.install_step(4, &[NOTHING]).unwrap();
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        plan.sweep(4);
+        at_step(&now, 5);
+        plan.install_step(5, &[served(1, 7)]).unwrap();
+        assert_eq!(plan.admit(), GateAnswer::Exact(served(1, 7)));
+        plan.settle(served(1, 7), 1, Some(7));
+        plan.sweep(5);
+        assert!(
+            plan.take_violations().is_empty(),
+            "two consults with positions mint nothing"
+        );
+        at_step(&now, 6);
+        plan.install_step(6, &[]).unwrap();
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.refused_consults(), 2);
+        assert_eq!(plan.unplanned_consults(), 0);
+        plan.sweep(6);
+        assert_eq!(plan.take_violations(), vec![unplanned(6, 1, 0)]);
     }
 
     #[test]
@@ -5233,11 +5484,50 @@ mod tests {
         assert_eq!(plan.admitted_this_step(), 3);
         plan.settle(served(3, 9), 2, Some(9));
         assert_eq!(plan.admitted(), 2);
-        // The two consults past a SPENT non-empty plan are the plan and the
-        // drain disagreeing about how many reads the step holds, counted apart
-        // from a recorded none and from an empty step plan.
+        // Under `Counted` the two consults past a SPENT non-empty plan are
+        // the plan and the drain disagreeing about how many reads the step
+        // holds, counted apart from a recorded none and from an empty step
+        // plan.
         assert_eq!(plan.refused_consults(), 2);
         assert_eq!(plan.unplanned_consults(), 2);
+        plan.sweep(1);
+        // The ONE divergence this stimulus mints under `Counted`, and it comes
+        // from the settle rather than from the two over-run consults: the grant
+        // was three pops and the drain delivered two. Hand table, so the arm
+        // says which half of the step is a divergence and which is a number.
+        assert_eq!(
+            plan.take_violations(),
+            vec![ReplayReadViolation {
+                key: plan_key("relay", 0, ReadStageRole::Body),
+                step: 1,
+                kind: ReplayReadViolationKind::PoppedShortfall {
+                    expected: 3,
+                    admitted: 2,
+                },
+            }],
+            "an over-run of the plan is a COUNT under this rule; the shortfall \
+             is the divergence"
+        );
+
+        // THE `Recorded` LEG, same stimulus: the recording holds ONE read at
+        // this stage this step, so the second and third consults are two
+        // schedules it did not take. Hand table: `{ consult: 2, planned: 1 }`
+        // then `{ consult: 3, planned: 1 }`, both at step 1; the counted
+        // witness stays at zero, the refused witness counts both.
+        let (plan, now) = armed_plan_under(None, ConsultRule::Recorded);
+        at_step(&now, 1);
+        plan.install_step(1, &[served(3, 9)]).unwrap();
+        assert_eq!(plan.admit(), GateAnswer::Exact(served(3, 9)));
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        plan.settle(served(3, 9), 3, Some(9));
+        assert_eq!(plan.refused_consults(), 2);
+        assert_eq!(plan.unplanned_consults(), 0);
+        plan.sweep(1);
+        assert_eq!(
+            plan.take_violations(),
+            vec![unplanned(1, 2, 1), unplanned(1, 3, 1)]
+        );
     }
 
     /// **An EMPTY step plan withholds, admits nothing and mints no violation.**
@@ -5418,6 +5708,62 @@ mod tests {
         assert_eq!(plan.admit(), GateAnswer::Exact(served(1, 7)));
     }
 
+    /// **THE GAP THE FORMAT CLOSES, pinned from BOTH sides of one run.**
+    ///
+    /// A stage consulted twice in one step whose POP is at the SECOND consult is
+    /// the shape the every-consult record exists for, and one run yields two
+    /// different plans depending on the format its recording stamped:
+    ///
+    /// * a format 7 recording holds a position per CONSULT, so the plan is
+    ///   `[nothing, served]`: the first consult withholds, the second admits,
+    ///   and the pop lands at the consult the recording served it at;
+    /// * the same run below format 7 wrote NO record for the empty first
+    ///   consult, so its plan is `[served]` alone: the FIRST consult spends the
+    ///   pop the recording served at the SECOND (one consult EARLY), and the
+    ///   second consult finds the plan spent, which the counted rule reports as
+    ///   one `unplanned_consults`.
+    ///
+    /// Neither side mints a violation: the archived side's over-run is a
+    /// reported number by design (the recording cannot distinguish it), and the
+    /// modern side has nothing to report. The two plans are the hand oracle,
+    /// written here rather than read back from the code under test.
+    ///
+    /// The engine-level twin of this pair needs a FIXTURE whose stage takes its
+    /// pop at a second consult within one step, which this tree's fixtures do
+    /// not produce (every one of them pops at the first consult of the step, the
+    /// boundary drain), so the gap is pinned at the gate rather than end to end.
+    #[test]
+    fn one_run_two_plans_put_the_pop_at_different_consults() {
+        // FORMAT 7: one position per consult.
+        let (modern, now) = armed_plan_under(None, ConsultRule::Recorded);
+        at_step(&now, 3);
+        modern.install_step(3, &[NOTHING, served(1, 7)]).unwrap();
+        assert_eq!(modern.admit(), GateAnswer::Withhold);
+        assert_eq!(modern.admit(), GateAnswer::Exact(served(1, 7)));
+        modern.settle(served(1, 7), 1, Some(7));
+        modern.sweep(3);
+        assert_eq!(modern.admitted(), 1);
+        assert_eq!(modern.refused_consults(), 1);
+        assert_eq!(modern.unplanned_consults(), 0);
+        assert!(modern.take_violations().is_empty());
+
+        // BELOW FORMAT 7: the same run, one record short, under the rule that
+        // recording selects.
+        let (archived, now) = armed_plan_under(None, ConsultRule::Counted);
+        at_step(&now, 3);
+        archived.install_step(3, &[served(1, 7)]).unwrap();
+        assert_eq!(archived.admit(), GateAnswer::Exact(served(1, 7)));
+        archived.settle(served(1, 7), 1, Some(7));
+        // The second consult has no position left: the OVER-RUN this format
+        // bump removes, counted and never minted.
+        assert_eq!(archived.admit(), GateAnswer::Withhold);
+        archived.sweep(3);
+        assert_eq!(archived.admitted(), 1);
+        assert_eq!(archived.refused_consults(), 1);
+        assert_eq!(archived.unplanned_consults(), 1);
+        assert!(archived.take_violations().is_empty());
+    }
+
     #[test]
     fn a_stale_plan_admits_nothing_and_counts_a_mismatch() {
         let (plan, now) = armed_plan(None);
@@ -5500,11 +5846,40 @@ mod tests {
         at_step(&now, 6);
         assert_eq!(plan.admit(), GateAnswer::Withhold);
         assert_eq!(plan.refused_consults(), 1);
-        // And it is counted as UNPLANNED: an armed stage the step's install
-        // omitted holds no position for this consult, which is a different fact
-        // from a recorded none.
+        // And under `Counted` it is counted as UNPLANNED: an armed stage the
+        // step's install omitted holds no position for this consult, which is
+        // a different fact from a recorded none.
         assert_eq!(plan.unplanned_consults(), 1);
         assert!(plan.is_armed());
+        assert!(plan.take_violations().is_empty());
+
+        // HALF THREE: the same omission under `Recorded`. The omitted install
+        // is the declaration that this stage reads nothing this step, the same
+        // declaration an empty plan makes, so each consult mints the same
+        // divergence: `{ consult: 1, planned: 0 }` then `{ consult: 2,
+        // planned: 0 }` at step 6, and the counted witness stays at zero.
+        let (plan, now) = armed_plan_under(None, ConsultRule::Recorded);
+        at_step(&now, 6);
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.refused_consults(), 1);
+        assert_eq!(plan.unplanned_consults(), 0);
+        // A SECOND consult of the same omitted step is the SECOND consult, by
+        // hand: an ordinal, never a constant, so two consults of one omitted
+        // stage render two distinguishable operator lines.
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.refused_consults(), 2);
+        assert_eq!(
+            plan.take_violations(),
+            vec![unplanned(6, 1, 0), unplanned(6, 2, 0)]
+        );
+        // A disarm resets the rule with the plan, so a re-arm under `Counted`
+        // counts again instead of minting.
+        plan.disarm();
+        plan.arm(ConsultRule::Counted).unwrap();
+        at_step(&now, 7);
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        assert_eq!(plan.unplanned_consults(), 1);
+        assert!(plan.take_violations().is_empty());
     }
 
     #[test]
@@ -5528,11 +5903,11 @@ mod tests {
 
         // And a disarm retires the quota with the gate, so a re-arm cannot
         // spend a retired step's reads.
-        plan.arm().unwrap();
+        plan.arm(ConsultRule::Counted).unwrap();
         plan.install_step(0, &[served(1, 1)]).unwrap();
         plan.disarm();
         assert!(!plan.is_armed());
-        plan.arm().unwrap();
+        plan.arm(ConsultRule::Counted).unwrap();
         assert_eq!(plan.admit(), GateAnswer::Withhold);
     }
 
@@ -5550,28 +5925,34 @@ mod tests {
                 ReadPlanRefusal::MultiPublisherEdge(key.clone()),
             ),
         ] {
-            let plan =
-                ReadPlanStage::new(key.clone(), ORDINARY_RIM, Some(blocker), Arc::clone(&now));
-            let census = plan.capability();
-            assert!(!census.enforceable);
-            assert_eq!(census.reason.as_ref(), Some(&want));
-            assert_eq!(plan.arm(), Err(want));
-            assert!(!plan.is_armed());
-            // Every refusal NAMES the stage, which is what an operator reads.
-            assert_eq!(census.reason.unwrap().key().label(), "relay[2]/body");
+            // Both wiring refusals hold under both consult rules today.
+            for rule in [ConsultRule::Counted, ConsultRule::Recorded] {
+                let plan =
+                    ReadPlanStage::new(key.clone(), ORDINARY_RIM, Some(blocker), Arc::clone(&now));
+                let census = plan.capability_under(rule);
+                assert!(!census.enforceable, "{blocker:?} under {rule:?}");
+                assert_eq!(census.reason.as_ref(), Some(&want));
+                assert_eq!(plan.arm(rule), Err(want.clone()));
+                assert!(!plan.is_armed());
+                // Every refusal NAMES the stage, which is what an operator reads.
+                assert_eq!(census.reason.unwrap().key().label(), "relay[2]/body");
+            }
         }
 
-        // A gateable stage's census row says so, and its arm succeeds.
-        let ok = ReadPlanStage::new(key.clone(), ORDINARY_RIM, None, Arc::clone(&now));
-        assert_eq!(
-            ok.capability(),
-            ReadEdgeCapability {
-                key: key.clone(),
-                enforceable: true,
-                reason: None,
-            }
-        );
-        assert!(ok.arm().is_ok());
+        // A gateable stage's census row says so under both rules, and its arm
+        // succeeds.
+        for rule in [ConsultRule::Counted, ConsultRule::Recorded] {
+            let ok = ReadPlanStage::new(key.clone(), ORDINARY_RIM, None, Arc::clone(&now));
+            assert_eq!(
+                ok.capability_under(rule),
+                ReadEdgeCapability {
+                    key: key.clone(),
+                    enforceable: true,
+                    reason: None,
+                }
+            );
+            assert!(ok.arm(rule).is_ok());
+        }
     }
 
     /// THE BOUND ON A STEP PLAN IS THE RECORDING, NOT THE RIM.
@@ -5624,7 +6005,11 @@ mod tests {
             None,
             Arc::clone(&now),
         );
-        plan.arm().expect("an ordinary body stage arms");
+        // Armed under the rule every format 1 to 6 bag arms under, which keeps
+        // this arm's claim the one it made: a recorded NOTHING withholds and
+        // mints nothing under either rule, and the rim is what is on trial.
+        plan.arm(ConsultRule::Counted)
+            .expect("an ordinary body stage arms");
         let wide: Vec<DueRead> = (0..=READ_OUTCOME_STAGE_MAX).map(|_| NOTHING).collect();
         assert!(
             wide.len() > READ_OUTCOME_STAGE_MIN as usize,
@@ -5786,7 +6171,7 @@ mod tests {
         assert!(caught.is_err());
 
         // The census and the arm both name the stage and the cause.
-        let census = plan.capability();
+        let census = plan.capability_under(ConsultRule::Counted);
         assert!(!census.enforceable);
         assert_eq!(
             census.reason,

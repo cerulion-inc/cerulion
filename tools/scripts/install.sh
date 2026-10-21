@@ -7,7 +7,8 @@
 # error so the backups remain available for manual recovery.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+#   curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh -s -- --uninstall
 #
 set -eu
 
@@ -29,6 +30,7 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [--version vX.Y.Z[-PRERELEASE]] [--dir DIRECTORY] [--base-url URL]
                   [--no-modify-path]
+       install.sh --uninstall [--dir DIRECTORY]
        install.sh --self-test
 
 Install the Cerulion CLI and its sibling daemons from a release archive.
@@ -37,7 +39,9 @@ Options:
   --version TAG     Install this release (otherwise use the latest stable release)
   --dir DIRECTORY  Install into DIRECTORY instead of $CERULION_INSTALL_DIR or ~/.cerulion/bin
   --base-url URL    Override the release download root (for local/offline testing)
-  --no-modify-path  Leave the shell profile files alone and print the PATH to set
+  --no-modify-path  Leave the shell profile files and ~/.local/bin alone and print the PATH to set
+  --uninstall       Remove what this script installed: the programs, their links, the
+                    env files and the marked profile lines (sign-in and settings stay)
   --self-test       Exercise platform and version parsing without network access
 
 Setting CERULION_NO_MODIFY_PATH to any value has the same effect as
@@ -482,6 +486,7 @@ is_running_pid() {
 # an `env` file that prepends the program directories, a fish twin of it, and
 # one marked line in each profile the user's shell reads that sources the file.
 PROFILE_MARKER='# added by the Cerulion installer'
+ENV_FILE_HEADER='# Written by the Cerulion installer; the next install rewrites it.'
 
 sh_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
@@ -520,7 +525,7 @@ write_env_file() {
     {
         printf '%s\n' '#!/bin/sh'
         printf '%s\n' '# Put the Cerulion programs on the PATH of this shell.'
-        printf '%s\n' '# Written by the Cerulion installer; the next install rewrites it.'
+        printf '%s\n' "$ENV_FILE_HEADER"
         sh_path_stanza "$env_bin"
         if [ -n "$env_cargo" ]; then
             sh_path_stanza "$env_cargo"
@@ -546,7 +551,7 @@ write_env_fish_file() {
     rm -f "$fish_env_temp" || return 1
     {
         printf '%s\n' '# Put the Cerulion programs on the PATH of this shell.'
-        printf '%s\n' '# Written by the Cerulion installer; the next install rewrites it.'
+        printf '%s\n' "$ENV_FILE_HEADER"
         fish_path_stanza "$fish_env_bin"
         if [ -n "$fish_env_cargo" ]; then
             fish_path_stanza "$fish_env_cargo"
@@ -667,9 +672,460 @@ setup_path_for_shells() {
         apply_profile "$setup_fish_dir/conf.d/cerulion.fish" \
             "$(fish_source_line "$setup_env_fish")" 1
     fi
-    printf 'Open a new terminal, or run . %s, then run cerulion login\n' \
-        "$(sh_quote "$setup_env")"
     return 0
+}
+
+# The programs that get a link in a bin directory the shell already searches.
+# The libraries stay beside the real binaries, where the CLI looks for them.
+LINKED_PROGRAMS='cerulion cerulion-netd cerulion-connectd'
+
+# The directory a shell searches for programs without any setup: ~/.local/bin
+# is on the default PATH of Debian and Ubuntu logins (through ~/.profile, once
+# the directory exists) and of Fedora, and is where Claude Code, Codex, uv and
+# pipx put their commands.
+home_bin_dir() {
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+# /usr/local/bin is on every default PATH. It is used only when it is writable
+# without sudo, and the variable is a test seam: no self-test arm may link into
+# the real directory.
+system_bin_dir() {
+    printf '%s\n' "${CERULION_SYSTEM_BIN_DIR:-/usr/local/bin}"
+}
+
+dir_on_path() {
+    on_path_dir=${1%/}
+    case ":${PATH:-}:" in
+        *":$on_path_dir:"* | *":$on_path_dir/:"*) return 0 ;;
+    esac
+    return 1
+}
+
+# 0 when the link at $1 resolves to the program at $2: the text this installer
+# writes, or another spelling of the same file.
+link_is_ours() {
+    [ -L "$1" ] || return 1
+    [ "$(readlink "$1" 2>/dev/null || :)" = "$2" ] && return 0
+    # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
+    [ -e "$2" ] && [ "$1" -ef "$2" ]
+}
+
+# Links each program into $1, pointing at the install directory $2. A name
+# that is already taken by anything other than this install's link is left
+# alone and reported. Returns 0 when every program is linked.
+link_programs() {
+    link_dir=$1
+    link_source=$2
+    if [ ! -d "$link_dir" ]; then
+        if ! mkdir -p "$link_dir" 2>/dev/null; then
+            printf 'warning: could not create %s\n' "$link_dir" >&2
+            return 1
+        fi
+    fi
+    link_failed=0
+    link_added=0
+    for link_program in $LINKED_PROGRAMS; do
+        link_path="$link_dir/$link_program"
+        link_target="$link_source/$link_program"
+        if link_is_ours "$link_path" "$link_target"; then
+            continue
+        fi
+        if [ -L "$link_path" ]; then
+            printf 'warning: leaving %s alone: it links to %s, not to this install\n' \
+                "$link_path" "$(readlink "$link_path" 2>/dev/null || :)" >&2
+            link_failed=1
+        elif [ -e "$link_path" ]; then
+            printf 'warning: leaving %s alone: it is not a link this installer made\n' \
+                "$link_path" >&2
+            link_failed=1
+        elif ln -s "$link_target" "$link_path" 2>/dev/null; then
+            link_added=1
+        else
+            printf 'warning: could not link %s\n' "$link_path" >&2
+            link_failed=1
+        fi
+    done
+    if [ "$link_added" -eq 1 ]; then
+        printf 'Linked the Cerulion programs into %s\n' "$link_dir"
+    fi
+    return "$link_failed"
+}
+
+# 0 when every directory from $1 up to / lets other accounts through, so a
+# link in a shared bin directory resolves for them too. A root install under
+# /root (mode 0700) fails this.
+dir_reachable_by_all() {
+    # The physical path, so a 0700 directory behind a symlink is checked too.
+    reach_dir=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd) || return 1
+    # The stop is a test seam: a self-test's scratch tree sits under a 0700
+    # temporary directory, so the arm checks from its own root down.
+    reach_stop=/
+    if [ -n "${CERULION_SELF_TEST_REACH_ROOT:-}" ]; then
+        reach_stop=$(CDPATH='' cd -P -- "$CERULION_SELF_TEST_REACH_ROOT" 2>/dev/null && pwd) ||
+            reach_stop=/
+    fi
+    while [ -n "$reach_dir" ] && [ "$reach_dir" != / ] && [ "$reach_dir" != "$reach_stop" ]; do
+        # shellcheck disable=SC2012
+        reach_mode=$(ls -ld "$reach_dir" 2>/dev/null | awk 'NR == 1 { print substr($1, 10, 1) }')
+        case "$reach_mode" in
+            x | t) ;;
+            *) return 1 ;;
+        esac
+        reach_dir=${reach_dir%/*}
+    done
+    return 0
+}
+
+# 0 when no account other than root and this one can change $1 or any
+# directory above it. Two chains are walked up to /: the path as written
+# (made absolute), where each component is followed through a symlink and the
+# symlink's own directory is the next component up, and the physical path.
+# The directories above a symlink's target are on the physical chain only
+# when that target is part of the resolved path.
+# Each directory has to pass path_safe_from_others. On a nonzero return,
+# unsafe_dir names the first directory that failed; safe_physical holds the
+# physical path that was checked.
+dir_safe_from_others() {
+    unsafe_dir=$1
+    safe_physical=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd) || return 1
+    case "$1" in
+        /*) safe_written=$1 ;;
+        *) safe_written="$(pwd)/$1" ;;
+    esac
+    safe_uid=$(id -u)
+    # The same test seam as dir_reachable_by_all: the walk ends below the
+    # self-test's scratch root, whose parents are the machine's temporary
+    # directories. Both spellings of the root end it.
+    safe_stop_written=
+    safe_stop_physical=
+    if [ -n "${CERULION_SELF_TEST_REACH_ROOT:-}" ]; then
+        safe_stop_written=${CERULION_SELF_TEST_REACH_ROOT%/}
+        safe_stop_physical=$(CDPATH='' cd -P -- "$CERULION_SELF_TEST_REACH_ROOT" 2>/dev/null && pwd) ||
+            safe_stop_physical=
+    fi
+    for safe_dir in "$safe_written" "$safe_physical"; do
+        while [ "$safe_dir" != / ] && [ "${safe_dir%/}" != "$safe_dir" ]; do
+            safe_dir=${safe_dir%/}
+        done
+        while [ -n "$safe_dir" ] && [ "$safe_dir" != "$safe_stop_written" ] &&
+            [ "$safe_dir" != "$safe_stop_physical" ]; do
+            path_safe_from_others "$safe_dir" "$safe_uid" || return 1
+            [ "$safe_dir" != / ] || break
+            safe_dir=${safe_dir%/*}
+            [ -n "$safe_dir" ] || safe_dir=/
+        done
+    done
+    return 0
+}
+
+# 0 when $1 (followed through a symlink) is owned by uid 0 or uid $2 and has
+# neither the group nor the other write bit; sets unsafe_dir to $1 otherwise.
+# A sticky world-writable directory fails. On Linux a POSIX ACL entry that
+# grants write also sets the group write bit ls prints (the ACL mask). A macOS
+# ACL is separate from the mode, so the entries `ls -le` lists are read too,
+# and one that allows any kind of write fails; where ls has no ACL listing
+# (GNU, busybox) no entry line is printed and the mode decides.
+path_safe_from_others() {
+    unsafe_dir=$1
+    # shellcheck disable=SC2012
+    safe_mode=$(ls -dLn -- "$1" 2>/dev/null | awk -v uid="$2" '
+        NR == 1 {
+            if (($3 == 0 || $3 == uid) && substr($1, 6, 1) != "w" && substr($1, 9, 1) != "w")
+                print $1
+        }
+    ')
+    [ -n "$safe_mode" ] || return 1
+    # shellcheck disable=SC2010  # the ACL entry lines are read, not file names
+    if ls -dLle -- "$1" 2>/dev/null |
+        grep -E '^ *[0-9]+: .* allow .*(write|add_file|add_subdirectory|delete_child|append|delete|chown)' >/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# A piped installer cannot change the PATH of the shell that ran it, so the
+# programs are linked into a directory that shell may already search: always
+# ~/.local/bin, and /usr/local/bin as well when ~/.local/bin is not on this
+# PATH but /usr/local/bin is, already exists and is writable without sudo
+# (in practice root). The shared directory is skipped when another account
+# could not follow the link into the install directory (root's 0700 home, a
+# macOS home), when a different cerulion is already on this PATH, which a
+# link earlier on the PATH would hide, and with a warning when another
+# account could change the shared directory, the install directory or a
+# linked program (system_link_safe). The links are made only after every
+# binary is activated, and a failure is a warning.
+link_into_path_dirs() {
+    path_link_source=$1
+    path_link_home=$(home_bin_dir)
+    path_link_existing=$(command -v cerulion 2>/dev/null || :)
+    if [ "$path_link_home" != "$path_link_source" ]; then
+        link_programs "$path_link_home" "$path_link_source" || :
+    fi
+    path_link_system=$(system_bin_dir)
+    if [ "$path_link_system" != "$path_link_source" ] &&
+        ! dir_on_path "$path_link_home" &&
+        dir_on_path "$path_link_system" &&
+        [ -d "$path_link_system" ] && [ -w "$path_link_system" ] &&
+        dir_reachable_by_all "$path_link_source"; then
+        # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
+        if [ -n "$path_link_existing" ] &&
+            ! [ "$path_link_existing" -ef "$path_link_source/cerulion" ]; then
+            :
+        elif ! system_link_safe "$path_link_system" "$path_link_source"; then
+            printf 'warning: not linking the Cerulion programs into %s: another account can change %s; add %s to PATH to run cerulion by name\n' \
+                "$path_link_system" "$unsafe_dir" "$path_link_home" >&2
+        else
+            # The links name the physical install directory, so running one
+            # follows no symlink outside the chain system_link_safe checked.
+            link_programs "$path_link_system" "$system_safe_root" || :
+        fi
+    fi
+}
+
+# 0 when a link in the shared directory $1 to the programs in $2 runs only
+# what root or this account put there: both directories pass
+# dir_safe_from_others and so does each linked program that exists. Sets
+# system_safe_root to the physical path of $2.
+system_link_safe() {
+    dir_safe_from_others "$1" || return 1
+    dir_safe_from_others "$2" || return 1
+    # The string that was checked is the one linked to: a second resolution
+    # could follow a symlink changed after the check.
+    system_safe_root=$safe_physical
+    system_safe_uid=$(id -u)
+    for system_safe_program in $LINKED_PROGRAMS; do
+        [ -e "$system_safe_root/$system_safe_program" ] || continue
+        path_safe_from_others "$system_safe_root/$system_safe_program" "$system_safe_uid" ||
+            return 1
+    done
+    return 0
+}
+
+# The last line of an install: whether `cerulion` already runs in the shell
+# that started the installer (this process inherited its PATH), and the one
+# command to run when it does not.
+print_next_step() {
+    next_install=$1
+    next_cargo=$2
+    next_env=$3
+    next_found=$(command -v cerulion 2>/dev/null || :)
+    next_ready=0
+    # shellcheck disable=SC3013  # -ef is in POSIX.1-2024 and in dash, bash, ash and ksh
+    if [ -n "$next_found" ] && [ "$next_found" -ef "$next_install/cerulion" ]; then
+        next_ready=1
+    fi
+    # Any cargo on this PATH will do: the Rust step refuses a machine whose
+    # Rust is not managed by rustup, so a cargo found here is a rustup proxy.
+    next_cargo_ready=1
+    if [ -n "$next_cargo" ] && ! dir_on_path "$next_cargo" &&
+        ! command -v cargo >/dev/null 2>&1; then
+        next_cargo_ready=0
+    fi
+    if [ "$next_ready" -eq 1 ] && [ "$next_cargo_ready" -eq 1 ]; then
+        printf '%s\n' 'cerulion is ready in this terminal; sign in once with cerulion login'
+        return 0
+    fi
+    if [ -n "$next_found" ] && [ "$next_ready" -eq 0 ] && dir_on_path "$next_install"; then
+        # Sourcing the env file changes nothing when the install directory is
+        # already on the PATH, so it is not offered as the fix.
+        printf 'Another cerulion (%s) comes before %s on this PATH; remove it or move %s earlier, then sign in once with cerulion login\n' \
+            "$next_found" "$next_install" "$next_install"
+        return 0
+    fi
+    if [ -z "$next_env" ]; then
+        return 1
+    fi
+    case "${SHELL:-}" in
+        */fish) next_command="source $(fish_quote "$next_env.fish")" ;;
+        *) next_command=". $(sh_quote "$next_env")" ;;
+    esac
+    if [ "$next_ready" -eq 1 ]; then
+        printf 'cerulion is ready in this terminal; run %s to put Cargo on its PATH too (new terminals have both), then sign in once with cerulion login\n' \
+            "$next_command"
+    elif [ -n "$next_found" ]; then
+        printf 'Another cerulion (%s) comes first on this PATH; run %s to put this install first, then sign in once with cerulion login\n' \
+            "$next_found" "$next_command"
+    else
+        printf 'To use cerulion in this terminal, run %s (new terminals already have it), then sign in once with cerulion login\n' \
+            "$next_command"
+    fi
+    return 0
+}
+
+# Removes every line carrying the installer's marker from one profile, writing
+# the file in place so a profile that is a link stays a link.
+remove_profile_line() {
+    remove_path=$1
+    [ -f "$remove_path" ] || return 0
+    grep -Fq "$PROFILE_MARKER" "$remove_path" 2>/dev/null || return 0
+    if ! profile_path_is_safe "$remove_path"; then
+        printf 'warning: leaving %s alone: it is a symlink out of your home directory\n' \
+            "$remove_path" >&2
+        return 1
+    fi
+    if ! remove_temp=$(mktemp "${TMPDIR:-/tmp}/cerulion-profile.XXXXXX"); then
+        printf 'warning: could not remove the PATH line from %s: no temporary file\n' \
+            "$remove_path" >&2
+        return 1
+    fi
+    remove_status=0
+    grep -vF "$PROFILE_MARKER" "$remove_path" > "$remove_temp" || remove_status=$?
+    if [ "$remove_status" -gt 1 ]; then
+        rm -f "$remove_temp"
+        printf 'warning: could not remove the PATH line from %s\n' "$remove_path" >&2
+        return 1
+    fi
+    # The write truncates the profile first; on a failed write the filtered
+    # copy is kept and named so nothing of the profile is lost.
+    if ! cat "$remove_temp" > "$remove_path"; then
+        printf 'warning: could not rewrite %s; its contents without the PATH line are in %s\n' \
+            "$remove_path" "$remove_temp" >&2
+        return 1
+    fi
+    rm -f "$remove_temp"
+    printf 'PATH line removed from %s\n' "$remove_path"
+    un_removed=1
+}
+
+# Undoes what an install wrote and nothing else: the programs and libraries
+# in the install directory (the default one, or one carrying this installer's
+# marker), the links that point at them, the two env files and the marked
+# profile lines. ~/.cerulion keeps the sign-in, keys and settings, and a Rust
+# toolchain stays with rustup, which manages it.
+uninstall_cerulion() {
+    un_dir=$1
+    [ "$un_dir" = / ] || un_dir=${un_dir%/}
+    un_status=0
+    un_removed=0
+    un_abs=$un_dir
+    if [ -d "$un_dir" ]; then
+        un_abs=$(CDPATH='' cd -- "$un_dir" && pwd) || un_abs=$un_dir
+        if [ -f "$un_dir/.cerulion-install.lock" ] &&
+            [ "$(classify_lock_owner "$un_dir/.cerulion-install.lock")" = live ]; then
+            die "an installation into $un_dir is in progress; run --uninstall after it finishes"
+        fi
+    fi
+    un_default=
+    if [ -n "${HOME:-}" ]; then
+        un_default="$HOME/.cerulion/bin"
+    fi
+    if [ -d "$un_dir" ] && [ "$un_dir" != "$un_default" ] &&
+        ! grep -Fq '"method":"install.sh"' "$un_dir/.cerulion-provenance.json" 2>/dev/null; then
+        # Nothing at all is changed for a directory this installer did not
+        # write: not its links, and not the PATH setup another install uses.
+        printf 'error: leaving %s alone: it carries no marker from this installer; nothing was removed\n' \
+            "$un_dir" >&2
+        return 1
+    fi
+    if [ -n "${HOME:-}" ]; then
+        un_link_dirs="$(home_bin_dir)
+$(system_bin_dir)"
+    else
+        un_link_dirs=$(system_bin_dir)
+    fi
+    # The system links name the physical install directory.
+    un_physical=$(CDPATH='' cd -P -- "$un_dir" 2>/dev/null && pwd) || un_physical=
+    un_old_ifs=$IFS
+    set -f
+    IFS='
+'
+    for un_link_dir in $un_link_dirs; do
+        IFS=$un_old_ifs
+        for un_program in $LINKED_PROGRAMS; do
+            un_link="$un_link_dir/$un_program"
+            if link_is_ours "$un_link" "$un_abs/$un_program" ||
+                link_is_ours "$un_link" "$un_dir/$un_program" ||
+                { [ -n "$un_physical" ] && link_is_ours "$un_link" "$un_physical/$un_program"; }; then
+                if rm -f "$un_link"; then
+                    printf 'Removed %s\n' "$un_link"
+                    un_removed=1
+                else
+                    printf 'warning: could not remove %s\n' "$un_link" >&2
+                    un_status=1
+                fi
+            fi
+        done
+    done
+    IFS=$un_old_ifs
+    set +f
+    if [ ! -d "$un_dir" ]; then
+        printf 'Nothing installed in %s\n' "$un_dir"
+    else
+        for un_file in cerulion cerulion-netd cerulion-connectd \
+            librmw_cerulion.so libcerulion_heaphook.so .cerulion-provenance.json; do
+            if [ -f "$un_dir/$un_file" ] || [ -L "$un_dir/$un_file" ]; then
+                rm -f "$un_dir/$un_file" || {
+                    printf 'warning: could not remove %s\n' "$un_dir/$un_file" >&2
+                    un_status=1
+                }
+            fi
+        done
+        un_removed=1
+        if rmdir "$un_dir" 2>/dev/null; then
+            printf 'Removed %s\n' "$un_dir"
+        else
+            printf 'Removed the Cerulion programs from %s; other files there were left in place\n' \
+                "$un_dir"
+        fi
+    fi
+    if [ -z "${HOME:-}" ]; then
+        printf '%s\n' 'NOTE: HOME is unset, so no shell profile was changed.' >&2
+        return "$un_status"
+    fi
+    un_home=${CERULION_HOME:-$HOME/.cerulion}
+    # The PATH setup is shared by whichever install wrote it last; it is
+    # removed only when it names this directory, so uninstalling a second
+    # copy leaves the first one on the PATH.
+    # The stanza is matched exactly, so a prefix or a typo of the directory
+    # never matches the path the env file names.
+    if [ -f "$un_home/env" ] &&
+        ! grep -Fq "*:$(sh_quote "$un_dir"):*)" "$un_home/env" 2>/dev/null &&
+        ! grep -Fq "*:$(sh_quote "$un_abs"):*)" "$un_home/env" 2>/dev/null; then
+        printf 'The PATH setup in %s names another install, so it was left in place\n' \
+            "$un_home/env"
+    else
+        # Profile lines first: the env files go only once nothing sources them.
+        un_profiles_status=0
+        for un_profile in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bash_login" \
+            "$HOME/.bashrc" "${ZDOTDIR:-$HOME}/.zshenv"; do
+            remove_profile_line "$un_profile" || un_profiles_status=1
+        done
+        un_fish="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/cerulion.fish"
+        if remove_profile_line "$un_fish"; then
+            if [ -f "$un_fish" ] && [ ! -s "$un_fish" ]; then
+                rm -f "$un_fish" || un_profiles_status=1
+            fi
+        else
+            un_profiles_status=1
+        fi
+        if [ "$un_profiles_status" -ne 0 ]; then
+            printf 'warning: kept %s and %s, which a profile above still sources\n' \
+                "$un_home/env" "$un_home/env.fish" >&2
+            un_status=1
+        else
+            for un_env in "$un_home/env" "$un_home/env.fish"; do
+                if [ -f "$un_env" ] && grep -Fxq "$ENV_FILE_HEADER" "$un_env" 2>/dev/null; then
+                    if rm -f "$un_env"; then
+                        printf 'Removed %s\n' "$un_env"
+                        un_removed=1
+                    else
+                        printf 'warning: could not remove %s\n' "$un_env" >&2
+                        un_status=1
+                    fi
+                fi
+            done
+        fi
+    fi
+    if [ "$un_status" -eq 0 ] && [ "$un_removed" -eq 0 ]; then
+        printf '%s\n' 'Nothing of this installer was found to remove'
+    elif [ "$un_status" -eq 0 ]; then
+        printf 'Cerulion is uninstalled. %s keeps your sign-in and settings; delete it to remove those too. A Rust toolchain stays with rustup.\n' \
+            "$un_home"
+    else
+        printf 'error: the uninstall did not finish; the warnings above name what is left\n' >&2
+    fi
+    return "$un_status"
 }
 
 # The install-provenance marker: one line of JSON beside the binaries naming
@@ -733,6 +1189,10 @@ self_test() {
     # their own scratch homes.
     CERULION_NO_MODIFY_PATH=1
     export CERULION_NO_MODIFY_PATH
+    # Nor may any install link into the real /usr/local/bin: the system link
+    # directory names a path that does not exist unless an arm creates it.
+    CERULION_SYSTEM_BIN_DIR="${TMPDIR:-/tmp}/cerulion-self-test-system-bin.$$"
+    export CERULION_SYSTEM_BIN_DIR
     [ "$(platform_target Linux x86_64)" = "x86_64-unknown-linux-gnu" ] ||
         die "self-test: Linux x86_64 mapping failed"
     [ "$(platform_target Linux aarch64)" = "aarch64-unknown-linux-gnu" ] ||
@@ -1053,6 +1513,11 @@ EOF
     fi
     owner_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-install-owner-test.XXXXXX") ||
         die "self-test: could not create owner classification directory"
+    # A TMPDIR with a trailing slash (the macOS default) makes mktemp return a
+    # path with "//"; the installer links to the cd-and-pwd form, so the
+    # expected link targets below use that form too.
+    owner_test_dir=$(CDPATH='' cd -- "$owner_test_dir" && pwd) ||
+        die "self-test: could not resolve owner classification directory"
     owner_test_path="$owner_test_dir/lock"
     cleanup_owner_test() {
         rm -rf "$owner_test_dir"
@@ -2185,8 +2650,30 @@ EOF
             "install.sh self-test: skipping FIFO destination arm because mkfifo is unavailable" >&2
     fi
 
+    # tar applies the umask to the programs it extracts, and a group-writable
+    # program is never linked into the system bin directory, so the arms up to
+    # the system link uninstall run under 022 whatever umask started the
+    # self-test.
+    self_test_umask=$(umask)
+    umask 022
     path_setup_root="$owner_test_dir/path-setup"
     mkdir -p "$path_setup_root"
+    # The PATH of the shell the arms pretend to run in: this one's, minus any
+    # directory holding a `cerulion`, so a copy installed on the machine
+    # running the self-test cannot decide which next step an arm prints.
+    path_clean=
+    path_rest="$PATH:"
+    while [ -n "$path_rest" ]; do
+        path_entry=${path_rest%%:*}
+        path_rest=${path_rest#*:}
+        [ -n "$path_entry" ] || continue
+        [ -e "$path_entry/cerulion" ] && continue
+        path_clean="${path_clean:+$path_clean:}$path_entry"
+    done
+    path_run_path=$path_clean
+    path_run_shell=/bin/sh
+    path_run_system="$path_setup_root/no-system-bin"
+    path_run_reach_root=/
     run_path_setup_install() {
         path_run_home=$1
         path_run_install=$2
@@ -2200,6 +2687,10 @@ EOF
             HOME="$path_run_home" \
             ZDOTDIR="$path_run_home" \
             XDG_CONFIG_HOME="$path_run_home/.config" \
+            PATH="$path_run_path" \
+            SHELL="$path_run_shell" \
+            CERULION_SYSTEM_BIN_DIR="$path_run_system" \
+            CERULION_SELF_TEST_REACH_ROOT="$path_run_reach_root" \
             "$0" --version v0.1.0 \
             --dir "$path_run_install" \
             --base-url "file://$signal_fixture_dir" \
@@ -2252,10 +2743,23 @@ EOF
         die "self-test: PATH setup did not report the env file it wrote"
     grep -Fq "PATH line added to $first_home/.profile" "$first_output" ||
         die "self-test: PATH setup did not report the profile it edited"
-    grep -Fq "Open a new terminal, or run . " "$first_output" ||
-        die "self-test: PATH setup did not say how to use the new PATH"
-    grep -Fq "cerulion login" "$first_output" ||
-        die "self-test: PATH setup did not name the sign-in command"
+    first_last=$(tail -n 1 "$first_output")
+    [ "$first_last" = "To use cerulion in this terminal, run . $(sh_quote "$first_env") (new terminals already have it), then sign in once with cerulion login" ] ||
+        die "self-test: an install off this PATH ended with: $first_last"
+    for path_program in $LINKED_PROGRAMS; do
+        [ -L "$first_home/.local/bin/$path_program" ] ||
+            die "self-test: PATH setup did not link $path_program into ~/.local/bin"
+        [ "$(readlink "$first_home/.local/bin/$path_program")" = "$first_install/$path_program" ] ||
+            die "self-test: the ~/.local/bin link for $path_program does not name the install"
+    done
+    for path_library in librmw_cerulion.so libcerulion_heaphook.so; do
+        [ ! -e "$first_home/.local/bin/$path_library" ] ||
+            die "self-test: PATH setup linked $path_library into ~/.local/bin"
+    done
+    grep -Fq "Linked the Cerulion programs into $first_home/.local/bin" "$first_output" ||
+        die "self-test: PATH setup did not report the links it made"
+    [ ! -e "$path_run_system" ] ||
+        die "self-test: an absent system bin directory was created"
     if grep -Fq 'Add tools to PATH' "$first_output"; then
         die "self-test: PATH setup still printed the manual export line"
     fi
@@ -2296,6 +2800,406 @@ EOF
         die "self-test: the second run changed the fish profile"
     grep -Fq "PATH line already in $first_home/.profile" "$second_output" ||
         die "self-test: the second run did not report the line it found"
+    if grep -Fq 'Linked the Cerulion programs' "$second_output"; then
+        die "self-test: the second run linked the programs again"
+    fi
+    if grep -Eq 'leaving .* alone|could not (link|create)' "$second_error"; then
+        die "self-test: the second run warned about its own links: $(cat "$second_error")"
+    fi
+    for path_program in $LINKED_PROGRAMS; do
+        [ "$(readlink "$first_home/.local/bin/$path_program")" = "$first_install/$path_program" ] ||
+            die "self-test: the second run changed the $path_program link"
+    done
+
+    # A shell that already searches ~/.local/bin runs cerulion straight away,
+    # and the installer says so in one line instead of naming the env file.
+    onpath_home="$path_setup_root/onpath-home"
+    onpath_install="$path_setup_root/onpath-install"
+    mkdir -p "$onpath_home" "$onpath_install"
+    path_run_path="$onpath_home/.local/bin:$path_clean"
+    run_path_setup_install "$onpath_home" "$onpath_install" \
+        "$path_setup_root/onpath-output" "$path_setup_root/onpath-error" ||
+        die "self-test: the install with ~/.local/bin on PATH failed"
+    [ "$(tail -n 1 "$path_setup_root/onpath-output")" = 'cerulion is ready in this terminal; sign in once with cerulion login' ] ||
+        die "self-test: an install already on PATH ended with: $(tail -n 1 "$path_setup_root/onpath-output")"
+    [ "$(PATH="$path_run_path" command -v cerulion)" = "$onpath_home/.local/bin/cerulion" ] ||
+        die "self-test: cerulion does not resolve through the ~/.local/bin link"
+
+    # Something else already named cerulion in ~/.local/bin is left alone,
+    # and the next step says which copy this PATH runs.
+    foreign_home="$path_setup_root/foreign-home"
+    foreign_install="$path_setup_root/foreign-install"
+    mkdir -p "$foreign_home/.local/bin" "$foreign_install"
+    printf '#!/bin/sh\necho foreign\n' > "$foreign_home/.local/bin/cerulion"
+    chmod +x "$foreign_home/.local/bin/cerulion"
+    ln -s "$path_setup_root/elsewhere/cerulion-netd" "$foreign_home/.local/bin/cerulion-netd"
+    path_run_path="$foreign_home/.local/bin:$path_clean"
+    run_path_setup_install "$foreign_home" "$foreign_install" \
+        "$path_setup_root/foreign-output" "$path_setup_root/foreign-error" ||
+        die "self-test: the install over a foreign ~/.local/bin/cerulion failed"
+    [ "$(cat "$foreign_home/.local/bin/cerulion")" = "$(printf '#!/bin/sh\necho foreign')" ] ||
+        die "self-test: a foreign ~/.local/bin/cerulion was replaced"
+    [ "$(readlink "$foreign_home/.local/bin/cerulion-netd")" = "$path_setup_root/elsewhere/cerulion-netd" ] ||
+        die "self-test: a foreign ~/.local/bin/cerulion-netd link was replaced"
+    [ "$(readlink "$foreign_home/.local/bin/cerulion-connectd")" = "$foreign_install/cerulion-connectd" ] ||
+        die "self-test: a free name beside a foreign one was not linked"
+    grep -Fq "leaving $foreign_home/.local/bin/cerulion alone: it is not a link this installer made" \
+        "$path_setup_root/foreign-error" ||
+        die "self-test: the foreign file was not reported"
+    grep -Fq "leaving $foreign_home/.local/bin/cerulion-netd alone: it links to" \
+        "$path_setup_root/foreign-error" ||
+        die "self-test: the foreign link was not reported"
+    [ "$(tail -n 1 "$path_setup_root/foreign-output")" = "Another cerulion ($foreign_home/.local/bin/cerulion) comes first on this PATH; run . $(sh_quote "$foreign_home/.cerulion/env") to put this install first, then sign in once with cerulion login" ] ||
+        die "self-test: a shadowed install ended with: $(tail -n 1 "$path_setup_root/foreign-output")"
+
+    # With ~/.local/bin off this PATH, a writable system bin directory that is
+    # on it gets the links too; fish is told to source the fish env file.
+    system_home="$path_setup_root/system-home"
+    system_install="$path_setup_root/system-install"
+    path_run_system="$path_setup_root/system-bin"
+    mkdir -p "$system_home" "$system_install" "$path_run_system"
+    path_run_path="$path_run_system:$path_clean"
+    path_run_reach_root=$path_setup_root
+    # An install directory other accounts cannot enter (root's 0700 home) is
+    # never linked into the shared directory: the link would fail for them.
+    private_home="$path_setup_root/private-home"
+    private_install="$path_setup_root/private-home/bin"
+    mkdir -p "$private_install"
+    chmod 0700 "$private_home"
+    run_path_setup_install "$private_home" "$private_install" \
+        "$path_setup_root/private-output" "$path_setup_root/private-error" ||
+        die "self-test: the install into a private directory failed"
+    if [ -e "$path_run_system/cerulion" ] || [ -L "$path_run_system/cerulion" ]; then
+        die "self-test: an install other accounts cannot reach was linked into the system bin directory"
+    fi
+    rm -rf "$private_home"
+    chmod 0755 "$path_setup_root" "$system_install"
+    # Nor when ~/.local/bin is already on this PATH, nor when a different
+    # cerulion on this PATH would be hidden by a link in the shared directory.
+    guard_system="$path_setup_root/guard-system-bin"
+    guard_other="$path_setup_root/guard-other-bin"
+    mkdir -p "$guard_system" "$guard_other"
+    printf '#!/bin/sh\necho other\n' > "$guard_other/cerulion"
+    chmod +x "$guard_other/cerulion"
+    path_run_system=$guard_system
+    for guard_case in onpath shadow; do
+        guard_home="$path_setup_root/guard-$guard_case-home"
+        guard_install="$path_setup_root/guard-$guard_case-install"
+        mkdir -p "$guard_home" "$guard_install"
+        chmod 0755 "$guard_install"
+        case "$guard_case" in
+            onpath) path_run_path="$guard_home/.local/bin:$guard_system:$path_clean" ;;
+            shadow) path_run_path="$guard_system:$guard_other:$path_clean" ;;
+        esac
+        run_path_setup_install "$guard_home" "$guard_install" \
+            "$path_setup_root/guard-$guard_case-output" "$path_setup_root/guard-$guard_case-error" ||
+            die "self-test: the $guard_case guard install failed"
+        [ ! -L "$guard_system/cerulion" ] ||
+            die "self-test: the $guard_case case still linked into the system bin directory"
+    done
+    # Nor when another account could change what the shared links run: a
+    # group- or world-writable directory on the way to the install directory,
+    # a world-writable sticky one included, or a group-writable system bin
+    # directory. The skip is a warning that names the directory.
+    unsafe_system="$path_setup_root/unsafe-system-bin"
+    mkdir -p "$unsafe_system"
+    chmod 0755 "$unsafe_system"
+    path_run_system=$unsafe_system
+    path_run_path="$unsafe_system:$path_clean"
+    for unsafe_case in group-parent world-sticky-parent group-install group-system; do
+        unsafe_home="$path_setup_root/unsafe-$unsafe_case-home"
+        unsafe_parent="$path_setup_root/unsafe-$unsafe_case-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        case "$unsafe_case" in
+            group-parent) unsafe_named=$unsafe_parent && chmod 0775 "$unsafe_parent" ;;
+            world-sticky-parent) unsafe_named=$unsafe_parent && chmod 1777 "$unsafe_parent" ;;
+            group-install) unsafe_named=$unsafe_install && chmod 0775 "$unsafe_install" ;;
+            group-system) unsafe_named=$unsafe_system && chmod 0775 "$unsafe_system" ;;
+        esac
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-$unsafe_case-output" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case install failed"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: the $unsafe_case case linked $path_program into the system bin directory"
+            fi
+            [ -L "$unsafe_home/.local/bin/$path_program" ] ||
+                die "self-test: the $unsafe_case case did not link $path_program into ~/.local/bin"
+        done
+        grep -Fq "warning: not linking the Cerulion programs into $unsafe_system: another account can change $unsafe_named" \
+            "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case case did not warn about $unsafe_named: $(cat "$path_setup_root/unsafe-$unsafe_case-error")"
+        grep -Fq "add $unsafe_home/.local/bin to PATH" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case warning did not name the ~/.local/bin fix"
+        chmod 0755 "$unsafe_parent" "$unsafe_system"
+    done
+    # A program file another account can write is refused the same way. The
+    # arm calls the linking step directly on stub programs, so no install
+    # rewrites the file mode it sets.
+    (
+        file_home="$path_setup_root/unsafe-group-file-home"
+        file_install="$path_setup_root/unsafe-group-file-install"
+        mkdir -p "$file_home" "$file_install"
+        chmod 0755 "$file_install"
+        for path_program in $LINKED_PROGRAMS; do
+            printf '#!/bin/sh\n' > "$file_install/$path_program"
+            chmod 0755 "$file_install/$path_program"
+        done
+        chmod 0775 "$file_install/cerulion-netd"
+        HOME=$file_home PATH="$unsafe_system:$path_clean" \
+            CERULION_SYSTEM_BIN_DIR=$unsafe_system \
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root \
+            link_into_path_dirs "$file_install" \
+            >"$path_setup_root/unsafe-group-file-output" 2>"$path_setup_root/unsafe-group-file-error"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: a group-writable program let $path_program be linked into the system bin directory"
+            fi
+        done
+        grep -Fq "another account can change $(CDPATH='' cd -P -- "$file_install" && pwd)/cerulion-netd" \
+            "$path_setup_root/unsafe-group-file-error" ||
+            die "self-test: the group-writable program case did not warn: $(cat "$path_setup_root/unsafe-group-file-error")"
+    ) || exit 1
+    # Ownership: a directory another non-root account owns is refused. Only
+    # root can hand a directory to another account, so the arm runs as root.
+    if [ "$(id -u)" -eq 0 ]; then
+        unsafe_home="$path_setup_root/unsafe-owner-home"
+        unsafe_parent="$path_setup_root/unsafe-owner-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        chown 65534 "$unsafe_parent"
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-owner-output" "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner install failed"
+        [ ! -L "$unsafe_system/cerulion" ] ||
+            die "self-test: an install under another account's directory was linked into the system bin directory"
+        grep -Fq "another account can change $unsafe_parent" \
+            "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner case did not warn"
+        chown 0 "$unsafe_parent"
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the foreign-owner system link arm because it needs root" >&2
+    fi
+    # The check itself: / and a 0755 tree are safe, 0775 and 1777 are not.
+    dir_safe_from_others / ||
+        die "self-test: / was reported writable by another account: $unsafe_dir"
+    (
+        CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+        unit_dir="$path_setup_root/unit/a/b"
+        mkdir -p "$unit_dir"
+        chmod 0755 "$path_setup_root/unit" "$path_setup_root/unit/a" "$unit_dir"
+        dir_safe_from_others "$unit_dir" ||
+            die "self-test: a 0755 tree was reported writable by another account: $unsafe_dir"
+        for unit_mode in 0775 0757 1777; do
+            chmod "$unit_mode" "$path_setup_root/unit/a"
+            if dir_safe_from_others "$unit_dir"; then
+                die "self-test: a mode $unit_mode parent was reported safe"
+            fi
+            [ "$unsafe_dir" = "$path_setup_root/unit/a" ] ||
+                die "self-test: the mode $unit_mode check named $unsafe_dir"
+        done
+        chmod 0755 "$path_setup_root/unit/a"
+    ) || exit 1
+    # A symlink on the way to the install directory is checked where it sits:
+    # one inside a group-writable directory is refused, though the directory
+    # it points at passes.
+    unsafe_home="$path_setup_root/unsafe-symlink-home"
+    unsafe_parent="$path_setup_root/unsafe-symlink-parent"
+    unsafe_real="$path_setup_root/unsafe-symlink-real"
+    mkdir -p "$unsafe_home" "$unsafe_parent" "$unsafe_real/install"
+    chmod 0755 "$unsafe_real" "$unsafe_real/install"
+    ln -s "$unsafe_real" "$unsafe_parent/link"
+    chmod 0775 "$unsafe_parent"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/unsafe-symlink-output" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the install through a symlink failed"
+    [ ! -L "$unsafe_system/cerulion" ] ||
+        die "self-test: an install through a symlink in a group-writable directory was linked into the system bin directory"
+    grep -Fq "another account can change $unsafe_parent" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the symlink case did not name its directory: $(cat "$path_setup_root/unsafe-symlink-error")"
+    chmod 0755 "$unsafe_parent"
+    # In a tree nobody else can change, the same install is linked, and the
+    # system links name the physical directory rather than the symlink.
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-output" "$path_setup_root/safe-symlink-error" ||
+        die "self-test: the install through a safe symlink failed"
+    unsafe_real_physical=$(CDPATH='' cd -P -- "$unsafe_real/install" && pwd)
+    for path_program in $LINKED_PROGRAMS; do
+        [ "$(readlink "$unsafe_system/$path_program")" = "$unsafe_real_physical/$path_program" ] ||
+            die "self-test: the $path_program system link through a safe symlink reads $(readlink "$unsafe_system/$path_program")"
+    done
+    # --uninstall through the symlink takes those links back, the one whose
+    # program is already gone included.
+    rm -f "$unsafe_real/install/cerulion-connectd"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-uninstall-output" "$path_setup_root/safe-symlink-uninstall-error" --uninstall ||
+        die "self-test: --uninstall through a safe symlink failed: $(cat "$path_setup_root/safe-symlink-uninstall-error")"
+    for path_program in $LINKED_PROGRAMS; do
+        if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+            die "self-test: --uninstall through a symlink left the $path_program system link"
+        fi
+    done
+    # A macOS ACL entry that lets another account write is refused although
+    # the mode bits pass; the stock home entry (everyone deny delete) is not.
+    acl_dir="$path_setup_root/unit-acl"
+    mkdir -p "$acl_dir"
+    chmod 0755 "$acl_dir"
+    if chmod +a "everyone deny delete" "$acl_dir" 2>/dev/null; then
+        # The entries come off before a failure exits: the deny entry would
+        # stop the scratch tree's removal.
+        acl_status=0
+        (
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+            dir_safe_from_others "$acl_dir" ||
+                die "self-test: a deny-only ACL was reported writable by another account"
+            chmod +a "everyone allow add_file,delete_child" "$acl_dir" ||
+                die "self-test: could not add an allow ACL entry"
+            if dir_safe_from_others "$acl_dir"; then
+                die "self-test: an ACL that lets everyone add files was reported safe"
+            fi
+        ) || acl_status=1
+        chmod -N "$acl_dir"
+        [ "$acl_status" -eq 0 ] || exit 1
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the macOS ACL arm because chmod +a is unavailable" >&2
+    fi
+    path_run_system="$path_setup_root/system-bin"
+    chmod 0755 "$path_run_system"
+    system_install_physical=$(CDPATH='' cd -P -- "$system_install" && pwd)
+    path_run_path="$path_run_system:$path_clean"
+    path_run_shell=/usr/bin/fish
+    run_path_setup_install "$system_home" "$system_install" \
+        "$path_setup_root/system-output" "$path_setup_root/system-error" ||
+        die "self-test: the install with a writable system bin directory failed"
+    for path_program in $LINKED_PROGRAMS; do
+        [ "$(readlink "$path_run_system/$path_program")" = "$system_install_physical/$path_program" ] ||
+            die "self-test: a writable system bin directory on PATH did not get the $path_program link"
+        [ -L "$system_home/.local/bin/$path_program" ] ||
+            die "self-test: the system bin links replaced the ~/.local/bin ones"
+    done
+    [ "$(tail -n 1 "$path_setup_root/system-output")" = 'cerulion is ready in this terminal; sign in once with cerulion login' ] ||
+        die "self-test: an install linked into the system bin directory ended with: $(tail -n 1 "$path_setup_root/system-output")"
+    fish_home="$path_setup_root/fish-home"
+    fish_install="$path_setup_root/fish-install"
+    mkdir -p "$fish_home" "$fish_install"
+    path_run_path=$path_clean
+    run_path_setup_install "$fish_home" "$fish_install" \
+        "$path_setup_root/fish-output" "$path_setup_root/fish-error" ||
+        die "self-test: the install under fish failed"
+    [ "$(readlink "$path_run_system/cerulion")" = "$system_install_physical/cerulion" ] ||
+        die "self-test: a system bin directory off this PATH was linked"
+    if grep -Fq "$path_run_system" "$path_setup_root/fish-error"; then
+        die "self-test: an install with the system bin directory off PATH tried to link there"
+    fi
+    [ "$(tail -n 1 "$path_setup_root/fish-output")" = "To use cerulion in this terminal, run source $(fish_quote "$fish_home/.cerulion/env.fish") (new terminals already have it), then sign in once with cerulion login" ] ||
+        die "self-test: an install under fish ended with: $(tail -n 1 "$path_setup_root/fish-output")"
+    path_run_shell=/bin/sh
+    path_run_system="$path_setup_root/no-system-bin"
+    path_run_reach_root=/
+
+    # --uninstall takes back exactly what the install wrote: the user's own
+    # profile lines, the sign-in data in ~/.cerulion and links that are not
+    # this install's stay.
+    printf '%s\n' 'alias keep=mine' >> "$first_home/.bashrc"
+    : > "$first_home/.cerulion/credentials"
+    run_path_setup_install "$first_home" "$first_install" \
+        "$path_setup_root/uninstall-output" "$path_setup_root/uninstall-error" --uninstall ||
+        die "self-test: --uninstall failed: $(cat "$path_setup_root/uninstall-error")"
+    [ ! -e "$first_install" ] ||
+        die "self-test: --uninstall left the install directory"
+    for path_program in $LINKED_PROGRAMS; do
+        if [ -e "$first_home/.local/bin/$path_program" ] || [ -L "$first_home/.local/bin/$path_program" ]; then
+            die "self-test: --uninstall left the $path_program link"
+        fi
+    done
+    for path_profile in "$first_home/.profile" "$first_home/.zshenv" "$first_home/.bashrc"; do
+        if grep -Fq "$PROFILE_MARKER" "$path_profile"; then
+            die "self-test: --uninstall left the PATH line in $path_profile"
+        fi
+    done
+    grep -Fxq 'alias keep=mine' "$first_home/.bashrc" ||
+        die "self-test: --uninstall removed a line it did not write"
+    [ ! -e "$first_fish_profile" ] ||
+        die "self-test: --uninstall left the fish profile"
+    if [ -e "$first_env" ] || [ -e "$first_env_fish" ]; then
+        die "self-test: --uninstall left an env file"
+    fi
+    [ -e "$first_home/.cerulion/credentials" ] ||
+        die "self-test: --uninstall removed the sign-in data"
+    grep -Fq 'keeps your sign-in and settings' "$path_setup_root/uninstall-output" ||
+        die "self-test: --uninstall did not say what it kept"
+    run_path_setup_install "$first_home" "$first_install" \
+        "$path_setup_root/uninstall-again-output" "$path_setup_root/uninstall-again-error" --uninstall ||
+        die "self-test: a second --uninstall failed"
+    grep -Fq "Nothing installed in $first_install" "$path_setup_root/uninstall-again-output" ||
+        die "self-test: a second --uninstall did not say there was nothing left"
+    run_path_setup_install "$foreign_home" "$foreign_install" \
+        "$path_setup_root/uninstall-foreign-output" "$path_setup_root/uninstall-foreign-error" --uninstall ||
+        die "self-test: --uninstall beside foreign links failed"
+    if ! [ -f "$foreign_home/.local/bin/cerulion" ] || ! [ -L "$foreign_home/.local/bin/cerulion-netd" ]; then
+        die "self-test: --uninstall removed a link or file it did not make"
+    fi
+    [ ! -L "$foreign_home/.local/bin/cerulion-connectd" ] ||
+        die "self-test: --uninstall left this install's own link beside foreign ones"
+    path_run_system="$path_setup_root/system-bin"
+    run_path_setup_install "$system_home" "$system_install" \
+        "$path_setup_root/uninstall-system-output" "$path_setup_root/uninstall-system-error" --uninstall ||
+        die "self-test: --uninstall of a system-linked install failed"
+    [ ! -L "$path_run_system/cerulion" ] ||
+        die "self-test: --uninstall left the system bin link"
+    path_run_system="$path_setup_root/no-system-bin"
+    umask "$self_test_umask"
+    unmarked_home="$path_setup_root/unmarked-home"
+    unmarked_install="$path_setup_root/unmarked-install"
+    mkdir -p "$unmarked_home/.cerulion" "$unmarked_install"
+    printf '%s\n' 'not ours' > "$unmarked_install/cerulion"
+    profile_source_line "$unmarked_home/.cerulion/env" > "$unmarked_home/.profile"
+    printf '%s\n' "$ENV_FILE_HEADER" > "$unmarked_home/.cerulion/env"
+    if run_path_setup_install "$unmarked_home" "$unmarked_install" \
+        "$path_setup_root/unmarked-output" "$path_setup_root/unmarked-error" --uninstall; then
+        die "self-test: --uninstall of a directory without the marker succeeded"
+    fi
+    [ "$(cat "$unmarked_install/cerulion")" = 'not ours' ] ||
+        die "self-test: --uninstall removed a program from a directory without the marker"
+    if ! grep -Fq "$PROFILE_MARKER" "$unmarked_home/.profile" ||
+        [ ! -f "$unmarked_home/.cerulion/env" ]; then
+        die "self-test: a refused --uninstall still removed the PATH setup"
+    fi
+    if grep -Fq 'Cerulion is uninstalled' "$path_setup_root/unmarked-output"; then
+        die "self-test: a refused --uninstall reported success"
+    fi
+    # A second install elsewhere: uninstalling it keeps the PATH setup that
+    # names the first.
+    second_copy="$path_setup_root/second-copy"
+    mkdir -p "$second_copy"
+    run_path_setup_install "$onpath_home" "$second_copy" \
+        "$path_setup_root/second-copy-output" "$path_setup_root/second-copy-error" --no-modify-path ||
+        die "self-test: the second copy install failed"
+    run_path_setup_install "$onpath_home" "$second_copy" \
+        "$path_setup_root/second-copy-un-output" "$path_setup_root/second-copy-un-error" --uninstall ||
+        die "self-test: uninstalling the second copy failed"
+    if [ ! -f "$onpath_home/.cerulion/env" ] ||
+        ! grep -Fq "$PROFILE_MARKER" "$onpath_home/.profile"; then
+        die "self-test: uninstalling a second copy removed the first copy's PATH setup"
+    fi
+    [ ! -e "$second_copy" ] ||
+        die "self-test: uninstalling the second copy left it in place"
+    # A typo that is a prefix of the real directory matches nothing.
+    run_path_setup_install "$onpath_home" "${onpath_install%?}" \
+        "$path_setup_root/typo-output" "$path_setup_root/typo-error" --uninstall ||
+        die "self-test: an --uninstall of a missing directory failed"
+    if [ ! -f "$onpath_home/.cerulion/env" ] ||
+        ! grep -Fq "$PROFILE_MARKER" "$onpath_home/.profile"; then
+        die "self-test: an --uninstall of a prefix typo removed the real install's PATH setup"
+    fi
+    grep -Fxq 'Nothing of this installer was found to remove' "$path_setup_root/typo-output" ||
+        die "self-test: an --uninstall that removed nothing did not say so"
+    path_run_path=$path_clean
 
     nomod_home="$path_setup_root/nomod-home"
     nomod_install="$path_setup_root/nomod-install"
@@ -2303,7 +3207,8 @@ EOF
     run_path_setup_install "$nomod_home" "$nomod_install" \
         "$path_setup_root/nomod-output" "$path_setup_root/nomod-error" --no-modify-path ||
         die "self-test: the --no-modify-path install failed"
-    if [ -e "$nomod_home/.cerulion/env" ] || [ -e "$nomod_home/.profile" ]; then
+    if [ -e "$nomod_home/.cerulion/env" ] || [ -e "$nomod_home/.profile" ] ||
+        [ -e "$nomod_home/.local" ]; then
         die "self-test: --no-modify-path still changed the home directory"
     fi
     grep -Fq 'Add tools to PATH' "$path_setup_root/nomod-output" ||
@@ -2460,6 +3365,7 @@ base_url=$DEFAULT_BASE_URL
 stable_base_url=$DEFAULT_STABLE_BASE_URL
 base_url_explicit=0
 self_test_requested=0
+uninstall_requested=0
 modify_path=1
 if [ -n "${CERULION_NO_MODIFY_PATH:-}" ]; then
     modify_path=0
@@ -2492,6 +3398,10 @@ while [ "$#" -gt 0 ]; do
             modify_path=0
             shift
             ;;
+        --uninstall)
+            uninstall_requested=1
+            shift
+            ;;
         --self-test)
             self_test_requested=1
             shift
@@ -2513,6 +3423,11 @@ if [ "$self_test_requested" -eq 1 ]; then
 fi
 
 install_dir=$(resolve_install_dir "$install_dir_explicit" "$install_dir")
+
+if [ "$uninstall_requested" -eq 1 ]; then
+    uninstall_cerulion "$install_dir"
+    exit $?
+fi
 
 command -v curl >/dev/null 2>&1 ||
     die "curl is required to install Cerulion"
@@ -2909,18 +3824,27 @@ fi
 # verified, so a run that fails earlier never leaves a line pointing at nothing.
 # A failed edit is reported and the PATH is printed instead; it never fails the
 # install, which has already succeeded by this point.
-path_setup_done=0
+path_setup_env=
+install_dir_absolute=$(CDPATH='' cd -- "$install_dir" && pwd) ||
+    install_dir_absolute=$install_dir
 if [ "$modify_path" -eq 1 ]; then
     if [ -n "${HOME:-}" ]; then
+        link_into_path_dirs "$install_dir_absolute"
         if setup_path_for_shells "$install_dir" "$cargo_bin_dir"; then
-            path_setup_done=1
+            path_setup_env="${CERULION_HOME:-$HOME/.cerulion}/env"
         fi
     else
         printf '%s\n' \
             'NOTE: HOME is unset, so no shell profile was changed.' >&2
     fi
 fi
-if [ "$path_setup_done" -eq 0 ]; then
+# Both arms reach here: an archive that provisioned Rust, and an older
+# binaries-only archive that did not. Either way a missing linker is only
+# discovered at the first node build unless it is named now. Advice is never
+# the reason an install reports failure, so its status is discarded. It comes
+# before the next step so that the step is the last line printed.
+report_c_toolchain || :
+if ! print_next_step "$install_dir_absolute" "$cargo_bin_dir" "$path_setup_env"; then
     path_prefix=$install_dir
     if [ -n "$cargo_bin_dir" ]; then
         path_prefix="$path_prefix:$cargo_bin_dir"
@@ -2931,8 +3855,3 @@ if [ "$path_setup_done" -eq 0 ]; then
     printf 'Add tools to PATH: export PATH=%s:"$PATH"\n' "'$quoted_path_prefix'"
     printf '%s\n' 'Then sign in once with cerulion login'
 fi
-# Both arms reach here: an archive that provisioned Rust, and an older
-# binaries-only archive that did not. Either way a missing linker is only
-# discovered at the first node build unless it is named now. Advice is never
-# the reason an install reports failure, so its status is discarded.
-report_c_toolchain || :

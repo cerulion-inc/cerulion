@@ -312,7 +312,9 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
     // Anti-tautology: the hook really pushed through the parallel path — per
     // step the ring carries 4 fires (3 sources + zsink) + 1 StepBoundary
     // (contract addendum) + 1 kind-6 READ-OUTCOME record (zsink's
-    // unified trigger drain pops za0's one frame per step) = 6 records.
+    // unified trigger drain pops za0's one frame per step; the burst's refill
+    // after the fire finds the queue empty and stages nothing, because a
+    // plan-driven replay makes no consult for that probe) = 6 records.
     let mut consumer = TraceRingConsumer::open(&ring_name).expect("open parallel consumer");
     let mut records = Vec::new();
     consumer.drain(&mut records).expect("drain (no overrun)");

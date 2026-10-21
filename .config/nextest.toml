@@ -86,7 +86,9 @@ default-namespace = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
-  binary(=adaptive_sizing_iceoryx2_test)
+  binary(=accumulate_set_iox2_test)
++ binary(=accumulate_zero_alloc_test)
++ binary(=adaptive_sizing_iceoryx2_test)
 + binary(=cli_e2e_graph_latency_test)
 + binary(=cross_thread_rtt_test)
 + binary(=deliver_history_failure_iox2_test)

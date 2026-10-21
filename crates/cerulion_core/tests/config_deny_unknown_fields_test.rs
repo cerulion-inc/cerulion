@@ -449,6 +449,22 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
          warn-reporting module",
     ),
 
+    (
+        "cerulion_core/src/graph/sibling_topics.rs",
+        "SiblingProducedTopics",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: a newtype over a `BTreeSet<String>`, so its wire \
+         shape is the bare array the worker plan already carried and there is no \
+         key for an unknown one to be",
+    ),
+    (
+        "cerulion_core/src/graph/sibling_topics.rs",
+        "SiblingConsumedTopics",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: the outbound direction of the same transparent \
+         newtype pair, with the same bare-array wire shape",
+    ),
+
     // ── The deferred `cerulion_cli_engine/src/` sweep ───────────────────
     //
     // Five families, and every one of them is machine-written or

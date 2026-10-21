@@ -57,6 +57,51 @@ pub enum CliError {
     /// (`cerulion login`) where the failure is a missing/expired identity.
     #[error("{0}")]
     Login(String),
+    /// One or more nodes returned `NodeError::Fatal` during the run and were
+    /// stopped: `(node id, the fatal error's message)` in graph order. The run
+    /// itself completed; the process exits with [`EXIT_NODE_FATAL`].
+    #[error("{}", render_node_fatal(.nodes))]
+    NodeFatal { nodes: Vec<(String, String)> },
+    /// A multi-process run in which the listed worker groups each stopped a
+    /// node on `NodeError::Fatal` (each worker exited [`EXIT_NODE_FATAL`]). The
+    /// worker's own `Error:` line, above in the same terminal, names the node
+    /// and the message; the supervisor only sees the exit status.
+    #[error(
+        "{}", .groups.iter().map(|g| format!(
+            "a node in worker group '{g}' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)"
+        )).collect::<Vec<_>>().join(VERDICT_LINE_SEP)
+    )]
+    WorkerNodeFatal { groups: Vec<String> },
+}
+
+/// Exit status of a `graph run` in which a node was stopped by a fatal error.
+/// The same number as `bag play --resim --verify`'s node-failure exit. The
+/// binary maps [`CliError::NodeFatal`] and [`CliError::WorkerNodeFatal`] to
+/// it; the multi-process supervisor reads it back from a worker's exit.
+pub const EXIT_NODE_FATAL: u8 = 3;
+
+/// Between two entries of one fatal verdict. `main` prints the error after
+/// one `Error: ` prefix, so this gives every stopped node (or worker group)
+/// its own `Error:` line, as `docs/user-api.md` promises.
+const VERDICT_LINE_SEP: &str = "\nError: ";
+
+fn render_node_fatal(nodes: &[(String, String)]) -> String {
+    let parts: Vec<String> = nodes
+        .iter()
+        .map(|(node, message)| format!("node '{node}' stopped on a fatal error: {message}"))
+        .collect();
+    parts.join(VERDICT_LINE_SEP)
+}
+
+/// The verdict for a finished run: `Err(NodeFatal)` when any node was
+/// stopped by a fatal error, else `Ok`.
+pub fn node_fatal_verdict(nodes: Vec<(String, String)>) -> CliResult<()> {
+    if nodes.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::NodeFatal { nodes })
+    }
 }
 
 /// Result type alias for CLI operations.
@@ -71,7 +116,11 @@ const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
 /// runtime libraries.
 pub fn render_user_error(error: &CliError) -> String {
     let rendered = error.to_string();
-    if let CliError::Transport(cerulion_core::TransportError::NodeError { reason, .. }) = error {
+    if let CliError::Transport(
+        cerulion_core::TransportError::NodeError { reason, .. }
+        | cerulion_core::TransportError::NodeFailed { reason, .. },
+    ) = error
+    {
         // The first two are the Linux and macOS dynamic-loader messages for
         // a cdylib whose libpython dependency is missing; the third is the
         // embedded host's own report when its explicit libpython load fails.
@@ -96,6 +145,56 @@ pub fn render_user_error(error: &CliError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_with_no_fatal_node_is_ok() {
+        assert!(node_fatal_verdict(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_fatal_node_is_node_fatal_and_names_every_node_and_message() {
+        let err = node_fatal_verdict(vec![
+            ("lidar".to_string(), "Fatal error: lost".to_string()),
+            ("imu".to_string(), "Fatal error: bus off".to_string()),
+        ])
+        .expect_err("a fatal node fails the run");
+        assert!(matches!(err, CliError::NodeFatal { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "node 'lidar' stopped on a fatal error: Fatal error: lost\n\
+             Error: node 'imu' stopped on a fatal error: Fatal error: bus off"
+        );
+    }
+
+    #[test]
+    fn a_worker_group_fatal_names_every_group() {
+        let err = CliError::WorkerNodeFatal {
+            groups: vec!["g0".to_string(), "g2".to_string()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "a node in worker group 'g0' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)\n\
+             Error: a node in worker group 'g2' stopped on a fatal error (that worker's \
+             `Error:` line above names the node and the error)"
+        );
+    }
+
+    #[test]
+    fn missing_libpython_remedy_also_covers_a_typed_node_error() {
+        // A node's own init error now arrives typed (`NodeFailed`); the
+        // embedded host's libpython report must still get the remedy.
+        let error = CliError::Transport(cerulion_core::TransportError::NodeFailed {
+            node_id: "echo".to_string(),
+            kind: cerulion_core::error::NodeErrorKind::Logic,
+            reason: "init failed: unable to load libpython3.12.so".to_string(),
+        });
+        let rendered = render_user_error(&error);
+        assert!(
+            rendered.contains("could not find libpython"),
+            "got: {rendered}"
+        );
+    }
 
     #[test]
     fn missing_libpython_error_includes_python_node_remedy() {

@@ -871,7 +871,9 @@ fn unified_trigger_drain_records_one_drained_batch_per_fire_in_arrival_order() {
     assert_eq!(
         kind6, expected,
         "one DrainedBatch(head, popped 1) per FIRE — the step's whole burst \
-         (boundary pop 2k, then the refill's 2k+1), never one frame per step"
+         (boundary pop 2k, then the refill's 2k+1), never one frame per step; \
+         the third refill, which found the queue empty and ended the burst, \
+         stages nothing (a plan-driven replay makes no consult for it)"
     );
 }
 
@@ -1173,7 +1175,8 @@ fn a_per_set_sync_nodes_member_pops_are_drain_site_reads() {
         role_view(&all),
         expected,
         "every per-set Sync matcher pop is a DRAIN-site read — one per trigger \
-         member per set-fire, in registration order, and nothing else"
+         member per set-fire, in registration order, and nothing else (the \
+         refill pass after each fire finds both queues empty and stages nothing)"
     );
 }
 
@@ -1284,6 +1287,18 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             popped,
         }
     }
+    /// A consult that found the queue empty (trace format 7): `NoFrame`, the
+    /// no-frame sentinel, popped 0.
+    fn nf_at(step: u64, node_idx: u32, input_idx: u16) -> ReadRec {
+        ReadRec {
+            step,
+            node_idx,
+            input_idx,
+            kind: READ_OUTCOME_NONE,
+            seq: READ_OUTCOME_NO_FRAME,
+            popped: 0,
+        }
+    }
 
     // =======================================================================
     // LEG 1 — PLAIN mints, on graph-owned single-writer topics.
@@ -1348,13 +1363,19 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             // Step 0: `a`'s boundary drain freezes its head. `b` is silent, so
             // the matcher waits and `a`'s head is held from here on.
             rec_at(0, 2, 0, 0, 1),
+            // `b`'s boundary drain finds its queue empty (`pb` first publishes
+            // at step 2) and records the consult: `NoFrame`, popped 0, at
+            // steps 0 and 1. `a`'s held head is re-offered at step 1 without
+            // a drain, so `a` records nothing there.
+            nf_at(0, 2, 1),
+            nf_at(1, 2, 1),
             // Step 2, the descent, in the order the matcher runs it: the
             // DEATH's refill (seq 1 becomes the head), the NeedStamp pop
             // (seq 2 is PARKED), then the `Advance`'s PROMOTION of that same
-            // frame — which now mints its own record at seq 2 with
-            // `popped: 0`, because the pop was accounted at the peek.
-            // `a`'s BOUNDARY drain records nothing this step — a held head is
-            // re-offered, never re-drained.
+            // frame, which mints its own record at seq 2 with `popped: 0`
+            // (the pop was accounted at the peek). `a`'s BOUNDARY drain
+            // records nothing this step (a held head is re-offered, never
+            // re-drained).
             rec_at(2, 2, 0, 1, 1),
             rec_at(2, 2, 0, 2, 1),
             rec_at(2, 2, 0, 2, 0),
@@ -1362,23 +1383,29 @@ fn the_sync_matchers_descent_pops_are_drain_site_reads() {
             // follows `a`'s whatever order the two ran in.
             rec_at(2, 2, 1, 0, 1),
             // Step 3: the set fired, so `a`'s head is EMITTED and the boundary
-            // drains a fresh frame. `b` is silent again ⇒ wait.
+            // drains a fresh frame; `b`'s boundary drain finds nothing again
+            // and the matcher waits.
             rec_at(3, 2, 0, 3, 1),
+            nf_at(3, 2, 1),
         ],
         "the matcher's descent rides the read log exactly as the boundary \
-         drain's pops do — one record per CONSUMED frame, PLUS one for the \
-         hand-off the `Advance` performs, whose `popped: 0` says the head \
-         advanced while nothing left the queue"
+         drain's pops do: one record per CONSUMED frame, one for the hand-off \
+         the `Advance` performs (whose `popped: 0` says the head advanced while \
+         nothing left the queue), and one for every BOUNDARY drain that found a \
+         queue empty"
     );
     assert_eq!(
         role_view(&all),
         vec![
             (0, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
+            (0, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
+            (1, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Peek),
             (2, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (2, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
+            (3, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
         ],
         "THE PIN: the matcher reads on the node's OWN body subscriber, but the \
          CALL SITE is the scheduler — so `sync_discard_head`'s refill (step 2, \
@@ -1987,7 +2014,8 @@ fn throttled_consumer_drain_records_at_the_drain_step_with_no_same_step_fire() {
     assert_eq!(
         kind6, expected,
         "one record per CONSUMED head at its pop step; held-head re-offer \
-         steps (2, 4, 5) record NOTHING"
+         steps (2, 4, 5) record NOTHING, and so does the refill that found the \
+         queue empty after step 0's fire"
     );
     // The deterministic fire set: steps 0 and 3 (VirtualClock — hand trace
     // above), UNCHANGED by the mint gate. Step 1 carries a DrainedBatch record
@@ -2129,7 +2157,9 @@ fn sync_per_set_records_one_drained_batch_per_member_and_the_frozen_serve_record
         kind6, expected,
         "per-set Sync: ONE DrainedBatch per trigger member per set-fire, in \
          registration order, and NOTHING else — the frozen serve records \
-         nothing, so any extra record here is a second read of a member"
+         nothing and the refill pass after the fire finds both queues empty \
+         and stages nothing, so any extra record here is a second read of a \
+         member"
     );
 }
 
@@ -2284,6 +2314,7 @@ fn armed_capture_is_record_only_delivered_values_match_the_kind6_stream() {
     const STEPS: u64 = 8;
     let (kind6, delivered, _fires) = run_relay_capture("recon", true, STEPS);
     // Hand oracle: one DrainedBatch per step (unified trigger drain), seq k.
+    // The refill after each fire finds the queue empty and stages nothing.
     let expected: Vec<ReadRec> = (0..STEPS)
         .map(|k| rec(k, READ_OUTCOME_DRAINED_BATCH, k, 1))
         .collect();
@@ -2709,23 +2740,29 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
         })
         .collect();
 
-    // The CONTROL claim: the graph itself staged NOTHING, so the whole stream
-    // belongs to the overflow window (step 1) and the oracle below counts only
-    // records this test staged. Without it, "700 staged" is an assumption.
+    // The control window (step 0): the graph's ONE record on this edge is the
+    // Data node's boundary drain finding the queue the silent producer never
+    // fed empty, `NoFrame`, popped 0 (trace format 7 records the consult).
+    let (control, window): (Vec<ReadRec>, Vec<ReadRec>) = kind6.iter().partition(|r| r.step == 0);
+    assert_eq!(
+        control,
+        vec![rec(0, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0)],
+        "the control window carries exactly the boundary drain's empty consult: {kind6:?}"
+    );
     assert!(
-        kind6.iter().all(|r| r.step == 1),
-        "the control window (step 0) must carry no kind-6 record at all — the \
-         graph stages nothing on this edge: {kind6:?}"
+        window.iter().all(|r| r.step == 1),
+        "every other record belongs to the overflow window: {kind6:?}"
     );
 
-    // Hand oracle: 700 reads staged against capacity ⇒ CAPACITY survive and
-    // the rest are dropped, and the drop report agrees with the wire.
-    let expected_dropped = STAGED - capacity as u64;
+    // At the overflow window the {STAGED} synthetic reads fill the stage before
+    // the step runs, so its boundary drain's `NoFrame` is the one record the
+    // graph adds to the drop count.
+    let expected_dropped = STAGED + 1 - capacity as u64;
     assert_eq!(
         dropped_total, expected_dropped,
         "the run-exit report's total is the hand oracle"
     );
-    let survivors = kind6
+    let survivors = window
         .iter()
         .filter(|r| r.kind != READ_OUTCOME_TRUNCATED)
         .count();
@@ -2734,7 +2771,7 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
         "the stage retained exactly its capacity in READ records"
     );
     // THE PIN: the hole is MARKED, and the marker is LAST in the window.
-    let marker = kind6
+    let marker = window
         .last()
         .copied()
         .expect("the window's records are non-empty");
@@ -2749,7 +2786,7 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
          frame: {kind6:?}"
     );
     assert_eq!(
-        kind6
+        window
             .iter()
             .filter(|r| r.kind == READ_OUTCOME_TRUNCATED)
             .count(),
@@ -2782,8 +2819,9 @@ fn truncated_consumed_frame_reads_as_a_marked_hole_not_silence() {
     // recording really performed.
     assert_eq!(
         survivors as u64 + marker.popped as u64,
-        STAGED,
-        "the read log accounts for EVERY staged read — retained or marked"
+        STAGED + 1,
+        "the read log accounts for EVERY read offered to the window, the \
+         boundary drain's included: retained or marked"
     );
 }
 
@@ -3054,6 +3092,18 @@ fn pair_annotated_reads(edge: &[AnnotRec]) -> Vec<AnnotatedRead> {
                  read to the wrong publisher): {edge:?}"
             );
             pending = Some(*rec);
+            continue;
+        }
+        if rec.kind == READ_OUTCOME_NONE {
+            // A read that served no frame (an empty boundary drain) names no
+            // producer: the annotation repeats a served frame's writer, and
+            // there is none. The walk passes it; an annotation pending across
+            // it is still a widow.
+            assert!(
+                pending.is_none(),
+                "a PRODUCER annotation followed by a NoFrame: the annotation names \
+                 a read that served nothing: {edge:?}"
+            );
             continue;
         }
         let annot = pending.take().unwrap_or_else(|| {
@@ -4758,11 +4808,12 @@ fn a_decimated_read_that_serves_a_held_frame_is_annotated_with_its_producer() {
          non-annotated record and would confound the pairing): {shared_edge:?}"
     );
 
-    // THE BOUNDARY: every read BEFORE the first annotation serves nothing —
-    // `held_sample` is still None, so the drain's Empty records `NoFrame` and
-    // carries no producer. Once a frame is delivered `held_sample` is `Some`
-    // forever, so an Empty can never classify `NoFrame` again: the unannotated
-    // reads are a strict PREFIX.
+    // THE BOUNDARY: every read BEFORE the first annotation serves nothing:
+    // the drain's Empty records `NoFrame` and carries no producer. A later
+    // empty consult of the same site records one too, so the pairing walk
+    // passes every `NoFrame` it meets (`pair_annotated_reads`) instead of
+    // treating the unannotated reads as a closed prefix; what is asserted here
+    // is that the prefix before the first annotation is all `NoFrame`.
     let first_annot = shared_edge
         .iter()
         .position(|r| r.kind == READ_OUTCOME_PRODUCER)
@@ -5193,14 +5244,17 @@ fn a_refused_overflow_marker_is_re_offered_in_the_following_window() {
         "the control must not overflow (it is the no-marker baseline)"
     );
     assert_eq!(
-        first_control, 0,
-        "the control's first window stages nothing, so it offers nothing — \
-         which is also the pin that the GRAPH contributes no records here"
+        first_control, 1,
+        "the control's first window offers exactly ONE read, the boundary \
+         drain's `NoFrame` on the queue the silent producer never fed (trace \
+         format 7 records the empty consult), and it is refused as unmapped"
     );
     assert_eq!(
-        quiet_control, QUIET,
-        "each quiet window offers EXACTLY the one read it staged: the windows \
-         really merge, and nothing else is offered on this edge"
+        quiet_control,
+        2 * QUIET,
+        "each quiet window offers EXACTLY two reads, the one it staged and the \
+         boundary drain's `NoFrame`: the windows really merge, and nothing else \
+         is offered on this edge"
     );
 
     // OVERFLOW: the first window is staged past the stage capacity, and its
@@ -5215,8 +5269,9 @@ fn a_refused_overflow_marker_is_re_offered_in_the_following_window() {
     );
     assert_eq!(
         dropped_overflow,
-        STAGED - capacity as u64,
-        "hand oracle: {STAGED} staged reads against the capacity"
+        STAGED + 1 - capacity as u64,
+        "hand oracle: {STAGED} staged reads against the capacity, plus the \
+         boundary drain's `NoFrame` that found the stage already full"
     );
     assert_eq!(
         first_overflow,
@@ -5324,7 +5379,8 @@ fn a_held_head_across_boundaries_records_one_row_per_consumed_frame() {
     assert_eq!(
         kind6, expected,
         "ONE record per CONSUMED frame at its pop step — every held-head \
-         re-offer (steps 2, 4, 5, 7, 8) records NOTHING. Deleting the EachFifo \
+         re-offer (steps 2, 4, 5, 7, 8) records NOTHING, and so does the refill \
+         that found the queue empty after step 0's fire. Deleting the EachFifo \
          held-head early return pops a fresh frame over the unserved head at \
          every boundary: surplus rows, and the served seqs walk ahead."
     );
@@ -5428,7 +5484,8 @@ fn without_a_throttle_no_head_is_held_and_pop_equals_consume() {
         .collect();
     assert_eq!(
         kind6, expected,
-        "one publish per step, consumed in the step it is popped"
+        "one publish per step, consumed in the step it is popped (the refill \
+         after each fire finds the queue empty and stages nothing)"
     );
 
     let pops = pops_of(&kind6);
@@ -5631,7 +5688,7 @@ fn a_trace_driven_burst_whose_frame_is_missing_fires_and_counts_the_shortfall() 
             rec(0, READ_OUTCOME_DRAINED_BATCH, 1, 1),
         ],
         "two frames existed, so two pops are staged — the third refill popped \
-         nothing and a silent drain records nothing"
+         nothing and an empty refill records nothing"
     );
     assert_eq!(
         consumer_fires, 3,
@@ -5795,11 +5852,18 @@ fn the_sync_matchers_decimated_pops_are_drain_site_reads() {
         role_view(&all),
         vec![
             (0, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
+            // `b`'s boundary drain on its empty queue (`pb` first publishes at
+            // step 2): `NoFrame` at steps 0 and 1; `a`'s head is held at step 1.
+            (0, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
+            (1, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (2, 2, 0, READ_OUTCOME_DECIMATED, ReadSiteRole::Drain),
             (2, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
             (3, 2, 0, READ_OUTCOME_DECIMATED, ReadSiteRole::Drain),
             (4, 2, 0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
+            // `b`'s boundary drain at step 4 finds nothing (its next frame is
+            // step 5's).
+            (4, 2, 1, READ_OUTCOME_NONE, ReadSiteRole::Drain),
             (5, 2, 0, READ_OUTCOME_DECIMATED, ReadSiteRole::Drain),
             (5, 2, 1, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain),
         ],

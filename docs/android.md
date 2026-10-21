@@ -20,6 +20,15 @@ cargo ndk -t arm64-v8a --platform 30 build -p cerulion_core
 
 Replace `cerulion_core` with any crate in the list to check that crate.
 
+The Android transport described below comes from a pinned iceoryx2 fork. The
+workspace applies that fork through `[patch.crates-io]` in the root
+`Cargo.toml`, and Cargo applies such a patch only to builds of this workspace.
+A project that depends on a released `cerulion_core` from crates.io resolves
+upstream iceoryx2 instead, so it does not get the file-backed shared memory,
+the `CERULION_SHM_DIR` placement, or the abstract-namespace sockets described
+here. Such a project must add the same `[patch.crates-io]` entries for the
+whole iceoryx2 family, at the same revision, to its own root `Cargo.toml`.
+
 Android does not provide `/dev/shm` in every environment. Named shared-memory
 objects used by Cerulion and iceoryx2 are regular files on Android. Publish and
 subscribe work within one process and between Android processes. The iceoryx2
@@ -27,12 +36,21 @@ root path is `/data/local/tmp/iceoryx2`. The runtime chooses the directory for
 Cerulion named shared-memory objects in this order: an absolute directory
 passed to `cerulion_core::posix_shm::set_shm_dir`, then a non-empty absolute
 `CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute.
+iceoryx2 places its own shared-memory segments through the pinned fork,
+which reads the environment on its own: a non-empty absolute
+`CERULION_SHM_DIR`, then `$TMPDIR/cerulion-shm` when `TMPDIR` is absolute,
+then `/data/local/tmp/cerulion-shm`. It never sees `set_shm_dir` and has no
+app-sandbox step, so an app process that calls `set_shm_dir` must also export
+`CERULION_SHM_DIR` (or an absolute `TMPDIR`) with the same app-writable
+directory before iceoryx2 starts; otherwise iceoryx2 fails with a permission
+error even though Cerulion's own objects work.
 Neither `set_shm_dir` nor `CERULION_SHM_DIR` moves the iceoryx2 root path,
 where iceoryx2 keeps its other files (node and service state, not the named
 shared-memory objects); the root path moves through the `[global] root-path`
 key in `config/iceoryx2.toml` under the process's working directory.
 `set_shm_dir` must run before the first
-named object is opened; calling it again with the resolved directory is a
+named object is opened or unlinked, because either call resolves and latches
+the directory; calling it again with the resolved directory is a
 no-op, and calling it with a different directory afterwards returns an error.
 When nothing is configured, shell and root processes fall back to
 `/data/local/tmp/cerulion-shm`. An app process cannot write there,
@@ -42,9 +60,9 @@ from `/proc/self/cmdline` (any `:process` suffix stripped), and when
 becomes `/data/user/<user>/<package>/cache/cerulion-shm`. An app whose
 sandbox cannot be resolved gets an `EACCES` failure on the first
 named-object operation and a single error log naming `set_shm_dir` and
-`CERULION_SHM_DIR`; the embedder must call `set_shm_dir` (or export
-`CERULION_SHM_DIR`) with an app-writable directory such as one under its
-files directory.
+`CERULION_SHM_DIR`; the embedder must export `CERULION_SHM_DIR` with an
+app-writable directory such as one under its files directory, since that is
+the one setting both Cerulion and iceoryx2 read.
 The selected directory must be writable by the process, owned by the process
 user, and not writable by group or others. The directory itself must not be a
 symbolic link, even when the path ends in `/` or `/.`, and a path containing
@@ -318,12 +336,13 @@ return `ENOSYS`. Node initialization refuses that library with:
 node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
 
-The check runs in two places: the host-side loader probes the host's iceoryx2
-before it calls the library's init symbol, and the generated `--raw-ffi`
-template calls `cerulion_core::transport::refuse_unsupported_android_shm`
-inside the library itself, because a cdylib statically links its own copy of
-iceoryx2 and the host's probe proves nothing about it. A hand-written raw-FFI
-library that does not use the template must make the same call in its init.
+The check runs in two places: the host-side loader probes the host's
+iceoryx2, and it then calls the library's own `cerulion_node_platform_check`
+export, because a cdylib statically links its own copy of iceoryx2 and the
+host's probe proves nothing about it. `#[cerulion_node]` and the generated
+`--raw-ffi` template both emit that export. On Android a library without it is
+refused at load, so a hand-written raw-FFI library must export it too (copy it
+from the template).
 
 For an adb shell session, provide writable home and temporary directories:
 
