@@ -511,16 +511,37 @@ network:
     root_ca: /etc/cerulion/robot.pem
 ```
 
-- **`reliability`**: `reliable` (the default: in order, retransmitted on
-  loss) or `best_effort`. A best-effort topic is put with zenoh's best-effort
-  marker, and on a `mixed_rel=1` QUIC connection zenoh sends it on the datagram
+- **`reliability`**: `reliable` (in order, retransmitted on loss) or
+  `best_effort`; an entry without it is put at `default_reliability`. A
+  best-effort topic is put with zenoh's best-effort marker, and on a `mixed_rel=1` QUIC connection zenoh sends it on the datagram
   link: a lost frame is gone, and the frames after it are not held behind it.
   All best-effort topics share that one datagram flow, which has no priority
   order. zenoh sizes datagrams once, when the link comes up: if the path MTU
   later shrinks below that size, a datagram send fails, and zenoh closes the
   datagram link and the stream link with it, so the whole connection
-  reconnects. Mark a topic best effort on a path whose MTU is stable. The
-  bare-string entry is the map with the default.
+  reconnects. Mark a topic best effort on a path whose MTU is stable. A
+  bare-string entry is a map with no `reliability`, and is put at
+  `default_reliability`.
+- **`default_reliability`**: `reliable` (the default) or `best_effort`, for
+  every `egress` entry that sets no `reliability` of its own. An entry's own
+  `reliability` always wins, so `{topic: /robot/cmd, reliability: reliable}`
+  keeps one topic reliable under a `best_effort` default. A `best_effort`
+  default needs a `mixed_rel=1` locator, as a best-effort topic does:
+
+  ```yaml
+  network:
+    mode: peer
+    listen:
+      - quic/0.0.0.0:7447?mixed_rel=1
+    default_reliability: best_effort
+    egress:
+      - /robot/lidar/points             # best effort, from the default
+      - topic: /robot/cmd_status
+        reliability: reliable           # reliable, its own setting wins
+    tls:
+      certificate: /etc/cerulion/robot.pem
+      private_key: /etc/cerulion/robot.key
+  ```
 - **`tls`**: absolute paths to PEM files, read when the gateway opens its
   session (a missing file fails the open, naming the path). A `quic/` listener
   needs `certificate` and `private_key`; a `quic/` connect needs `root_ca`,
@@ -596,7 +617,7 @@ Strict block, which topics cross the machine boundary is declared in YAML.
 
 ### Loop-safety rules (graph-load validation)
 
-Every rejection names the offending topic and states the fix:
+Every rejection names the offending topic or setting and states the fix:
 
 1. **No topic in both lists** (it would loop back to itself): remove it
    from one list. The gateway ALSO refuses a plan whose announce and ingress
@@ -615,9 +636,11 @@ Every rejection names the offending topic and states the fix:
 9. **No inert `tls` setting**: `root_ca` without a `quic/` connect locator,
    or `certificate` / `private_key` without a `quic/` listen locator, is
    refused (each is read only by that side).
-10. **Best effort needs a datagram link**: a `best_effort` topic needs a
-    `mixed_rel=1` QUIC locator (not `auto`) in `listen` or `connect`;
-    without one it would ride the reliable link with nothing saying so.
+10. **Best effort needs a datagram link**: a `best_effort` topic, and a
+    `default_reliability: best_effort`, each need a `mixed_rel=1` QUIC
+    locator (not `auto`) in `listen` or `connect`; without one the topics
+    would ride the reliable link with nothing saying so. The default is
+    refused even when every entry sets its own `reliability`.
 
 Empty `egress`/`ingress` with `peer`/`client` mode is valid.
 
