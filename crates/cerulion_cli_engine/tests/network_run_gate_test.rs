@@ -310,6 +310,7 @@ fn record_ingress_block_is_refused() {
 #[test]
 fn no_block_real_clock_is_permissive_synth() {
     let _lock = env_lock();
+    std::env::remove_var("CERULION_MULTICAST_SCOUTING");
     let RunNetwork::Permissive(net) =
         resolve_run_network(&graph_with(None), false, TimeSource::Real, false).unwrap()
     else {
@@ -317,8 +318,9 @@ fn no_block_real_clock_is_permissive_synth() {
     };
     assert_eq!(net.mode, ZenohMode::Peer);
     assert!(
-        net.multicast_scouting && net.gossip_scouting,
-        "the permissive synth must enable scouting (unpaired robots LAN-discoverable)"
+        !net.multicast_scouting && net.gossip_scouting,
+        "the permissive synth runs gossip only; multicast scouting is opt-in \
+         (the gateway's mDNS beacon is how peers find it)"
     );
     assert!(
         net.connect_endpoints.is_empty(),
@@ -329,6 +331,21 @@ fn no_block_real_clock_is_permissive_synth() {
         vec![format!("tcp/[::]:{GATEWAY_WELL_KNOWN_PORT}")],
         "the permissive synth listens on the well-known gateway port"
     );
+}
+
+/// `CERULION_MULTICAST_SCOUTING=on` turns multicast scouting back on in the
+/// permissive synth.
+#[test]
+fn multicast_scouting_switch_enables_it_on_the_permissive_synth() {
+    let _lock = env_lock();
+    std::env::set_var("CERULION_MULTICAST_SCOUTING", "on");
+    let _g = EnvGuard("CERULION_MULTICAST_SCOUTING");
+    let RunNetwork::Permissive(net) =
+        resolve_run_network(&graph_with(None), false, TimeSource::Real, false).unwrap()
+    else {
+        panic!("a no-block real-clock run must be Permissive");
+    };
+    assert!(net.multicast_scouting && net.gossip_scouting);
 }
 
 /// `--record` + no block ⇒ Permissive (permissive has no ingress, so
@@ -464,7 +481,7 @@ fn ros_attach_bridge_graph_shape_is_permissive() {
 ///
 /// If it did, that would be the sharp end of the failure: the block vanishes,
 /// the robot falls to the permissive default — every produced topic announced
-/// to the LAN, multicast and gossip scouting on, listening on the gateway
+/// to the LAN, gossip scouting on, listening on the gateway
 /// port — and the only line printed insists there is "no `network:` block",
 /// which reads as normal to anyone not already suspecting a typo and reads as
 /// WRONG to the author looking straight at the block they wrote.
