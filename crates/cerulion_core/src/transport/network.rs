@@ -2022,7 +2022,9 @@ fn build_catalog_reply_from_bridge(
     robot: &str,
 ) -> cerulion_q::CatalogReply {
     // Held for the WHOLE build: a `SchemaServingHandles::replace` in flight
-    // must not interleave its new snapshot set with the old topic/hash maps.
+    // must not interleave its new snapshot set with the old topic/hash maps,
+    // and a host restart's `replace_then` retires the prior run's bridge
+    // topics under this same lock, so the registry read below is of one run.
     let _snapshot_guard = catalog
         .snapshot_lock
         .lock()
@@ -5451,6 +5453,68 @@ mod tests {
                 ("/host/late", CatalogProvenance::Runtime),
             ])
         );
+    }
+
+    /// A catalog GET must see one generation during a host restart: the
+    /// bridge retirement runs inside `replace_then`'s snapshot critical
+    /// section, so a reader cannot pair the new boot set with a prior-run
+    /// bridge entry (which it would list as `Runtime`). Hand oracle: while
+    /// retirement runs, the catalog's snapshot lock is held; the reply after
+    /// it lists only the new run's topic, as `Boot`.
+    #[test]
+    fn a_catalog_reader_cannot_see_the_new_snapshot_before_the_retirement() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::sync::{Arc, Mutex};
+
+        let bridge = TopicBridgeManager::new();
+        bridge.register_topic("/run_one/cam").expect("register old");
+        bridge.register_topic("/run_two/cam").expect("register new");
+        let snapshot_lock = Arc::new(Mutex::new(()));
+        let catalog = CatalogSource {
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+            boot_topics: Arc::new(Mutex::new(HashSet::new())),
+            topic_schemas: Arc::new(Mutex::new(HashMap::new())),
+            hash_names: Arc::new(Mutex::new(HashMap::new())),
+            producer_probe: None,
+            liveness: None,
+            liveness_clock: None,
+            snapshot_lock: Arc::clone(&snapshot_lock),
+        };
+        let handles = crate::transport::gateway::SchemaServingHandles::from_parts(
+            Arc::clone(&catalog.topic_schemas),
+            Arc::clone(&catalog.hash_names),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_lock,
+            Arc::clone(&catalog.hashes),
+            Arc::clone(&catalog.boot_topics),
+        );
+
+        let (_prior, dropped) = handles.replace_then(
+            &crate::transport::gateway::SchemaServing {
+                served_topics: vec!["/run_two/cam".to_string()],
+                ..Default::default()
+            },
+            || {
+                assert!(
+                    matches!(
+                        catalog.snapshot_lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "a catalog reader must be locked out until the retirement ends"
+                );
+                bridge
+                    .unregister_topics_except(&["/run_two/cam".to_string()])
+                    .expect("unregister")
+            },
+        );
+        assert_eq!(dropped, 1);
+        let reply = build_catalog_reply_from_bridge(&bridge, &catalog, "go2");
+        let provenance: Vec<(&str, CatalogProvenance)> = reply
+            .entries
+            .iter()
+            .map(|e| (e.topic.as_str(), e.provenance))
+            .collect();
+        assert_eq!(provenance, [("/run_two/cam", CatalogProvenance::Boot)]);
     }
 
     #[test]

@@ -482,10 +482,35 @@ impl SchemaServingHandles {
     /// Returns the replaced state, so a caller whose run then fails to start
     /// can [`restore`](Self::restore) it.
     pub fn replace(&self, serving: &SchemaServing) -> SchemaServingState {
+        self.replace_then(serving, || ()).0
+    }
+
+    /// [`replace`](Self::replace), then run `retire` before the snapshot lock
+    /// is released, and return both results.
+    ///
+    /// A catalog GET holds the same snapshot lock for its whole build and
+    /// lists the bridge registry. A host that restarts its gateway retires
+    /// the prior run's bridge topics in `retire`, so no catalog reply can pair
+    /// the new boot set and schema bindings with a prior-run bridge entry.
+    ///
+    /// `retire` must not take the snapshot lock (it is not reentrant) or call
+    /// back into these handles.
+    pub fn replace_then<R>(
+        &self,
+        serving: &SchemaServing,
+        retire: impl FnOnce() -> R,
+    ) -> (SchemaServingState, R) {
         let _snapshot = self
             .snapshot_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = self.swap_maps(serving);
+        (prior, retire())
+    }
+
+    /// The map swap behind [`replace_then`](Self::replace_then). The caller
+    /// holds the snapshot lock.
+    fn swap_maps(&self, serving: &SchemaServing) -> SchemaServingState {
         // hot-path-alloc-ok: process-restart schema refresh, never per frame.
         // Lock order matches the catalog reader: runtime hashes, then names.
         let mut rh = self
