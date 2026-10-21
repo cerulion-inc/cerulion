@@ -33,7 +33,7 @@ python3 benches/latency/bench.py compile-csv && python3 benches/latency/bench.py
 
 | Directory | Status | What it is |
 |---|---|---|
-| `latency/` | **ACTIVE: the public suite** | Complete, self-contained latency campaign: native floor + comparison lines, real-CLI workspace lines (`cerulion graph run`, mono + split legs), ROS 2 cell matrix in Docker, driver (`bench.py`), strict offline aggregation, smoke gate, plot system. Raw `.bin` samples → offline percentiles; no number ships without its harness (Principle #13). |
+| `latency/` | **ACTIVE: the public suite** | Complete, self-contained latency campaign: native floor + comparison lines, real-CLI workspace lines (`cerulion graph run`, mono + split + split3 legs, free-run default with an opt-in lockstep arm), ROS 2 cell matrix in Docker, driver (`bench.py`), strict offline aggregation, smoke gate, plot system. Raw `.bin` samples → offline percentiles; no number ships without its harness (Principle #13). |
 
 ## Conventions (all suites)
 

@@ -101,8 +101,11 @@ quantization").
 |---|---|---|---|
 | `cerulion_workspace_split_chrt{0,1}` | **user-facing: THE HEADLINE ROW** | `cerulion graph run rtt_bench_split`, a declared 2-group `process_groups:` graph, **zero flags, zero env overrides** | Real-clock multi-process: g1={ping} / g2={pong, latency}, so the ping → pong edge is a real cross-process iceoryx2 hop, free-running by default (each rank on its own wall-following clock; `CERULION_EXECUTION_MODE=lockstep` opts a run out), and the network gateway spawns by default. This is the multi-process pairing against ROS 2's own 3-process shape. **Type class: variable**; these legs ride `sensor_msgs/Image` with the unbounded `data` field loaned per tick (they always have; the axis just names it; see `METHODOLOGY.md` §18). |
 | `cerulion_workspace_mono_chrt{0,1}` | **user-facing** | `graph run rtt_bench --single-process`, one flag, nothing else | The single-process opt-in. The gateway still spawns (it is the product's default network posture); the row label IS the invocation. **Type class: variable** (same note as split). |
+| `cerulion_workspace_split3_chrt{0,1}` | **user-facing** | `cerulion graph run rtt_bench_split3`, a declared 3-group `process_groups:` graph, zero flags, zero env overrides | The same chain with one node per group: g1={ping} / g2={pong} / g3={latency}, so BOTH edges (ping → pong and pong → latency) are real cross-process iceoryx2 hops. It matches ROS 2's own 3-process shape hop for hop, and the split3-vs-split delta is the second cross-process hop. Same structural skip under backtoback as split. **Type class: variable** (same note as split). |
 | `cerulion_workspace_split_pod_chrt{0,1}` | **type-class twin** | `graph run rtt_bench_pod_split`, the same declared 2-group shape | The FIXED-POD twin of the split leg (type-class axis, `METHODOLOGY.md` §18): identical wiring, the message swapped for `PodPayload`, a purely-fixed workspace schema totaling exactly N bytes per sweep point (mirroring ROS 2's `Pod<N>`), rebuilt per size with the baked array length + an init-time size gate. The split-variable vs split-pod delta isolates what a variable field costs the loaned-slot write path. |
 | `cerulion_workspace_mono_pod_chrt{0,1}` | **type-class twin** | `graph run rtt_bench_pod --single-process` | The FIXED-POD twin of the mono leg (same rules). |
+| `cerulion_workspace_split3_pod_chrt{0,1}` | **type-class twin** | `graph run rtt_bench_pod_split3`, the same declared 3-group shape | The FIXED-POD twin of the split3 leg (same rules as the split twin). |
+| `cerulion_workspace_{split,split3}_lockstep[_pod]_chrt{0,1}` | **execution-mode arm (opt-in)** | the same graph as the token-less row, run with `CERULION_EXECUTION_MODE=lockstep` | The shared-barrier opt-out of a multi-process leg, measured beside the free-run default (`bench.py workspace --execution-mode lockstep` or `both`; `CER_BENCH_EXECUTION_MODE` on the runner). The token-less rows ARE the free-run default: the runner UNSETS `CERULION_EXECUTION_MODE` for them, an inherited value included. Not part of `full`. mono has no lockstep row: a `--single-process` run has no ranks to lock together. |
 
 > **Where the flagless default is:** the retired `default` leg (`cerulion graph run
 > rtt_bench`, zero flags, where the runtime derives a process-per-node partition)
@@ -173,6 +176,7 @@ The matrix below is the normalization key; the pairing table in
 | `iox2_chrt0` (floor) | 1 (two threads) | 0 process / 2 thread | 0: spin-poll both sides | spin | harness bracket |
 | `zenoh_shm_*` | 2 | 2 | 2 (blocking `recv()` + RX callback) | block | harness bracket |
 | `cerulion_workspace_split_*` | 2 workers (+ supervisor & gateway, off-path) | 1 | 1 cross-process data wake (ping → pong); the pong → latency echo hop is in-process in g2, so under the free-run default nothing gates it but g2's own level order inside the step (levels 1 and 2 run back to back on that rank's thread, no rendezvous of any kind); `CERULION_EXECUTION_MODE=lockstep` opts a run out and puts the level-boundary barrier rendezvous there | block (WaitSet/park) | embedded stamp |
+| `cerulion_workspace_split3_*` | 3 workers (+ supervisor & gateway, off-path) | 2 | 2 cross-process data wakes (ping → pong, pong → latency), one per edge; under the free-run default each rank steps on its own clock with no rendezvous; `CERULION_EXECUTION_MODE=lockstep` opts a run out and adds the level-boundary barrier rendezvous to both hops | block (WaitSet/park) | embedded stamp |
 | `cerulion_workspace_mono_*` | 1 (+ gateway, off-path) | 0 | 0: all three nodes fire in one step on one thread | in-step dispatch | embedded stamp |
 | ROS 2 `*_rclcpp_*` | 3 nodes (+ iox-roudi / rmw_zenohd where applicable, off-path) | 2 | 2 executor wakes (+ per-receive heap alloc + payload memcpy) | block (executor) | embedded stamp |
 | ROS 2 `*_loan_*` | 3 nodes | 2 | 2 WaitSet wakes (no receive memcpy on pong/latency) | block (WaitSet) | embedded stamp |
@@ -238,6 +242,9 @@ govern every number this suite ever produces:
 | "ROS 2 over Cerulion vs stock ROS 2" | `{distro}_cerulion_shm_loan_*` vs `{distro}_stock_rclcpp_*`. This suite carries the `cerulion` cells for one purpose, the `rmw_cerulion` line of the README round-trip chart (`jazzy_cerulion_shm_loan_be1_chrt0`) | Same harness, posture and pacing, three processes on both sides. The `cerulion` cell publishes and takes loaned messages and the stock cell does not, so quote the loan posture with the pair. It is ROS 2 over the Cerulion transport, never a native number (rule 2). |
 | "Cerulion multi-process vs ROS 2 default" | `cerulion_workspace_split_*` vs `{distro}_stock_rclcpp_*` (default-vs-default, memo §5: the stock lane IS the unconfigured `ros2 run` experience; the per-rmw `{distro}_{rmw}_shm_rclcpp_*` cells are the configured variants of the same pairing) | **Near-matched, asymmetry named** (2 worker processes / 1 in-window crossing vs 3 processes / 2 in-window crossings): the split's declared g2={pong, latency} keeps the echo hop in-process, so quote the crossing counts with the pair. (The flagless default, 3 workers, 2 crossings, the exact crossing-match, returns as this pairing when the park-wake fix lands; see the flagless-default note above.) Executor models also differ (a free-running per-rank level executor, which is what the zero-env split leg runs now that free run is the multi-process default, vs 3× rclcpp spin), a real product difference, named not hidden. |
 | "What a process boundary costs Cerulion" | `split` vs `mono` | Within-family A/B: the split-vs-mono delta is exactly ONE explicit cross-process hop (the declared 2-group partition vs `--single-process` on the same 3-node chain). |
+| "Cerulion 3-process vs ROS 2 default" | `cerulion_workspace_split3_*` vs `{distro}_stock_rclcpp_*` | **Matched on topology** (3 worker processes / 2 in-window crossings on both sides): split3 declares one node per group, so both of its edges cross processes, as both of ROS 2's do. Executor models still differ (free-running per-rank level executors vs 3× rclcpp spin), named not hidden. |
+| "What the second process boundary costs Cerulion" | `split3` vs `split` | Within-family A/B: the split3-vs-split delta is exactly ONE more cross-process hop (pong → latency leaves g2's process). |
+| "What lockstep costs over free run" | `cerulion_workspace_<leg>_lockstep_*` vs `cerulion_workspace_<leg>_*` | Within-family A/B on the SAME graph and leg: the only moving part is `CERULION_EXECUTION_MODE` (lockstep adds the level-boundary barrier rendezvous at every global-level advance, the in-process echo hop of split included). Measure both in one sitting (`--execution-mode both`). |
 | "Cerulion collapsed shape vs ROS 2" | `mono` vs `{distro}_composed_ipc{on,off}_rclcpp_*` | **Matched** (1 process vs 1 process, 0 in-window crossings on both): ROS 2's collapsed twin is the `composed` lane (memo §2: composition + the intra-process opt-in). Named asymmetry: with ipc=on the ROS 2 side bypasses its middleware entirely (rclcpp pointer-pass with N−1-copy fan-out cliffs), so this row compares *framework* overhead, not transport; `mono` keeps Cerulion's full SHM transport + observability plane in the path. `mono` vs any OTHER ROS 2 cell stays NOT matched (0 vs 2 crossings), citable only with the crossing row quoted. |
 | "… vs the hardware floor" | `iox2_chrt0` vs anything | **Floor reference only**: spin-bound, 0 wakes; never a fairness pair for any wake-driven line. |
 | "zenoh-native vs Cerulion-native" | `zenoh_shm_*` vs `cerulion_workspace_split_*` | Data-path process count matched (2 vs 2 workers); crossings differ (2 vs 1; the split's echo hop is in-process) and receive models differ (blocking recv vs free-running per-rank workers, the split leg's default); quote the crossing counts. Comparison lines replicate their upstream canonical harness shape (`z_ping_shm`); that rule, stated once, covers the residual. |
@@ -355,9 +362,12 @@ cd benches/latency
 # 1. Native host lines (iceoryx2 floor + zenoh comparison)
 python3 bench.py native --chrt both
 
-# 2. Workspace lines (real `cerulion graph run`; split + mono legs;
+# 2. Workspace lines (real `cerulion graph run`; split + split3 + mono legs;
 #    split is the headline row)
 python3 bench.py workspace --chrt both
+#    The lockstep execution-mode arm of the multi-process legs is opt-in
+#    (`--execution-mode lockstep`, or `both` for the two modes side by
+#    side); plot it with `bench.py plots --execution-mode <same value>`.
 
 # 3. ROS 2 cells (builds the per-distro images, tagged latency_bench:{distro},
 #    on first run; hours, unattended)
@@ -372,6 +382,9 @@ python3 bench.py ros2 --chrt both --build-image
 #    plot.py refuses a --variant that contradicts the run dir's run.json)
 python3 bench.py compile-csv
 python3 bench.py plots --chrt both
+#    A run dir measured before the split3 leg existed has no split3 CSVs,
+#    and the workspace group EXPECTS them: render it with --skip-missing
+#    (the figure then names the omitted rows itself).
 
 # Or end-to-end in one call:
 python3 bench.py full --chrt both --build-image
@@ -412,7 +425,7 @@ and by name, when the property is unproven.
 
 
 ```bash
-# Workspace legs without the orchestrator (leg = split | mono). The runner
+# Workspace legs without the orchestrator (leg = split | split3 | mono). The runner
 # REFUSES to start without a raw output directory and the leg's raw
 # prefix (bench.py normally sets both), so pass them here:
 mkdir -p /tmp/cerbench-raw
@@ -432,6 +445,14 @@ CER_BENCH_MSG=pod \
 CER_BENCH_RAW_DUMP_DIR=/tmp/cerbench-raw \
 CER_BENCH_RAW_NAME=cerulion_workspace_split_pod_chrt0 \
     bash workspace/run_workspace.sh split
+# Execution-mode arm (default CER_BENCH_EXECUTION_MODE=free_run, which
+# UNSETS CERULION_EXECUTION_MODE for the graph). lockstep carries its own
+# token in the raw prefix (cerulion_workspace_<leg>_lockstep[_pod]_chrt<N>),
+# and the runner refuses it on the mono leg:
+CER_BENCH_EXECUTION_MODE=lockstep \
+CER_BENCH_RAW_DUMP_DIR=/tmp/cerbench-raw \
+CER_BENCH_RAW_NAME=cerulion_workspace_split3_lockstep_chrt0 \
+    bash workspace/run_workspace.sh split3
 
 # One ROS 2 cell inside its container (per-cell driver):
 #   see ros2/run_bench.sh; bench.py invokes it per cell with the
