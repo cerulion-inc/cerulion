@@ -150,10 +150,13 @@ pub struct GraphConfig {
     /// networking; it does not switch it on.
     ///
     /// Under `cerulion graph run` on the real clock, an absent block (and a
-    /// block whose `mode` is `disabled`) means the PERMISSIVE default: the CLI
-    /// starts one separate gateway process that opens the machine's zenoh
-    /// session, listens on port 7683 (`CERULION_GATEWAY_PORT` overrides it),
-    /// scouts the LAN and announces every topic the graph produces. An enabled
+    /// block whose `mode` is `disabled`) means the PERMISSIVE default: one
+    /// gateway outside the graph process opens the machine's zenoh session and
+    /// announces the topics the graph produces when LAN access is open. On the default Unix path that
+    /// gateway is hosted by `cerulion-netd`, which listens and advertises over
+    /// mDNS only when `CERULION_NETD_LISTEN` is set; the per-run fallback
+    /// gateway child listens on port 7683 (`CERULION_GATEWAY_PORT` overrides
+    /// it) and advertises itself over mDNS. An enabled
     /// block (`mode: peer` or `client`) replaces that with a STRICT posture:
     /// the `connect` / `listen` locators used verbatim, no scouting, and only
     /// the listed `egress` and `ingress` topics crossing. No value of this
@@ -307,8 +310,8 @@ impl GraphConfig {
 pub enum NetworkMode {
     /// The block imposes NO restriction, exactly like an absent block. The
     /// default when `mode:` is omitted. Under `cerulion graph run` on the real
-    /// clock that is the PERMISSIVE default (a gateway process, LAN scouting,
-    /// every produced topic announced), NOT "no network": the local-only
+    /// clock that is the PERMISSIVE default (a gateway process, mDNS
+    /// discovery, produced topics announced when LAN access is open), NOT "no network": the local-only
     /// switch is `graph run --network off`. Declaring `egress`/`ingress` under
     /// this mode is a graph-load error.
     #[default]
@@ -432,6 +435,11 @@ impl EgressTopic {
     pub fn effective_reliability(&self, default: EgressReliability) -> EgressReliability {
         self.reliability.unwrap_or(default)
     }
+
+    /// The topic name.
+    pub fn as_str(&self) -> &str {
+        &self.topic
+    }
 }
 
 impl From<&str> for EgressTopic {
@@ -443,6 +451,60 @@ impl From<&str> for EgressTopic {
 impl From<String> for EgressTopic {
     fn from(topic: String) -> Self {
         Self::new(topic)
+    }
+}
+
+impl AsRef<str> for EgressTopic {
+    fn as_ref(&self) -> &str {
+        &self.topic
+    }
+}
+
+impl std::fmt::Display for EgressTopic {
+    /// Writes the topic name; an entry's own `reliability` is not written.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.topic)
+    }
+}
+
+// A topic name compares equal to an entry when the entry is that name's bare
+// spelling: the same `topic` and no `reliability` of its own. An entry that
+// sets a `reliability` is not equal to any string, which keeps these impls
+// consistent with `EgressTopic == EgressTopic`. A `Vec<EgressTopic>` compares
+// with a `Vec<String>` or a `Vec<&str>` through them.
+impl PartialEq<str> for EgressTopic {
+    fn eq(&self, other: &str) -> bool {
+        self.reliability.is_none() && self.topic == other
+    }
+}
+
+impl PartialEq<&str> for EgressTopic {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+
+impl PartialEq<String> for EgressTopic {
+    fn eq(&self, other: &String) -> bool {
+        *self == **other
+    }
+}
+
+impl PartialEq<EgressTopic> for str {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == *self
+    }
+}
+
+impl PartialEq<EgressTopic> for &str {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == **self
+    }
+}
+
+impl PartialEq<EgressTopic> for String {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == **self
     }
 }
 
@@ -1577,5 +1639,94 @@ network:
         .unwrap();
         assert!(disabled.network_transport_config().is_none());
         assert!(!disabled.has_enabled_network());
+    }
+
+    /// A 1.0 `egress:` list of topic names, block or flow style, parses to
+    /// bare entries and serializes back to the same list of strings.
+    #[test]
+    fn egress_string_list_parses_and_serializes_back_as_strings() {
+        for yaml in [
+            "mode: peer\negress:\n  - /a/x\n  - /b/y\n",
+            "mode: peer\negress: [/a/x, /b/y]\n",
+        ] {
+            let block: NetworkBlock = serde_yaml::from_str(yaml).expect(yaml);
+            assert_eq!(
+                block.egress,
+                vec![EgressTopic::new("/a/x"), EgressTopic::new("/b/y")],
+                "{yaml}"
+            );
+            assert_eq!(block.egress, vec!["/a/x".to_string(), "/b/y".to_string()]);
+            let value = serde_yaml::to_value(&block).unwrap();
+            assert_eq!(
+                value["egress"],
+                serde_yaml::from_str::<serde_yaml::Value>("[/a/x, /b/y]").unwrap(),
+                "{yaml}"
+            );
+            let back: NetworkBlock =
+                serde_yaml::from_str(&serde_yaml::to_string(&block).unwrap()).unwrap();
+            assert_eq!(back, block, "{yaml}");
+        }
+    }
+
+    /// Bare names and maps mix in one list, and only a map entry keeps a
+    /// `reliability` of its own.
+    #[test]
+    fn egress_list_mixes_bare_names_and_maps() {
+        let block: NetworkBlock = serde_yaml::from_str(
+            "mode: peer\negress:\n  - /r/cmd\n  - topic: /r/scan\n    reliability: best_effort\n  - topic: /r/odom\n",
+        )
+        .unwrap();
+        assert_eq!(
+            block.egress,
+            vec![
+                EgressTopic::new("/r/cmd"),
+                EgressTopic::with_reliability("/r/scan", EgressReliability::BestEffort),
+                EgressTopic::new("/r/odom"),
+            ]
+        );
+        let value = serde_yaml::to_value(&block).unwrap();
+        assert_eq!(
+            value["egress"],
+            serde_yaml::from_str::<serde_yaml::Value>(
+                "[/r/cmd, {topic: /r/scan, reliability: best_effort}, /r/odom]"
+            )
+            .unwrap()
+        );
+    }
+
+    /// Rust code that held the list as strings: entries build from `&str` and
+    /// `String`, compare with both in either order, and read back as `&str`.
+    /// An entry with its own `reliability` equals no string.
+    #[test]
+    fn egress_topic_builds_from_and_compares_with_strings() {
+        let block = NetworkBlock {
+            mode: NetworkMode::Peer,
+            egress: vec!["/a/x".into(), String::from("/b/y").into()],
+            ..NetworkBlock::default()
+        };
+        assert_eq!(block.egress, vec!["/a/x", "/b/y"]);
+        assert_eq!(block.egress, vec!["/a/x".to_string(), "/b/y".to_string()]);
+        assert!(block.egress.iter().any(|t| t == "/b/y"));
+        assert!(block.egress.iter().all(|t| t != "/c/z"));
+        let wanted = String::from("/b/y");
+        assert!(block.egress.iter().any(|t| *t == wanted));
+
+        let bare = EgressTopic::new("/a/x");
+        assert!(bare == *"/a/x" && *"/a/x" == bare);
+        assert!(bare == "/a/x" && "/a/x" == bare);
+        let owned = String::from("/a/x");
+        assert!(bare == owned && owned == bare);
+        assert!(bare != "/a/y");
+        assert_eq!(bare.as_str(), "/a/x");
+        assert_eq!(AsRef::<str>::as_ref(&bare), "/a/x");
+        assert_eq!(bare.to_string(), "/a/x");
+
+        for reliability in [EgressReliability::Reliable, EgressReliability::BestEffort] {
+            let set = EgressTopic::with_reliability("/a/x", reliability);
+            assert!(set != "/a/x" && "/a/x" != set, "{reliability:?}");
+            assert!(set != owned && owned != set, "{reliability:?}");
+            assert_eq!(set.as_str(), "/a/x");
+            assert_eq!(set.to_string(), "/a/x");
+        }
     }
 }

@@ -1305,14 +1305,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 70 where the root manifest's `members` array lists 69: the extra one is the
+/// 71 where the root manifest's `members` array lists 70: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 70;
+const WORKSPACE_MEMBER_COUNT: usize = 71;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -2960,6 +2960,18 @@ fn observation_edges_of_source(
             continue;
         }
         let before = &views.code[..literal.at];
+        // A fixture loaded by its crate name through `cdylib_name("<stem>")`:
+        // the call builds the platform's `lib<stem>.so` / `.dylib` file name
+        // at run time, so the literal is the bare artifact stem and no other
+        // rule sees a `dlopen` in it.
+        if before.trim_end().ends_with("cdylib_name(") {
+            if let Some(package) = cdylibs.get(literal.text.as_str()) {
+                if package != observing {
+                    out.insert((package.clone(), EDGE_DLOPEN, line_at(src, literal.at)));
+                }
+            }
+            continue;
+        }
         let in_a_read_table = read_tables
             .iter()
             .any(|item| (item.start..item.end).contains(&literal.at));
@@ -3318,6 +3330,21 @@ fn missing_and_stale(
 /// reason [`HAND_SCANNED_DOC_PINS`] gives: a row written twice makes a length
 /// add up while hiding a derived edge nobody wrote down.
 const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
+    // The embedded-runtime tests load node fixtures from the fixture crates'
+    // build output, named by the library file or by crate name through
+    // `cdylib_name("<stem>")`, which builds the platform file name.
+    (
+        "cerulion_android",
+        "test_node_macro_external_cdylib",
+        "dlopen",
+    ),
+    ("cerulion_android", "test_node_failing_cdylib", "dlopen"),
+    ("cerulion_android", "test_node_hang_cdylib", "dlopen"),
+    (
+        "cerulion_android",
+        "test_node_macro_period_cdylib",
+        "dlopen",
+    ),
     // state_anchor_partial_scan_test's REGION table names sources of two other
     // crates by their paths under the crates tree: the cli engine's graph
     // command, replay state and state arm attach, and the core's state ring.
@@ -3742,6 +3769,17 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
     assert_eq!(
         fixture_edges("let p = dir.join(\"libgamma.dylib\");\n"),
         edge("gamma", EDGE_DLOPEN, 1)
+    );
+
+    // (e2) The same `dlopen`, named by its artifact stem through
+    //      `cdylib_name`, which builds the platform's file name.
+    assert_eq!(
+        fixture_edges("let p = dir.join(cdylib_name(\"gamma\"));\n"),
+        edge("gamma", EDGE_DLOPEN, 1)
+    );
+    assert_eq!(
+        fixture_edges("let p = dir.join(graph_cmd::cdylib_name(\n    \"gamma\",\n));\n"),
+        edge("gamma", EDGE_DLOPEN, 2)
     );
 
     // (f) An artifact name built at RUN TIME cannot be attributed.

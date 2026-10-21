@@ -457,7 +457,7 @@ fn seam_reinject_failure_is_counted_and_latch_warns_once() {
             .count();
         let recoveries = lines
             .iter()
-            .filter(|l| l.contains(topic.as_str()) && l.contains("recovered — frames validating"))
+            .filter(|l| l.contains(topic.as_str()) && l.contains("recovered; frames validating"))
             .count();
         if warns == 1 && recoveries == 1 {
             Ok(())

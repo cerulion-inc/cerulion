@@ -536,6 +536,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point for the raw-FFI half of the same contract",
     ),
     (
+        "cdylib_shm_fd_handoff_iox2_test.rs",
+        "subprocess_child_shm_fd_handoff",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` in a fresh process, since its descriptor table is the subject",
+    ),
+    (
         "cdylib_tracing_stopgap_test.rs",
         "subprocess_child_discard_probe",
         "child",
@@ -582,6 +588,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subscriber_role",
         "child",
         "self-re-exec subscriber role that reports readiness before the publisher starts",
+    ),
+    (
+        "gateway_iox2_test.rs",
+        "lan_announce_observer_role",
+        "child",
+        "self-re-exec LAN observer role; one zenoh session per process, so the parent drives it in a child and reads the announce set it prints",
+    ),
+    (
+        "gateway_iox2_test.rs",
+        "lan_demand_client_role",
+        "child",
+        "self-re-exec LAN demand-client role; one zenoh session per process, so the parent drives it in a child and reads the PRE/POST tokens it prints",
     ),
 ];
 
