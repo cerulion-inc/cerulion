@@ -556,18 +556,28 @@ FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#
 NESTED_PARENT_RE = re.compile(r'^const PARENT: &str = "([a-z][a-z0-9-]*)";$', re.M)
 
 
-def without_comments(src):
-    """`src` with every Rust comment removed and string literals kept, each
-    line's trailing blanks trimmed, so a declaration inside a comment is never
-    read as code."""
-    return "\n".join(line.rstrip() for line in lex_rust(src, keep_strings=True)[0].split("\n"))
+def code_matches(pattern, src):
+    """The matches of `pattern` that start in CODE: searched over `src` with
+    every comment removed (string literals kept, each line's trailing blanks
+    trimmed), and a match that starts inside a string literal dropped, so a
+    declaration in a comment or in a string (a doc example in a raw string)
+    is never read as code."""
+    kept, blanked = [], []
+    for k, b in zip(lex_rust(src, keep_strings=True)[0].split("\n"), lex_rust(src)[0].split("\n")):
+        n = len(k.rstrip())
+        kept.append(k[:n])
+        blanked.append(b[:n])
+    view, code = "\n".join(kept), "\n".join(blanked)
+    # A string body is blanked in `code` only, and every pattern here starts
+    # on a non-blank character, so a start that differs is inside a string.
+    return [m for m in pattern.finditer(view) if code[m.start()] == view[m.start()]]
 
 
 def module_verbs(path, fsrc):
     """The verbs of one family or nested-verb module: the subtree of the one
-    `Subcommand` enum no other enum in the module nests. Comments are not
-    code, so an enum inside one is never a verb."""
-    fam = parse_enums(FAMILY_ENUM_RE.finditer(without_comments(fsrc)))
+    `Subcommand` enum no other enum in the module nests. Only code counts, so
+    an enum inside a comment or a string is never a verb."""
+    fam = parse_enums(code_matches(FAMILY_ENUM_RE, fsrc))
     nested = {d["sub"] for variants in fam.values() for d in variants.values()}
     roots = [e for e in fam if e not in nested]
     if not roots:
@@ -597,9 +607,9 @@ def parse_cli_tree(src, family_srcs=(), nested_srcs=()):
             tree[verb] = node
     for path, fsrc in nested_srcs:
         # A nested verb set's verbs join the subtree of the verb it names.
-        # Exactly one declaration, read outside comments: a commented-out
-        # parent is not the one the binary uses.
-        parents = list(NESTED_PARENT_RE.finditer(without_comments(fsrc)))
+        # Exactly one declaration, read from code only: a parent in a comment
+        # or a string is not the one the binary uses.
+        parents = code_matches(NESTED_PARENT_RE, fsrc)
         if len(parents) != 1:
             raise CannotRun("%s: a nested verb set declares %d `const PARENT: &str = \"<verb>\";` lines, expected exactly one, so its parent verb cannot be established" % (path, len(parents)))
         parent = parents[0]
@@ -2285,6 +2295,10 @@ def self_test(out=sys.stdout):
     commented = '/*\nconst PARENT: &str = "nope";\n*/\n// const PARENT: &str = "nope";\n/*\n#[derive(Subcommand)]\nenum Ghost {\n    Haunt,\n}\n*/\n' + nested_src
     tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", commented)])
     arm("verb-tree-nested-commented-decoys", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    # Nor is one inside a string: a raw-string doc example is text, not a declaration.
+    in_string = 'const DOC: &str = r#"\nconst PARENT: &str = "nope";\n#[derive(Subcommand)]\nenum Ghost {\n    Haunt,\n}\n"#;\n\n' + nested_src
+    tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", in_string)])
+    arm("verb-tree-nested-string-decoys", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
     for label, bad in (("verb-tree-nested-duplicate", nested_src.replace("Inspect {", "Run {")),
                        ("verb-tree-nested-unknown-parent", nested_src.replace('"graph"', '"nope"')),
                        ("verb-tree-nested-no-parent", nested_src.replace('const PARENT: &str = "graph";', "")),
