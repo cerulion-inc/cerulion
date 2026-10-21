@@ -3510,6 +3510,9 @@ pub struct GraphRuntime {
     /// (helper threads included — see the `external_bindings` doc) rather than
     /// re-querying / re-spawning.
     external_sources_collected: bool,
+    /// Every native node's params as this build resolved them, keyed by node
+    /// id: what [`Self::param_differences`] compares a recording against.
+    params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -5054,6 +5057,27 @@ impl GraphRuntime {
         // param. The resolved maps are handed to each entry just before its
         // `init` below.
         let resolved_params = crate::graph::params::resolve_graph_params(&config, &entry_infos)?;
+        // Kept on the runtime for a resume, which compares each restored
+        // node's values in force with the ones the recording names
+        // (`crate::graph::param_resume`).
+        // hot-path-alloc-ok: cold: graph build, one map per node
+        let params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce> =
+            resolved_params
+                .iter()
+                .map(|(id, values)| {
+                    let specs = entry_infos
+                        .get(id)
+                        .map(|info| info.params().to_vec())
+                        .unwrap_or_default();
+                    (
+                        id.clone(),
+                        crate::graph::param_resume::ParamsInForce {
+                            specs,
+                            values: values.clone(),
+                        },
+                    )
+                })
+                .collect();
         // The `(topic, consumer node, consumer input)` key set of
         // every cross-process `block` edge this build carries a credit word
         // for. Derived ONCE and read twice — by `validate_with_credit_edges`
@@ -9124,6 +9148,7 @@ impl GraphRuntime {
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
             external_sources_collected: false,
+            params_in_force,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -17048,6 +17073,34 @@ impl GraphRuntime {
             }
         }
         Ok(out)
+    }
+
+    /// RESUME: every param of a node in `recorded` whose value in force
+    /// differs from the recorded one, in the graph's declaration order, one
+    /// [`ParamDifference`](crate::graph::param_resume::ParamDifference) per
+    /// param. A param is not node state, so a restore never writes one and a
+    /// resumed node runs on the values this build handed it; the caller
+    /// compares BEFORE it restores and refuses on any difference unless the
+    /// operator chose the current values.
+    ///
+    /// `recorded` maps node id to the params the recording names for it. A
+    /// node of `recorded` that this graph does not run, or that declares no
+    /// params and has none recorded, contributes nothing.
+    pub fn param_differences(
+        &self,
+        recorded: &std::collections::BTreeMap<String, crate::graph::params::ParamValues>,
+    ) -> Vec<crate::graph::param_resume::ParamDifference> {
+        let none = crate::graph::param_resume::ParamsInForce::default();
+        self.nodes
+            .keys()
+            .filter_map(|id| recorded.get(id).map(|values| (id, values)))
+            .flat_map(|(id, values)| {
+                self.params_in_force
+                    .get(id)
+                    .unwrap_or(&none)
+                    .differences(id, values)
+            })
+            .collect()
     }
 
     /// Get the graph config.

@@ -517,9 +517,11 @@ pub fn duplicate_param_error(attr: &syn::Attribute, field_name: &Ident) -> syn::
 /// fragment and one apply method for every param, unconditionally, so a
 /// field under `#[cfg(..)]` (or `#[cfg_attr(..)]`) would be written to after
 /// the compiler removed it and the node would fail to build inside generated
-/// code. A `#[cerulion(reconstruct)]` field is rebuilt by the node rather
-/// than carried, which a param, a plain value the graph sets at load, never
-/// needs. Both are refused here, pointing at the attribute.
+/// code. `#[cerulion(reconstruct)]` says "not captured, untouched on
+/// restore", which every param already is (the graph sets it at load and the
+/// state fold-in leaves it out), so on a param the key is redundant and would
+/// suggest the field could be captured without it. Both are refused here,
+/// pointing at the attribute.
 pub fn refuse_conditional_param_field(field: &syn::Field, field_name: &Ident) -> syn::Result<()> {
     for attr in &field.attrs {
         if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
@@ -547,8 +549,9 @@ pub fn refuse_conditional_param_field(field: &syn::Field, field_name: &Ident) ->
                     attr,
                     format!(
                         "`#[param]` field `{field_name}` cannot be `#[cerulion(reconstruct)]`: \
-                         a param is a plain value the graph sets at load and is carried like \
-                         any other field; remove `reconstruct`"
+                         a param is never node state (the graph sets it at load, it is not \
+                         captured and a restore leaves it alone), so `reconstruct` adds \
+                         nothing; remove it"
                     ),
                 ));
             }
@@ -932,9 +935,9 @@ mod tests {
         assert_eq!(
             refuse(rebuilt),
             Err(
-                "`#[param]` field `gain` cannot be `#[cerulion(reconstruct)]`: a param is a \
-                 plain value the graph sets at load and is carried like any other field; \
-                 remove `reconstruct`"
+                "`#[param]` field `gain` cannot be `#[cerulion(reconstruct)]`: a param is \
+                 never node state (the graph sets it at load, it is not captured and a \
+                 restore leaves it alone), so `reconstruct` adds nothing; remove it"
                     .to_string()
             )
         );

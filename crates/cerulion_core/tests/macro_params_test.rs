@@ -385,3 +385,58 @@ fn two_nodes_given_the_same_params_publish_identical_frames() {
     // "odom" is four bytes.
     assert_eq!(frames, vec![(3.25, 0.0, 4.0), (3.25, 0.0, 4.0)]);
 }
+
+/// A param is not node state: the fold-in leaves every `#[param]` field out
+/// of the shape, so the shape holds the struct name and `probe_tag` alone.
+/// Changing a param's type or name therefore never refuses an anchor.
+#[test]
+fn a_nodes_shape_leaves_every_param_out() {
+    use cerulion_core::state::{CerulionState, StateShape};
+    // HAND ORACLE: the struct name, then ONLY the one non-param, non-port
+    // field. A shape that folded `gain`, `offset`, `frame_id` or `enabled`
+    // could not match this.
+    let expected = StateShape::of("ParamNode")
+        .field("probe_tag", <String as CerulionState>::STATE_SHAPE)
+        .finish();
+    assert_eq!(<ParamNode as CerulionState>::STATE_SHAPE, expected);
+    // A node whose only non-port fields are params has an empty shape.
+    assert_eq!(
+        <RawNameNode as CerulionState>::STATE_SHAPE,
+        StateShape::of("RawNameNode").finish()
+    );
+}
+
+/// The resume rule at the node seam: an anchor captured while `gain` was 2.0,
+/// restored into a node the graph built with `gain` 3.0, keeps 3.0 for
+/// `init` and the first tick, while the node's own state (`probe_tag`) is
+/// restored from the anchor.
+#[test]
+fn a_restore_keeps_the_graphs_param_values_and_restores_the_rest() {
+    use cerulion_core::state::VecSink;
+    let anchored = ParamNodeEntry::with_state(ParamNode {
+        gain: 2.0,
+        offset: 5,
+        frame_id: "odom".into(),
+        enabled: true,
+        probe_tag: "anchored".into(),
+        ..Default::default()
+    });
+    let mut payload = VecSink::new();
+    anchored.capture_state(&mut payload).expect("capture");
+
+    let (_tt, ctx, mut sub) = wire("restore");
+    let mut resumed = ParamNodeEntry::new();
+    resumed
+        .set_params(&values(&[("gain", ParamValue::Float(3.0))]))
+        .expect("set_params");
+    resumed.init(ctx).expect("init");
+    resumed.restore_state(payload.as_slice()).expect("restore");
+    assert_eq!(
+        resumed.inner.probe_tag, "anchored",
+        "the node's own state comes from the anchor"
+    );
+    resumed.tick().expect("tick");
+    // gain 3.0 from the graph, offset 0 and "base_link" (nine bytes) from the
+    // defaults: no param value comes from the anchor.
+    assert_eq!(read_cmd(&mut sub), (3.0, 0.0, 9.0));
+}

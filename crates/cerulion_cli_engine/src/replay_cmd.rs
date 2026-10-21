@@ -1341,6 +1341,12 @@ pub struct ReplayOptions {
     ///
     /// Inert on a from-start replay (nothing is restored there by design).
     pub strict_state: bool,
+    /// `--allow-param-change`. On a replay that RESUMES from a recorded
+    /// checkpoint, run on the param values in force even where they differ
+    /// from the ones the recording names. A param is not node state, so a
+    /// restore never writes one; without this flag such a difference refuses
+    /// the replay, one line per param. Inert on a from-start replay.
+    pub allow_param_change: bool,
     /// `--record-out PATH`: write the re-executed frames of every graph-produced
     /// topic to a fresh bag here. `None` writes nothing. The path must not
     /// exist; the surface refuses one that does.
@@ -1899,6 +1905,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         fire_tap: None,
         tolerance,
         strict_state: opts.strict_state,
+        allow_param_change: opts.allow_param_change,
         ros2_entries_skipped,
         record_out,
     };

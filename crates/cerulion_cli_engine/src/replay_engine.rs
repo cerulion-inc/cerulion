@@ -3586,6 +3586,12 @@ pub struct ReplayInputs {
     /// is only ever consulted on a resumed replay (a from-start one restores
     /// nothing by design, so there is nothing for it to be strict about).
     pub strict_state: bool,
+    /// `--allow-param-change`. On a replay that RESUMES from a recorded
+    /// checkpoint, run on the param values in force even where they differ
+    /// from the ones the recording names. A param is not node state, so a
+    /// restore never writes one; without this flag such a difference refuses
+    /// the replay, one line per param. Inert on a from-start replay.
+    pub allow_param_change: bool,
     /// `ros2:` entries the preflight lifted OUT of the embedded graph
     /// (by design: a mixed graph's bag embeds them verbatim; a resim
     /// re-executes NATIVE nodes only — these are opaque processes whose
@@ -3664,6 +3670,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         mut fire_tap,
         tolerance,
         strict_state,
+        allow_param_change,
         ros2_entries_skipped,
         record_out,
     } = inputs;
@@ -4141,7 +4148,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             //     always `None` on a multi-pass run and this block only ever
             //     runs on the single pass a resume can apply to.
             if let Some(plan) = resume.as_ref() {
-                match apply_resume(plan, &clock, &mut runtime, strict_state) {
+                match apply_resume(plan, &clock, &mut runtime, strict_state, allow_param_change) {
                     Ok(report) => acc.resume_report = Some(report),
                     Err(e) => break 'passes Some((rank, e)),
                 }
@@ -8192,6 +8199,54 @@ fn restored_sync_heads_by_input(
     out
 }
 
+/// The resume rule for params, applied before the restore.
+///
+/// Every param of a node the anchor restores whose value in force differs
+/// from the value the recording names refuses the resume, one line per param
+/// (node, param, recorded value, current value), unless `allow_param_change`
+/// says to resume on the current values; then each difference is a WARN.
+fn refuse_param_differences(
+    plan: &ResumePlan,
+    runtime: &GraphRuntime,
+    allow_param_change: bool,
+) -> Result<(), ReplayError> {
+    let recorded: BTreeMap<String, cerulion_core::graph::params::ParamValues> = runtime
+        .config()
+        .nodes
+        .iter()
+        .filter(|node| plan.blobs.contains_key(&node.id))
+        .map(|node| (node.id.clone(), node.params.clone()))
+        .collect();
+    let differences = runtime.param_differences(&recorded);
+    if differences.is_empty() {
+        return Ok(());
+    }
+    if allow_param_change {
+        for difference in &differences {
+            tracing::warn!(
+                node_id = %difference.node,
+                param = %difference.param,
+                difference = %difference,
+                "replay resume: a param value in force differs from the recorded one; \
+                 resuming on the current value (`--allow-param-change`)"
+            );
+        }
+        return Ok(());
+    }
+    let lines: Vec<String> = differences.iter().map(|d| format!("  {d}")).collect();
+    Err(ReplayError::StateRestore {
+        reason: format!(
+            "this recording resumes from a mid-run anchor, and {} param value(s) in force \
+             differ from the ones the recording names. A param is not node state: the \
+             resumed nodes run on the values in force, not on the recorded ones.\n{}\n\
+             Fix: resume with a build whose params match the recording, or pass \
+             `--allow-param-change` to resume on the current values.",
+            differences.len(),
+            lines.join("\n"),
+        ),
+    })
+}
+
 /// Apply a mid-run resume anchor to a freshly built runtime.
 ///
 /// Lifted verbatim out of `run_engine` so the pass loop can call it at the one
@@ -8204,6 +8259,7 @@ fn apply_resume(
     clock: &Arc<VirtualClock>,
     runtime: &mut GraphRuntime,
     strict_state: bool,
+    allow_param_change: bool,
 ) -> Result<ResumeReport, ReplayError> {
     // Place the graph AT the anchor before the state lands. The clock is read
     // by a node's own `restored()` hook (the restore comes after `init()`
@@ -8222,6 +8278,12 @@ fn apply_resume(
     // carry a step number 0-based against a recording that numbers the same
     // step `S + 1`.
     runtime.set_resume_step(plan.anchor.first_replay_step());
+    // A param is not node state: the anchor carries none and the restore
+    // writes none, so every restored node runs on the values this build
+    // handed it. Compare them with the values the recording names BEFORE any
+    // state lands. The recording embeds every node's resolved params and a
+    // value is fixed for the run, so those are the values at this anchor.
+    refuse_param_differences(plan, runtime, allow_param_change)?;
     let report =
         runtime
             .restore_node_states(&plan.blobs)

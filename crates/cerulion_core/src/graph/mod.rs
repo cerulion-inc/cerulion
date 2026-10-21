@@ -28,6 +28,7 @@ pub mod chain;
 pub mod config;
 pub mod drain_latch;
 pub mod node;
+pub mod param_resume;
 pub mod params;
 pub mod partition;
 pub mod runtime;

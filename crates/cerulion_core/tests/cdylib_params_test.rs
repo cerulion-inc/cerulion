@@ -3,7 +3,8 @@
 //! and the graph's values reach the node through the OPTIONAL
 //! `cerulion_node_init_with_params` symbol before its first tick. A cdylib
 //! that lacks the symbol loads unchanged and refuses a handoff by name; one
-//! that lacks it yet declares params is refused when its info is read.
+//! that lacks it yet declares params is refused when its info is read. A
+//! param is not node state: a restore leaves the graph's value in force.
 //!
 //! Hand oracles from the fixture body (`test_node_macro_param_cdylib`:
 //! `cmd.x = gain`, `cmd.y = offset`, `cmd.z = frame_id.len()` or `-1.0` when
@@ -31,6 +32,7 @@ use cerulion_core::graph::node::{
     AnyPublisher, AnySubscriber, DylibNodeEntry, NodeContext, NodeEntry,
 };
 use cerulion_core::graph::params::{ParamSpec, ParamType, ParamValue, ParamValues};
+use cerulion_core::state::VecSink;
 use cerulion_core::testing::TestTransport;
 use cerulion_core::transport::subscriber::CerulionSubscriber;
 use cerulion_core::wire::MaxSliceLen;
@@ -189,6 +191,8 @@ fn values_cross_the_optional_symbol_and_instances_hold_their_own() {
     let (_tt3, ctx_twin_a, mut sub_twin_a) = wire("twin_a");
     let (_tt4, ctx_twin_b, mut sub_twin_b) = wire("twin_b");
     let (_tt5, ctx_unknown, _sub_unknown) = wire("unknown");
+    let (_tt6, ctx_anchor, mut sub_anchor) = wire("anchor");
+    let (_tt7, ctx_resumed, mut sub_resumed) = wire("resumed");
 
     // 1. Defaults.
     let mut defaults = load(PARAM_FIXTURE);
@@ -236,4 +240,33 @@ fn values_cross_the_optional_symbol_and_instances_hold_their_own() {
         .init(ctx_unknown)
         .expect_err("init must refuse an unknown name");
     assert!(err.to_string().contains("unknown param 'bogus'"), "{err}");
+
+    // 5. A restore keeps the graph's values. The fixture's only non-port
+    //    fields are params, and a param is not node state, so the anchor
+    //    captured at gain 2.0 is EMPTY, and a node the graph built with
+    //    gain 3.0 still reads 3.0 on its first tick after the restore.
+    let mut anchor = load(PARAM_FIXTURE);
+    anchor
+        .set_params(&values(&[("gain", ParamValue::Float(2.0))]))
+        .expect("set_params anchor");
+    anchor.init(ctx_anchor).expect("init anchor");
+    anchor.tick().expect("tick anchor");
+    assert_eq!(read_cmd(&mut sub_anchor), (2.0, 0.0, 9.0));
+    let mut payload = VecSink::new();
+    anchor.capture_state(&mut payload).expect("capture anchor");
+    assert!(
+        payload.is_empty(),
+        "no param may be captured: {:?}",
+        payload.as_slice()
+    );
+    let mut resumed = load(PARAM_FIXTURE);
+    resumed
+        .set_params(&values(&[("gain", ParamValue::Float(3.0))]))
+        .expect("set_params resumed");
+    resumed.init(ctx_resumed).expect("init resumed");
+    resumed
+        .restore_state(payload.as_slice())
+        .expect("restore resumed");
+    resumed.tick().expect("tick resumed");
+    assert_eq!(read_cmd(&mut sub_resumed), (3.0, 0.0, 9.0));
 }

@@ -472,11 +472,25 @@ fn is_port_field(field: &Field) -> bool {
         .any(|a| a.path().is_ident("input") || a.path().is_ident("output"))
 }
 
+/// Does this field declare a `#[param]`?
+///
+/// A param is not node state: the graph sets it at load, before `init`, and
+/// the value in force is the graph's, on a fresh run and on a resume alike.
+/// So the fold-in leaves it out of the walk exactly as it leaves out a port:
+/// not captured, untouched on restore, and not in `STATE_SHAPE`, so changing
+/// a param's type or name never refuses an anchor. A resume compares the
+/// recorded values with the ones in force instead (`apply_resume` in the
+/// replay engine). The same attribute path `parse.rs` reads.
+fn is_param_field(field: &Field) -> bool {
+    field.attrs.iter().any(|a| a.path().is_ident("param"))
+}
+
 /// Emit `impl CerulionState` for a `#[cerulion_node]` struct — the fold-in.
 ///
 /// Called from `codegen::generate`, so an ordinary node costs the user ZERO
 /// new lines, by design. What it walks is the **pre-injection**
-/// field list minus ports, and both exclusions are load-bearing:
+/// field list minus ports and params, and all three exclusions are
+/// load-bearing:
 ///
 /// - A **port**'s declared type is a zero-sized SHM marker the impl macro
 ///   accesses through a per-tick local, never through the struct field. It
@@ -487,6 +501,9 @@ fn is_port_field(field: &Field) -> bool {
 ///   `Arc<dyn Clock>`. It is in the resource inventory as well, so it would
 ///   classify `reconstruct` even if it were reached — but it is not reached,
 ///   because this walks `input` before the injection.
+/// - A **`#[param]`** field is set by the graph at load, so carrying it would
+///   let a resumed anchor write the recorded value over the graph's, with no
+///   error (see [`is_param_field`]).
 ///
 /// A prototype measured what a naive whole-struct walk costs: three
 /// phantom lossy fields on a node whose real state is fully capturable.
@@ -497,7 +514,11 @@ pub(crate) fn expand_node(input: &DeriveInput) -> Result<TokenStream, syn::Error
         return Ok(TokenStream::new());
     };
     let named: Vec<&Field> = match &data.fields {
-        Fields::Named(named) => named.named.iter().filter(|f| !is_port_field(f)).collect(),
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .filter(|f| !is_port_field(f) && !is_param_field(f))
+            .collect(),
         // A unit node struct is promoted to named-with-no-fields by the
         // macro; either way it captures nothing.
         Fields::Unit => Vec::new(),

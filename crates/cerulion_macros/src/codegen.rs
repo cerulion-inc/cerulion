@@ -3553,16 +3553,17 @@ mod advertised_attribute_parity_tests {
             &[base_input()],
             &[base_output()],
         );
+        // Both init exports share ONE body, so the order is checked there.
         let init = expansion
-            .split("pubextern\"C\"fncerulion_node_init")
+            .split("fn__cer_init_with(")
             .nth(1)
-            .expect("cdylib init export");
+            .expect("the shared cdylib init body");
         let null_check = init.find("ctx_ptr.is_null()").expect("null check");
         let platform_check = init
             .find("cdylib_platform_check()")
             .expect("platform check");
         let constructor = init
-            .find("ProbeNodeEntry::with_state")
+            .find("ProbeNodeEntry::new()")
             .expect("node constructor");
 
         assert!(null_check < platform_check);
