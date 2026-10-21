@@ -17086,6 +17086,7 @@ impl GraphRuntime {
     /// `recorded` maps node id to the params the recording names for it. A
     /// node of `recorded` that this graph does not run, or that declares no
     /// params and has none recorded, contributes nothing.
+    // hot-path-alloc-ok-fn: cold: once per resumed replay, before the first step
     pub fn param_differences(
         &self,
         recorded: &std::collections::BTreeMap<String, crate::graph::params::ParamValues>,
