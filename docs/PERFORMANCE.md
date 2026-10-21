@@ -150,6 +150,39 @@ Package: [campaign directory](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fix
 [HEADLINE.md](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/HEADLINE.md), and
 [provenance](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/PROVENANCE.txt).
 
+### macOS two-process data wake
+
+On macOS 14.4 and later a producer's publish rings a shared-memory wake word
+that a parked consumer in another process is kernel-blocked on, so a
+two-process hop wakes on the data rather than on the park's recheck timer
+([`deployment_tuning.md`](deployment_tuning.md), "macOS data-wake doorbell").
+Measured before and after that change on one Apple M3 Max (16 cores, macOS
+26.0.1): `benches/latency` round trip, quiescent pacing, default settings, no
+pinning, five reps per cell per build with the two builds alternating within
+one session per cell. Before is main `75b487eaa4`; after is `a0b4529fe7`, a
+commit on the pull request that merged as `64fc0de94c`. Four later commits on
+that pull request touched the doorbell and the graph runtime before it merged.
+p50 is the median of the five per-rep p50s and p99 is pooled across the five
+reps. The recorder state of these runs is not recorded. Quiescent pacing is not
+the fixed 100 Hz of the tables above, so compare within this table only.
+
+| Payload | Two-process p50 before | Two-process p50 after | Two-process p99 before | Two-process p99 after | Single-process p50 before | Single-process p50 after |
+|---|---|---|---|---|---|---|
+| 64 B | 70.17 µs | 10.42 µs | 141.54 µs | 28.21 µs | 4.46 µs | 4.50 µs |
+| 4 KiB | 77.75 µs | 12.79 µs | 143.79 µs | 29.83 µs | 4.46 µs | 4.58 µs |
+| 1 MiB | 80.12 µs | 16.14 µs | 152.42 µs | 41.67 µs | 7.25 µs | 7.38 µs |
+
+The two-process median falls 6.7x at 64 B, 6.1x at 4 KiB and 5.0x at 1 MiB,
+with disjoint per-rep ranges. The single-process rows moved by one to three
+ticks of the 24 MHz timebase (41.667 ns per tick), inside overlapping per-rep
+ranges, so no change in either direction is resolved there. The Apple M4 row of the README platform chart was measured before this
+change and has not been re-measured since. Main has also changed the wake path
+since this pair (a publish now rings every topic a graph produces), and that
+build has not been re-measured on macOS. Package:
+[campaign directory](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/),
+[HEADLINE.md](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/HEADLINE.md), and
+[provenance](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/PROVENANCE.txt).
+
 ### ROS 2 over `rmw_cerulion`, in the same harness
 
 The README round-trip chart draws a sixth line: ROS 2 Jazzy running over

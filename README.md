@@ -279,7 +279,15 @@ The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion'
 
 ![Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.](docs/media/platform-rtt.svg)
 
-These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. A producer-driven macOS wake path is on the [roadmap](#roadmap).
+These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. That M4 row predates the macOS data wake: on macOS 14.4 and later, a two-process consumer now blocks on a kernel wake word that the producer's publish rings, instead of waking on the park's recheck timer. Measured before and after that change on an Apple M3 Max, five reps per cell with the two builds alternating. This pair uses quiescent pacing rather than the charts' fixed 100 Hz and a different machine, so compare within the table only, and its recorder state is not recorded:
+
+| Payload | Two-process before, p50 / p99 in µs | Two-process after, p50 / p99 in µs |
+|---|---:|---:|
+| 64 B | 70.17 / 141.54 | 10.42 / 28.21 |
+| 4 KiB | 77.75 / 143.79 | 12.79 / 29.83 |
+| 1 MiB | 80.12 / 152.42 | 16.14 / 41.67 |
+
+Single-process medians on that machine rose by one to three ticks of its 24 MHz clock, inside overlapping per-rep ranges (64 B: 4.46 before, 4.50 µs after). The M4 chart row has not been re-measured since the change. [Results and provenance](docs/benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/).
 
 Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99; both figures show round trips.
 
