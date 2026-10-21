@@ -70,6 +70,11 @@ use cerulion_core::transport::run_registry::{
 };
 use cerulion_core::transport::{TransportConfig, TransportManager};
 
+#[cfg(not(feature = "local-transport"))]
+type TestService = iceoryx2::service::ipc_threadsafe::Service;
+#[cfg(feature = "local-transport")]
+type TestService = iceoryx2::service::local_threadsafe::Service;
+
 /// The robot identity every arm queries under. The reply SELF-ATTRIBUTES here.
 const ROBOT: &str = "runsrv";
 
@@ -205,9 +210,8 @@ fn serve_until_runs(gateway: &GatewayRuntime, want: usize) -> RunsReply {
 /// public parameters the registry itself uses, so a drift in any of them fails
 /// this open rather than silently opening a second, incompatible service.
 struct SilentRegistryWriter {
-    _node: iceoryx2::prelude::Node<iceoryx2::service::ipc_threadsafe::Service>,
-    _publisher:
-        iceoryx2::port::publisher::Publisher<iceoryx2::service::ipc_threadsafe::Service, [u8], ()>,
+    _node: iceoryx2::prelude::Node<TestService>,
+    _publisher: iceoryx2::port::publisher::Publisher<TestService, [u8], ()>,
 }
 
 impl SilentRegistryWriter {
@@ -217,7 +221,7 @@ impl SilentRegistryWriter {
         let node = NodeBuilder::new()
             .name(&name)
             .config(config)
-            .create::<iceoryx2::service::ipc_threadsafe::Service>()
+            .create::<TestService>()
             .expect("silent-writer node");
         let service_name: ServiceName = RUN_REGISTRY_SERVICE_NAME.try_into().expect("service name");
         let factory = node
