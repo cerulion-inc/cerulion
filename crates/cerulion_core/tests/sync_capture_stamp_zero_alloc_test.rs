@@ -230,10 +230,10 @@ fn measure(prefix: &str, capture: bool, dirty: bool) -> (u64, usize) {
     runtime.set_liveliness_cleanup_period_for_test(SWEEP_PARKED_MS);
     let mgr = runtime.test_transport().expect("test transport parked");
     let mut cam = mgr
-        .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(128), 0)
+        .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(256), 0)
         .expect("publisher on cam");
     let mut lidar = mgr
-        .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(128), 0)
+        .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(256), 0)
         .expect("publisher on lidar");
 
     let mut allocations = 0u64;

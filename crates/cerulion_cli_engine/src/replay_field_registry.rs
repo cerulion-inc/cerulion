@@ -979,8 +979,8 @@ pub struct LocatedField<'f> {
 /// Why a frame field could not be decoded (a corrupt bag → loud error, never UB).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DecodeError {
-    /// The frame is shorter than the 32-byte wire header.
-    #[error("frame is {len} bytes, shorter than the 32-byte wire header")]
+    /// The frame is shorter than the 40-byte wire header.
+    #[error("frame is {len} bytes, shorter than the 40-byte wire header")]
     FrameTooShort {
         /// The frame length.
         len: usize,
@@ -1803,7 +1803,7 @@ mod tests {
     #[test]
     fn fixed_field_resolves_to_offset_and_type() {
         let reg = registry_over(vec![image_schema()], "/cam", "test_msgs/Img");
-        // Build a frame: 32-byte header + fixed section (16 B) + offset table
+        // Build a frame: 40-byte header + fixed section (16 B) + offset table
         // (2 × 8 = 16) + variable payload.
         let mut frame = vec![0u8; WireHeader::SIZE];
         // fixed section

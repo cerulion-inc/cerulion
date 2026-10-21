@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The desk-side re-inject worker: dial the robot's `cerulion/wire/1` ALPN, speak
+//! The desk-side re-inject worker: dial the robot's `cerulion/wire/2` ALPN, speak
 //! the `cerulion_q` catalog/demand/schema vocabulary over the bidi control
 //! stream, and spawn one per-topic re-inject reader per accepted demand
 //! ("remote = local").

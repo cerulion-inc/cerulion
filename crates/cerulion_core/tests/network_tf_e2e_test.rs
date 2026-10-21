@@ -24,7 +24,7 @@
 //!    PER-FRAME LOCKSTEP (publish one → bounded-wait until B's local
 //!    iceoryx2 subscriber yields THAT frame, via the one-sample-per-call
 //!    `try_receive_one` — never the drain-all `try_receive` → publish the
-//!    next), and each FULL received frame (32-byte header rebuilt via
+//!    next), and each FULL received frame (40-byte header rebuilt via
 //!    `write_to_buf` + the payload slice, offset-table bytes included) is
 //!    compared against a HAND-BUILT oracle frame. Covers the multi-transform broadcast, a single-transform frame,
 //!    AND the empty-array edge (`set_transforms_bytes(&[])` → an offset-table
@@ -227,7 +227,7 @@ fn static_transform_payload() -> Vec<u8> {
 // ===========================================================================
 
 /// Hand-build the FULL wire frame a `loan_proxy::<TFMessage>` publish commits
-/// for `transforms_bytes`: 32-byte header + `[OffsetEntry][transforms bytes]`.
+/// for `transforms_bytes`: 40-byte header + `[OffsetEntry][transforms bytes]`.
 /// See the module doc for the layout derivation. Asserts the 0-fixed /
 /// 1-variable shape it depends on, so a codegen change to TFMessage's layout
 /// fails HERE (loudly) rather than silently skewing the oracle.
@@ -261,6 +261,7 @@ fn tfmessage_oracle_frame(seq: u32, ts: u64, transforms_bytes: &[u8]) -> Vec<u8>
         offset_table_count: TFMessage::VARIABLE_FIELD_COUNT as u32,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

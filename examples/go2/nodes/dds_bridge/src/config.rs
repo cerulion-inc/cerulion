@@ -235,7 +235,7 @@ pub enum ConfigError {
     },
     #[error(
         "bridge config mapping {index}: max_slice_len {value} is invalid — it must be at \
-         least 32 (the wire-header size); omit it for the {default}-byte default",
+         least 40 (the wire-header size); omit it for the {default}-byte default",
         default = DEFAULT_RAW_MAX_SLICE_LEN
     )]
     BadMaxSliceLen { index: usize, value: u32 },
@@ -717,7 +717,7 @@ mappings:
 
     #[test]
     fn max_slice_len_arms_are_validated() {
-        // Below the 32-byte wire-header floor → loud error.
+        // Below the 40-byte wire-header floor → loud error.
         let err = BridgeConfig::from_yaml(
             r#"
 mappings:
@@ -730,7 +730,7 @@ mappings:
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::BadMaxSliceLen { value: 8, .. }));
-        assert!(err.to_string().contains("at least 32"), "{err}");
+        assert!(err.to_string().contains("at least 40"), "{err}");
 
         // On a TYPED mapping → rejected (would be a silently-ignored knob;
         // typed ports take their cap from the graph's OutputDef).
@@ -1245,8 +1245,8 @@ mappings:
     /// that reaches the depth CAP.
     ///
     /// Hand oracle: `geometry_msgs/Twist` is two `Vector3`s = 6 × f64 = 48 bytes
-    /// of fixed section, so the frame is `WireHeader::SIZE` (32) + 48 = 80.
-    /// `clamp(64 MiB / 80, 16, 1024)` = 1024, the cap.
+    /// of fixed section, so the frame is `WireHeader::SIZE` (40) + 48 = 88.
+    /// `clamp(64 MiB / 88, 16, 1024)` = 1024, the cap.
     #[test]
     fn a_fixed_type_route_gets_its_exact_frame_size_and_the_depth_cap() {
         let codec = crate::generic::bridge_codec_with_store(&[]);
@@ -1262,7 +1262,7 @@ mappings:
         );
 
         let slice = BridgeConfig::raw_slice_len_for_route(&m, &codec);
-        assert_eq!(slice.get(), 80, "32-byte header + 48-byte Twist");
+        assert_eq!(slice.get(), 88, "40-byte header + 48-byte Twist");
         let depth = cerulion_core::transport::ingress_route_buffer_depth(slice.get() as usize);
         assert_eq!(depth, 1024, "the cap: 64 MiB / 80 B is far past it");
         assert!(
@@ -1440,7 +1440,7 @@ mappings:
         let m = &cfg.raw_mappings()[0];
 
         let slice = BridgeConfig::raw_slice_len_for_route(m, &codec);
-        assert_eq!(slice.get(), 48, "32-byte header + a 16-byte fixed section");
+        assert_eq!(slice.get(), 56, "40-byte header + a 16-byte fixed section");
         assert_eq!(
             cerulion_core::transport::ingress_route_buffer_depth(slice.get() as usize),
             1024

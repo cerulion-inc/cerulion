@@ -178,7 +178,7 @@ pub struct ChannelScan {
     pub schema_hash: Option<u64>,
     /// Frames counted on this channel.
     pub frames: u64,
-    /// The largest frame (full wire frame: 32-byte header + payload) in bytes.
+    /// The largest frame (full wire frame: 40-byte header + payload) in bytes.
     pub max_frame_len: usize,
     /// The first and last MCAP `log_time` seen, in ns. `None` for an empty
     /// channel.
@@ -199,7 +199,7 @@ pub struct BagScan {
     /// epochs (see [`MAX_FRAME_GAP_NS`]); playback still runs, in recorded
     /// order.
     pub backwards_log_times: u64,
-    /// Frames whose 32-byte wire header would not parse. They are still
+    /// Frames whose 40-byte wire header would not parse. They are still
     /// republished verbatim; they contribute no timing.
     pub headerless_frames: u64,
     /// The longest span WITHIN any single channel, in ns — never a subtraction
@@ -14131,6 +14131,7 @@ mod state_section {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame[..WireHeader::SIZE]);
 

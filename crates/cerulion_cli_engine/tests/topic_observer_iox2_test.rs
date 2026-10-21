@@ -55,7 +55,7 @@ fn unique_topic(tag: &str) -> String {
 /// `topic_echo`'s `decode_string_payload` pretty-prints as
 /// `std_msgs/String: "<s>"`.
 ///
-/// Layout: 32-byte [`WireHeader`] (schema hash = the pinned
+/// Layout: 40-byte [`WireHeader`] (schema hash = the pinned
 /// `std_msgs/String` hash so echo recognizes it), then the payload — an
 /// 8-byte offset table (`offset = 8`, `len = s.len()`) followed by the
 /// UTF-8 bytes. `total_size` is the full frame length.
@@ -76,7 +76,7 @@ fn build_string_frame(seq: u32, ts_ns: u64, s: &str) -> Vec<u8> {
     frame
 }
 
-/// Build a bare 32-byte frame (header only, empty payload) carrying an
+/// Build a bare 40-byte frame (header only, empty payload) carrying an
 /// arbitrary `schema_hash` — `topic_info` reads only the header, so this drives
 /// the unknown-hash resolution arm without a decodable payload.
 fn build_frame_with_hash(hash: u64, seq: u32, ts_ns: u64) -> Vec<u8> {

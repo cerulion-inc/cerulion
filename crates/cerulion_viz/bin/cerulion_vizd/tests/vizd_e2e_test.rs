@@ -524,6 +524,7 @@ fn build_vector3_frame(seq: u32, ts: u64, v: [f64; 3]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -548,6 +549,7 @@ fn build_widget_frame(schema_hash: u64, seq: u32, ts: u64, x: f64, y: f64) -> Ve
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -3945,7 +3947,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
             if let Ok(n) = probe.drain_owned(1, &mut scratch) {
                 for frame in scratch.iter().take(n) {
                     // `payload()` on a drained owned frame is the FULL wire frame
-                    // (32-byte WireHeader + data); the custom fields begin after it.
+                    // (40-byte WireHeader + data); the custom fields begin after it.
                     let full = frame.payload();
                     let base = WireHeader::SIZE;
                     if full.len() >= base + 16 {
@@ -8961,6 +8963,7 @@ fn build_undecodable_path_frame() -> Vec<u8> {
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns: PLAN_TS,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE];
     header.write_to_buf(&mut frame);
@@ -10876,6 +10879,7 @@ fn voxel_delta_frame() -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -10977,6 +10981,7 @@ fn marker_array_frame(blob: &[u8]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -11264,6 +11269,7 @@ fn h264_frame(au: &[u8]) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

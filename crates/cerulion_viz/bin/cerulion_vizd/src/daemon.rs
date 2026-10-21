@@ -9573,6 +9573,7 @@ mod tests {
             offset_table_count: 3,
             sequence: 0,
             timestamp_ns: 42_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame);
         frame.extend_from_slice(&payload);
@@ -9831,6 +9832,7 @@ mod tests {
                 offset_table_count: 3,
                 sequence: 0,
                 timestamp_ns: 42_000,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut frame);
             frame.extend_from_slice(&payload);
@@ -13814,6 +13816,7 @@ mod unknown_hash {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);

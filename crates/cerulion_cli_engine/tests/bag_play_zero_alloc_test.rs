@@ -109,6 +109,7 @@ fn frame(seq: u32, payload: &[u8]) -> Vec<u8> {
         // allocation added inside the rate-bound branch would NOT be caught
         // here.
         timestamp_ns: 1_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut buf = vec![0u8; total];
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);

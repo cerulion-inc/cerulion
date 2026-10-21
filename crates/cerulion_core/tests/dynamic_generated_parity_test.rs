@@ -55,7 +55,7 @@ fn capture_last_frame(sub: &CerulionSubscriber) -> Vec<u8> {
 /// `ChannelFloat32 { name: "rgb", values: [0.5, -1.0, 2.0] }`.
 ///
 /// Wire oracle (payload-relative): fixed 0 B, table [0,16), floor 16,
-/// `name` @16 len 3, pad to 20, `values` @20 len 12 → payload 32, total 64.
+/// `name` @16 len 3, pad to 20, `values` @20 len 12 → payload 32, total 72.
 #[test]
 fn channel_float32_generated_publish_equals_frame_encoder_bytes() {
     let set = builtin_set();
@@ -77,12 +77,12 @@ fn channel_float32_generated_publish_equals_frame_encoder_bytes() {
         proxy.set_values(&[0.5, -1.0, 2.0]).expect("values");
     }
     let generated = capture_last_frame(&sub);
-    assert_eq!(generated.len(), 64);
+    assert_eq!(generated.len(), 72);
     let gen_view = FrameView::new(set.walker(), &generated).expect("generated frame is valid");
 
     let enc = FrameEncoder::new(layout).expect("valid layout");
-    assert_eq!(enc.required_len(&[3, 12]), Ok(64));
-    let mut ours = vec![0xA5u8; 64];
+    assert_eq!(enc.required_len(&[3, 12]), Ok(72));
+    let mut ours = vec![0xA5u8; 72];
     let mut cur = enc
         .begin(&mut ours, &[3, 12], gen_view.timestamp_ns())
         .expect("begin");
@@ -94,7 +94,7 @@ fn channel_float32_generated_publish_equals_frame_encoder_bytes() {
     values[0..4].copy_from_slice(&0.5f32.to_le_bytes());
     values[4..8].copy_from_slice(&(-1.0f32).to_le_bytes());
     values[8..12].copy_from_slice(&2.0f32.to_le_bytes());
-    assert_eq!(cur.finish(), 64);
+    assert_eq!(cur.finish(), 72);
 
     assert_eq!(
         ours, generated,
@@ -102,10 +102,12 @@ fn channel_float32_generated_publish_equals_frame_encoder_bytes() {
     );
 
     // Hand-written oracle for everything the publisher does not choose at
-    // runtime (sequence/timestamp live at [20..32)).
+    // runtime (sequence/timestamp live at [20..32)), then the untagged step
+    // tag at [32..40).
     let mut oracle = ChannelFloat32::SCHEMA_HASH.to_le_bytes().to_vec();
-    oracle.extend_from_slice(&[64, 0, 0, 0, 32, 0, 0, 0, 2, 0, 0, 0]);
+    oracle.extend_from_slice(&[72, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0]);
     assert_eq!(&generated[..20], &oracle[..]);
+    assert_eq!(&generated[32..40], &[0u8; 8], "every frame is untagged");
     let mut payload = vec![16, 0, 0, 0, 3, 0, 0, 0, 20, 0, 0, 0, 12, 0, 0, 0];
     payload.extend_from_slice(b"rgb\0");
     payload.extend_from_slice(&[0, 0, 0, 0x3F, 0, 0, 0x80, 0xBF, 0, 0, 0, 0x40]);

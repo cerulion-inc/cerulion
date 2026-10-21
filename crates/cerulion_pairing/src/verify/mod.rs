@@ -114,7 +114,7 @@ impl OwnerGrantPresentationWire {
 /// The **serde-transportable** access-list-epoch SYNC artifact — the ONE
 /// canonical wire shape shared by BOTH the desk carriage (`cerulion_wireclient`,
 /// which reads it from the desk's epoch cache and encodes it) and the robot's
-/// `sync_epoch` `cerulion/wire/1` control verb (`cerulion_remoted`, which decodes it
+/// `sync_epoch` `cerulion/wire/2` control verb (`cerulion_remoted`, which decodes it
 /// and feeds [`TrustStore::apply_epoch`]). Homed here — in the crate that owns the
 /// byte-oriented serde for these cert/epoch types and is the common dependency of
 /// both sides — so the two can NEVER drift in field order and there is no

@@ -172,9 +172,9 @@ impl SchemaDescriptor {
             other => {
                 return Err(BagError::SchemaDescriptor {
                     reason: format!(
-                        "unknown descriptor_version {other} (this build writes v{DESCRIPTOR_VERSION} \
+                    "unknown descriptor_version {other} (this build writes v{DESCRIPTOR_VERSION} \
                          and reads v1 and v{DESCRIPTOR_VERSION})"
-                    ),
+                ),
                 })
             }
         };

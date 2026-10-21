@@ -54,7 +54,7 @@ impl<'l, 'a> FrameView<'l, 'a> {
     /// `schema_hash` to. `frame` is the FULL wire frame, header first, as
     /// `OwnedInboundSample::payload()` returns it (in
     /// `crate::transport::subscriber`). A `try_receive` callback's
-    /// `ReceivedMessage::payload()` is the body WITHOUT the 32-byte header:
+    /// `ReceivedMessage::payload()` is the body WITHOUT the 40-byte header:
     /// write `msg.header()` with `WireHeader::write_to_buf` in front of it
     /// first, or the first body bytes are read as the `schema_hash`. Trailing
     /// bytes past `total_size` are ignored.

@@ -8629,8 +8629,8 @@ mod tests {
     // `max_slice_len_default: Option<usize>` to `Option<MaxSliceLen>`.
     // These tests pin the four-bucket decision:
     //   n == 0                 → drop silently (interpreted as "unset")
-    //   1 <= n < 32            → drop with `tracing::warn!`
-    //   32 <= n <= u32::MAX    → accept as `Some(MaxSliceLen(n))`
+    //   1 <= n < 40            → drop with `tracing::warn!`
+    //   40 <= n <= u32::MAX    → accept as `Some(MaxSliceLen(n))`
     //   n > u32::MAX           → drop with `tracing::warn!`
     // Without these, a future flip of `<` to `<=` (or removal of the
     // warn branch) ships silently.
@@ -8654,8 +8654,8 @@ mod tests {
 
     #[test]
     fn parse_info_json_max_slice_len_default_below_floor_drops() {
-        // 1, 31: positive but `< WireHeader::SIZE` — dropped with warn.
-        for n in [1u64, 16, 31] {
+        // 1, 39: positive but `< WireHeader::SIZE`, dropped with warn.
+        for n in [1u64, 16, 39] {
             let info = parse_info_with_msl(serde_json::json!(n));
             assert_eq!(
                 info.output_meta[0].max_slice_len_default, None,
@@ -8666,12 +8666,12 @@ mod tests {
 
     #[test]
     fn parse_info_json_max_slice_len_default_at_floor_accepted() {
-        // 32 = WireHeader::SIZE — smallest legal MaxSliceLen.
-        let info = parse_info_with_msl(serde_json::json!(32u64));
+        // 40 = WireHeader::SIZE, the smallest legal MaxSliceLen.
+        let info = parse_info_with_msl(serde_json::json!(40u64));
         let msl = info.output_meta[0]
             .max_slice_len_default
-            .expect("32 must be accepted");
-        assert_eq!(msl.get(), 32);
+            .expect("40 must be accepted");
+        assert_eq!(msl.get(), 40);
     }
 
     #[test]

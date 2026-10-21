@@ -1890,10 +1890,8 @@ mod tests {
             "the runs verb gates on the version that introduced it"
         );
         assert_eq!(RUNS_MIN_DAEMON_VERSION, 7);
-        assert!(
-            PROTOCOL_VERSION >= 7,
-            "the banner bump is what makes the per-verb gate reachable"
-        );
+        // The banner bump is what makes the per-verb gate reachable.
+        const { assert!(PROTOCOL_VERSION >= RUNS_MIN_DAEMON_VERSION) };
 
         // The SCOPED half: a bump that raised every verb's floor would lock a v6
         // consumer out of the vocabulary it has always been able to use.

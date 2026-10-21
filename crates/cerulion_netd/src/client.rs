@@ -2702,9 +2702,10 @@ mod tests {
         let sock = serve(format!(
             r#"{{"hello":"cerulion-netd","protocol":{PROTOCOL_VERSION},"wire_header":{other}}}"#
         ));
-        let err = NetdClient::connect_existing_at(sock)
-            .err()
-            .expect("a daemon at another wire header version must be refused");
+        let err = match NetdClient::connect_existing_at(sock) {
+            Ok(_) => panic!("a daemon at another wire header version must be refused"),
+            Err(e) => e,
+        };
         let text = err.to_string();
         assert!(matches!(err, ClientError::Protocol(_)), "got: {text}");
         assert!(

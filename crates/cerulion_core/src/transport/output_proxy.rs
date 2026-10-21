@@ -77,7 +77,7 @@ pub struct OutputProxy<'loan, T: ShmMessage + 'loan> {
 
     /// SHM-backed writer — the codegen-emitted `<Name>Shm` (`<'loan>` for
     /// variable schemas). Constructed from a `&'loan mut [u8]` slice into
-    /// the loaned payload (after the 32-byte WireHeader prefix).
+    /// the loaned payload (after the 40-byte WireHeader prefix).
     writer: T::Writer<'loan>,
 
     /// Borrow of the iceoryx2 publisher backend. Held for `'loan` so a
@@ -365,7 +365,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
             // patch total_size to the final wire size before forwarding.
             let original_bytes = self.sample.bytes();
             // This guard is unreachable in production: `loan_proxy`
-            // stamps a 32-byte header before constructing the proxy; the
+            // stamps a 40-byte header before constructing the proxy; the
             // check defends against a future invariant break + buggy
             // hand-written `impl ShmMessage`. There is
             // deliberately no

@@ -1260,7 +1260,8 @@ pub fn user_topic_schemas(channels: &[BagChannel]) -> CliResult<Vec<TopicSchema>
         // A version 1 descriptor differs from the current one only by the wire
         // header version it implies, which the decoder fills in; the hash
         // fields mean the same thing in both, so it migrates.
-        let descriptor_readable = d.descriptor_version == 1 || d.descriptor_version == DESCRIPTOR_VERSION;
+        let descriptor_readable =
+            d.descriptor_version == 1 || d.descriptor_version == DESCRIPTOR_VERSION;
         if !descriptor_readable || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE {
             return Err(CliError::Validation(format!(
                 "bag migrate: channel '{}' was recorded with schema descriptor version {} / hash \

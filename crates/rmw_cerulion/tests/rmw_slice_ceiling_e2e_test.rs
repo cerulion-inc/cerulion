@@ -324,10 +324,10 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
     //   - nonsense                  malformed sibling (must warn ONCE, and
     //                               must not disturb any other entry)
     //   - rmw_slc/Narrow{S}:1024    a user type the table never lists
-    //   - rmw_slc/Fixed{S}:32       names a FIXED type (must be ignored)
-    //   - rmw_slc/Fixed2{S}:32      a SECOND fixed type (its own loud head)
+    //   - rmw_slc/Fixed{S}:64       names a FIXED type (must be ignored)
+    //   - rmw_slc/Fixed2{S}:64      a SECOND fixed type (its own loud head)
     let env_value = format!(
-        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:32,rmw_slc/Fixed2{suffix}:32"
+        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:64,rmw_slc/Fixed2{suffix}:64"
     );
     let _guard = EnvVarGuard::set("CERULION_RMW_SLICE_CEILING", &env_value);
 

@@ -376,7 +376,7 @@ impl ResolvedCorpus {
                         schema = %s.qualified_name(),
                         fixed_size = size,
                         offset_table_entries,
-                        "bagd schema corpus: frame prefix (the 32-byte header, the fixed \
+                        "bagd schema corpus: frame prefix (the 40-byte header, the fixed \
                          section and the offset table) exceeds the u32 wire total_size — \
                          unrepresentable on the wire, not indexed (hostile or corrupt \
                          definition; the rest still resolve)"
@@ -1377,7 +1377,7 @@ mod tests {
     fn a_composed_overflow_nested_target_is_preflighted_before_resolution() {
         // Without the preflight this PANICS (schema.rs: FixedArray size overflows usize).
         let corpus = ResolvedCorpus::build(vec![
-            parse("cer15", "Inner", "float64[536870907] v\n"),
+            parse("cer15", "Inner", "float64[536870906] v\n"),
             parse("cer15", "Outer", "Inner[8589934592] arr\n"),
             parse("cer15", "Wrapper", "Outer o\nfloat64 w\n"),
             parse("cer15", "Probe", "float64 x\n"),
@@ -1390,7 +1390,7 @@ mod tests {
         let (_, inner_size) = corpus
             .identity_of("cer15/Inner")
             .expect("the representable member indexes");
-        assert_eq!(inner_size, 536_870_907 * 8);
+        assert_eq!(inner_size, 536_870_906 * 8);
         // Wrapper survives with its ref conservatively variable: hash oracle
         // = the definition hashed alone (nothing resolves its ref).
         let (wrapper_hash, wrapper_size) = corpus
@@ -1437,13 +1437,13 @@ mod tests {
     /// field — not a bare `u32::try_from` of the fixed section (which
     /// indexed a section of exactly `u32::MAX` bytes, a descriptor no frame
     /// can carry). Both sides of the boundary, on the RESOLVED corpus:
-    /// `At` (`u32::MAX − 32`) and `VarAt` (`u32::MAX − 40`, one string)
+    /// `At` (`u32::MAX - 40`) and `VarAt` (`u32::MAX - 48`, one string)
     /// index with their exact sizes; one byte past each, the
     /// extreme `Max`, and `WrapOver` (a `uint8` run whose inlined 8-byte
     /// `Small` lands one byte past through padding) do not; `WrapAt` does.
     #[test]
     fn the_corpus_ceiling_counts_the_header_and_the_offset_table_on_both_sides() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         const VAR_AT: usize = AT - 8;
         let corpus = ResolvedCorpus::build(vec![
             parse("cer26", "At", &format!("uint8[{AT}] a\n")),
@@ -1485,26 +1485,26 @@ mod tests {
             parse("cer26", "Wrap32", "uint8[4294967296] a\n"),
         ]);
         let size_of = |name: &str| corpus.identity_of(name).map(|(_, size)| size);
-        assert_eq!(size_of("cer26/At"), Some(u32::MAX - 32), "at the ceiling");
+        assert_eq!(size_of("cer26/At"), Some(u32::MAX - 40), "at the ceiling");
         assert_eq!(size_of("cer26/Over"), None, "one byte past");
         assert_eq!(size_of("cer26/Max"), None, "the extreme");
         assert_eq!(
             size_of("cer26/VarAt"),
-            Some(u32::MAX - 40),
+            Some(u32::MAX - 48),
             "one offset entry"
         );
         assert_eq!(size_of("cer26/VarOver"), None, "one byte past, one entry");
-        // AT − 16 = …247; the u64 lands at …248 and ends …256 (= AT − 7).
+        // AT - 16 = ...239; the u64 lands at ...240 and ends ...248 (= AT - 7).
         assert_eq!(
             size_of("cer26/WrapAt"),
-            Some(u32::MAX - 39),
+            Some(u32::MAX - 47),
             "inlined, fits"
         );
-        // AT − 8 = …255; the u64 lands at …256 and ends …264 (= AT + 1).
+        // AT - 8 = ...247; the u64 lands at ...248 and ends ...256 (= AT + 1).
         assert_eq!(size_of("cer26/WrapOver"), None, "inlined, one past");
         assert_eq!(
             size_of("cer26/VarNestAt"),
-            Some(u32::MAX - 40),
+            Some(u32::MAX - 48),
             "a still-variable nested reference is one offset entry: at the ceiling"
         );
         assert_eq!(

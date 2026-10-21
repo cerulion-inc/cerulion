@@ -329,7 +329,9 @@ fn probe_queue_depth(mgr: &TransportManager, body_len: usize, depth: Option<usiz
         None => mgr
             .create_ingress_publisher(&topic, msl)
             .expect("create_ingress_publisher"),
-        Some(d) => publisher_with_provisioning(mgr, &topic, 2, d, (body_len + WireHeader::SIZE) as u32),
+        Some(d) => {
+            publisher_with_provisioning(mgr, &topic, 2, d, (body_len + WireHeader::SIZE) as u32)
+        }
     };
     let mut sub = mgr
         .create_data_only_subscriber(&topic)

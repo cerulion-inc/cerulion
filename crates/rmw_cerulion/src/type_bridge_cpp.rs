@@ -1191,6 +1191,7 @@ impl CppBridgedMessage {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut head = [0u8; WireHeader::SIZE];
         header.write_to_buf(&mut head);

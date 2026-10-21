@@ -17,7 +17,7 @@ use cerulion_core::wire::WireHeader;
 
 const SCHEMA_HASH: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
-/// Build a wire frame: 32-byte WireHeader + N-byte payload of `0x42`.
+/// Build a wire frame: 40-byte WireHeader + N-byte payload of `0x42`.
 fn make_wire_frame(sequence: u32, timestamp_ns: u64, payload_len: usize) -> Vec<u8> {
     let header = WireHeader::new(SCHEMA_HASH, sequence, timestamp_ns);
     let mut buf = vec![0u8; WireHeader::SIZE + payload_len];

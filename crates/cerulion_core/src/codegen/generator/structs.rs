@@ -1349,7 +1349,7 @@ fn generate_snapshot_default_impl(out: &mut String, schema: &MessageSchema, snap
 //
 // Wire layout (matches the wire spec):
 //
-//   [WireHeader (32 bytes)][fixed_section][offset_table][variable_payload]
+//   [WireHeader (40 bytes)][fixed_section][offset_table][variable_payload]
 //
 // `<Name>Shm<'a>` borrows the bytes after the WireHeader as `payload: &'a mut [u8]`.
 // The fixed section starts at `payload[0]` and is laid out as `<Name>FixedSection`
@@ -1735,7 +1735,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     .unwrap();
     writeln!(
         out,
-        "    /// the 32-byte WireHeader). Read by the spill helper to decide"
+        "    /// the 40-byte WireHeader). Read by the spill helper to decide"
     )
     .unwrap();
     writeln!(
@@ -2231,14 +2231,14 @@ fn generate_fixed_section_default_impl(
 /// `<Name>FixedSection`, plus a static assertion that the FixedSection's
 /// alignment is `≤ 8` (so the post-WireHeader payload pointer, 8-aligned
 /// via the align-8 per-sample header, whose size is a multiple of 8, plus the
-/// 32-byte WireHeader, is always sufficient).
+/// 40-byte WireHeader, is always sufficient).
 fn generate_variable_shm_deref_impls(out: &mut String, shm_name: &str, fixed_section_name: &str) {
     // Static assertion: align(FixedSection) must be ≤ 8. The post-header
     // payload pointer (where `<Name>FixedSection` is overlaid) is 8-aligned:
     // the per-sample header is align 8 and its size is a multiple of 8
     // (`IOX2_SAMPLE_HEADER_BYTES`, currently 48), so a `[u8]` payload starts
-    // 8-aligned in an 8-aligned chunk, and `WireHeader::SIZE == 32`
-    // keeps `payload_base + 32` 8-aligned. That is DE FACTO (measured), not
+    // 8-aligned in an 8-aligned chunk, and `WireHeader::SIZE == 40`
+    // keeps `payload_base + 40` 8-aligned. That is DE FACTO (measured), not
     // a declared iceoryx2 contract — the rmw loan paths assert it
     // fail-closed before handing out a typed pointer.
     // If a future schema adds `u128`, vector intrinsics, or any other type
@@ -2267,7 +2267,7 @@ fn generate_variable_shm_deref_impls(out: &mut String, shm_name: &str, fixed_sec
     .unwrap();
     writeln!(
         out,
-        "// SHM region's alignment promise, or grow `WireHeader` past its current 32 bytes."
+        "// SHM region's alignment promise, or grow `WireHeader` past its current 40 bytes."
     )
     .unwrap();
     writeln!(out, "const _: () = assert!(").unwrap();
@@ -2743,7 +2743,7 @@ fn generate_var_shm_from_bytes(
     writeln!(out, "    ///").unwrap();
     writeln!(
         out,
-        "    /// `bytes` must be the SHM payload *after* the 32-byte WireHeader."
+        "    /// `bytes` must be the SHM payload *after* the 40-byte WireHeader."
     )
     .unwrap();
     writeln!(

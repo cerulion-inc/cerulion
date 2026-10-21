@@ -69,9 +69,9 @@ fn vector3_dds_payload(x: f64, y: f64, z: f64) -> Vec<u8> {
     p
 }
 
-/// Hand-build the EXPECTED Cerulion wire frame for that Vector3: 32-byte
+/// Hand-build the EXPECTED Cerulion wire frame for that Vector3: 40-byte
 /// header (schema_hash = the GENERATED type's `SCHEMA_HASH`) + the same 24
-/// fixed-section bytes. Table offset is FRAME-relative (header + fixed = 56)
+/// fixed-section bytes. Table offset is FRAME-relative (header + fixed = 64)
 /// — the native-publisher convention, count 0.
 fn vector3_expected_frame(x: f64, y: f64, z: f64, sequence: u32, timestamp_ns: u64) -> Vec<u8> {
     let header = WireHeader {
@@ -81,6 +81,7 @@ fn vector3_expected_frame(x: f64, y: f64, z: f64, sequence: u32, timestamp_ns: u
         offset_table_count: 0,
         sequence,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE];
     header.write_to_buf(&mut frame);
@@ -103,7 +104,7 @@ fn string_dds_payload(content: &str) -> Vec<u8> {
 /// Hand-build the EXPECTED Cerulion wire frame for that String: fixed size 0,
 /// ONE offset-table entry `(offset=8, len)` then the UTF-8 content (no NUL).
 /// The header's table offset is FRAME-relative: String's fixed section is
-/// empty, so the table starts right after the 32-byte header.
+/// empty, so the table starts right after the 40-byte header.
 fn string_expected_frame(content: &str, sequence: u32, timestamp_ns: u64) -> Vec<u8> {
     let header = WireHeader {
         schema_hash: <native_ros2_messages::std_msgs::String as ShmMessage>::SCHEMA_HASH,
@@ -112,6 +113,7 @@ fn string_expected_frame(content: &str, sequence: u32, timestamp_ns: u64) -> Vec
         offset_table_count: 1,
         sequence,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE];
     header.write_to_buf(&mut frame);

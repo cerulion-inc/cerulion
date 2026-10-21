@@ -4131,7 +4131,7 @@ fn write_custom_decode(
     explained_hashes: &mut std::collections::BTreeSet<u64>,
     truncate_length: usize,
 ) {
-    // Reconstruct the full wire frame (32-byte header + payload) once; `walk`
+    // Reconstruct the full wire frame (40-byte header + payload) once; `walk`
     // slices the header off.
     let mut frame = vec![0u8; cerulion_core::wire::WireHeader::SIZE];
     header.write_to_buf(&mut frame);
@@ -7070,7 +7070,7 @@ mod tests {
             cerulion_core::SchemaDoc {
                 qualified: "hostile/Inner".to_string(),
                 encoding: cerulion_core::SchemaEncoding::Msg,
-                text: "float64[536870907] v\n".to_string(),
+                text: "float64[536870906] v\n".to_string(),
                 deps: vec![],
             },
             cerulion_core::SchemaDoc {
@@ -7115,7 +7115,7 @@ mod tests {
         let msg_dir = tmp.path().join("nav14").join("msg");
         std::fs::create_dir_all(&msg_dir).unwrap();
         std::fs::write(msg_dir.join("Huge.msg"), "float64[2305843009213693951] v\n").unwrap();
-        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870907] v\n").unwrap();
+        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870906] v\n").unwrap();
         std::fs::write(msg_dir.join("Outer.msg"), "Inner[8589934592] arr\n").unwrap();
         std::fs::write(msg_dir.join("Wrapper.msg"), "Outer o\nfloat64 w\n").unwrap();
         let goal_text = "float64 x\nfloat64 y\n";

@@ -2298,9 +2298,13 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
     (kind6, delivered, fires)
 }
 
-/// The `x` field of a `Vector3` wire frame (32-byte header + fixed section).
+/// The `x` field of a `Vector3` wire frame (40-byte header + fixed section).
 fn frame_x(frame: &[u8]) -> f64 {
-    f64::from_le_bytes(frame[cerulion_core::wire::WireHeader::SIZE..cerulion_core::wire::WireHeader::SIZE + 8].try_into().expect("frame carries x"))
+    f64::from_le_bytes(
+        frame[cerulion_core::wire::WireHeader::SIZE..cerulion_core::wire::WireHeader::SIZE + 8]
+            .try_into()
+            .expect("frame carries x"),
+    )
 }
 
 /// (m) ARMED CAPTURE IS RECORD-ONLY, the delivery half: with

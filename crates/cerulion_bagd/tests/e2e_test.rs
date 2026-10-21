@@ -3203,9 +3203,11 @@ fn salvage_reflush_after_durable_prefix_counts_no_false_gap() {
         .into_iter()
         .filter(|m| m.topic == topic)
         .map(|m| {
-            cerulion_core::wire::WireHeader::read_from_buf(&m.data[..cerulion_core::wire::WireHeader::SIZE])
-                .expect("header")
-                .sequence
+            cerulion_core::wire::WireHeader::read_from_buf(
+                &m.data[..cerulion_core::wire::WireHeader::SIZE],
+            )
+            .expect("header")
+            .sequence
         })
         .collect();
     assert_eq!(

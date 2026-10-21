@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The SHAPE-PARITY pin between `cerulion_connectd`'s MIRRORED
-//! `cerulion/wire/1` control types and the ROBOT's serve types
+//! `cerulion/wire/2` control types and the ROBOT's serve types
 //! (`cerulion_remoted::wire`).
 //!
 //! `cerulion_connectd` MIRRORS the wire protocol instead of importing

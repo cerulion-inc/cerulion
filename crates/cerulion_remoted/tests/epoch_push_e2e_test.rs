@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! THE desk-push revocation-epoch e2e, driven through the PRODUCTION wire
-//! plane (`cerulion/wire/1`), the PRODUCTION sync seam (`SharedTrust::apply_epoch`),
+//! plane (`cerulion/wire/2`), the PRODUCTION sync seam (`SharedTrust::apply_epoch`),
 //! the PRODUCTION accept gate (`PairingAuthorizer`) and the eviction sweep.
 //! No inert shipping: every assertion goes through the real `sync_epoch` verb over a
 //! real loopback iroh connection.
@@ -355,6 +355,7 @@ fn make_frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000_000 + seq as u64 * 10_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

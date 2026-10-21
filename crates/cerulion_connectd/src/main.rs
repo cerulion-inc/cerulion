@@ -4,7 +4,7 @@
 //! Two subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
-//! - `cerulion-connectd connect …` — dial a robot's `cerulion/wire/1` ALPN, demand
+//! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
 //!   topics, and re-inject each into desk-local SHM ("remote = local"). The catalog
 //!   prints to STDOUT; structured logs go to STDERR.
 //! - `cerulion-connectd pair …` — run the CPace **code-pairing** ceremony over the

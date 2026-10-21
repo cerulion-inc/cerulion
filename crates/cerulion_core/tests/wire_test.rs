@@ -14,15 +14,15 @@ use std::mem::{align_of, size_of};
 #[repr(align(8))]
 struct AlignedBuf<const N: usize>([u8; N]);
 
-/// Test that WireHeader is exactly 32 bytes.
+/// Test that WireHeader is exactly 40 bytes.
 #[test]
 fn test_wire_header_size() {
     assert_eq!(
         size_of::<WireHeader>(),
-        32,
-        "WireHeader must be exactly 32 bytes"
+        40,
+        "WireHeader must be exactly 40 bytes"
     );
-    assert_eq!(WireHeader::SIZE, 32, "WireHeader::SIZE must match size_of");
+    assert_eq!(WireHeader::SIZE, 40, "WireHeader::SIZE must match size_of");
 }
 
 /// Test that WireHeader has proper alignment.
@@ -221,18 +221,18 @@ fn test_wire_error_display() {
 
 // === Edge Case Tests ===
 
-/// Test WireHeader from_bytes with exactly 32 bytes (boundary condition).
+/// Test WireHeader from_bytes with exactly 40 bytes (boundary condition).
 #[test]
 fn test_wire_header_exact_size_boundary() {
     let hash = fnv1a_hash(b"TestMsg");
     let original = WireHeader::new(hash, 42, 123456789);
 
-    // Buffer of exactly 32 bytes (boundary) with guaranteed 8-byte alignment.
-    let mut buf = AlignedBuf::<32>([0u8; 32]);
+    // Buffer of exactly 40 bytes (boundary) with guaranteed 8-byte alignment.
+    let mut buf = AlignedBuf::<40>([0u8; 40]);
     buf.0.copy_from_slice(original.as_bytes());
 
     let parsed = WireHeader::from_bytes(&buf.0);
-    assert!(parsed.is_some(), "Should parse buffer of exactly 32 bytes");
+    assert!(parsed.is_some(), "Should parse buffer of exactly 40 bytes");
 
     let header = parsed.unwrap();
     assert_eq!(header.schema_hash, hash);
@@ -247,17 +247,17 @@ fn test_wire_header_from_bytes_rejects_unaligned() {
     let hash = fnv1a_hash(b"TestMsg");
     let original = WireHeader::new(hash, 42, 123456789);
 
-    let mut buf = AlignedBuf::<40>([0u8; 40]);
-    buf.0[1..33].copy_from_slice(original.as_bytes());
+    let mut buf = AlignedBuf::<48>([0u8; 48]);
+    buf.0[1..41].copy_from_slice(original.as_bytes());
 
     assert!(
-        WireHeader::from_bytes(&buf.0[1..33]).is_none(),
+        WireHeader::from_bytes(&buf.0[1..41]).is_none(),
         "from_bytes must reject a non-8-aligned buffer"
     );
 
     // The alignment-safe path handles the same bytes fine.
-    let header = WireHeader::read_from_buf(&buf.0[1..33])
-        .expect("read_from_buf must accept an unaligned 32-byte buffer");
+    let header = WireHeader::read_from_buf(&buf.0[1..41])
+        .expect("read_from_buf must accept an unaligned 40-byte buffer");
     assert_eq!(header.schema_hash, hash);
     assert_eq!(header.sequence, 42);
 }
@@ -379,6 +379,7 @@ proptest! {
             offset_table_count,
             sequence,
             timestamp_ns,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut buf = [0u8; WireHeader::SIZE];
         header.write_to_buf(&mut buf);
@@ -391,19 +392,19 @@ proptest! {
         prop_assert_eq!(parsed.timestamp_ns, timestamp_ns);
     }
 
-    /// No-panic: arbitrary 32 bytes should never cause read_from_buf to panic.
+    /// No-panic: arbitrary 40 bytes should never cause read_from_buf to panic.
     #[test]
     fn prop_wire_header_no_panic_on_arbitrary_bytes(
-        bytes in prop::collection::vec(any::<u8>(), 32..=32),
+        bytes in prop::collection::vec(any::<u8>(), 40..=40),
     ) {
-        // Should return Some (any 32 bytes are "valid" structurally) or None, but never panic
+        // Should return Some (any 40 bytes are "valid" structurally) or None, but never panic
         let _ = WireHeader::read_from_buf(&bytes);
     }
 
-    /// No-panic: buffers shorter than 32 bytes should return None, never panic.
+    /// No-panic: buffers shorter than 40 bytes should return None, never panic.
     #[test]
     fn prop_wire_header_short_buffer_no_panic(
-        bytes in prop::collection::vec(any::<u8>(), 0..32),
+        bytes in prop::collection::vec(any::<u8>(), 0..40),
     ) {
         let result = WireHeader::read_from_buf(&bytes);
         prop_assert!(result.is_none(), "short buffer should return None");

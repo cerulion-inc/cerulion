@@ -726,6 +726,7 @@ mod tests {
                 offset_table_count: 0,
                 sequence: sequence as u32,
                 timestamp_ns: 1_000_000_000 + sequence as u64,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut wire[..WireHeader::SIZE]);
             wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&angle.to_le_bytes());
@@ -803,6 +804,7 @@ mod tests {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut wire[..WireHeader::SIZE]);
         wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&f32::NAN.to_le_bytes());
@@ -891,6 +893,7 @@ mod tests {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut wire[..WireHeader::SIZE]);
         wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.25f32.to_le_bytes());

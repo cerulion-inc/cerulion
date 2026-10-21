@@ -292,7 +292,7 @@ pub struct CerulionPublisher {
     ///   bug).
     /// - Small buffer at overflow drop: `original_bytes.len() <
     ///   WireHeader::SIZE` (would indicate `loan_proxy` failed to stamp
-    ///   the 32-byte header).
+    ///   the 40-byte header).
     /// - Small buffer at steady-state drop: loaned `buf.len() < 12`
     ///   (would indicate a publisher returned an undersized sample).
     ///
@@ -1423,6 +1423,7 @@ impl CerulionPublisher {
             offset_table_count: T::VARIABLE_FIELD_COUNT as u32,
             sequence: seq,
             timestamp_ns: self.clock.now_ns(),
+            step_tag: crate::wire::StepTag::UNTAGGED,
         };
         let payload = sample.payload_mut();
         header.write_to_buf(&mut payload[..WireHeader::SIZE]);
@@ -2693,7 +2694,7 @@ impl Drop for CerulionPublisher {
 /// Regime A: parse the `WireHeader` fields needed for a
 /// `PublishTraceEntry` (schema_hash, sequence, timestamp_ns) from the
 /// publish-bytes prefix. Returns `None` if the slice is shorter than
-/// `WireHeader::SIZE` (32 B) — defensive against malformed publishes.
+/// `WireHeader::SIZE` (40 B), defensive against malformed publishes.
 ///
 /// Alignment-safe: reads field bytes via `to_le_bytes`-style extraction,
 /// no `unsafe` and no alignment requirement on the input slice. (A loaned

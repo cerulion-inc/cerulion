@@ -133,6 +133,7 @@ impl<'l> FrameEncoder<'l> {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence: 0,
             timestamp_ns,
+            step_tag: crate::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(frame);
         Ok(FrameCursor {

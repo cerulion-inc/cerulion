@@ -455,6 +455,10 @@ impl RawInputView<'_> {
     /// `Owned` views pin their SHM sample and consume borrow budget for as long
     /// as the returned value lives; a `Held` view borrows the subscriber's
     /// held sample and is returned unchanged in the error arm.
+    // The error arm IS the unchanged view (a header copy plus a borrow), returned
+    // by value so the caller keeps reading it; boxing it would allocate on a
+    // receive path to satisfy a size lint.
+    #[allow(clippy::result_large_err)]
     pub fn into_owned(self) -> Result<RawInputView<'static>, Self> {
         let header = self.header;
         match self.inner {
@@ -594,7 +598,7 @@ impl OwnedInboundSample {
         }
     }
 
-    /// The full published wire frame (32-byte [`WireHeader`] + body), exactly
+    /// The full published wire frame (40-byte [`WireHeader`] + body), exactly
     /// the bytes the publisher wrote — zero-copy, borrowing the SHM slot.
     ///
     /// Trailing loan capacity past `WireHeader::total_size` is excluded (the
@@ -1121,7 +1125,7 @@ impl DrainOutcome {
 
 /// A received message with zero-copy payload access.
 ///
-/// The `header` is an owned copy (32 bytes on stack, from alignment-safe deserialization).
+/// The `header` is an owned copy (40 bytes on stack, from alignment-safe deserialization).
 /// The `payload` is a reference directly into iceoryx2 shared memory — true zero-copy.
 ///
 /// # Lifetime
@@ -6240,7 +6244,7 @@ mod tests {
         )
         .expect("per-test SHM transport");
 
-        // A hand-built wire frame: 32-byte header + 8 payload bytes, the
+        // A hand-built wire frame: 40-byte header + 8 payload bytes, the
         // caller-stamped `sequence` the capture parses back.
         let frame = |seq: u32| -> Vec<u8> {
             let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
@@ -6769,11 +6773,12 @@ mod tests {
     fn raw_view_frame(sequence: u32) -> Vec<u8> {
         let mut frame = vec![
             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema hash
-            0x22, 0x00, 0x00, 0x00, // total size
-            0x20, 0x00, 0x00, 0x00, // offset table offset
+            0x2A, 0x00, 0x00, 0x00, // total size
+            0x28, 0x00, 0x00, 0x00, // offset table offset
             0x00, 0x00, 0x00, 0x00, // offset table count
             0x00, 0x00, 0x00, 0x00, // sequence
             0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step tag: untagged
             0xAA, 0xBB,
         ];
         frame[20..24].copy_from_slice(&sequence.to_le_bytes());

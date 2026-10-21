@@ -159,7 +159,7 @@ fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
 }
 
 /// `out.x` of every recorded frame on `topic`: the f64 right after the
-/// 32-byte wire header of a `geometry_msgs/Vector3` frame.
+/// 40-byte wire header of a `geometry_msgs/Vector3` frame.
 fn recorded_x(bag: &Path, topic: &str) -> Vec<f64> {
     let reader = BagReader::open(bag).expect("open bag");
     let (msgs, completeness) = reader.recover_messages().expect("recover");
@@ -169,7 +169,14 @@ fn recorded_x(bag: &Path, topic: &str) -> Vec<f64> {
     );
     msgs.iter()
         .filter(|m| m.topic == topic)
-        .map(|m| f64::from_le_bytes(m.data[cerulion_core::wire::WireHeader::SIZE..cerulion_core::wire::WireHeader::SIZE + 8].try_into().unwrap()))
+        .map(|m| {
+            f64::from_le_bytes(
+                m.data[cerulion_core::wire::WireHeader::SIZE
+                    ..cerulion_core::wire::WireHeader::SIZE + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
         .collect()
 }
 

@@ -66,7 +66,7 @@ fn proxy_round_trip_fixed_schema_iceoryx2() {
 
     let mgr = TransportManager::get_or_init().expect("init");
     let topic = unique_topic("fixed_iox2");
-    // 32 (header) + 24 (Vector3) = 56; round up for safety.
+    // 40 (header) + 24 (Vector3) = 64; round up for safety.
     let mut publisher = mgr
         .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
         .expect("create publisher");
@@ -99,7 +99,7 @@ fn proxy_round_trip_variable_schema_iceoryx2() {
 
     let mgr = TransportManager::get_or_init().expect("init");
     let topic = unique_topic("var_iox2");
-    // 32 (header) + 0 (fixed) + 8 (offset table) + 64 (room for the string) = 104.
+    // 40 (header) + 0 (fixed) + 8 (offset table) + 64 (room for the string) = 112.
     let mut publisher = mgr
         .create_publisher_simple(&topic, MaxSliceLen::const_new(1024))
         .expect("create publisher");
@@ -215,11 +215,11 @@ fn loan_proxy_rejects_undersized_buffer_for_variable_schema() {
     use native_ros2_messages::std_msgs::String as RosString;
 
     let topic = unique_topic("undersized");
-    // 32 (header) + 0 (fixed) + 8 (offset table) = 40 bytes minimum for std_msgs::String.
-    // 32 is the smallest legal MaxSliceLen (newtype lower bound = WireHeader::SIZE);
-    // 32 < 40 so loan_proxy must still reject as MaxSliceLenRequired.
+    // 40 (header) + 0 (fixed) + 8 (offset table) = 48 bytes minimum for std_msgs::String.
+    // 40 is the smallest legal MaxSliceLen (newtype lower bound = WireHeader::SIZE);
+    // 40 < 48 so loan_proxy must still reject as MaxSliceLenRequired.
     let tt = TestTransport::with_buffer_size(16);
-    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(32), 0);
+    let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(40), 0);
     let result = publisher.loan_proxy::<RosString>();
     match result {
         Err(TransportError::MaxSliceLenRequired { .. }) => {}
@@ -349,14 +349,14 @@ fn spin_view_until_seq_times_out_when_no_publisher() {
 /// Drain every pending frame, returning `(sequence, x)` per frame in
 /// arrival order — the wire-level oracle surface (exactly what bagd's
 /// gap detector reads). `x` is Vector3's first fixed field at frame
-/// bytes `[32..40]` (f64 LE, after the 32-byte WireHeader).
+/// bytes `[40..48]` (f64 LE, after the 40-byte WireHeader).
 fn drain_seq_and_x(
     subscriber: &mut cerulion_core::transport::subscriber::CerulionSubscriber,
 ) -> Vec<(u32, f64)> {
     let mut out = Vec::new();
     // `try_receive` drains the whole queue (FIFO), handing each frame's parsed
     // WireHeader + body to the callback. `msg.payload()` is the body AFTER the
-    // 32-byte header, so Vector3's first fixed field `x` is body bytes [0..8].
+    // 40-byte header, so Vector3's first fixed field `x` is body bytes [0..8].
     subscriber
         .try_receive(|msg| {
             let x = f64::from_le_bytes(msg.payload()[0..8].try_into().expect("x field bytes"));

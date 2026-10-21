@@ -2065,7 +2065,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"version":1,"robot":"go2","entries":[{"topic":"/imu","schema_hash":7,"schema_name":null,"provenance":"runtime","producer_count":1}]}"#,
+            r#"{"version":1,"robot":"go2","entries":[{"topic":"/imu","schema_hash":7,"schema_name":null,"provenance":"runtime","producer_count":1}],"wire_header_version":2}"#,
             "the no-liveness wire must be byte-identical to the pre-liveness document"
         );
 
@@ -2076,7 +2076,12 @@ mod tests {
             decoded.entries[0].liveness, None,
             "an old robot's entry must read UNKNOWN, never a fabricated liveness"
         );
-        assert_eq!(decoded, bare, "old wire == the no-liveness reply");
+        // An old robot states no wire header version: version 1, unlike this build.
+        assert_eq!(decoded.wire_header_version, 1);
+        assert_eq!(
+            decoded.entries, bare.entries,
+            "old wire == the no-liveness reply"
+        );
 
         // (3) a liveness-carrying entry serializes + round-trips.
         let observed = build_catalog_reply(

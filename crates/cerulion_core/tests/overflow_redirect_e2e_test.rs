@@ -398,13 +398,13 @@ fn e2e_exact_boundary_loan_equals_max_capacity() {
     // A hot publisher hides this boundary because the sizer + 1.5x
     // headroom obscure the loan size; a cold publisher exposes it.
     //
-    // max_slice_len = 256. WireHeader = 32. Loan post-header = 224.
+    // max_slice_len = 256. WireHeader = 40. Loan post-header = 216.
     // Image fixed section + offset table = 16 + 24 = 40. So cursor
-    // starts at 40, with 224 - 40 = 184 bytes for variable payload.
+    // starts at 40, with 216 - 40 = 176 bytes for variable payload.
     //
-    // Write header_bytes(empty), encoding("x"). Then set_data(183) fits
-    // (cursor 40 + 1 [encoding] + 183 = 224, exactly self.len). No spill.
-    // set_data(184) exceeds by 1 → triggers spill.
+    // Write header_bytes(empty), encoding("x"). Then set_data(175) fits
+    // (cursor 40 + 1 [encoding] + 175 = 216, exactly self.len). No spill.
+    // set_data(176) exceeds by 1 → triggers spill.
     let (tt, mut pub_) = fresh_publisher("e2e/boundary", 256, 16);
     let mut sub = tt.subscriber("e2e/boundary");
 
@@ -412,27 +412,27 @@ fn e2e_exact_boundary_loan_equals_max_capacity() {
     publish_tick(&mut pub_, |proxy| {
         proxy.set_header_bytes(&[]).expect("set_header_bytes");
         proxy.set_encoding("x").expect("set_encoding");
-        // 224 (loan post-header) - 40 (fixed+offset) - 1 (encoding) = 183.
-        // Setter advances cursor to 224 == self.len. No spill.
-        proxy.set_data(&[1u8; 183]).expect("exact-fit no spill");
+        // 216 (loan post-header) - 40 (fixed+offset) - 1 (encoding) = 175.
+        // Setter advances cursor to 216 == self.len. No spill.
+        proxy.set_data(&[1u8; 175]).expect("exact-fit no spill");
     });
     // Drain.
     let obs1 = sub
         .try_view::<Image, _>(|view| view.data().to_vec())
         .expect("try_view")
         .expect("frame present");
-    assert_eq!(obs1.len(), 183);
+    assert_eq!(obs1.len(), 175);
 
-    // Tick 2: explicitly try 185 bytes via set_data on a fresh proxy
-    // (cursor 40 + 185 = 225 > 224 = self.len, AND > max_capacity = 224).
+    // Tick 2: explicitly try 177 bytes via set_data on a fresh proxy
+    // (cursor 40 + 177 = 217 > 216 = self.len, AND > max_capacity = 216).
     // PayloadTooLarge.
     let mut proxy = pub_.loan_proxy::<Image>().expect("loan_proxy");
-    let r = proxy.set_data(&[1u8; 185]);
+    let r = proxy.set_data(&[1u8; 177]);
     match r {
         Err(TransportError::PayloadTooLarge { requested, max, .. }) => {
-            assert_eq!(max, 224, "max_capacity = max_slice_len - WireHeader::SIZE");
+            assert_eq!(max, 216, "max_capacity = max_slice_len - WireHeader::SIZE");
             assert!(
-                requested >= 40 + 185,
+                requested >= 40 + 177,
                 "requested includes fixed-section offset + write size"
             );
         }
@@ -728,7 +728,7 @@ fn e2e_spill_allocation_failed_surfaces_to_setter_call() {
                 // requested == max_capacity == max_slice_len - WireHeader::SIZE = 16K - 32.
                 assert_eq!(
                     requested,
-                    16 * 1024 - 32,
+                    16 * 1024 - 40,
                     "AllocationFailed.requested must reflect max_capacity, not the setter's bytes_needed"
                 );
             }

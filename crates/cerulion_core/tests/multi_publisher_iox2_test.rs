@@ -352,7 +352,7 @@ impl SeqProducer {
 }
 
 /// Decode (stream_id, seq) from a drained Vector3 body. `try_receive` strips
-/// the 32-byte `WireHeader`, so `payload` is the Vector3 fixed section
+/// the 40-byte `WireHeader`, so `payload` is the Vector3 fixed section
 /// (x,y,z f64); x = stream id at [0..8], y = seq at [8..16], little-endian.
 fn decode_stream_seq(payload: &[u8]) -> (u32, u32) {
     let x = f64::from_le_bytes(payload[0..8].try_into().unwrap());

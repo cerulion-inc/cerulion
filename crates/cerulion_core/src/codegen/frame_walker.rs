@@ -21,7 +21,7 @@
 //! # Wire layout it decodes (see [`crate::shm_runtime`] / [`crate::wire`])
 //!
 //! ```text
-//! [WireHeader (32 B)][fixed section][offset table (8·N B)][variable payload]
+//! [WireHeader (40 B)][fixed section][offset table (8·N B)][variable payload]
 //! ```
 //!
 //! - Fixed-section fields are read at the `#[repr(C)]` offsets computed by
@@ -364,7 +364,7 @@ pub enum WalkError {
     #[error("unknown schema_hash 0x{0:016X} (no schema in the set matches)")]
     UnknownSchemaHash(u64),
 
-    /// The frame is shorter than the 32-byte WireHeader.
+    /// The frame is shorter than the 40-byte WireHeader.
     #[error("frame too short: have {have} bytes, need at least {need} for the WireHeader")]
     FrameTooShort { have: usize, need: usize },
 
@@ -669,7 +669,7 @@ impl FrameWalker {
 
     /// Decode `frame` as the schema named `qualified_name`.
     ///
-    /// `frame` is the whole wire frame including the 32-byte WireHeader
+    /// `frame` is the whole wire frame including the 40-byte WireHeader
     /// (exactly what a subscriber's `payload()` / an `InputView`'s frame
     /// bytes return).
     pub fn walk<'a>(
@@ -1500,7 +1500,7 @@ mod tests {
     // offsets so the walker is checked against an oracle, not a re-run of the
     // production writer.
 
-    /// Prepend a 32-byte WireHeader (schema_hash only — the walker does not
+    /// Prepend a 40-byte WireHeader (schema_hash only, the walker does not
     /// require the counts for `walk`) to a hand-built payload.
     fn frame(schema_hash: u64, payload: &[u8]) -> Vec<u8> {
         let mut f = vec![0u8; WireHeader::SIZE];
