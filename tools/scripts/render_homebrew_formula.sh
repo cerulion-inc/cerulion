@@ -83,7 +83,7 @@ class Cerulion < Formula
   end
 
   def install
-    ["cerulion", "cerulion-netd", "cerulion-connectd"].each do |binary|
+    ["cerulion", "cerulion-netd", "cerulion-connectd", "cerulion-remoted"].each do |binary|
       path = Dir["{,*/}#{binary}"].find { |candidate| File.file?(candidate) }
       odie "release archive is missing #{binary}" unless path
       bin.install path

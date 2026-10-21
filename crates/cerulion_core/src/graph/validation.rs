@@ -936,12 +936,14 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 ///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
 ///    a connecting peer for no certificate), so each is refused without the
 ///    locator that reads it.
-/// 10. **Best effort needs a datagram link**: a `reliability: best_effort`
-///     egress topic needs at least one `listen` or `connect` locator with
-///     `mixed_rel=1` (`quic/...?mixed_rel=1` or `udp/...?rel=1;mixed_rel=1`);
+/// 10. **Best effort needs a datagram link**: `default_reliability:
+///     best_effort`, and a `reliability: best_effort` egress topic, each need
+///     at least one `listen` or `connect` locator with `mixed_rel=1`
+///     (`quic/...?mixed_rel=1` or `udp/...?rel=1;mixed_rel=1`);
 ///     `mixed_rel=auto` does not count, because it falls back to streams only.
-///     Without one the topic would ride the reliable link with nothing saying
-///     so.
+///     Without one the topics would ride the reliable link with nothing saying
+///     so. The default is refused even when every egress entry sets its own
+///     `reliability`.
 fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> TransportResult<()> {
     use crate::transport::carrier::{classify_locator, Carrier, EgressReliability};
     let err = |reason: String| TransportError::GraphError { reason };
@@ -1022,10 +1024,21 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
         ));
     }
 
+    if net.default_reliability == EgressReliability::BestEffort && !datagram_link {
+        return Err(err(
+            "network default_reliability is best_effort, but no listen or connect locator is \
+             certain to have a datagram link (mixed_rel=auto falls back to streams when the peer \
+             does not offer it), so every egress topic without its own reliability would ride \
+             the reliable link; add mixed_rel=1 to a quic/ locator \
+             ('quic/<host>:<port>?mixed_rel=1'), use 'udp/<host>:<port>?rel=1;mixed_rel=1', or \
+             remove default_reliability"
+                .to_string(),
+        ));
+    }
     if let Some(be) = net
         .egress
         .iter()
-        .find(|e| e.reliability == EgressReliability::BestEffort)
+        .find(|e| e.reliability == Some(EgressReliability::BestEffort))
     {
         if !datagram_link {
             return Err(err(format!(
@@ -1668,7 +1681,10 @@ nodes:
     /// Rules 7-10, accepted shapes: a `quic/` listener with its certificate
     /// and key and a best-effort topic on a mixed-reliability locator; the
     /// unsecure `udp/...?rel=1;mixed_rel=1` spelling needs no tls block; a
-    /// best-effort entry on a mixed-rel CONNECT locator counts too.
+    /// best-effort entry on a mixed-rel CONNECT locator counts too; a
+    /// `best_effort` default on a mixed-rel locator, with or without a topic
+    /// that opts back to `reliable`; a `reliable` default and topic need no
+    /// datagram link.
     #[test]
     fn test_network_carriers_accepted_shapes() {
         for block in [
@@ -1702,6 +1718,32 @@ nodes:
       reliability: best_effort
   tls:
     root_ca: /etc/cerulion/peers.pem
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - udp/0.0.0.0:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - /robo/cam/cloud
+"#,
+            r#"network:
+  mode: peer
+  connect:
+    - udp/10.0.0.2:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  default_reliability: reliable
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
 "#,
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();
@@ -1764,6 +1806,18 @@ nodes:
             (
                 "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
                 &["mixed_rel=auto falls back"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - /robo/cam/cloud\n",
+                &["network default_reliability is best_effort", "mixed_rel=1", "remove default_reliability"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: reliable\n",
+                &["network default_reliability is best_effort"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  default_reliability: best_effort\n",
+                &["network default_reliability is best_effort", "mixed_rel=auto falls back"][..],
             ),
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();

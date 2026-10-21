@@ -231,7 +231,7 @@ mkdir -p "$stage" "$work/dist/v0.2.0" "$work/installed" "$CARGO_HOME/bin"
 cp "$work/rustup-fixture" "$CARGO_HOME/bin/rustup"
 cp "$work/metadata" "$stage/rustc-version.txt"
 cp "$script_dir/install_rust.sh" "$stage/install_rust.sh"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     printf '#!/bin/sh\nprintf "new %s\\n"\n' "$binary" > "$stage/$binary"
     chmod +x "$stage/$binary"
     printf 'old %s\n' "$binary" > "$work/installed/$binary"
@@ -247,7 +247,7 @@ if FIXTURE_FAIL_INSTALL=1 sh "$script_dir/install.sh" --version v0.2.0 \
     printf '%s\n' 'error: failed Rust setup activated the installer' >&2; exit 1
 fi
 grep -Fq 'Rust/Cargo setup failed' "$work/transaction-fail.log"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     [ "$(cat "$work/installed/$binary")" = "old $binary" ]
 done
 (
@@ -256,7 +256,7 @@ done
         --version v0.2.0 --base-url "file://$work/dist"
 ) > "$work/transaction-pass.log" 2>&1 ||
     { cat "$work/transaction-pass.log" >&2; exit 1; }
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     cmp "$stage/$binary" "$work/installed/$binary"
 done
 activation=$(sed -n 's/^Add tools to PATH: //p' "$work/transaction-pass.log")
@@ -392,7 +392,7 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
         cp "$con_case/rustup/settings.toml" "$con_case/settings-before"
     fi
     for con_dest in "$con_case/a" "$con_case/b"; do
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             printf 'old %s\n' "$binary" > "$con_dest/$binary"
         done
     done
@@ -403,7 +403,7 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
     [ ! -e "$con_case/entered.b" ]
     [ "$(cat "$con_case/mutations")" = a ]
     for con_dest in "$con_case/a" "$con_case/b"; do
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$con_dest/$binary")" = "old $binary" ]
         done
     done
@@ -418,7 +418,7 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
         kill -0 "$con_a"
         kill -TERM "$con_a"; con_join "$con_a" failure
         for con_dest in "$con_case/a" "$con_case/b"; do
-            for binary in cerulion cerulion-netd cerulion-connectd; do
+            for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
                 [ "$(cat "$con_dest/$binary")" = "old $binary" ]
             done
         done
@@ -426,7 +426,7 @@ for con_mode in same-destination fresh-shared split-cargo identical-homes cancel
         : > "$con_case/release.a"; : > "$con_case/release.b"
         con_join "$con_a" success; con_join "$con_b" success
         for con_dest in "$con_case/a" "$con_dest_b"; do
-            for binary in cerulion cerulion-netd cerulion-connectd; do
+            for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
                 cmp "$stage/$binary" "$con_dest/$binary"
             done
             [ "$(cat "$con_dest/.cerulion-provenance.json")" = \

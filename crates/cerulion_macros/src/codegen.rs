@@ -1825,7 +1825,7 @@ fn gen_cdylib(
 
             #[no_mangle]
             pub extern "C" fn cerulion_abi_version() -> u32 {
-                ::cerulion_core::CERULION_ABI_VERSION
+                ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
             }
 
             // ABI v22: reports the rustc that compiled THIS cdylib, so the
@@ -1915,6 +1915,34 @@ fn gen_cdylib(
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
 
+            // `cerulion_node_platform_check`: the loader calls this at load,
+            // before init, so the probe runs against THIS cdylib's iceoryx2
+            // copy rather than the host's. Required on Android. 0 = supported;
+            // nonzero sets LAST_ERROR.
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_platform_check() -> i32 {
+                let result = ::std::panic::catch_unwind(|| {
+                    ::cerulion_core::graph::node::cdylib_platform_check()
+                });
+                match result {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(e)) => {
+                        __cer_set_last_error(::std::format!(
+                            "node library {}: {}",
+                            stringify!(#node_name),
+                            e,
+                        ));
+                        1
+                    }
+                    Err(_) => {
+                        __cer_set_last_error(::std::string::String::from(
+                            "cerulion_node_platform_check: panic caught by catch_unwind",
+                        ));
+                        2
+                    }
+                }
+            }
+
             #[no_mangle]
             pub extern "C" fn cerulion_node_init(ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext) -> u64 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
@@ -1931,6 +1959,17 @@ fn gen_cdylib(
                     // We always consume the pointer here — on both success and failure paths
                     // the Box drops naturally (either stored in entry or dropped on error).
                     let ctx = unsafe { *Box::from_raw(ctx_ptr) };
+
+                    if let ::std::result::Result::Err(e) =
+                        ::cerulion_core::graph::node::cdylib_platform_check()
+                    {
+                        __cer_set_last_error(::std::format!(
+                            "node library {}: {}",
+                            stringify!(#node_name),
+                            e,
+                        ));
+                        return 0_u64;
+                    }
 
                     // STOPGAP: install a cdylib-local stderr tracing
                     // subscriber so node-side `tracing` events (including
@@ -3367,6 +3406,61 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_abi_version_carries_the_transport_kind() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+
+        assert!(
+            expansion.contains("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()")
+        );
+        assert!(!expansion.contains(concat!("cerulion_transport", "_kind")));
+    }
+
+    #[test]
+    fn cdylib_init_checks_platform_before_constructing_the_node() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        let init = expansion
+            .split("pubextern\"C\"fncerulion_node_init")
+            .nth(1)
+            .expect("cdylib init export");
+        let null_check = init.find("ctx_ptr.is_null()").expect("null check");
+        let platform_check = init
+            .find("cdylib_platform_check()")
+            .expect("platform check");
+        let constructor = init
+            .find("ProbeNodeEntry::with_state")
+            .expect("node constructor");
+
+        assert!(null_check < platform_check);
+        assert!(platform_check < constructor);
+        assert!(init.contains("nodelibrary{}:{}"));
+        assert!(init.contains("stringify!(ProbeNode)"));
+    }
+
+    #[test]
+    fn cdylib_exports_its_own_platform_check() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        let export = expansion
+            .split("pubextern\"C\"fncerulion_node_platform_check()->i32")
+            .nth(1)
+            .expect("platform check export");
+        let export = export.split("#[no_mangle]").next().expect("export body");
+        assert!(export.contains("cdylib_platform_check()"));
+        assert!(export.contains("stringify!(ProbeNode)"));
     }
 
     /// A node-level attribute, the declaration that sets it, and the marker
