@@ -252,6 +252,13 @@ struct Run {
     /// last, and its own fields release the lease after the reset.
     ownership: Option<GatewayOwnership>,
     manager: Arc<TransportManager>,
+    /// Orders a worker's failure against the commit. A worker records
+    /// Failed while holding it, and the commit holds it from its failure
+    /// check until the run is Running, so a failure lands wholly before
+    /// the commit opens LAN access or wholly after the run started. It is
+    /// separate from the status lock, so status reads never wait out the
+    /// commit's network steps.
+    commit_gate: Arc<Mutex<()>>,
 }
 
 struct GraphWorker {
@@ -1016,6 +1023,7 @@ impl Run {
             publishers: BTreeMap::new(),
             ownership: None,
             manager,
+            commit_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1197,6 +1205,7 @@ fn build_into(
         let recorder_manager = Arc::clone(&manager);
         let bagd_config = recorder.config.clone();
         let thread_status = Arc::clone(status);
+        let thread_gate = Arc::clone(&run.commit_gate);
         let thread = thread::Builder::new()
             .name("cerulion-bagd".to_string())
             .spawn(move || {
@@ -1206,7 +1215,7 @@ fn build_into(
                 }))
                 .unwrap_or_else(|_| Err("recorder worker panicked".to_string()));
                 if let Err(error) = &result {
-                    set_thread_error(&thread_status, codes::RECORDER, error);
+                    record_worker_failure(&thread_gate, &thread_status, codes::RECORDER, error);
                 }
                 result
             })
@@ -1241,6 +1250,7 @@ fn build_into(
             status: Arc::clone(status),
         };
         let thread_status = Arc::clone(status);
+        let thread_gate = Arc::clone(&run.commit_gate);
         let thread = thread::Builder::new()
             .name("cerulion-gateway".to_string())
             .spawn(move || {
@@ -1258,7 +1268,7 @@ fn build_into(
                 .unwrap_or_else(|_| Err("gateway worker panicked".to_string()));
                 drop(release);
                 if let Err(error) = &result {
-                    set_thread_error(&thread_status, codes::NETWORK, error);
+                    record_worker_failure(&thread_gate, &thread_status, codes::NETWORK, error);
                 }
                 result
             })
@@ -1278,6 +1288,7 @@ fn build_into(
         let ready = Arc::new(AtomicBool::new(false));
         let thread_ready = Arc::clone(&ready);
         let thread_status = Arc::clone(status);
+        let thread_gate = Arc::clone(&run.commit_gate);
         let thread = thread::Builder::new()
             .name("cerulion-graph".to_string())
             .spawn(move || {
@@ -1295,7 +1306,10 @@ fn build_into(
                 }))
                 .map(|result| result.map_err(|error| error.to_string()))
                 .unwrap_or_else(|_| Err("graph worker panicked".to_string()));
-                record_graph_exit(&thread_status, &thread_running, &result);
+                {
+                    let _commit = lock_gate(&thread_gate);
+                    record_graph_exit(&thread_status, &thread_running, &result);
+                }
                 result
             })
             .map_err(|error| EmbedError::Graph(error.to_string()))?;
@@ -1348,23 +1362,28 @@ fn build_into(
 /// the beacon. The only step of a start that does so. On an error the
 /// caller shuts the run down, which closes LAN access first.
 ///
-/// The status lock is held from the last worker-failure check through the
-/// posture write, the announce replay and the switch to Running. A worker
-/// records its failure under that same lock, so a failure either lands
-/// first (the commit refuses and LAN access never opens) or lands after the
-/// run is Running (a failure of a started run). A failed start never
-/// authorizes a LAN demand, even briefly. No other lock is taken while a
-/// worker holds the status lock, so holding it here cannot deadlock.
+/// The run's commit gate is held from the last worker-failure check through
+/// the posture write, the announce replay and the switch to Running. A
+/// worker records its failure under that same gate, so a failure either
+/// lands first (the commit refuses and LAN access never opens) or lands
+/// after the run is Running (a failure of a started run). A failed start
+/// never authorizes a LAN demand, even briefly. The status lock is taken
+/// only briefly, never across the network steps, so a status read during
+/// the commit returns at once.
 fn commit(
     run: &mut Run,
     plan: &StartPlan,
     status: &Arc<Mutex<Status>>,
     robot: &str,
 ) -> Result<(), EmbedError> {
+    let gate = Arc::clone(&run.commit_gate);
     {
-        let mut status = lock_status(status);
-        if matches!(status.state, RuntimeState::Failed) {
-            return Err(recorded_failure(&status));
+        let _commit = lock_gate(&gate);
+        {
+            let status = lock_status(status);
+            if matches!(status.state, RuntimeState::Failed) {
+                return Err(recorded_failure(&status));
+            }
         }
         if let Some(gateway) = &plan.gateway {
             let network = run.manager.network().ok_or_else(|| {
@@ -1387,6 +1406,7 @@ fn commit(
                 }
             }
         }
+        let mut status = lock_status(status);
         // A graph that already finished on its own keeps Finished.
         if !matches!(status.state, RuntimeState::Finished) {
             status.state = RuntimeState::Running;
@@ -1406,7 +1426,7 @@ fn commit(
     }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
-    // closes its slot, so a beacon raised after a failure is dropped.
+    // closes its slot, so a beacon raised after it stopped is dropped.
     if let Some(gateway) = &plan.gateway {
         if gateway.mdns {
             let beacon = advertise_beacon(robot, &plan.listen);
@@ -1674,6 +1694,17 @@ fn set_error(status: &Arc<Mutex<Status>>, error: &EmbedError) {
         code: error.code(),
         message: error.to_string(),
     });
+}
+
+fn lock_gate(gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    gate.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Record a worker's failure under the run's commit gate, so it is ordered
+/// against the commit (see [`commit`]).
+fn record_worker_failure(gate: &Mutex<()>, status: &Arc<Mutex<Status>>, code: i32, message: &str) {
+    let _commit = lock_gate(gate);
+    set_thread_error(status, code, message);
 }
 
 fn set_thread_error(status: &Arc<Mutex<Status>>, code: i32, message: &str) {
@@ -2274,12 +2305,14 @@ mod tests {
         assert_baseline(&manager);
     }
 
-    /// The commit holds the status lock from its last failure check through
-    /// opening LAN access and replaying announces, so a worker failure cannot
-    /// land between the check and the open. Hand oracle: during the replay
-    /// (the after-insert hook) the status lock is held, a worker failure
-    /// raised there waits, and it lands only after the run is Running, so
-    /// the commit succeeds and the failure is a started run's failure.
+    /// The commit holds the run's commit gate, not the status lock, from its
+    /// last failure check through opening LAN access and replaying
+    /// announces, so a worker failure cannot land between the check and the
+    /// open while a status read still returns at once. Hand oracle: during
+    /// the replay (the after-insert hook) the gate is held and the status
+    /// lock is free; a worker failure raised there waits on the gate and
+    /// lands only after the run is Running, so the commit succeeds and the
+    /// failure is a started run's failure.
     #[test]
     fn a_worker_failure_cannot_land_between_the_commit_check_and_the_open() {
         let _serial = gateway_test_lock();
@@ -2291,17 +2324,23 @@ mod tests {
             .register_topic("/commit_race/topic")
             .expect("register bridge");
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
-        let held_during_open = Arc::new(AtomicBool::new(false));
+        let mut run = Run::empty(Arc::clone(&manager));
+        let gate_held = Arc::new(AtomicBool::new(false));
+        let status_free = Arc::new(AtomicBool::new(false));
         let failer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
         {
             let status = Arc::clone(&status);
-            let held = Arc::clone(&held_during_open);
+            let gate = Arc::clone(&run.commit_gate);
+            let gate_held = Arc::clone(&gate_held);
+            let status_free = Arc::clone(&status_free);
             let failer = Arc::clone(&failer);
             network.set_after_announce_insert_for_test(Some(Arc::new(move || {
-                held.store(status.try_lock().is_err(), Ordering::SeqCst);
+                gate_held.store(gate.try_lock().is_err(), Ordering::SeqCst);
+                status_free.store(status.try_lock().is_ok(), Ordering::SeqCst);
                 let status = Arc::clone(&status);
+                let gate = Arc::clone(&gate);
                 *failer.lock().unwrap() = Some(thread::spawn(move || {
-                    set_thread_error(&status, codes::NETWORK, "late worker failure");
+                    record_worker_failure(&gate, &status, codes::NETWORK, "late worker failure");
                 }));
             })));
         }
@@ -2327,7 +2366,6 @@ mod tests {
             }),
             recorder: None,
         };
-        let mut run = Run::empty(Arc::clone(&manager));
 
         let result = commit(&mut run, &plan, &status, "t");
         network.set_after_announce_insert_for_test(None);
@@ -2336,8 +2374,12 @@ mod tests {
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
-            held_during_open.load(Ordering::SeqCst),
-            "the status lock must be held while LAN access opens"
+            gate_held.load(Ordering::SeqCst),
+            "the commit gate must be held while LAN access opens"
+        );
+        assert!(
+            status_free.load(Ordering::SeqCst),
+            "a status read must not wait out the commit's network steps"
         );
         assert_eq!(network.lan_access(), LanAccess::Open);
         assert_eq!(lock_status(&status).state, RuntimeState::Failed);
