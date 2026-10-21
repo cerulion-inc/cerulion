@@ -70,47 +70,80 @@ pub fn browse_rung_report(budget: Duration) -> BrowseRungReport {
         }
     };
 
-    let mut peers: Vec<DiscoveredPeer> = Vec::new();
-    let deadline = Instant::now() + budget;
-    let mut window_elapsed_cleanly = true;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline - now;
-        // `recv_timeout` returns Err on both a window timeout and a sender
-        // disconnect; `is_disconnected` tells them apart. A disconnect means the
-        // ServiceDaemon's background thread exited before this function shut it
-        // down, so the result may be partial.
-        match receiver.recv_timeout(remaining) {
+    // `recv_timeout` returns Err on both a window timeout and a sender
+    // disconnect; `is_disconnected` tells them apart.
+    let report = drain_browse_window(
+        budget,
+        Instant::now,
+        |remaining| match receiver.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(resolved)) => {
                 let addrs: Vec<IpAddr> =
                     resolved.addresses.iter().map(|a| a.to_ip_addr()).collect();
                 let robot_txt = resolved.get_property_val_str("robot");
-                peers.extend(peer_from_resolved(
+                BrowseEvent::Resolved(peer_from_resolved(
                     robot_txt,
                     &resolved.fullname,
                     &addrs,
                     resolved.port,
-                ));
+                ))
             }
-            Ok(_) => continue,
-            Err(_) => {
-                if receiver.is_disconnected() {
-                    window_elapsed_cleanly = false;
-                    tracing::warn!(
-                        "mDNS: the `_cerulion._tcp` browse daemon died mid-browse; robot discovery results may be PARTIAL; if an expected robot is missing, reach it directly with `--connect tcp/<host>:7683`"
-                    );
-                }
-                break;
-            }
+            Ok(_) => BrowseEvent::Other,
+            Err(_) => BrowseEvent::NoEvent,
+        },
+        || receiver.is_disconnected(),
+    );
+    let _ = daemon.shutdown();
+    report
+}
+
+/// One receive of a browse window.
+enum BrowseEvent {
+    /// A resolved `_cerulion._tcp` record, mapped to its peers.
+    Resolved(Vec<DiscoveredPeer>),
+    /// Any other browse event.
+    Other,
+    /// The receive timed out or the daemon's sender disconnected.
+    NoEvent,
+}
+
+/// Collect a browse window of `budget` from `recv` (handed the time left
+/// in the window) and report whether it elapsed cleanly. A zero budget
+/// observes nothing, so it is partial. Every exit, including the deadline,
+/// checks `is_disconnected`: a daemon that exited while events were still
+/// queued leaves a partial view, and a partial view proves no absence.
+fn drain_browse_window(
+    budget: Duration,
+    now: impl Fn() -> Instant,
+    mut recv: impl FnMut(Duration) -> BrowseEvent,
+    is_disconnected: impl Fn() -> bool,
+) -> BrowseRungReport {
+    if budget.is_zero() {
+        return BrowseRungReport::partial(Vec::new());
+    }
+    let mut peers: Vec<DiscoveredPeer> = Vec::new();
+    let deadline = now() + budget;
+    loop {
+        let current = now();
+        if current >= deadline {
+            break;
+        }
+        match recv(deadline - current) {
+            BrowseEvent::Resolved(resolved) => peers.extend(resolved),
+            BrowseEvent::Other => {}
+            BrowseEvent::NoEvent => break,
         }
     }
-    let _ = daemon.shutdown();
+    // A disconnect means the ServiceDaemon's background thread exited before
+    // the caller shut it down, so the result may be partial.
+    if is_disconnected() {
+        tracing::warn!(
+            "mDNS: the `_cerulion._tcp` browse daemon died mid-browse; robot discovery results may be PARTIAL; if an expected robot is missing, reach it directly with `--connect tcp/<host>:7683`"
+        );
+        return BrowseRungReport::partial(peers);
+    }
     BrowseRungReport {
         peers,
-        window_elapsed_cleanly,
+        window_elapsed_cleanly: true,
     }
 }
 
@@ -167,6 +200,67 @@ fn peer_from_resolved(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn peer(robot: &str) -> DiscoveredPeer {
+        DiscoveredPeer {
+            robot: robot.to_string(),
+            locator: "tcp/10.0.0.9:7683".to_string(),
+            rung: DiscoveryRung::Mdns,
+        }
+    }
+
+    /// A zero budget observes nothing: the report is partial and nothing is
+    /// received.
+    #[test]
+    fn a_zero_budget_browse_is_partial() {
+        let start = Instant::now();
+        let report = drain_browse_window(
+            Duration::ZERO,
+            || start,
+            |_| panic!("a zero window receives nothing"),
+            || false,
+        );
+        assert!(report.peers.is_empty());
+        assert!(!report.window_elapsed_cleanly);
+    }
+
+    /// A resolved event spans the deadline and the daemon disconnected
+    /// meanwhile: the loop leaves at the deadline, and the report is still
+    /// partial (it keeps the peer it saw).
+    #[test]
+    fn a_disconnect_seen_at_the_deadline_marks_the_browse_partial() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let report = drain_browse_window(
+            Duration::from_secs(1),
+            || clock.get(),
+            |remaining| {
+                clock.set(clock.get() + remaining);
+                BrowseEvent::Resolved(vec![peer("go2")])
+            },
+            || true,
+        );
+        assert_eq!(report.peers, vec![peer("go2")]);
+        assert!(!report.window_elapsed_cleanly);
+    }
+
+    /// The same window with the daemon alive is clean.
+    #[test]
+    fn a_window_that_reaches_its_deadline_with_a_live_daemon_is_clean() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let report = drain_browse_window(
+            Duration::from_secs(1),
+            || clock.get(),
+            |remaining| {
+                clock.set(clock.get() + remaining);
+                BrowseEvent::Other
+            },
+            || false,
+        );
+        assert!(report.peers.is_empty());
+        assert!(report.window_elapsed_cleanly);
+    }
 
     #[test]
     fn instance_from_fullname_strips_service_suffix() {
