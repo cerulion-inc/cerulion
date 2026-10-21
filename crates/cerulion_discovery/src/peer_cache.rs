@@ -114,13 +114,33 @@ pub struct CachedPeer {
     pub last_seen: u64,
 }
 
-/// Default cache path: `~/.cerulion/peers.json`. `None` when there is no home
-/// directory — the call sites that resolve it (the `topic_cmd` write-back, the
+/// Default cache path: `~/.cerulion/peers.json`, or `peers.json` in
+/// `CERULION_HOME` when that is set. `None` when neither resolves. The call
+/// sites that resolve it (the `topic_cmd` write-back, the
 /// `discovery_ladder` cache-rung wiring, and `cerulion-netd`'s boot fold;
 /// `record_confirmed` and [`cache_rung`] themselves take an explicit path) emit
 /// the loud warn (this resolver stays quiet so it composes cleanly).
 pub fn default_cache_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cerulion").join("peers.json"))
+    default_cache_path_from(
+        std::env::var_os("CERULION_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// [`default_cache_path`] with its inputs passed in: `peers.json` in
+/// `cerulion_home` verbatim when it is set and non-empty, else in
+/// `home_dir/.cerulion`. It mirrors `cerulion_pairing::identity::config_dir_from`
+/// without depending on that crate; `cerulion_cli`'s
+/// `config_home_test` pins the two to the same directory.
+pub fn default_cache_path_from(
+    cerulion_home: Option<&std::ffi::OsStr>,
+    home_dir: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let dir = match cerulion_home.filter(|h| !h.is_empty()) {
+        Some(home) => PathBuf::from(home),
+        None => home_dir?.join(".cerulion"),
+    };
+    Some(dir.join("peers.json"))
 }
 
 /// Keep an entry iff its age is strictly LESS than the TTL.
@@ -559,5 +579,24 @@ mod tests {
         );
         // A missing file is an empty candidate set, never an error.
         assert!(cache_rung(CACHE_RUNG_BUDGET, &dir.file("absent.json")).is_empty());
+    }
+
+    #[test]
+    fn the_cache_path_follows_cerulion_home_then_the_home_directory() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        assert_eq!(
+            default_cache_path_from(Some(OsStr::new("/srv/rig")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/srv/rig/peers.json"))
+        );
+        assert_eq!(
+            default_cache_path_from(Some(OsStr::new("")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cerulion/peers.json"))
+        );
+        assert_eq!(
+            default_cache_path_from(None, Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cerulion/peers.json"))
+        );
+        assert_eq!(default_cache_path_from(None, None), None);
     }
 }
