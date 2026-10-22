@@ -165,6 +165,7 @@ fn graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "chatty".to_string(),
             node_type: "chatty".to_string(),

@@ -67,6 +67,7 @@ fn graph(tag: &str) -> GraphConfig {
         prefix: format!("logcdy_{tag}_{nanos}"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "chatter".to_string(),
             node_type: "chatter".to_string(),
