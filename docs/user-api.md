@@ -2064,6 +2064,43 @@ use native_ros2_messages::sensor_msgs::Image;
 image: Image,
 ```
 
+### Constants and defaults
+
+A `.msg` constant line (`int8 STATUS_FIX=0`, `string MODE="AUTO"`) becomes an
+associated constant on the generated type, so node code reads it as
+`NavSatStatus::STATUS_FIX`. Constants never reach the wire and do not change the
+schema hash. A constant takes a primitive type or `string`, its name is upper case
+(`A_B2`, not `type` or `Mixed`) as in ROS 2, and its value must fit the type:
+`uint8 X=256` is a parse error that names the line. A `float32` value is refused only
+when it rounds to infinity, the same rule the Rust compiler applies.
+
+A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
+`bool[2] mask [true, false]`) is kept and applied by the generated `Default`, so
+`QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
+arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
+must have exactly that many elements, and a `<=N` bound is checked (a `string<=N`
+counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A `wstring` is written
+as UTF-8, not the UTF-16 a ROS 2 peer reads, so a non-empty `wstring` default is a
+parse error; an empty one (`""`, `[]`) and a `wstring` constant are accepted. A message-type
+field takes no default, and a fixed-size `string[N]` field does not generate yet,
+with or without a default. A default never changes the wire layout or the schema hash,
+and a loaned output slot still starts zeroed: the default applies when you build a
+value with `Default`.
+
+As in ROS 2, the first `#` on a line starts a comment, inside quotes too, so a
+constant or default cannot hold a `#`: `string s a#b` has the default `a`.
+
+### Service files
+
+A `.srv` file is a request body and a response body split by one `---` line. Each
+part parses as its own message in the package of the service, named as ROS 2 names
+it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
+`std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part. The generated Rust
+types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
+`SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
+code generated from a `.srv` passes `clippy -D warnings`.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and

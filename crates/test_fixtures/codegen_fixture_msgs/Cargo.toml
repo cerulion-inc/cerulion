@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "codegen_fixture_msgs"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Test fixture: .msg files with constants and string, array and all-zero defaults, and a .srv service whose request and response keep the ROS 2 names, generated at build time through cerulion_core's codegen so the generated Default impls compile, pass clippy and run in cerulion_core's codegen_defaults_compiled_test."
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Codegen emits test-only items under `#[cfg(any(test, feature = "test-helpers"))]`,
+# so the feature must exist here for that cfg to be a known one.
+[features]
+test-helpers = []
+
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+[build-dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+
+[lints]
+workspace = true

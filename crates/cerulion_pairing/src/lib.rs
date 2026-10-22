@@ -51,6 +51,7 @@
 //! | [`mod@pake`]   | CPace ceremony state machine (bounded attempts, TTL, code-burn) |
 //! | [`mod@pop`]    | Proof-of-possession gesture: sign/verify a device-key challenge |
 //! | [`mod@client`] | Device-side key seam, cert carry, and pairing driver |
+//! | [`mod@team`]   | Team X.509 leaf and CA profile, trust bundle, status list, anti-rollback decisions |
 //! | [`mod@identity`] | The machine identity on disk: config directory, the one machine key, the MAC'd high-water file |
 
 // P12 (Logging, see AGENTS.md): library code never prints — it logs through
@@ -67,6 +68,7 @@ pub mod format;
 pub mod identity;
 pub mod pake;
 pub mod pop;
+pub mod team;
 pub mod verify;
 
 pub use error::{CertKind, PairingError};

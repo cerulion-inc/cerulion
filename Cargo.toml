@@ -192,6 +192,10 @@ members = [
     # ONLY through the preload, never a static link. Consumed by
     # `cerulion_heaphook/tests/heaphook_e2e_test.rs` (built first on Linux CI).
     "crates/test_fixtures/heaphook_probe",
+    # Compiled codegen fixture: .msg constants and string/array/all-zero
+    # defaults generated at build time; consumed by cerulion_core's
+    # codegen_defaults_compiled_test.
+    "crates/test_fixtures/codegen_fixture_msgs",
     # A trivial second malloc interposer preloaded AHEAD of the hook,
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
