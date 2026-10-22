@@ -16,8 +16,9 @@ use serde_yaml::mapping::Entry;
 use serde_yaml::value::{Tag, TaggedValue};
 use serde_yaml::{Mapping, Value};
 
-/// The tag that holds an integer past 64 bits as its decimal text. It has
-/// a space, which no YAML tag can spell, so typed input never carries it.
+/// The tag that holds an integer past 64 bits as its decimal text. A YAML
+/// tag can spell it (`!integer%20past%2064%20bits`), so [`NodeVisitor`]
+/// keeps such a typed tag from ever reading as the mark.
 const WIDE_INTEGER_TAG: &str = "!integer past 64 bits";
 
 /// Parse one YAML document. Errors are the parser's own (syntax, duplicate
@@ -137,10 +138,20 @@ impl<'de> de::Visitor<'de> for NodeVisitor {
             return Err(de::Error::custom("empty YAML tag is not allowed"));
         }
         let Node(value) = contents.newtype_variant()?;
-        Ok(Value::Tagged(Box::new(TaggedValue {
-            tag: Tag::new(tag),
-            value,
-        })))
+        let tag = Tag::new(tag);
+        // A typed tag that spells the wide-integer mark keeps its tag, so
+        // the decoder refuses it as written, but its value goes one layer
+        // down: `wide_integer` needs a bare string under the mark, so the
+        // input can never pass as an integer past 64 bits.
+        let value = if tag == WIDE_INTEGER_TAG {
+            Value::Tagged(Box::new(TaggedValue {
+                tag: tag.clone(),
+                value,
+            }))
+        } else {
+            value
+        };
+        Ok(Value::Tagged(Box::new(TaggedValue { tag, value })))
     }
 }
 

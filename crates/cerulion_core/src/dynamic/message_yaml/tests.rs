@@ -1477,6 +1477,16 @@ pose:
             pose.replace("x: 1.0", "x: !meters 1.0"),
             "pose.position.x: YAML tag !meters is not supported",
         ),
+        // A tag cannot forge the parser's own mark for an integer past 64
+        // bits: a percent escape spells the space it holds.
+        (
+            pose.replace("x: 1.0", "x: !integer%20past%2064%20bits \"5\""),
+            "pose.position.x: YAML tag !integer past 64 bits is not supported",
+        ),
+        (
+            pose.replace("x: 1.0", "x: !<!integer%20past%2064%20bits> \"5\""),
+            "pose.position.x: YAML tag !integer past 64 bits is not supported",
+        ),
         (
             "[1]".to_string(),
             "(message): expected geometry_msgs/PoseStamped, got sequence",
@@ -1965,20 +1975,25 @@ fn every_corpus_type_matches_the_oracle_both_ways() {
     }
 }
 
-/// Two runs in one process, and a second process, give the same bytes.
+/// Two runs in one process give the same bytes.
 #[test]
-fn encoding_is_deterministic_across_runs_and_processes() {
+fn encoding_is_deterministic_across_runs() {
     let walker = builtin_walker();
     let (codec, _) = CdrCodec::new(builtin_schemas());
-    let frames = corpus(&walker, &codec);
-    let digest = |walker: &FrameWalker| {
-        frames
-            .iter()
-            .map(|(q, frame, _)| format!("== {q}\n{}", message_to_yaml(walker, frame).unwrap()))
-            .collect::<String>()
-    };
-    let first = digest(&walker);
-    assert_eq!(first, digest(&builtin_walker()));
+    assert_eq!(
+        corpus_digest(&walker, &codec),
+        corpus_digest(&builtin_walker(), &codec)
+    );
+}
+
+/// A second process gives the same bytes. Unix only: the child is told
+/// apart by its parent's process id.
+#[cfg(unix)]
+#[test]
+fn encoding_is_deterministic_across_processes() {
+    let walker = builtin_walker();
+    let (codec, _) = CdrCodec::new(builtin_schemas());
+    let first = corpus_digest(&walker, &codec);
 
     // Child mode only when THIS test's parent spawned us: the variable
     // carries the parent's process id, so a value inherited from the shell
@@ -1991,7 +2006,7 @@ fn encoding_is_deterministic_across_runs_and_processes() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "dynamic::message_yaml::tests::encoding_is_deterministic_across_runs_and_processes",
+            "dynamic::message_yaml::tests::encoding_is_deterministic_across_processes",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -2006,6 +2021,14 @@ fn encoding_is_deterministic_across_runs_and_processes() {
         first,
         "a second process must print the same YAML"
     );
+}
+
+/// The YAML of every corpus frame, in corpus order.
+fn corpus_digest(walker: &FrameWalker, codec: &CdrCodec) -> String {
+    corpus(walker, codec)
+        .iter()
+        .map(|(q, frame, _)| format!("== {q}\n{}", message_to_yaml(walker, frame).unwrap()))
+        .collect()
 }
 
 /// Zero-size messages: `Row` is 2^20 empty messages and `Big` is 2^20

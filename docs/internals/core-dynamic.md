@@ -301,8 +301,8 @@ turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_
 covers one message of every vendored type against two oracles: the frame from `CdrCodec`
 and the YAML from the test's own `Sample` writer, which spells out the documented form
 with no call into the codec, so encode must print that YAML and decode must build that
-frame; `encoding_is_deterministic_across_runs_and_processes`
-re-runs the corpus in a second process.
+frame; `encoding_is_deterministic_across_runs` re-runs the corpus in the same process, and
+`encoding_is_deterministic_across_processes` (Unix only) re-runs it in a second process.
 
 ## Tests
 
