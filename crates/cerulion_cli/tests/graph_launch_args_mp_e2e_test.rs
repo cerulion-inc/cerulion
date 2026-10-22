@@ -70,7 +70,6 @@ fn a_yes_run_under_a_wiring_override_runs_when_the_saved_partition_is_already_cu
                 "side:=right",
                 "--auto-partition",
                 "--yes",
-                "--no-validate",
                 &record_flag,
             ])
             .current_dir(root)
