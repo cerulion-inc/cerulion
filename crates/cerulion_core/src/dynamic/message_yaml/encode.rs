@@ -70,9 +70,15 @@ pub fn message_to_yaml_with(
     message_to_yaml_capped(walker, frame, options, MAX_YAML_BYTES)
 }
 
-/// [`message_to_yaml_with`] with the output cap as a parameter, so tests
-/// can reach it with small messages.
-pub(super) fn message_to_yaml_capped(
+/// [`message_to_yaml_with`] with an output cap of `max_bytes` in place of
+/// [`super::MAX_YAML_BYTES`]: a caller that builds more from the text than
+/// the text itself (a tree of values per element) bounds it tighter.
+///
+/// # Errors
+///
+/// As [`message_to_yaml`], with [`DynamicError::YamlOutputTooLarge`] at
+/// `max_bytes`.
+pub fn message_to_yaml_capped(
     walker: &FrameWalker,
     frame: &[u8],
     options: YamlEncodeOptions,

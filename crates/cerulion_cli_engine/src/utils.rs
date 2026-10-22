@@ -78,6 +78,8 @@ pub fn validate_python_identifier(name: &str) -> CliResult<()> {
         "request_shutdown",
         "env",
         "loan",
+        "publish_yaml",
+        "publish_dict",
         "tick",
         "init",
         "shutdown",
@@ -162,7 +164,7 @@ mod tests {
             let err = validate_python_identifier(name).unwrap_err();
             assert!(err.to_string().contains("is a Python keyword"));
         }
-        for name in ["loan", "tick"] {
+        for name in ["loan", "tick", "publish_yaml", "publish_dict"] {
             let err = validate_python_identifier(name).unwrap_err();
             assert!(err
                 .to_string()

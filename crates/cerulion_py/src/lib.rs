@@ -21,6 +21,7 @@ pub(crate) use errors::{
 mod align;
 mod bag;
 mod frame;
+mod message_yaml;
 mod publisher;
 mod session;
 mod subscriber;
@@ -55,5 +56,9 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bag::PyBag>()?;
     m.add_class::<bag::BagRecordIter>()?;
     m.add_function(wrap_pyfunction!(bag::open_bag, m)?)?;
+    m.add_function(wrap_pyfunction!(message_yaml::message_to_yaml_text, m)?)?;
+    m.add_function(wrap_pyfunction!(message_yaml::yaml_to_message_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(message_yaml::message_to_dict, m)?)?;
+    m.add_function(wrap_pyfunction!(message_yaml::dict_to_message_bytes, m)?)?;
     Ok(())
 }

@@ -8,15 +8,25 @@ import os
 import sys
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
+from cerulion._native import WIRE_HEADER_SIZE, EncodeError
 from cerulion._typed import (
     Message,
     SchemaSet,
+    _byte_len,
+    _descriptors_from_body,
     _dynamic_descriptor,
     _is_message_type,
     _schema_mismatch,
     _view,
     _wire_length,
 )
+
+# Host methods a node class gets; a port or method of the same name is refused.
+_HOST_METHODS = ("now_ns", "request_shutdown", "env", "loan", "publish_yaml", "publish_dict")
+
+# The attribute that marks a method the node decorator installed.
+_HOST_MARK = "_cer_host_method"
+_MISSING = object()
 
 M = TypeVar("M", bound=Message)
 
@@ -406,9 +416,15 @@ def node(
     def decorate(cls):
         if not callable(cls.__dict__.get("tick")):
             raise TypeError("Python node must define a callable tick method")
-        for reserved in ("now_ns", "request_shutdown", "env", "loan"):
-            if reserved in cls.__dict__:
-                raise TypeError(f"reserved method name: {reserved}")
+        # The host installs these on the class, so one the class defines or
+        # inherits would be silently replaced. Only a method a decorator
+        # installed (on a decorated base) may already be there.
+        for reserved in _HOST_METHODS:
+            for klass in cls.__mro__:
+                attr = klass.__dict__.get(reserved, _MISSING)
+                if attr is not _MISSING and not getattr(attr, _HOST_MARK, False):
+                    where = "" if klass is cls else f" (inherited from {klass.__name__})"
+                    raise TypeError(f"reserved method name: {reserved}{where}")
         ports = list(getattr(cls, "__cerulion_declared_ports__", ()))
         seen = set()
         for port in ports:
@@ -418,10 +434,7 @@ def node(
             if port.name.startswith("__"):
                 raise TypeError(f"reserved port name: {port.name}")
             if port.name.startswith("_cer_") or port.name.startswith("__cerulion") or port.name in (
-                "now_ns",
-                "request_shutdown",
-                "env",
-                "loan",
+                *_HOST_METHODS,
                 "tick",
                 "init",
                 "shutdown",
@@ -556,10 +569,32 @@ def node(
             self._cer_outputs[name] = self._cer_make_output(name, lengths)
             return self._cer_outputs[name]
 
-        cls.now_ns = now_ns
-        cls.env = env
-        cls.request_shutdown = request_shutdown
-        cls.loan = loan
+        output_schemas = {port.name: port.schema for port in outputs}
+
+        def _output_schema(name):
+            if name not in output_schemas:
+                raise KeyError(name)
+            return output_schemas[name]
+
+        # A whole message from message YAML or a dict, through the codec
+        # `topic echo` uses: the frame is byte-identical to the one the Rust
+        # codec builds from the same text.
+        # hot-path-alloc-ok: an explicit cold call, never the tick's own
+        # publish path. Text in has to be parsed, and the parse allocates, so
+        # no form of this call is alloc-free; the loan's size comes from the
+        # built frame's offset table, so the frame exists before the loan
+        # does. The zero-copy publish path is `self.out` and `self.loan()`.
+        def publish_yaml(self, name, text, /):
+            frame = self._cer_schemas.yaml_to_message(_output_schema(name), text)
+            self._cer_publish_frame(name, frame)
+
+        def publish_dict(self, name, values, /):
+            frame = self._cer_schemas.dict_to_message(_output_schema(name), values)
+            self._cer_publish_frame(name, frame)
+
+        for method in (now_ns, env, request_shutdown, loan, publish_yaml, publish_dict):
+            setattr(method, _HOST_MARK, True)
+            setattr(cls, method.__name__, method)
         return cls
 
     return decorate
@@ -585,6 +620,8 @@ class _Runtime:
             for port in cls.__cerulion_ports__["outputs"]
         }
         self.instance._cer_make_output = self._make_output
+        self.instance._cer_publish_frame = self._publish_frame
+        self.instance._cer_schemas = self.schemas
         if hasattr(self.instance, "init"):
             self.instance.init(ctx)
 
@@ -613,6 +650,7 @@ class _Runtime:
                 self.schemas,
                 resolved.get("variables"),
                 owner=frame,
+                whole_frame=True,
             )
         self.instance._cer_inputs = inputs
 
@@ -634,6 +672,34 @@ class _Runtime:
         )
         self.instance._cer_loans[name] = loan
         return message
+
+    def _publish_frame(self, name, frame):
+        """Loan output ``name`` sized for the wire ``frame`` and copy its body
+        in, offset table included, so the published bytes are the frame's."""
+        if name in self.instance._cer_outputs:
+            raise RuntimeError(f"output '{name}' was already touched this tick")
+        layout = self.instance._cer_layouts[name]
+        body = memoryview(frame)[WIRE_HEADER_SIZE:]
+        table = _descriptors_from_body(layout, body)
+        lengths = [_byte_len(table[field.name]) for field in layout.variable_fields]
+        message = self._make_output(name, lengths)
+        with memoryview(self.instance._cer_loans[name]) as slot:
+            slot_len = len(slot)
+            fits = slot_len == len(body)
+            if fits:
+                slot[:] = body
+        if not fits:
+            # The output stays untouched: the unfilled loan is dropped
+            # unpublished, so a caught error sends no frame of zeros.
+            del self.instance._cer_loans[name]
+            message._detach()
+            err = EncodeError(
+                f"output '{name}': the {len(body)}-byte message does not fill its "
+                f"{slot_len}-byte loan"
+            )
+            err.kind = "FrameLoanSizeMismatch"
+            raise err
+        self.instance._cer_outputs[name] = message
 
     def run_tick(self):
         return self.instance.tick()

@@ -240,6 +240,88 @@ tag: string is 5 bytes, over the bound of 4 bytes
 ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
 ```
 
+### Message YAML
+
+`topic echo` prints a message in one YAML form, and the same form is how
+Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
+API): a message printed whole (no `!truncated` element) is valid input as it
+stands, with or without the `---` line echo prints after it. An unset nested field prints as its zero values, so reading it back
+gives the same values in a full-size frame, not the same bytes.
+
+```yaml
+header:
+  stamp:
+    sec: 1
+    nanosec: 2
+  frame_id: "map"
+name: ["shoulder", "elbow"]
+position: [0.5, 1e-7]
+velocity: []
+effort: [1.5]
+```
+
+- **Keys.** One key per field, in the order the `.msg` or schema YAML
+  declares them. Every field is required on input, and a key that is not a
+  field of the type is an error. A message type with no fields is `{}`
+  (empty input is accepted for it).
+- **Numbers.** Integers are decimal. An integer that does not fit its
+  field is refused as out of range at that field; past 128 bits YAML reads
+  the digits as a float, so the error is `expected uint64, got float`. Floats print in the shortest form that
+  reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
+  `.inf` and `-.inf`; an integer is accepted for a float field. A
+  `float32` reads back to the same bits. The one exception is NaN: every
+  NaN prints `.nan` and reads back as the standard quiet NaN, so its sign
+  and payload bits are not kept.
+- **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
+  strings. Control characters and the characters YAML reads as line breaks
+  print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
+- **Arrays.** Arrays of numbers, booleans and strings are flow sequences
+  (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
+  `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
+  array (`float64[9]`) must have exactly its length. An unbounded array of
+  messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
+  form holds no count for it, so a longer one is refused. Arrays of
+  strings and messages nest at most 8 deep through variable-size messages
+  (ones holding a string, `bytes` or an unbounded array at any depth): a
+  nonempty ninth level is refused (`arrays of strings and messages nest
+  more than 8 deep here`), because echo could not print it back.
+- **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
+  messages: `stamp: {sec: 1, nanosec: 2}` in block form.
+- **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
+  written as the number: `level: 1`, not `level: WARN`.
+- **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
+  holds no NUL character. A ROS `string<=N` value (or each element of
+  `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
+  `N` elements (`dimensions: expected at most 3 elements, got 4`). A
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, so `é` counts 1 and a character past U+FFFF counts 2;
+  a longer value is refused (`YamlWideStringTooLong`). Echo prints a frame
+  past its bounds as it is; reading that output back is refused.
+- **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
+  duplicate keys and more than one document are refused. A `!truncated`
+  element is refused with a message that says the array was cut for
+  display.
+- **Size.** A message whose YAML form is longer than 256 MiB is not
+  printed: the error names the field being written when the cap was
+  passed (`inner.rows[0].leaves[9].v: the YAML form passes the
+  268435456-byte output cap`). An unset nested field prints its zero
+  values, so a small frame can name a very large form. Message YAML
+  longer than 257 MiB (the 256 MiB form plus room for echo's comment
+  lines and `---`) is refused before it is read.
+
+Every error names the full field path (`(message)` for the whole message)
+and the expected type or bound:
+
+```text
+pose.position.x: expected float64, got string
+header.stamp.nanosec: -1 is out of range for uint32 (0 to 4294967295)
+pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation
+pose.orientation.w: missing field required by geometry_msgs/Quaternion
+covariance: expected exactly 36 elements, got 35
+tag: string is 5 bytes, over the bound of 4 bytes
+ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
+```
+
 ### Local scope for runs and topic inspection
 
 This source version accepts `--local` on `graph run`, `node run`, and `topic

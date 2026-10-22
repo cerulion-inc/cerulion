@@ -145,6 +145,43 @@ class SchemaSet:
     def warnings(self):
         return self._native.warnings
 
+    # ---- message <-> dict / YAML (the shared Rust codec) ----------------
+    # Each direction is one call into the codec that `topic echo` uses, so
+    # the YAML and the error text are the CLI's. `frame` is a whole wire
+    # frame: bytes-like, a received `Frame`, a bag record, or a received
+    # message view (`Frame.view()`, a node input).
+
+    def message_to_yaml(self, frame):
+        """The message YAML of a wire frame, fields in declaration order."""
+        return _native.message_to_yaml_text(self._native, _wire_frame(frame))
+
+    def message_to_dict(self, frame):
+        """A wire frame as plain Python values (dict, list, str, int,
+        float, bool), keys in declaration order."""
+        return _native.message_to_dict(self._native, _wire_frame(frame))
+
+    def yaml_to_message(self, name, text, timestamp_ns=0):
+        """The wire frame (``bytes``, header included) of YAML ``text``
+        (``str`` or UTF-8 bytes-like) as one ``name`` message."""
+        if isinstance(text, str):
+            # `surrogatepass` keeps a lone surrogate as the bytes the codec
+            # refuses as not UTF-8, with its offset, instead of raising
+            # `UnicodeEncodeError` here.
+            raw = text.encode("utf-8", "surrogatepass")
+        elif isinstance(text, (bytes, bytearray, memoryview)):
+            raw = bytes(text)
+        else:
+            # `bytes(5)` would be five NUL bytes, not YAML.
+            raise TypeError(
+                f"message YAML must be str or bytes-like, not {type(text).__name__}"
+            )
+        return _native.yaml_to_message_bytes(self._native, name, raw, timestamp_ns)
+
+    def dict_to_message(self, name, values, timestamp_ns=0):
+        """The wire frame (``bytes``, header included) of ``values`` as one
+        ``name`` message; every field is required."""
+        return _native.dict_to_message_bytes(self._native, name, values, timestamp_ns)
+
     def layout(self, name):
         cached = self._layouts.get(name)
         if cached is not None and cached[0] == self._generation:
@@ -1155,6 +1192,16 @@ class Message:
             result[field.name] = _owned(self[field.name])
         return result
 
+    def to_dict(self):
+        """This received message as plain Python values; see
+        `SchemaSet.message_to_dict`."""
+        return self._schemas.message_to_dict(self)
+
+    def to_yaml(self):
+        """This received message as message YAML; see
+        `SchemaSet.message_to_yaml`."""
+        return self._schemas.message_to_yaml(self)
+
     def _frame_raw(self):
         """The whole received wire frame this view was opened over, or
         ``None`` for a loan, a scratch frame, or a nested view (a fixed
@@ -1165,7 +1212,9 @@ class Message:
         self._check_alive()
         if not self._whole_frame:
             return None
-        return self._owner.raw
+        # A node input's owner is the host frame itself (a buffer).
+        raw = getattr(self._owner, "raw", None)
+        return memoryview(self._owner) if raw is None else raw
 
     def _forward_values(self):
         """`copy()` shaped for re-encoding: the variable fields that
@@ -1203,6 +1252,32 @@ class Message:
         object.__setattr__(self, "_payload", None)
         object.__setattr__(self, "_owner", None)
         object.__setattr__(self, "_variables", {})
+
+
+def _wire_frame(frame):
+    """The whole wire frame behind ``frame`` as a buffer."""
+    if isinstance(frame, Message):
+        raw = frame._frame_raw()
+        if raw is None:
+            raise TypeError(
+                "only a received message converts as a whole frame (a loan or "
+                "a nested view does not)"
+            )
+        return raw
+    raw = getattr(frame, "raw", None)
+    raw = frame if raw is None else raw
+    try:
+        view = memoryview(raw)
+    except TypeError:
+        view = None
+    # A strided or wide-item buffer would be copied element by element
+    # into a frame it never was; refuse it as every other buffer API does.
+    if view is None or not view.c_contiguous or view.format not in ("B", "c"):
+        raise TypeError(
+            "frame must be a contiguous bytes-like object of single-byte "
+            "items (bytes, bytearray, memoryview of bytes, np.uint8 array)"
+        )
+    return raw
 
 
 def _array_key(field_type):

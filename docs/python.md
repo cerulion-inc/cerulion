@@ -367,6 +367,116 @@ point_frame.release()
 2.5 {'x': 2.5, 'y': -4.0}
 ```
 
+## Messages as dicts and YAML
+
+`SchemaSet` turns any message of the set into plain Python values or into
+message YAML, and builds a wire frame from either. The YAML is the form
+`cerulion topic echo` prints (see "Message YAML" in the user API
+reference), and both directions use the same codec as the CLI, so YAML a
+script prints reads back unchanged and a bad value fails with the same text.
+
+- `message_to_dict(frame)` and `message_to_yaml(frame)` take a whole wire
+  frame: bytes, a received `Frame`, a bag record or a view of either
+  (`frame.view().to_dict()` and `.to_yaml()` are the same calls). A
+  strided or wide-item buffer raises `TypeError`.
+- `dict_to_message(name, values)` and `yaml_to_message(name, text)` return
+  the frame as `bytes`, header included; `timestamp_ns=` sets the header
+  stamp. Every field is required and an unknown key is refused. `text` is a
+  `str` or a bytes-like object; any other type raises `TypeError`.
+
+A dict holds `int`, `float`, `bool`, `str`, lists and nested dicts.
+`message_to_dict` returns keys in declaration order; `dict_to_message`
+accepts them in any order. Byte arrays are lists of integers; `bytes` and
+NumPy arrays are accepted on input. YAML has one NaN, so a NaN reads back
+as the canonical NaN: its sign and payload are not kept.
+
+A message these calls cannot convert raises `EncodeError`, `DecodeError` or
+`SchemaError` with a `kind` to branch on; a wrong argument type (such as
+YAML text that is neither `str` nor bytes-like) is a plain `TypeError` with
+no `kind`. A value that does not make the
+message raises `EncodeError` naming the field path, with the codec's kind
+(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Five
+kinds come from the dict itself, before the codec reads it: `DictUnsupportedValue`
+(a value of no message type, such as an `object()`), `DictNotUtf8` (a `str`
+with a lone surrogate), `DictTooDeep` (a dict nested past 129 levels,
+such as one that contains itself), `DictTooLarge` (a dict whose YAML
+passes 256 MiB, such as one list shared many times over) and `DictChangedSize`
+(an array whose length changes while it is read, such as one another thread resizes: the length is read again once every item is written, so growth and shrinkage both raise it). An integer past 64 bits in a dict is
+written as its digits, so it gets the error the same YAML text gets: an integer field refuses it
+with `YamlOutOfRange` up to 128 bits and `YamlWrongType` past that (the YAML parser reads such
+digits as a float), and a float field takes its nearest float value. Past the float range
+(1024 bits) the parser reads the digits as a string, so every field refuses them with
+`YamlWrongType`. An integer too long for Python to write as decimal text (past 4300 digits) is
+`YamlOutOfRange` naming its field. A frame value with no YAML form raises
+`DecodeError` (`YamlUnencodable`), and a schema the YAML form cannot cover
+raises `SchemaError` (`YamlUnresolvedNested`, `YamlTooDeep`,
+`YamlUnsupportedField`).
+
+An unset nested field reads back as its schema's zero values, so a small
+frame can name a very large dict. `message_to_dict` bounds the dict by the
+frame: its YAML form may take 64 bytes per frame byte plus 16 MiB (else
+`DecodeError` `YamlOutputTooLarge`), and it may hold 4 Python values (each
+dict, list, key and scalar) per frame byte plus 1048576 (else `DecodeError`
+`DictTooLarge`). A frame nested past the codec's 64 levels (a message and an array of
+messages are one level each) raises `SchemaError` `YamlTooDeep` on both paths.
+`message_to_yaml` keeps the codec's 256 MiB cap, so a frame past the dict bounds still prints.
+
+`Message.copy()` is not this conversion: it materializes a view (a
+received message, a loan or a nested view) as owned NumPy values,
+`bytes`, nested copies and, for `string[]` and nested-message array
+fields, decoded Python lists. The typed `publish()` takes those fields only
+as pre-framed bytes, so a copy of a message with one of them is refused
+with `EncodeError`. To send a received message on, pass the received
+`Message` itself to `publish()`, which forwards its frame bytes. To send
+plain values, build the frame with `dict_to_message(name, message.to_dict())`
+and hand it to `publish_frame()`. Use `to_dict()` for the plain values
+`topic echo` shows.
+
+```python
+frame = schemas.yaml_to_message("Point", "x: 1.5\ny: -2.0\n")
+print(schemas.message_to_dict(frame))
+print(schemas.message_to_yaml(schemas.dict_to_message("Point", {"x": 0.5, "y": 4})), end="")
+try:
+    schemas.dict_to_message("Point", {"x": 1.0})
+except cerulion.EncodeError as e:
+    print(e.kind, e)
+```
+
+```text
+{'x': 1.5, 'y': -2.0}
+x: 0.5
+y: 4.0
+YamlMissingField y: missing field required by Point
+```
+
+A Python node publishes a whole message the same way: `self.publish_yaml(name,
+text)` and `self.publish_dict(name, values)` encode the output's own schema
+and publish the result as that output for this tick, byte for byte the
+frame the CLI codec builds. An input reads back with `self.inp.to_dict()`.
+These are explicit calls that allocate; for a high-rate output keep writing
+fields on `self.out` or a `self.loan(...)`. `publish_yaml` and
+`publish_dict` are host methods, so a port or method of either name is
+refused, like `loan` and `env`.
+
+```python-source
+import cerulion
+from cerulion.msgs.geometry_msgs import PoseStamped
+
+GOAL = """
+header: {stamp: {sec: 0, nanosec: 0}, frame_id: "map"}
+pose:
+  position: {x: 2.0, y: 0.5, z: 0.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+"""
+
+@cerulion.node(period_ms=500)
+class Goal:
+    out = cerulion.output(PoseStamped)
+
+    def tick(self):
+        self.publish_yaml("out", GOAL)
+```
+
 ## Bags
 
 `cerulion.open_bag(path) -> Bag` opens a finalized MCAP bag written by
@@ -438,8 +548,10 @@ Client errors derive from `cerulion.CerulionError`:
 - `EncodeError` - facade-side checks on what is about to be sent: a payload
   larger than `max_payload_len`, committing a loan while a live buffer view
   exists, a typed `publish()` payload that is not a dict or `Message` or
-  has missing, extra or ill-typed fields, and a frame handed to a typed
-  publisher's `publish_frame()` that is not well-formed for its schema. A
+  has missing, extra or ill-typed fields, a frame handed to a typed
+  publisher's `publish_frame()` that is not well-formed for its schema, and
+  YAML or a dict that does not make a message (`yaml_to_message()`,
+  `dict_to_message()`, `publish_yaml()`, `publish_dict()`). A
   core `LoanCapacity` failure (loan-pool exhaustion) maps to
   `TransportError`, not `EncodeError`.
 - `DecodeError` - malformed wire layout or invalid UTF-8 in a fixed or

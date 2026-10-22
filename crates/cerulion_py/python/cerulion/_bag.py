@@ -74,7 +74,7 @@ class Record:
     @overload
     def view(self, schema: "type[M]") -> "M": ...
     @overload
-    def view(self, schema: str, *, schemas: "SchemaSet | None" = None) -> Any: ...
+    def view(self, schema: str, *, schemas: "SchemaSet") -> Any: ...
     def view(self, schema, *extra, schemas=None):
         """The typed view of this record as ``schema``: a message class, or a
         schema name with ``schemas=``."""
@@ -82,7 +82,11 @@ class Record:
         schemas, schema = _schema_arg(schema, schemas, "view()")
         descriptor = schemas._native.resolve_frame_buffer(self.raw, schema)
         layout = schemas.layout(descriptor["schema"])
-        return _view(self.payload, layout, schemas, descriptor["variables"], self)
+        # A record is one whole wire frame, so its view converts
+        # (`to_dict()`, `to_yaml()`) and forwards as the bytes it holds.
+        return _view(
+            self.payload, layout, schemas, descriptor["variables"], self, whole_frame=True
+        )
 
 
 class _Messages:

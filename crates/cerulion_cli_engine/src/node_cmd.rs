@@ -2113,6 +2113,19 @@ if write_workspace_stubs is not None:
             reason: format!("python metadata generation failed: {reason}"),
         });
     }
+    // A run that succeeds can still warn on stderr (the editor stubs were
+    // not written, the node's own imports warn); only a failure reads the
+    // captured stream otherwise, so show it here.
+    for line in String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        tracing::warn!(
+            node_type = %node_type,
+            stderr = %line,
+            "python metadata generation printed a warning"
+        );
+    }
     let json = std::fs::read_to_string(&info_path).map_err(|error| CliError::BuildFailed {
         target: node_type.to_string(),
         reason: format!("python metadata generation produced invalid JSON: {error}"),
@@ -2879,6 +2892,88 @@ mod tests {
     }
 
     #[test]
+    fn python_template_keeps_a_package_named_msgs_apart_from_the_root() {
+        // `msgs/Reading` and a package-less `Reading` share a leaf, so both
+        // are reached through a module; the package must not bind the root
+        // `msgs` name the package-less class is reached through.
+        let inputs = vec![
+            ("a".to_string(), "msgs/Reading".to_string()),
+            ("b".to_string(), "Reading".to_string()),
+            ("c".to_string(), "_msgs_package/Odd".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion import msgs\n\
+             from cerulion.msgs import msgs as _msgs_package"
+        );
+        for line in [
+            "    a = cerulion.input(_msgs_package.Reading)\n",
+            "    b = cerulion.input(msgs.Reading)\n",
+            "    c = cerulion.input(\"_msgs_package/Odd\")\n",
+        ] {
+            assert!(source.contains(line), "{line:?} in {source}");
+        }
+        // Alone, the package's leaf is imported by name.
+        let alone = vec![("a".to_string(), "msgs/Reading".to_string())];
+        let source = templates::generate_python_node_py(&alone, &[], "period_ms=1", &[]);
+        assert!(source.contains("from cerulion.msgs.msgs import Reading\n"));
+        assert!(source.contains("    a = cerulion.input(Reading)\n"));
+    }
+
+    #[test]
+    fn python_template_binds_no_module_under_a_port_name() {
+        // Every port is a class-body assignment, so a port spelled like a
+        // module the body reads (or like `cerulion`) would rebind it for
+        // every later port: each such module is bound under a free name.
+        let inputs = vec![
+            ("_msgs_package".to_string(), "msgs/Point".to_string()),
+            ("b".to_string(), "msgs/Reading".to_string()),
+            ("c".to_string(), "Reading".to_string()),
+            ("msgs".to_string(), "geometry_msgs/Pose".to_string()),
+            ("geometry_msgs".to_string(), "vision_msgs/Pose".to_string()),
+            ("cerulion".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let outputs = vec![("out".to_string(), "Reading".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion as cerulion_\n\
+             from cerulion import msgs as msgs_\n\
+             from cerulion.msgs import geometry_msgs as geometry_msgs_, msgs as _msgs_package_, vision_msgs\n\
+             from cerulion.msgs.msgs import Point\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "@cerulion_.node(period_ms=1)\nclass Node:\n",
+            "    _msgs_package = cerulion_.input(Point)\n",
+            "    b = cerulion_.input(_msgs_package_.Reading)\n",
+            "    c = cerulion_.input(msgs_.Reading)\n",
+            "    msgs = cerulion_.input(geometry_msgs_.Pose)\n",
+            "    geometry_msgs = cerulion_.input(vision_msgs.Pose)\n",
+            "    cerulion = cerulion_.input(Int32)\n",
+            "    out = cerulion_.output(msgs_.Reading)\n",
+        ] {
+            assert!(source.contains(line), "{line:?} in {source}");
+        }
+        // An imported class spelled like a module takes that name first.
+        let inputs = vec![
+            ("Header".to_string(), "std_msgs/Header".to_string()),
+            ("x".to_string(), "foo/std_msgs".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion\n\
+             from cerulion.msgs import std_msgs as std_msgs_\n\
+             from cerulion.msgs.foo import std_msgs"
+        );
+        assert!(source.contains("    Header = cerulion.input(std_msgs_.Header)\n"));
+        assert!(source.contains("    x = cerulion.input(std_msgs)\n"));
+    }
+
+    #[test]
     fn python_node_rejects_raw_ffi_before_any_write() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let options = NodeCreateOptions {
@@ -3042,17 +3137,38 @@ mod tests {
         }
     }
 
+    /// Write the executable script `contents` to `path` from a child
+    /// process. A file this test process held open for writing could be
+    /// inherited by a child another test thread forks at that moment, and
+    /// executing the script while that child lives fails with ETXTBSY
+    /// ("Text file busy") on Linux; the writer's descriptor never exists
+    /// in this process, so no fork can inherit it.
+    #[cfg(unix)]
+    fn write_executable_stub(path: &Path, contents: &str) {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
     #[cfg(unix)]
     #[test]
     fn regenerate_python_info_cleans_temp_file_on_every_result() {
-        use std::os::unix::fs::PermissionsExt;
-
         fn make_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).unwrap();
+            write_executable_stub(&path, &format!("#!/bin/sh\n{body}\n"));
             path
         }
 
@@ -3096,7 +3212,10 @@ mod tests {
                     assert!(source.contains(expected));
                 }
                 ("two", Err(err), None) => {
-                    assert!(err.to_string().contains("expected exactly one document"));
+                    assert!(
+                        err.to_string().contains("expected exactly one document"),
+                        "{err}"
+                    );
                 }
                 ("bad", Err(err), None) => {
                     assert!(err.to_string().contains("produced invalid JSON"));
@@ -3161,9 +3280,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn regenerate_python_build_rs_bakes_interpreter_libdir() {
-        use std::os::unix::fs::PermissionsExt;
+    #[tracing_test::traced_test]
+    fn regenerate_python_info_shows_the_warning_of_a_run_that_succeeds() {
+        // The metadata child exits 0 when only the editor stubs failed; the
+        // warning it prints must still reach the user.
+        let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+        let options = NodeCreateOptions {
+            language: NodeLanguage::Python,
+            ..NodeCreateOptions::default()
+        };
+        node_create_with_options(
+            &nodes_dir,
+            &cargo_toml,
+            "stub_warning",
+            Some(MacroPolicy::Period { period_ms: 1 }),
+            &options,
+        )
+        .unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join("python");
+        write_executable_stub(
+            &stub,
+            "#!/bin/sh\nprintf '%s' '{\"inputs\":[],\"outputs\":[]}' > \"$3\"\n\
+             printf 'warning: the workspace type stubs were not written: read-only\\n' >&2\n",
+        );
 
+        regenerate_python_info_with(&nodes_dir.join("stub_warning"), "stub_warning", &stub)
+            .unwrap();
+        assert!(logs_contain("python metadata generation printed a warning"));
+        assert!(logs_contain(
+            "warning: the workspace type stubs were not written: read-only"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regenerate_python_build_rs_bakes_interpreter_libdir() {
         let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
         let stub_dir = tempfile::tempdir().unwrap();
         let options = NodeCreateOptions {
@@ -3181,18 +3333,14 @@ mod tests {
         let stub = nodes_dir.join("python-stub");
         let site = stub_dir.path().join("site");
         std::fs::create_dir(&site).unwrap();
-        std::fs::write(
+        write_executable_stub(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '%s\\n' '{{\"libdir\":\"/opt/python/lib\",\"purelib\":\"{}\",\"platlib\":\"{}\"}}'; fi\n",
                 site.display(),
                 site.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&stub, permissions).unwrap();
+        );
 
         let node_dir = nodes_dir.join("rpath_node");
         let paths = query_python_paths(&stub).unwrap();
@@ -3246,7 +3394,19 @@ mod tests {
         .contains("CERULION:PORT_SCHEMAS"));
         assert_eq!(
             templates::generate_python_node_py(&inputs, &outputs, "period_ms=100", &[]),
-            "import cerulion\nfrom cerulion.msgs.geometry_msgs import Vector3\n\n\n@cerulion.node(period_ms=100)\nclass Node:\n    inp = cerulion.input(Vector3)\n    out = cerulion.output(Vector3)\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n"
+            "import cerulion\nfrom cerulion.msgs.geometry_msgs import Vector3\n\n\n@cerulion.node(period_ms=100)\nclass Node:\n    inp = cerulion.input(Vector3)\n    out = cerulion.output(Vector3)\n\n    def tick(self):\n        msg = self.inp\n        if msg is None:  # no frame received yet\n            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n        out = self.out  # first touch loans the output; it is committed at tick end\n        # copy fields here, e.g. out.x = msg.x\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_dict(\"out\", {\"field\": value})\n"
+        );
+        // An output-only node gets the YAML form of the same hint.
+        assert!(
+            templates::generate_python_node_py(&[], &outputs, "period_ms=100", &[]).ends_with(
+                "        out = self.out  # first touch loans the output; it is committed at tick end\n        # or, in place of self.out above, publish a whole message:\n        # self.publish_yaml(\"out\", \"field: value\\n\")\n"
+            )
+        );
+        // An input-only node gets the read hint.
+        assert!(
+            templates::generate_python_node_py(&inputs, &[], "period_ms=100", &[]).ends_with(
+                "            return\n        # msg.to_dict() / msg.to_yaml(): the message as plain values / `topic echo` YAML\n"
+            )
         );
     }
 

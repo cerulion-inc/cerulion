@@ -102,6 +102,8 @@ def test_views_are_instances_of_their_class_nested_ones_too():
     assert type(pose.position) is Point
     assert (pose.position.x, pose.position.y, pose.position.z) == (1.0, 2.0, 3.0)
     assert type(frame.view(Pose)) is Pose
+    # An explicit `schema=None` is the bare call: the subscriber's schema.
+    assert frame.view(schema=None) is pose
     frame.release()
     with publisher.loan() as loan:
         assert type(loan) is Pose
