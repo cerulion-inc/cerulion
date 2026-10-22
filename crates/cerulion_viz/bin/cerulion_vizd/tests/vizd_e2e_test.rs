@@ -3535,6 +3535,7 @@ fn a_remote_topic_re_attaches_right_after_detach_on_both_surfaces_e2e() {
         }],
         schema_docs: vec![],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3803,6 +3804,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
         ],
         schema_docs: vec![widget_doc.clone()],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -4044,6 +4046,7 @@ fn schema_less_resolve_is_served_by_netd_not_vizds_own_network() {
         ],
         schema_docs: vec![widget_doc.clone()],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,

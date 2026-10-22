@@ -509,7 +509,7 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     let Some(key_file) = cli.key_file.as_deref() else {
         tracing::error!(
             "cerulion pair: --key-file is required (a persistent desk device key). Run \
-             `cerulion pair <robot>`, which creates + passes ~/.cerulion/desk.key."
+             `cerulion pair <robot>`, which creates + passes this machine's key."
         );
         return ExitCode::from(EXIT_USAGE);
     };

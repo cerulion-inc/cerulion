@@ -310,6 +310,7 @@ fn record_ingress_block_is_refused() {
 #[test]
 fn no_block_real_clock_is_permissive_synth() {
     let _lock = env_lock();
+    std::env::remove_var("CERULION_MULTICAST_SCOUTING");
     let RunNetwork::Permissive(net) =
         resolve_run_network(&graph_with(None), false, TimeSource::Real, false).unwrap()
     else {
@@ -317,8 +318,9 @@ fn no_block_real_clock_is_permissive_synth() {
     };
     assert_eq!(net.mode, ZenohMode::Peer);
     assert!(
-        net.multicast_scouting && net.gossip_scouting,
-        "the permissive synth must enable scouting (unpaired robots LAN-discoverable)"
+        !net.multicast_scouting && net.gossip_scouting,
+        "the permissive synth runs gossip only; multicast scouting is opt-in \
+         (the gateway's mDNS beacon is how peers find it)"
     );
     assert!(
         net.connect_endpoints.is_empty(),
@@ -329,6 +331,21 @@ fn no_block_real_clock_is_permissive_synth() {
         vec![format!("tcp/[::]:{GATEWAY_WELL_KNOWN_PORT}")],
         "the permissive synth listens on the well-known gateway port"
     );
+}
+
+/// `CERULION_MULTICAST_SCOUTING=on` turns multicast scouting back on in the
+/// permissive synth.
+#[test]
+fn multicast_scouting_switch_enables_it_on_the_permissive_synth() {
+    let _lock = env_lock();
+    std::env::set_var("CERULION_MULTICAST_SCOUTING", "on");
+    let _g = EnvGuard("CERULION_MULTICAST_SCOUTING");
+    let RunNetwork::Permissive(net) =
+        resolve_run_network(&graph_with(None), false, TimeSource::Real, false).unwrap()
+    else {
+        panic!("a no-block real-clock run must be Permissive");
+    };
+    assert!(net.multicast_scouting && net.gossip_scouting);
 }
 
 /// `--record` + no block ⇒ Permissive (permissive has no ingress, so
@@ -464,7 +481,7 @@ fn ros_attach_bridge_graph_shape_is_permissive() {
 ///
 /// If it did, that would be the sharp end of the failure: the block vanishes,
 /// the robot falls to the permissive default — every produced topic announced
-/// to the LAN, multicast and gossip scouting on, listening on the gateway
+/// to the LAN, gossip scouting on, listening on the gateway
 /// port — and the only line printed insists there is "no `network:` block",
 /// which reads as normal to anyone not already suspecting a typo and reads as
 /// WRONG to the author looking straight at the block they wrote.
@@ -673,6 +690,8 @@ fn network_env_kill_parse_oracle() {
 fn remote_network_suppressed_honors_the_kill_switch_and_warns_on_garbage() {
     let _lock = env_lock();
     let _g = EnvGuard("CERULION_NETWORK");
+    let _netd = EnvGuard("CERULION_NETD_NETWORK");
+    std::env::remove_var("CERULION_NETD_NETWORK");
 
     std::env::remove_var("CERULION_NETWORK");
     assert!(!remote_network_suppressed());
@@ -772,6 +791,8 @@ fn topic_list_scope_and_environment_precedence() {
     use cerulion_cli_engine::topic_cmd::remote_discovery_options;
     let _lock = env_lock();
     let previous = std::env::var("CERULION_NETWORK").ok();
+    let previous_netd = std::env::var("CERULION_NETD_NETWORK").ok();
+    std::env::remove_var("CERULION_NETD_NETWORK");
     for value in ["", "off", " OFF ", "on", "typo"] {
         std::env::set_var("CERULION_NETWORK", value);
         for explicit_local in [false, true] {
@@ -787,8 +808,86 @@ fn topic_list_scope_and_environment_precedence() {
             );
         }
     }
+    // netd's own switch engages the same local scope, under netd's byte-exact
+    // parse: only exactly `off`.
+    std::env::remove_var("CERULION_NETWORK");
+    for (value, engaged) in [("off", true), ("", false), (" OFF ", false), ("on", false)] {
+        std::env::set_var("CERULION_NETD_NETWORK", value);
+        let decision = remote_discovery_options(false, vec!["tcp/127.0.0.1:1".into()], vec![]);
+        assert_eq!(
+            decision.is_none(),
+            engaged,
+            "CERULION_NETD_NETWORK={value:?}"
+        );
+        assert_eq!(
+            remote_network_suppressed(),
+            engaged,
+            "CERULION_NETD_NETWORK={value:?}"
+        );
+    }
+    restore("CERULION_NETD_NETWORK", previous_netd);
+    restore("CERULION_NETWORK", previous);
+}
+
+fn restore(name: &str, previous: Option<String>) {
     match previous {
-        Some(value) => std::env::set_var("CERULION_NETWORK", value),
-        None => std::env::remove_var("CERULION_NETWORK"),
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
+}
+
+/// The query-side kill-switch parse: `CERULION_NETWORK` under the run parse,
+/// `CERULION_NETD_NETWORK` under netd's exact-`off` parse, either one engaging.
+#[test]
+fn query_network_kill_reads_both_spellings() {
+    use cerulion_cli_engine::graph_cmd::{query_network_kill_from, QueryNetworkKill};
+    assert_eq!(query_network_kill_from(None, None), QueryNetworkKill::UNSET);
+    assert!(!query_network_kill_from(Some(" ".into()), Some("")).is_off());
+    let netd = query_network_kill_from(None, Some("off"));
+    assert_eq!(netd.network, NetworkEnvKill::Unset);
+    assert!(netd.netd_off && netd.is_off() && !netd.both_engaged());
+    assert_eq!(netd.unset_remedy(), "unset CERULION_NETD_NETWORK");
+    for mistyped in ["OFF", " off", "false", "0"] {
+        assert!(
+            !query_network_kill_from(None, Some(mistyped)).is_off(),
+            "netd treats {mistyped:?} as ON, so the query verbs do too"
+        );
+    }
+    let network = query_network_kill_from(Some(" Off ".into()), None);
+    assert_eq!(network.network, NetworkEnvKill::Off);
+    assert!(network.is_off() && !network.netd_off);
+    assert_eq!(network.unset_remedy(), "unset CERULION_NETWORK");
+    let both = query_network_kill_from(Some("typo".into()), Some("off"));
+    assert!(both.both_engaged());
+    assert_eq!(
+        both.unset_remedy(),
+        "unset CERULION_NETWORK and CERULION_NETD_NETWORK"
+    );
+    assert_eq!(
+        QueryNetworkKill::UNSET.unset_remedy(),
+        "unset CERULION_NETWORK"
+    );
+}
+
+/// The CLI's spelling and parse of netd's switch are netd's own.
+#[cfg(unix)]
+#[test]
+fn netd_network_switch_matches_the_daemon() {
+    use cerulion_cli_engine::graph_cmd::{netd_network_off_from, NETD_NETWORK_ENV};
+    use cerulion_netd::net::{classify_network_switch, NetworkSwitch, NETWORK_ENV};
+    assert_eq!(NETD_NETWORK_ENV, NETWORK_ENV);
+    for value in [
+        None,
+        Some(""),
+        Some("off"),
+        Some("OFF"),
+        Some(" off "),
+        Some("on"),
+    ] {
+        assert_eq!(
+            netd_network_off_from(value),
+            classify_network_switch(value) == NetworkSwitch::Off,
+            "{value:?}"
+        );
     }
 }

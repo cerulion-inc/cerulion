@@ -138,7 +138,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | Core runtime (wire, transport, scheduler, graph, codegen) | `cerulion_core`* |
 | Node-author macros | `cerulion_macros`* |
 | Generated ROS 2 message types | `native_ros2_messages`* |
-| CLI binary / logic / TUI / telemetry | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry` |
+| CLI / Android | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry`, `cerulion_android` |
 | Recording: MCAP writer/reader + daemon | `cerulion_bag`*, `cerulion_bagd`* |
 | ROS 2 RMW layer (via `cerulion ros2 run/launch`) | `rmw_cerulion`* |
 | Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |

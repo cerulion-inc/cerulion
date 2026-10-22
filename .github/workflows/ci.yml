@@ -1365,6 +1365,7 @@ jobs:
             || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
             || contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
             || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
           ) }}
     # `actions: write` is for the cache prune step only. The default cache-save
     # policy does not include this namespace, so it restores but does not save
@@ -1428,6 +1429,9 @@ jobs:
 
       - name: Check local-transport on Android
         run: cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core --features local-transport
+
+      - name: Build cerulion_android on Android
+        run: cargo ndk -t arm64-v8a --platform 30 build -p cerulion_android
 
       - name: Cache cargo (prune the namespace to the current key)
         id: cache-prune
@@ -2583,6 +2587,54 @@ jobs:
       - name: CLI engine tests
         if: matrix.shard == 2
         run: cargo test -p cerulion_cli_engine
+      - name: cerulion_android host tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --lib -- --test-threads=1
+      - name: Build the Android runtime test fixture
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo build -p test_node_macro_period_cdylib -p test_node_macro_external_cdylib -p test_node_hang_cdylib -p test_node_failing_cdylib
+      - name: cerulion_android embedded runtime integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
+      - name: cerulion_android graph finish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+      - name: cerulion_android graph launch refusal integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_launch_refusal_test -- --test-threads=1
+      - name: cerulion_android component failure integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_component_failure_test -- --test-threads=1
+      - name: cerulion_android schema restart integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android gateway exclusivity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
+      - name: cerulion_android identity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_identity_test -- --test-threads=1
+      - name: cerulion_android LAN access integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
+      - name: cerulion_android LAN ownership tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
+      - name: cerulion_android gateway owner tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test gateway_owner_test -- --test-threads=1
+      - name: cerulion_android gateway restart baseline tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test gateway_restart_baseline_test -- --test-threads=1
+      - name: cerulion_android first start failure tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
+      - name: selection marker, cerulion_android
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android (selected: $SELECTED)"
       # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
       - name: CLI binary tests
         if: matrix.shard == 1
