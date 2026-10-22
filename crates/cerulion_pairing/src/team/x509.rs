@@ -39,7 +39,7 @@ pub const CI_LIFETIME_SECS: u64 = 24 * 3600;
 pub const NO_EXPIRY_UNIX_SECS: u64 = 253_402_300_799;
 
 const SERIAL_DOMAIN: &[u8] = b"cerulion-pairing:team-cert-serial:v1";
-const NS_PER_SEC: u64 = 1_000_000_000;
+const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 /// Inputs for one machine leaf.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,7 +311,7 @@ fn build_cert(inputs: CertInputs<'_>, signer: &SigningKey) -> Result<Vec<u8>, Pa
 /// robot.
 pub fn issue_leaf(params: &LeafParams, ca_key: &SigningKey) -> Result<Vec<u8>, PairingError> {
     // `u64::MAX` ns is 18_446_744_073 s (year 2554); adding a lifetime stays in range.
-    let issued = params.issued_at_ns / NS_PER_SEC;
+    let issued = params.issued_at_ns / NANOS_PER_SEC;
     let not_before = issued.saturating_sub(BACKDATE_SECS);
     let not_after = match params.role.lifetime_secs() {
         Some(life) => issued + life,
@@ -402,7 +402,7 @@ pub fn issue_team_ca(
             subject_cn: &cn,
             issuer_cn: &cn,
             subject_key: &key,
-            not_before: (issued_at_ns / NS_PER_SEC).saturating_sub(BACKDATE_SECS),
+            not_before: (issued_at_ns / NANOS_PER_SEC).saturating_sub(BACKDATE_SECS),
             not_after: NO_EXPIRY_UNIX_SECS,
             extensions,
         },

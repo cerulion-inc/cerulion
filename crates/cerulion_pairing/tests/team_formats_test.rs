@@ -925,6 +925,20 @@ fn a_signed_bundle_verifies_and_round_trips() {
 }
 
 #[test]
+fn a_root_set_with_threshold_zero_is_refused_before_the_chain() {
+    // An intermediate no root signed passes a zero threshold count, so the
+    // verifier must refuse the root set itself.
+    let (mut root_set, int, _) = roots();
+    root_set.threshold = 0;
+    let unsigned_int = make_intermediate(pk(&int), wide_validity(), ISSUED).sign_by_roots(&[]);
+    let signed = bundle(2, vec![]).sign(&int, unsigned_int);
+    assert!(matches!(
+        verify_team_trust_bundle(&root_set, &signed, T_NOW),
+        Err(PairingError::InvalidRootSet(_))
+    ));
+}
+
+#[test]
 fn bundle_chain_refusals() {
     let (root_set, int, signed_int) = roots();
     // Tampered after signing.

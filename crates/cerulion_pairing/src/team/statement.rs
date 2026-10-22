@@ -69,6 +69,10 @@ fn verify_chain<T: SignedPayload>(
     now_ns: u64,
     kind: CertKind,
 ) -> Result<(), PairingError> {
+    // `RootSet` fields are public, so a caller can hand in a set with
+    // threshold 0, which `verify_intermediate` would satisfy with no root
+    // signature at all.
+    root_set.validate()?;
     verify_intermediate(root_set, intermediate, now_ns)?;
     if *issuer_key != intermediate.cert.intermediate_key {
         return Err(PairingError::IssuerMismatch(kind));
