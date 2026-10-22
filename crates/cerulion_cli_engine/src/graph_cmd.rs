@@ -6089,6 +6089,7 @@ pub fn graph_run(
         config.identity(),
         running.clone(),
         resolve_peer_loss(peer_loss),
+        time_source,
     )?;
 
     // Write THIS RUN's directory and announce it on

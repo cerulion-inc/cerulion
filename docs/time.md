@@ -16,13 +16,17 @@ which one each run mode uses, and explains sim time.
 | --- | --- | --- |
 | Real | The machine's monotonic clock. Under `cerulion graph run` it is the run clock, which stands still while the run is paused with `cerulion graph pause` and continues on resume. | The default. `--time-source real`. |
 | Virtual | The scheduler: the clock moves only when the graph steps. On `--time-source virtual` every step is exactly 1 ms. A recording and its replay use this domain too: the recorded step boundaries are what `cerulion bag play --resim` hands back, so the replay is byte-identical to the live run. | `--time-source virtual`; `--record`; `bag play --resim`. |
-| Sim | A simulator or sim bridge: `rosgraph_msgs/Clock` samples published on `/clock`. The graph steps once per sample, so the graph advances only when `/clock` does. | `sim_time: true` in the graph YAML, or `--time-source external`. |
+| Sim | A simulator or sim bridge: `rosgraph_msgs/Clock` samples published on `/clock`. The graph steps once per accepted sample, so the graph advances only when `/clock` does. Single process only: a graph with `process_groups:` is refused, run it with `--single-process`. | `sim_time: true` in the graph YAML, or `--time-source external`. |
 
 Sim time is a controlled clock in the virtual domain: the samples on `/clock`
 decide how far each step advances it, and nothing else moves it. The
-clock-driven schedule is therefore a pure function of the `/clock` sample
-sequence: two runs over the same samples step to the same stamps, and fire
-the same period nodes at them. Nodes triggered by input data also depend on
+clock-driven schedule is therefore a pure function of the sequence of
+ACCEPTED samples: two runs that accept the same samples step to the same
+stamps, and fire the same period nodes at them. The run reads `/clock`
+through a queue of 64 samples; a sample published while that queue is full
+is dropped and merges into the next step, so a simulator that outruns the
+graph can make two runs over the same published samples step differently.
+Nodes triggered by input data also depend on
 which frames have arrived by each step, and `/clock` alone does not fix that.
 A sim-time run is not recordable yet (`--record` is refused, see the limits
 below).
@@ -41,6 +45,9 @@ Python nodes read the same clock through `ctx.now_ns`. Output stamps
 so under sim time every stamp is a sim time.
 
 ## Sim time
+
+Sim time runs the graph in one process only. A graph with `process_groups:`
+is refused under sim time; run it with `--single-process`.
 
 Turn it on with one key in the graph YAML:
 
@@ -96,6 +103,14 @@ is skipped with the same loud-once, counted warning. No field of a frame with a
 bad header is read. A skipped frame does not count as a clock: a stream of them
 still reaches the no-clock and stalled-clock warnings above.
 
+### `ros2:` entries
+
+A `ros2:` entry of a sim-time graph is put on `/clock` too. A `ros2 run`
+entry gets `--ros-args -p use_sim_time:=true`; a `ros2 launch` entry gets the
+launch argument `use_sim_time:=true`, which the launch file must declare and
+pass to its nodes. An entry that sets `use_sim_time` itself (under `params:`,
+or as an `args:` word `use_sim_time:=...`) keeps its own value.
+
 ### A clock publisher
 
 Anything in another process that publishes `rosgraph_msgs/Clock` on `/clock`
@@ -125,6 +140,10 @@ output on `/clock` is refused at load, as is one that lists `/clock` in
   clock, naming the nodes. Set `sim_time: false` and drop `--time-source
   external` to run them on the live clock, or move them to a separate graph
   on the real clock.
+- **Sub-stepping.** A period node fires at most once per accepted sample, so
+  the `/clock` publish rate caps every period node's rate. Steps at the
+  nodes' own deadlines between two samples are not made. Publish `/clock` at
+  least as fast as the fastest period node in the graph.
 - **Recording.** `--record` requires the live clock. A sim-time run is not
   recordable yet.
 - **Networking.** A sim-time run opens no gateway, like every controlled-clock

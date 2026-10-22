@@ -44,7 +44,7 @@ use cerulion_core::graph::config::Ros2NodeDef;
 use cerulion_core::graph::GraphConfig;
 
 use crate::error::{CliError, CliResult};
-use crate::graph_cmd::{ChildGuard, ChildPoll, PeerLossPolicy};
+use crate::graph_cmd::{ChildGuard, ChildPoll, PeerLossPolicy, TimeSource};
 use crate::ros2_cmd;
 
 /// Death-watch poll cadence — how quickly a child's exit is noticed.
@@ -87,8 +87,23 @@ pub fn describe(entry: &Ros2Entry) -> String {
 /// The spawn argv (everything after `ros2`), with a RELATIVE `launch:` /
 /// `params_file:` resolved against `workspace_root` — and both checked to
 /// EXIST, loudly, before anything is spawned (a missing launch file would
-/// otherwise be reinterpreted by `ros2 launch` as a PACKAGE name).
-pub fn spawn_argv(entry: &Ros2Entry, workspace_root: &Path) -> CliResult<Vec<String>> {
+/// otherwise be reinterpreted by `ros2 launch` as a PACKAGE name). Under sim
+/// time ([`TimeSource::External`]) the entry is also put on `/clock`
+/// ([`crate::sim_time_run::put_ros2_entry_on_sim_time`]).
+pub fn spawn_argv(
+    entry: &Ros2Entry,
+    workspace_root: &Path,
+    time_source: TimeSource,
+) -> CliResult<Vec<String>> {
+    let mut argv = resolved_argv(entry, workspace_root)?;
+    if time_source == TimeSource::External {
+        crate::sim_time_run::put_ros2_entry_on_sim_time(&entry.def, &mut argv);
+    }
+    Ok(argv)
+}
+
+/// [`spawn_argv`] before the clock is chosen.
+fn resolved_argv(entry: &Ros2Entry, workspace_root: &Path) -> CliResult<Vec<String>> {
     let resolve = |raw: &str| -> PathBuf {
         let p = Path::new(raw);
         if p.is_absolute() {
@@ -290,6 +305,7 @@ impl Ros2Children {
         graph: &str,
         running: Arc<AtomicBool>,
         policy: PeerLossPolicy,
+        time_source: TimeSource,
     ) -> CliResult<Self> {
         let set = Self::with_policy(graph, policy, running);
         if entries.is_empty() {
@@ -297,7 +313,7 @@ impl Ros2Children {
         }
         let env = stage_ros2_child_env()?;
         for entry in entries {
-            let argv = spawn_argv(entry, workspace_root)?;
+            let argv = spawn_argv(entry, workspace_root, time_source)?;
             let mut cmd = std::process::Command::new("ros2");
             cmd.args(&argv).current_dir(workspace_root);
             for (k, v) in &env {
@@ -683,7 +699,7 @@ mod tests {
         };
         let resolved = root.path().join("launch/robot.launch.py");
         assert_eq!(
-            spawn_argv(&launch, root.path()).expect("resolves"),
+            spawn_argv(&launch, root.path(), TimeSource::Real).expect("resolves"),
             ["launch", &resolved.display().to_string(), "a:=1"]
         );
 
@@ -694,7 +710,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let err = spawn_argv(&missing, root.path()).expect_err("missing launch file");
+        let err =
+            spawn_argv(&missing, root.path(), TimeSource::Real).expect_err("missing launch file");
         let msg = err.to_string();
         assert!(
             msg.contains("'bringup'") && msg.contains("nope.launch.py"),
@@ -712,7 +729,7 @@ mod tests {
         };
         let params = root.path().join("params.yaml");
         assert_eq!(
-            spawn_argv(&run, root.path()).expect("resolves"),
+            spawn_argv(&run, root.path(), TimeSource::Real).expect("resolves"),
             [
                 "run",
                 "pkg",
@@ -2586,6 +2603,7 @@ mod tests {
             "g",
             Arc::new(AtomicBool::new(true)),
             PeerLossPolicy::Continue,
+            TimeSource::Real,
         )
         .unwrap_or_else(|e| panic!("the production spawn path must succeed: {e}"));
         let pid = await_stand_in(&pidfile);

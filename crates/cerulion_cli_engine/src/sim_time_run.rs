@@ -14,19 +14,24 @@
 //!    ([`refuse_external_nodes_under_sim_time`]), not after the simulator
 //!    starts.
 //! 2. **Wait for the epoch.** Nothing is built and nothing fires until the
-//!    first sample (`await_first_clock`). After [`NO_CLOCK_GRACE`] without
-//!    one, exactly one warning names `/clock` and the YAML key
-//!    ([`NO_CLOCK_WARNING`]); a clock that arrives in time prints nothing.
+//!    first sample (the [`ClockFeeder`] emits no event before it). After
+//!    [`NO_CLOCK_GRACE`] without one, exactly one warning names `/clock` and
+//!    the YAML key ([`NO_CLOCK_WARNING`]); a clock that arrives in time
+//!    prints nothing.
 //! 3. **Place the clock, then build.** The graph clock is set to the epoch
 //!    BEFORE the runtime is built, so every period deadline is anchored one
 //!    interval after the epoch and no deadline window counts a phantom miss,
 //!    exactly as a build at that instant would have produced.
-//! 4. **One step per sample** (`follow_clock`). A forward sample steps the
-//!    graph by the difference, an equal one by zero (data triggers still
-//!    drain while a paused simulator republishes the same time), and a
-//!    backward one is refused with a warning and never stored. A clock that
-//!    stops mid-run is reported once per stall ([`CLOCK_STALLED_WARNING`]):
-//!    the graph stands still, and says so.
+//! 4. **One step per accepted sample.** The [`ClockFeeder`] owns the clock
+//!    source and turns each accepted sample into one [`ClockEvent`], and the
+//!    [`ClockApplier`] moves the graph from those events alone. A forward
+//!    sample steps the graph by the difference, an equal one by zero (data
+//!    triggers still drain while a paused simulator republishes the same
+//!    time), and a backward one is refused with a warning and never stored.
+//!    A sample the tap could not hold ([`CLOCK_TAP_DEPTH`]) never reaches the
+//!    feeder, so it merges into the next step. A clock that stops mid-run is
+//!    reported once per stall ([`CLOCK_STALLED_WARNING`]): the graph stands
+//!    still, and says so.
 //!
 //! The graph advances only when `/clock` does. Wall time is read only to
 //! pace the idle poll and to time the two clock warnings: all three change
@@ -36,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cerulion_core::graph::config::GraphConfig;
+use cerulion_core::graph::config::{GraphConfig, Ros2NodeDef};
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::sim_time::{
     clock_sample_ns, SimClockFeed, SimClockVerdict, SIM_CLOCK_SCHEMA, SIM_CLOCK_TOPIC, SIM_TIME_KEY,
@@ -180,6 +185,40 @@ pub fn resolve_time_source(
         (_, true) => Ok(TimeSource::External),
         (flag, false) => Ok(flag),
     }
+}
+
+/// The ROS 2 parameter, and the launch argument by convention, that puts a
+/// ROS 2 node on `/clock`.
+pub const ROS2_USE_SIM_TIME: &str = "use_sim_time";
+
+/// Put a `ros2:` entry of a sim-time graph on `/clock` too, so its nodes
+/// stamp, time out and fire on the same clock as the native nodes.
+///
+/// `argv` is the entry's spawn argv (everything after `ros2`). A `ros2 run`
+/// entry gets `-p use_sim_time:=true` in a `--ros-args` block (its own, or a
+/// new one at the end); a `ros2 launch` entry gets the `use_sim_time:=true`
+/// launch argument, which the launch file must declare and pass to its nodes.
+/// A `use_sim_time` the entry already sets (in `params:`, or as an `args:`
+/// word `use_sim_time:=...`) is the entry's own choice and is kept.
+pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) {
+    let assignment = format!("{ROS2_USE_SIM_TIME}:=");
+    let set_by_entry = def.params.contains_key(ROS2_USE_SIM_TIME)
+        || def.args.iter().any(|arg| arg.starts_with(&assignment));
+    if set_by_entry {
+        return;
+    }
+    let value = format!("{assignment}true");
+    if def.launch.is_some() {
+        argv.push(value);
+        return;
+    }
+    // `Ros2NodeDef::argv` closes a `run` argv with its own `--ros-args`
+    // block exactly when the entry has a params file or params.
+    if def.params_file.is_none() && def.params.is_empty() {
+        argv.push("--ros-args".to_string());
+    }
+    argv.push("-p".to_string());
+    argv.push(value);
 }
 
 /// Decides, from the wall time elapsed since the run started and whether a
@@ -502,10 +541,270 @@ where
     pub idle: Duration,
 }
 
+/// What the feeder tells the applier: the graph clock's next move.
+///
+/// The feeder emits exactly one [`ClockEvent::Epoch`], then one
+/// [`ClockEvent::Step`] per accepted sample. A refused sample (backward) and
+/// a frame that is not a clock sample emit nothing. The event stream is the
+/// whole of what moves the graph clock, so it is also what a recording of a
+/// sim-time run, or a second process following the same clock, would carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockEvent {
+    /// The first accepted sample: the graph clock is placed here before the
+    /// runtime is built.
+    Epoch {
+        /// The sample, in nanoseconds.
+        ns: u64,
+    },
+    /// An accepted sample after the epoch: step the graph by `delta_ns`
+    /// (zero for a sample equal to the last accepted one).
+    Step {
+        /// The step's position in the run: 1 for the first step after the
+        /// epoch, one more for each step after it.
+        seq: u64,
+        /// How far this step advances the graph clock.
+        delta_ns: u64,
+    },
+}
+
+/// One poll of the [`ClockFeeder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeederPoll {
+    /// The graph clock moves.
+    Event(ClockEvent),
+    /// A frame was read and skipped, or a sample was refused: poll again now,
+    /// the next frame may already be waiting.
+    Skipped,
+    /// Nothing was waiting: pause before the next poll.
+    Idle,
+}
+
+/// The feeder: the sole owner of the clock source and of the rules that turn
+/// its frames into [`ClockEvent`]s. It holds the source, the sample feed, the
+/// flood-suppressed diagnostics and the two silence watches (no clock yet,
+/// and a stall after the epoch). It never touches the graph: the applier
+/// does that, from the events alone.
+pub struct ClockFeeder<'a, S: ClockSource> {
+    graph_name: &'a str,
+    source: S,
+    feed: SimClockFeed,
+    diagnostics: ClockDiagnostics,
+    grace: Duration,
+    /// When the feeder started waiting for its epoch.
+    started: Instant,
+    no_clock: NoClockWatch,
+    /// Whether the epoch has been emitted.
+    epoch_seen: bool,
+    /// Armed by the first poll after the epoch, so the time the applier
+    /// spends building the runtime does not count as a stall.
+    stall: Option<StallWatch>,
+    /// The `seq` of the last [`ClockEvent::Step`] emitted.
+    seq: u64,
+}
+
+impl<'a, S: ClockSource> ClockFeeder<'a, S> {
+    /// A feeder over `source` that warns after `grace` of silence on
+    /// `/clock`, before the epoch and after it.
+    pub fn new(graph_name: &'a str, source: S, grace: Duration) -> Self {
+        Self {
+            graph_name,
+            source,
+            feed: SimClockFeed::new(),
+            diagnostics: ClockDiagnostics::default(),
+            grace,
+            started: Instant::now(),
+            no_clock: NoClockWatch::new(grace),
+            epoch_seen: false,
+            stall: None,
+            seq: 0,
+        }
+    }
+
+    /// Read at most one frame and say what it does to the graph clock.
+    /// `Err` is a transport failure that ends the run.
+    pub fn poll(&mut self) -> CliResult<FeederPoll> {
+        if self.epoch_seen && self.stall.is_none() {
+            self.stall = Some(StallWatch::new(self.grace));
+        }
+        let read = self.source.read()?;
+        let idle = matches!(read, ClockRead::Empty);
+        // The event this read makes; `None` for an empty poll, a rejected
+        // frame and a refused (backward) sample alike.
+        let event = match read {
+            ClockRead::Empty => None,
+            ClockRead::Rejected(why) => {
+                self.diagnostics.note_rejected(self.graph_name, why);
+                None
+            }
+            ClockRead::Sample(ns) => {
+                let last_ns = self.feed.last_ns();
+                match self.feed.offer(ns) {
+                    SimClockVerdict::First { .. } => Some(ClockEvent::Epoch { ns }),
+                    SimClockVerdict::Forward { delta_ns } => Some(self.step(delta_ns)),
+                    SimClockVerdict::Equal => Some(self.step(0)),
+                    SimClockVerdict::Backward { by_ns } => {
+                        self.diagnostics.note_backwards(
+                            self.graph_name,
+                            last_ns.unwrap_or(0),
+                            by_ns,
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        match event {
+            Some(event) => {
+                self.on_event(event);
+                Ok(FeederPoll::Event(event))
+            }
+            None => {
+                // Nothing moved graph time, so every kind of non-advance
+                // counts as silence for the two clock warnings.
+                self.on_silence();
+                Ok(if idle {
+                    FeederPoll::Idle
+                } else {
+                    FeederPoll::Skipped
+                })
+            }
+        }
+    }
+
+    fn step(&mut self, delta_ns: u64) -> ClockEvent {
+        self.seq += 1;
+        ClockEvent::Step {
+            seq: self.seq,
+            delta_ns,
+        }
+    }
+
+    fn on_event(&mut self, event: ClockEvent) {
+        self.diagnostics.note_sample_accepted(self.graph_name);
+        if matches!(event, ClockEvent::Epoch { .. }) {
+            self.epoch_seen = true;
+        }
+        // A step is read only after the epoch, by a poll that armed the
+        // watch first.
+        if let Some(stall) = self.stall.as_mut() {
+            if stall.sample_accepted() {
+                tracing::info!(
+                    graph = %self.graph_name,
+                    topic = SIM_CLOCK_TOPIC,
+                    "clock samples are arriving again"
+                );
+            }
+        }
+    }
+
+    fn on_silence(&mut self) {
+        // After the epoch the watch is always armed: this poll armed it.
+        match self.stall.as_mut() {
+            // A rejected frame is not a clock either: a stream of them still
+            // reaches the no-clock warning, next to its own rejection warning.
+            None => {
+                if self.no_clock.poll(self.started.elapsed(), false).is_some() {
+                    tracing::warn!(
+                        graph = %self.graph_name,
+                        topic = SIM_CLOCK_TOPIC,
+                        key = SIM_TIME_KEY,
+                        "{NO_CLOCK_WARNING}"
+                    );
+                }
+            }
+            Some(stall) => {
+                if stall.poll_idle().is_some() {
+                    tracing::warn!(
+                        graph = %self.graph_name,
+                        topic = SIM_CLOCK_TOPIC,
+                        last_ns = self.feed.last_ns().unwrap_or(0),
+                        "{CLOCK_STALLED_WARNING}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The applier: moves the graph from [`ClockEvent`]s alone. It places the
+/// clock and builds the runtime on the epoch, then steps the runtime once per
+/// step event. It reads no clock source and judges no sample.
+pub struct ClockApplier<'a, B>
+where
+    B: FnOnce() -> CliResult<GraphRuntime>,
+{
+    graph_name: &'a str,
+    clock: &'a VirtualClock,
+    build: Option<B>,
+    runtime: Option<GraphRuntime>,
+}
+
+impl<'a, B> ClockApplier<'a, B>
+where
+    B: FnOnce() -> CliResult<GraphRuntime>,
+{
+    /// An applier that builds with `build` over `clock` on the epoch.
+    pub fn new(graph_name: &'a str, clock: &'a VirtualClock, build: B) -> Self {
+        Self {
+            graph_name,
+            clock,
+            build: Some(build),
+            runtime: None,
+        }
+    }
+
+    /// Apply one event. The epoch builds the runtime (once); a step advances
+    /// it. A step before the epoch, or a second epoch, moves nothing: the
+    /// feeder emits neither.
+    pub fn apply(&mut self, event: ClockEvent) -> CliResult<()> {
+        match event {
+            ClockEvent::Epoch { ns } => {
+                let Some(build) = self.build.take() else {
+                    return Ok(());
+                };
+                // Place the clock BEFORE the build: `Scheduler::add_node`
+                // anchors every period deadline at `now + interval` and every
+                // deadline window at `now`.
+                self.clock.set(ns);
+                let mut runtime = build()?;
+                runtime.set_period_fire_ceiling(Some(SIM_TIME_PERIOD_FIRES_PER_SAMPLE));
+                tracing::info!(
+                    graph = %self.graph_name,
+                    topic = SIM_CLOCK_TOPIC,
+                    epoch_ns = ns,
+                    "graph running on sim time: the first clock sample is the epoch; press Ctrl+C to stop"
+                );
+                self.runtime = Some(runtime);
+            }
+            ClockEvent::Step { delta_ns, .. } => {
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.step(Duration::from_nanos(delta_ns));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a node of the built runtime asked the graph to shut down.
+    fn shutdown_requested(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(GraphRuntime::shutdown_requested)
+    }
+
+    /// The built runtime, `None` when no epoch arrived.
+    fn into_runtime(self) -> Option<GraphRuntime> {
+        self.runtime
+    }
+}
+
 /// Run a graph on sim time until `running` clears or a node requests
 /// shutdown. Returns the runtime for the caller to harvest and shut down, or
 /// `None` when the run ended before the first clock sample (nothing was
 /// built).
+///
+/// The loop only pumps: the [`ClockFeeder`] turns frames into events and the
+/// [`ClockApplier`] turns events into graph steps.
 pub fn run_sim_time<S, B>(run: SimTimeRun<'_, S, B>) -> CliResult<Option<GraphRuntime>>
 where
     S: ClockSource,
@@ -516,158 +815,24 @@ where
         running,
         clock,
         build,
-        mut source,
+        source,
         no_clock_grace,
         idle,
     } = run;
-    let mut diagnostics = ClockDiagnostics::default();
-    let pacing = Pacing {
-        grace: no_clock_grace,
-        idle,
-    };
-    let Some(epoch_ns) =
-        await_first_clock(&mut source, running, graph_name, pacing, &mut diagnostics)?
-    else {
-        return Ok(None);
-    };
-    // Place the clock BEFORE the build: `Scheduler::add_node` anchors every
-    // period deadline at `now + interval` and every deadline window at `now`.
-    clock.set(epoch_ns);
-    let mut runtime = build()?;
-    runtime.set_period_fire_ceiling(Some(SIM_TIME_PERIOD_FIRES_PER_SAMPLE));
-    let mut feed = SimClockFeed::new();
-    feed.offer(epoch_ns);
-    tracing::info!(
-        graph = %graph_name,
-        topic = SIM_CLOCK_TOPIC,
-        epoch_ns,
-        "graph running on sim time: the first clock sample is the epoch; press Ctrl+C to stop"
-    );
-    follow_clock(
-        &mut runtime,
-        &mut source,
-        &mut feed,
-        running,
-        graph_name,
-        pacing,
-        &mut diagnostics,
-    )?;
-    Ok(Some(runtime))
-}
-
-/// The two wall-time knobs of the loop: how long a silence on `/clock` lasts
-/// before a warning, and how long an idle poll sleeps.
-#[derive(Debug, Clone, Copy)]
-struct Pacing {
-    grace: Duration,
-    idle: Duration,
-}
-
-/// Poll until the first well-formed sample. `None` when `running`
-/// cleared first. Prints [`NO_CLOCK_WARNING`] once after the grace.
-fn await_first_clock<S: ClockSource>(
-    source: &mut S,
-    running: &AtomicBool,
-    graph_name: &str,
-    pacing: Pacing,
-    diagnostics: &mut ClockDiagnostics,
-) -> CliResult<Option<u64>> {
-    let started = Instant::now();
-    let mut watch = NoClockWatch::new(pacing.grace);
+    let mut feeder = ClockFeeder::new(graph_name, source, no_clock_grace);
+    let mut applier = ClockApplier::new(graph_name, clock, build);
     while running.load(Ordering::Relaxed) {
-        let read = source.read()?;
-        if let ClockRead::Sample(ns) = read {
-            return Ok(Some(ns));
-        }
-        // A rejected frame is not a clock either: a stream of them still
-        // reaches the no-clock warning, next to its own rejection warning.
-        if watch.poll(started.elapsed(), false).is_some() {
-            tracing::warn!(
-                graph = %graph_name,
-                topic = SIM_CLOCK_TOPIC,
-                key = SIM_TIME_KEY,
-                "{NO_CLOCK_WARNING}"
-            );
-        }
-        match read {
-            ClockRead::Rejected(why) => diagnostics.note_rejected(graph_name, why),
-            ClockRead::Empty | ClockRead::Sample(_) => std::thread::sleep(pacing.idle),
-        }
-    }
-    Ok(None)
-}
-
-/// Step the graph once per accepted sample, until `running` clears or a node
-/// requests shutdown. Prints [`CLOCK_STALLED_WARNING`] once per stall: the
-/// first idle poll a grace after the last accepted sample, re-armed by the
-/// next accepted one.
-fn follow_clock<S: ClockSource>(
-    runtime: &mut GraphRuntime,
-    source: &mut S,
-    feed: &mut SimClockFeed,
-    running: &AtomicBool,
-    graph_name: &str,
-    pacing: Pacing,
-    diagnostics: &mut ClockDiagnostics,
-) -> CliResult<()> {
-    let mut stall = StallWatch::new(pacing.grace);
-    while running.load(Ordering::Relaxed) {
-        if runtime.shutdown_requested() {
+        if applier.shutdown_requested() {
             tracing::info!(graph = %graph_name, "node requested graph shutdown");
             break;
         }
-        let read = source.read()?;
-        let empty = matches!(read, ClockRead::Empty);
-        // The advance this read makes; `None` for an empty poll, a rejected
-        // frame and a refused (backward) sample alike.
-        let advance = match read {
-            ClockRead::Empty => None,
-            ClockRead::Rejected(why) => {
-                diagnostics.note_rejected(graph_name, why);
-                None
-            }
-            ClockRead::Sample(ns) => {
-                let last_ns = feed.last_ns();
-                match feed.offer(ns) {
-                    SimClockVerdict::Forward { delta_ns } => Some(Duration::from_nanos(delta_ns)),
-                    // A feed that already holds its epoch never answers
-                    // `First`; it is listed with `Equal` so the match stays
-                    // total without a panic arm, and both mean "no advance".
-                    SimClockVerdict::Equal | SimClockVerdict::First { .. } => Some(Duration::ZERO),
-                    SimClockVerdict::Backward { by_ns } => {
-                        diagnostics.note_backwards(graph_name, last_ns.unwrap_or(0), by_ns);
-                        None
-                    }
-                }
-            }
-        };
-        let Some(advance) = advance else {
-            // Nothing moved graph time, so every kind of non-advance counts
-            // as silence for the stall warning.
-            if stall.poll_idle().is_some() {
-                tracing::warn!(
-                    graph = %graph_name,
-                    topic = SIM_CLOCK_TOPIC,
-                    last_ns = feed.last_ns().unwrap_or(0),
-                    "{CLOCK_STALLED_WARNING}"
-                );
-            }
-            if empty {
-                std::thread::sleep(pacing.idle);
-            }
-            continue;
-        };
-        diagnostics.note_sample_accepted(graph_name);
-        if stall.sample_accepted() {
-            tracing::info!(
-                graph = %graph_name,
-                topic = SIM_CLOCK_TOPIC,
-                "clock samples are arriving again"
-            );
+        match feeder.poll()? {
+            FeederPoll::Event(event) => applier.apply(event)?,
+            FeederPoll::Skipped => {}
+            FeederPoll::Idle => std::thread::sleep(idle),
         }
-        runtime.step(advance);
     }
-    Ok(())
+    Ok(applier.into_runtime())
 }
 
 /// The mid-run twin of [`NoClockWatch`]: warns once per STALL, measured from
@@ -715,6 +880,219 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
+
+    // -----------------------------------------------------------------
+    // ros2: entries under sim time
+    // -----------------------------------------------------------------
+
+    fn sim_argv(def: &Ros2NodeDef) -> Vec<String> {
+        let mut argv = def.argv(None);
+        put_ros2_entry_on_sim_time(def, &mut argv);
+        argv
+    }
+
+    #[test]
+    fn a_ros2_run_entry_gets_use_sim_time_in_a_new_ros_args_block() {
+        let def = Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            args: vec!["--log-level".to_string(), "warn".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&def),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--log-level",
+                "warn",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ros2_run_entry_with_params_gets_use_sim_time_in_its_own_block() {
+        let mut params = IndexMap::new();
+        params.insert("rate".to_string(), serde_yaml::Value::from(5));
+        let def = Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            params,
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&def),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-p",
+                "rate:=5",
+                "-p",
+                "use_sim_time:=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ros2_launch_entry_gets_the_use_sim_time_launch_argument() {
+        let def = Ros2NodeDef {
+            launch: Some("bringup.launch.py".to_string()),
+            args: vec!["use_rviz:=false".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&def),
+            [
+                "launch",
+                "bringup.launch.py",
+                "use_rviz:=false",
+                "use_sim_time:=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_use_sim_time_the_entry_sets_itself_is_kept() {
+        let mut params = IndexMap::new();
+        params.insert("use_sim_time".to_string(), serde_yaml::Value::from(false));
+        let run = Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            params,
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&run),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=false"
+            ]
+        );
+        let launch = Ros2NodeDef {
+            launch: Some("bringup.launch.py".to_string()),
+            args: vec!["use_sim_time:=false".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&launch),
+            ["launch", "bringup.launch.py", "use_sim_time:=false"]
+        );
+    }
+
+    #[test]
+    fn the_spawn_argv_puts_ros2_entries_on_sim_time_only_under_sim_time() {
+        use crate::ros2_graph::{spawn_argv, Ros2Entry};
+        let root = tempfile::tempdir().expect("tempdir");
+        let entry = Ros2Entry {
+            id: "talker".to_string(),
+            def: Ros2NodeDef {
+                package: Some("demo_nodes_cpp".to_string()),
+                executable: Some("talker".to_string()),
+                ..Default::default()
+            },
+        };
+        let wall = ["run", "demo_nodes_cpp", "talker"];
+        for source in [TimeSource::Real, TimeSource::Virtual] {
+            assert_eq!(
+                spawn_argv(&entry, root.path(), source).expect("argv"),
+                wall,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            spawn_argv(&entry, root.path(), TimeSource::External).expect("argv"),
+            [
+                "run",
+                "demo_nodes_cpp",
+                "talker",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_clock_guide_states_the_tap_depth() {
+        let guide = include_str!("../../../docs/time.md").replace('\n', " ");
+        assert!(
+            guide.contains(&format!("a queue of {CLOCK_TAP_DEPTH} samples")),
+            "docs/time.md must state CLOCK_TAP_DEPTH"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ClockFeeder: events from frames
+    // -----------------------------------------------------------------
+
+    /// A source that hands out a fixed list of reads, then `Empty`.
+    struct ListedReads(VecDeque<ClockRead>);
+
+    impl ClockSource for ListedReads {
+        fn read(&mut self) -> CliResult<ClockRead> {
+            Ok(self.0.pop_front().unwrap_or(ClockRead::Empty))
+        }
+    }
+
+    #[test]
+    fn the_feeder_emits_the_epoch_then_one_numbered_step_per_accepted_sample() {
+        let reads = [
+            ClockRead::Empty,
+            ClockRead::Rejected(ClockRejection::Undersized { size_bytes: 1 }),
+            ClockRead::Sample(1_000),
+            ClockRead::Sample(1_500),
+            ClockRead::Sample(1_500),
+            ClockRead::Sample(1_200),
+            ClockRead::Sample(4_000),
+            ClockRead::Empty,
+        ];
+        let mut feeder = ClockFeeder::new(
+            "g",
+            ListedReads(reads.into_iter().collect()),
+            Duration::from_secs(3600),
+        );
+        let polls: Vec<FeederPoll> = (0..reads.len())
+            .map(|_| feeder.poll().expect("poll"))
+            .collect();
+        use ClockEvent::{Epoch, Step};
+        use FeederPoll::{Event, Idle, Skipped};
+        assert_eq!(
+            polls,
+            [
+                Idle,
+                Skipped,
+                Event(Epoch { ns: 1_000 }),
+                Event(Step {
+                    seq: 1,
+                    delta_ns: 500
+                }),
+                // Equal: a zero step, so data still drains.
+                Event(Step {
+                    seq: 2,
+                    delta_ns: 0
+                }),
+                // Backward: refused, no event, and no step number used.
+                Skipped,
+                // The step after a refusal advances from the last ACCEPTED
+                // sample (1500), not from the refused one.
+                Event(Step {
+                    seq: 3,
+                    delta_ns: 2_500
+                }),
+                Idle,
+            ]
+        );
+    }
 
     // -----------------------------------------------------------------
     // resolve_time_source: the full matrix

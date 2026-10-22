@@ -16,9 +16,11 @@
 //!
 //! The clock moves ONLY through the scheduler's per-step advance: the feeder
 //! turns each accepted sample into one `step(delta)`, so the clock-driven
-//! schedule is a pure function of the `/clock` sample sequence: two runs over
-//! the same samples step to the same stamps and fire the same period nodes at
-//! them. Data-triggered nodes also depend on which input frames have arrived
+//! schedule is a pure function of the accepted sample sequence: two runs that
+//! accept the same samples step to the same stamps and fire the same period
+//! nodes at them. A sample the transport could not hold (the reader's queue
+//! was full) never reaches the feeder and merges into the next step.
+//! Data-triggered nodes also depend on which input frames have arrived
 //! by each step, which `/clock` alone does not fix. Nothing here reads the
 //! wall clock. A sim-time run is not recordable yet (`--record` is refused);
 //! when it becomes one, the step deltas are already the boundaries a
