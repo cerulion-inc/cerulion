@@ -1606,6 +1606,9 @@ jobs:
       - name: Obstacle avoidance source regressions
         run: cd examples/obstacle_avoidance && cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
 
+      - name: Simulated arm plant (examples/aspire_arm)
+        run: cd examples/aspire_arm && cargo test -p arm_sim --lib
+
   # The Go2 demo workspace (examples/go2) is ISOLATED: not a member of
   # the root cargo workspace, and deliberately skipped by `examples` (its
   # joystick crate needs the libudev system library, which only this job
@@ -3723,6 +3726,8 @@ jobs:
   # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
   # (their own headers say "parallel-safe without `#[serial]`"), which is the
   # same property that lets the `cerulion_connectd` step above run parallel.
+  # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
+  # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
   # binds 127.0.0.1:0; `cerulion_link` runs loopback iroh with per-test
   # identities; `cerulion_pairing` / `cerulion-wire` / `cerulion_mdns` are pure
@@ -3902,6 +3907,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_rcpd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        run: cargo test -p cerulion_rcpd
+      - name: selection marker, cerulion_rcpd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_rcpd (selected: $SELECTED)"
       - name: cerulion_remoted tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted

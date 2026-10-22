@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_rcpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Robot Context Protocol daemon for Cerulion: an MCP server (stdio and streamable HTTP) that exposes the live robot graph, its runs, topics, rates and monitor flags, as the robot://graph resource"
+# Not published to crates.io: a daemon operators run beside a graph, not a
+# library anyone adds with `cargo add`.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerulion-rcpd"
+path = "src/main.rs"
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+# The hash-chained receipt log.
+cerud = { path = "../cerud" }
+# The MCP server SDK. No `macros`: the handler is written by hand, so the
+# proc-macro tree stays out of the build.
+rmcp = { version = "3.5.1", default-features = false, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+# Streamable HTTP is hosted on hyper directly (already in the default build),
+# not on a web framework.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tower-service = "0.3"
+tokio = { version = "1", default-features = false, features = [
+    "io-std",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+# The binary installs a STDERR subscriber; stdout carries the stdio MCP stream.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "server"] }
+tempfile = "3"

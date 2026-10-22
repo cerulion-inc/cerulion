@@ -3211,6 +3211,14 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 | `CERULION_NETD_RELAY_DISABLED` | Any non-empty value disables all iroh relays (LAN direct-dial only), for a locked-down or air-gapped desk. WAN builds only. |
 | `CERULION_STATE_ROOT` | The on-robot state root for `cerulion-remoted` (default `/var/lib/cerulion`). Also its `--state-root` flag. |
 
+### Robot Context Protocol
+
+For the `cerulion-rcpd` MCP server. See `docs/rcp.md`.
+
+| Variable | Meaning |
+|---|---|
+| `CERULION_RCP_TOKEN` | The bearer token every streamable HTTP request must carry (`Authorization: Bearer <token>`). `--http` refuses to start when it is unset, empty or whitespace. Not read in stdio mode. |
+
 ### Multi-process execution
 
 | Variable | Meaning |
