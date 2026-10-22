@@ -1862,6 +1862,21 @@ fn render_node_entry(node: &NodeDef, indent: &str, nested_step: usize) -> String
             }
         }
     }
+    if !node.params.is_empty() {
+        // Declaration order, one scalar per line. A string goes through
+        // `render_scalar` so `"2.0"` stays a string; a number or bool is its
+        // `Display`, which keeps a float's decimal point (`2.0`, `-0.0`), so
+        // each value re-parses as the same `ParamValue`.
+        use cerulion_core::graph::params::ParamValue;
+        out.push_str(&format!("{key}params:\n"));
+        for (name, value) in &node.params {
+            let rendered = match value {
+                ParamValue::Str(s) => render_scalar(s),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("{key}  {}: {rendered}\n", render_scalar(name)));
+        }
+    }
     out
 }
 
