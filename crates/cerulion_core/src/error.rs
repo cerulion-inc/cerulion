@@ -63,7 +63,9 @@ pub enum TransportError {
         required: usize,
         /// The largest cap the topic allows.
         limit: usize,
-        /// The messages each publisher keeps.
+        /// The messages each publisher keeps: the topic's history, which
+        /// every publisher of the topic shares (the deepest any output
+        /// declares, and at least 1).
         depth: usize,
         /// Every `/tf_static` output in the graph, as `node.output`.
         publishers: Vec<String>,
@@ -640,9 +642,16 @@ fn render_tf_static_cap(
         publishers.join(", ")
     );
     if required > limit {
+        // Lowering history_size helps only while a publisher keeps more
+        // than the one message a latched output always keeps.
+        let history = if depth > 1 {
+            ", or lower their history_size to 1"
+        } else {
+            ""
+        };
         format!(
-            "{head}, more than the cap limit of {limit}: send fewer static messages by moving \
-             static transforms into fewer publishers, or keep history_size at 1"
+            "{head}, more than the cap limit of {limit}: move static transforms into fewer \
+             publishers{history}"
         )
     } else {
         format!(

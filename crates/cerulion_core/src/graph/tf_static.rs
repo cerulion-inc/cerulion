@@ -32,14 +32,12 @@ use super::topology::{TopicFlow, MAX_CONSUMER_DEPTH};
 /// The topic of static transforms.
 pub const TF_STATIC_TOPIC: &str = "/tf_static";
 
-/// Whether `schema` names `tf2_msgs/TFMessage`, in any of the spellings a
-/// graph accepts: `tf2_msgs/TFMessage`, `tf2_msgs/msg/TFMessage` or the
-/// bare `TFMessage`.
+/// Whether `schema` names `tf2_msgs/TFMessage`: `tf2_msgs/TFMessage` or
+/// `tf2_msgs/msg/TFMessage` (`::` separators are normalized to `/` at
+/// parse). A bare `TFMessage` is not enough: a workspace schema of that
+/// name is another type.
 fn is_tf_message(schema: &str) -> bool {
-    matches!(
-        schema,
-        "tf2_msgs/TFMessage" | "tf2_msgs/msg/TFMessage" | "TFMessage"
-    )
+    matches!(schema, "tf2_msgs/TFMessage" | "tf2_msgs/msg/TFMessage")
 }
 
 /// Whether an output publishing `schema` on the resolved `topic` is a
@@ -188,10 +186,13 @@ mod tests {
     fn a_static_transform_output_keeps_at_least_one_message() {
         let latched = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessage", 0);
         assert_eq!(effective_history_size(TF_STATIC_TOPIC, &latched), 1);
-        for schema in ["tf2_msgs/msg/TFMessage", "TFMessage"] {
-            let o = output("tf_static", Some(TF_STATIC_TOPIC), schema, 0);
-            assert_eq!(effective_history_size(TF_STATIC_TOPIC, &o), 1, "{schema}");
-        }
+        let long = output(
+            "tf_static",
+            Some(TF_STATIC_TOPIC),
+            "tf2_msgs/msg/TFMessage",
+            0,
+        );
+        assert_eq!(effective_history_size(TF_STATIC_TOPIC, &long), 1);
         // A declared history above 1 is kept as declared.
         let deep = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessage", 3);
         assert_eq!(effective_history_size(TF_STATIC_TOPIC, &deep), 3);
@@ -207,6 +208,9 @@ mod tests {
         assert_eq!(effective_history_size(TF_STATIC_TOPIC, &other), 0);
         let near = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessages", 0);
         assert_eq!(effective_history_size(TF_STATIC_TOPIC, &near), 0);
+        // A bare `TFMessage` may be a workspace schema of that name.
+        let bare = output("tf_static", Some(TF_STATIC_TOPIC), "TFMessage", 0);
+        assert_eq!(effective_history_size(TF_STATIC_TOPIC, &bare), 0);
         // A relative output named `tf_static` resolves under the prefix.
         let relative = output("tf_static", None, "tf2_msgs/TFMessage", 2);
         assert_eq!(
@@ -277,10 +281,29 @@ mod tests {
         assert!(
             text.ends_with(
                 "that keep 1 message each, so a listener that starts after them receives \
-                 17, more than the cap limit of 16: send fewer static messages by moving \
-                 static transforms into fewer publishers, or keep history_size at 1"
+                 17, more than the cap limit of 16: move static transforms into fewer \
+                 publishers"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_deep_history_past_the_limit_names_history_size_as_a_remedy() {
+        // 6 publishers keeping 3 each need 18: lowering history_size to 1
+        // would bring that to 6.
+        let config = graph(
+            statics(&["a", "b", "c", "d", "e", "f"], 3),
+            &[TF_STATIC_TOPIC],
+        );
+        let err = check_listener_caps(&config, &flow(TF_STATIC_TOPIC, &[16])).unwrap_err();
+        assert!(
+            err.to_string().ends_with(
+                "that keep 3 messages each, so a listener that starts after them receives \
+                 18, more than the cap limit of 16: move static transforms into fewer \
+                 publishers, or lower their history_size to 1"
+            ),
+            "{err}"
         );
     }
 

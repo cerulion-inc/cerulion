@@ -69,7 +69,9 @@ so a dropped static transform is never silent. On a `multi_publisher_topics`
 topic the cap is at most 16; a graph whose static publishers need more is
 refused too: move static transforms into fewer publishers. Publishers in
 another graph are not counted, so a listener of another graph's static
-publishers sets its cap to their number itself.
+publishers sets its cap itself: their number times the messages each keeps.
+The topic's publishers share one history, the largest `history_size` any of
+them declares and at least 1, so with no `history_size` that is their number.
 
 A `/tf` output can keep `history_size` at 0. A listener that starts late then
 holds no sample older than the first it receives, and a lookup at an earlier
