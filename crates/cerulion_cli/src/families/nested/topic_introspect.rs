@@ -164,6 +164,7 @@ fn run(action: TopicIntrospectAction) -> CliResult<()> {
             for note in [
                 &found.remote_unavailable,
                 &found.unread_local,
+                &found.silent_local,
                 &found.unsearched_mirrors,
                 &found.unsearched_robots,
             ]

@@ -498,6 +498,36 @@ fn the_typed_listing_types_every_topic_across_batches() {
         );
     }
     assert_eq!(typed[live.len()].ty, TopicType::Unknown);
+    assert!(
+        listing.silent.is_empty(),
+        "a topic gone since the listing did not open, so it is not silent: {:?}",
+        listing.silent
+    );
+}
+
+/// A topic that opens but sends nothing in the wait is unknown, and named as
+/// silent (not as unread, since nothing failed), so `topic find` can say it
+/// was not searched.
+#[test]
+#[serial]
+fn the_typed_listing_names_a_topic_that_sends_nothing() {
+    let _net = EnvGuard::set("CERULION_NETWORK", "off");
+    let quiet = unique_topic("listed_quiet");
+    let _writer = RawTopicWriter::new(&quiet, true);
+    let walker = local_walker_from_workspace(None);
+    let listing = type_local_topics(
+        &[TopicInfo {
+            name: quiet.clone(),
+        }],
+        &walker,
+        false,
+        InternalTopics::Read,
+    )
+    .expect("typed listing");
+    assert_eq!(listing.topics.len(), 1);
+    assert_eq!(listing.topics[0].ty, TopicType::Unknown);
+    assert_eq!(listing.silent, vec![quiet]);
+    assert!(listing.unread.is_empty(), "{:?}", listing.unread);
 }
 
 #[test]

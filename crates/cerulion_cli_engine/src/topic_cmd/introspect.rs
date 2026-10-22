@@ -57,9 +57,10 @@ pub struct BwStats {
 /// `S` bytes every `T` seconds measures exactly `S / T`. Every frame ON a
 /// publisher's earliest stamp opens its span and is left out of its rate
 /// (two frames stamped together at the start are one instant, not one
-/// interval). The topic's rate is the sum of the publisher rates, so two
-/// publishers whose clocks disagree (a sim clock and a wall clock) still
-/// measure what each one sends. A publisher with no time span yet (one
+/// interval). The topic's rate is the sum of the publisher rates, rounded
+/// once to the nearest byte, so two publishers whose clocks disagree (a sim
+/// clock and a wall clock) still measure what each one sends, and slow
+/// publishers that each send less than a byte a second still add up. A publisher with no time span yet (one
 /// frame, or every frame on one stamp) adds no rate. `None` when no
 /// publisher in the window has a span. The frame count and the sizes cover
 /// the whole window. Integer arithmetic in `u128`, so the largest sizes and
@@ -72,11 +73,11 @@ pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
         if window[..i].iter().any(|f| f.publisher == frame.publisher) {
             continue;
         }
-        if let Some(r) = publisher_rate(window, frame.publisher) {
+        if let Some(r) = publisher_rate_milli(window, frame.publisher) {
             rate = Some(rate.unwrap_or(0).saturating_add(r));
         }
     }
-    let rate = rate?;
+    let rate = rate?.saturating_add(500) / 1000;
     let total: u128 = window.iter().map(|f| u128::from(f.size_bytes)).sum();
     let frames = window.len();
     Some(BwStats {
@@ -88,10 +89,12 @@ pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
     })
 }
 
-/// The rate in bytes per second of `publisher`'s frames in `window`, on that
-/// publisher's own stamps and rounded to the nearest byte (see
-/// [`bandwidth`]). `None` when its frames span no time.
-fn publisher_rate(window: &[BwFrame], publisher: u128) -> Option<u128> {
+/// The rate of `publisher`'s frames in `window` in thousandths of a byte per
+/// second, on that publisher's own stamps and rounded down (see
+/// [`bandwidth`], which sums these and rounds once). `None` when its frames
+/// span no time. A window of the largest size (100000 frames of `u64::MAX`
+/// bytes) stays inside `u128`; past that the product saturates.
+fn publisher_rate_milli(window: &[BwFrame], publisher: u128) -> Option<u128> {
     let own = || window.iter().filter(move |f| f.publisher == publisher);
     let first_ns = own().map(|f| f.timestamp_ns).min()?;
     let last_ns = own().map(|f| f.timestamp_ns).max()?;
@@ -103,7 +106,7 @@ fn publisher_rate(window: &[BwFrame], publisher: u128) -> Option<u128> {
         .filter(|f| f.timestamp_ns != first_ns)
         .map(|f| u128::from(f.size_bytes))
         .sum();
-    Some((after_first * 1_000_000_000 + span_ns / 2) / span_ns)
+    Some(after_first.saturating_mul(1_000_000_000_000) / span_ns)
 }
 
 /// The decimal unit prefixes `topic bw` scales by (1 KB = 1000 B, as
@@ -613,10 +616,11 @@ pub enum InternalTopics {
 /// A topic is opened as a genuine local producer (see `local_only` and the
 /// mirror recheck of `topic info`). A network mirror, a topic gone since the
 /// listing, a skipped internal topic and a topic that sends no frame in the
-/// wait are [`TopicType::Unknown`]. A topic whose open, local lease, mirror
-/// check or receive fails is [`TopicType::Unknown`] too, but it is also
-/// named in [`TypedListing::unread`] and logged at `warn`, so a caller can
-/// say that the listing is short. A hash `walker` does not name is
+/// wait are [`TopicType::Unknown`]. A topic that opened but sent no frame in
+/// the wait is also named in [`TypedListing::silent`]. A topic whose open,
+/// local lease, mirror check or receive fails is [`TopicType::Unknown`] too,
+/// but it is also named in [`TypedListing::unread`] and logged at `warn`, so
+/// a caller can say that the listing is short. A hash `walker` does not name is
 /// [`TopicType::Unnamed`].
 pub fn type_local_topics(
     local: &[super::TopicInfo],
@@ -628,6 +632,7 @@ pub fn type_local_topics(
     let mut listing = TypedListing {
         topics: Vec::with_capacity(local.len()),
         unread: Vec::new(),
+        silent: Vec::new(),
     };
     for batch in local.chunks(TYPED_LISTING_BATCH) {
         type_local_batch(
@@ -651,6 +656,10 @@ pub struct TypedListing {
     /// mirror check or the receive failed), in the order given. Each one is
     /// [`TopicType::Unknown`] in `topics`.
     pub unread: Vec<String>,
+    /// The topics that opened but sent no frame in the wait, in the order
+    /// given. Each one is [`TopicType::Unknown`] in `topics`: a topic slower
+    /// than the wait is typed by no frame, so its type is not known.
+    pub silent: Vec<String>,
 }
 
 /// The stderr note `topic find` gives for the local topics it could not
@@ -664,6 +673,23 @@ pub fn unread_local_note(unread: &[String]) -> Option<String> {
             "local: {} topic(s) not searched: they could not be read ({}), so their type is \
              not known\n",
             names.len(),
+            names.join(", ")
+        )
+    })
+}
+
+/// The stderr note `topic find` gives for the local topics that sent no
+/// message in the wait ([`TypedListing::silent`]), else `None`. Such a
+/// topic is not searched (a topic slower than one message a second is one),
+/// so the note names each one and an empty result is never silently short.
+pub fn silent_local_note(silent: &[String]) -> Option<String> {
+    (!silent.is_empty()).then(|| {
+        let names: Vec<String> = silent.iter().map(|t| super::sanitize_display(t)).collect();
+        format!(
+            "local: {} topic(s) not searched: they sent no message in {}s ({}), so their type \
+             is not known\n",
+            names.len(),
+            TYPED_LISTING_WAIT.as_secs(),
             names.join(", ")
         )
     })
@@ -693,7 +719,12 @@ fn type_local_batch(
     for (topic, open) in batch.iter().zip(opened) {
         let read = match open {
             Some(LocalOpen::Opened(s)) => {
-                first_schema_hash(&s, deadline.saturating_duration_since(Instant::now()))
+                let read =
+                    first_schema_hash(&s, deadline.saturating_duration_since(Instant::now()));
+                if matches!(read, Ok(None)) {
+                    listing.silent.push(topic.name.clone());
+                }
+                read
             }
             Some(LocalOpen::Absent) | None => Ok(None),
             Some(LocalOpen::Failed(e)) => Err(e),
@@ -868,6 +899,9 @@ pub struct FoundTopics {
     /// The [`unread_local_note`] when a local topic could not be read, else
     /// `None`.
     pub unread_local: Option<String>,
+    /// The [`silent_local_note`] when a local topic sent no message in the
+    /// wait, else `None`.
+    pub silent_local: Option<String>,
     /// The [`unsearched_mirrors_note`] when a mirrored topic could not be
     /// searched, else `None`.
     pub unsearched_mirrors: Option<String>,
@@ -931,7 +965,8 @@ pub fn unsearched_robots_note<'a>(
 /// mirrored topic is searched through its origin robot's catalog only; one
 /// that catalog does not list is counted in [`FoundTopics::unsearched_mirrors`].
 /// A local topic that could not be read is named in
-/// [`FoundTopics::unread_local`]. An unknown type is an empty list; a malformed name is an error before any topic is read.
+/// [`FoundTopics::unread_local`], and one that sent no message in the wait
+/// in [`FoundTopics::silent_local`]. An unknown type is an empty list; a malformed name is an error before any topic is read.
 /// `connect` and `listen` add locators to the discovery session, as `topic
 /// list --connect` and `--listen` do, for a robot discovery cannot find.
 pub fn topic_find(
@@ -977,6 +1012,7 @@ pub fn topic_find(
         topics: topics.iter().map(|t| super::sanitize_display(t)).collect(),
         remote_unavailable,
         unread_local: unread_local_note(&typed.unread),
+        silent_local: silent_local_note(&typed.silent),
         unsearched_mirrors: unsearched_mirrors_note(&streaming, &gather.replies),
         unsearched_robots: unsearched_robots_note(discovered.iter().map(String::as_str), &gather),
     })
@@ -1775,6 +1811,19 @@ mod tests {
     }
 
     #[test]
+    fn slow_publishers_are_summed_before_the_rate_is_rounded() {
+        // Two publishers each send 1 byte over 3 s: 1/3 B/s each, 2/3 B/s
+        // together, which rounds to 1 (each alone would round to 0).
+        let window = [
+            from(0xA, 0, 1),
+            from(0xA, 3 * SEC, 1),
+            from(0xB, 50 * SEC, 1),
+            from(0xB, 53 * SEC, 1),
+        ];
+        assert_eq!(bandwidth(&window).map(|s| s.bytes_per_sec), Some(1));
+    }
+
+    #[test]
     fn publishers_with_no_span_have_no_bandwidth() {
         assert_eq!(
             bandwidth(&[from(0xA, SEC, 10), from(0xB, 2 * SEC, 10)]),
@@ -2190,6 +2239,20 @@ mod tests {
             )
         );
         let note = unread_local_note(&["/x\u{1b}[2J".to_string()]).unwrap();
+        assert!(!note.contains('\u{1b}'), "{note:?}");
+    }
+
+    #[test]
+    fn every_silent_local_topic_is_named_in_one_note() {
+        assert_eq!(silent_local_note(&[]), None);
+        assert_eq!(
+            silent_local_note(&["/slow".to_string(), "/idle".to_string()]).as_deref(),
+            Some(
+                "local: 2 topic(s) not searched: they sent no message in 1s (/slow, /idle), so \
+                 their type is not known\n"
+            )
+        );
+        let note = silent_local_note(&["/x\u{1b}[2J".to_string()]).unwrap();
         assert!(!note.contains('\u{1b}'), "{note:?}");
     }
 
