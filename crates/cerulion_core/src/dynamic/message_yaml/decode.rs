@@ -399,14 +399,14 @@ impl<'w> Builder<'w> {
                 });
             }
             if let Some(bound) = max_wstring_units {
-                // Past `bound` units the count stops: a long string is not
-                // walked to its end.
-                let got = s.encode_utf16().take(bound + 1).count();
+                // No arithmetic on the bound: any `usize` the parser takes,
+                // `usize::MAX` included, is a valid one.
+                let got = s.encode_utf16().count();
                 if got > bound {
                     return Err(DynamicError::YamlWideStringTooLong {
                         path: shown(path),
                         bound,
-                        got: s.encode_utf16().count(),
+                        got,
                     });
                 }
             }

@@ -1186,6 +1186,19 @@ fn a_wide_string_bound_counts_utf16_units() {
         decode_err(w, "demo/Wide", "w: \"\"\nws: [\"\", \"\", \"\", \"\"]\n"),
         "ws: expected at most 3 elements, got 4"
     );
+    // The largest bound the parser takes, on every bounded kind, reads a
+    // value without overflow.
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    let max = usize::MAX;
+    set.add_rosmsg_str(
+        &format!("wstring<={max} w\nstring<={max} s\nwstring<={max}[<={max}] ws\n"),
+        "Huge",
+        Some("demo"),
+    )
+    .unwrap();
+    let text = "w: \"\"\ns: \"ab\"\nws: [\"\u{1f600}\"]\n";
+    let frame = yaml_to_message(set.walker(), "demo/Huge", text.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
 }
 
 /// A value past a ROS upper bound is refused with the path and the bound.
