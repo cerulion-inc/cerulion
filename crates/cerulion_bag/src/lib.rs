@@ -56,6 +56,8 @@ pub mod schema;
 pub mod writer;
 
 #[cfg(any(test, feature = "test-helpers"))]
+pub mod legacy_fixture;
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_sink;
 
 pub use catalog::{

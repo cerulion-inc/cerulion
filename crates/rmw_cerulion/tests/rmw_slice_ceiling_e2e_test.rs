@@ -324,10 +324,10 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
     //   - nonsense                  malformed sibling (must warn ONCE, and
     //                               must not disturb any other entry)
     //   - rmw_slc/Narrow{S}:1024    a user type the table never lists
-    //   - rmw_slc/Fixed{S}:64       names a FIXED type (must be ignored)
-    //   - rmw_slc/Fixed2{S}:64      a SECOND fixed type (its own loud head)
+    //   - rmw_slc/Fixed{S}:48       names a FIXED type (must be ignored)
+    //   - rmw_slc/Fixed2{S}:48      a SECOND fixed type (its own loud head)
     let env_value = format!(
-        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:64,rmw_slc/Fixed2{suffix}:64"
+        "tf2_msgs/TFMessage:1024,nonsense,rmw_slc/Narrow{suffix}:1024,rmw_slc/Fixed{suffix}:48,rmw_slc/Fixed2{suffix}:48"
     );
     let _guard = EnvVarGuard::set("CERULION_RMW_SLICE_CEILING", &env_value);
 
@@ -474,9 +474,9 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
 
         // ── ARM 5: an override naming a FIXED type is ignored, and the
         // ignored-override warn is once-per-TYPE, not per creation ────────
-        // `rmw_slc/Fixed{S}` (3 doubles, exact frame 32 + 24 = 56 B) is
-        // named in the env at 32 B. If the override were APPLIED, this
-        // 56-byte frame could never loan and the publish would fail — its
+        // `rmw_slc/Fixed{S}` (3 doubles, exact frame 40 + 24 = 64 B) is
+        // named in the env at 48 B. If the override were APPLIED, this
+        // 64-byte frame could never loan and the publish would fail; its
         // success is the behavioral proof the override is ignored. THREE
         // publishers of the type are created (distinct topics) so the warn
         // pin below can require 1 loud head + 2 suppressed repeats (a
@@ -529,8 +529,8 @@ fn the_resolved_ceiling_governs_real_negotiated_buffers_end_to_end() {
                 std::ptr::null_mut()
             ),
             RMW_RET_OK,
-            "a fixed type's exact 56-byte frame must publish — failure here \
-             means the 32-byte override was APPLIED instead of ignored"
+            "a fixed type's exact 64-byte frame must publish; failure here \
+             means the 48-byte override was APPLIED instead of ignored"
         );
 
         // ── ARM 6: determinism — a second same-type creation resolves

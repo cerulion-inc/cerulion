@@ -40,7 +40,7 @@ use super::demand_authorizer::{
 use super::discovery::{
     liveliness_prefix, query_announce_entries, query_live_topics_by_prefix, TopicToken,
 };
-use super::failure_regime_latch::{lock_regime_latch, FailureRegimeLatch, RegimeDecision};
+use super::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use super::gateway::is_reserved_topic;
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
@@ -426,6 +426,15 @@ const _: () = assert!(
     WIRE_HEADER_VERSION == 2,
     "bump DATA_KEY_NAMESPACE with the wire header"
 );
+
+/// The replying robot named by a demand reply key
+/// (`cerulion_q/{robot}/demand{topic}`), or the whole key when it does not
+/// have that shape.
+fn demand_reply_peer(key: &str) -> &str {
+    key.strip_prefix("cerulion_q/")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(key)
+}
 
 /// The demand GET payload: this build's [`WIRE_HEADER_VERSION`], two bytes
 /// little-endian.
@@ -910,11 +919,51 @@ pub struct GetDemandState {
     /// cumulative GET-expiry disables applied by the reconciler thread.
     expiries: AtomicU64,
     /// cumulative GETs refused because the demander's wire header version is
-    /// not this build's (counted inside [`Self::wire_header_latch`] too).
+    /// not this build's.
     wire_header_refusals: AtomicU64,
-    /// flood suppression for the wire header refusal: loud on the first one of
-    /// a run, counted repeats, re-armed by the next accepted GET.
-    wire_header_latch: Mutex<FailureRegimeLatch>,
+    /// flood suppression for the wire header refusal, one latch per
+    /// (stated version, topic): loud on the first refusal of each, counted
+    /// repeats, decade re-announcements. A GET at this build's version comes
+    /// from another peer, so it never re-arms a mismatched key.
+    wire_header_latches: Mutex<KeyedLatches<(Option<u16>, String)>>,
+}
+
+/// The most distinct keys a [`KeyedLatches`] tracks; past it every new key
+/// shares one overflow latch, so a hostile or huge network cannot grow it.
+const KEYED_LATCHES_CAP: usize = 256;
+
+/// Flood-suppression latches keyed by peer and topic, bounded at
+/// [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
+struct KeyedLatches<K: Ord> {
+    by_key: std::collections::BTreeMap<K, FailureRegimeLatch>,
+    overflow: FailureRegimeLatch,
+}
+
+impl<K: Ord> Default for KeyedLatches<K> {
+    fn default() -> Self {
+        Self {
+            by_key: std::collections::BTreeMap::new(),
+            overflow: FailureRegimeLatch::new(),
+        }
+    }
+}
+
+impl<K: Ord> KeyedLatches<K> {
+    /// The latch for `key`, created on first use while under the cap.
+    fn latch(&mut self, key: K) -> &mut FailureRegimeLatch {
+        if self.by_key.contains_key(&key) || self.by_key.len() < KEYED_LATCHES_CAP {
+            self.by_key.entry(key).or_default()
+        } else {
+            &mut self.overflow
+        }
+    }
+
+    /// Re-arm `key`'s latch if it exists (a success from that key's peer).
+    fn success(&mut self, key: &K) -> Option<u64> {
+        self.by_key
+            .get_mut(key)
+            .and_then(FailureRegimeLatch::on_success)
+    }
 }
 
 impl GetDemandState {
@@ -968,13 +1017,6 @@ impl GetDemandState {
     fn wire_header_gate(&self, canonical: &str, payload: Option<&[u8]>) -> Option<&'static [u8]> {
         let peer = demand_payload_wire_header_version(payload);
         if peer == Some(WIRE_HEADER_VERSION) {
-            if let Some(suppressed) = lock_regime_latch(&self.wire_header_latch).on_success() {
-                tracing::info!(
-                    topic = %canonical,
-                    suppressed,
-                    "demand GET wire header versions agree again; the refusals stopped"
-                );
-            }
             return None;
         }
         self.wire_header_refusals.fetch_add(1, Ordering::Relaxed);
@@ -982,7 +1024,14 @@ impl GetDemandState {
             Some(v) => v.to_string(),
             None => "unreadable".to_string(),
         };
-        match lock_regime_latch(&self.wire_header_latch).on_failure() {
+        let decision = self
+            .wire_header_latches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            // hot-path-alloc-ok: cold, a refused demand GET on the control plane.
+            .latch((peer, canonical.to_string()))
+            .on_failure();
+        match decision {
             RegimeDecision::Loud => tracing::warn!(
                 topic = %canonical,
                 peer_wire_header = %peer_text,
@@ -1044,8 +1093,9 @@ pub struct DemandGetState {
     /// cumulative replies acking "refused:wire-header" (the producer runs a
     /// build with a different wire header version).
     wire_header_refused_acks: AtomicU64,
-    /// flood suppression for the wire header refusals this demander receives.
-    wire_header_latch: Mutex<FailureRegimeLatch>,
+    /// flood suppression for the wire header refusals this demander receives,
+    /// one latch per (replying peer, topic), re-armed by a grant from that peer.
+    wire_header_latches: Mutex<KeyedLatches<(String, String)>>,
     /// once-per-regime GET-failure latch (loud-once; a dead link must not flood).
     fail: Mutex<GatherFailureLatch>,
 }
@@ -1115,12 +1165,19 @@ impl DemandGetState {
         self.wire_header_refused_acks.load(Ordering::Relaxed)
     }
 
-    /// Tally one demand ack. A grant re-arms the wire header latch; a wire
-    /// header refusal is counted and loud on the first of a run.
-    fn record_ack(&self, topic: &str, ack: &[u8]) {
+    /// Tally one demand ack from `peer` (the replying robot). A grant re-arms
+    /// that peer's wire header latch for the topic; a wire header refusal is
+    /// counted and loud on the first of a run per (peer, topic).
+    // hot-path-alloc-ok-fn: cold, one ack per demand GET reply on the control plane.
+    fn record_ack(&self, peer: &str, topic: &str, ack: &[u8]) {
+        let key = (peer.to_string(), topic.to_string());
+        let mut latches = self
+            .wire_header_latches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ack == ACK_ENABLED {
             self.enabled_acks.fetch_add(1, Ordering::Relaxed);
-            lock_regime_latch(&self.wire_header_latch).on_success();
+            latches.success(&key);
         } else if ack == ACK_REFUSED {
             self.refused_acks.fetch_add(1, Ordering::Relaxed);
         } else if ack == ACK_REFUSED_WIRE_HEADER || ack == LEGACY_ACK_ENABLED {
@@ -1128,9 +1185,10 @@ impl DemandGetState {
             // previous key namespace: as unreachable as an explicit refusal.
             self.wire_header_refused_acks
                 .fetch_add(1, Ordering::Relaxed);
-            match lock_regime_latch(&self.wire_header_latch).on_failure() {
+            match latches.latch(key).on_failure() {
                 RegimeDecision::Loud => tracing::warn!(
                     topic = %topic,
+                    peer = %peer,
                     local_wire_header = WIRE_HEADER_VERSION,
                     "demand REFUSED by the producing machine: it runs a Cerulion build with a \
                      different wire header version, so this topic cannot be received from it. \
@@ -2756,7 +2814,8 @@ fn run_demand_get_pass_on_session(
                     while let Ok(reply) = replies.recv() {
                         if let Ok(sample) = reply.into_result() {
                             let payload = sample.payload().to_bytes();
-                            demand_state.record_ack(topic, payload.as_ref());
+                            let peer = demand_reply_peer(sample.key_expr().as_str());
+                            demand_state.record_ack(peer, topic, payload.as_ref());
                         }
                     }
                 }
@@ -2788,7 +2847,7 @@ fn run_demand_get_pass_on_session(
 pub enum IngressRejection {
     /// Fewer than `WireHeader::SIZE` (40) bytes: cannot contain a header.
     TooSmall,
-    /// The 32 header bytes did not parse into a [`WireHeader`]. Defensive:
+    /// The 40 header bytes did not parse into a [`WireHeader`]. Defensive:
     /// `WireHeader::read_from_buf` fails only on a short buffer (already caught
     /// by `TooSmall`), so this arm is unreachable today, but it makes the
     /// header-parse failure an EXPLICIT rejection class if that contract ever
@@ -3948,7 +4007,7 @@ impl NetworkManager {
     ///
     /// # Errors
     ///
-    /// - `TransportError::Publish` if the frame is smaller than the 32-byte
+    /// - `TransportError::Publish` if the frame is smaller than the 40-byte
     ///   wire header (cannot be a valid Cerulion frame) or the zenoh put fails
     /// - `TransportError::SessionCreation` if the session cannot be opened
     pub fn publish_to_network(&self, topic: &str, frame: Vec<u8>) -> TransportResult<()> {
@@ -7015,11 +7074,11 @@ mod tests {
         );
     }
 
-    /// The producer's wire header gate: a matching version (and an absent
-    /// payload, which is version 1) passes without counting; a different or
-    /// unreadable version is refused with `refused:wire-header`, counted every
-    /// time, loud once per run, and re-armed by the next passing GET. It never
-    /// grants: `granted_topics` stays empty.
+    /// The producer's wire header gate: a matching version passes without
+    /// counting; a different, absent (version 1) or unreadable version is
+    /// refused with `refused:wire-header`, counted every time, and loud on the
+    /// first refusal of each (stated version, topic). A passing GET comes from
+    /// another peer and re-arms nothing. It never grants.
     #[tracing_test::traced_test]
     #[test]
     fn a_demand_from_a_different_wire_header_version_is_refused_counted_and_loud_once() {
@@ -7051,13 +7110,18 @@ mod tests {
             "a distinct counter from the allow list's"
         );
 
-        // A passing GET closes the run; the next mismatch is loud again.
+        // A passing GET (another peer) does not re-arm version 99 on `/a`; the
+        // same version on another topic is its own key and loud.
         assert_eq!(state.wire_header_gate("/a", Some(&[0x02, 0x00])), None);
+        assert_eq!(
+            state.wire_header_gate("/a", Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
         assert_eq!(
             state.wire_header_gate("/b", Some(&[0x63, 0x00])),
             Some(ACK_REFUSED_WIRE_HEADER)
         );
-        assert_eq!(state.wire_header_refusal_count(), 5);
+        assert_eq!(state.wire_header_refusal_count(), 6);
         logs_assert(|lines: &[&str]| {
             let loud = lines
                 .iter()
@@ -7065,9 +7129,10 @@ mod tests {
                     l.contains("WARN") && l.contains("demand REFUSED: the demanding machine")
                 })
                 .count();
+            // (1, /a), (99, /a), (unreadable, /a), (99, /b).
             match loud {
-                2 => Ok(()),
-                n => Err(format!("expected 2 loud refusals (one per run), got {n}")),
+                4 => Ok(()),
+                n => Err(format!("expected 4 loud refusals (one per key), got {n}")),
             }
         });
     }
@@ -7077,13 +7142,13 @@ mod tests {
     #[test]
     fn the_demander_counts_each_ack_class_and_warns_once_on_a_wire_header_refusal() {
         let state = DemandGetState::default();
-        state.record_ack("/a", ACK_ENABLED);
-        state.record_ack("/a", ACK_REFUSED);
-        state.record_ack("/a", ACK_REFUSED_WIRE_HEADER);
-        state.record_ack("/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("go2", "/a", ACK_ENABLED);
+        state.record_ack("go2", "/a", ACK_REFUSED);
+        state.record_ack("go2", "/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("go2", "/a", ACK_REFUSED_WIRE_HEADER);
         // A producer older than the handshake grants with the bare token.
-        state.record_ack("/a", LEGACY_ACK_ENABLED);
-        state.record_ack("/a", b"something-newer");
+        state.record_ack("go2", "/a", LEGACY_ACK_ENABLED);
+        state.record_ack("go2", "/a", b"something-newer");
         assert_eq!(state.enabled_ack_count(), 1);
         assert_eq!(state.refused_ack_count(), 1);
         assert_eq!(state.wire_header_refused_ack_count(), 3);
@@ -7099,6 +7164,40 @@ mod tests {
                 n => Err(format!("expected 1 loud refusal, got {n}")),
             }
         });
+    }
+
+    /// Two producers on one topic each get their own latch: both refusals are
+    /// loud, a grant from one re-arms only that one, and the other stays
+    /// suppressed.
+    #[tracing_test::traced_test]
+    #[test]
+    fn two_refusing_peers_on_one_topic_are_each_loud_and_rearm_independently() {
+        let state = DemandGetState::default();
+        state.record_ack("alpha", "/t", ACK_REFUSED_WIRE_HEADER); // loud (alpha)
+        state.record_ack("beta", "/t", ACK_REFUSED_WIRE_HEADER); // loud (beta)
+        state.record_ack("beta", "/t", ACK_REFUSED_WIRE_HEADER); // suppressed
+        state.record_ack("alpha", "/t", ACK_ENABLED); // re-arms alpha only
+        state.record_ack("alpha", "/t", ACK_REFUSED_WIRE_HEADER); // loud (alpha again)
+        state.record_ack("beta", "/t", ACK_REFUSED_WIRE_HEADER); // suppressed
+        assert_eq!(state.wire_header_refused_ack_count(), 5);
+        logs_assert(|lines: &[&str]| {
+            let loud: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("WARN") && l.contains("demand REFUSED by the producing machine")
+                })
+                .collect();
+            let alpha = loud.iter().filter(|l| l.contains("peer=alpha")).count();
+            let beta = loud.iter().filter(|l| l.contains("peer=beta")).count();
+            match (alpha, beta) {
+                (2, 1) => Ok(()),
+                other => Err(format!(
+                    "expected (alpha 2, beta 1) loud refusals, got {other:?}"
+                )),
+            }
+        });
+        assert_eq!(demand_reply_peer("cerulion_q/go2/demand/imu"), "go2");
+        assert_eq!(demand_reply_peer("other"), "other");
     }
 
     /// A validated frame whose local re-injection fails is

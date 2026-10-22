@@ -1379,7 +1379,7 @@ impl CerulionPublisher {
         //    tail is `MaybeUninit<u8>` but never observed.
         let mut sample = unsafe { sample.assume_init() };
 
-        // 4. Stamp the WireHeader at bytes [0..32]. `total_size` is set
+        // 4. Stamp the WireHeader at bytes [0..WireHeader::SIZE]. `total_size` is set
         //    provisionally to the worst case (max_slice_len); Drop will
         //    rewrite it once the writer cursor is final. Timestamp is
         //    captured at loan time so all subscribers see the
@@ -2715,6 +2715,7 @@ pub(crate) fn parse_trace_entry_from_wire(topic: &str, data: &[u8]) -> Option<Pu
     //   offset_table_count: [16..20]
     //   sequence:          [20..24] u32 LE
     //   timestamp_ns:      [24..32] u64 LE
+    //   step_tag:          [32..40] u64 LE (not traced)
     let schema_hash = u64::from_le_bytes(data[0..8].try_into().ok()?);
     let sequence = u32::from_le_bytes(data[20..24].try_into().ok()?);
     let timestamp_ns = u64::from_le_bytes(data[24..32].try_into().ok()?);
@@ -2817,7 +2818,7 @@ impl RawShmLoanUninit {
     ///   `MaybeUninit` typing on this API is the DISCIPLINE layer that
     ///   forces callers to state which case they are.
     /// - The caller must have written a parseable [`WireHeader`] at
-    ///   `[0, 32)` whose `total_size` is at most the loan length, and every
+    ///   `[0, WireHeader::SIZE)` whose `total_size` is at most the loan length, and every
     ///   byte range a READER interprets (the wire head and every
     ///   offset-table-referenced range) must have been written — either by
     ///   the caller or by the in-slot fill it is adopting. Consumers slice

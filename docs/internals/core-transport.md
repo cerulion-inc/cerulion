@@ -64,11 +64,20 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   offset/count, `sequence`, `timestamp_ns`, `step_tag`), wire header version 2
   (`wire::WIRE_HEADER_VERSION`). Every boundary a frame crosses states that
   version: the iceoryx2 data service attribute `cerulion.wire_header_version`
-  (required by every opener), the zenoh key namespace `cerulion_w2` plus the
-  demand GET payload (`refused:wire-header` on a mismatch), the catalog's
-  `wire_header_version`, the `cerulion-netd` banner and the bag schema descriptor
-  (version 2). A bag recorded with version 1 descriptors has its user frames
-  upgraded on read (`wire::upgrade_v1_frame_into`). The canonical schema-hash recipe lives in
+  (defined on every service this build creates; an opener refuses another stated
+  version and accepts, with a once-per-topic warning, a service stating none),
+  the zenoh key namespace `cerulion_w2` plus the demand GET payload
+  (`refused:wire-header` on a mismatch), the catalog's `wire_header_version`, the
+  `cerulion-netd` banner, the iroh ALPN `cerulion/wire/2` and the bag schema
+  descriptor (version 2). Every check is ONE-DIRECTIONAL: it runs in the newer
+  process, and an older process reads no version, so it is not refused when it
+  opens a service, demands a topic or reads a bag this build made. The supported
+  configuration is one Cerulion release per machine (and one across machines that
+  exchange frames). A bag recorded with version 1 descriptors has its user frames
+  upgraded on read (`wire::upgrade_v1_frame_into`): per message on the message
+  streams, into one exact-size copy (at most `LEGACY_UPGRADE_CAP_BYTES`, 2 GiB) on
+  the frame walks; a frame that is not one whole frame is served unchanged and
+  counted. The canonical schema-hash recipe lives in
   exactly ONE place: `MessageSchema::schema_hash` (`src/codegen/schema.rs`). Never
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original

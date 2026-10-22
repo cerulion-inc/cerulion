@@ -91,9 +91,13 @@ pub fn open_bag(path: &Bound<'_, PyAny>) -> PyResult<PyBag> {
         }
     }
     // The completeness gate checks the footer's fingerprint, not its values:
-    // starting a walk validates the footer's summary offset, and the channel
-    // table read validates the summary itself.
-    reader.user_frames().map_err(map_bag_err)?;
+    // the footer probe validates its summary offset (building nothing), and
+    // the channel table read validates the summary itself.
+    if !reader.has_readable_footer() {
+        return Err(BagError::new_err(
+            "bag is not finalized: its footer does not name a readable data section",
+        ));
+    }
     reader.channels().map_err(map_bag_err)?;
     Ok(PyBag {
         reader: Rc::new(RefCell::new(Some(reader))),

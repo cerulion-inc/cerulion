@@ -2241,6 +2241,63 @@ fn frame_y(frame: &[u8]) -> f64 {
 // 1. Happy path
 // ===========================================================================
 
+/// A recording made by the release with the 32-byte wire header resims:
+/// its frames are upgraded as they are read, the re-executed graph's
+/// untagged 40-byte frames match them byte for byte, and the run passes. A
+/// payload byte flipped in the legacy file still fails it, so the verdict
+/// compares the upgraded bytes rather than skipping them.
+#[test]
+#[serial]
+fn a_recording_from_the_32_byte_release_resims_byte_exact() {
+    let steps = 4;
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.mcap");
+    write_bag(&rec, &current, None);
+    let legacy_bytes =
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap());
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(&legacy, &legacy_bytes).unwrap();
+    let topics = cerulion_bag::BagReader::open(&legacy)
+        .unwrap()
+        .legacy_wire_header_topics()
+        .unwrap();
+    assert_eq!(
+        topics,
+        vec!["/sr/relay/out".to_string(), "/sr/source/out".to_string()]
+    );
+
+    let outcome = replay(&legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        outcome.passed,
+        "a legacy recording must resim byte-exact: {:?}",
+        outcome.violations
+    );
+    assert_eq!(outcome.ticks_replayed, steps);
+
+    // Flip the first payload byte of the last relay frame in the legacy
+    // recording (payload starts at byte 32 in the old layout).
+    let mut flipped = rec.clone();
+    let rel = flipped.messages.get_mut("/sr/relay/out").unwrap();
+    let last = rel.len() - 1;
+    rel[last][cerulion_core::wire::WireHeader::SIZE] ^= 0x01;
+    let flipped_current = dir.path().join("flipped_current.mcap");
+    write_bag(&flipped, &flipped_current, None);
+    let flipped_legacy = dir.path().join("flipped_legacy.mcap");
+    std::fs::write(
+        &flipped_legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(
+            &std::fs::read(&flipped_current).unwrap(),
+        ),
+    )
+    .unwrap();
+    let outcome = replay(&flipped_legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        !outcome.passed,
+        "a flipped payload byte in a legacy recording must fail"
+    );
+}
+
 #[test]
 #[serial]
 fn happy_path_replays_byte_exact_and_passes() {

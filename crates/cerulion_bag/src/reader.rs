@@ -28,7 +28,8 @@ use std::sync::{Mutex, OnceLock};
 
 use cerulion_core::trace_ring::{TraceRingRecord, TRACE_RECORD_SIZE};
 use cerulion_core::wire::{
-    upgrade_v1_frame, upgrade_v1_frame_into, WireHeader, V1_HEADER_SIZE, WIRE_HEADER_VERSION,
+    upgrade_v1_frame, upgrade_v1_frame_into, FrameUpgradeError, WireHeader, V1_HEADER_SIZE,
+    WIRE_HEADER_VERSION,
 };
 use indexmap::IndexMap;
 
@@ -324,41 +325,6 @@ pub struct BagMessage {
     pub data: Vec<u8>,
 }
 
-impl BagMessage {
-    /// Own one decoded MCAP message. A user frame recorded with the version 1
-    /// wire header (its channel's descriptor says so) is upgraded to the
-    /// current layout; a frame that is not one whole version 1 frame is
-    /// refused rather than passed on to be misread.
-    // hot-path-alloc-ok-fn: recording read path, one owned copy per message by contract.
-    fn from_mcap(m: mcap::Message<'_>) -> BagResult<Self> {
-        let descriptor = m
-            .channel
-            .schema
-            .as_ref()
-            .filter(|s| s.encoding == SCHEMA_ENCODING)
-            .and_then(|s| SchemaDescriptor::decode(&s.data).ok());
-        let data = if channel_needs_upgrade(&m.channel.topic, descriptor.as_ref()) {
-            upgrade_v1_frame(&m.data).map_err(|e| BagError::Malformed {
-                reason: format!(
-                    "a frame on '{}' recorded with the version 1 wire header could not be \
-                     upgraded: {e}",
-                    m.channel.topic
-                ),
-            })?
-        } else {
-            m.data.into_owned()
-        };
-        Ok(Self {
-            channel_id: m.channel.id,
-            topic: m.channel.topic.clone(),
-            sequence: m.sequence,
-            log_time: m.log_time,
-            publish_time: m.publish_time,
-            data,
-        })
-    }
-}
-
 /// An attachment read back from a bag.
 #[derive(Debug, Clone)]
 pub struct BagAttachment {
@@ -447,17 +413,32 @@ pub struct BagReader {
     /// The upgraded copies of a version 1 bag's user frames, built on the
     /// first frame walk (see [`LegacyFrames`]). Empty for a current bag.
     legacy: OnceLock<LegacyFrames>,
+    /// Version 1 frames served unchanged because they are not one whole
+    /// version 1 frame (see [`BagReader::legacy_passthrough_count`]).
+    legacy_passthrough: AtomicU64,
+    /// The topics already warned about a passed-through frame.
+    legacy_passthrough_warned: Mutex<std::collections::BTreeSet<String>>,
 }
+
+/// The most user-frame bytes [`BagReader`] will hold upgraded in memory for a
+/// version 1 bag's frame walks: 2 GiB. A larger version 1 bag is refused by
+/// the frame walk with [`BagError::LegacyUpgrade`]; the message streams
+/// upgrade one message at a time and have no such limit, which is what
+/// `cerulion bag migrate` uses to write a current copy.
+pub const LEGACY_UPGRADE_CAP_BYTES: usize = 2 << 30;
 
 /// A bag recorded with the version 1 wire header (a version 1 schema
 /// descriptor) carries 32-byte headers. Its user frames are upgraded ONCE, on
-/// the first frame walk, into an in-memory arena; the walk then yields spans
-/// into the arena and [`BagReader::frame`] serves the upgraded bytes, so every
-/// span consumer reads current frames without knowing the bag was older. The
-/// cost is one copy of the user frames, held for the reader's lifetime, and
-/// only for such a bag. An arena span's offset is past the end of the mapped
-/// bytes (`map_len + position`), which is how [`BagReader::frame`] tells the
-/// two apart.
+/// the first frame walk, into an arena reserved at its exact size (and refused
+/// above [`LEGACY_UPGRADE_CAP_BYTES`]); the walk then yields spans into the
+/// arena and [`BagReader::frame`] serves the upgraded bytes, so every span
+/// consumer reads current frames without knowing the bag was older. The walk
+/// API hands out slices that live as long as the reader, which is why the
+/// upgraded copy is held for the reader's lifetime rather than per frame. An
+/// arena span's offset is past the end of the mapped bytes
+/// (`map_len + position`), which is how [`BagReader::frame`] tells the two
+/// apart. A frame that is not one whole version 1 frame is not in the index:
+/// the walk serves it from the map unchanged.
 #[derive(Default)]
 struct LegacyFrames {
     /// The user channels whose frames carry the version 1 header.
@@ -481,13 +462,37 @@ impl LegacyFrames {
     }
 }
 
-/// True when a channel's frames carry an older wire header than this build's:
-/// a user channel (reserved `__cerulion/*` payloads are not wire frames) whose
-/// descriptor states another version. A channel with no descriptor states
-/// nothing and is left alone.
-fn channel_needs_upgrade(topic: &str, descriptor: Option<&SchemaDescriptor>) -> bool {
-    !topic.starts_with(RESERVED_PREFIX)
-        && descriptor.is_some_and(|d| d.wire_header_version != WIRE_HEADER_VERSION)
+/// How a channel's frames relate to this build's wire header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelHeader {
+    /// Served as recorded: this build's version, a reserved `__cerulion/*`
+    /// channel (its payloads are not wire frames) or a channel with no
+    /// descriptor (it states nothing).
+    Current,
+    /// Version 1 (the 32-byte header): upgraded on read.
+    V1,
+    /// Any other version: refused with [`BagError::UnsupportedWireHeader`].
+    Unsupported(u16),
+}
+
+fn channel_header(topic: &str, descriptor: Option<&SchemaDescriptor>) -> ChannelHeader {
+    let Some(d) = descriptor else {
+        return ChannelHeader::Current;
+    };
+    if topic.starts_with(RESERVED_PREFIX) || d.wire_header_version == WIRE_HEADER_VERSION {
+        ChannelHeader::Current
+    } else if d.wire_header_version == 1 {
+        ChannelHeader::V1
+    } else {
+        ChannelHeader::Unsupported(d.wire_header_version)
+    }
+}
+
+fn unsupported(topic: &str, version: u16) -> BagError {
+    BagError::UnsupportedWireHeader {
+        topic: topic.to_string(),
+        version,
+    }
 }
 
 /// The source of [`BagReader::reader_id`]: a plain counter, so two live readers
@@ -522,6 +527,8 @@ impl BagReader {
                 file: Some(file),
                 reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
                 legacy: OnceLock::new(),
+                legacy_passthrough: AtomicU64::new(0),
+                legacy_passthrough_warned: Mutex::new(Default::default()),
             });
         }
         // SAFETY: the only sound-usage requirement `memmap2` places on a
@@ -536,6 +543,8 @@ impl BagReader {
             file: Some(file),
             reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
             legacy: OnceLock::new(),
+            legacy_passthrough: AtomicU64::new(0),
+            legacy_passthrough_warned: Mutex::new(Default::default()),
         })
     }
 
@@ -556,6 +565,8 @@ impl BagReader {
             file: None,
             reader_id: READER_IDS.fetch_add(1, Ordering::Relaxed),
             legacy: OnceLock::new(),
+            legacy_passthrough: AtomicU64::new(0),
+            legacy_passthrough_warned: Mutex::new(Default::default()),
         }
     }
 
@@ -790,46 +801,148 @@ impl BagReader {
         &arena[at..at + span.len]
     }
 
-    /// The user topics whose frames this bag recorded with an older wire header
-    /// than this build's, sorted. Their frames are upgraded on read by every
-    /// accessor (frame walks and message streams alike); this names them so a
-    /// tool can say so.
+    /// The user topics whose frames this bag recorded with the version 1 wire
+    /// header, sorted. Their frames are upgraded on read by every accessor
+    /// (frame walks and message streams alike); this names them so a tool can
+    /// say so. Refuses a bag whose user channels state a version this build
+    /// cannot read.
     pub fn legacy_wire_header_topics(&self) -> BagResult<Vec<String>> {
-        let mut topics: Vec<String> = self
-            .channels()?
-            .into_iter()
-            .filter(|c| channel_needs_upgrade(&c.topic, c.descriptor.as_ref()))
-            .map(|c| c.topic)
-            .collect();
+        let mut topics = Vec::new();
+        for c in self.channels()? {
+            match channel_header(&c.topic, c.descriptor.as_ref()) {
+                ChannelHeader::Current => {}
+                ChannelHeader::V1 => topics.push(c.topic),
+                ChannelHeader::Unsupported(v) => return Err(unsupported(&c.topic, v)),
+            }
+        }
         topics.sort();
         topics.dedup();
         Ok(topics)
     }
 
+    /// How many version 1 frames were served UNCHANGED because they are not
+    /// one whole version 1 frame (their `total_size` disagrees with their
+    /// length, or they are shorter than the header). Such a frame is handed
+    /// on as recorded, the way a headerless frame is, rather than refused;
+    /// the first on each topic logs a warning.
+    pub fn legacy_passthrough_count(&self) -> u64 {
+        self.legacy_passthrough.load(Ordering::Relaxed)
+    }
+
+    // hot-path-alloc-ok-fn: recording read path, cold, once per passed-through frame.
+    fn note_legacy_passthrough(&self, topic: &str, error: &FrameUpgradeError) {
+        self.legacy_passthrough.fetch_add(1, Ordering::Relaxed);
+        let first = self
+            .legacy_passthrough_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(topic.to_string());
+        if first {
+            tracing::warn!(
+                topic = %topic,
+                error = %error,
+                "a frame recorded with the version 1 wire header is not one whole frame, so it \
+                 is served unchanged (not upgraded); later ones on this topic are counted only"
+            );
+        }
+    }
+
+    /// Own one decoded MCAP message. A user frame recorded with the version 1
+    /// wire header is upgraded to the current layout; one that is not a whole
+    /// version 1 frame is passed on unchanged (counted, see
+    /// [`Self::legacy_passthrough_count`]); a channel at an unreadable version
+    /// is refused.
+    // hot-path-alloc-ok-fn: recording read path, one owned copy per message by contract.
+    fn own_message(&self, m: mcap::Message<'_>) -> BagResult<BagMessage> {
+        let descriptor = m
+            .channel
+            .schema
+            .as_ref()
+            .filter(|s| s.encoding == SCHEMA_ENCODING)
+            .and_then(|s| SchemaDescriptor::decode(&s.data).ok());
+        let data = match channel_header(&m.channel.topic, descriptor.as_ref()) {
+            ChannelHeader::Current => m.data.into_owned(),
+            ChannelHeader::Unsupported(v) => return Err(unsupported(&m.channel.topic, v)),
+            ChannelHeader::V1 => match upgrade_v1_frame(&m.data) {
+                Ok(up) => up,
+                Err(
+                    e @ (FrameUpgradeError::TooShort { .. }
+                    | FrameUpgradeError::SizeMismatch { .. }),
+                ) => {
+                    self.note_legacy_passthrough(&m.channel.topic, &e);
+                    m.data.into_owned()
+                }
+                Err(e) => {
+                    return Err(BagError::LegacyUpgrade {
+                        reason: format!("a frame on '{}': {e}", m.channel.topic),
+                    })
+                }
+            },
+        };
+        Ok(BagMessage {
+            channel_id: m.channel.id,
+            topic: m.channel.topic.clone(),
+            sequence: m.sequence,
+            log_time: m.log_time,
+            publish_time: m.publish_time,
+            data,
+        })
+    }
+
+    /// True when the bag carries a readable footer naming its data section,
+    /// the precondition every frame walk has. A cheap finalized probe: it
+    /// reads the footer only and builds nothing.
+    pub fn has_readable_footer(&self) -> bool {
+        self.finalized_data_end().is_ok()
+    }
+
     /// The upgraded copies of a version 1 bag's user frames, built on first
-    /// use from one raw walk. A bag with no such channel (or whose channel
-    /// table cannot be read; the walk that needs the copy fails on its own
-    /// then) gets an empty table and pays nothing more.
+    /// use: one raw walk sizes the copy exactly (refused above
+    /// [`LEGACY_UPGRADE_CAP_BYTES`]), a second fills it. A bag with no such
+    /// channel (or whose channel table cannot be read; the walk that needs the
+    /// copy fails on its own then) gets an empty table and pays nothing more.
     // hot-path-alloc-ok-fn: once per reader, a version 1 recording only.
     fn legacy_frames(&self) -> BagResult<&LegacyFrames> {
         if let Some(built) = self.legacy.get() {
             return Ok(built);
         }
-        let channels: std::collections::BTreeSet<u16> = match self.channels() {
-            Ok(chans) => chans
-                .iter()
-                .filter(|c| channel_needs_upgrade(&c.topic, c.descriptor.as_ref()))
-                .map(|c| c.id)
-                .collect(),
-            Err(_) => Default::default(),
-        };
+        let mut channels = std::collections::BTreeSet::new();
+        if let Ok(chans) = self.channels() {
+            for c in &chans {
+                match channel_header(&c.topic, c.descriptor.as_ref()) {
+                    ChannelHeader::Current => {}
+                    ChannelHeader::V1 => {
+                        channels.insert(c.id);
+                    }
+                    ChannelHeader::Unsupported(v) => return Err(unsupported(&c.topic, v)),
+                }
+            }
+        }
         let mut built = LegacyFrames {
             channels,
             ..Default::default()
         };
         if !built.channels.is_empty() {
-            let mut walk = self.raw_user_frames()?;
             let grow = WireHeader::SIZE - V1_HEADER_SIZE;
+            let mut total = 0usize;
+            let mut walk = self.raw_user_frames()?;
+            while let Some((channel_id, span)) = walk.next_user_frame()? {
+                if built.channels.contains(&channel_id) {
+                    total = total.saturating_add(span.len + grow);
+                }
+            }
+            if total > LEGACY_UPGRADE_CAP_BYTES {
+                return Err(BagError::LegacyUpgrade {
+                    reason: format!(
+                        "this bag was recorded with the 32-byte wire header and its frames \
+                         would take {total} bytes upgraded in memory, past the \
+                         {LEGACY_UPGRADE_CAP_BYTES}-byte limit; write a current copy with \
+                         `cerulion bag migrate <BAG>` and use that"
+                    ),
+                });
+            }
+            built.arena.reserve_exact(total);
+            let mut walk = self.raw_user_frames()?;
             while let Some((channel_id, span)) = walk.next_user_frame()? {
                 if !built.channels.contains(&channel_id) {
                     continue;
@@ -837,16 +950,24 @@ impl BagReader {
                 let src = &self.bytes()[span.offset..span.offset + span.len];
                 let at = built.arena.len();
                 built.arena.resize(at + span.len + grow, 0);
-                let n = upgrade_v1_frame_into(src, &mut built.arena[at..]).map_err(|e| {
-                    BagError::Malformed {
-                        reason: format!(
-                            "a frame on '{}' recorded with the version 1 wire header could \
-                             not be upgraded: {e}",
-                            walk.topic(channel_id)
-                        ),
+                match upgrade_v1_frame_into(src, &mut built.arena[at..]) {
+                    Ok(n) => {
+                        built.arena.truncate(at + n);
+                        built.index.push((span.offset, at, n));
                     }
-                })?;
-                built.index.push((span.offset, at, n));
+                    Err(
+                        e @ (FrameUpgradeError::TooShort { .. }
+                        | FrameUpgradeError::SizeMismatch { .. }),
+                    ) => {
+                        built.arena.truncate(at);
+                        self.note_legacy_passthrough(walk.topic(channel_id), &e);
+                    }
+                    Err(e) => {
+                        return Err(BagError::LegacyUpgrade {
+                            reason: format!("a frame on '{}': {e}", walk.topic(channel_id)),
+                        })
+                    }
+                }
             }
         }
         Ok(self.legacy.get_or_init(|| built))
@@ -1262,7 +1383,7 @@ impl BagReader {
     /// bag).
     pub fn messages(&self) -> BagResult<impl Iterator<Item = BagResult<BagMessage>> + '_> {
         Ok(mcap::MessageStream::new(&self.data)?
-            .map(|r| r.map_err(BagError::from).and_then(BagMessage::from_mcap)))
+            .map(move |r| r.map_err(BagError::from).and_then(|m| self.own_message(m))))
     }
 
     /// STREAM the messages on ONE topic out of a possibly-truncated bag,
@@ -1301,7 +1422,7 @@ impl BagReader {
             match item {
                 // The topic test rides the BORROWED message, so a payload on
                 // any other channel is skipped without ever being copied.
-                Ok(m) if m.channel.topic == topic => Some(BagMessage::from_mcap(m)),
+                Ok(m) if m.channel.topic == topic => Some(self.own_message(m)),
                 Ok(_) => None,
                 Err(e) => {
                     ended = true;
@@ -1328,7 +1449,7 @@ impl BagReader {
         let mut out = Vec::new();
         for item in stream {
             match item {
-                Ok(m) => out.push(BagMessage::from_mcap(m)?),
+                Ok(m) => out.push(self.own_message(m)?),
                 Err(e) => {
                     return Ok((out, BagCompleteness::TornTail(BagError::from(e))));
                 }
@@ -1758,13 +1879,13 @@ impl UserFrameWalk<'_> {
                              (unexpected copy — a compressed or corrupt chunk?)"
                         .to_string(),
                 })?;
-            if let Some(legacy) = self.legacy.filter(|l| l.channels.contains(&channel_id)) {
-                let (at, len) = legacy.lookup(offset).ok_or_else(|| BagError::Malformed {
-                    reason: format!(
-                        "a frame on '{topic}' recorded with the version 1 wire header has no \
-                         upgraded copy (the bag changed under the reader?)"
-                    ),
-                })?;
+            // A version 1 frame that was not one whole frame has no upgraded
+            // copy and is served from the map as recorded.
+            if let Some((at, len)) = self
+                .legacy
+                .filter(|l| l.channels.contains(&channel_id))
+                .and_then(|l| l.lookup(offset))
+            {
                 return Ok(Some((
                     channel_id,
                     FrameSpan {

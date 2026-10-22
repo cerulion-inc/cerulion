@@ -79,7 +79,7 @@ def test_two_input_one_output_metadata_matches_handwritten_oracle():
                 "name": "result",
                 "schema": "Probe",
                 "schema_hash": 5093796653891464803,
-                "max_slice_len_default": 36,
+                "max_slice_len_default": 44,
                 "promise_within_ms": None,
                 "wire_fixed_size": 4,
             }

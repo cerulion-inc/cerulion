@@ -131,7 +131,7 @@ fn a_version_1_bag_names_its_legacy_topics_and_its_descriptors_say_version_1() {
     );
     for c in r.channels().unwrap() {
         let d = c.descriptor.expect("cerulion descriptor");
-        assert_eq!(d.descriptor_version, 1, "{}", c.topic);
+        assert_eq!(d.descriptor_version(), 1, "{}", c.topic);
         assert_eq!(d.wire_header_version, 1, "{}", c.topic);
     }
 }
@@ -199,25 +199,95 @@ fn the_frame_walk_its_resumption_and_the_span_index_serve_upgraded_frames() {
     assert_eq!(r.frame(&s), want[0].as_slice());
 }
 
+/// A version 1 frame that is not one whole frame (its `total_size` disagrees
+/// with its length) is served UNCHANGED, as a headerless frame is: by the
+/// message streams and by the frame walk, counted, and the bag stays usable
+/// (its finalized probe and every other frame are unaffected).
 #[test]
-fn a_version_1_frame_that_is_not_whole_is_refused_rather_than_misread() {
+fn a_version_1_frame_that_is_not_whole_is_served_unchanged_and_counted() {
     // The second frame declares 57 bytes but carries 56.
     let mut frames = three_frames();
     frames[1][8] = 57;
+    let broken = frames[1].clone();
     let r = BagReader::from_bytes(legacy_bag(&frames));
-    let streamed: Vec<_> = r.messages().unwrap().collect();
-    assert!(
-        streamed.iter().any(|m| m.is_err()),
-        "the broken frame must surface as an error"
+    assert!(r.has_readable_footer(), "the bag is intact");
+
+    let user: Vec<Vec<u8>> = r
+        .messages()
+        .unwrap()
+        .map(|m| m.unwrap())
+        .filter(|m| m.topic == "/v3")
+        .map(|m| m.data)
+        .collect();
+    assert_eq!(
+        user,
+        vec![v2_frame(0, 1.5), broken.clone(), v2_frame(2, 3.5)]
     );
-    let err = match r.user_frames() {
-        Ok(_) => panic!("the frame walk must refuse a bag whose frames cannot be upgraded"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.contains("version 1 wire header"),
-        "names the cause: {err}"
+    assert_eq!(r.legacy_passthrough_count(), 1);
+
+    let mut walk = r.user_frames().unwrap();
+    let mut walked = Vec::new();
+    while let Some((_, span)) = walk.next_user_frame().unwrap() {
+        walked.push(r.frame(&span).to_vec());
+    }
+    assert_eq!(walked, vec![v2_frame(0, 1.5), broken, v2_frame(2, 3.5)]);
+    assert_eq!(
+        r.legacy_passthrough_count(),
+        2,
+        "once per accessor that served it"
     );
+}
+
+/// A user channel stating a wire header version other than 1 or this build's
+/// is refused by every accessor, naming the version.
+#[test]
+fn a_channel_at_an_unknown_wire_header_version_is_refused_naming_it() {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = mcap::WriteOptions::new()
+            .compression(None)
+            .create(&mut buf)
+            .unwrap();
+        // A version 2 descriptor stating wire header version 7.
+        let mut d = vec![0x02, 0x00, 0x03, 0x00, 0x00, 0x00];
+        d.extend_from_slice(&HASH.to_le_bytes());
+        d.extend_from_slice(&[0x18, 0x00, 0x00, 0x00, 0x07, 0x00]);
+        let schema = w
+            .add_schema("geometry_msgs/Vector3", "cerulion", &d)
+            .unwrap();
+        let ch = w
+            .add_channel(schema, "/v7", "cerulion", &Default::default())
+            .unwrap();
+        w.write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: ch,
+                sequence: 0,
+                log_time: 1,
+                publish_time: 1,
+            },
+            &v2_frame(0, 1.0),
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
+    let r = BagReader::from_bytes(buf.into_inner());
+    for err in [
+        r.legacy_wire_header_topics().unwrap_err(),
+        r.user_frames().err().expect("the walk refuses"),
+        r.messages()
+            .unwrap()
+            .find_map(Result::err)
+            .expect("the stream refuses"),
+    ] {
+        assert!(
+            matches!(
+                err,
+                cerulion_bag::BagError::UnsupportedWireHeader { version: 7, .. }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("wire header version 7"), "{err}");
+    }
 }
 
 #[test]

@@ -97,8 +97,11 @@ pub const FRAME_PRODUCERS_SCHEMA: &str = "cerulion.FrameProducers";
 /// A decoded `cerulion` schema descriptor (the Schema record's `data` blob).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaDescriptor {
-    /// The descriptor wire version. Written as [`DESCRIPTOR_VERSION`].
-    pub descriptor_version: u16,
+    /// The descriptor wire version it was DECODED from (1 or 2); a new one is
+    /// [`DESCRIPTOR_VERSION`]. Private: [`Self::encode`] always writes the
+    /// current layout, so a settable version would claim a layout the bytes do
+    /// not have. Read it with [`Self::descriptor_version`].
+    descriptor_version: u16,
     /// The schema-hash recipe id (see `cerulion_core::trace::bag::HASH_RECIPE`).
     /// Written as the current [`HASH_RECIPE`].
     pub hash_recipe: u32,
@@ -137,9 +140,15 @@ impl SchemaDescriptor {
         }
     }
 
+    /// The descriptor version this value was decoded from (1 or 2), or
+    /// [`DESCRIPTOR_VERSION`] for one built with [`Self::new`].
+    pub fn descriptor_version(&self) -> u16 {
+        self.descriptor_version
+    }
+
     /// Encode to the fixed [`DESCRIPTOR_LEN`]-byte little-endian blob. Always
-    /// writes the current layout (version 2), whatever
-    /// [`descriptor_version`](Self::descriptor_version) a decoded value held.
+    /// writes the current layout (version 2): a version 1 value re-encodes as
+    /// version 2 with the wire header version it decoded (1).
     pub fn encode(&self) -> [u8; DESCRIPTOR_LEN] {
         let mut b = [0u8; DESCRIPTOR_LEN];
         b[0..2].copy_from_slice(&DESCRIPTOR_VERSION.to_le_bytes());

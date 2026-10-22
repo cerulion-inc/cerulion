@@ -228,16 +228,71 @@ fn open_only_heals_missing_event_half_without_minting_topics() {
     );
 }
 
-/// A data service that does not state this build's wire header version is
-/// refused by every Cerulion opener, with the remedy in the error: one created
-/// without the attribute (a release older than it, or a raw iceoryx2 program)
-/// and one stating another version. The data-only recording tap, the open-only
-/// introspection subscriber and the graph opener all refuse; nothing attaches.
+/// A data service stating ANOTHER wire header version is refused by every
+/// Cerulion opener, naming both versions and the remedy: the open-only
+/// subscriber, the data-only recording tap, the graph opener and the external
+/// publisher probe. Nothing attaches.
 #[test]
-fn a_data_service_without_this_wire_header_version_is_refused_by_every_opener() {
+fn a_data_service_at_another_wire_header_version_is_refused_by_every_opener() {
     use cerulion_core::transport::wire_header_attribute::specifier_for;
     use cerulion_core::wire::WIRE_HEADER_VERSION;
 
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let raw_node = iceoryx2::node::NodeBuilder::new()
+        .config(&ix)
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("raw iceoryx2 node");
+    let other: iceoryx2::service::service_name::ServiceName =
+        "/wirehdr/other/data".try_into().expect("service name");
+    let _other = raw_node
+        .service_builder(&other)
+        .publish_subscribe::<[u8]>()
+        // The graph opener requires its subscriber buffer as the service
+        // ceiling; matching it makes the wire header the only mismatch.
+        .subscriber_max_buffer_size(8)
+        .create_with_attributes(&specifier_for(WIRE_HEADER_VERSION + 1).expect("attribute"))
+        .expect("a data service stating another wire header version");
+
+    let mgr = manager_with("wirehdr_refuse", 8, ix);
+    let topic = "/wirehdr/other";
+    let mut errors = Vec::new();
+    match mgr.create_subscriber_open_only(topic) {
+        Ok(_) => panic!("the open-only subscriber must refuse"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    match mgr.create_data_only_subscriber(topic) {
+        Ok(_) => panic!("the recording tap must refuse"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    match mgr.create_subscriber(topic) {
+        Ok(_) => panic!("the graph opener must refuse"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    match mgr.external_publisher_probe(topic) {
+        Ok(_) => panic!("the external publisher probe must refuse"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    let want = format!(
+        "states wire header version {} and this build reads version {WIRE_HEADER_VERSION}",
+        WIRE_HEADER_VERSION + 1
+    );
+    for msg in errors {
+        assert!(
+            msg.contains(&want) && msg.contains("another Cerulion release"),
+            "the refusal must name both versions and the remedy: {msg}"
+        );
+    }
+    // The count probes read it as absent rather than as a live topic.
+    assert_eq!(mgr.topic_publisher_count(topic), 0);
+    assert_eq!(mgr.topic_publisher_count_checked(topic), None);
+}
+
+/// A data service that states NO wire header version (a raw iceoryx2
+/// program created it) is accepted by every opener, with one warning per
+/// topic that its frames are assumed to carry this build's header layout.
+#[tracing_test::traced_test]
+#[test]
+fn a_data_service_without_the_attribute_is_accepted_and_warned_once() {
     let ix = cerulion_core::testing::iceoryx_test_config();
     let raw_node = iceoryx2::node::NodeBuilder::new()
         .config(&ix)
@@ -248,38 +303,33 @@ fn a_data_service_without_this_wire_header_version_is_refused_by_every_opener() 
     let _unstated = raw_node
         .service_builder(&unstated)
         .publish_subscribe::<[u8]>()
+        // The graph opener requires its subscriber buffer as the service
+        // ceiling; matching it makes the attribute the only difference.
+        .subscriber_max_buffer_size(8)
         .create()
         .expect("a data service with no wire header attribute");
-    let other: iceoryx2::service::service_name::ServiceName =
-        "/wirehdr/other/data".try_into().expect("service name");
-    let _other = raw_node
-        .service_builder(&other)
-        .publish_subscribe::<[u8]>()
-        .create_with_attributes(&specifier_for(WIRE_HEADER_VERSION + 1).expect("attribute"))
-        .expect("a data service stating another wire header version");
 
-    let mgr = manager_with("wirehdr_refuse", 8, ix);
-    for topic in ["/wirehdr/unstated", "/wirehdr/other"] {
-        let open_only = match mgr.create_subscriber_open_only(topic) {
-            Ok(_) => panic!("{topic}: the open-only subscriber must refuse"),
-            Err(e) => e.to_string(),
-        };
-        let tap = match mgr.create_data_only_subscriber(topic) {
-            Ok(_) => panic!("{topic}: the recording tap must refuse"),
-            Err(e) => e.to_string(),
-        };
-        let graph = match mgr.create_subscriber(topic) {
-            Ok(_) => panic!("{topic}: the graph opener must refuse"),
-            Err(e) => e.to_string(),
-        };
-        for msg in [open_only, tap, graph] {
-            assert!(
-                msg.contains("does not state this build's wire header")
-                    && msg.contains("different Cerulion release"),
-                "{topic}: the refusal must name the wire header cause and remedy: {msg}"
-            );
+    let mgr = manager_with("wirehdr_absent", 8, ix);
+    let topic = "/wirehdr/unstated";
+    let _a = mgr
+        .create_subscriber_open_only(topic)
+        .expect("the open-only subscriber accepts it");
+    let _b = mgr
+        .create_data_only_subscriber(topic)
+        .expect("the recording tap accepts it");
+    let _c = mgr
+        .create_subscriber(topic)
+        .expect("the graph opener accepts it");
+    logs_assert(|lines: &[&str]| {
+        let warns = lines
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains("states no wire header version"))
+            .count();
+        match warns {
+            1 => Ok(()),
+            n => Err(format!("expected one warning for the topic, got {n}")),
         }
-    }
+    });
 }
 
 /// A data service a Cerulion publisher creates states this build's wire

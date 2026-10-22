@@ -245,6 +245,11 @@ pub struct MigrationRecord {
     pub migrated_graph_yaml_sha256: String,
     /// The keys that were removed.
     pub stripped: Vec<StrippedKey>,
+    /// The topics whose frames were recorded with the 32-byte wire header
+    /// and were upgraded to the current one by this migration. Empty (and
+    /// absent from the record) when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wire_header_upgraded_topics: Vec<String>,
 }
 
 // ===========================================================================
@@ -300,7 +305,7 @@ pub fn bag_migrate(
     // — so `attachments()` would answer "none" rather than "unreadable". Ask
     // the cheap question the frame walk already answers, then pay for the
     // precise classification ONLY to describe the refusal.
-    if reader.user_frames().is_err() {
+    if !reader.has_readable_footer() {
         let how = match reader.completeness() {
             Ok(c) => format!("{c:?}"),
             Err(e) => format!("unreadable ({e})"),
@@ -336,8 +341,16 @@ pub fn bag_migrate(
         ))
     })?;
 
+    // A bag recorded with the 32-byte wire header (version 1) is migrated to
+    // the current header even when its graph parses: the message stream this
+    // verb copies upgrades every such frame, and the output's descriptors state
+    // the current version.
+    let legacy_topics = reader.legacy_wire_header_topics().map_err(|e| {
+        CliError::Validation(format!("bag migrate: cannot read the channel table: {e}"))
+    })?;
+
     // THE nothing-to-do gate, decided by literally running the strict parser.
-    if parse_graph_raw(yaml).is_ok() {
+    if legacy_topics.is_empty() && parse_graph_raw(yaml).is_ok() {
         return Err(CliError::Validation(format!(
             "bag migrate: the `{GRAPH_ATTACHMENT}` embedded in '{}' already parses — there is \
              nothing to migrate, and this verb will not mint a copy that differs from the \
@@ -1261,7 +1274,7 @@ pub fn user_topic_schemas(channels: &[BagChannel]) -> CliResult<Vec<TopicSchema>
         // header version it implies, which the decoder fills in; the hash
         // fields mean the same thing in both, so it migrates.
         let descriptor_readable =
-            d.descriptor_version == 1 || d.descriptor_version == DESCRIPTOR_VERSION;
+            d.descriptor_version() == 1 || d.descriptor_version() == DESCRIPTOR_VERSION;
         if !descriptor_readable || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE {
             return Err(CliError::Validation(format!(
                 "bag migrate: channel '{}' was recorded with schema descriptor version {} / hash \
@@ -1269,7 +1282,7 @@ pub fn user_topic_schemas(channels: &[BagChannel]) -> CliResult<Vec<TopicSchema>
                  migrated copy would re-stamp them, silently claiming its hashes were computed \
                  by a recipe that did not compute them. Refusing.",
                 ch.topic,
-                d.descriptor_version,
+                d.descriptor_version(),
                 d.hash_recipe,
                 cerulion_core::trace::bag::HASH_RECIPE
             )));
@@ -1346,6 +1359,9 @@ fn write_migrated_bag(
         ),
         migrated_graph_yaml_sha256: sha256_hex(migrated_yaml.as_bytes()),
         stripped: strip.stripped.clone(),
+        wire_header_upgraded_topics: reader.legacy_wire_header_topics().map_err(|e| {
+            CliError::Validation(format!("bag migrate: cannot read the channel table: {e}"))
+        })?,
     };
     let record_bytes = serde_json::to_vec_pretty(&record).map_err(|e| {
         CliError::Validation(format!(
@@ -3758,6 +3774,7 @@ mod tests {
                 path: "nodes[0].policy".into(),
                 line: 5,
             }],
+            wire_header_upgraded_topics: Vec::new(),
         })
         .unwrap();
         write_legacy_bag_with_attachment(&input, MIGRATION_ATTACHMENT, &record);
@@ -3965,7 +3982,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_descriptor_channel_is_carried_and_an_unknown_version_is_refused() {
+    fn a_version_1_descriptor_channel_is_carried_and_an_unknown_version_cannot_decode() {
         // A version 1 blob: 18 bytes, recipe 3, hash 0xAB, fixed size 12.
         let mut v1 = [0u8; cerulion_bag::DESCRIPTOR_V1_LEN];
         v1[0] = 1;
@@ -3978,12 +3995,10 @@ mod tests {
         assert_eq!(got[0].schema_hash, 0xAB);
         assert_eq!(got[0].wire_fixed_size, 12);
 
-        let mut unknown = cerulion_bag::SchemaDescriptor::new(0xAB, 12);
-        unknown.descriptor_version = 3;
-        let err = user_topic_schemas(&[chan("/v3", Some(unknown))])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("schema descriptor version 3"), "got: {err}");
+        // An unknown descriptor version cannot be constructed: decode refuses it.
+        let mut v3 = v1;
+        v3[0] = 3;
+        assert!(cerulion_bag::SchemaDescriptor::decode(&v3).is_err());
     }
 
     #[test]

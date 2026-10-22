@@ -358,9 +358,9 @@ def output(schema, *, promise_within_ms=None, max_slice_len_default=None):
     if max_slice_len_default is not None and (
         isinstance(max_slice_len_default, bool)
         or not isinstance(max_slice_len_default, int)
-        or max_slice_len_default < 32
+        or max_slice_len_default < WIRE_HEADER_SIZE
     ):
-        raise ValueError("max_slice_len_default must be at least 32")
+        raise ValueError(f"max_slice_len_default must be at least {WIRE_HEADER_SIZE}")
     return Output(
         schema,
         input_port=False,

@@ -128,13 +128,13 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
     /// User code reaches the proxy only through `loan_proxy`.
     ///
     /// The `sample` must hold an outbound iceoryx2 sample
-    /// that has had the WireHeader written to bytes `[0..32]` (with
+    /// that has had the WireHeader written to bytes `[0..WireHeader::SIZE]` (with
     /// `total_size` AND `sequence` provisionally set — drop rewrites
     /// `total_size` from `T::payload_wire_size` and stamps the
     /// committed sequence consumed via `commit_sequence`). The offset
     /// table (variable schemas) must already be zero-initialized.
     /// `writer` must be a `T::Writer<'loan>` constructed over the
-    /// payload bytes `[32..]` of that same sample (via
+    /// payload bytes `[WireHeader::SIZE..]` of that same sample (via
     /// `T::build_writer`).
     pub(crate) fn new(
         sample: SampleHandle<'loan>,
@@ -360,7 +360,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 "OutputProxy::Drop overflow: total_size {} exceeds u32::MAX",
                 total_size
             );
-            // Copy the WireHeader from the original sample's [0..32]
+            // Copy the WireHeader from the original sample's [0..WireHeader::SIZE]
             // (stamped at loan time with provisional total_size) and
             // patch total_size to the final wire size before forwarding.
             let original_bytes = self.sample.bytes();
@@ -375,7 +375,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
             // the correct fail-loud mechanism for a Drop-time invariant
             // break.
             if original_bytes.len() < WireHeader::SIZE {
-                // Invariant violation: `loan_proxy` stamps a 32-byte
+                // Invariant violation: `loan_proxy` stamps a 40-byte
                 // header before proxy construction; reaching this
                 // branch means a future refactor broke that
                 // invariant. Bump `frames_dropped_invariant_violation`
@@ -496,7 +496,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
 
         // 2. Finalize WireHeader::total_size + `sequence` in the
         //    loaned bytes. The payload size comes from the writer (cursor
-        //    for variable, WIRE_FIXED_SIZE for fixed); add the 32-byte
+        //    for variable, WIRE_FIXED_SIZE for fixed); add the 40-byte
         //    header to get the wire frame total size.
         let payload_size = T::payload_wire_size(&self.writer);
         let total_size = WireHeader::SIZE + payload_size;
@@ -576,7 +576,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 // simply call `send()` here. The header carries the real
                 // size for the receiver to slice on.
                 // SAFETY: every byte is initialized — the WireHeader covers
-                // [0..32], `T::build_writer` initialized the fixed section
+                // [0..WireHeader::SIZE], `T::build_writer` initialized the fixed section
                 // and zeroed the offset table, and the user's writes
                 // initialized the variable payload region (or the bytes
                 // are unused dead space past total_size).

@@ -288,7 +288,7 @@ fn channels_of(reader: &BagReader) -> BTreeMap<String, Chan> {
                     schema_name: c.schema_name,
                     schema_encoding: c.schema_encoding,
                     message_encoding: c.message_encoding,
-                    descriptor_version: c.descriptor.map(|d| d.descriptor_version),
+                    descriptor_version: c.descriptor.map(|d| d.descriptor_version()),
                     hash_recipe: c.descriptor.map(|d| d.hash_recipe),
                     schema_hash: c.descriptor.map(|d| d.schema_hash),
                     wire_fixed_size: c.descriptor.map(|d| d.wire_fixed_size),
@@ -1023,4 +1023,91 @@ fn the_input_bag_can_never_be_the_output() {
         before,
         "the recording must be byte-untouched"
     );
+}
+
+/// A recording from the release with the 32-byte wire header whose graph
+/// already parses is still migrated: the copy carries every user frame in the
+/// current 40-byte layout under version 2 descriptors, and the record names
+/// the upgraded topics. The same bag in the current layout has nothing to
+/// migrate.
+#[test]
+fn a_32_byte_header_recording_migrates_to_the_current_header() {
+    use cerulion_core::wire::{StepTag, WireHeader};
+    let dir = tmp();
+    let current = dir.path().join("current.mcap");
+    let topic = TopicSchema {
+        topic: USER_TOPIC_B.into(),
+        schema_name: "geometry_msgs/Vector3".into(),
+        schema_hash: 0x0BAD_F00D_DEAD_BEEF,
+        wire_fixed_size: 24,
+    };
+    let frames: Vec<Vec<u8>> = (0..3u32)
+        .map(|i| {
+            let mut f = vec![0u8; WireHeader::SIZE + 24];
+            WireHeader {
+                schema_hash: 0x0BAD_F00D_DEAD_BEEF,
+                total_size: f.len() as u32,
+                offset_table_offset: f.len() as u32,
+                offset_table_count: 0,
+                sequence: i,
+                timestamp_ns: 1_000 + i as u64,
+                step_tag: StepTag::UNTAGGED,
+            }
+            .write_to_buf(&mut f[..WireHeader::SIZE]);
+            f[WireHeader::SIZE..].fill(0x40 + i as u8);
+            f
+        })
+        .collect();
+    let mut w = BagWriter::create(&current, BagWriterConfig::default(), &[topic]).unwrap();
+    w.write_chunk(|c| {
+        for (i, f) in frames.iter().enumerate() {
+            c.write_message(USER_TOPIC_B, i as u32, 10 + i as u64, 10 + i as u64, &[f])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    w.write_attachment("graph.yaml", "application/yaml", 1, 1, &clean_graph_yaml())
+        .unwrap();
+    w.finalize().unwrap();
+    assert!(
+        migrate_with_yes(&current, Some(dir.path().join("nothing.mcap"))).is_err(),
+        "a current bag with a clean graph has nothing to migrate"
+    );
+
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(
+        &legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap()),
+    )
+    .unwrap();
+    let out = dir.path().join("migrated.mcap");
+    migrate_with_yes(&legacy, Some(out.clone())).expect("a legacy bag migrates");
+
+    let migrated = BagReader::open(&out).unwrap();
+    assert!(migrated.legacy_wire_header_topics().unwrap().is_empty());
+    let chans = migrated.channels().unwrap();
+    let ch = chans.iter().find(|c| c.topic == USER_TOPIC_B).unwrap();
+    let d = ch.descriptor.unwrap();
+    assert_eq!((d.descriptor_version(), d.wire_header_version), (2, 2));
+    let got: Vec<Vec<u8>> = migrated
+        .messages()
+        .unwrap()
+        .map(|m| m.unwrap())
+        .filter(|m| m.topic == USER_TOPIC_B)
+        .map(|m| m.data)
+        .collect();
+    assert_eq!(
+        got, frames,
+        "the migrated frames are the current-layout originals"
+    );
+    let record = migrated
+        .attachment(cerulion_cli_engine::bag_migrate::MIGRATION_ATTACHMENT)
+        .unwrap()
+        .expect("a migration record");
+    let v: serde_json::Value = serde_json::from_slice(&record.data).unwrap();
+    assert_eq!(
+        v["wire_header_upgraded_topics"],
+        serde_json::json!([USER_TOPIC_B])
+    );
+    assert_eq!(v["stripped"], serde_json::json!([]));
 }

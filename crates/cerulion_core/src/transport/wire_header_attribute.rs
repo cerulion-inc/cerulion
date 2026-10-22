@@ -2,25 +2,36 @@
 //! The iceoryx2 service attribute that states which [`WireHeader`] layout a
 //! topic's data service carries.
 //!
-//! Every Cerulion data service (`{topic}/data`) is created with the attribute
-//! [`WIRE_HEADER_ATTRIBUTE_KEY`] set to this build's [`WIRE_HEADER_VERSION`],
-//! and every Cerulion opener REQUIRES it. A process from a release with a
-//! different header version (or a foreign iceoryx2 process that created the
-//! service without the attribute) therefore cannot be attached to: the open
-//! fails with `IncompatibleAttributes` and the error names the remedy, instead
-//! of the two sides reading each other's frames at the wrong offsets.
+//! Every Cerulion data service (`{topic}/data`) this build creates carries the
+//! attribute [`WIRE_HEADER_ATTRIBUTE_KEY`] set to its [`WIRE_HEADER_VERSION`].
+//! Every Cerulion opener reads the attribute of the service it opened
+//! ([`check_opened`]):
 //!
-//! What this cannot do: a process built BEFORE the attribute existed requires
-//! nothing when it opens, so an older process opening a service this build
-//! created is not refused by iceoryx2. Run one Cerulion release per machine.
+//! - the key states this build's version: the service is used;
+//! - the key states ANOTHER version: the open is refused, loudly (once per
+//!   topic in the log, every time in the error), because the two sides would
+//!   read each other's frames at the wrong offsets;
+//! - the key is absent: the service was created by a raw iceoryx2 program, or
+//!   by a Cerulion release older than the attribute. It is accepted, and a
+//!   warning (once per topic) says its frames are assumed to carry this
+//!   build's header layout.
+//!
+//! What this cannot do: a process built BEFORE the attribute existed reads no
+//! attribute, so an older process opening a service this build created is
+//! not refused by anything; and an older release's service (no attribute)
+//! is accepted here under the assumption above. One Cerulion release per
+//! machine is the supported configuration; the attribute turns the
+//! newer-meets-newer mismatch loud.
 //!
 //! A raw iceoryx2 program that publishes Cerulion frames creates its data
-//! service with [`data_service_specifier`] (or opens with
-//! [`data_service_verifier`]) to interoperate.
+//! service with [`data_service_specifier`] to state its version.
 //!
 //! [`WireHeader`]: crate::wire::WireHeader
 
-use iceoryx2::service::attribute::{AttributeSpecifier, AttributeVerifier};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
+use iceoryx2::service::attribute::{AttributeSet, AttributeSpecifier, AttributeVerifier};
 
 use crate::error::{TransportError, TransportResult};
 use crate::wire::WIRE_HEADER_VERSION;
@@ -85,6 +96,103 @@ pub fn data_service_verifier() -> TransportResult<AttributeVerifier> {
     verifier_for(WIRE_HEADER_VERSION)
 }
 
+/// What an opened data service states about its wire header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatedWireHeader {
+    /// The attribute states this build's version.
+    Matches,
+    /// The service carries no such attribute.
+    Absent,
+    /// The attribute states something else (another version, or a value that
+    /// is not one), verbatim.
+    Other(String),
+}
+
+/// Read the wire header attribute off an opened service's attribute set.
+// hot-path-alloc-ok-fn: cold, one read per service open, never per frame.
+pub fn stated(attributes: &AttributeSet) -> StatedWireHeader {
+    let Ok(key) = WIRE_HEADER_ATTRIBUTE_KEY.try_into() else {
+        return StatedWireHeader::Absent;
+    };
+    let ours = WIRE_HEADER_VERSION.to_string();
+    let n = attributes.number_of_key_values(&key);
+    if n == 0 {
+        return StatedWireHeader::Absent;
+    }
+    let mut other = None;
+    for i in 0..n {
+        if let Some(v) = attributes.key_value(&key, i) {
+            let v = v.to_string();
+            if v == ours {
+                return StatedWireHeader::Matches;
+            }
+            other.get_or_insert(v);
+        }
+    }
+    StatedWireHeader::Other(other.unwrap_or_default())
+}
+
+/// The most topics each once-per-topic log set remembers; past it a new topic
+/// logs at `debug!`, so a machine with unbounded topic churn cannot grow it.
+const LOGGED_TOPICS_CAP: usize = 1024;
+
+static WARNED_ABSENT: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new()); // hot-path-alloc-ok: const empty set, filled only at service open
+static LOGGED_MISMATCH: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new()); // hot-path-alloc-ok: const empty set, filled only at service open
+
+// hot-path-alloc-ok-fn: cold, one insert per topic, bounded.
+fn first_time(set: &Mutex<BTreeSet<String>>, topic: &str) -> bool {
+    let mut set = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set.len() < LOGGED_TOPICS_CAP && set.insert(topic.to_string())
+}
+
+/// The rule every Cerulion opener applies to a data service it opened (see
+/// the module docs): `Ok` to use it, `Err(reason)` to refuse. An absent
+/// attribute is accepted with a once-per-topic warning; another stated
+/// version is refused, logged once per topic, the reason naming both
+/// versions and the remedy.
+// hot-path-alloc-ok-fn: cold, one check per service open, never per frame.
+pub fn check_opened(topic: &str, attributes: &AttributeSet) -> Result<(), String> {
+    match stated(attributes) {
+        StatedWireHeader::Matches => Ok(()),
+        StatedWireHeader::Absent => {
+            if first_time(&WARNED_ABSENT, topic) {
+                tracing::warn!(
+                    topic = %topic,
+                    local_wire_header = WIRE_HEADER_VERSION,
+                    "this topic's data service states no wire header version (it was created \
+                     by a raw iceoryx2 program or an older Cerulion release); its frames are \
+                     assumed to carry this build's header layout"
+                );
+            } else {
+                tracing::debug!(topic = %topic, "data service states no wire header version (repeat)");
+            }
+            Ok(())
+        }
+        StatedWireHeader::Other(theirs) => {
+            let reason = format!(
+                "the data service states wire header version {theirs} and this build reads \
+                 version {WIRE_HEADER_VERSION}, so its frames would be read at the wrong offsets; \
+                 it was created by a process from another Cerulion release. Stop the processes \
+                 from that release (and rebuild node libraries with `cerulion node build`), then \
+                 retry"
+            );
+            if first_time(&LOGGED_MISMATCH, topic) {
+                tracing::error!(
+                    topic = %topic,
+                    stated_wire_header = %theirs,
+                    local_wire_header = WIRE_HEADER_VERSION,
+                    "refused a data service created by another Cerulion release: it states \
+                     another wire header version, so its frames would be read at the wrong \
+                     offsets"
+                );
+            }
+            Err(reason)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +233,29 @@ mod tests {
             .unwrap()
             .verify_requirements(specifier_for(2).unwrap().attributes())
             .is_ok());
+    }
+
+    /// `stated` reads the three cases off an attribute set.
+    #[test]
+    fn an_attribute_set_states_matching_absent_or_another_version() {
+        assert_eq!(
+            stated(specifier_for(WIRE_HEADER_VERSION).unwrap().attributes()),
+            StatedWireHeader::Matches
+        );
+        assert_eq!(
+            stated(AttributeSpecifier::new().attributes()),
+            StatedWireHeader::Absent
+        );
+        assert_eq!(
+            stated(specifier_for(WIRE_HEADER_VERSION + 1).unwrap().attributes()),
+            StatedWireHeader::Other((WIRE_HEADER_VERSION + 1).to_string())
+        );
+        assert!(check_opened("/t/absent", AttributeSpecifier::new().attributes()).is_ok());
+        let err = check_opened(
+            "/t/other",
+            specifier_for(WIRE_HEADER_VERSION + 1).unwrap().attributes(),
+        )
+        .unwrap_err();
+        assert!(err.contains(&format!("wire header version {}", WIRE_HEADER_VERSION + 1)));
     }
 }

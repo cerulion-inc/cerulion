@@ -2066,7 +2066,7 @@ mod tests {
         assert_eq!(
             json,
             r#"{"version":1,"robot":"go2","entries":[{"topic":"/imu","schema_hash":7,"schema_name":null,"provenance":"runtime","producer_count":1}],"wire_header_version":2}"#,
-            "the no-liveness wire must be byte-identical to the pre-liveness document"
+            "the no-liveness wire must carry no liveness key and nothing else new"
         );
 
         // (2) an OLD robot's literal document decodes with liveness UNKNOWN.

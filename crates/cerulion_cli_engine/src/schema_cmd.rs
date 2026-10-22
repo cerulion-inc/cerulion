@@ -373,9 +373,9 @@ pub(crate) fn offset_table_entries(schema: &MessageSchema, moment: SizeMoment) -
 
 /// The wire-representability CEILING — the ONE rule every size-fold
 /// surface applies, stated by `cerulion_core::wire` and consulted here:
-/// a schema is representable iff its FRAME PREFIX — the 32-byte
+/// a schema is representable iff its FRAME PREFIX (the 40-byte
 /// `WireHeader`, the fixed section and one 8-byte `OffsetEntry` per
-/// variable field, i.e. its smallest possible frame — fits the wire's
+/// variable field, i.e. its smallest possible frame) fits the wire's
 /// `u32` `total_size` (which is also the type of every recorded
 /// `wire_fixed_size` descriptor). A ceiling on the fixed section alone
 /// (`fixed_size <= u32::MAX`, the earlier rule) accepted a schema

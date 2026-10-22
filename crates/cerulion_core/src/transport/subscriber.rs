@@ -7,8 +7,8 @@
 //! 1. listener.timed_wait_one(timeout)   → block until event or timeout
 //! 2. subscriber.receive() in loop       → drain ALL available samples
 //! 3. For each sample:
-//!    a. read_from_buf() → owned WireHeader (32 bytes, alignment-safe)
-//!    b. &raw[32..] → zero-copy payload slice into shared memory
+//!    a. read_from_buf() → owned WireHeader (40 bytes, alignment-safe)
+//!    b. &raw[WireHeader::SIZE..] → zero-copy payload slice into shared memory
 //!    c. invoke callback with ReceivedMessage
 //! ```
 //!
@@ -558,7 +558,8 @@ impl OwnedInboundSample {
         debug_assert!(
             (WireHeader::SIZE..=sample.payload().len()).contains(&frame_len),
             "with_header's caller must bounds-check total_size against the loaned slot: \
-             {frame_len} is outside 32..={}",
+             {frame_len} is outside {}..={}",
+            WireHeader::SIZE,
             sample.payload().len()
         );
         Self {
@@ -613,7 +614,7 @@ impl OwnedInboundSample {
     /// The parsed [`WireHeader`] at the front of the frame, or `None` when the
     /// frame is shorter than a header / unparseable.
     ///
-    /// Returned by value (32 bytes on the stack), and the value is the one the read
+    /// Returned by value (40 bytes on the stack), and the value is the one the read
     /// path parsed with the alignment-safe [`WireHeader::read_from_buf`]: iceoryx2
     /// SHM slots are not guaranteed 8-byte aligned, so a borrowed
     /// [`WireHeader::from_bytes`] view would spuriously return `None` on an

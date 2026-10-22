@@ -4552,7 +4552,7 @@ mod slice_ceiling_tests {
     /// section` bound, and an env entry naming it is IGNORED — loudly (one
     /// WARN per creation naming the type), never silently inert and never
     /// applied (an applied narrow override would refuse every publish of a
-    /// frame that is ALWAYS exactly 56 bytes here).
+    /// frame that is ALWAYS exactly 64 bytes here).
     #[traced_test]
     #[test]
     fn a_fixed_type_keeps_its_exact_bound_and_an_override_naming_it_warns_ignored() {
@@ -4564,7 +4564,7 @@ mod slice_ceiling_tests {
             exact,
             "no override: exact bound, byte-identical to the pre-override bound"
         );
-        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:64");
+        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:48");
         assert_eq!(
             slice_len_with_overrides(&bridge, &named).get(),
             exact,
@@ -4593,7 +4593,7 @@ mod slice_ceiling_tests {
     #[test]
     fn the_ignored_override_warn_is_once_per_type_not_per_creation() {
         let exact = (WireHeader::SIZE + 24) as u32;
-        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:64,rmw_slcflood/B:64");
+        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:48,rmw_slcflood/B:48");
         let a = fixed_bridge("rmw_slcflood__msg", "A");
         for _ in 0..5 {
             assert_eq!(

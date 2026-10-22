@@ -359,7 +359,7 @@ impl ResolvedCorpus {
             // size stamped into an immutable MCAP channel descriptor). Checked
             // BEFORE hashing: `schema_hash`/`wire_fixed_size` panic on a hostile
             // `FixedArray` length, and a served doc is untrusted input. The
-            // ceiling is core's ONE wire rule on the FRAME PREFIX (the 32-byte
+            // ceiling is core's ONE wire rule on the FRAME PREFIX (the 40-byte
             // header, the fixed section and the offset table — the schema is
             // resolved here, so its table is counted exactly), not a bare
             // `u32::try_from` of the fixed section, which admitted a section of
@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(size, 8, "the sibling's real fixed size");
     }
 
-    /// The corpus ceiling is the FRAME PREFIX — the 32-byte
+    /// The corpus ceiling is the FRAME PREFIX: the 40-byte
     /// header, the fixed section and one 8-byte offset entry per variable
     /// field — not a bare `u32::try_from` of the fixed section (which
     /// indexed a section of exactly `u32::MAX` bytes, a descriptor no frame

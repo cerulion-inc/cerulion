@@ -76,7 +76,10 @@ impl StepTag {
         Ok(Self(((rank as u64) << Self::STEP_BITS) | (step + 1)))
     }
 
-    /// The tag exactly as it rides the wire.
+    /// The tag exactly as it rides the wire. Every `u64` is accepted: a value
+    /// whose step field (bits 0 to 47) is zero, such as `rank << 48`, names a
+    /// rank but no step, and [`Self::step`] reads it as `None`, the same as
+    /// [`Self::UNTAGGED`]; [`Self::is_untagged`] is true only for all zeros.
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }

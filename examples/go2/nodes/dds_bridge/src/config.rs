@@ -103,7 +103,7 @@ pub struct TopicMapping {
     #[serde(default)]
     pub qos: QosMode,
     /// RAW mappings only: the ingress publisher's slice capacity in bytes
-    /// (default [`DEFAULT_RAW_MAX_SLICE_LEN`]). Must be ≥ 32 (the wire
+    /// (default [`DEFAULT_RAW_MAX_SLICE_LEN`]). Must be ≥ 40 (the wire
     /// header). REJECTED on a typed mapping — typed ports take their cap
     /// from the graph's `OutputDef`, so a config value there would be a
     /// silently-ignored knob.
@@ -320,7 +320,7 @@ impl BridgeConfig {
     /// (see the module docs); at most one TYPED mapping per ros_type (each
     /// type owns one fixed output port); RAW mappings may repeat a
     /// ros_type (two DDS topics of one type are legitimate) but never a
-    /// cerulion_topic; `max_slice_len` only on RAW mappings, ≥ 32.
+    /// cerulion_topic; `max_slice_len` only on RAW mappings, ≥ 40.
     ///
     /// The generic codec is built LAZILY — a config using only the four
     /// typed projections never pays the registry parse.
@@ -1264,7 +1264,7 @@ mappings:
         let slice = BridgeConfig::raw_slice_len_for_route(&m, &codec);
         assert_eq!(slice.get(), 88, "40-byte header + 48-byte Twist");
         let depth = cerulion_core::transport::ingress_route_buffer_depth(slice.get() as usize);
-        assert_eq!(depth, 1024, "the cap: 64 MiB / 80 B is far past it");
+        assert_eq!(depth, 1024, "the cap: 64 MiB / 88 B is far past it");
         assert!(
             absorbs_ms_at_1660hz(depth) > 600.0,
             "617 ms of absorption, against 38.6 ms at the bridge default"
@@ -1366,8 +1366,8 @@ mappings:
     /// schema budget.
     ///
     /// Driven in the direction that can actually fail: a 4 MiB explicit value on
-    /// a type whose derived budget is 80 bytes. A rule that `min`-ed
-    /// unconditionally would return 80 here and silently overrule an operator
+    /// a type whose derived budget is 88 bytes. A rule that `min`-ed
+    /// unconditionally would return 88 here and silently overrule an operator
     /// who sized the route on purpose.
     #[test]
     fn an_explicit_slice_is_never_narrowed_by_the_schema_budget() {
@@ -1386,7 +1386,7 @@ mappings:
                 &codec
             )
             .get(),
-            80
+            88
         );
     }
 

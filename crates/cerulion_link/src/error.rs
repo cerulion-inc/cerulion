@@ -15,10 +15,13 @@ pub enum LinkError {
     Bind(#[source] BoxError),
 
     /// Dialing a peer failed. `peer` is the target endpoint id, hex-encoded.
-    #[error("failed to dial peer {peer}")]
+    #[error("failed to dial peer {peer}{hint}")]
     Connect {
         /// The target endpoint id (hex).
         peer: String,
+        /// What the operator can do about it, when the plane suggests one
+        /// (empty otherwise).
+        hint: &'static str,
         /// The underlying iroh connect error.
         #[source]
         source: BoxError,

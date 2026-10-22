@@ -395,6 +395,11 @@ corrupted, truncated, or unfinalized bag raises `BagError` at open. Every
 walk over the data (`open_bag`, each `messages()` iterator as it yields,
 and `topics()` on a bag whose summary carries no statistics) releases the
 mapped pages behind it, so resident memory stays bounded on large bags.
+The one exception is a bag recorded by a release with the 32-byte wire header:
+its frames are upgraded to the current 40-byte layout when the bag is first
+walked, and the upgraded copy (the size of the bag's frames plus 8 bytes each)
+is held until the bag is closed. Such a bag over 2 GiB of frames raises
+`BagError`; `cerulion bag migrate` writes a current copy of it.
 `Record.view(schema)` decodes a typed message from those bytes; `schema` is a
 message class, or a schema name with `schemas=`.
 A record whose embedded wire header is shorter than 40 bytes, or whose

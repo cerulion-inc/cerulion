@@ -330,6 +330,47 @@ fn a_played_bag_republishes_byte_identical_frames() {
     assert_eq!(summary.topics[0].failed, 0);
 }
 
+/// A bag recorded by the release with the 32-byte wire header plays: every
+/// frame reaches the subscriber in the current 40-byte layout (an untagged
+/// step tag), its sequence, stamp and body exactly as recorded.
+#[test]
+fn a_bag_from_the_32_byte_release_plays_upgraded_frames() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let topic = format!("/play/legacy/{}", unique());
+    let spec: Vec<(u32, u64, Vec<u8>)> = vec![
+        (7, 1_000_000_000, vec![0xDE, 0xAD]),
+        (8, 1_010_000_000, vec![0xBE, 0xEF, 0x01]),
+    ];
+    let recorded: Vec<Recorded> = spec
+        .iter()
+        .map(|(seq, ts, p)| Recorded {
+            topic: topic.clone(),
+            bytes: frame(HASH_A, *seq, *ts, p),
+        })
+        .collect();
+    let current = write_bag(dir.path(), "current.mcap", &[(&topic, HASH_A)], &recorded);
+    let legacy_bytes =
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap());
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(&legacy, &legacy_bytes).unwrap();
+    // The file really is the old layout: 32-byte frames under v1 descriptors.
+    let r = cerulion_bag::BagReader::open(&legacy).unwrap();
+    assert_eq!(r.legacy_wire_header_topics().unwrap(), vec![topic.clone()]);
+    drop(r);
+
+    let mgr = manager("legacy");
+    let (got, _summary) = play_looping_and_collect(&mgr, &legacy, &topic, spec.len() * 3, 1.0);
+    let oracle: Vec<Vec<u8>> = spec
+        .iter()
+        .map(|(seq, ts, p)| frame(HASH_A, *seq, *ts, p))
+        .collect();
+    assert_eq!(
+        first_full_cycle(&got, &oracle, "legacy playback"),
+        oracle,
+        "a legacy bag plays its frames in the current layout, otherwise unchanged"
+    );
+}
+
 /// The DETERMINISM contract: two plays of one bag publish byte-identical frames
 /// in an identical order. The order is the bag's file (recorded) order, which
 /// is fixed by immutable bytes on disk, so it needs no sort and cannot tie.

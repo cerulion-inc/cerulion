@@ -202,6 +202,11 @@ pub struct BagScan {
     /// Frames whose 40-byte wire header would not parse. They are still
     /// republished verbatim; they contribute no timing.
     pub headerless_frames: u64,
+    /// User topics recorded with the 32-byte wire header (version 1), whose
+    /// frames every reader upgrades to the current layout as it reads them.
+    pub legacy_wire_header_topics: Vec<String>,
+    /// Version 1 frames served unchanged because they are not one whole frame.
+    pub legacy_passthrough_frames: u64,
     /// The longest span WITHIN any single channel, in ns — never a subtraction
     /// across channels, whose stamps share no number line.
     pub span_ns: Option<u64>,
@@ -891,7 +896,7 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
     // one for `bag play`, whose setup would then allocate once per recorded
     // frame before publishing anything. Opening the walk reads only the footer,
     // so this costs nothing and answers the only question playback has.
-    let finalized = reader.user_frames().is_ok();
+    let finalized = reader.has_readable_footer();
     let completeness_text = if finalized {
         "finalized".to_string()
     } else {
@@ -1015,11 +1020,20 @@ pub fn scan_bag(reader: &BagReader, path: &Path) -> CliResult<BagScan> {
         .max()
         .filter(|s| *s > 0);
 
+    let legacy_wire_header_topics = if finalized {
+        reader
+            .legacy_wire_header_topics()
+            .map_err(|e| bag_err(path, "cannot read the channel table of bag", e))?
+    } else {
+        Vec::new()
+    };
     Ok(BagScan {
         channels: per_topic.into_values().collect(),
         total_frames,
         backwards_log_times: backwards,
         headerless_frames: headerless,
+        legacy_wire_header_topics,
+        legacy_passthrough_frames: reader.legacy_passthrough_count(),
         span_ns,
         completeness: completeness_text,
         finalized,
@@ -3713,6 +3727,21 @@ pub fn render_scan(
             "note: {} frame(s) carry no parseable wire header — they are recorded and will be \
              republished verbatim, but they contribute no timing and pace as instant.\n",
             scan.headerless_frames
+        ));
+    }
+    if !scan.legacy_wire_header_topics.is_empty() {
+        out.push_str(&format!(
+            "note: {} topic(s) were recorded with the 32-byte wire header of an older release; \
+             their frames are upgraded to the current 40-byte header as they are read ({}).\n",
+            scan.legacy_wire_header_topics.len(),
+            scan.legacy_wire_header_topics.join(", ")
+        ));
+    }
+    if scan.legacy_passthrough_frames > 0 {
+        out.push_str(&format!(
+            "note: {} frame(s) recorded with the 32-byte header are not whole frames, so they \
+             are served unchanged rather than upgraded.\n",
+            scan.legacy_passthrough_frames
         ));
     }
     out.push('\n');
@@ -8871,6 +8900,8 @@ mod tests {
             total_frames: topics.iter().map(|(_, n)| *n).sum(),
             backwards_log_times: 0,
             headerless_frames: 0,
+            legacy_wire_header_topics: Vec::new(),
+            legacy_passthrough_frames: 0,
             span_ns: Some(1),
             completeness: "finalized".to_string(),
             finalized: true,

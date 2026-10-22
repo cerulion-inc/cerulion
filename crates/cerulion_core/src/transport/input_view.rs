@@ -54,7 +54,7 @@ pub struct InputView<'sample, T: ShmMessage + 'sample> {
     sample: SampleHandle<'sample>,
 
     /// SHM-backed reader — the codegen-emitted `<Name><'sample>` type.
-    /// Constructed from `&'sample [u8]` over `[32..total_size]` of the
+    /// Constructed from `&'sample [u8]` over `[WireHeader::SIZE..total_size]` of the
     /// sample's payload (after the 40-byte WireHeader).
     reader: T::Reader<'sample>,
 
@@ -212,7 +212,7 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
         });
     }
     // 8 is the wire format's own alignment: [`WireHeader`] is
-    // `#[repr(C, align(8))]`, the header is exactly 32 bytes so a payload
+    // `#[repr(C, align(8))]`, the header is exactly 40 bytes so a payload
     // starts 8-aligned whenever the frame does, and 8 bytes is the widest
     // primitive a generated fixed section holds.
     const WIRE_ALIGN: usize = 8;
