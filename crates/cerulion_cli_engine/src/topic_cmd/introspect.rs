@@ -67,17 +67,24 @@ pub struct BwStats {
 /// spans never overflow; a rate above `u64::MAX` saturates. No allocation:
 /// the window is read once per publisher it holds.
 pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
-    let mut rate: Option<u128> = None;
+    // The sum of the publisher rates as whole bytes a second plus the sum of
+    // their fractions in units of 2^-64 B/s.
+    let mut rate: Option<(u128, u128)> = None;
     for (i, frame) in window.iter().enumerate() {
         // Measure each publisher once, at its first frame in the window.
         if window[..i].iter().any(|f| f.publisher == frame.publisher) {
             continue;
         }
-        if let Some(r) = publisher_rate_milli(window, frame.publisher) {
-            rate = Some(rate.unwrap_or(0).saturating_add(r));
+        if let Some((whole, fraction)) = publisher_rate(window, frame.publisher) {
+            let (sum_whole, sum_fraction) = rate.unwrap_or((0, 0));
+            rate = Some((
+                sum_whole.saturating_add(whole),
+                sum_fraction.saturating_add(fraction),
+            ));
         }
     }
-    let rate = rate?.saturating_add(500) / 1000;
+    let (whole, fraction) = rate?;
+    let rate = whole.saturating_add((fraction + (1 << 63)) >> 64);
     let total: u128 = window.iter().map(|f| u128::from(f.size_bytes)).sum();
     let frames = window.len();
     Some(BwStats {
@@ -89,12 +96,14 @@ pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
     })
 }
 
-/// The rate of `publisher`'s frames in `window` in thousandths of a byte per
-/// second, on that publisher's own stamps and rounded down (see
-/// [`bandwidth`], which sums these and rounds once). `None` when its frames
-/// span no time. A window of the largest size (100000 frames of `u64::MAX`
-/// bytes) stays inside `u128`; past that the product saturates.
-fn publisher_rate_milli(window: &[BwFrame], publisher: u128) -> Option<u128> {
+/// The rate of `publisher`'s frames in `window` in bytes per second, on that
+/// publisher's own stamps, as the whole bytes and the fraction in units of
+/// 2^-64 B/s (rounded down, so the error is below 2^-64 B/s; [`bandwidth`]
+/// sums these and rounds once). `None` when its frames span no time. The
+/// span is below 2^64 ns, so the fraction's remainder fits `u128` when
+/// shifted; a window of the largest size (100000 frames of `u64::MAX` bytes)
+/// keeps the product inside `u128`, and past that it saturates.
+fn publisher_rate(window: &[BwFrame], publisher: u128) -> Option<(u128, u128)> {
     let own = || window.iter().filter(move |f| f.publisher == publisher);
     let first_ns = own().map(|f| f.timestamp_ns).min()?;
     let last_ns = own().map(|f| f.timestamp_ns).max()?;
@@ -106,7 +115,8 @@ fn publisher_rate_milli(window: &[BwFrame], publisher: u128) -> Option<u128> {
         .filter(|f| f.timestamp_ns != first_ns)
         .map(|f| u128::from(f.size_bytes))
         .sum();
-    Some(after_first.saturating_mul(1_000_000_000_000) / span_ns)
+    let bytes_ns = after_first.saturating_mul(1_000_000_000);
+    Some((bytes_ns / span_ns, ((bytes_ns % span_ns) << 64) / span_ns))
 }
 
 /// The decimal unit prefixes `topic bw` scales by (1 KB = 1000 B, as
@@ -1819,6 +1829,37 @@ mod tests {
             from(0xA, 3 * SEC, 1),
             from(0xB, 50 * SEC, 1),
             from(0xB, 53 * SEC, 1),
+        ];
+        assert_eq!(bandwidth(&window).map(|s| s.bytes_per_sec), Some(1));
+    }
+
+    #[test]
+    fn publisher_fractions_are_kept_through_the_sum() {
+        // 501 pairs of publishers: one sends 5009 bytes over 10000 s (0.5009
+        // B/s), the other 499 bytes over 1000 s (0.499 B/s). Together
+        // 501 x 0.9999 = 500.9499 B/s, which rounds to 501; fractions cut
+        // to thousandths would sum to 500.499 and print 500.
+        let window: Vec<BwFrame> = (0..501u128)
+            .flat_map(|i| {
+                [
+                    from(2 * i, 0, 1),
+                    from(2 * i, 10_000 * SEC, 5009),
+                    from(2 * i + 1, 0, 1),
+                    from(2 * i + 1, 1000 * SEC, 499),
+                ]
+            })
+            .collect();
+        assert_eq!(bandwidth(&window).map(|s| s.bytes_per_sec), Some(501));
+    }
+
+    #[test]
+    fn two_exact_halves_sum_to_one() {
+        // 1 byte over 2 s from each publisher: 0.5 + 0.5 is exactly 1.
+        let window = [
+            from(0xA, 0, 1),
+            from(0xA, 2 * SEC, 1),
+            from(0xB, 0, 1),
+            from(0xB, 2 * SEC, 1),
         ];
         assert_eq!(bandwidth(&window).map(|s| s.bytes_per_sec), Some(1));
     }
