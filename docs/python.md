@@ -395,12 +395,13 @@ A message these calls cannot convert raises `EncodeError`, `DecodeError` or
 YAML text that is neither `str` nor bytes-like) is a plain `TypeError` with
 no `kind`. A value that does not make the
 message raises `EncodeError` naming the field path, with the codec's kind
-(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Four
+(`YamlMissingField`, `YamlWrongType`, `YamlOutOfRange` and so on). Five
 kinds come from the dict itself, before the codec reads it: `DictUnsupportedValue`
 (a value of no message type, such as an `object()`), `DictNotUtf8` (a `str`
 with a lone surrogate), `DictTooDeep` (a dict nested past 129 levels,
-such as one that contains itself) and `DictTooLarge` (a dict whose YAML
-passes 256 MiB, such as one list shared many times over). An integer past 64 bits in a dict is
+such as one that contains itself), `DictTooLarge` (a dict whose YAML
+passes 256 MiB, such as one list shared many times over) and `DictChangedSize`
+(an array whose length changes while it is read, such as one another thread resizes). An integer past 64 bits in a dict is
 written as its digits, so it gets the error the same YAML text gets: an integer field refuses it
 with `YamlOutOfRange` up to 128 bits and `YamlWrongType` past that (the YAML parser reads such
 digits as a float), and a float field takes its nearest float value. Past the float range

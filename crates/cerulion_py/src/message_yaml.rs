@@ -372,7 +372,13 @@ fn emit_array(
     while index < len {
         if rank > 1 {
             // A sub-array per item of the first axis, one level deeper.
-            let item = value.get_item(index)?;
+            let item = value.get_item(index).map_err(|e| {
+                if e.is_instance_of::<pyo3::exceptions::PyIndexError>(py) {
+                    changed_size(py, path)
+                } else {
+                    e
+                }
+            })?;
             push_item(out, path, index, |out, path| {
                 emit_array(&item, rank - 1, out, path, depth + 1)
             })?;
@@ -390,11 +396,8 @@ fn emit_array(
             })?;
             index += 1;
         }
-        if index < end {
-            return Err(PyValueError::new_err(format!(
-                "{}: the array changed size while it was read",
-                shown(path)
-            )));
+        if index != end {
+            return Err(changed_size(py, path));
         }
     }
     out.push(']');
@@ -452,6 +455,16 @@ fn within_budget(py: Python<'_>, out: &str, path: &str) -> PyResult<()> {
         return Ok(());
     }
     Err(too_large(py, path))
+}
+
+/// The `DictChangedSize` error naming `path`: the array's length moved
+/// while it was read, so its items no longer match the length written.
+fn changed_size(py: Python<'_>, path: &str) -> PyErr {
+    kinded::<EncodeError>(
+        py,
+        "DictChangedSize",
+        format!("{}: the array changed size while it was read", shown(path)),
+    )
 }
 
 /// The `DictTooLarge` error naming `path`.

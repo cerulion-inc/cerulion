@@ -841,6 +841,46 @@ def test_a_numpy_array_converts_across_its_chunks(schemas):
     ) == named_frame(schemas, "n", [1.0, -3.0])
 
 
+class ResizedArray:
+    """An array-like whose length moves while it is read: `len()` names
+    `length` items, but a slice of it gives `items` (another thread
+    resizing a NumPy array looks the same to the reader)."""
+
+    def __init__(self, ndim, length, items):
+        self.ndim = ndim
+        self.length = length
+        self.items = items
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return ResizedArray(1, len(self.items), self.items)
+        if key >= len(self.items):
+            raise IndexError(key)
+        return ResizedArray(1, len(self.items[key]), self.items[key])
+
+    def tolist(self):
+        return list(self.items)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ResizedArray(1, 3, [0.5]),
+        ResizedArray(1, 2, [0.5, 1.0, 1.5]),
+        ResizedArray(2, 2, [[0.5]]),
+    ],
+    ids=["shrank", "grew", "lost_a_row"],
+)
+def test_an_array_that_changes_size_while_read_is_an_encode_error(schemas, value):
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Named", {"name": "n", "samples": value})
+    assert err.value.kind == "DictChangedSize"
+    assert str(err.value) == "samples: the array changed size while it was read"
+
+
 def test_a_two_dimensional_numpy_array_is_its_nested_lists(schemas):
     # A 2-D array writes `[[...], [...]]` as its nested lists would, so a
     # float64[] field refuses both with the same error at the same item.
