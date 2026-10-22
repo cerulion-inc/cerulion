@@ -1,7 +1,7 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+All `cerulion` CLI command logic, testable without spawning processes;
+`cerulion_cli` is its thin clap binary.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
@@ -16,8 +16,6 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Enforce invariants at the engine boundary; CLI checks are UX.
-- `sim_time_run.rs` owns sim time (folds `sim_time:` into `TimeSource` before any guard
-  reads it; one step per `/clock` sample); its contract is `docs/internals/cli.md` §14.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
 - Android: per node, cdylib lookup prefers cargo-ndk's `<target>/<triple>/<profile>`,
@@ -57,4 +55,4 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
 - Numeric verification has false-pass classes (NaN folds, >2^53 widening,
   length-derived fields); see the dossier before adding a metric.
 Read `docs/internals/cli.md` before changing topics/local scope, starters,
-replay, completions, Python nodes (§13), sim time (§14), or graph run/profile/partition.
+replay, completions, Python nodes (§13), sim time (§15), or graph run/profile/partition.
