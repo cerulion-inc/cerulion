@@ -17,10 +17,15 @@
 //!   10 ms before the tick runs, so the throttle word is 10_000_001;
 //! - a fresh instance restored from those bytes captures them back byte for
 //!   byte: the section crossed the wall in both directions;
-//! - that restored instance then runs on the restored words: ticks at 10 to
+//! - that restored instance then runs on the restored words: its first step
+//!   is `step(100 ms)`, so its first ticks read graph time 100 ms, not 10 ms
+//!   (the 10 ms node catches up 10 ticks inside that one step, and each tick
+//!   reads the step's one time). A reset throttle word would emit there and
+//!   hold 100_000_001, which differs from the saved word. Ticks at 100 to
 //!   250 ms are inside the 250 ms period of the saved 10 ms emit, so neither
 //!   word moves; a tick at 260 ms emits the throttle site, whose word becomes
-//!   260_000_001, and the once word stays 1;
+//!   260_000_001 (a reset word would wait until 350 ms), and the once word
+//!   stays 1;
 //! - an instance that ticked, restored from the field-only bytes, captures
 //!   the field-only bytes: its own live log state is gone, the table is the
 //!   checkpoint's.
@@ -155,6 +160,11 @@ fn word_of(table: &[(u64, u64)], id: u64) -> u64 {
 /// at 0.
 const TICK_NS: u64 = 10_000_000;
 
+/// The graph time of the restored instance's first step: one `step(100 ms)`
+/// from its own clock at 0. It is inside the 250 ms period of the saved emit
+/// at [`TICK_NS`], and not equal to it, so a reset throttle word shows.
+const FRESH_FIRST_TICK_NS: u64 = 100_000_000;
+
 #[test]
 #[serial]
 fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_bytes() {
@@ -193,18 +203,27 @@ fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_byt
         "the section crossed the wall"
     );
 
-    // The restored words drive the restored instance. Its next 25 ticks run
-    // at 10, 20, .., 250 ms, all less than 250 ms after the saved throttle
-    // emit at 10 ms: inside the period, so the throttle word does not move,
-    // and the once word stays.
-    for _ in 0..25 {
+    // The restored words drive the restored instance. Its first step runs 10
+    // catch-up ticks, and each reads the step's one graph time, 100 ms: a
+    // time no saved word holds, so a reset throttle word would emit there
+    // and hold 100_000_001. Then 15 ticks run at 110, 120, .., 250 ms. All
+    // are less than 250 ms after the saved throttle emit at 10 ms: inside the
+    // period, so the throttle word does not move, and the once word stays.
+    fresh_rt.step(Duration::from_nanos(FRESH_FIRST_TICK_NS));
+    let first = log_table(&capture(&fresh));
+    assert_eq!(
+        word_of(&first, throttle_id),
+        TICK_NS + 1,
+        "the first restored tick is inside the saved period"
+    );
+    for _ in 0..15 {
         fresh_rt.step(Duration::from_nanos(TICK_NS));
     }
     let inside = capture(&fresh);
     assert_eq!(
         inside[..4],
         26u32.to_le_bytes(),
-        "the restored tick, then 25"
+        "the restored tick, then 10 catch-up ticks, then 15"
     );
     assert_eq!(
         log_table(&inside),
