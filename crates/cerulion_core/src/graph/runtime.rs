@@ -5590,10 +5590,11 @@ impl GraphRuntime {
         let force_separate_discipline = drain_discipline_forces_separate();
         for node_def in &config.nodes {
             for output in &node_def.outputs {
-                if output.history_size > 0 {
-                    let topic = resolve_output_topic(&config.prefix, &node_def.id, output);
+                let topic = resolve_output_topic(&config.prefix, &node_def.id, output);
+                let history_size = super::tf_static::effective_history_size(&topic, output);
+                if history_size > 0 {
                     let entry = history_by_topic.entry(topic).or_insert(0);
-                    *entry = (*entry).max(output.history_size);
+                    *entry = (*entry).max(history_size);
                 }
             }
             if let Some(info) = entry_infos.get(&node_def.id) {
@@ -5689,6 +5690,7 @@ impl GraphRuntime {
             }
         }
         for flow in topology.topics() {
+            super::tf_static::check_listener_caps(&config, flow)?;
             let max_depth = flow.consumers.iter().map(|c| c.depth).max().unwrap_or(0);
             if max_depth > sub_buf {
                 // A raised ceiling multiplies every publisher
@@ -6924,10 +6926,12 @@ impl GraphRuntime {
                 // — open it OPEN-ONLY (`.open()`), making the pre-create
                 // load-bearing (a missing service fails loudly here instead
                 // of being masked by a lazy create).
+                // A `/tf_static` TFMessage output keeps at least one message.
+                let history_size = super::tf_static::effective_history_size(&topic, output);
                 let mut publisher = transport.create_publisher_on_existing_service(
                     &topic,
                     resolved_max_slice_len,
-                    output.history_size,
+                    history_size,
                     topic_config_of(&topic),
                 )?;
                 // History truncation:
@@ -6941,16 +6945,16 @@ impl GraphRuntime {
                 // of the H-sample history, the rest never delivered. Warn per
                 // shallow edge so the operator sees exactly what each consumer
                 // gets.
-                if output.history_size > 0 {
+                if history_size > 0 {
                     if let Some(flow) = topology.topic(&topic) {
                         for edge in &flow.consumers {
-                            if edge.depth < output.history_size {
+                            if edge.depth < history_size {
                                 tracing::warn!(
                                     topic = %topic,
                                     node = %edge.node_id,
                                     input = %edge.input,
                                     depth = edge.depth,
-                                    history_size = output.history_size,
+                                    history_size = history_size,
                                     "consumer input depth is below the topic's \
                                      history_size; iceoryx2 native history delivers this \
                                      consumer only its `depth` most-recent frames of the \
@@ -6967,10 +6971,10 @@ impl GraphRuntime {
                 // outstanding counters so every send mirrors into their
                 // queue-depth atomics. No-op unless the topic is all-block.
                 if let Some(counters) = pub_block_by_topic.get(&topic) {
-                    if output.history_size > 0 {
+                    if history_size > 0 {
                         tracing::warn!(
                             topic = %topic,
-                            history_size = output.history_size,
+                            history_size = history_size,
                             "block topic also declares history_size > 0; the outstanding mirror \
                              does not track history-replayed frames, so a late joiner's block \
                              accounting may under-count. block topics are streams — prefer \

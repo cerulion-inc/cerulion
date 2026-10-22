@@ -1663,7 +1663,7 @@ nodes:
                                 #   field's Rust type. `pkg/Type`, `pkg::Type`, or a bare name
                                 #   for a schema in this workspace's `schemas/`
         max_slice_len: 134217728 # optional; falls back to <T>::MAX_SLICE_LEN, then 128 MiB + warn
-        history_size: 8         # optional; iceoryx2-native per-publisher history for late joiners (default 0; max 64 = MAX_CONSUMER_DEPTH: replays through consumer queues capped at that depth, so a larger history can't be delivered in full). Late joiners receive history even from a QUIESCENT producer that has stopped publishing (the runtime services them each live-loop iteration).
+        history_size: 8         # optional; iceoryx2-native per-publisher history for late joiners (default 0; max 64 = MAX_CONSUMER_DEPTH: replays through consumer queues capped at that depth, so a larger history can't be delivered in full). Late joiners receive history even from a QUIESCENT producer that has stopped publishing (the runtime services them each live-loop iteration). An output on `/tf_static` with schema `tf2_msgs/TFMessage` keeps at least 1 (latched) even when this is 0 or omitted; see `docs/transforms.md`.
 
   - id: detector
     type: detector

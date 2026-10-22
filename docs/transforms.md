@@ -38,10 +38,9 @@ tf: TFMessage,
 tf_static: TFMessage,
 ```
 
-A static transform is published once, so a listener that starts after the
-publisher would never see it. The publisher's `/tf_static` output keeps it for
-late listeners with `history_size` in the graph YAML (it defaults to 0, no
-history):
+A static transform is published once, so `/tf_static` is latched: an output
+on `/tf_static` with schema `tf2_msgs/TFMessage` keeps its last message for a
+listener that starts later, with no `history_size` in the graph YAML:
 
 ```yaml
 nodes:
@@ -51,31 +50,33 @@ nodes:
       - name: tf_static
         topic: /tf_static
         schema: tf2_msgs/TFMessage
-        history_size: 1
 ```
 
-Set `history_size` to the number of `TFMessage`s the publisher sends for its
-static set: 1 when it sends every static transform in one batch, which is the
-simplest shape. The topic keeps one history depth for all of its publishers,
-the largest `history_size` any of its outputs declares, and each publisher
-keeps up to that many of its own most recent messages, repeats included. A
-late listener receives every static publisher's history through its
-`tf_static` queue, so set the listener's `cap` to at least the number of
-static publishers times that shared depth. With every static publisher at
-`history_size: 1`, that is one slot per publisher.
+The publisher sends its whole static set, merged by child frame, in every
+message, so the one message it keeps holds every static transform it
+publishes. Keep the set in a `TfBuffer`: `insert_static` for a child the
+buffer already holds replaces that child's transform, and
+`buffer.static_edges()` lists one edge per child frame (parent, child and
+transform) to write into each `TFMessage`.
 
-That product must fit in the cap limit of 16 on a `multi_publisher_topics`
-topic. Past the cap the oldest frames are dropped, so a late listener misses
-those static edges and lookups through them fail. When the product is more
-than 16, make it smaller: send each publisher's static set in one
-`TFMessage` and keep `history_size` at 1, or move static transforms into
-fewer publishers.
+A late listener receives the kept message of every static publisher at once,
+through its `tf_static` queue. The graph load checks every listener in the
+graph: its `cap` must be at least the number of `/tf_static` outputs in the
+graph times the messages each keeps, which is 1 unless an output sets a
+larger `history_size`. A smaller cap refuses the graph with
+`TfStaticCapTooSmall`, which names the listener, its cap and the publishers,
+so a dropped static transform is never silent. On a `multi_publisher_topics`
+topic the cap is at most 16; a graph whose static publishers need more is
+refused too: move static transforms into fewer publishers. Publishers in
+another graph are not counted, so a listener of another graph's static
+publishers sets its cap to their number itself.
 
 A `/tf` output can keep `history_size` at 0. A listener that starts late then
 holds no sample older than the first it receives, and a lookup at an earlier
 stamp returns `OutOfRange`. When a listener must answer stamps from before it
-started, give the `/tf` outputs history too, and size the listener's `tf` cap
-the same way, within the same limit of 16.
+started, give the `/tf` outputs history too, and set the listener's `tf` cap
+to at least the number of `/tf` publishers times that history, within the
+same limit of 16.
 
 Each `TransformStamped` names its parent (`header.frame_id`), its child
 (`child_frame_id`), its stamp (`header.stamp`) and the transform
