@@ -28,7 +28,7 @@ fn main() {
     // Collect all .msg files by package
     let mut packages: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
 
-    if msg_dir.exists() {
+    if corpus_root_exists(msg_dir) {
         collect_msg_files(msg_dir, &mut packages);
     }
     let vendored_packages: BTreeSet<String> = packages.keys().cloned().collect();
@@ -39,7 +39,7 @@ fn main() {
     // one silently replace the other, so it fails the build.
     let srv_dir = Path::new("srv");
     let mut services: BTreeMap<String, Vec<ServiceDefinition>> = BTreeMap::new();
-    if srv_dir.exists() {
+    if corpus_root_exists(srv_dir) {
         for (package, srv_name, file, text) in collect_srv_files(srv_dir) {
             let parts = split_rossrv(&text, &file).unwrap_or_else(|e| panic!("{e}"));
             let service = parse_rossrv(&text, &srv_name, Some(&package), &file)
@@ -858,6 +858,14 @@ fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
+}
+
+/// Whether a corpus root (`msg/`, `srv/`) is there. `Path::exists` reads an
+/// I/O error as "absent", which would build the crate without that whole
+/// tree, so only a root that is really missing reads as absent.
+fn corpus_root_exists(root: &Path) -> bool {
+    root.try_exists()
+        .unwrap_or_else(|e| panic!("failed to check for {}: {}", root.display(), e))
 }
 
 /// Whether a corpus entry is a directory. `Path::is_dir` reads a metadata
