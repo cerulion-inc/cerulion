@@ -402,7 +402,7 @@ fn a_hidden_twin_past_the_wire_limit_is_refused() {
             assert_eq!(schema, "pkg/Big");
             assert_eq!(
                 detail,
-                "frame prefix (32-byte header + 8796093022208-byte fixed section + 0-entry offset table) exceeds the u32 wire total_size"
+                "frame prefix (40-byte header + 8796093022208-byte fixed section + 0-entry offset table) exceeds the u32 wire total_size"
             );
         }
         other => panic!("expected a wire-limit refusal, got {:?}", other.map(|_| ())),

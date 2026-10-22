@@ -9746,6 +9746,7 @@ mod tests {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 0,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame);
         frame.extend_from_slice(&1.5f64.to_le_bytes());

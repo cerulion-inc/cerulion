@@ -5362,7 +5362,7 @@ impl TransportManager {
                 };
                 map_err(format!("{e}{hint}"))
             })?;
-        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(&map_err)?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(map_err)?;
 
         // Size the event-id space to the ids this transport mints; see
         // `CERULION_MAX_EVENT_ID`.
