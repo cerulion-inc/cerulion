@@ -611,6 +611,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // incident that has just happened.
         "cerulion flashback::note",
         "cerulion graph create::prefix",
+        // `name:=value` launch-argument overrides. The declared names live in
+        // the graph named by the PRECEDING positional, which a per-value
+        // completer cannot see, and the value half is the operator's choice.
+        "cerulion graph run::launch_args",
         "cerulion node run::id",
         "cerulion node run::prefix",
         "cerulion node stage::id",

@@ -27,6 +27,7 @@
 pub mod chain;
 pub mod config;
 pub mod drain_latch;
+pub mod launch_args;
 pub mod node;
 pub mod param_resume;
 pub mod params;
@@ -58,6 +59,11 @@ pub use chain::{
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
 };
+pub use launch_args::{
+    parse_graph_as_written, parse_graph_with_launch_args, parse_override, resolve_args,
+    substitute_text, ArgDecl, ArgDecls, ArgProblem, ArgProvenance, ArgSpec, LaunchOverride,
+    ResolvedArgs,
+};
 #[cfg(feature = "fuzz-helpers")]
 pub use node::fuzz_parse_info_json;
 #[cfg(any(test, feature = "test-helpers"))]
@@ -88,7 +94,7 @@ pub use topology::{
 pub use validation::{validate_graph, validate_graph_with, ValidationOptions};
 pub use waitset::{check_waitset_attachment_capacity, WAITSET_MAX_ATTACHMENTS};
 
-use crate::error::{TransportError, TransportResult};
+use crate::error::TransportResult;
 
 // ─── Graph Parsing ───────────────────────────────────────────
 
@@ -124,11 +130,25 @@ pub fn parse_graph(yaml: &str) -> TransportResult<GraphConfig> {
 /// occurrence with the migration instruction — the warn is the remedy, the
 /// parse error is the stop.
 pub fn parse_graph_raw(yaml: &str) -> TransportResult<GraphConfig> {
+    parse_graph_raw_with_launch_args(yaml, &[]).map(|(config, _)| config)
+}
+
+/// [`parse_graph_raw`] with launch-argument `overrides` (`name:=value` on
+/// `graph run`). Launch arguments resolve HERE, on every parse of a graph
+/// that declares `args:`: the section is lifted out and every `${name}`
+/// replaced before the graph types read the document, so each reader of a
+/// graph file sees a plain graph; a document with no `args:` and no
+/// overrides is read as written. The plain parser passes no overrides, so
+/// every verb but `graph run` sees the declared defaults. Beside the graph
+/// comes which argument fed each `params:` value that was exactly one
+/// reference, for a param refusal that names the argument.
+pub fn parse_graph_raw_with_launch_args(
+    yaml: &str,
+    overrides: &[launch_args::LaunchOverride],
+) -> TransportResult<(GraphConfig, launch_args::ArgProvenance)> {
     warn_on_legacy_policy_block(yaml);
-    let mut config: GraphConfig =
-        serde_yaml::from_str(yaml).map_err(|e| TransportError::GraphParseError {
-            reason: e.to_string(),
-        })?;
+    let (mut config, provenance) =
+        launch_args::parse_graph_with_launch_args_traced(yaml, overrides)?;
     // The file stem is the graph name, but a string has no
     // file, so a stemless parse SEEDS the identity from the deprecated `name:`
     // key. That is the only identity such a config can have, and it is what
@@ -141,7 +161,7 @@ pub fn parse_graph_raw(yaml: &str) -> TransportResult<GraphConfig> {
     // hot-path-alloc-ok: cold: graph YAML PARSE — once per `graph run`/`replay`, before any
     // node exists
     config.identity = config.name.clone().unwrap_or_default();
-    Ok(config)
+    Ok((config, provenance))
 }
 
 /// The key named by a `deny_unknown_fields` failure in a graph-YAML parse
@@ -162,7 +182,7 @@ pub fn parse_graph_raw(yaml: &str) -> TransportResult<GraphConfig> {
 /// bagd), so a shared home had to be a crate both of them already depend on.
 ///
 /// Tolerant of a wrapper: the caller may pass serde's raw message or
-/// [`TransportError::GraphParseError`]'s rendered text, since the marker it
+/// [`TransportError::GraphParseError`](crate::error::TransportError::GraphParseError)'s rendered text, since the marker it
 /// looks for survives either.
 pub fn unknown_field_key(parse_error: &str) -> Option<String> {
     const MARKER: &str = "unknown field `";
@@ -392,7 +412,7 @@ mod tests {
     // ── The shared unknown-key reader ──────────────────────────
 
     /// It reads the key, and it reads it out of the REAL error text —
-    /// including the wrapped [`TransportError::GraphParseError`] rendering,
+    /// including the wrapped [`TransportError::GraphParseError`](crate::error::TransportError::GraphParseError) rendering,
     /// which is what two of the three call sites actually hold.
     #[test]
     fn the_unknown_key_reader_reads_the_key_and_nothing_else() {
