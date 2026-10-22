@@ -173,9 +173,15 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
+      # The hosted image ships a packages.microsoft.com apt source; apt-get
+      # update exits 100 when that source refuses or fails its signature check,
+      # even though the package comes from the Ubuntu archives. Deleting its
+      # list first keeps that source out of the update; rm -f exits 0 when the
+      # file is absent.
       - name: Install aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
