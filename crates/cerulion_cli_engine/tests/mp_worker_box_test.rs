@@ -224,13 +224,14 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         process_groups: Default::default(),
         process_group_order: Vec::new(),
     };
-    // GO gate: this hand-written test-SUPERVISOR pre-signals GO before the worker
-    // even spawns — a SINGLE-worker deployment has no siblings to wait for, and
-    // both tests here pin worker behavior AFTER the start gate (happy live-loop
-    // advance / barrier poison). The real supervisor writes GO only once ALL
-    // workers are READY; that ordering is `mp_supervisor_box_test`'s concern.
+    // GO gate: this hand-written test-SUPERVISOR signals GO itself, right after
+    // the lone worker signals READY (`signal_go`), exactly as the real
+    // supervisor does once every worker is READY. A SINGLE-worker deployment has
+    // no siblings to wait for; the multi-worker ordering is
+    // `mp_supervisor_box_test`'s concern. The sentinel carries the shared start
+    // epoch, which the worker refuses when it is more than a second stale, so it
+    // cannot be pre-written before the worker builds.
     let go = dir.join("worker.go");
-    std::fs::write(&go, b"go").expect("pre-signal GO sentinel");
     let plan = WorkerPlan {
         group: "solo".to_string(),
         graph_identity: "boxwork_solo".to_string(),
@@ -332,6 +333,22 @@ fn spawn_worker(ws_root: &Path, plan_path: &Path, stop_ms: u64) -> std::process:
 /// concurrent binaries / re-runs) never collide on a `/dev/shm` object.
 fn barrier_ns(tag: &str) -> String {
     format!("worker_{}_{tag}", std::process::id())
+}
+
+/// Write the GO sentinel the plan names (`worker.go` under `dir`) the way the
+/// supervisor does: the text goes to a sibling `.tmp` file that is renamed over
+/// it, so the polling worker never reads a partial file. The epoch is
+/// `SHARED_START_LEAD_NS` ahead of now.
+fn signal_go(dir: &Path) {
+    let tmp = dir.join("worker.go.tmp");
+    std::fs::write(
+        &tmp,
+        cerulion_cli_engine::multiprocess::encode_go_sentinel(
+            cerulion_core::real_ns() + cerulion_cli_engine::multiprocess::SHARED_START_LEAD_NS,
+        ),
+    )
+    .expect("write the GO sentinel's temp file");
+    std::fs::rename(&tmp, dir.join("worker.go")).expect("rename the GO sentinel into place");
 }
 
 /// BOUNDED wait for `path` to appear (the worker's READY sentinel). Fail-fasts
@@ -455,6 +472,7 @@ fn box_single_worker_advances_barrier_and_exits_clean() {
         "worker never signalled READY within 30s — its transport init / cdylib load likely \
          failed (see its stderr above). This is a fail-fast, not a hang."
     );
+    signal_go(run_tmp.path());
 
     let status = guard
         .wait_bounded(Duration::from_secs(60))
@@ -526,6 +544,7 @@ fn box_lone_worker_times_out_poisons_and_exits_nonzero() {
         wait_for_file(&ready, Duration::from_secs(30)),
         "lone worker never signalled READY within 30s — build / transport init likely failed."
     );
+    signal_go(run_tmp.path());
 
     // 15s deadline: > the ~5s poison, << the 30s watchdog. A `Some` means the
     // worker exited ON ITS OWN (the barrier poison broke `run_live`), NOT that we
@@ -593,6 +612,7 @@ fn box_running_worker_directed_sigint_drains_clean_within_window() {
         wait_for_file(&ready, Duration::from_secs(30)),
         "worker never signalled READY within 30s — build / transport init likely failed."
     );
+    signal_go(run_tmp.path());
     // Let the live loop genuinely run (the barrier generation advances).
     std::thread::sleep(Duration::from_millis(800));
 
@@ -672,6 +692,7 @@ fn box_parked_worker_directed_sigint_exits_bounded() {
         wait_for_file(&ready, Duration::from_secs(30)),
         "worker never signalled READY within 30s — build / transport init likely failed."
     );
+    signal_go(run_tmp.path());
     // Settle INTO the park: past READY + GO, the first step's barrier wait has
     // no peer, so ~1s in the worker is parked mid-ladder.
     std::thread::sleep(Duration::from_millis(1000));

@@ -1316,6 +1316,10 @@ contributes name-only, and a layout change inside such a target is not caught.
 | `cerulion topic list` | List active topics |
 | `cerulion topic echo <topic> [--truncate-length N]` | Stream messages, decoded field by field |
 | `cerulion topic hz <topic>` | Measure publish rate |
+| `cerulion topic type <topic>` | Print a topic's message type (`ros2 topic type`) |
+| `cerulion topic find <type>` | List the topics that carry a type (`ros2 topic find`) |
+| `cerulion topic list -t` | List topics with their types (`ros2 topic list -t`) |
+| `cerulion topic bw <topic>` | Measure payload bandwidth (`ros2 topic bw`) |
 | `cerulion topic info <topic>` | Show the topic's schema and last message metadata |
 | `cerulion bag info <bag>` | Summarize a recording |
 | `cerulion bag play <bag> --resim all --verify` | Re-execute a recording against the current nodes and compare every output frame (exit 0 = match) |

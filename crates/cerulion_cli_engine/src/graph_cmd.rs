@@ -7791,7 +7791,7 @@ pub fn graph_run_worker(
     // the ~5s boundary timeout. Positioned BEFORE `run_live` (the first barrier
     // arrival), with a hard deadline so a dead supervisor can never hang the
     // worker forever.
-    wait_for_go(
+    let shared_start_epoch = wait_for_go(
         Path::new(&plan.go_path),
         &plan.group,
         &running,
@@ -8003,10 +8003,12 @@ pub fn graph_run_worker(
     // producer-clock values, and cross-rank stamp arithmetic (Sync's window
     // spread, `expect_within`'s elapsed) would otherwise cross unrelated clock
     // domains. Every rank ARMS its placement HERE, after GO, and `run_live`
-    // reads `real_ns()` — machine-wide boot-monotonic, so no distribution is
-    // needed — at its wall-clock anchor, so the ranks' placement instants
-    // differ by the GO fan-out only and not by the seconds of sequential-spawn
-    // skew a build-time placement would bake in. The primitive also re-phases
+    // places it at the deployment's shared start epoch from the GO sentinel
+    // (8.95), a `real_ns()` instant, machine-wide boot-monotonic, so every rank
+    // within one gating quantum of it places the same value; a rank later
+    // places a fresh `real_ns()` at its anchor instead. Either way no rank
+    // bakes in the seconds of sequential-spawn skew a build-time placement
+    // would. The primitive also re-phases
     // the `Period` deadlines and re-seeds the watchdog windows the build
     // anchored at 0 (see `place_gating_epoch` for why a bare `clock.set` would
     // hang on the first step). A lockstep rank keeps its quantum timeline; a
@@ -8033,8 +8035,24 @@ pub fn graph_run_worker(
             group = %plan.group,
             rank = plan.rank,
             "free-run traced rank: gating clock epoch armed for the live loop's wall-clock \
-             anchor (read from real_ns() immediately before the first delta)"
+             anchor (placed at the shared start epoch, or at real_ns() there when more than one \
+             gating quantum late)"
         );
+    }
+    // (8.95) The deployment's SHARED START EPOCH, read from the GO sentinel:
+    // `run_live` waits for it after its prologue; a rank there within one
+    // gating quantum places a traced rank's armed epoch (8.9) at exactly this
+    // value and back-dates its wall anchors to it, and a later one warns and
+    // starts its own timeline. `None` only when Ctrl-C ended the GO wait;
+    // `run_live` then runs its prologue and no step.
+    if let Some(epoch_ns) = shared_start_epoch {
+        if let Err(e) = runtime.start_live_at_shared_epoch(epoch_ns) {
+            runtime.shutdown();
+            return Err(CliError::Validation(format!(
+                "graph run-worker: group '{}' could not arm the shared start epoch: {e}",
+                plan.group
+            )));
+        }
     }
     tracing::info!(group = %plan.group, "worker live loop starting — press Ctrl+C to stop");
     if let Err(e) = runtime.run_live(&running) {
@@ -8565,14 +8583,30 @@ fn credit_open_refusal_message(topic: &str, ns: &str, id: &str, e: &std::io::Err
     }
 }
 
-/// Block until the deployment-wide GO sentinel appears (the supervisor touches it
-/// once ALL workers are built + READY — see `WorkerPlan::go_path` for the
-/// start-gate contract). 20 ms poll; a LOUD error at the deadline — a worker must
-/// never hang forever on a dead supervisor. The deadline is the plan's
-/// `go_deadline_ms` (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned
-/// worker legitimately waits out every later sibling's sequential READY window,
-/// so a fixed deadline would spuriously fail-loud large slow deployments. A
-/// Ctrl-C (`running` flipping false) returns `Ok` early: `run_live` checks
+/// Write the GO sentinel carrying `epoch_ns` so a polling worker never reads a
+/// half-written file: the text goes to a sibling `.tmp` file first and is renamed
+/// over `go_path`, and a rename within one directory is atomic, so `exists()`
+/// turns true only once the whole line is there.
+fn write_go_sentinel(go_path: &Path, epoch_ns: u64) -> std::io::Result<()> {
+    let mut tmp = go_path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, crate::multiprocess::encode_go_sentinel(epoch_ns))?;
+    std::fs::rename(&tmp, go_path)
+}
+
+/// Block until the deployment-wide GO sentinel appears (the supervisor writes it
+/// once ALL workers are built + READY; see `WorkerPlan::go_path` for the
+/// start-gate contract) and return the shared start epoch it carries
+/// (`multiprocess::parse_go_sentinel`). 2 ms poll, so a worker sees GO well
+/// inside the `SHARED_START_LEAD_NS` the supervisor leaves before the epoch. A
+/// LOUD error on a sentinel that cannot be read or does not parse, and a LOUD
+/// error at the deadline, so a worker never hangs forever on a dead
+/// supervisor. The deadline is the plan's `go_deadline_ms`
+/// (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned worker legitimately
+/// waits out every later sibling's sequential READY window, so a fixed deadline
+/// would spuriously fail-loud large slow deployments. A
+/// Ctrl-C (`running` flipping false) returns `Ok(None)` early: `run_live` checks
 /// `running` first and exits immediately, so the worker drains cleanly instead
 /// of sitting out the deadline.
 fn wait_for_go(
@@ -8580,16 +8614,35 @@ fn wait_for_go(
     group: &str,
     running: &AtomicBool,
     deadline: Duration,
-) -> CliResult<()> {
+) -> CliResult<Option<u64>> {
     let start = Instant::now();
     loop {
         if go_path.exists() {
-            tracing::info!(group = %group, "GO observed — entering live loop");
-            return Ok(());
+            let text = std::fs::read_to_string(go_path).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' saw the GO sentinel `{}` but cannot \
+                     read it: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let epoch_ns = crate::multiprocess::parse_go_sentinel(&text).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' cannot use the GO sentinel `{}`: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let now_ns = cerulion_core::real_ns();
+            tracing::info!(
+                group = %group,
+                epoch_ns,
+                lead_ns = epoch_ns as i128 - now_ns as i128,
+                "GO observed; the live loop starts at the shared start epoch"
+            );
+            return Ok(Some(epoch_ns));
         }
         if !running.load(Ordering::Relaxed) {
             tracing::info!(group = %group, "Ctrl-C during GO wait — draining without stepping");
-            return Ok(());
+            return Ok(None);
         }
         if start.elapsed() >= deadline {
             return Err(CliError::Validation(format!(
@@ -8598,7 +8651,7 @@ fn wait_for_go(
                 go_path.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -11759,7 +11812,9 @@ fn graph_run_supervisor(
     // withholding GO keeps every not-yet-released worker from stepping at all
     // (each exits via `wait_for_go`'s `running` check).
     if running.load(Ordering::Relaxed) {
-        std::fs::write(&go_path, b"go").map_err(|e| {
+        let epoch_ns =
+            cerulion_core::real_ns().saturating_add(crate::multiprocess::SHARED_START_LEAD_NS);
+        write_go_sentinel(Path::new(&go_path), epoch_ns).map_err(|e| {
             CliError::Validation(format!(
                 "graph run (multi-process): cannot write the GO sentinel `{go_path}`: {e} — \
                  deployment aborted (all workers killed)"
@@ -25478,10 +25533,13 @@ nodes:
     ///   the `Lockstep` arm of the build-path match (a free-run rank that
     ///   opened the barrier would wait at a generation no sibling arrives at);
     /// * the epoch is ARMED at EXACTLY ONE site (`run_live` places it at its
-    ///   wall-clock anchor), AFTER the GO wait (so the ranks' placement
-    ///   instants differ by the GO fan-out, never by the sequential-spawn
-    ///   skew) and BEFORE `run_live` (an epoch is an origin;
-    ///   the primitive refuses a placement after the first step);
+    ///   wall-clock anchor, at the shared start epoch the GO sentinel carries,
+    ///   or at a fresh real_ns() when more than one gating quantum late),
+    ///   AFTER the GO wait (never baking in the sequential-spawn skew) and
+    ///   BEFORE `run_live` (an epoch is an origin; the primitive refuses a
+    ///   placement after the first step);
+    /// * the shared start is armed at EXACTLY ONE site, from the GO wait's
+    ///   epoch, before `run_live` and under no build-path guard;
     /// * the build-path decision precedes every consumer of it (the clock
     ///   mint, the barrier open, the build, the recording configuration, the
     ///   epoch, the cohort leave).
@@ -25601,6 +25659,38 @@ nodes:
             body[go..epoch].matches("WorkerBuildPath::").count(),
             1,
             "exactly ONE build-path token between GO and the arming — the guard itself"
+        );
+        // The SHARED START: one arming site, fed by the epoch the GO wait
+        // returns, after that wait and before run_live, and under NO build-path
+        // guard: every rank (traced, plain free run, lockstep) starts at the
+        // deployment's shared epoch. Nesting it inside the traced arm above
+        // would leave plain free-run ranks starting one GO poll apart; the
+        // brace balance from the traced guard's line to the call is exactly
+        // the one `if let Some(..)` that opens around it.
+        assert!(
+            body.contains("let shared_start_epoch = wait_for_go("),
+            "the GO wait's returned epoch is bound for the shared start"
+        );
+        assert_eq!(
+            body.matches("start_live_at_shared_epoch(").count(),
+            1,
+            "exactly ONE shared-start arming"
+        );
+        let shared = body.find("start_live_at_shared_epoch(").unwrap();
+        assert!(
+            go < shared && shared < run_live,
+            "the shared start is armed after the GO wait and before run_live"
+        );
+        assert_eq!(
+            body[go..shared].matches("WorkerBuildPath::").count(),
+            1,
+            "no build-path token guards the shared start beyond the traced epoch's own guard"
+        );
+        let depth = body[guard_line..shared].matches('{').count() as i64
+            - body[guard_line..shared].matches('}').count() as i64;
+        assert_eq!(
+            depth, 1,
+            "the shared start sits outside the traced arm, inside only its own `if let Some`"
         );
         // The clock-config half is bound to its arm: the nearest build-path
         // token before `configure_traced_runtime_free_run(` is FreeRunTraced
@@ -42835,12 +42925,68 @@ mod supervisor_tests {
 
     /// Pre-created GO file → immediate Ok.
     #[test]
-    fn wait_for_go_returns_ok_on_existing_sentinel() {
+    fn wait_for_go_returns_the_epoch_an_existing_sentinel_carries() {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("d.go");
+        write_go_sentinel(&go, 987_654_321).unwrap();
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .expect("existing GO must be Ok");
+        assert_eq!(epoch, Some(987_654_321));
+    }
+
+    /// A sentinel written while the worker polls is picked up, epoch intact.
+    #[test]
+    fn wait_for_go_returns_the_epoch_of_a_sentinel_written_during_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("late.go");
+        let writer_go = go.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            write_go_sentinel(&writer_go, 42).unwrap();
+        });
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("GO arrives");
+        writer.join().unwrap();
+        assert_eq!(epoch, Some(42));
+    }
+
+    /// The atomic write leaves no `.tmp` sibling behind and replaces an older
+    /// sentinel whole.
+    #[test]
+    fn write_go_sentinel_replaces_whole_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("w.go");
+        write_go_sentinel(&go, 1).unwrap();
+        write_go_sentinel(&go, 22).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&go).unwrap(),
+            "cerulion-go-v1 epoch_ns=22\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("w.go")]);
+    }
+
+    /// A sentinel from an older build (bare `go`) is a LOUD error naming the
+    /// file and the build mismatch, never a guessed epoch.
+    #[test]
+    fn wait_for_go_refuses_an_unparseable_sentinel_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("old.go");
         std::fs::write(&go, b"go").unwrap();
         let running = AtomicBool::new(true);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("existing GO must be Ok");
+        let msg = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("cannot use the GO sentinel")
+                && msg.contains("old.go")
+                && msg.contains("not written by this build's supervisor"),
+            "{msg}"
+        );
     }
 
     /// `running` already false (Ctrl-C) → immediate Ok without a sentinel
@@ -42850,8 +42996,9 @@ mod supervisor_tests {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("never.go");
         let running = AtomicBool::new(false);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5))
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
             .expect("Ctrl-C during GO wait must drain cleanly, not error");
+        assert_eq!(epoch, None, "no sentinel was read, so no epoch");
     }
 
     /// No sentinel within the deadline → LOUD Err naming both suspects (a dead
