@@ -130,6 +130,7 @@ fn run_degrade() -> (u64, u64) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "degrade_block_producer".to_string(),
@@ -138,6 +139,7 @@ fn run_degrade() -> (u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "depth_consumer".to_string(),
                 node_type: "depth_probe".to_string(),
@@ -155,6 +157,7 @@ fn run_degrade() -> (u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
                 node_type: "drop_oldest_sibling".to_string(),

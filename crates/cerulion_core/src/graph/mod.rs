@@ -28,6 +28,8 @@ pub mod chain;
 pub mod config;
 pub mod drain_latch;
 pub mod node;
+pub mod param_resume;
+pub mod params;
 pub mod partition;
 pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
@@ -61,6 +63,10 @@ pub use node::fuzz_parse_info_json;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use node::ClosureNodeEntry;
 pub use node::{DylibNodeEntry, NodeContext, NodeEntry, NodeInfo};
+pub use params::{
+    params_from_json, params_to_json, resolve_params, FromParamValue, ParamProblem, ParamSpec,
+    ParamType, ParamValue, ParamValues,
+};
 pub use partition::{
     auto_partition, baseline_process_per_node, block_colocation_seeds,
     compress_group_level_assignments, creditable_split_block_edges, derive_default_budget_ns,

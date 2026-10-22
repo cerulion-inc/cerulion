@@ -2054,6 +2054,15 @@ pub enum BagAction {
         /// claim about the recording, so a plain `--resim all` honours it too.
         #[arg(long)]
         strict_state: bool,
+        /// With `--resim`: on a recording that begins MID-RUN, resume on the
+        /// param values in force even where they differ from the ones the
+        /// recording names. A param is not node state, so a restore never
+        /// writes one; without this flag such a difference refuses the run
+        /// with exit 2, one line per param (node, param, recorded value,
+        /// current value). Inert on a from-start bag. Valid in BOTH resim
+        /// modes.
+        #[arg(long)]
+        allow_param_change: bool,
         /// With `--resim`: write the re-executed frames to a new bag at this
         /// path. One channel per graph-produced topic, labelled with the schema
         /// the re-executed graph publishes, holding every frame it published on
@@ -4611,6 +4620,31 @@ mod verb_log_class_tests {
             assert!(strict_state, "{argv:?} must carry --strict-state");
             assert_eq!(verify, want_verify, "{argv:?}");
             assert_eq!(resim.as_deref(), Some("all"), "{argv:?}");
+        }
+    }
+
+    /// `--allow-param-change` parses onto `bag play` in both resim modes, and
+    /// an invocation without it carries `false`.
+    #[test]
+    fn bag_play_parses_allow_param_change_in_both_resim_modes() {
+        for (extra, want) in [
+            (vec!["--allow-param-change"], true),
+            (vec!["--verify", "--allow-param-change"], true),
+            (vec![], false),
+        ] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action:
+                    BagAction::Play {
+                        allow_param_change, ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(allow_param_change, want, "{argv:?}");
         }
     }
 

@@ -27,8 +27,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 ## Testing
 
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
-  They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field, never the
-  first (Rust drops fields in declaration order).
+  They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
+  drops fields in declaration order).
 - Never run a bare `cerulion clean` from a test: the `/tmp/*.shm_state` reclaim is machine wide by
   construction (compile-time directory, no `TMPDIR`), so arms here pass `--report-only` only and the
   destructive proof lives in `cerulion_cli_engine`'s `sweep_dead_nodes_test.rs`
@@ -41,7 +41,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`;
     `mp_auto_partition`: those two + `..._trigger_block_cdylib`
   - `signal_matrix`: `period` only. `credit_death`: + `..._trigger_block_cdylib`.
-    `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`
+    `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`.
+    `graph_params_e2e`: `period` + `param`
 
 ## Gotchas
 
@@ -56,5 +57,4 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
-Reference: docs/internals/cli.md - command contracts, completion rules, verb families
-and both crates' test maps.
+Reference: docs/internals/cli.md (contracts, completion, verb families, test maps).

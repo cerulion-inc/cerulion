@@ -3517,6 +3517,9 @@ pub struct GraphRuntime {
     /// (helper threads included — see the `external_bindings` doc) rather than
     /// re-querying / re-spawning.
     external_sources_collected: bool,
+    /// Every native node's params as this build resolved them, keyed by node
+    /// id: what [`Self::param_differences`] compares a recording against.
+    params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -5100,6 +5103,33 @@ impl GraphRuntime {
         // "compile-time" check. This model also drives the backpressure
         // wiring below and is the DAG edge model the levelization reuses.
         let topology = GraphTopology::build(&config, &entry_infos)?;
+        // Resolve every node's `params:` against what its type declares,
+        // HERE, before any transport resource exists: an unknown name, a
+        // wrong type or an out-of-range value refuses the graph by node and
+        // param. The resolved maps are handed to each entry just before its
+        // `init` below.
+        let resolved_params = crate::graph::params::resolve_graph_params(&config, &entry_infos)?;
+        // Kept on the runtime for a resume, which compares each restored
+        // node's values in force with the ones the recording names
+        // (`crate::graph::param_resume`).
+        // hot-path-alloc-ok: cold: graph build, one map per node
+        let params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce> =
+            resolved_params
+                .iter()
+                .map(|(id, values)| {
+                    let specs = entry_infos
+                        .get(id)
+                        .map(|info| info.params().to_vec())
+                        .unwrap_or_default();
+                    (
+                        id.clone(),
+                        crate::graph::param_resume::ParamsInForce {
+                            specs,
+                            values: values.clone(),
+                        },
+                    )
+                })
+                .collect();
         // The `(topic, consumer node, consumer input)` key set of
         // every cross-process `block` edge this build carries a credit word
         // for. Derived ONCE and read twice — by `validate_with_credit_edges`
@@ -8036,6 +8066,13 @@ impl GraphRuntime {
             if purpose == BuildPurpose::PlanningOnly {
                 context.silence_teardown_reconciliation();
             }
+            // The node's resolved params, checked in the pre-pass above,
+            // reach it BEFORE `init` so its own `init` and first tick read
+            // the graph's values. A node that declares none gets an empty
+            // map, which every entry accepts.
+            if let Some(values) = resolved_params.get(&node_def.id) {
+                entry.set_params(values)?;
+            }
             entry.init(context)?;
 
             // Share entry between the
@@ -9163,6 +9200,7 @@ impl GraphRuntime {
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
             external_sources_collected: false,
+            params_in_force,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -17262,6 +17300,35 @@ impl GraphRuntime {
         Ok(out)
     }
 
+    /// RESUME: every param of a node in `recorded` whose value in force
+    /// differs from the recorded one, in the graph's declaration order, one
+    /// [`ParamDifference`](crate::graph::param_resume::ParamDifference) per
+    /// param. A param is not node state, so a restore never writes one and a
+    /// resumed node runs on the values this build handed it; the caller
+    /// compares BEFORE it restores and refuses on any difference unless the
+    /// operator chose the current values.
+    ///
+    /// `recorded` maps node id to the params the recording names for it. A
+    /// node of `recorded` that this graph does not run, or that declares no
+    /// params and has none recorded, contributes nothing.
+    // hot-path-alloc-ok-fn: cold: once per resumed replay, before the first step
+    pub fn param_differences(
+        &self,
+        recorded: &std::collections::BTreeMap<String, crate::graph::params::ParamValues>,
+    ) -> Vec<crate::graph::param_resume::ParamDifference> {
+        let none = crate::graph::param_resume::ParamsInForce::default();
+        self.nodes
+            .keys()
+            .filter_map(|id| recorded.get(id).map(|values| (id, values)))
+            .flat_map(|(id, values)| {
+                self.params_in_force
+                    .get(id)
+                    .unwrap_or(&none)
+                    .differences(id, values)
+            })
+            .collect()
+    }
+
     /// Get the graph config.
     pub fn config(&self) -> &GraphConfig {
         &self.config
@@ -19333,6 +19400,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: id.to_string(),
                     node_type: "t".to_string(),
@@ -19605,6 +19673,7 @@ mod tests {
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "me".to_string(),
             node_type: "me".to_string(),
@@ -19972,6 +20041,7 @@ mod tests {
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -20029,6 +20099,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -20050,6 +20121,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),

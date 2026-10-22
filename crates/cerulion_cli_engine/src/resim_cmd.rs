@@ -116,6 +116,9 @@ pub struct ResimOptions {
     /// `--strict-state` — refuse the re-execution unless every executed node's
     /// state restored (carried across from `cerulion replay`).
     pub strict_state: bool,
+    /// `--allow-param-change`: on a resume, run on the param values in force
+    /// where they differ from the recorded ones instead of refusing.
+    pub allow_param_change: bool,
     /// `--record-out PATH` (legal in both modes).
     pub record_out_path: Option<PathBuf>,
 }
@@ -178,6 +181,8 @@ pub struct PlayFlags {
     pub tolerance: Option<PathBuf>,
     /// `--strict-state` — resim only, in EITHER mode.
     pub strict_state: bool,
+    /// `--allow-param-change`: resim only, in EITHER mode.
+    pub allow_param_change: bool,
     /// `--record-out PATH`: resim only, in EITHER mode.
     pub record_out: Option<PathBuf>,
 }
@@ -263,6 +268,11 @@ const RESIM_ONLY: &[(&str, &str)] = &[
          and executes nothing",
     ),
     (
+        "--allow-param-change",
+        "there is no anchor to resume from: playback re-publishes recorded frames \
+         and executes nothing",
+    ),
+    (
         "--record-out",
         "plain playback republishes the recorded frames and re-executes nothing, so \
          there is no re-executed output to write",
@@ -301,6 +311,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         report,
         tolerance,
         strict_state,
+        allow_param_change,
         record_out,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
@@ -311,11 +322,12 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 5] = [
+        let present: [bool; 6] = [
             verify,
             report.is_some(),
             tolerance.is_some(),
             strict_state,
+            allow_param_change,
             record_out.is_some(),
         ];
         if let Some((flag, why)) = RESIM_ONLY
@@ -397,6 +409,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             report_path: report,
             tolerance_path: tolerance,
             strict_state,
+            allow_param_change,
             record_out_path: record_out,
         },
     })
@@ -941,6 +954,7 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         report_path,
         tolerance_path,
         strict_state,
+        allow_param_change,
         record_out_path,
     } = o;
     replay_cmd::ReplayOptions {
@@ -948,6 +962,7 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         report_path,
         tolerance_path,
         strict_state,
+        allow_param_change,
         record_out_path,
     }
 }
@@ -1256,6 +1271,7 @@ mod tests {
             report: Some(PathBuf::from("/tmp/r.json")),
             tolerance: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state: true,
+            allow_param_change: true,
             ..Default::default()
         })
         .unwrap();
@@ -1269,6 +1285,7 @@ mod tests {
                     report_path: Some(PathBuf::from("/tmp/r.json")),
                     tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
                     strict_state: true,
+                    allow_param_change: true,
                     record_out_path: None,
                 },
             }
@@ -1307,6 +1324,23 @@ mod tests {
                 "`--strict-state` must reach the engine in {} mode",
                 if verify { "verify" } else { "neutral" }
             );
+        }
+    }
+
+    /// `--allow-param-change` decides what a resume runs ON, not the
+    /// comparison, so it is legal in BOTH modes and reaches the options.
+    #[test]
+    fn allow_param_change_is_legal_in_both_resim_modes_and_reaches_the_options() {
+        for verify in [false, true] {
+            let PlayMode::Resim { options, .. } = resolve_play_mode(PlayFlags {
+                verify,
+                allow_param_change: true,
+                ..resim("all")
+            })
+            .unwrap() else {
+                panic!("expected a resim");
+            };
+            assert!(options.allow_param_change, "verify={verify}");
         }
     }
 
@@ -1519,7 +1553,7 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 5] = [
+        let cases: [(&str, PlayFlags); 6] = [
             (
                 "--record-out",
                 PlayFlags {
@@ -1538,6 +1572,13 @@ mod tests {
                 "--strict-state",
                 PlayFlags {
                     strict_state: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--allow-param-change",
+                PlayFlags {
+                    allow_param_change: true,
                     ..Default::default()
                 },
             ),
@@ -2067,6 +2108,7 @@ mod tests {
             report_path: Some(PathBuf::from("/tmp/r.json")),
             tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state: true,
+            allow_param_change: true,
             record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
         });
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
@@ -2086,6 +2128,10 @@ mod tests {
              from-start bag, so no e2e this repo can cheaply build would catch \
              it being dropped here"
         );
+        assert!(
+            got.allow_param_change,
+            "`--allow-param-change` must reach the engine: it is inert on a from-start bag"
+        );
 
         // And the negative: a knob nobody set must not be invented.
         let none = engine_options(ResimOptions::default());
@@ -2093,6 +2139,7 @@ mod tests {
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());
         assert!(!none.strict_state);
+        assert!(!none.allow_param_change);
         assert!(none.record_out_path.is_none());
     }
 
