@@ -102,6 +102,10 @@
 //! it as present-with-zero-fields) — encodes as the nested schema's
 //! ZERO-DEFAULT fields (every fixed field zero, every string/array empty,
 //! recursively). Deterministic; a legitimate native frame is never rejected.
+//! The same rule holds for a dynamic `string[]` or array of a variable
+//! nested type: an empty blob (what a derived `Default` snapshot holds)
+//! encodes as zero elements. A fixed array of `N > 0` such elements with an
+//! empty blob is refused, since its arity is knowably wrong.
 
 use std::collections::BTreeMap;
 
@@ -1394,6 +1398,22 @@ impl CdrCodec {
         writer: &mut CdrWriter,
     ) -> Result<(), CdrCodecError> {
         let schema = self.names[parent].as_str();
+        // An EMPTY blob for a counted array (`string[]`, or an array of a
+        // variable nested type) is how a native writer spells zero elements:
+        // the `set_<f>_bytes(&[])` idiom, and the value a derived
+        // `Default` snapshot holds. The frame walker reads it as zero
+        // elements, so encode it the same way. A fixed array of `N > 0`
+        // such elements has a knowably wrong arity, so it still falls
+        // through and fails on the missing count.
+        if vbytes.is_empty()
+            && fixed_count.unwrap_or(0) == 0
+            && self.is_counted(parent, field, element_type)
+        {
+            if fixed_count.is_none() {
+                writer.write_u32(0);
+            }
+            return Ok(());
+        }
         match element_type {
             FieldType::Bool | FieldType::I8 | FieldType::U8 => {
                 if fixed_count.is_none() {
@@ -1494,6 +1514,25 @@ impl CdrCodec {
                 field: field.to_string(),
                 detail: format!("array of {} is not supported", other.canonical_str()),
             }),
+        }
+    }
+
+    /// True when an array of `element_type` is framed as a `u32` count and
+    /// per element a `u32` length and body: a `string`, or a nested type
+    /// whose bound layout is variable. A nested type that does not bind is
+    /// not counted here, so the normal path reports it.
+    fn is_counted(&self, parent: usize, field: &str, element_type: &FieldType) -> bool {
+        match element_type {
+            FieldType::String => true,
+            FieldType::Nested {
+                schema_name,
+                package,
+                ..
+            } => self
+                .resolve_nested(parent, field, schema_name, package)
+                .and_then(|nidx| self.slot(nidx))
+                .is_ok_and(|(_, layout)| !layout.is_fixed()),
+            _ => false,
         }
     }
 
@@ -2543,6 +2582,77 @@ mod tests {
             .encode("test_msgs/Stamped", CdrEndianness::Little, &frame)
             .expect("re-encode");
         assert_eq!(re, cdr, "encode(decode(x)) == x holds for the zero-default");
+    }
+
+    #[test]
+    fn test_encode_empty_counted_arrays_emit_zero_count() {
+        // An empty blob for a `string[]` or an array of a variable nested
+        // type (a derived `Default` snapshot, or `set_<f>_bytes(&[])`) is
+        // zero elements, as the frame walker reads it, never a rejected
+        // frame.
+        let mut set = pointfield_set();
+        let mut lists = MessageSchema::new_in_package("Lists", "test_msgs");
+        lists.add_field(FieldDef::new(
+            "names",
+            FieldType::DynamicArray {
+                element_type: Box::new(FieldType::String),
+            },
+        ));
+        lists.add_field(FieldDef::new(
+            "fields",
+            FieldType::DynamicArray {
+                element_type: Box::new(nested("PointField", "sensor_msgs")),
+            },
+        ));
+        lists.add_field(FieldDef::new("value", FieldType::U32));
+        set.push(lists);
+        let c = codec(set);
+
+        // Hand Cerulion payload: fixed [value=9] + table [(0,0), (0,0)].
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        for _ in 0..2 {
+            payload.extend_from_slice(&0u32.to_le_bytes()); // entry offset 0
+            payload.extend_from_slice(&0u32.to_le_bytes()); // entry len 0
+        }
+        let cdr = c
+            .encode(
+                "test_msgs/Lists",
+                CdrEndianness::Little,
+                &headerless_input(&payload),
+            )
+            .expect("empty counted arrays encode as zero elements");
+
+        // Hand oracle: names count 0, fields count 0, value 9.
+        let mut expect = Vec::new();
+        expect.extend_from_slice(&0u32.to_le_bytes());
+        expect.extend_from_slice(&0u32.to_le_bytes());
+        expect.extend_from_slice(&9u32.to_le_bytes());
+        assert_eq!(cdr, expect);
+    }
+
+    #[test]
+    fn test_encode_empty_fixed_string_array_is_err() {
+        // `string[2]` with an empty blob has a knowably wrong arity: refuse
+        // it, never emit two invented empty strings.
+        let mut pair = MessageSchema::new_in_package("Pair", "test_msgs");
+        pair.add_field(FieldDef::new(
+            "names",
+            FieldType::FixedArray {
+                element_type: Box::new(FieldType::String),
+                length: 2,
+            },
+        ));
+        let c = codec(vec![pair]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let r = c.encode(
+            "test_msgs/Pair",
+            CdrEndianness::Little,
+            &headerless_input(&payload),
+        );
+        assert!(r.is_err(), "{r:?}");
     }
 
     #[test]
