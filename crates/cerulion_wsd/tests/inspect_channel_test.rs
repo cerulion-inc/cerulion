@@ -416,6 +416,34 @@ fn a_library_that_declares_params_without_the_symbol_is_refused_by_the_helper() 
     );
 }
 
+/// The parent parses the forwarded document again and logs its own
+/// diagnostics, so the child's check must not log them too: an unknown key
+/// would otherwise reach the operator twice, the second time inside the
+/// child's relayed stderr.
+#[test]
+fn the_child_does_not_log_the_unknown_key_warning_the_parent_logs() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = inspect_node_output_with_env(
+        &fixture,
+        &[("CER_INFO_UNKNOWN_KEY", "1"), ("RUST_LOG", "warn")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "an unknown key is a warning, never a refusal: {} / {stderr}",
+        out.status
+    );
+    assert_eq!(
+        stdout, r#"{"inputs":[],"outputs":[],"polciy":"x"}"#,
+        "the document is forwarded as read"
+    );
+    assert!(
+        !stderr.contains("unknown key") && !stderr.contains("polciy"),
+        "the child must leave the unknown-key warning to the parent: {stderr:?}"
+    );
+}
+
 /// The child forwards the document that PASSED the checks, from one read. The
 /// fixture, under `CER_INFO_FIRST_READ_PLAIN=1`, answers its first info call
 /// with a plain document the host accepts and every later call with one that

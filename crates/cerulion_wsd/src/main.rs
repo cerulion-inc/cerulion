@@ -145,9 +145,17 @@ fn inspect_node(lib: &std::path::Path) -> ExitCode {
     // parent, which only ever sees the raw document, cannot accept a library
     // the run would refuse. It reads the document ONCE, so what crosses the
     // pipe is the very document that passed those checks.
-    match cerulion_core::graph::node::DylibNodeEntry::load(lib)
-        .and_then(|entry| entry.checked_info_json())
-    {
+    //
+    // The check's parse runs with tracing OFF: the parent parses the same
+    // document again and emits its diagnostics (an unknown-key warning, say)
+    // itself, so a warning here would reach the operator twice, once as the
+    // parent's own and once inside the child's relayed stderr. A refusal is
+    // still reported, by the `Err` arm below. `load` keeps its own logging.
+    match cerulion_core::graph::node::DylibNodeEntry::load(lib).and_then(|entry| {
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            entry.checked_info_json()
+        })
+    }) {
         Ok(json) => match document
             .write_all(json.as_bytes())
             .and_then(|()| document.flush())
