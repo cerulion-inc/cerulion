@@ -669,6 +669,15 @@ empty, never a hang.
   malformed-frame storm. The load-bearing test assertion is the pacing counter
   (`observer_pacing_engaged_count`), never a CPU percentage; CPU gates fail open on a
   loaded runner.
+- **Echo renders through the message YAML codec** (`cerulion_core::dynamic::
+  message_to_yaml_with`, arrays cut at `--truncate-length`), local walker first, then
+  the remote-seeded one. Every line that is not the message is a `#` comment and each
+  frame ends with `---`, so a frame block is valid YAML and an uncut message is valid
+  input to anything that reads the codec. There are no per-type printers: one render
+  path means one YAML form. The 2000-line cap (`ECHO_MAX_LINES`) is passed to the codec
+  as `YamlEncodeOptions::max_lines`, so the encoder stops writing at the cap (a small
+  frame that names a huge zero-default form costs 2000 lines of work, not the whole form)
+  and ends the cut frame with a column-0 `!truncated` line that no YAML reader accepts.
 
 ---
 

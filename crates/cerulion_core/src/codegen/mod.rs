@@ -55,7 +55,8 @@ pub use rossrv_parser::{
 };
 pub use route_budget::{route_slice_budget, route_slice_budget_capped};
 pub use schema::{
-    ConstantDef, DefaultLiteral, FieldDef, FieldType, MessageSchema, NestedFixedInfo, ScalarLiteral,
+    ConstantDef, DefaultLiteral, FieldBounds, FieldDef, FieldType, MessageSchema, NestedFixedInfo,
+    ScalarLiteral,
 };
 pub use slice_ceiling::{
     resolve_rmw_slice_ceiling, slice_ceiling_for_type, SliceCeilingOverrides, RMW_SLICE_CEILING_ENV,

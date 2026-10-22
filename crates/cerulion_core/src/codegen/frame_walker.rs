@@ -3,11 +3,10 @@
 //!
 //! [`FrameWalker`] decodes a raw Cerulion wire frame into a typed
 //! [`FrameValue`] tree, driven ENTIRELY by the schema IR — no per-message
-//! code. It is designed to replace the hand-written, two-hash decoders in
-//! `cerulion_cli_engine::topic_cmd` (`decode_string_payload` /
-//! `decode_image_meta`) — those decoders still exist today; rewriting
-//! `topic echo` onto the walker is a tracked follow-on — and it is the
-//! substrate for schema-driven sinks such as the Rerun bridge (`examples/go2`).
+//! code. It is the decode half of the message YAML codec
+//! (`crate::dynamic::message_to_yaml`, which `topic echo` prints through) and
+//! the substrate for schema-driven sinks such as the Rerun bridge
+//! (`examples/go2`).
 //!
 //! # What it does
 //!
@@ -431,6 +430,11 @@ pub enum WalkError {
         consumed: usize,
         body_len: usize,
     },
+
+    /// Nested messages go deeper than [`MAX_WALK_NESTING`] levels. Only a
+    /// recursive schema can do that, with a frame built to.
+    #[error("messages in the frame nest deeper than {max} levels at '{schema}'")]
+    NestingTooDeep { schema: String, max: u32 },
 }
 
 /// How strictly ONE payload's own offset-table accounting is audited.
@@ -546,7 +550,7 @@ impl FrameWalker {
             let schema = &resolver.schemas()[idx];
             let slot = slots.layouts.len();
             slots.slot_of.push(Some(slot));
-            slots.packages.push(schema.package.clone());
+            slots.schemas.push(schema.clone());
             if slots.index.is_active(schema, idx) {
                 active.push(slot);
             }
@@ -608,6 +612,42 @@ impl FrameWalker {
                     .then_some((idx, layout))
             })
             .collect()
+    }
+
+    /// The resolved schema for a qualified NAME (fields in declaration
+    /// order; nested references carry their fixed-size resolution), from
+    /// the same slot as [`layout_for_name`](Self::layout_for_name). `None`
+    /// exactly when that is `None`.
+    pub fn schema_for_name(&self, qualified_name: &str) -> Option<&MessageSchema> {
+        self.layouts
+            .get(qualified_name)
+            .map(|&slot| &self.slots.schemas[slot])
+    }
+
+    /// The resolved schema a frame with this `schema_hash` decodes as: the
+    /// slot [`walk_by_hash`](Self::walk_by_hash) picks, which a twin that
+    /// owns the same qualified name never replaces. `None` exactly when
+    /// [`layout_for_hash`](Self::layout_for_hash) is `None`.
+    pub fn schema_for_hash(&self, schema_hash: u64) -> Option<&MessageSchema> {
+        let &slot = self.hash_index.get(&schema_hash)?;
+        Some(&self.slots.schemas[slot])
+    }
+
+    /// Resolve a nested field reference (`schema_name` + optional
+    /// `package`, declared inside a schema of package `parent_package`) to
+    /// its target's layout and resolved schema, through the same identity
+    /// binding the walker decodes with: on the target's own `(package,
+    /// name)`, never on qualified-name text. Both halves
+    /// come from one slot, so a twin that owns the target's qualified name
+    /// never stands in for it.
+    pub fn nested_target(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent_package: Option<&str>,
+    ) -> Option<(&WireLayout, &MessageSchema)> {
+        self.nested_slot(schema_name, package, parent_package)
+            .map(|slot| (&self.slots.layouts[slot], &self.slots.schemas[slot]))
     }
 
     /// True if `qualified_name` is decodable by this walker.
@@ -677,15 +717,55 @@ impl FrameWalker {
         qualified_name: &str,
         frame: &'a [u8],
     ) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_reach(qualified_name, frame, Reach::ALL)
+    }
+
+    /// [`walk`](Self::walk), holding at most `keep` decoded elements of each
+    /// element array ([`FrameValueKind::Array`] and
+    /// [`FrameValueKind::NestedArray`]), so a caller that shows only the
+    /// first few elements does not hold a tree of all of them.
+    ///
+    /// Every element is still decoded and checked, one at a time, so the
+    /// result is the same as [`walk`](Self::walk)'s with the element lists
+    /// cut: a bad element past `keep` degrades its array to
+    /// [`FrameValueKind::NestedArrayOpaque`] exactly as it does there. The
+    /// full element count stays readable: an `Array` has its schema's
+    /// declared length; a `NestedArray`'s `raw` bytes are the whole array.
+    ///
+    /// A fixed array of zero-size messages (no bytes per element: an empty
+    /// message, or one made only of such arrays) holds none of its
+    /// elements: each is the schema's empty value, so the schema alone
+    /// gives them, and a frame of a few bytes cannot make the walker build
+    /// one value per declared element.
+    pub fn walk_keeping<'a>(
+        &self,
+        qualified_name: &str,
+        frame: &'a [u8],
+        keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_reach(qualified_name, frame, Reach::keeping(keep))
+    }
+
+    fn walk_reach<'a>(
+        &self,
+        qualified_name: &str,
+        frame: &'a [u8],
+        reach: Reach,
+    ) -> Result<FrameValue<'a>, WalkError> {
         let slot = *self
             .layouts
             .get(qualified_name)
             .ok_or_else(|| WalkError::UnknownSchema(qualified_name.to_string()))?;
-        self.walk_slot(slot, frame)
+        self.walk_slot(slot, frame, reach)
     }
 
     /// Decode `frame` (WireHeader included) with the `slot`-th layout.
-    fn walk_slot<'a>(&self, slot: usize, frame: &'a [u8]) -> Result<FrameValue<'a>, WalkError> {
+    fn walk_slot<'a>(
+        &self,
+        slot: usize,
+        frame: &'a [u8],
+        reach: Reach,
+    ) -> Result<FrameValue<'a>, WalkError> {
         if frame.len() < WireHeader::SIZE {
             return Err(WalkError::FrameTooShort {
                 have: frame.len(),
@@ -693,13 +773,48 @@ impl FrameWalker {
             });
         }
         let payload = &frame[WireHeader::SIZE..];
-        self.walk_payload(self.target(slot), payload, 0, PayloadAudit::Frame)
+        self.walk_payload(self.target(slot), payload, 0, reach, PayloadAudit::Frame)
     }
 
     /// Decode `frame` using its own `WireHeader.schema_hash` to pick the
     /// schema (the general "topic echo" entry point). Errors if the hash is
     /// unknown or the frame is truncated.
     pub fn walk_by_hash<'a>(&self, frame: &'a [u8]) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_by_hash_reach(frame, Reach::ALL)
+    }
+
+    /// [`walk_by_hash`](Self::walk_by_hash) with the element limit of
+    /// [`walk_keeping`](Self::walk_keeping).
+    pub fn walk_by_hash_keeping<'a>(
+        &self,
+        frame: &'a [u8],
+        keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        self.walk_by_hash_reach(frame, Reach::keeping(keep))
+    }
+
+    /// [`walk_by_hash_keeping`](Self::walk_by_hash_keeping) that keeps a
+    /// scalar `bool` byte other than 0 or 1 as [`FrameValueKind::U8`] with
+    /// that byte, not as `Bool(true)`. The YAML writer refuses such a frame
+    /// (`true` would read back as 1, so the frame has no YAML form); every
+    /// other caller reads any nonzero byte as true.
+    pub(crate) fn walk_by_hash_keeping_raw_bools<'a>(
+        &self,
+        frame: &'a [u8],
+        keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        let reach = Reach {
+            raw_bools: true,
+            ..Reach::keeping(keep)
+        };
+        self.walk_by_hash_reach(frame, reach)
+    }
+
+    fn walk_by_hash_reach<'a>(
+        &self,
+        frame: &'a [u8],
+        reach: Reach,
+    ) -> Result<FrameValue<'a>, WalkError> {
         if frame.len() < WireHeader::SIZE {
             return Err(WalkError::FrameTooShort {
                 have: frame.len(),
@@ -717,7 +832,7 @@ impl FrameWalker {
             .hash_index
             .get(&header.schema_hash)
             .ok_or(WalkError::UnknownSchemaHash(header.schema_hash))?;
-        self.walk_slot(slot, frame)
+        self.walk_slot(slot, frame, reach)
     }
 
     /// Decode a headerless payload (`[fixed][table][var]`) against a layout.
@@ -731,8 +846,18 @@ impl FrameWalker {
         layout: Target<'_>,
         payload: &'a [u8],
         array_depth: u32,
+        reach: Reach,
         audit: PayloadAudit,
     ) -> Result<FrameValue<'a>, WalkError> {
+        // Every nested message is one more level of this recursion, and a
+        // recursive schema (`Node { Node child }`) lets the frame's bytes
+        // alone pick the depth: stop at a fixed bound, never at the stack.
+        if reach.nest >= MAX_WALK_NESTING {
+            return Err(WalkError::NestingTooDeep {
+                schema: layout.qualified_name.clone(),
+                max: MAX_WALK_NESTING,
+            });
+        }
         // Untrusted-input strictness (findings 1+5): the WHOLE declared
         // offset table must be present up front. `read_offset_entry`'s
         // (0, 0) short-buffer fallback exists for the production writer's
@@ -768,7 +893,13 @@ impl FrameWalker {
                     payload_len: payload.len(),
                 }
             })?;
-            let value = self.decode_fixed(&fl.field_type, bytes, layout.package, array_depth)?;
+            let value = self.decode_fixed(
+                &fl.field_type,
+                bytes,
+                layout.package,
+                array_depth,
+                reach.deeper(),
+            )?;
             fields.push(NamedValue {
                 name: fl.name.clone(),
                 value,
@@ -832,8 +963,14 @@ impl FrameWalker {
                     &payload[off..off + len]
                 }
             };
-            let value =
-                self.decode_variable(&vf.field_type, bytes, layout.package, array_depth, audit)?;
+            let value = self.decode_variable(
+                &vf.field_type,
+                bytes,
+                layout.package,
+                array_depth,
+                reach.deeper(),
+                audit,
+            )?;
             fields.push(NamedValue {
                 name: vf.name.clone(),
                 value,
@@ -866,8 +1003,10 @@ impl FrameWalker {
         bytes: &'a [u8],
         parent_package: Option<&str>,
         array_depth: u32,
+        reach: Reach,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         Ok(match ft {
+            FieldType::Bool if reach.raw_bools && bytes[0] > 1 => FrameValueKind::U8(bytes[0]),
             FieldType::Bool => FrameValueKind::Bool(bytes[0] != 0),
             FieldType::I8 => FrameValueKind::I8(bytes[0] as i8),
             FieldType::U8 => FrameValueKind::U8(bytes[0]),
@@ -895,7 +1034,14 @@ impl FrameWalker {
             FieldType::FixedArray {
                 element_type,
                 length,
-            } => self.decode_array(element_type, *length, bytes, parent_package, array_depth)?,
+            } => self.decode_array(
+                element_type,
+                *length,
+                bytes,
+                parent_package,
+                array_depth,
+                reach,
+            )?,
             FieldType::Nested {
                 schema_name,
                 package,
@@ -915,6 +1061,7 @@ impl FrameWalker {
                     target,
                     bytes,
                     array_depth,
+                    reach,
                     PayloadAudit::Frame,
                 )?))
             }
@@ -925,6 +1072,25 @@ impl FrameWalker {
         })
     }
 
+    /// A `FixedArray` of zero-size messages. Every element is decoded from
+    /// the same empty slice, so one decode checks them all and the rest
+    /// are copies: the work is bounded by what is held, not by `length`.
+    fn decode_zero_size_array<'a>(
+        &self,
+        element_type: &FieldType,
+        length: usize,
+        parent_package: Option<&str>,
+        array_depth: u32,
+        reach: Reach,
+    ) -> Result<FrameValueKind<'a>, WalkError> {
+        let held = length.min(reach.keep).min(reach.keep_zero_size);
+        if length == 0 {
+            return Ok(FrameValueKind::Array(Vec::new()));
+        }
+        let first = self.decode_fixed(element_type, &[], parent_package, array_depth, reach)?;
+        Ok(FrameValueKind::Array(vec![first; held]))
+    }
+
     /// Decode a `FixedArray<T>` whose bytes are the whole array slice.
     fn decode_array<'a>(
         &self,
@@ -933,6 +1099,7 @@ impl FrameWalker {
         bytes: &'a [u8],
         parent_package: Option<&str>,
         array_depth: u32,
+        reach: Reach,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         if let Some(pt) = prim_type_of(element_type) {
             return Ok(FrameValueKind::PrimArray(PrimArray {
@@ -950,7 +1117,16 @@ impl FrameWalker {
                 // Array of fixed-nested: split into `length` equal strides
                 // and decode each element.
                 let stride = info.fixed_size;
-                let mut out = Vec::with_capacity(length);
+                if stride == 0 {
+                    return self.decode_zero_size_array(
+                        element_type,
+                        length,
+                        parent_package,
+                        array_depth,
+                        reach,
+                    );
+                }
+                let mut out = Vec::with_capacity(length.min(ELEMENT_PREALLOC_CAP).min(reach.keep));
                 for i in 0..length {
                     let s = i.checked_mul(stride);
                     let e = s.and_then(|s| s.checked_add(stride));
@@ -962,7 +1138,11 @@ impl FrameWalker {
                             payload_len: bytes.len(),
                         }
                     })?;
-                    out.push(self.decode_fixed(element_type, elem, parent_package, array_depth)?);
+                    let value =
+                        self.decode_fixed(element_type, elem, parent_package, array_depth, reach)?;
+                    if out.len() < reach.keep {
+                        out.push(value);
+                    }
                 }
                 Ok(FrameValueKind::Array(out))
             }
@@ -981,6 +1161,7 @@ impl FrameWalker {
         bytes: &'a [u8],
         parent_package: Option<&str>,
         array_depth: u32,
+        reach: Reach,
         audit: PayloadAudit,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         Ok(match ft {
@@ -1003,7 +1184,14 @@ impl FrameWalker {
                         // `Nested[]` / `string[]` under the canonical
                         // element framing; degrades to
                         // `NestedArrayOpaque` when the bytes do not satisfy it.
-                        self.decode_element_array(other, None, bytes, parent_package, array_depth)
+                        self.decode_element_array(
+                            other,
+                            None,
+                            bytes,
+                            parent_package,
+                            array_depth,
+                            reach,
+                        )
                     }
                 }
             },
@@ -1044,6 +1232,7 @@ impl FrameWalker {
                         target,
                         bytes,
                         array_depth,
+                        reach,
                         audit,
                     )?))
                 }
@@ -1062,6 +1251,7 @@ impl FrameWalker {
                 bytes,
                 parent_package,
                 array_depth,
+                reach,
             ),
             // Fixed primitives never land in the variable section.
             _ => FrameValueKind::Bytes(bytes),
@@ -1088,6 +1278,7 @@ impl FrameWalker {
         bytes: &'a [u8],
         parent_package: Option<&str>,
         array_depth: u32,
+        reach: Reach,
     ) -> FrameValueKind<'a> {
         // An EMPTY blob is the `set_<f>_bytes(&[])` producer idiom for an
         // intentionally empty complex field (the same rule the single
@@ -1126,13 +1317,20 @@ impl FrameWalker {
                     return FrameValueKind::NestedArrayOpaque(bytes);
                 };
                 if target.is_fixed() {
-                    self.decode_fixed_stride_elements(target, declared_length, bytes, array_depth)
+                    self.decode_fixed_stride_elements(
+                        target,
+                        declared_length,
+                        bytes,
+                        array_depth,
+                        reach,
+                    )
                 } else {
                     self.decode_counted_elements(
                         CountedElement::SubFrame(target),
                         declared_length,
                         bytes,
                         array_depth,
+                        reach,
                     )
                 }
             }
@@ -1141,6 +1339,7 @@ impl FrameWalker {
                 declared_length,
                 bytes,
                 array_depth,
+                reach,
             ),
             // `DynamicArray<DynamicArray<..>>`, `StringFixed` elements, and any
             // other element shape canonical v1 does not define: opaque.
@@ -1180,6 +1379,7 @@ impl FrameWalker {
         declared_length: Option<usize>,
         bytes: &'a [u8],
         array_depth: u32,
+        reach: Reach,
     ) -> FrameValueKind<'a> {
         let opaque = FrameValueKind::NestedArrayOpaque(bytes);
         let mut cur = ElementCursor::new(bytes);
@@ -1194,7 +1394,7 @@ impl FrameWalker {
         if declared_length.is_some_and(|n| n != count) {
             return opaque;
         }
-        let mut out = Vec::with_capacity(count.min(ELEMENT_PREALLOC_CAP));
+        let mut out = Vec::with_capacity(count.min(ELEMENT_PREALLOC_CAP).min(reach.keep));
         for _ in 0..count {
             let Some(len) = cur.read_u32() else {
                 return opaque;
@@ -1205,7 +1405,10 @@ impl FrameWalker {
             match element {
                 // An empty UTF-8 element is a legitimate empty string (CDR
                 // `u32(1) | NUL` carries zero content bytes).
-                CountedElement::Utf8 => out.push(decode_str_or_bytes(body)),
+                CountedElement::Utf8 if out.len() < reach.keep => {
+                    out.push(decode_str_or_bytes(body))
+                }
+                CountedElement::Utf8 => {}
                 CountedElement::SubFrame(target) => {
                     if body.is_empty() {
                         // A VARIABLE element schema has at least one
@@ -1225,8 +1428,20 @@ impl FrameWalker {
                         // a fixed target.
                         return opaque;
                     }
-                    match self.walk_payload(target, body, array_depth + 1, PayloadAudit::Element) {
-                        Ok(fv) => out.push(FrameValueKind::Nested(Box::new(fv))),
+                    match self.walk_payload(
+                        target,
+                        body,
+                        array_depth + 1,
+                        reach,
+                        PayloadAudit::Element,
+                    ) {
+                        // Every element is decoded, so a bad one past
+                        // `keep` still degrades the array; only the first
+                        // `keep` are held.
+                        Ok(fv) if out.len() < reach.keep => {
+                            out.push(FrameValueKind::Nested(Box::new(fv)))
+                        }
+                        Ok(_) => {}
                         // ALL-OR-NOTHING (see `decode_fixed_stride_elements`).
                         Err(_) => return opaque,
                     }
@@ -1256,6 +1471,7 @@ impl FrameWalker {
         declared_length: Option<usize>,
         bytes: &'a [u8],
         array_depth: u32,
+        reach: Reach,
     ) -> FrameValueKind<'a> {
         let stride = target.fixed_size;
         // stride == 0 (a fieldless element schema, e.g. `std_msgs/Empty[]`)
@@ -1269,7 +1485,7 @@ impl FrameWalker {
         if declared_length.is_some_and(|n| n != count) {
             return FrameValueKind::NestedArrayOpaque(bytes);
         }
-        let mut out = Vec::with_capacity(count.min(ELEMENT_PREALLOC_CAP));
+        let mut out = Vec::with_capacity(count.min(ELEMENT_PREALLOC_CAP).min(reach.keep));
         for i in 0..count {
             let elem = &bytes[i * stride..(i + 1) * stride];
             // A fixed element schema has no offset table, so its body cannot
@@ -1277,8 +1493,9 @@ impl FrameWalker {
             // The Element audit reduces to `elem.len() == target.fixed_size`,
             // which the stride arithmetic already guarantees; passed for
             // uniformity (an element is audited as an element).
-            match self.walk_payload(target, elem, array_depth, PayloadAudit::Element) {
-                Ok(fv) => out.push(FrameValueKind::Nested(Box::new(fv))),
+            match self.walk_payload(target, elem, array_depth, reach, PayloadAudit::Element) {
+                Ok(fv) if out.len() < reach.keep => out.push(FrameValueKind::Nested(Box::new(fv))),
+                Ok(_) => {}
                 // ALL-OR-NOTHING: a half-decoded array is exactly the
                 // fabricated value the walker forbids.
                 Err(_) => return FrameValueKind::NestedArrayOpaque(bytes),
@@ -1295,7 +1512,7 @@ impl FrameWalker {
     fn target(&self, slot: usize) -> Target<'_> {
         Target {
             layout: &self.slots.layouts[slot],
-            package: self.slots.packages[slot].as_deref(),
+            package: self.slots.schemas[slot].package.as_deref(),
         }
     }
 
@@ -1328,12 +1545,22 @@ impl FrameWalker {
         package: &Option<String>,
         parent_package: Option<&str>,
     ) -> Option<Target<'_>> {
+        self.nested_slot(schema_name, package, parent_package)
+            .map(|slot| self.target(slot))
+    }
+
+    /// The slot [`lookup_nested`](Self::lookup_nested) binds to.
+    fn nested_slot(
+        &self,
+        schema_name: &str,
+        package: &Option<String>,
+        parent_package: Option<&str>,
+    ) -> Option<usize> {
         self.slots
             .index
             .bind(package.as_deref(), schema_name, parent_package)
             .ok()
             .and_then(|bound| self.slots.slot_of[bound.idx])
-            .map(|slot| self.target(slot))
     }
 }
 
@@ -1343,9 +1570,13 @@ struct Slots {
     /// One wire layout per schema identity in the set, precomputed
     /// (including nested targets, so recursion is an index lookup).
     layouts: Vec<WireLayout>,
-    /// The package of each slot's schema: the same-package context for the
-    /// nested references inside it.
-    packages: Vec<Option<String>>,
+    /// Each slot's RESOLVED schema (fields in declaration order; nested
+    /// references carry their fixed-size resolution). A [`WireLayout`]
+    /// splits fields into a fixed and a variable group, so the declaration
+    /// order a user reads in a `.msg` survives only here; the message YAML
+    /// codec (`crate::dynamic`) keys its output on it. Its package is the
+    /// same-package context for the nested references inside it.
+    schemas: Vec<MessageSchema>,
     /// Identity `(package, name)` → schema index, over EVERY schema in the
     /// set (the resolver's own registry): what nested references bind
     /// through, the same ladder the schema resolver binds with.
@@ -1370,6 +1601,54 @@ impl std::ops::Deref for Target<'_> {
     }
 }
 
+/// What one walk may hold and how deep it has gone: at most `keep` decoded
+/// elements per element array (`keep_zero_size` per fixed array of
+/// zero-size messages), `nest` messages below the root.
+#[derive(Clone, Copy)]
+struct Reach {
+    keep: usize,
+    keep_zero_size: usize,
+    nest: u32,
+    /// Keep a scalar `bool` byte past 1 as `U8` (see
+    /// [`FrameWalker::walk_by_hash_keeping_raw_bools`]).
+    raw_bools: bool,
+}
+
+impl Reach {
+    /// Hold every element (what [`FrameWalker::walk`] returns).
+    const ALL: Self = Self {
+        keep: usize::MAX,
+        keep_zero_size: usize::MAX,
+        nest: 0,
+        raw_bools: false,
+    };
+
+    /// What [`FrameWalker::walk_keeping`] holds.
+    const fn keeping(keep: usize) -> Self {
+        Self {
+            keep,
+            keep_zero_size: 0,
+            nest: 0,
+            raw_bools: false,
+        }
+    }
+
+    /// One message further down.
+    fn deeper(self) -> Self {
+        Self {
+            nest: self.nest + 1,
+            ..self
+        }
+    }
+}
+
+/// How deep nested messages of any kind may go before the walker refuses
+/// the frame ([`WalkError::NestingTooDeep`]). Far past any real ROS 2 type
+/// (well under 10) and past the YAML codec's 64, so the codec still names
+/// the field where its own bound stops; low enough that the recursion stays
+/// a few hundred stack frames deep.
+pub const MAX_WALK_NESTING: u32 = 256;
+
 /// How deep canonically-framed element ARRAYS may nest before the walker
 /// stops decoding and hands the bytes back opaque. Element bodies
 /// shrink strictly at every level, so termination does not rest on this — it
@@ -1379,13 +1658,10 @@ impl std::ops::Deref for Target<'_> {
 ///
 /// SCOPE: only [`FrameWalker::decode_element_array`] consults it. The
 /// SINGULAR variable-nested arm (`decode_variable`'s `Nested` case) recurses
-/// through `walk_payload` at the same depth with no cap, so a *recursive*
-/// schema (`Node { Node child, string tag }`) can still drive walker recursion
-/// as deep as the frame's bytes allow. That hole predates element framing and is not
-/// widened by it (the same reachability class — a frame can only drive depth at
-/// all under a recursive schema); it is called out here so the cap is not read
-/// as a total answer.
-const MAX_NESTED_ARRAY_DEPTH: u32 = 8;
+/// through `walk_payload` at the same array depth; a *recursive* schema
+/// (`Node { Node child, string tag }`) there is bounded by
+/// [`MAX_WALK_NESTING`] instead.
+pub(crate) const MAX_NESTED_ARRAY_DEPTH: u32 = 8;
 
 /// Upper bound on the element `Vec`'s UP-FRONT capacity.
 ///
@@ -3141,14 +3417,14 @@ mod tests {
         let bytes = vec![0u8; 72];
 
         // Arity matches ⇒ decodes.
-        match walker.decode_fixed_stride_elements(point, Some(3), &bytes, 0) {
+        match walker.decode_fixed_stride_elements(point, Some(3), &bytes, 0, Reach::ALL) {
             FrameValueKind::NestedArray { elements, .. } => assert_eq!(elements.len(), 3),
             other => panic!("expected 3 decoded elements, got {other:?}"),
         }
         // Arity disagrees ⇒ opaque (never a silently-different count).
         for declared in [2usize, 4] {
             assert_eq!(
-                walker.decode_fixed_stride_elements(point, Some(declared), &bytes, 0),
+                walker.decode_fixed_stride_elements(point, Some(declared), &bytes, 0, Reach::ALL),
                 FrameValueKind::NestedArrayOpaque(bytes.as_slice()),
                 "declared {declared} vs 3 real strides must degrade"
             );

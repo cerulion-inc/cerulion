@@ -1205,8 +1205,14 @@ jobs:
       # ring (through the QUIC link's rustls) compiles C in its build script,
       # so the check needs the aarch64 C compiler that release-artifacts.yml
       # installs for the same target.
+      # The hosted image ships a packages.microsoft.com apt source; apt-get
+      # update exits 100 when that source refuses or fails its signature check,
+      # even though both packages come from the Ubuntu archives. Deleting its
+      # list first keeps that source out of the update; rm -f exits 0 when the
+      # file is absent.
       - name: Install aarch64 C compiler
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
