@@ -50,6 +50,7 @@ fn graph_with(network: Option<NetworkBlock>) -> GraphConfig {
         prefix: "ng".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "n".to_string(),
             node_type: "t".to_string(),
@@ -412,6 +413,7 @@ fn node_run_temp_graph_shape_is_permissive() {
         prefix: "standalone".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "talker".to_string(),
             node_type: "talker".to_string(),
@@ -446,6 +448,7 @@ fn ros_attach_bridge_graph_shape_is_permissive() {
     config.identity = "go2_bridge".to_string();
     config.nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "viz".to_string(),
         node_type: "cerulion_viz".to_string(),

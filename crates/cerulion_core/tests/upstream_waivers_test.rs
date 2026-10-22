@@ -244,8 +244,8 @@ const SUPPORT_SPAWN_HELPERS: &[&str] = &["spawn_mp_record", "spawn_graph_run_gra
 /// Reached by the derivation and deliberately NOT waived, as `(path, why)`.
 ///
 /// The derivation selects every binary that can reach a plugin load, which is wider
-/// than the set that fails: two of these spawn a `--single-process` child, which loads
-/// the plugins and creates its resources once, the third spawns a run that is rejected
+/// than the set that fails: three of these spawn a `--single-process` child, which loads
+/// the plugins and creates its resources once, the fourth spawns a run that is rejected
 /// before any plugin loads, and all are observed PASSING on macOS. Naming them here,
 /// rather than narrowing the rule until it excluded them, is what keeps the next such
 /// suite a decision instead of a silent omission: a file reached by the walk must
@@ -258,6 +258,11 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/flashback_resim_e2e_test.rs",
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
+    ),
+    (
+        "crates/cerulion_cli/tests/graph_params_e2e_test.rs",
+        "spawns `graph run --single-process`; its 6 macOS arms passed on Darwin 27 \
+         under `-- --test-threads=1`",
     ),
     (
         "crates/cerulion_cli/tests/node_fatal_e2e_test.rs",

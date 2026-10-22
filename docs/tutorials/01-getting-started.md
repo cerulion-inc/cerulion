@@ -281,8 +281,13 @@ cerulion node info lidar_sensor
 Node type: lidar_sensor
 Policy: period 100ms
 Outputs:
-  scan sensor_msgs/LaserScan
+  scan (sensor_msgs/LaserScan)
+Params: not read (no loadable library: searched <workspace>/target/debug/liblidar_sensor.dylib and <workspace>/target/release/liblidar_sensor.dylib (debug profile); run `cerulion node build lidar_sensor` first)
 ```
+
+On Linux the library is `liblidar_sensor.so`.
+
+The `Params:` line lists the node's `#[param]` fields once the node is built.
 
 > **Note on schema introspection:** `cerulion schema info` covers BOTH
 > workspace-local schemas (`schemas/*.yaml`, looked up by file stem or

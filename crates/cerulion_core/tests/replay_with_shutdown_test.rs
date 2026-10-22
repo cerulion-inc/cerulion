@@ -75,6 +75,7 @@ fn run_replay_capture(target_ticks: u32) -> Vec<u64> {
         prefix: "rws".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -133,6 +134,7 @@ fn run_with_shutdown_during_init() -> Vec<u64> {
         prefix: "rsi".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

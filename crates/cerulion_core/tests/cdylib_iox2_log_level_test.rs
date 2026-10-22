@@ -157,6 +157,7 @@ fn build_probe_graph() -> TransportResult<GraphRuntime> {
         prefix: "lvl".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "probe0".to_string(),
             node_type: "discard_probe".to_string(),
@@ -386,6 +387,7 @@ fn subprocess_child_raw_ffi_level_probe() {
         prefix: "lvlr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "raw0".to_string(),
             node_type: "raw_probe".to_string(),

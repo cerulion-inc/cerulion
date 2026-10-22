@@ -176,6 +176,7 @@ fn one_node_config(prefix: &str, id: &str, node_type: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: node_type.to_string(),

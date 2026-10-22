@@ -116,6 +116,7 @@ impl Sink {
 fn writer_def(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "writer".to_string(),
@@ -146,6 +147,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
             writer_def("writer_b"),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "acc".to_string(),
                 node_type: "accumulate_node".to_string(),
@@ -163,6 +165,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),

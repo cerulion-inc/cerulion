@@ -23,6 +23,8 @@ integration oracle for every codegen/rewriter change is `cargo test -p cerulion_
   AND `gen_zero_copy_node_entry_impl`'s `.with_policy(...)` chain in `src/codegen.rs`),
   the CLI `--policy` parser, and the user docs - the in-process and cdylib paths
   diverge whenever only one emitter moves.
+- `#[param]` is ONE module, `src/param_attr.rs`: parse, checks and all three emissions come
+  from one parsed list, so the in-process and cdylib paths cannot disagree (internals doc).
 - Keep internal modules `mod`, never `pub mod` - a `proc-macro = true` crate may export
   only its macros; `pub mod` is a hard compile error.
 - Macro error paths re-emit the original struct alongside the `compile_error!` - keep
@@ -43,9 +45,8 @@ integration oracle for every codegen/rewriter change is `cargo test -p cerulion_
 
 ## Gotchas
 
-- `Ident::to_string()` keeps the `r#` prefix; feeding it into `format_ident!` for a
-  derived name panics at expansion. Strip `r#` before deriving idents; keep the raw
-  spelling in user-facing messages. ROS 2 has keyword fields (`Marker.type`).
+- `Ident::to_string()` keeps the `r#` prefix: strip it before `format_ident!` (it panics) and
+  for external names (`#[param] r#type` is the param `type`). ROS 2 has keyword fields.
 - Two-phase borrows do not apply to closure captures: wrapping a user RHS in a closure
   over the written port breaks same-port read-backs (E0502). Hoist the RHS to a temp
   first - Rust evaluates `rhs` before `place`, so the hoist is semantics-preserving.
@@ -56,5 +57,4 @@ integration oracle for every codegen/rewriter change is `cargo test -p cerulion_
   preserves `100_000`/`0xff`/type suffixes, which `str::parse::<u64>()` rejects, and a
   swallowed parse error silently drops the user's policy.
 
-Deep reference: docs/internals/macros.md - read before changing the attribute grammar,
-the rewriter, generated FFI symbols, or trybuild fixtures.
+Deep reference: docs/internals/macros.md (attribute grammar, rewriter, FFI symbols, trybuild).

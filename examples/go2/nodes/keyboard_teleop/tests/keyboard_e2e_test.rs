@@ -77,6 +77,7 @@ fn build_rig(prefix: &str) -> Rig {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "keyboard".to_string(),
             node_type: "keyboard_teleop".to_string(),
