@@ -15,7 +15,7 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 ## 1. `cerulion bag play --resim`: exit-code contract
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
-[--strict-state] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
+[--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -963,6 +963,7 @@ own binary.
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
 | `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |

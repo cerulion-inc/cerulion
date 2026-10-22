@@ -739,6 +739,7 @@ fn output_discard_count_is_observable_through_node_handle_e2e() {
         prefix: "odn".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "prod".to_string(),
             node_type: "discarding".to_string(),
@@ -954,6 +955,7 @@ fn notify_undelivered_count_is_observable_through_node_handle_e2e() {
         prefix: "nun".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "prod".to_string(),
             node_type: "notifying".to_string(),

@@ -2819,6 +2819,7 @@ mod tests {
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),
@@ -4517,6 +4518,7 @@ mod tests {
             prefix: PREFIX.to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -5636,6 +5638,7 @@ mod tests {
     fn abs_node(id: &str, inputs: &[(&str, &str)], out_topic: Option<&str>) -> NodeDef {
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

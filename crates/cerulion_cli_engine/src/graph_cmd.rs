@@ -1862,6 +1862,21 @@ fn render_node_entry(node: &NodeDef, indent: &str, nested_step: usize) -> String
             }
         }
     }
+    if !node.params.is_empty() {
+        // Declaration order, one scalar per line. A string goes through
+        // `render_scalar` so `"2.0"` stays a string; a number or bool is its
+        // `Display`, which keeps a float's decimal point (`2.0`, `-0.0`), so
+        // each value re-parses as the same `ParamValue`.
+        use cerulion_core::graph::params::ParamValue;
+        out.push_str(&format!("{key}params:\n"));
+        for (name, value) in &node.params {
+            let rendered = match value {
+                ParamValue::Str(s) => render_scalar(s),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("{key}  {}: {rendered}\n", render_scalar(name)));
+        }
+    }
     out
 }
 
@@ -2108,6 +2123,7 @@ pub fn build_node_def(
 
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id,
         node_type: node_type.to_string(),
@@ -2321,13 +2337,17 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
+    // Both checks that read a node library (the ingress gate and the params
+    // check) go through ONE memo, so each library's static initialization
+    // and teardown run once per validation, not once per check and node.
+    let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
         graph_name,
         &config,
         &cdylib_cache,
         true,
-        inspector,
+        &inspector,
     ))
 }
 
@@ -2393,6 +2413,10 @@ fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache)
         // into the same sentence from `GraphRuntime::build`.
         || label.starts_with(DATA_TRIGGER_CHECK_PREFIX)
         || label.starts_with(SYNC_TRIGGER_CHECK_PREFIX)
+        // The graph BUILD resolves every node's `params:` again before any
+        // transport resource exists, so a failing params line blocks the run
+        // under the flag with the same sentence.
+        || label.starts_with(crate::graph_params_check::PARAMS_CHECK_PREFIX)
     {
         return true;
     }
@@ -3493,6 +3517,16 @@ fn graph_validate_with_cache(
             )),
         }
     }
+
+    // Every node's `params:` against the specs its library declares, read
+    // through the caller's inspector once per resolved type. The graph build
+    // re-runs the same resolution, so a failing line here is a blocking one
+    // (`failing_check_blocks_the_run`).
+    checks.extend(crate::graph_params_check::params_checks(
+        config,
+        &resolved_library_paths(cdylib_cache),
+        inspector,
+    ));
 
     tracing::info!(graph = %graph_name, "graph validation complete");
 
@@ -5258,6 +5292,7 @@ mod open_file_limit_verdict_tests {
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id,
             node_type: "n".to_string(),
@@ -5660,6 +5695,14 @@ pub fn graph_run(
         crate::partition_emit::PartitionIntent::Derive
     );
 
+    // The params passes below (the validation report's check, the pre-write
+    // refusal and the effective-graph fill) read node libraries through one
+    // memo over a loader that keeps each library loaded for the whole run, so
+    // the run's own node load reuses it: a library's static initialization
+    // runs once per run, however many passes read its info.
+    let params_libraries = crate::graph_params_check::KeepLoaded::default();
+    let params_inspector = crate::graph_params_check::OncePerLibrary::new(&params_libraries);
+
     if !skip_validate {
         // A run that is about to DERIVE a partition validates REPLACE-SCOPED:
         // the block on disk is what it is here to replace, so it must not be
@@ -5683,7 +5726,7 @@ pub fn graph_run(
             report_config,
             &cdylib_cache,
             false,
-            &crate::node_inspector::InProcessInspector,
+            &params_inspector,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5765,6 +5808,14 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+    // Params the build would refuse, refused NOW, before the auto-partition
+    // pre-flight can write the graph file: `--no-validate` skips the report,
+    // not this, so a run refused over its params never mutates the file.
+    crate::graph_params_check::refuse_unresolvable_params(
+        &config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+    )?;
 
     // This process holds every topic of the graph while it starts, a set of
     // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
@@ -5934,6 +5985,18 @@ pub fn graph_run(
     // lifted out, so deployment planning, the recording's topic derivation
     // and the runtime build below see a plain native graph; the entries are
     // spawned beside it once the run's side effects begin.
+    //
+    // First, each node's `params:` is completed to the RESOLVED map (the
+    // graph's values over the declared defaults, in declaration order), so the
+    // document both embeds render carries the values in force and a resim
+    // applies them even after a node's `#[param]` default changed. Best
+    // effort: a node whose library will not read, or whose values the build
+    // refuses, keeps its map as written and the build below says why.
+    crate::graph_params_check::fill_resolved_params(
+        &mut config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+    );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
 
@@ -14769,14 +14832,14 @@ pub fn write_profile_artifact_atomically(
 /// callers need so none of it has to be re-derived from the path
 /// (and so the staleness walk runs exactly once per resolution).
 #[derive(Clone, Debug)]
-struct ResolvedCdylib {
-    path: std::path::PathBuf,
+pub(crate) struct ResolvedCdylib {
+    pub(crate) path: std::path::PathBuf,
     /// True when the artifact came from `target/release/`.
     release: bool,
     /// Best-effort staleness verdict: true when a build
     /// input under `nodes/<type>/` is strictly newer than the
     /// artifact.
-    stale: bool,
+    pub(crate) stale: bool,
 }
 
 impl ResolvedCdylib {
@@ -14844,6 +14907,23 @@ fn warn_if_stale(node_type: &str, lib: &ResolvedCdylib) {
 /// `graph_validate` and `graph_run` so a validated run
 /// walks each `src/` tree exactly once total rather than twice.
 type ResolvedCdylibCache = indexmap::IndexMap<String, Result<ResolvedCdylib, String>>;
+
+/// The cdylib path of every node TYPE in `cache` that resolved, for the
+/// passes that read a library's node info through a `NodeInspector` (the
+/// params check and the params fill). A type that did not resolve is absent;
+/// its own cdylib check already says why.
+fn resolved_library_paths(
+    cache: &ResolvedCdylibCache,
+) -> indexmap::IndexMap<String, std::path::PathBuf> {
+    cache
+        .iter()
+        .filter_map(|(node_type, lib)| {
+            lib.as_ref()
+                .ok()
+                .map(|lib| (node_type.clone(), lib.path.clone()))
+        })
+        .collect()
+}
 
 /// Resolve every distinct node type in `config` to its cdylib once,
 /// returning a per-type memo. The staleness walk runs exactly once
@@ -15307,7 +15387,7 @@ fn arch_filter<'a>(
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
 /// [`warn_if_stale`]).
-fn find_cdylib(
+pub(crate) fn find_cdylib(
     workspace_root: &Path,
     node_type: &str,
     prefer_release: bool,
@@ -24845,6 +24925,7 @@ nodes:
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
                     node_type: "cam".to_string(),
@@ -24875,6 +24956,7 @@ nodes:
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
                     node_type: "cam2".to_string(),
@@ -25197,6 +25279,7 @@ nodes:
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25274,6 +25357,7 @@ nodes:
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25356,6 +25440,7 @@ nodes:
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -28438,6 +28523,7 @@ nodes:
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
                 node_type: "driver".to_string(),
@@ -28506,6 +28592,7 @@ nodes:
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -32823,6 +32910,7 @@ network:
             nodes: (0..n)
                 .map(|i| NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
                     node_type: node_type.to_string(),
@@ -37003,6 +37091,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -37061,6 +37150,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
                     node_type: "fast".to_string(),
@@ -37075,6 +37165,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
                     node_type: "slow".to_string(),
@@ -40121,6 +40212,7 @@ mod worker_tests {
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
                 node_type: id.to_string(),
@@ -41851,6 +41943,7 @@ mod supervisor_tests {
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "t".to_string(),
