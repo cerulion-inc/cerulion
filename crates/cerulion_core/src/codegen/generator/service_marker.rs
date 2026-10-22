@@ -4,6 +4,7 @@
 //! [`super::generate_schema`] emits.
 
 use crate::codegen::rossrv_parser::ServiceDefinition;
+use crate::codegen::schema::MessageSchema;
 
 /// Generate the service marker for a parsed `.srv` file.
 ///
@@ -76,6 +77,48 @@ pub fn service_marker_conflict(
     None
 }
 
+/// Why the marker for `service` would name a part the message set has
+/// replaced, or `None` when every part in the set is the one the `.srv`
+/// declares.
+///
+/// `in_set` returns the message the set holds under a part's name, before
+/// nested resolution. A workspace schema of the same qualified name (a YAML
+/// file or a `.msg` in the workspace store) replaces the vendored part; its
+/// schema hash stays the same, since the hash covers the name, but its fields
+/// can differ, and then `ServiceType` would name the wrong wire type. A part
+/// counts as replaced when its fields (name, type, default) or constants
+/// differ from the `.srv`; descriptions do not count. A part missing from the
+/// set is left to [`service_marker_conflict`].
+pub fn service_part_replaced<'a>(
+    service: &ServiceDefinition,
+    in_set: impl Fn(&str) -> Option<&'a MessageSchema>,
+) -> Option<String> {
+    let replaced: Vec<&str> = [&service.request, &service.response]
+        .into_iter()
+        .filter(|part| in_set(&part.name).is_some_and(|held| !same_definition(part, held)))
+        .map(|part| part.name.as_str())
+        .collect();
+    if replaced.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "service '{}' is not generated: the workspace replaces its part(s) {} with a different definition",
+        service.qualified_name(),
+        replaced.join(", ")
+    ))
+}
+
+/// Same fields (name, type, default) in the same order, and same constants.
+fn same_definition(a: &MessageSchema, b: &MessageSchema) -> bool {
+    a.constants == b.constants
+        && a.fields.len() == b.fields.len()
+        && a.fields.iter().zip(&b.fields).all(|(x, y)| {
+            x.name == y.name
+                && x.field_type == y.field_type
+                && x.default_literal == y.default_literal
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +188,52 @@ mod tests {
             service_marker_conflict(&trigger(), |n| generated.contains(&n)).as_deref(),
             Some("service 'std_srvs/Trigger' is not generated: a message of the same name takes its name")
         );
+    }
+
+    /// The set holds the part the `.srv` declares: no replacement.
+    #[test]
+    fn a_part_the_set_holds_unchanged_is_not_replaced() {
+        let srv = trigger();
+        let parts = [srv.request.clone(), srv.response.clone()];
+        let lookup = |n: &str| parts.iter().find(|p| p.name == n);
+        assert_eq!(service_part_replaced(&srv, lookup), None);
+    }
+
+    /// A workspace part of the same name with other fields is named, and only
+    /// that part: the marker would bind it as the response.
+    #[test]
+    fn a_part_with_other_fields_is_replaced() {
+        let srv = trigger();
+        let other =
+            crate::codegen::parse_rosmsg("int32 code\n", "Trigger_Response", Some("std_srvs"))
+                .unwrap();
+        let parts = [srv.request.clone(), other];
+        let lookup = |n: &str| parts.iter().find(|p| p.name == n);
+        assert_eq!(
+            service_part_replaced(&srv, lookup).as_deref(),
+            Some("service 'std_srvs/Trigger' is not generated: the workspace replaces its part(s) Trigger_Response with a different definition")
+        );
+    }
+
+    /// A different comment is not a different definition.
+    #[test]
+    fn a_part_that_differs_only_in_comments_is_not_replaced() {
+        let srv = trigger();
+        let commented = crate::codegen::parse_rosmsg(
+            "# the result\nbool success # ok\n",
+            "Trigger_Response",
+            Some("std_srvs"),
+        )
+        .unwrap();
+        let parts = [srv.request.clone(), commented];
+        let lookup = |n: &str| parts.iter().find(|p| p.name == n);
+        assert_eq!(service_part_replaced(&srv, lookup), None);
+    }
+
+    /// A part missing from the set is not a replacement; the conflict check
+    /// reports it.
+    #[test]
+    fn a_missing_part_is_not_a_replacement() {
+        assert_eq!(service_part_replaced(&trigger(), |_| None), None);
     }
 }

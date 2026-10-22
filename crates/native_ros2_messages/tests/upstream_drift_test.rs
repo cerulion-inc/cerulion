@@ -1389,3 +1389,22 @@ fn refresh_manifest_from_upstream_tree() {
         );
     }
 }
+
+/// A corpus root that does not exist contributes nothing: a checkout without
+/// a `srv/` directory still walks its `.msg` files.
+#[test]
+fn a_missing_corpus_root_contributes_nothing() {
+    let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no_such_corpus_root");
+    assert!(common::corpus_sources(&missing, &missing).is_empty());
+}
+
+/// A corpus root that exists but cannot be listed is an error, not an empty
+/// corpus, so a refresh never rewrites the manifest from nothing. A plain
+/// file stands in for the unreadable root: listing it fails with an error
+/// other than "not found".
+#[test]
+#[should_panic(expected = "read ")]
+fn an_unlistable_corpus_root_panics() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    common::corpus_sources(&file, &file);
+}

@@ -19,7 +19,8 @@ pub fn vendored_sources() -> BTreeMap<(String, String), String> {
 
 /// `(pkg, Name) -> .msg text` for the `.msg` files under `msg_root/<pkg>/`
 /// and the `.srv` parts under `srv_root/<pkg>/` (the two roots may be the
-/// same directory). A missing root contributes nothing. A `.srv` part that
+/// same directory). A missing root contributes nothing; any other read
+/// failure panics, so a refresh never runs on a partial corpus. A `.srv` part that
 /// has the name of a `.msg` in its package panics, as in `build.rs`.
 pub fn corpus_sources(msg_root: &Path, srv_root: &Path) -> BTreeMap<(String, String), String> {
     let mut out = BTreeMap::new();
@@ -53,14 +54,24 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The path of one directory entry; an entry the OS cannot read panics, so a
+/// corpus file is never skipped without a word.
+fn entry_path(entry: std::io::Result<std::fs::DirEntry>, dir: &Path) -> PathBuf {
+    entry
+        .unwrap_or_else(|e| panic!("read an entry of {}: {e}", dir.display()))
+        .path()
+}
+
 /// `(pkg, stem, path)` of every `<root>/<pkg>/*.<ext>`, with `build.rs`'s
 /// package-name sanitization applied.
 fn files_with_extension(root: &Path, ext: &str) -> Vec<(String, String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("read {}: {e}", root.display()),
     };
     let mut out = Vec::new();
-    for pkg_dir in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+    for pkg_dir in entries.map(|e| entry_path(e, root)).filter(|p| p.is_dir()) {
         let pkg = pkg_dir
             .file_name()
             .expect("package dir name")
@@ -68,8 +79,7 @@ fn files_with_extension(root: &Path, ext: &str) -> Vec<(String, String, PathBuf)
             .replace('-', "_");
         for path in std::fs::read_dir(&pkg_dir)
             .unwrap_or_else(|e| panic!("read {}: {e}", pkg_dir.display()))
-            .flatten()
-            .map(|e| e.path())
+            .map(|e| entry_path(e, &pkg_dir))
             .filter(|p| p.extension().is_some_and(|x| x == ext))
         {
             let stem = path

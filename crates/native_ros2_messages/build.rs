@@ -13,8 +13,8 @@
 
 use cerulion_core::codegen::{
     generate_schema, generate_service_marker, parse_rosmsg, parse_rossrv, resolve_fixed_nested,
-    service_marker_conflict, split_rossrv, srv_request_name, srv_response_name, FieldType,
-    MessageSchema, ServiceDefinition,
+    service_marker_conflict, service_part_replaced, split_rossrv, srv_request_name,
+    srv_response_name, FieldType, MessageSchema, ServiceDefinition,
 };
 use cerulion_core::dynamic::SchemaSet;
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,8 +146,28 @@ fn main() {
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from);
     let workspace_mode = workspace.is_some();
+    // A service whose part the workspace replaces with another definition
+    // keeps the replacement as a message, but loses its marker: the marker
+    // would name the replacement as the standard request or response.
+    let mut replaced_services: BTreeSet<(String, String)> = BTreeSet::new();
     if let Some(root) = &workspace {
         all_schemas = workspace_message_set(root, all_schemas);
+        for (package, defs) in &services {
+            let held = all_schemas
+                .get(package)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for service in defs {
+                let in_set = |part: &str| {
+                    let qualified = format!("{package}/{part}");
+                    held.iter().find(|s| s.name == part || s.name == qualified)
+                };
+                if let Some(why) = service_part_replaced(service, in_set) {
+                    println!("cargo:warning=workspace messages: {why}");
+                    replaced_services.insert((package.clone(), service.name.clone()));
+                }
+            }
+        }
     }
 
     // Nested-resolution prerequisite: resolve nested-reference fixedness across
@@ -339,13 +359,17 @@ fn main() {
         // emitted only when both parts are generated and no generated message
         // takes the marker's name. The vendored corpus alone always passes
         // (the checks at the top fail its build first); a workspace can drop
-        // a part (an override shadows a type it embeds) or declare a message
-        // of the marker's name, and then only this service is left out.
+        // a part (an override shadows a type it embeds), replace a part with
+        // another definition (checked above, before resolution) or declare a
+        // message of the marker's name, and then only this service is left out.
         let generated_names: BTreeSet<&str> = generated
             .iter()
             .map(|(schema, _)| schema.name.as_str())
             .collect();
         for service in services.get(package).into_iter().flatten() {
+            if replaced_services.contains(&(package.clone(), service.name.clone())) {
+                continue;
+            }
             if let Some(why) =
                 service_marker_conflict(service, |name| generated_names.contains(name))
             {

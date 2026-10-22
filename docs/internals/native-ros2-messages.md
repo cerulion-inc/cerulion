@@ -39,7 +39,11 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
    marker (`pub struct <Name>;` carrying `impl ShmMessage`), the SHM-backed accessor
    `<Name>Shm`, and the heap-owned `<Name>Snapshot` replay/round-trip companion.
 6. **Service markers**: per `.srv`, `generate_service_marker` emits `pub struct <Name>;`
-   with `impl cerulion_core::message::ServiceType` naming the two parts.
+   with `impl cerulion_core::message::ServiceType` naming the two parts. In workspace
+   mode a marker is left out, with a cargo warning, when a part is not generated, when
+   a message takes the marker's name (`service_marker_conflict`), or when the workspace
+   replaces a part with a definition whose fields or constants differ from the `.srv`
+   (`service_part_replaced`, checked before nested resolution).
 7. **Module assembly**: one file per package plus `ros2_msgs.rs` re-exports.
 
 Cross-package `use` edges are derived by `collect_field_deps`, which mirrors the
