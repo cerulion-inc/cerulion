@@ -88,6 +88,8 @@ pub use buffer::{
     DEFAULT_MAX_RATE_HZ, DEFAULT_NAME_BYTES, DEFAULT_RETENTION, NAME_BYTES_PER_FRAME,
 };
 pub use edge_policy::EdgePolicy;
+#[allow(deprecated)]
+pub use error::TfMathError;
 pub use error::{Describe, TfError};
 pub use frame_id::{FrameId, FrameLabel, WriterId, FRAME_LABEL_BYTES};
 pub use quaternion::UnitQuaternion;

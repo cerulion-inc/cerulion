@@ -456,3 +456,18 @@ fn rotation_at_the_scaling_threshold_is_exact_for_the_identity() {
     let got = UnitQuaternion::IDENTITY.rotate(v);
     assert_eq!(got.map(f64::to_bits), v.map(f64::to_bits));
 }
+
+/// Code written against the former error name still compiles: it names the
+/// type, builds a variant through it, and receives a math refusal as it.
+#[test]
+#[allow(deprecated)]
+fn the_former_error_name_still_names_the_math_refusals() {
+    use cerulion_tf::TfMathError;
+    let refused: Result<UnitQuaternion, TfMathError> = UnitQuaternion::new(0.0, 0.0, 0.0, 0.0);
+    assert_eq!(
+        refused,
+        Err(TfMathError::DegenerateQuaternion { norm: 0.0 })
+    );
+    let nan: TfMathError = UnitQuaternion::new(f64::NAN, 0.0, 0.0, 1.0).unwrap_err();
+    assert_eq!(nan, TfError::NonFiniteQuaternion);
+}

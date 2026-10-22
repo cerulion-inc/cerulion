@@ -15,7 +15,9 @@
 //! inside a window; the repeat pass on the same buffer, which begins a new
 //! epoch and meets a full frame table and counted repeat refusals, is
 //! measured on its own. A static insert that clears a dynamic edge's
-//! history has its own window too.
+//! history has its own window too, and so do the two refusals this buffer
+//! cannot reach: a name past the byte budget (its full frame table refuses
+//! first) and a handle from another buffer.
 //!
 //! ONE `#[test]` body on purpose: the window is process-global, and a second
 //! test in this binary could reset it mid-measurement.
@@ -166,7 +168,8 @@ fn small_buffer() -> TfBuffer {
 /// Every buffer operation, on a buffer of 10 frames with rings of 3 and a
 /// window of 1000 ns: inserts that add, replace, expire and overflow, a
 /// static edge, edge policies, an epoch, lookups of every shape, and every
-/// refusal. The first pass on a fresh buffer registers frames and grows
+/// refusal but `NameBudgetFull` and `UnknownFrameId`, which the test body
+/// measures on a buffer of its own. The first pass on a fresh buffer registers frames and grows
 /// rings; run again on the same buffer, the repeat meets full rings, a full
 /// frame table and counted repeat refusals, so all are measured.
 fn every_buffer_operation(b: &mut TfBuffer) {
@@ -384,6 +387,54 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     assert!(edge.is_static);
     assert_eq!(edge.samples, 0, "the static insert cleared the ring");
     assert_eq!(converted.expired(), 3, "three cleared samples");
+
+    // The two refusals the full buffer above cannot reach: its new frames
+    // meet the full frame table before the name budget, and its handles
+    // are all its own. A buffer with a budget of 8 name bytes refuses a
+    // name past what is left, and refuses a handle another buffer issued.
+    let shift = Transform::new([1.0, 0.0, 0.0], UnitQuaternion::IDENTITY).unwrap();
+    let mut tight = TfBuffer::with_config(TfBufferConfig {
+        frames: NonZeroUsize::new(4).unwrap(),
+        name_bytes: 8,
+        ..TfBufferConfig::default()
+    });
+    tight.insert(W, "odom", "base", 0, shift).unwrap();
+    let (odom, base) = (
+        tight.frame_id("odom").unwrap(),
+        tight.frame_id("base").unwrap(),
+    );
+    let foreign = buffer.frame_id("odom").unwrap();
+    let mut sink = Sink::default();
+    ALLOC.open();
+    let refusals = [
+        tight
+            .insert(W, "base", black_box("c"), 1, shift)
+            .unwrap_err(),
+        tight.insert_static(W, "base", LONG_ID, shift).unwrap_err(),
+        tight.lookup_ids(black_box(foreign), base, 0).unwrap_err(),
+        tight
+            .lookup_latest_ids(odom, black_box(foreign))
+            .unwrap_err(),
+    ];
+    for refusal in &refusals {
+        write!(sink, "{}", tight.describe(refusal)).unwrap();
+    }
+    let during_unreached = ALLOC.close();
+    assert_eq!(
+        during_unreached, 0,
+        "the name budget and foreign handle refusals allocated {during_unreached} time(s)"
+    );
+    assert!(matches!(
+        refusals[0],
+        TfError::NameBudgetFull { left: 0, .. }
+    ));
+    assert!(matches!(
+        refusals[1],
+        TfError::NameBudgetFull { len, .. } if len == LONG_ID.len()
+    ));
+    assert!(matches!(refusals[2], TfError::UnknownFrameId { .. }));
+    assert!(matches!(refusals[3], TfError::UnknownFrameId { .. }));
+    assert_eq!(tight.frame_count(), 2, "a refused insert registers nothing");
 
     // Control: a real allocation inside a window is counted.
     ALLOC.open();

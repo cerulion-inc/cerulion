@@ -282,7 +282,9 @@ inserts it uses `?` on both. A frame the buffer has registered is named in
 an error by its `FrameId`, which prints as `#n` on its own;
 `buffer.describe(&err)` prints the error with the frame names, and
 `buffer.frame_name(id)` gives one name. A frame id the buffer has not
-registered is carried as a `FrameLabel`, its first 48 bytes.
+registered is carried as a `FrameLabel`, its first 48 bytes. `TfMathError`,
+the name of the math refusals before the buffer, stays as a deprecated
+alias of `TfError`.
 
 | Variant | When | What to do |
 |---|---|---|

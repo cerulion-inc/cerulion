@@ -7,6 +7,13 @@ use std::fmt;
 
 use crate::{FrameId, FrameLabel, TfBuffer, WriterId};
 
+/// The former name of [`TfError`], from before the crate had a buffer.
+/// Every variant it had is a variant of [`TfError`] with the same fields,
+/// so code that names it or builds its variants still compiles. A `match`
+/// over it now needs an arm for the buffer refusals too.
+#[deprecated(note = "renamed to `TfError`, which adds the buffer refusals")]
+pub type TfMathError = TfError;
+
 /// Why an SE(3) operation or the tf buffer refused its input.
 ///
 /// **The math.** Every operation that builds a [`crate::Transform`] or a
