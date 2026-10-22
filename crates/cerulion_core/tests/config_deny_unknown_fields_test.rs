@@ -1703,3 +1703,76 @@ fn every_graph_yaml_in_the_repo_still_parses() {
         failures.join("\n")
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Launch arguments: the `args:` section is lifted out of the document before
+// the graph types read it, so `deny_unknown_fields` on `GraphConfig` stays
+// in force and the section carries its own unknown-key refusal.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An `args:` graph parses through the ordinary raw parser with its
+/// defaults applied, and a graph with no `args:` is untouched by the pass.
+#[test]
+fn a_graph_declaring_args_parses_with_its_defaults_applied() {
+    let yaml = r#"
+args:
+  ns: lab
+  use_sim:
+    default: false
+    description: drive the simulator
+prefix: ${ns}
+nodes:
+  - id: cam
+    type: camera
+    params:
+      enabled: ${use_sim}
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        topic: /${ns}/image
+"#;
+    let config = cerulion_core::graph::parse_graph_raw(yaml)
+        .expect("a graph declaring args parses with its defaults applied");
+    assert_eq!(config.prefix, "lab");
+    assert_eq!(
+        config.nodes[0].outputs[0].topic.as_deref(),
+        Some("/lab/image")
+    );
+    assert_eq!(
+        config.nodes[0].params["enabled"],
+        cerulion_core::graph::ParamValue::Bool(false)
+    );
+    // The resolved graph re-serializes with no `args:` and no reference: a
+    // bag's `graph.yaml` is a plain graph.
+    let rendered = serde_yaml::to_string(&config).expect("renders");
+    assert!(!rendered.contains("args:"), "{rendered}");
+    assert!(!rendered.contains("${"), "{rendered}");
+}
+
+/// A misspelled key INSIDE the long form of a declaration is refused naming
+/// the key and the accepted ones, exactly like a misspelled graph key.
+#[test]
+fn a_misspelled_key_inside_an_args_declaration_is_refused_naming_the_key() {
+    let yaml = r#"
+args:
+  use_sim:
+    defualt: false
+prefix: lab
+nodes:
+  - id: cam
+    type: camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+"#;
+    let err = cerulion_core::graph::parse_graph_raw(yaml)
+        .expect_err("a misspelled key inside `args:` must be refused");
+    let reason = err.to_string();
+    assert!(reason.contains("use_sim"), "{reason}");
+    assert!(reason.contains("`defualt`"), "{reason}");
+    for accepted in ["default", "description"] {
+        assert!(reason.contains(&format!("`{accepted}`")), "{reason}");
+    }
+    let fixed = yaml.replace("defualt", "default");
+    cerulion_core::graph::parse_graph_raw(&fixed).expect("the corrected document parses");
+}

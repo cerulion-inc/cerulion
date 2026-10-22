@@ -27,7 +27,8 @@
 use std::path::{Path, PathBuf};
 
 use cerulion_core::graph::config::GraphConfig;
-use cerulion_core::graph::params::{resolve_params, ParamValues};
+use cerulion_core::graph::launch_args::ArgProvenance;
+use cerulion_core::graph::params::{resolve_params, ParamProblem, ParamValues};
 use cerulion_core::graph::NodeInfo;
 use indexmap::IndexMap;
 
@@ -54,15 +55,38 @@ fn render_values(values: &ParamValues) -> String {
         .join(", ")
 }
 
+/// The refusal text for a params problem. A value that a launch argument
+/// fed (a `params:` value that was exactly one `${name}` reference) came from
+/// a declaration or a command-line override the error text would otherwise
+/// never mention, so that is appended: `node 'cam': param 'gain' expects f64,
+/// got string "fast" (from launch argument 'speed', set by override
+/// `speed:=fast`)`. An unknown param name is the graph's own key, never an
+/// argument's value.
+fn describe(problem: &ParamProblem, provenance: &ArgProvenance) -> String {
+    let (node, param) = match problem {
+        ParamProblem::UnknownParam { .. } => return problem.to_string(),
+        ParamProblem::WrongType { node, param, .. }
+        | ParamProblem::NotFinite { node, param, .. }
+        | ParamProblem::OutOfRange { node, param, .. } => (node, param),
+    };
+    match provenance.describe(node, param) {
+        Some(origin) => format!("{problem} ({origin})"),
+        None => problem.to_string(),
+    }
+}
+
 /// Build the params checks for `config`. `libraries` maps each native node
 /// TYPE that resolved to its cdylib path; a type absent from it did not
 /// resolve, and its cdylib check already says so, so a node of that type
 /// gets a `not checked` failure only when it sets `params:` (the user must
-/// learn those values were never looked at).
+/// learn those values were never looked at). `provenance` is the graph
+/// parse's record of which launch argument fed which value, so a failing
+/// line names the argument.
 pub fn params_checks(
     config: &GraphConfig,
     libraries: &IndexMap<String, PathBuf>,
     inspector: &dyn NodeInspector,
+    provenance: &ArgProvenance,
 ) -> Vec<ValidationCheck> {
     let mut infos: IndexMap<String, Result<NodeInfo, String>> = IndexMap::new();
     let mut checks = Vec::new();
@@ -105,9 +129,10 @@ pub fn params_checks(
                         label(&node.id),
                         render_values(&values),
                     )),
-                    Err(problem) => {
-                        checks.push(ValidationCheck::fail(label(&node.id), problem.to_string()))
-                    }
+                    Err(problem) => checks.push(ValidationCheck::fail(
+                        label(&node.id),
+                        describe(&problem, provenance),
+                    )),
                 }
             }
         }
@@ -168,6 +193,7 @@ pub fn refuse_unresolvable_params(
     config: &GraphConfig,
     libraries: &IndexMap<String, PathBuf>,
     inspector: &dyn NodeInspector,
+    provenance: &ArgProvenance,
 ) -> crate::error::CliResult<()> {
     let mut infos: IndexMap<String, Result<NodeInfo, String>> = IndexMap::new();
     for node in &config.nodes {
@@ -194,7 +220,13 @@ pub fn refuse_unresolvable_params(
             }
         };
         if let Err(problem) = resolve_params(&node.id, info.params(), &node.params) {
-            return Err(crate::error::CliError::Transport(problem.into()));
+            // The build's own error shape (`GraphError`), with the launch
+            // argument named when one fed the value.
+            return Err(crate::error::CliError::Transport(
+                cerulion_core::error::TransportError::GraphError {
+                    reason: describe(&problem, provenance),
+                },
+            ));
         }
     }
     Ok(())
@@ -319,6 +351,79 @@ mod tests {
             .collect()
     }
 
+    /// A graph whose `params:` were written as literals: no launch argument
+    /// fed any value.
+    fn no_args() -> ArgProvenance {
+        ArgProvenance::default()
+    }
+
+    /// A value a launch argument fed is refused naming the argument and how
+    /// it was set, on the check line and in the pre-write refusal alike; the
+    /// argument is named even when its name differs from the param's.
+    #[test]
+    fn a_refused_value_fed_by_a_launch_argument_names_the_argument_and_the_override() {
+        let graph = GRAPH.replace("prefix: demo\n", "args:\n  cam_gain: 2.5\nprefix: demo\n");
+        // Inside a flow mapping a reference is quoted: a bare `{` would open
+        // a nested mapping.
+        let graph = graph.replace("params: {gain: 2.5,", "params: {gain: \"${cam_gain}\",");
+        let fast = [cerulion_core::graph::parse_override("cam_gain:=fast").unwrap()];
+        let (config, provenance) =
+            cerulion_core::graph::parse_graph_raw_with_launch_args(&graph, &fast).unwrap();
+        let expected = "node 'left': param 'gain' expects f64, got string \"fast\" (from launch \
+                        argument 'cam_gain', set by override `cam_gain:=fast`)";
+        let checks = params_checks(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &provenance,
+        );
+        let line = checks.iter().find(|c| c.label == "params 'left'").unwrap();
+        assert!(!line.passed);
+        assert_eq!(line.detail, expected);
+        let err = refuse_unresolvable_params(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &provenance,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(err.contains(expected), "{err}");
+
+        // The declared default, with no override, is named as such.
+        let (config, provenance) = cerulion_core::graph::parse_graph_raw_with_launch_args(
+            &graph.replace("cam_gain: 2.5", "cam_gain: 11.0"),
+            &[],
+        )
+        .unwrap();
+        let checks = params_checks(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &provenance,
+        );
+        let line = checks.iter().find(|c| c.label == "params 'left'").unwrap();
+        assert_eq!(
+            line.detail,
+            "node 'left': param 'gain' = 11.0 is outside [0.0, 10.0] (from launch argument \
+             'cam_gain', its declared default)"
+        );
+
+        // A value written in the file gets the build's text and nothing more.
+        let config = parse_graph_raw(&GRAPH.replace("gain: 2.5", "gain: fast")).unwrap();
+        let checks = params_checks(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &no_args(),
+        );
+        let line = checks.iter().find(|c| c.label == "params 'left'").unwrap();
+        assert_eq!(
+            line.detail,
+            "node 'left': param 'gain' expects f64, got string \"fast\""
+        );
+    }
+
     fn table() -> Table {
         let mut t = IndexMap::new();
         t.insert("cam".to_string(), cam_info());
@@ -347,7 +452,12 @@ nodes:
     #[test]
     fn a_passing_line_lists_the_values_in_force_and_a_type_without_params_gets_no_line() {
         let config = parse_graph_raw(GRAPH).unwrap();
-        let checks = params_checks(&config, &libraries(&["cam", "ticker"]), &table());
+        let checks = params_checks(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &no_args(),
+        );
         let rendered: Vec<(String, bool, String)> = checks
             .iter()
             .map(|c| (c.label.clone(), c.passed, c.detail.clone()))
@@ -389,7 +499,7 @@ nodes:
                 "prefix: demo\nnodes:\n  - id: left\n    type: cam\n    {block}\n    outputs: [{{name: cmd, schema: geometry_msgs/Vector3}}]\n"
             );
             let config = parse_graph_raw(&yaml).unwrap();
-            let checks = params_checks(&config, &libraries(&["cam"]), &table());
+            let checks = params_checks(&config, &libraries(&["cam"]), &table(), &no_args());
             assert_eq!(checks.len(), 1, "{block}");
             assert!(!checks[0].passed, "{block}");
             assert_eq!(checks[0].label, "params 'left'");
@@ -401,7 +511,7 @@ nodes:
     fn params_on_a_type_that_declares_none_fails_by_name() {
         let yaml = "prefix: demo\nnodes:\n  - id: tick\n    type: ticker\n    params: {gain: 1.0}\n    outputs: [{name: cmd, schema: geometry_msgs/Vector3}]\n";
         let config = parse_graph_raw(yaml).unwrap();
-        let checks = params_checks(&config, &libraries(&["ticker"]), &table());
+        let checks = params_checks(&config, &libraries(&["ticker"]), &table(), &no_args());
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].passed);
         assert_eq!(
@@ -413,7 +523,7 @@ nodes:
     #[test]
     fn an_unresolved_library_is_reported_only_when_the_node_sets_params() {
         let config = parse_graph_raw(GRAPH).unwrap();
-        let checks = params_checks(&config, &libraries(&[]), &table());
+        let checks = params_checks(&config, &libraries(&[]), &table(), &no_args());
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].label, "params 'left'");
         assert!(!checks[0].passed);
@@ -438,7 +548,12 @@ nodes:
             }
         }
         let config = parse_graph_raw(GRAPH).unwrap();
-        let checks = params_checks(&config, &libraries(&["cam", "ticker"]), &Refuses);
+        let checks = params_checks(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &Refuses,
+            &no_args(),
+        );
         let rendered: Vec<(&str, bool)> = checks
             .iter()
             .map(|c| (c.label.as_str(), c.passed))
@@ -495,8 +610,8 @@ nodes:
                 .collect()
         };
         assert_eq!(
-            render(params_checks(&config, &libs, &once)),
-            render(params_checks(&config, &libs, &table())),
+            render(params_checks(&config, &libs, &once, &no_args())),
+            render(params_checks(&config, &libs, &table(), &no_args())),
             "the cache must not change what the check reports"
         );
         fill_resolved_params(&mut config, &libs, &once);
@@ -536,13 +651,23 @@ nodes:
     #[test]
     fn the_pre_write_refusal_uses_the_build_text_and_passes_a_resolvable_graph() {
         let config = parse_graph_raw(GRAPH).unwrap();
-        refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &table())
-            .expect("every params block in GRAPH resolves");
+        refuse_unresolvable_params(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &no_args(),
+        )
+        .expect("every params block in GRAPH resolves");
 
         let out_of_range = GRAPH.replace("gain: 2.5", "gain: 11.0");
         let config = parse_graph_raw(&out_of_range).unwrap();
-        let err = refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &table())
-            .expect_err("gain above its max");
+        let err = refuse_unresolvable_params(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &table(),
+            &no_args(),
+        )
+        .expect_err("gain above its max");
         let infos: IndexMap<String, NodeInfo> = [
             ("left".to_string(), cam_info()),
             ("right".to_string(), cam_info()),
@@ -559,7 +684,7 @@ nodes:
         );
 
         // Not resolved: the cdylib lookup's refusal.
-        refuse_unresolvable_params(&config, &libraries(&[]), &table())
+        refuse_unresolvable_params(&config, &libraries(&[]), &table(), &no_args())
             .expect("an unresolved library is the cdylib check's");
         struct Refuses;
         impl NodeInspector for Refuses {
@@ -567,8 +692,13 @@ nodes:
                 Err(crate::error::CliError::Validation("unreadable".into()))
             }
         }
-        let err = refuse_unresolvable_params(&config, &libraries(&["cam", "ticker"]), &Refuses)
-            .expect_err("an unreadable library is refused before any write");
+        let err = refuse_unresolvable_params(
+            &config,
+            &libraries(&["cam", "ticker"]),
+            &Refuses,
+            &no_args(),
+        )
+        .expect_err("an unreadable library is refused before any write");
         assert_eq!(
             err.to_string(),
             "node 'left': the node library could not be read: unreadable"
@@ -668,7 +798,7 @@ nodes:
     fn params_on_a_ros2_entry_is_left_to_the_topology_check() {
         let yaml = "prefix: demo\nnodes:\n  - id: talker\n    ros2:\n      package: demo_nodes_cpp\n      executable: talker\n    params: {rate: 2}\n";
         let config = parse_graph_raw(yaml).unwrap();
-        let checks = params_checks(&config, &libraries(&[]), &table());
+        let checks = params_checks(&config, &libraries(&[]), &table(), &no_args());
         assert!(
             checks.is_empty(),
             "{:?}",

@@ -1435,23 +1435,14 @@ pub fn graph_read(graphs_dir: &Path, name: &str) -> CliResult<GraphConfig> {
 /// the file and the splice would land on another — which is the whole class
 /// the precondition exists to close.
 pub fn graph_read_raw(graphs_dir: &Path, name: &str) -> CliResult<(GraphConfig, String)> {
-    let graph_path = graphs_dir.join(format!("{}.yaml", name));
-    if !graph_path.exists() {
-        return Err(CliError::GraphNotFound {
-            name: name.to_string(),
-        });
-    }
-    let yaml = std::fs::read_to_string(&graph_path)?;
-    // Use the raw parser so an absent `prefix:` line stays absent when
-    // CLI commands like `node stage` round-trip the YAML back to disk.
-    let mut config = parse_graph_raw(&yaml)?;
-    // This is the seam where a graph acquires its identity. Every
-    // CLI verb resolves a graph by joining `graphs/{name}.yaml`, so `name` IS
-    // the file stem, and every identity surface downstream reads it back
-    // through `GraphConfig::identity()`. A legacy `name:` that disagrees warns
-    // here, once, at the one place both values are in scope.
-    cerulion_core::graph::adopt_file_stem_identity(&mut config, name);
-    Ok((config, yaml))
+    // The raw parser keeps an absent `prefix:` line absent when CLI commands
+    // like `node stage` round-trip the YAML back to disk, and it is where a
+    // graph acquires its identity: every CLI verb resolves a graph by joining
+    // `graphs/{name}.yaml`, so `name` IS the file stem. Launch arguments
+    // resolve to their declared defaults on this path; `graph run` reads
+    // through the same function with the operator's overrides.
+    crate::graph_launch_args::graph_read_raw_with_launch_args(graphs_dir, name, &[])
+        .map(|(config, yaml, _)| (config, yaml))
 }
 
 // There is deliberately NO whole-file graph writer (`serde_yaml::to_string` + a truncating
@@ -2309,7 +2300,10 @@ pub fn graph_validate_with_inspector(
     inspector: &dyn crate::node_inspector::NodeInspector,
 ) -> CliResult<ValidationReport> {
     let graphs_dir = workspace_root.join("graphs");
-    let mut config = graph_read(&graphs_dir, graph_name)?;
+    // The declared defaults, with the record of which launch argument fed
+    // which `params:` value, so the params check can name the argument.
+    let (mut config, _, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(&graphs_dir, graph_name, &[])?;
     // Fill the DEFAULT PREFIX before anything judges this config.
     //
     // `graph_read` deliberately uses the RAW parser so an absent `prefix:` line
@@ -2348,6 +2342,7 @@ pub fn graph_validate_with_inspector(
         &cdylib_cache,
         true,
         &inspector,
+        &launch_arg_sources,
     ))
 }
 
@@ -2857,6 +2852,7 @@ fn graph_validate_with_cache(
     cdylib_cache: &ResolvedCdylibCache,
     check_network_ingress: bool,
     inspector: &dyn crate::node_inspector::NodeInspector,
+    launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
     let nodes_dir = workspace_root.join("nodes");
     let mut checks = Vec::new();
@@ -3526,6 +3522,7 @@ fn graph_validate_with_cache(
         config,
         &resolved_library_paths(cdylib_cache),
         inspector,
+        launch_arg_sources,
     ));
 
     tracing::info!(graph = %graph_name, "graph validation complete");
@@ -5543,6 +5540,11 @@ pub fn graph_run(
     // external clocks, non-Unix — each of which says so at launch rather than
     // swallowing the flag.
     no_rings: bool,
+    // `graph run <NAME> [NAME:=VALUE]...`: the launch-argument overrides,
+    // already parsed. They apply to the graph READ below and nowhere else;
+    // the run executes, validates and records the resolved graph. Internal
+    // callers (`node run`, `ros2 attach`) pass none.
+    launch_args: &[cerulion_core::graph::LaunchOverride],
 ) -> CliResult<()> {
     // CPU C-state cap. Acquired AFTER the runtime is built —
     // not here — so the cap can be DERIVED from the graph's own tightest
@@ -5615,7 +5617,19 @@ pub fn graph_run(
     // ONE read: `config` and the bytes the auto-partition preflight splices
     // must describe the SAME revision (see
     // `run_auto_partition_preflight`).
-    let (mut config, raw_graph_yaml) = graph_read_raw(graphs_dir, graph_name)?;
+    let (mut config, raw_graph_yaml, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(
+            graphs_dir,
+            graph_name,
+            launch_args,
+        )?;
+    // `--yes` saves a partition derived from the graph as DECLARED (what
+    // `graph partition` derives). Whether this run's overrides moved its
+    // wiring is judged on the bytes just read, BEFORE the prefix fill below
+    // (the fill would differ from the declared defaults on a prefix-less
+    // file); the auto-partition pre-flight refuses the save when they did.
+    let wiring_overridden = !launch_args.is_empty()
+        && crate::graph_launch_args::overrides_change_wiring(&raw_graph_yaml, &config)?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -5727,6 +5741,7 @@ pub fn graph_run(
             &cdylib_cache,
             false,
             &params_inspector,
+            &launch_arg_sources,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5815,6 +5830,7 @@ pub fn graph_run(
         &config,
         &resolved_library_paths(&cdylib_cache),
         &params_inspector,
+        &launch_arg_sources,
     )?;
 
     // This process holds every topic of the graph while it starts, a set of
@@ -5876,32 +5892,46 @@ pub fn graph_run(
     // a written file would produce (the in-memory == written equality pin).
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
-    let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
-            let consent = partition_consent
-                .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
-            let pre = crate::partition_emit::run_auto_partition_preflight(
-                workspace_root,
-                graph_name,
-                config,
-                &raw_graph_yaml,
-                &crate::partition_emit::PreflightOptions {
-                    // Lenient only on the zero-flag default —
-                    // an explicit --auto-partition asked for cost-aware
-                    // behavior, so a broken default artifact stays a hard Err.
-                    lenient_costs: !consent.auto_partition,
-                    assume_yes: consent.assume_yes,
-                },
-            )?;
-            // The OUTCOME is the run's partition PROVENANCE — kept
-            // rather than discarded, because the file cannot tell you: on the
-            // no-TTY floor the run executes derived groups the file does not
-            // carry.
-            let provenance = run_dir_partition_provenance(pre.outcome);
-            (pre.config, provenance)
-        } else {
-            (config, crate::run_dir::PartitionProvenance::Declared)
-        };
+    let (mut config, partition_provenance) = if let crate::partition_emit::PartitionIntent::Derive =
+        partition_intent
+    {
+        let consent = partition_consent
+            .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
+        // A partition the file keeps must hold for the graph as declared,
+        // not for one run's overrides. Under such overrides the pre-flight
+        // runs with saving OFF, so it can never write; only an outcome that
+        // WOULD have written (`InMemory`) refuses the run's `--yes`. A file
+        // that already carries exactly the derived partition needs no
+        // write, so that run proceeds.
+        let refuse_save = consent.assume_yes && wiring_overridden;
+        let pre = crate::partition_emit::run_auto_partition_preflight(
+            workspace_root,
+            graph_name,
+            config,
+            &raw_graph_yaml,
+            &crate::partition_emit::PreflightOptions {
+                // Lenient only on the zero-flag default:
+                // an explicit --auto-partition asked for cost-aware
+                // behavior, so a broken default artifact stays a hard Err.
+                lenient_costs: !consent.auto_partition,
+                assume_yes: consent.assume_yes && !refuse_save,
+            },
+        )?;
+        if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
+        {
+            return Err(
+                crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
+            );
+        }
+        // The OUTCOME is the run's partition PROVENANCE, kept
+        // rather than discarded, because the file cannot tell you: on the
+        // no-TTY floor the run executes derived groups the file does not
+        // carry.
+        let provenance = run_dir_partition_provenance(pre.outcome);
+        (pre.config, provenance)
+    } else {
+        (config, crate::run_dir::PartitionProvenance::Declared)
+    };
 
     // The deployment is RESOLVED here rather than inside the `match`
     // below, for two reasons that are both load-bearing.
@@ -30504,6 +30534,62 @@ nodes:
         );
     }
 
+    /// A `graph run --yes` saves a partition for the graph as DECLARED. Whether this run's
+    /// launch-argument overrides moved the wiring is judged on the bytes of
+    /// the one read, before the prefix fill (which would differ from the
+    /// declared defaults on a prefix-less file). Under such overrides the
+    /// pre-flight runs with saving OFF, so it cannot write the graph file, and
+    /// only an outcome that would have written refuses the run: a file that
+    /// already carries the derived partition (`AlreadyCurrent`) proceeds.
+    #[test]
+    fn graph_run_refuses_a_yes_save_under_wiring_overrides_before_the_preflight_writes() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let read = body
+            .find("graph_read_raw_with_launch_args(")
+            .expect("the graph read must still be there");
+        let judged = body
+            .find("overrides_change_wiring(")
+            .expect("the wiring judgement must still be there");
+        let fill = read
+            + body[read..]
+                .find("default_prefix(")
+                .expect("the prefix fill must follow the read");
+        assert!(
+            read < judged && judged < fill,
+            "the wiring is judged on the bytes just read, BEFORE the prefix fill"
+        );
+
+        let gate = body
+            .find("let refuse_save = consent.assume_yes && wiring_overridden;")
+            .expect("the save gate must be computed from --yes and the wiring judgement");
+        let preflight = body
+            .find("run_auto_partition_preflight(")
+            .expect("the pre-flight must still be there");
+        assert!(
+            gate < preflight,
+            "the save gate is decided before the pre-flight runs"
+        );
+        let save_off = preflight
+            + body[preflight..]
+                .find("assume_yes: consent.assume_yes && !refuse_save,")
+                .expect("the pre-flight must run with saving OFF under wiring overrides");
+        let refused = body
+            .find("refuse_persist_under_wiring_overrides(")
+            .expect("the save refusal must still be there");
+        assert!(
+            save_off < refused,
+            "the refusal reads the outcome of a pre-flight that could not write"
+        );
+        let exempt = &body[preflight..refused];
+        assert!(
+            exempt.contains("if refuse_save && pre.outcome != ")
+                && exempt.contains("RunPartitionOutcome::AlreadyCurrent"),
+            "a file that already carries the derived partition needs no write, so the \
+             refusal must exempt `AlreadyCurrent`"
+        );
+    }
+
     /// `graph run` arms the graceful-exit
     /// hygiene pass, and arms it as a TEARDOWN rather than as startup work.
     ///
@@ -30550,7 +30636,7 @@ nodes:
         // the first preflight step and the deployment REJECTION is the last, so
         // both must precede the arming.
         let read = body
-            .find("graph_read_raw(graphs_dir, graph_name)?")
+            .find("graph_read_raw_with_launch_args(")
             .expect("the graph read must still be there");
         assert!(
             read < armed,
@@ -30629,6 +30715,7 @@ nodes:
             RecordCpu::Auto,
             /* partition_consent */ None,
             /* no_rings */ true,
+            /* launch_args */ &[],
         );
         assert!(err.is_err(), "a graph that does not exist must be refused");
         assert_eq!(
@@ -34930,6 +35017,7 @@ struct Sink {
                 RecordCpu::Auto,
                 /* partition_consent */ None,
                 /* no_rings */ true,
+                /* launch_args */ &[],
             )
         };
         let msg = run()

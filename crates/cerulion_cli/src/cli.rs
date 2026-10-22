@@ -1356,6 +1356,19 @@ pub enum GraphAction {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
+        /// Launch-argument overrides, `name:=value`, for the arguments the
+        /// graph declares under its top-level `args:` map (each with a
+        /// default). An override replaces the default for this run only:
+        /// `cerulion graph run robot use_sim:=true robot_name:=go2`. The
+        /// value is read as a YAML scalar (`true` is a bool, `50` an
+        /// integer, `go2` text; quote digits to keep them text). An
+        /// override for an argument the graph does not declare is refused
+        /// before any node loads, with the nearest declared name.
+        #[arg(
+            value_name = "NAME:=VALUE",
+            value_parser = cerulion_cli_engine::graph_launch_args::check_override_word
+        )]
+        launch_args: Vec<String>,
         /// Clock that drives the run
         #[arg(long = "time-source", value_enum, default_value_t = TimeSource::Real)]
         time_source: TimeSource,
@@ -2682,6 +2695,72 @@ mod graph_partition_dispatch_tests {
             Cli::try_parse_from(["cerulion", "graph", "partition", "g", "--force"]).is_err(),
             "an unknown --force flag must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_run_launch_args_tests {
+    use super::*;
+
+    fn launch_args_of(argv: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Run { launch_args, .. },
+            } => launch_args,
+            _ => panic!("expected Graph::Run"),
+        }
+    }
+
+    /// `name:=value` words after the graph name are collected in order, and
+    /// flags may follow or precede them.
+    #[test]
+    fn graph_run_collects_name_value_overrides_after_the_graph_name() {
+        assert_eq!(
+            launch_args_of(&[
+                "cerulion",
+                "graph",
+                "run",
+                "robot",
+                "use_sim:=true",
+                "robot_name:=go2",
+                "--single-process",
+            ]),
+            ["use_sim:=true", "robot_name:=go2"]
+        );
+        assert_eq!(
+            launch_args_of(&["cerulion", "graph", "run", "--release", "robot", "n:=1"]),
+            ["n:=1"]
+        );
+    }
+
+    /// A bare `graph run <name>` carries no override: the graph's declared
+    /// defaults apply.
+    #[test]
+    fn graph_run_without_overrides_carries_none() {
+        assert!(launch_args_of(&["cerulion", "graph", "run", "robot"]).is_empty());
+    }
+
+    /// A word after the graph name that is not `name:=value` is a usage
+    /// error at parse, naming the word, the shape and the `--flag=value`
+    /// spelling (the word a user most often means is a flag's value).
+    #[test]
+    fn graph_run_refuses_a_word_that_is_not_an_override_at_parse() {
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "bags"])
+            .err()
+            .expect("a bare word is not an override")
+            .to_string();
+        assert!(
+            err.contains("launch argument override 'bags' is malformed")
+                && err.contains("found no `:=`")
+                && err.contains("`--record=DIR`"),
+            "{err}"
+        );
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "my-arg:=1"])
+            .err()
+            .expect("an invalid name is refused")
+            .to_string();
+        assert!(err.contains("'my-arg' is not an argument name"), "{err}");
     }
 }
 
