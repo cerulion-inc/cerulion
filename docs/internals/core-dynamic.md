@@ -46,9 +46,27 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
 - **Warnings are loud twice.** Every `LayoutResolver` warning (unresolved nested target,
   skipped workspace file, …) is `tracing::warn!`ed AND returned in the `Vec<String>`.
   A failed `add_*` leaves the set unchanged.
+- **Nested references bind on identity.** `resolve_fixed_nested`, `LayoutResolver`,
+  `FrameWalker` and the capture-time `header.stamp` locator (`codegen/header_stamp.rs`)
+  all bind a nested reference through one registry
+  (`codegen/nested_index.rs`) keyed on each schema's own `(package, name)`, never on
+  its qualified-name text. A package-less YAML entry named `pkg/Type` keeps that text
+  for name lookups (`layout(name)`, `walk`), where the later definition wins; a store
+  schema's reference to `Type` still binds the store's `(Some("pkg"), "Type")`, the
+  definition the resolver inlined, and both twins stay reachable by their own
+  `schema_hash` (`walk_by_hash`, `layout_for_hash`). A consumer that resolved a name from
+  a hash decodes with `walk_by_hash`, never `walk(name)`, so a twin never decodes under
+  the other twin's layout. A nested reference that does not bind is never a panic, but
+  it is not always an error: `resolve_fixed_nested` warns and leaves the field variable,
+  so the layout still succeeds, and an unresolved array element can decode as
+  `NestedArrayOpaque`. `LayoutError::UnresolvedNested` covers only a fixed stamp that no
+  longer binds in the set, and `WalkError::NestedResolutionFailed` a nested frame whose
+  reference does not bind at walk time. A fixed section whose inlined size overflows
+  `usize` is `LayoutError::FixedSectionOverflow`, and the walker leaves that schema out.
 - `from_schemas` returns `Result` and preflights every build through three gates:
   declared fixed size, composed overflow via `composed_overflow_indices`, and
-  resolved frame prefix ≤ `u32`. `add_*` is all-or-nothing. The workspace loader
+  resolved frame prefix ≤ `u32` for every layout a frame can reach, by name or by hash
+  (a twin hidden from name lookups included). `add_*` is all-or-nothing. The workspace loader
   skips offenders to a fixpoint with warnings. `layout(name)` is a direct name
   lookup, never a hash-index lookup.
 - `dynamic::parse_rosmsg` is the checked parser (`codegen::parse_rosmsg` is the raw

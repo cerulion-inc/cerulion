@@ -4146,8 +4146,10 @@ fn write_custom_decode(
     // LOCAL walker first: a frame whose type the workspace already knows decodes
     // LOCALLY — no network, no remote fallback, no breadcrumb.
     // render the full decoded field TREE, not a bare field count.
+    // Decode by HASH, not by the returned name: two identities can share
+    // a qualified name, and only the hash picks the frame's own layout.
     if let Some(name) = local_walker.schema_name_for_hash(header.schema_hash) {
-        match local_walker.walk(name, &frame) {
+        match local_walker.walk_by_hash(&frame) {
             Ok(value) => {
                 // The schema NAME is a local, trusted identifier — no sanitize
                 // needed (it never crossed the network). Field VALUES are
@@ -4166,7 +4168,7 @@ fn write_custom_decode(
     let mut remote_decoded = None;
     if let Some((robot, walker)) = remote_walker {
         if let Some(name) = walker.schema_name_for_hash(header.schema_hash) {
-            match walker.walk(name, &frame) {
+            match walker.walk_by_hash(&frame) {
                 Ok(value) => remote_decoded = Some((robot.as_str(), name, value)),
                 // Known-to-the-remote-walker but undecodable: remember it (only
                 // if the local walker did not already record a failure).
@@ -7444,6 +7446,65 @@ mod tests {
         assert!(
             !good.contains("undecodable"),
             "a decodable frame must not be labelled undecodable: {good}"
+        );
+    }
+
+    /// Two identities share the qualified name `pkg/Type`: the store's
+    /// packaged `{ float64 x }` and a later package-less YAML entry NAMED
+    /// `pkg/Type` (`{ uint32 a }`) that owns the name. A frame stamped with
+    /// the packaged hash must decode as `x = 1.5` on BOTH the local and the
+    /// remote path, never re-read through the name as the `a` twin.
+    #[test]
+    fn write_custom_decode_decodes_a_name_twin_by_its_own_hash() {
+        use cerulion_core::codegen::{FieldDef, FieldType, FrameWalker, MessageSchema};
+        use cerulion_core::wire::WireHeader;
+
+        let mut packaged = MessageSchema::new_in_package("Type", "pkg");
+        packaged.add_field(FieldDef::new("x", FieldType::F64));
+        let mut loose = MessageSchema::new("pkg/Type");
+        loose.add_field(FieldDef::new("a", FieldType::U32));
+        let packaged_hash = packaged.schema_hash();
+        assert_ne!(packaged_hash, loose.schema_hash());
+        let twins = || FrameWalker::new(vec![packaged.clone(), loose.clone()]).0;
+        let payload = 1.5f64.to_le_bytes();
+
+        let decode = |local: &FrameWalker, remote: Option<&(String, FrameWalker)>| {
+            let mut shown = false;
+            let mut explained = std::collections::BTreeSet::new();
+            let mut buf: Vec<u8> = Vec::new();
+            write_custom_decode(
+                &mut buf,
+                "/twin",
+                &WireHeader::with_schema(packaged_hash),
+                &payload,
+                local,
+                remote,
+                &mut shown,
+                &mut explained,
+                DEFAULT_ECHO_TRUNCATE_LENGTH,
+            );
+            String::from_utf8(buf).unwrap()
+        };
+
+        let local_out = decode(&twins(), None);
+        assert!(local_out.contains("  pkg/Type:"), "{local_out}");
+        assert!(local_out.contains("x: 1.5"), "{local_out}");
+        assert!(
+            !local_out.lines().any(|l| l.trim_start().starts_with("a:")),
+            "{local_out}"
+        );
+
+        let empty = FrameWalker::new(Vec::new()).0;
+        let remote = ("bot".to_string(), twins());
+        let remote_out = decode(&empty, Some(&remote));
+        assert!(
+            remote_out.contains("pkg/Type (via robot 'bot'):"),
+            "{remote_out}"
+        );
+        assert!(remote_out.contains("x: 1.5"), "{remote_out}");
+        assert!(
+            !remote_out.lines().any(|l| l.trim_start().starts_with("a:")),
+            "{remote_out}"
         );
     }
 
