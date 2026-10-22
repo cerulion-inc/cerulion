@@ -3812,269 +3812,49 @@ fn remote_fallback_breadcrumb(topic: &str, robot: &str) -> String {
     )
 }
 
-/// Default max array ELEMENTS `topic echo` renders inline before
-/// truncating with a trailing `...` inside the brackets plus a `(N elements)`
-/// total annotation — matching `ros2 topic echo`'s default `--truncate-length`.
-/// Overridable per-run via the `--truncate-length` flag; named in ONE place (the
-/// CLI's flag default references this constant). Keeps a 57600-point
-/// PointCloud2 `data` field or a long joint-state array readable instead of
-/// flooding the terminal.
+/// Default max array ELEMENTS `topic echo` prints per array before it
+/// closes the array with a `!truncated <n>` element (the count left out),
+/// matching `ros2 topic echo`'s default `--truncate-length`. Overridable per
+/// run with the `--truncate-length` flag; named in ONE place (the CLI's flag
+/// default references this constant). Keeps a 57600-point PointCloud2 `data`
+/// field or a long joint-state array readable instead of flooding the
+/// terminal. A message with no array longer than this prints in full, which
+/// is exactly the YAML `cerulion_core::dynamic::yaml_to_message` reads back.
 pub const DEFAULT_ECHO_TRUNCATE_LENGTH: usize = 128;
 
-/// Total lines one frame's field render may emit.
+/// Total lines one frame's YAML may print.
 ///
 /// `truncate_length` bounds each array INDEPENDENTLY, and it is re-applied at
 /// every nesting level, so a frame whose element arrays nest costs
 /// `truncate_length ^ depth` lines: a `visualization_msgs/MarkerArray`
 /// (`Marker[] markers`, each with `Point[] points` + `ColorRGBA[] colors`)
-/// renders ~1.5×10^5 lines PER FRAME at the default 128 — an echo no operator
-/// can read, on a topic real robots publish at 10 Hz. Before the walker was
-/// taught the canonical element framing those fields were one opaque line
-/// each, so this ceiling is what keeps the new element rendering from
-/// regressing `topic echo`. Mirrors `cerulion_viz::archetype`'s
+/// renders ~1.5×10^5 lines PER FRAME at the default 128, on a topic real
+/// robots publish at 10 Hz. Mirrors `cerulion_viz::archetype`'s
 /// `DUMP_MAX_LINES`, which carries a global budget for the same reason.
 ///
-/// A frame that hits it renders its first `ECHO_MAX_LINES` lines plus a loud
-/// truncation notice — never a silent cut, and never an unbounded dump. This
-/// is deliberately a CONSTANT, not a multiple of `truncate_length`: raising
-/// `--truncate-length` widens each array, and the whole point of the ceiling
-/// is that the total does not follow that exponentially.
+/// A frame that hits it prints its first `ECHO_MAX_LINES` lines, then a
+/// column-0 `!truncated` line (which no YAML reader accepts, so cut output
+/// can never be published back as a shorter message) and a comment saying
+/// what happened. The codec stops writing at the budget
+/// ([`cerulion_core::dynamic::YamlEncodeOptions::max_lines`]), so a small
+/// frame that names a huge YAML form costs `ECHO_MAX_LINES` lines of work
+/// per frame, not the whole form. This is deliberately a CONSTANT, not a
+/// multiple of `truncate_length`.
 const ECHO_MAX_LINES: usize = 2000;
 
-/// Append `", ...] (N elements)"` when an array of `count` elements was
-/// truncated at `shown`, or close the bracket plain otherwise. ONE seam so every
-/// inline leaf array (`uint8[]`, `float64[]`, …) shares the exact truncation
-/// shape: a trailing `...` INSIDE the brackets + a `(N elements)` total
-/// annotation for truncated renders only (an untruncated array gets NO
-/// annotation — ros2-parity).
-fn close_array(parts: &[String], count: usize, shown: usize) -> String {
-    if count > shown {
-        format!("[{}, ...] ({} elements)", parts.join(", "), count)
-    } else {
-        format!("[{}]", parts.join(", "))
-    }
-}
-
-/// Format ONE decoded LEAF value (scalar / string / byte-blob /
-/// numeric-array) as a compact inline string. `Nested` + `Array` are multi-line
-/// composites rendered by [`write_named_value`] and never reach here.
-///
-/// Every STRING value is terminal-escape-sanitized ([`sanitize_display`]) THEN
-/// quoted: a wire string is LAN/robot-supplied data,
-/// so an embedded ANSI/CSI escape must never reach the operator's terminal.
-/// A `uint8[]`/`int8[]` byte array now renders its ELEMENTS (decimal
-/// u8) like every other array — truncated at `truncate_length` — instead of the
-/// old opaque `<N bytes>` placeholder (a PointCloud2 `data` field or a LowState
-/// `head: [255, 0]` are now readable).
-fn format_leaf_value(
-    kind: &cerulion_core::codegen::FrameValueKind,
-    truncate_length: usize,
-) -> String {
-    use cerulion_core::codegen::FrameValueKind as K;
-    match kind {
-        K::Bool(v) => v.to_string(),
-        K::I8(v) => v.to_string(),
-        K::U8(v) => v.to_string(),
-        K::I16(v) => v.to_string(),
-        K::U16(v) => v.to_string(),
-        K::I32(v) => v.to_string(),
-        K::U32(v) => v.to_string(),
-        K::I64(v) => v.to_string(),
-        K::U64(v) => v.to_string(),
-        // `{:?}` keeps the float-ness visible (`1.0`, not `1`) — the familiar
-        // `ros2 topic echo` presentation.
-        K::F32(v) => format!("{v:?}"),
-        K::F64(v) => format!("{v:?}"),
-        // Sanitize THEN quote: `{:?}` escapes embedded quotes/backslashes and
-        // sanitize has already neutralized every control char.
-        K::Str(s) => format!("{:?}", sanitize_display(s)),
-        K::Bytes(b) => format_byte_array(b, truncate_length),
-        K::PrimArray(a) => format_prim_array(a, truncate_length),
-        // The walker maps a DynamicArray of Nested / String / bool / array
-        // element to this opaque-bytes arm (frame_walker.rs) when the bytes are
-        // NOT canonically framed, so the label must NOT claim
-        // "nested-message" — a `bool[]` lands here too. Neutral + accurate:
-        // opaque producer bytes with no framing we can enumerate.
-        K::NestedArrayOpaque(b) => format!("<{} bytes, opaque array>", b.len()),
-        // Composites are rendered multi-line by write_named_value; the arm is
-        // unreachable in practice but keeps the match total.
-        K::Nested(_) | K::Array(_) | K::NestedArray { .. } => String::from("<nested>"),
-    }
-}
-
-/// Render a `uint8[]` / `int8[]` byte array as its ELEMENTS (decimal
-/// u8), truncated to `truncate_length` with a trailing `...` + `(N elements)`
-/// tail. Bytes are raw wire numbers, NOT a string, so no sanitize/quote applies
-/// (a `u8` renders as a decimal digit sequence — never a control char).
-fn format_byte_array(bytes: &[u8], truncate_length: usize) -> String {
-    let shown = bytes.len().min(truncate_length);
-    let parts: Vec<String> = bytes[..shown].iter().map(|b| b.to_string()).collect();
-    close_array(&parts, bytes.len(), shown)
-}
-
-/// Render a numeric primitive array (`float64[]`, `uint32[9]`,
-/// …) as `[e0, e1, …, ...] (N elements)`, truncated to `truncate_length`. Each
-/// element is formatted in its NATIVE type (integers stay integer, floats keep
-/// the decimal point) — no lossy widen. Bounds-guarded: a malformed
-/// short-`bytes` array stops rather than panicking on untrusted wire input.
-fn format_prim_array(a: &cerulion_core::codegen::PrimArray, truncate_length: usize) -> String {
-    use cerulion_core::codegen::PrimType as P;
-    let shown = a.count.min(truncate_length);
-    let sz = a.elem.size();
-    let mut parts: Vec<String> = Vec::with_capacity(shown);
-    for i in 0..shown {
-        let start = i * sz;
-        let Some(b) = a.bytes.get(start..start + sz) else {
-            break;
-        };
-        let elem = match a.elem {
-            P::I16 => i16::from_le_bytes([b[0], b[1]]).to_string(),
-            P::U16 => u16::from_le_bytes([b[0], b[1]]).to_string(),
-            P::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
-            P::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
-            P::I64 => {
-                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
-            }
-            P::U64 => {
-                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
-            }
-            P::F32 => format!("{:?}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            P::F64 => format!(
-                "{:?}",
-                f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-            ),
-        };
-        parts.push(elem);
-    }
-    close_array(&parts, a.count, shown)
-}
-
-/// Write ONE `name: value` line — or a multi-line block for a nested
-/// message / message array — indented `indent` levels under the schema header.
-/// `truncate_length` bounds EVERY array — inline leaf arrays (threaded
-/// through [`format_leaf_value`]) AND this multi-line nested-message array arm.
-fn write_named_value(
-    writer: &mut dyn Write,
-    name: &str,
-    kind: &cerulion_core::codegen::FrameValueKind,
-    indent: usize,
-    truncate_length: usize,
-    lines: &mut usize,
-) {
-    if *lines >= ECHO_MAX_LINES {
-        return;
-    }
-    *lines += 1;
-    use cerulion_core::codegen::FrameValueKind as K;
-    let pad = "  ".repeat(indent + 1);
-    // Security: a field NAME is wire-derived (for a remote type it comes from
-    // a robot's LAN-fetched `.msg`, which the parser does not
-    // identifier-validate), so it is sanitized before display in
-    // EVERY arm (a hostile `x\x1b[2J…` field name would otherwise clear the
-    // operator's terminal each frame). Nested field names are sanitized on their
-    // own recursion through this fn; the `[i]` index labels are numeric.
-    let name = sanitize_display(name);
-    match kind {
-        K::Nested(inner) => {
-            writeln!(writer, "{pad}{name}:").ok();
-            render_frame_fields_budgeted(writer, inner, indent + 1, truncate_length, lines);
-        }
-        // A canonically-framed `Nested[]` / `string[]` renders exactly
-        // like a fixed-length nested array — element-by-element, bounded by
-        // `truncate_length` per level AND by `ECHO_MAX_LINES` overall.
-        K::Array(elems)
-        | K::NestedArray {
-            elements: elems, ..
-        } => {
-            writeln!(writer, "{pad}{name}: [{} element(s)]", elems.len()).ok();
-            let mut shown = 0usize;
-            for (i, elem) in elems.iter().take(truncate_length).enumerate() {
-                if *lines >= ECHO_MAX_LINES {
-                    break;
-                }
-                *lines += 1;
-                shown += 1;
-                match elem {
-                    K::Nested(inner) => {
-                        writeln!(writer, "{pad}  [{i}]:").ok();
-                        render_frame_fields_budgeted(
-                            writer,
-                            inner,
-                            indent + 2,
-                            truncate_length,
-                            lines,
-                        );
-                    }
-                    other => {
-                        writeln!(
-                            writer,
-                            "{pad}  [{i}]: {}",
-                            format_leaf_value(other, truncate_length)
-                        )
-                        .ok();
-                    }
-                }
-            }
-            if elems.len() > shown {
-                writeln!(writer, "{pad}  … ({} total)", elems.len()).ok();
-            }
-        }
-        leaf => {
-            writeln!(
-                writer,
-                "{pad}{name}: {}",
-                format_leaf_value(leaf, truncate_length)
-            )
-            .ok();
-        }
-    }
-}
-
-/// Render every field of a decoded
-/// [`FrameValue`](cerulion_core::codegen::FrameValue) as readable
-/// `name: value` lines — the output shows the data a frame carries, not a field
-/// count. Reused by the LOCAL-walker and REMOTE-walker echo paths so there is
-/// ONE rendering seam. `truncate_length` is threaded down to bound
-/// every rendered array.
-fn render_frame_fields(
-    writer: &mut dyn Write,
-    value: &cerulion_core::codegen::FrameValue,
-    indent: usize,
-    truncate_length: usize,
-) {
-    let mut lines = 0usize;
-    render_frame_fields_budgeted(writer, value, indent, truncate_length, &mut lines);
-    if lines >= ECHO_MAX_LINES {
+/// Write one decoded frame's YAML (already cut at [`ECHO_MAX_LINES`] by
+/// the codec), plus a comment when it was cut.
+fn write_yaml_body(writer: &mut dyn Write, yaml: &str) {
+    writer.write_all(yaml.as_bytes()).ok();
+    // A cut ends in a column-0 marker line; no message line can be one
+    // (column-0 lines are `key:` lines, and keys are never tags).
+    if yaml.lines().next_back() == Some(cerulion_core::dynamic::YAML_TRUNCATED_TAG) {
         writeln!(
             writer,
-            "  … (output truncated at {ECHO_MAX_LINES} lines — this frame nests more \
-             element arrays than one echo can render)"
+            "# output cut at {ECHO_MAX_LINES} lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays",
         )
         .ok();
-    }
-}
-
-/// [`render_frame_fields`]'s recursive half, carrying the shared
-/// [`ECHO_MAX_LINES`] budget.
-fn render_frame_fields_budgeted(
-    writer: &mut dyn Write,
-    value: &cerulion_core::codegen::FrameValue,
-    indent: usize,
-    truncate_length: usize,
-    lines: &mut usize,
-) {
-    for field in &value.fields {
-        if *lines >= ECHO_MAX_LINES {
-            return;
-        }
-        write_named_value(
-            writer,
-            &field.name,
-            &field.value,
-            indent,
-            truncate_length,
-            lines,
-        );
     }
 }
 
@@ -4102,9 +3882,10 @@ fn resolve_schema_line(
     )
 }
 
-/// Render the decode line(s) for one `topic echo` frame whose
-/// `schema_hash` is not a pinned built-in (`std_msgs/String` /
-/// `sensor_msgs/Image` are handled inline by the caller).
+/// Write the body of one `topic echo` frame: a `# <type>` comment line and
+/// the message as YAML (the [`cerulion_core::dynamic::message_to_yaml_with`]
+/// codec, arrays cut at `truncate_length`), or comment lines that explain a
+/// frame no walker can decode, with a hex preview.
 ///
 /// Tries the LOCAL walker first (built-ins + the workspace `.msg` store +
 /// `schemas/*.yaml`): a locally-known type decodes with NO
@@ -4115,10 +3896,11 @@ fn resolve_schema_line(
 /// once-only discipline; keeping the breadcrumb here (not pre-loop) is what
 /// makes it factual rather than a prediction a local-heavy topic breaks.
 ///
-/// `truncate_length` bounds EVERY array rendered on this walker path —
-/// byte, numeric, and nested-message arrays. It does NOT affect the caller's
-/// pinned `sensor_msgs/Image` fast-path (a deliberate curated summary) nor the
-/// undecodable-frame hex preview below (a fixed 64-byte raw-wire diagnostic).
+/// Every line that is not the message itself starts with `#`, so a frame's
+/// block is valid YAML and a copied message is valid message YAML input. The
+/// codec quotes every string and escapes control characters, and quotes any
+/// key that is not a plain identifier, so a wire string or a remote field
+/// name cannot reach the terminal as an escape sequence.
 #[allow(clippy::too_many_arguments)]
 fn write_custom_decode(
     writer: &mut dyn Write,
@@ -4131,143 +3913,116 @@ fn write_custom_decode(
     explained_hashes: &mut std::collections::BTreeSet<u64>,
     truncate_length: usize,
 ) {
-    // Reconstruct the full wire frame (32-byte header + payload) once; `walk`
-    // slices the header off.
+    use cerulion_core::dynamic::{message_to_yaml_with, YamlEncodeOptions};
+    // Reconstruct the full wire frame (32-byte header + payload) once.
     let mut frame = vec![0u8; cerulion_core::wire::WireHeader::SIZE];
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(payload);
+    let options = YamlEncodeOptions {
+        truncate_arrays: Some(truncate_length),
+        max_lines: Some(ECHO_MAX_LINES),
+    };
 
-    // A schema whose hash the walker RESOLVES but whose
-    // frame fails to `walk()` (a truncated / corrupt frame) must be distinguished
-    // from a genuinely-unknown type — otherwise both render as bare hex. Remember
-    // the first such `(name, WalkError)` and surface it before the hex dump.
-    let mut decode_failure: Option<(String, cerulion_core::codegen::WalkError)> = None;
+    // A schema whose hash a walker RESOLVES but whose frame does not decode
+    // (a truncated / corrupt frame, or a value with no YAML form) must be
+    // distinguished from a genuinely-unknown type. Remember the first such
+    // `(name, error text)` and surface it before the hex dump.
+    let mut decode_failure: Option<(String, String)> = None;
 
     // LOCAL walker first: a frame whose type the workspace already knows decodes
     // LOCALLY — no network, no remote fallback, no breadcrumb.
-    // render the full decoded field TREE, not a bare field count.
     // Decode by HASH, not by the returned name: two identities can share
     // a qualified name, and only the hash picks the frame's own layout.
     if let Some(name) = local_walker.schema_name_for_hash(header.schema_hash) {
-        match local_walker.walk_by_hash(&frame) {
-            Ok(value) => {
+        match message_to_yaml_with(local_walker, &frame, options) {
+            Ok(yaml) => {
                 // The schema NAME is a local, trusted identifier — no sanitize
-                // needed (it never crossed the network). Field VALUES are
-                // sanitized inside the renderer.
-                writeln!(writer, "  {name}:").ok();
-                render_frame_fields(writer, &value, 1, truncate_length);
+                // needed (it never crossed the network).
+                writeln!(writer, "# {name}").ok();
+                write_yaml_body(writer, &yaml);
                 return;
             }
-            Err(e) => decode_failure = Some((name.to_string(), e)),
+            Err(e) => decode_failure = Some((name.to_string(), e.to_string())),
         }
     }
 
-    // Fall back to the remote-seeded walker — a frame whose custom-type hash the
-    // walker knows is decoded + RENDERED (structurally validated) instead of
-    // dumped as opaque hex.
-    let mut remote_decoded = None;
+    // Fall back to the remote-seeded walker.
     if let Some((robot, walker)) = remote_walker {
         if let Some(name) = walker.schema_name_for_hash(header.schema_hash) {
-            match walker.walk_by_hash(&frame) {
-                Ok(value) => remote_decoded = Some((robot.as_str(), name, value)),
-                // Known-to-the-remote-walker but undecodable: remember it (only
-                // if the local walker did not already record a failure).
+            match message_to_yaml_with(walker, &frame, options) {
+                Ok(yaml) => {
+                    // The FACTUAL breadcrumb, emitted ONCE on the FIRST frame
+                    // that actually decodes remotely. `robot` is LAN-sourced, so it is
+                    // sanitized inside `remote_fallback_breadcrumb`.
+                    if !*breadcrumb_shown {
+                        writeln!(writer, "# {}", remote_fallback_breadcrumb(topic, robot)).ok();
+                        *breadcrumb_shown = true;
+                    }
+                    // BOTH `name` (the remote-served schema name) and `robot`
+                    // are LAN-supplied: sanitize before display.
+                    writeln!(
+                        writer,
+                        "# {} (via robot '{}')",
+                        sanitize_display(name),
+                        sanitize_display(robot),
+                    )
+                    .ok();
+                    write_yaml_body(writer, &yaml);
+                    return;
+                }
                 Err(e) => {
-                    decode_failure.get_or_insert((name.to_string(), e));
+                    decode_failure.get_or_insert((name.to_string(), e.to_string()));
                 }
             }
         }
     }
-    match remote_decoded {
-        Some((robot, name, value)) => {
-            // The FACTUAL breadcrumb, emitted ONCE on the FIRST frame that
-            // actually decodes remotely (never pre-loop, never for a
-            // locally-decoded frame). `robot` is LAN-sourced — sanitized inside
-            // `remote_fallback_breadcrumb`.
-            if !*breadcrumb_shown {
-                writeln!(writer, "{}", remote_fallback_breadcrumb(topic, robot)).ok();
-                *breadcrumb_shown = true;
-            }
-            // BOTH `name` (the remote-served schema
-            // name) and `robot` (announce-space) are LAN-supplied — sanitize
-            // terminal-escape chars before display. Field VALUES are sanitized
-            // inside the renderer.
+
+    match &decode_failure {
+        // Name the known-but-undecodable schema before the hex. The name AND
+        // the error text can carry wire-derived field/schema names (remote),
+        // so BOTH are sanitized.
+        Some((name, err)) => {
             writeln!(
                 writer,
-                "  {} (via robot '{}'):",
+                "# ({}: decode failed: {})",
                 sanitize_display(name),
-                sanitize_display(robot),
+                sanitize_display(err),
             )
             .ok();
-            render_frame_fields(writer, &value, 1, truncate_length);
         }
         None => {
-            // Name the known-but-undecodable schema before the
-            // hex. The name AND the WalkError Display can carry wire-derived
-            // field/schema names (remote), so BOTH are sanitized.
-            if let Some((name, err)) = &decode_failure {
-                writeln!(
-                    writer,
-                    "  ({}: decode failed: {})",
-                    sanitize_display(name),
-                    sanitize_display(&err.to_string()),
-                )
-                .ok();
-            } else {
-                // NEITHER walker names this hash. Printing
-                // bare hex and nothing else would make the one surface an operator
-                // reaches for first say only "here are some bytes",
-                // on the command whose whole job is to
-                // say what is on a topic. (`topic info` names this
-                // condition too; the two surfaces agree.)
-                //
-                // No candidate name is threaded here: echo's remote walker is
-                // keyed by hash, and had a name been known the branch above would
-                // have run. `schema_unidentified` is the correct verdict for this
-                // vantage.
-                //
-                // Once per distinct hash, never per frame.
-                // Echo always passes `candidate: None`, so only the
-                // `Unidentified` arm is reachable and its text is byte-invariant
-                // for a given hash — printing it on every frame of a 500 Hz
-                // undecodable topic is ~135 KB/s of identical prose carrying zero
-                // per-frame information, which is the very flood class the rest of
-                // this path latches. The per-frame hex preview is untouched: the
-                // paragraph explains the dump, so it needs saying once.
-                //
-                // A SEPARATE set from `breadcrumb_shown` deliberately — that
-                // latches the remote-fallback breadcrumb, a different condition,
-                // and sharing it would let whichever fired first suppress the
-                // other. Bounded by the topic's schema cardinality (in practice 1).
-                if explained_hashes.insert(header.schema_hash) {
-                    let diagnosis =
-                        cerulion_core::codegen::diagnose_unknown_hash(header.schema_hash, None);
-                    writeln!(writer, "  (undecodable: {})", diagnosis.detail()).ok();
-                }
+            // NEITHER walker names this hash: say so, once per distinct hash
+            // (never per frame: the text is byte-invariant for a hash, and a
+            // 500 Hz undecodable topic would flood ~135 KB/s of identical
+            // prose). A SEPARATE latch from `breadcrumb_shown`, which marks a
+            // different condition.
+            if explained_hashes.insert(header.schema_hash) {
+                let diagnosis =
+                    cerulion_core::codegen::diagnose_unknown_hash(header.schema_hash, None);
+                writeln!(writer, "# (undecodable: {})", diagnosis.detail()).ok();
             }
-            // This hex preview shows the raw wire bytes of a FAILED
-            // decode (not array ELEMENTS of a decoded field), so its 64-byte
-            // bound is DELIBERATELY independent of `--truncate-length` — it is a
-            // fixed diagnostic dump, not a rendered array.
-            let hex: String = payload
-                .iter()
-                .take(64)
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let suffix = if payload.len() > 64 { "..." } else { "" };
-            writeln!(writer, "  payload: {}{}", hex, suffix).ok();
         }
     }
+    // The raw wire bytes of a FAILED decode: a fixed 64-byte diagnostic,
+    // deliberately independent of `--truncate-length`.
+    let hex: String = payload
+        .iter()
+        .take(64)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if payload.len() > 64 { "..." } else { "" };
+    writeln!(writer, "# payload: {}{}", hex, suffix).ok();
 }
 
 /// Echo messages from a topic.
 ///
-/// Pretty-prints payloads for well-known schemas (`std_msgs/String`,
-/// `sensor_msgs/Image`) and falls back to a hex preview otherwise. Schema
-/// recognition is by `WireHeader::schema_hash` — the
-/// layout-sensitive hash baked in by the message codegen, so it survives
-/// recompiles and round-trips through the wire format unchanged.
+/// Each frame prints as one YAML document: a `# seq=.. ts=..ns schema=0x..
+/// size=..` comment, a `# <type>` comment, the message as YAML (the
+/// `cerulion_core::dynamic` codec), then `---`. The message lines are valid
+/// message YAML input as long as no array was cut at `truncate_length`.
+/// A frame no walker decodes prints comment lines with a hex preview.
+/// Schema recognition is by `WireHeader::schema_hash`.
 pub fn topic_echo(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
@@ -4294,14 +4049,10 @@ pub fn topic_echo_with_scope(
     schemas_dir: Option<&std::path::Path>,
     running: Arc<AtomicBool>,
     writer: &mut dyn Write,
-    // Max array ELEMENTS to render inline before truncating with a
-    // trailing `...` + `(N elements)` tail (the `--truncate-length` flag; the CLI
-    // passes [`DEFAULT_ECHO_TRUNCATE_LENGTH`] when the flag is omitted). Bounds
-    // every array in the CUSTOM-DECODE walker path (`write_custom_decode`) —
-    // u8/byte arrays (never an opaque `<N bytes>` placeholder) AND
-    // numeric/nested-message arrays. The pinned `sensor_msgs/Image` fast-path
-    // deliberately keeps its one-line `data=N bytes` summary (it never dumps
-    // pixel bytes), so the bound does NOT reach it.
+    // Max array ELEMENTS to print per array before closing it with a
+    // `!truncated <n>` element (the `--truncate-length` flag; the CLI passes
+    // [`DEFAULT_ECHO_TRUNCATE_LENGTH`] when the flag is omitted). Bounds every
+    // array: byte, numeric, string and message arrays alike.
     truncate_length: usize,
     scope: TopicScope,
 ) -> CliResult<()> {
@@ -4332,14 +4083,6 @@ pub fn topic_echo_with_scope(
     // carrying a WORKSPACE type decodes LOCALLY (no network). The remote walker
     // below stays the FALLBACK for types the desk genuinely lacks.
     let local_walker = local_walker_from_workspace(schemas_dir);
-
-    // Recipe-3 layout-sensitive schema hashes — a `const fn` over the name
-    // alone CANNOT reproduce them (the recipe folds in wire_fixed_size +
-    // per-field canonical_str + nested layout). The pinned literals live in
-    // the named consts above and are kept in sync with the generated
-    // `<T>::SCHEMA_HASH` by `pinned_hashes_match_generated_constants`.
-    const STD_MSGS_STRING: u64 = STD_MSGS_STRING_SCHEMA_HASH;
-    const SENSOR_MSGS_IMAGE: u64 = SENSOR_MSGS_IMAGE_SCHEMA_HASH;
 
     // Delivery accounting: the wire sequence of the last frame this
     // run displayed. The non-notifying degrade window (~1 heartbeat between
@@ -4435,7 +4178,7 @@ pub fn topic_echo_with_scope(
                     if missed > 0 {
                         writeln!(
                             writer,
-                            "[gap: {missed} frame(s) missed — subscriber queue overflow \
+                            "# [gap: {missed} frame(s) missed: subscriber queue overflow \
                              (drop_oldest) between drains; wire seq jumped {last} -> {}]",
                             header.sequence,
                         )
@@ -4446,66 +4189,36 @@ pub fn topic_echo_with_scope(
             last_seq = Some(header.sequence);
             writeln!(
                 writer,
-                "seq={} ts={}ns schema=0x{:016x} size={}",
+                "# seq={} ts={}ns schema=0x{:016x} size={}",
                 header.sequence, header.timestamp_ns, header.schema_hash, header.total_size,
             )
             .ok();
 
-            match header.schema_hash {
-                STD_MSGS_STRING => match decode_string_payload(payload) {
-                    Some(s) => {
-                        writeln!(writer, "  std_msgs/String: {:?}", s).ok();
-                    }
-                    None => {
-                        writeln!(writer, "  std_msgs/String: <undecodable>").ok();
-                    }
-                },
-                SENSOR_MSGS_IMAGE => match decode_image_meta(payload) {
-                    Some(meta) => {
-                        // EXCEPTION: this pinned fast-path is a
-                        // curated one-line summary for the one type where dumping
-                        // the `data` pixel bytes is exactly the flood we avoid —
-                        // so `--truncate-length` does NOT apply here (it bounds the
-                        // custom-decode walker path). `data=N bytes` stays a
-                        // summary, never element-rendered.
-                        writeln!(
-                            writer,
-                            "  sensor_msgs/Image: {}x{} encoding={:?} step={} data={} bytes",
-                            meta.width, meta.height, meta.encoding, meta.step, meta.data_len,
-                        )
-                        .ok();
-                    }
-                    None => {
-                        writeln!(writer, "  sensor_msgs/Image: <undecodable>").ok();
-                    }
-                },
-                _ if !payload.is_empty() => {
-                    // LOCAL walker first, remote-seeded walker as the
-                    // fallback, hash-only hex otherwise. The one-time remote
-                    // breadcrumb is emitted LAZILY inside — only when a frame
-                    // ACTUALLY decodes remotely (factual, not predictive).
-                    if remote_walker_pending
-                        && local_walker
-                            .schema_name_for_hash(header.schema_hash)
-                            .is_none()
-                    {
-                        remote_walker_pending = false;
-                        remote_walker = resolve_remote_walker_for_topic(topic);
-                    }
-                    write_custom_decode(
-                        writer,
-                        topic,
-                        header,
-                        payload,
-                        &local_walker,
-                        remote_walker.as_ref(),
-                        &mut breadcrumb_shown,
-                        &mut explained_hashes,
-                        truncate_length,
-                    );
-                }
-                _ => {}
+            // LOCAL walker first, remote-seeded walker as the fallback,
+            // hash-only hex otherwise. The one-time remote breadcrumb is
+            // emitted LAZILY inside, only when a frame ACTUALLY decodes
+            // remotely (factual, not predictive). The remote walker itself is
+            // resolved on the first frame the local walker cannot name.
+            if remote_walker_pending
+                && local_walker
+                    .schema_name_for_hash(header.schema_hash)
+                    .is_none()
+            {
+                remote_walker_pending = false;
+                remote_walker = resolve_remote_walker_for_topic(topic);
             }
+            write_custom_decode(
+                writer,
+                topic,
+                header,
+                payload,
+                &local_walker,
+                remote_walker.as_ref(),
+                &mut breadcrumb_shown,
+                &mut explained_hashes,
+                truncate_length,
+            );
+            writeln!(writer, "---").ok();
         });
 
         match received {
@@ -4583,81 +4296,6 @@ pub fn topic_echo_with_scope(
     }
 
     Ok(())
-}
-
-/// Pull the UTF-8 bytes from a `std_msgs/String` SHM payload.
-///
-/// The wire layout for a single-variable-field message: 8-byte offset table
-/// at byte 0 (one 4-byte offset + 4-byte length), then the payload bytes
-/// at that offset. Returns `None` if the offset table is missing or the
-/// referenced range is out of bounds.
-fn decode_string_payload(payload: &[u8]) -> Option<String> {
-    if payload.len() < 8 {
-        return None;
-    }
-    let offset = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
-    let len = u32::from_le_bytes(payload[4..8].try_into().ok()?) as usize;
-    let end = offset.checked_add(len)?;
-    if end > payload.len() {
-        return None;
-    }
-    std::str::from_utf8(&payload[offset..end])
-        .ok()
-        .map(|s| s.to_string())
-}
-
-struct ImageMeta {
-    width: u32,
-    height: u32,
-    encoding: String,
-    step: u32,
-    data_len: usize,
-}
-
-/// Pull width/height/encoding/data-size out of a `sensor_msgs/Image` SHM
-/// payload. The fixed section layout (matching `ImageFixedSection` in the
-/// generated bindings) is `height: u32, width: u32, is_bigendian: u8,
-/// step: u32` (with C alignment padding to 16 bytes), followed by a
-/// 24-byte offset table covering the three variable fields
-/// (header_bytes, encoding, data).
-fn decode_image_meta(payload: &[u8]) -> Option<ImageMeta> {
-    // FIXED_SIZE = size_of::<ImageFixedSection>() with C alignment = 16 bytes.
-    const FIXED_SIZE: usize = 16;
-    const TABLE_BYTES: usize = 8 * 3;
-    if payload.len() < FIXED_SIZE + TABLE_BYTES {
-        return None;
-    }
-    let height = u32::from_le_bytes(payload[0..4].try_into().ok()?);
-    let width = u32::from_le_bytes(payload[4..8].try_into().ok()?);
-    // is_bigendian at offset 8 (1 byte) — skipped here.
-    let step = u32::from_le_bytes(payload[12..16].try_into().ok()?);
-
-    // Offset-table entry layout: `[u32 offset, u32 len]` per variable field.
-    // Field index 1 = encoding, field index 2 = data.
-    let read_entry = |idx: usize| -> Option<(usize, usize)> {
-        let base = FIXED_SIZE + idx * 8;
-        let off = u32::from_le_bytes(payload[base..base + 4].try_into().ok()?) as usize;
-        let len = u32::from_le_bytes(payload[base + 4..base + 8].try_into().ok()?) as usize;
-        Some((off, len))
-    };
-    let (enc_off, enc_len) = read_entry(1)?;
-    let (_, data_len) = read_entry(2)?;
-    let enc_end = enc_off.checked_add(enc_len)?;
-    if enc_end > payload.len() {
-        return None;
-    }
-    let encoding = std::str::from_utf8(&payload[enc_off..enc_end])
-        .ok()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    Some(ImageMeta {
-        width,
-        height,
-        encoding,
-        step,
-        data_len,
-    })
 }
 
 /// Measure publish rate on a topic.
@@ -7287,8 +6925,8 @@ mod tests {
         );
         let a = String::from_utf8(std::mem::take(&mut buf)).unwrap();
         assert!(
-            a.contains("demo_msgs/Widget:"),
-            "Widget must decode locally under its schema-name header: {a}"
+            a == "# demo_msgs/Widget\nx: 1.0\ny: 2.0\n",
+            "Widget must decode locally as YAML under its schema-name comment: {a}"
         );
         // The ACTUAL field VALUES are rendered (not a count).
         assert!(
@@ -7440,7 +7078,7 @@ mod tests {
         );
         let good = String::from_utf8(std::mem::take(&mut buf)).unwrap();
         assert!(
-            good.contains("demo_msgs/Widget:"),
+            good.contains("# demo_msgs/Widget\nx: 1.0\ny: 2.0\n"),
             "the control really does decode: {good}"
         );
         assert!(
@@ -7487,8 +7125,7 @@ mod tests {
         };
 
         let local_out = decode(&twins(), None);
-        assert!(local_out.contains("  pkg/Type:"), "{local_out}");
-        assert!(local_out.contains("x: 1.5"), "{local_out}");
+        assert!(local_out.starts_with("# pkg/Type\nx: 1.5\n"), "{local_out}");
         assert!(
             !local_out.lines().any(|l| l.trim_start().starts_with("a:")),
             "{local_out}"
@@ -7498,10 +7135,9 @@ mod tests {
         let remote = ("bot".to_string(), twins());
         let remote_out = decode(&empty, Some(&remote));
         assert!(
-            remote_out.contains("pkg/Type (via robot 'bot'):"),
+            remote_out.contains("# pkg/Type (via robot 'bot')\nx: 1.5\n"),
             "{remote_out}"
         );
-        assert!(remote_out.contains("x: 1.5"), "{remote_out}");
         assert!(
             !remote_out.lines().any(|l| l.trim_start().starts_with("a:")),
             "{remote_out}"
@@ -7596,353 +7232,6 @@ mod tests {
         );
     }
 
-    /// `format_leaf_value` renders each decoded LEAF
-    /// kind in a human-readable form — scalars verbatim, floats with the decimal
-    /// point, strings quoted, and byte arrays as their ELEMENTS. Hand
-    /// oracles (never self-compare).
-    #[test]
-    fn format_leaf_value_renders_scalars_strings_and_blobs() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        let n = DEFAULT_ECHO_TRUNCATE_LENGTH;
-        assert_eq!(format_leaf_value(&K::Bool(true), n), "true");
-        assert_eq!(format_leaf_value(&K::U8(7), n), "7");
-        assert_eq!(format_leaf_value(&K::I32(-42), n), "-42");
-        assert_eq!(
-            format_leaf_value(&K::U64(18446744073709551615), n),
-            "18446744073709551615"
-        );
-        // `{:?}` keeps the float-ness visible (`1.0`, not `1`).
-        assert_eq!(format_leaf_value(&K::F64(1.0), n), "1.0");
-        assert_eq!(format_leaf_value(&K::F32(0.5), n), "0.5");
-        assert_eq!(format_leaf_value(&K::Str("hello"), n), "\"hello\"");
-        // A short byte array renders its ELEMENTS (no more `<N bytes>`).
-        let short_bytes = vec![12u8, 0, 255];
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&short_bytes), n),
-            "[12, 0, 255]"
-        );
-        // A numeric array renders in its NATIVE type.
-        let f64_bytes: Vec<u8> = [1.0f64, 2.0, 3.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let arr = PrimArray {
-            elem: PrimType::F64,
-            bytes: &f64_bytes,
-            count: 3,
-        };
-        assert_eq!(format_leaf_value(&K::PrimArray(arr), n), "[1.0, 2.0, 3.0]");
-        let opaque = vec![0u8; 12];
-        assert_eq!(
-            format_leaf_value(&K::NestedArrayOpaque(&opaque), n),
-            // NEUTRAL label — the walker routes bool[] here
-            // too, so it must not claim "nested-message". This opaque-array
-            // arm stays a summary (no element framing to enumerate).
-            "<12 bytes, opaque array>"
-        );
-    }
-
-    /// A numeric array longer than `truncate_length` is truncated with a
-    /// trailing `...` inside the brackets + a `(N elements)` total annotation; an
-    /// exactly-bound-length array is shown in full with NO annotation; integer
-    /// elements stay integer.
-    #[test]
-    fn format_prim_array_truncates_beyond_bound() {
-        use cerulion_core::codegen::{PrimArray, PrimType};
-        let vals: Vec<u32> = (0..10).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 10,
-        };
-        // Bound 8 < 10 → truncated: 8 elements + `...` + `(10 elements)`.
-        assert_eq!(
-            format_prim_array(&arr, 8),
-            "[0, 1, 2, 3, 4, 5, 6, 7, ...] (10 elements)"
-        );
-        // Bound == count (10) → full, NO annotation (ros2-parity).
-        assert_eq!(
-            format_prim_array(&arr, 10),
-            "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]"
-        );
-    }
-
-    /// A `uint8[]` shorter than or equal to the bound renders EVERY
-    /// element with NO annotation (the LowState `head` / short-array case).
-    #[test]
-    fn byte_array_within_bound_renders_all_elements_no_annotation() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // Empty byte array → empty brackets.
-        assert_eq!(format_leaf_value(&K::Bytes(&[]), 128), "[]");
-        // A 2-byte LowState `head`.
-        assert_eq!(format_leaf_value(&K::Bytes(&[255u8, 0]), 128), "[255, 0]");
-        // Exactly-at-bound (128) renders full, no `...`, no `(N elements)`.
-        let at_bound: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
-        let rendered = format_leaf_value(&K::Bytes(&at_bound), 128);
-        assert!(
-            !rendered.contains("..."),
-            "at-bound must not truncate: no `...`"
-        );
-        assert!(
-            !rendered.contains("elements)"),
-            "at-bound must not carry the count annotation"
-        );
-        let expected: Vec<String> = at_bound.iter().map(|b| b.to_string()).collect();
-        assert_eq!(rendered, format!("[{}]", expected.join(", ")));
-    }
-
-    /// A `uint8[]` LONGER than the bound truncates at EXACTLY the bound
-    /// with a trailing `...` inside the brackets + a `(N elements)` total
-    /// annotation — the PointCloud2 `data` case (the headline ros2-parity shape).
-    #[test]
-    fn byte_array_beyond_bound_truncates_at_128_with_count() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // 57600 bytes (a small PointCloud2 `data`), first three are 12/0/255.
-        let mut data: Vec<u8> = vec![0u8; 57600];
-        data[0] = 12;
-        data[1] = 0;
-        data[2] = 255;
-        let rendered = format_leaf_value(&K::Bytes(&data), 128);
-        // EXACTLY 128 elements shown before the marker.
-        let shown: Vec<String> = data[..128].iter().map(|b| b.to_string()).collect();
-        assert_eq!(
-            rendered,
-            format!("[{}, ...] (57600 elements)", shown.join(", "))
-        );
-        // Head/tail spot-checks so the assertion is not vacuous.
-        assert!(rendered.starts_with("[12, 0, 255, "), "{rendered}");
-        assert!(rendered.ends_with(", ...] (57600 elements)"), "{rendered}");
-    }
-
-    /// Truncation boundary: exactly-128 is full (no annotation); 129 truncates.
-    #[test]
-    fn byte_array_boundary_128_full_129_truncated() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let n128: Vec<u8> = (0..128u32).map(|i| (i % 256) as u8).collect();
-        let n129: Vec<u8> = (0..129u32).map(|i| (i % 256) as u8).collect();
-        // 128 → full, no `...`.
-        assert!(!format_leaf_value(&K::Bytes(&n128), 128).contains("..."));
-        // 129 → truncated to 128 + `...` + `(129 elements)`.
-        let r129 = format_leaf_value(&K::Bytes(&n129), 128);
-        let shown: Vec<String> = n129[..128].iter().map(|b| b.to_string()).collect();
-        assert_eq!(r129, format!("[{}, ...] (129 elements)", shown.join(", ")));
-    }
-
-    /// A non-u8 (numeric) array LONGER than the bound truncates in the
-    /// EXACT same shape as a byte array — one seam, one shape.
-    #[test]
-    fn non_u8_array_beyond_bound_truncates_identically() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        let vals: Vec<u32> = (0..200).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 200,
-        };
-        let rendered = format_leaf_value(&K::PrimArray(arr), 128);
-        let shown: Vec<String> = (0..128u32).map(|v| v.to_string()).collect();
-        assert_eq!(
-            rendered,
-            format!("[{}, ...] (200 elements)", shown.join(", "))
-        );
-    }
-
-    /// The `truncate_length` bound is THREADED — a bound of 4 renders 4
-    /// elements + `...` + the count, on BOTH byte and numeric arrays.
-    #[test]
-    fn truncate_length_bound_is_honored_end_to_end() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        // Byte array, bound 4.
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&[10u8, 20, 30, 40, 50, 60]), 4),
-            "[10, 20, 30, 40, ...] (6 elements)"
-        );
-        // Numeric array, bound 4.
-        let vals: Vec<u32> = (0..6).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 6,
-        };
-        assert_eq!(
-            format_leaf_value(&K::PrimArray(arr), 4),
-            "[0, 1, 2, 3, ...] (6 elements)"
-        );
-    }
-
-    /// Truncation boundary: a bound of 1 is the tightest legal bound — N>1 shows one
-    /// element + `...` + `(N elements)`, exactly-one-element renders `[e0]` with
-    /// NO annotation, and an empty array renders `[]`.
-    #[test]
-    fn bound_of_one_shows_single_element_and_truncates_the_rest() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // N>1 → one element then the truncation marker + count.
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&[7u8, 8, 9]), 1),
-            "[7, ...] (3 elements)"
-        );
-        // Exactly one element at bound 1 → full, NO annotation.
-        assert_eq!(format_leaf_value(&K::Bytes(&[42u8]), 1), "[42]");
-        // Empty at bound 1 → empty brackets, NO annotation.
-        assert_eq!(format_leaf_value(&K::Bytes(&[]), 1), "[]");
-    }
-
-    /// The MULTI-LINE nested-message array arm (`FrameValueKind::Array`,
-    /// which the walker emits for a fixed array of fixed-nested messages like
-    /// `geometry_msgs/Point[N]`) also honors `truncate_length` — it renders up to
-    /// `bound` element blocks, elides the rest, and closes with the multi-line
-    /// `… (N total)` tail. Pins BOTH the truncation bound behavior AND the exact
-    /// tail wording. Hand-built oracle (never a self-compare).
-    #[test]
-    fn nested_message_array_truncates_at_bound_with_total_tail() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        // A `geometry_msgs/Point[5]`-shaped fixed array of fixed-nested messages
-        // — exactly the shape the walker decodes into `FrameValueKind::Array`.
-        let point = |x: f64| {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "geometry_msgs/Point".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "x".into(),
-                        value: K::F64(x),
-                    },
-                    NamedValue {
-                        name: "y".into(),
-                        value: K::F64(0.0),
-                    },
-                ],
-            }))
-        };
-        let arr = K::Array(vec![
-            point(0.0),
-            point(1.0),
-            point(2.0),
-            point(3.0),
-            point(4.0),
-        ]);
-
-        // Bound 2 < 5 → header count line, blocks [0] and [1] rendered, [2..]
-        // elided, and the multi-line `… (5 total)` tail.
-        let mut buf: Vec<u8> = Vec::new();
-        write_named_value(&mut buf, "points", &arr, 0, 2, &mut 0);
-        let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("points: [5 element(s)]"), "{out}");
-        assert!(out.contains("[0]:") && out.contains("x: 0.0"), "{out}");
-        assert!(out.contains("[1]:") && out.contains("x: 1.0"), "{out}");
-        assert!(
-            !out.contains("[2]:"),
-            "beyond-bound blocks must be elided: {out}"
-        );
-        assert!(
-            !out.contains("x: 2.0"),
-            "the 3rd element's fields must be elided: {out}"
-        );
-        // The EXACT multi-line truncation tail wording (unicode ellipsis).
-        assert!(out.contains("… (5 total)"), "{out}");
-
-        // Control: bound 5 == len → every block rendered, NO `… (N total)` tail.
-        let mut buf2: Vec<u8> = Vec::new();
-        write_named_value(&mut buf2, "points", &arr, 0, 5, &mut 0);
-        let out2 = String::from_utf8(buf2).unwrap();
-        assert!(out2.contains("[4]:") && out2.contains("x: 4.0"), "{out2}");
-        assert!(
-            !out2.contains("total)"),
-            "an at-or-above-bound array must not carry the total tail: {out2}"
-        );
-    }
-
-    /// STRINGS are NOT affected by the array-truncation change — a long
-    /// string still renders whole + quoted, never element-split or `...`-tailed.
-    #[test]
-    fn strings_are_not_truncated_by_the_array_bound() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let long = "a".repeat(300);
-        let rendered = format_leaf_value(&K::Str(&long), 4);
-        assert_eq!(rendered, format!("{long:?}"));
-        assert!(
-            !rendered.contains("elements)") && !rendered.contains(", ..."),
-            "a string must never carry the array truncation tail: {rendered}"
-        );
-    }
-
-    /// `render_frame_fields` renders a nested message
-    /// indented under its parent, quotes string values, and renders byte arrays
-    /// as their ELEMENTS. Hand oracle over a HAND-BUILT `FrameValue` (never a
-    /// self-compare).
-    #[test]
-    fn render_frame_fields_renders_nested_and_byte_arrays() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        let inner = FrameValue {
-            schema_name: "demo/Inner".into(),
-            fields: vec![NamedValue {
-                name: "x".into(),
-                value: K::F64(1.5),
-            }],
-        };
-        // A LowState-style `head` byte field renders its elements.
-        let blob = vec![255u8, 0];
-        let msg = FrameValue {
-            schema_name: "demo/Outer".into(),
-            fields: vec![
-                NamedValue {
-                    name: "count".into(),
-                    value: K::U32(5),
-                },
-                NamedValue {
-                    name: "label".into(),
-                    value: K::Str("ok"),
-                },
-                NamedValue {
-                    name: "inner".into(),
-                    value: K::Nested(Box::new(inner)),
-                },
-                NamedValue {
-                    name: "head".into(),
-                    value: K::Bytes(&blob),
-                },
-            ],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &msg, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        // Top-level fields at 4-space indent (indent 1 → pad = 2 levels).
-        assert!(
-            out.contains("\n    count: 5\n") || out.starts_with("    count: 5\n"),
-            "{out}"
-        );
-        assert!(out.contains("    label: \"ok\""), "{out}");
-        assert!(out.contains("    inner:\n"), "{out}");
-        // Nested field at 6-space indent (indent 2).
-        assert!(out.contains("      x: 1.5"), "{out}");
-        // The byte field renders its elements, not `<2 bytes>`.
-        assert!(out.contains("    head: [255, 0]"), "{out}");
-    }
-
-    /// SECURITY: a wire STRING value is terminal-escape-sanitized before
-    /// display: an injected ANSI/CSI escape
-    /// is neutralized to U+FFFD, the printable tail survives.
-    #[test]
-    fn format_leaf_value_sanitizes_terminal_escapes_in_strings() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let hostile = "\u{1b}[2Jowned";
-        let rendered = format_leaf_value(&K::Str(hostile), DEFAULT_ECHO_TRUNCATE_LENGTH);
-        assert!(
-            !rendered.contains('\u{1b}'),
-            "raw ESC must be neutralized: {rendered:?}"
-        );
-        assert!(
-            rendered.contains('\u{fffd}'),
-            "control chars map to U+FFFD: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("owned"),
-            "the printable tail survives: {rendered:?}"
-        );
-    }
-
     /// `resolve_schema_line` names a built-in and a workspace
     /// type via the LOCAL walker, falls back to the REMOTE walker for a type the
     /// desk lacks, and degrades to a hash-only line + hint for an unknown hash.
@@ -8008,156 +7297,197 @@ mod tests {
         );
     }
 
-    /// Security: a wire-derived field NAME is
-    /// terminal-escape-sanitized before display — a hostile robot's `.msg` field
-    /// named `x\x1b[2J…` must not clear the operator's terminal. Both the
-    /// top-level and the NESTED (recursed) name paths are covered.
-    /// `topic echo`'s field render is bounded globally, not
-    /// just per array. The pathological shape is real —
-    /// `visualization_msgs/MarkerArray` is `Marker[] markers` where each
-    /// `Marker` carries `Point[] points` + `ColorRGBA[] colors`, and with
-    /// `truncate_length` re-applied at every level that renders ~1.5×10^5 lines
-    /// per frame. Without the canonical element framing those
-    /// fields would be ONE opaque line each, so an unbounded render is a straight
-    /// regression of the verb.
+    /// Echo one frame of `qualified` (a `.msg` written to a temp workspace)
+    /// through `write_custom_decode`, as the echo loop does.
+    fn echo_one(
+        msg: &str,
+        qualified: &str,
+        payload: &[u8],
+        truncate_length: usize,
+    ) -> (String, Vec<u8>, cerulion_core::codegen::FrameWalker) {
+        use cerulion_core::codegen::parse_rosmsg;
+        use cerulion_core::wire::WireHeader;
+        let (pkg, name) = qualified.split_once('/').unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let msg_dir = tmp.path().join(pkg).join("msg");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(msg_dir.join(format!("{name}.msg")), msg).unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let hash = walker
+            .schema_hash_for(qualified)
+            .unwrap_or_else(|| parse_rosmsg(msg, name, Some(pkg)).unwrap().schema_hash());
+        let layout = walker
+            .layout_for_name(qualified)
+            .expect("workspace type loads");
+        let mut header = WireHeader::with_schema(hash);
+        header.total_size = (WireHeader::SIZE + payload.len()) as u32;
+        header.offset_table_offset = (WireHeader::SIZE + layout.fixed_size) as u32;
+        header.offset_table_count = layout.variable_fields.len() as u32;
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        header.write_to_buf(&mut frame);
+        frame.extend_from_slice(payload);
+        let mut buf = Vec::new();
+        write_custom_decode(
+            &mut buf,
+            "/t",
+            &header,
+            payload,
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
+            truncate_length,
+        );
+        (String::from_utf8(buf).unwrap(), frame, walker)
+    }
+
+    /// The body after the `# <type>` line is the codec's YAML: arrays past
+    /// `--truncate-length` end in `!truncated <n>`, strings are quoted with
+    /// control characters escaped, and an uncut body decodes back to the
+    /// same frame. Hand-built frame, hand-written YAML.
     #[test]
-    fn render_frame_fields_bounds_total_lines_for_nested_element_arrays() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-
-        // A `Marker`-shaped element: two nested element arrays of 128 leaves.
-        let leaf = || {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "geometry_msgs/Point".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "x".into(),
-                        value: K::F64(1.0),
-                    },
-                    NamedValue {
-                        name: "y".into(),
-                        value: K::F64(2.0),
-                    },
-                ],
-            }))
-        };
-        let leaves = || K::NestedArray {
-            elements: (0..DEFAULT_ECHO_TRUNCATE_LENGTH).map(|_| leaf()).collect(),
-            raw: &[],
-        };
-        let marker = || {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "visualization_msgs/Marker".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "points".into(),
-                        value: leaves(),
-                    },
-                    NamedValue {
-                        name: "colors".into(),
-                        value: leaves(),
-                    },
-                ],
-            }))
-        };
-        let frame = FrameValue {
-            schema_name: "visualization_msgs/MarkerArray".into(),
-            fields: vec![NamedValue {
-                name: "markers".into(),
-                value: K::NestedArray {
-                    elements: (0..DEFAULT_ECHO_TRUNCATE_LENGTH)
-                        .map(|_| marker())
-                        .collect(),
-                    raw: &[],
-                },
-            }],
-        };
-
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &frame, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        let rendered = out.lines().count();
-        // Bounded, and the bound is what did the bounding: an unbounded render
-        // of this frame is 128 × (1 + 2 × (1 + 128 × 3)) ≈ 9.9×10^4 lines.
-        assert!(
-            rendered <= ECHO_MAX_LINES + 8,
-            "render must be globally bounded, got {rendered} lines"
-        );
-        assert!(
-            out.contains("output truncated at"),
-            "the cut must be LOUD, never silent: {}",
-            &out[out.len().saturating_sub(400)..]
-        );
-
-        // CONTROL (anti-tautology): an ordinary frame is untouched — every
-        // field renders and there is NO truncation notice.
-        let small = FrameValue {
-            schema_name: "geometry_msgs/PoseArray".into(),
-            fields: vec![NamedValue {
-                name: "poses".into(),
-                value: K::NestedArray {
-                    elements: vec![leaf(), leaf()],
-                    raw: &[],
-                },
-            }],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &small, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        assert!(!out.contains("output truncated at"), "{out}");
-        assert!(out.contains("poses: [2 element(s)]"), "{out}");
+    fn echo_prints_codec_yaml_that_decodes_back_when_uncut() {
+        // table: v @16 len 24 (8-aligned), name @40 len 2.
+        let mut payload = vec![16, 0, 0, 0, 24, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0];
+        for v in [1.0f64, 2.0, 3.0] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(b"a\x1b");
+        let msg = "float64[] v\nstring name\n";
+        let (cut, _, _) = echo_one(msg, "demo_msgs/Arr", &payload, 2);
         assert_eq!(
-            out.matches("x: 1.0").count(),
-            2,
-            "both elements render: {out}"
+            cut,
+            "# demo_msgs/Arr\nv: [1.0, 2.0, !truncated 1]\nname: \"a\\x1B\"\n"
+        );
+        assert!(
+            !cut.contains('\u{1b}'),
+            "no raw ESC reaches the terminal: {cut:?}"
+        );
+
+        let (whole, frame, walker) =
+            echo_one(msg, "demo_msgs/Arr", &payload, DEFAULT_ECHO_TRUNCATE_LENGTH);
+        assert_eq!(
+            whole,
+            "# demo_msgs/Arr\nv: [1.0, 2.0, 3.0]\nname: \"a\\x1B\"\n"
+        );
+        let mut back =
+            cerulion_core::dynamic::yaml_to_message(&walker, "demo_msgs/Arr", whole.as_bytes(), 0)
+                .expect("an uncut echo is message YAML input");
+        // The echo header carries the publisher's sequence/timestamp; the
+        // decoded frame carries 0 for both.
+        back[20..32].copy_from_slice(&frame[20..32]);
+        assert_eq!(back, frame);
+    }
+
+    /// A frame whose YAML passes `ECHO_MAX_LINES` prints that many lines, a
+    /// `!truncated` line and a comment; the cut output never
+    /// decodes. A short frame of the same type is not cut.
+    #[test]
+    fn echo_cuts_a_frame_at_the_line_budget_and_the_cut_never_decodes() {
+        let points = |n: usize| {
+            let mut p = vec![8, 0, 0, 0];
+            p.extend_from_slice(&((n * 24) as u32).to_le_bytes());
+            for i in 0..n {
+                for v in [i as f64, 0.5, -1.0] {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            p
+        };
+        let msg = "geometry_msgs/Point[] p\n";
+        let (out, _, walker) = echo_one(msg, "demo_msgs/Pts", &points(1000), 2000);
+        let lines: Vec<&str> = out.lines().collect();
+        // `# type` + 2000 body lines + the marker + the comment.
+        assert_eq!(lines.len(), 2003, "{}", &out[out.len() - 300..]);
+        assert_eq!(lines[2001], "!truncated");
+        assert!(
+            lines[2002].starts_with("# output cut at 2000 lines"),
+            "{}",
+            lines[2002]
+        );
+        match cerulion_core::dynamic::yaml_to_message(&walker, "demo_msgs/Pts", out.as_bytes(), 0) {
+            Err(cerulion_core::dynamic::DynamicError::YamlSyntax(_)) => {}
+            other => panic!("cut echo output must not decode, got {other:?}"),
+        }
+
+        let (small, _, _) = echo_one(msg, "demo_msgs/Pts", &points(2), 2000);
+        assert_eq!(
+            small,
+            "# demo_msgs/Pts\np:\n  - x: 0.0\n    y: 0.5\n    z: -1.0\n  - x: 1.0\n    y: 0.5\n    z: -1.0\n"
         );
     }
 
+    /// An 8-byte payload whose unset nested field names 2^31 zero lines
+    /// (2^15 rows of 2^16 leaves) prints the first 2000 and stops: the
+    /// codec stops at the line budget, so echo never builds the rest.
     #[test]
-    fn write_named_value_sanitizes_hostile_field_names() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        let hostile = "x\u{1b}[2J";
-        let mut buf: Vec<u8> = Vec::new();
-        write_named_value(
+    fn echo_of_a_huge_zero_default_frame_stops_at_the_line_budget() {
+        use cerulion_core::wire::WireHeader;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.yaml"),
+            "schemas:\n  Leaf:\n    fields:\n      uint8 v: {}\n  Row:\n    fields:\n      \
+             Leaf[65536] leaves: {}\n  Inner:\n    fields:\n      string s: {}\n      \
+             Row[32768] rows: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n",
+        )
+        .unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let mut header = WireHeader::with_schema(walker.schema_hash_for("Wrap").unwrap());
+        header.total_size = 40;
+        header.offset_table_offset = 32;
+        header.offset_table_count = 1;
+        let mut buf = Vec::new();
+        write_custom_decode(
             &mut buf,
-            hostile,
-            &K::U32(5),
-            0,
-            DEFAULT_ECHO_TRUNCATE_LENGTH,
-            &mut 0,
+            "/t",
+            &header,
+            &[8, 0, 0, 0, 0, 0, 0, 0],
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
+            usize::MAX,
         );
         let out = String::from_utf8(buf).unwrap();
-        assert!(
-            !out.contains('\u{1b}'),
-            "raw ESC in the field NAME must be neutralized: {out:?}"
+        let mut expected = String::from("# Wrap\ninner:\n  s: \"\"\n  rows:\n    - leaves:\n");
+        expected.push_str(&"        - v: 0\n".repeat(ECHO_MAX_LINES - 4));
+        expected.push_str(
+            "!truncated\n# output cut at 2000 lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays\n",
         );
-        assert!(
-            out.contains('\u{fffd}'),
-            "control chars in the name map to U+FFFD: {out:?}"
-        );
-        assert!(out.contains(": 5"), "the value still renders: {out:?}");
+        assert_eq!(out, expected);
+    }
 
-        // Nested field names are sanitized on their own recursion.
-        let inner = FrameValue {
-            schema_name: "demo/Inner".into(),
-            fields: vec![NamedValue {
-                name: hostile.into(),
-                value: K::U8(1),
-            }],
-        };
-        let mut buf2: Vec<u8> = Vec::new();
-        write_named_value(
-            &mut buf2,
-            "outer",
-            &K::Nested(Box::new(inner)),
-            0,
+    /// A field NAME is wire-derived for a remote type; one that is not a
+    /// plain identifier is printed as a quoted, escaped key.
+    #[test]
+    fn echo_quotes_and_escapes_a_hostile_field_name() {
+        use cerulion_core::wire::WireHeader;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("odd.yaml"),
+            "schemas:\n  Odd:\n    fields:\n      \"uint32 x\\e[2J\": {}\n",
+        )
+        .unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let hash = walker
+            .schema_hash_for("Odd")
+            .expect("workspace schema loads");
+        let header = WireHeader::with_schema(hash);
+        let mut buf = Vec::new();
+        write_custom_decode(
+            &mut buf,
+            "/t",
+            &header,
+            &5u32.to_le_bytes(),
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
             DEFAULT_ECHO_TRUNCATE_LENGTH,
-            &mut 0,
         );
-        let out2 = String::from_utf8(buf2).unwrap();
-        assert!(
-            !out2.contains('\u{1b}'),
-            "a nested hostile field name is also sanitized: {out2:?}"
-        );
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "# Odd\n\"x\\x1B[2J\": 5\n");
     }
 
     /// A KNOWN schema whose frame fails to `walk()` (a

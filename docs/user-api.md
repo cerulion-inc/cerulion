@@ -143,7 +143,7 @@ no command that rewrites an existing workspace's manifest in place.
 |---|---|
 | `topic list [--all] [-t] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (the discovery ladder below, gossip scouting on, zenoh multicast scouting only under `CERULION_MULTICAST_SCOUTING=on`, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer the ladder can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
 | `topic info <TOPIC> [--local]` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
-| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages with schema-aware decoding for stock types (`std_msgs/String`, `sensor_msgs/Image`, …); hex fallback otherwise. `--truncate-length` caps how many elements of a long array or string each line prints (default 128, minimum 1); raise it to see a whole payload, lower it to keep a fast topic readable. |
+| `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages as YAML, one document per frame: a `# seq=.. ts=..ns schema=0x.. size=..` comment, a `# <type>` comment, the message in the [message YAML](#message-yaml) form, then `---`. Every type the workspace or a robot can name decodes (built-in, `.msg` store, `schemas/*.yaml`); a frame no schema names prints `#` comment lines that say why, with a hex preview of its first 64 payload bytes. `--truncate-length` caps how many elements of each array print (default 128, minimum 1); a cut array ends in `!truncated <n>`, the number left out. Raise it to see a whole payload, lower it to keep a fast topic readable. A frame whose YAML passes 2000 lines prints its first 2000, then a `!truncated` line and a comment; echo stops writing there, so a huge frame costs no more than its first 2000 lines. |
 | `topic hz <TOPIC> [--local]` | Publish-rate measurement. |
 | `topic list -t` (also `--show-types`) | The same listing with each topic's message type after its name: `/robot/camera/image  [sensor_msgs/Image]`. The topic name stays the first token of the row; `--all`'s `internal` marker and a mirror row's `● streaming` marker follow the type. A LOCAL topic is typed from one message, read in batches of 128 topics that each share one one second wait, so a listing costs about one second per 128 local topics (hidden internal topics are not read unless `--all` is given), and named from the built-in, `.msg` store and workspace types; a topic that sent nothing in its batch's second shows `[unknown]`, and a type no local schema names shows its schema hash, `[0x...]`. A REMOTE row is typed from its robot's catalog (the schema name the robot sends, else its schema hash named as above), and a mirror row from its origin robot's catalog only, never from another robot that publishes the same topic name; a row no catalog types, or every remote row under `--local`, shows `[unknown]`. Plain `topic list` output does not change. |
 | `topic type <TOPIC> [--local]` | Print the topic's message type as `package/Type`, or as the bare YAML key for a workspace schema declared with no package. Opens the topic exactly as `topic info` does, so a REMOTE robot's topic works the same way, and names it with the same ladder. Exit 1 with an error naming the topic when it is not found, when it sends no message within the wait (1 s local, 3 s remote), or when no known type names its schema hash. A local topic whose hash no built-in or workspace type names is looked up once on the network, as `topic echo` does, which can add a few seconds; `--local` (or `CERULION_NETWORK=off`) skips that lookup. |
@@ -158,6 +158,87 @@ The discovery verbs map onto the ROS 2 ones:
 | `ros2 topic type /chatter` | `cerulion topic type /chatter` |
 | `ros2 topic find std_msgs/msg/String` | `cerulion topic find std_msgs/msg/String` (or `std_msgs/String`) |
 | `ros2 topic bw /chatter --window 100` | `cerulion topic bw /chatter --window 100` |
+
+### Message YAML
+
+`topic echo` prints a message in one YAML form, and the same form is how
+Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
+API): a message printed whole (no `!truncated` element) is valid input as it
+stands, with or without the `---` line echo prints after it. An unset nested field prints as its zero values, so reading it back
+gives the same values in a full-size frame, not the same bytes.
+
+```yaml
+header:
+  stamp:
+    sec: 1
+    nanosec: 2
+  frame_id: "map"
+name: ["shoulder", "elbow"]
+position: [0.5, 1e-7]
+velocity: []
+effort: [1.5]
+```
+
+- **Keys.** One key per field, in the order the `.msg` or schema YAML
+  declares them. Every field is required on input, and a key that is not a
+  field of the type is an error. A message type with no fields is `{}`
+  (empty input is accepted for it).
+- **Numbers.** Integers are decimal. An integer that does not fit its
+  field is refused as out of range at that field; past 128 bits YAML reads
+  the digits as a float, so the error is `expected uint64, got float`. Floats print in the shortest form that
+  reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
+  `.inf` and `-.inf`; an integer is accepted for a float field. A
+  `float32` reads back to the same bits. The one exception is NaN: every
+  NaN prints `.nan` and reads back as the standard quiet NaN, so its sign
+  and payload bits are not kept.
+- **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
+  strings. Control characters and the characters YAML reads as line breaks
+  print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
+- **Arrays.** Arrays of numbers, booleans and strings are flow sequences
+  (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
+  `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
+  array (`float64[9]`) must have exactly its length. An unbounded array of
+  messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
+  form holds no count for it, so a longer one is refused. Arrays of
+  strings and messages nest at most 8 deep through variable-size messages
+  (ones holding a string, `bytes` or an unbounded array at any depth): a
+  nonempty ninth level is refused (`arrays of strings and messages nest
+  more than 8 deep here`), because echo could not print it back.
+- **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
+  messages: `stamp: {sec: 1, nanosec: 2}` in block form.
+- **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
+  written as the number: `level: 1`, not `level: WARN`.
+- **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
+  holds no NUL character. A ROS `string<=N` value (or each element of
+  `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
+  `N` elements (`dimensions: expected at most 3 elements, got 4`). A
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, as ROS 2 counts them. Echo prints a frame past its bounds
+  as it is; reading that output back is refused.
+- **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
+  duplicate keys and more than one document are refused. A `!truncated`
+  element is refused with a message that says the array was cut for
+  display.
+- **Size.** A message whose YAML form is longer than 256 MiB is not
+  printed: the error names the field being written when the cap was
+  passed (`inner.rows[0].leaves[9].v: the YAML form passes the
+  268435456-byte output cap`). An unset nested field prints its zero
+  values, so a small frame can name a very large form. Message YAML
+  longer than 257 MiB (the 256 MiB form plus room for echo's comment
+  lines and `---`) is refused before it is read.
+
+Every error names the full field path (`(message)` for the whole message)
+and the expected type or bound:
+
+```text
+pose.position.x: expected float64, got string
+header.stamp.nanosec: -1 is out of range for uint32 (0 to 4294967295)
+pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation
+pose.orientation.w: missing field required by geometry_msgs/Quaternion
+covariance: expected exactly 36 elements, got 35
+tag: string is 5 bytes, over the bound of 4 bytes
+ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
+```
 
 ### Local scope for runs and topic inspection
 
