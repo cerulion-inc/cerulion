@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion bag migrate` — rewrite a bag whose embedded `graph.yaml` carries
-//! keys the graph format no longer defines.
+//! keys the graph format no longer defines, or whose frames were recorded with
+//! the 32-byte wire header of an older release.
 //!
 //! # The problem this exists for
 //!
@@ -24,11 +25,17 @@
 //!   verb refuses outright if the resolved output would be the input.
 //! * Every recorded frame — user topics and the reserved `__cerulion/*`
 //!   streams alike — is copied with its topic, sequence, log time, publish time
-//!   and payload BYTES unchanged, in file order.
+//!   and payload BYTES unchanged, in file order, except the header upgrade: a
+//!   user frame recorded with the 32-byte wire header is written in the current
+//!   40-byte layout (an untagged step tag added), and the migration refuses a
+//!   bag holding a 32-byte-header frame it cannot upgrade rather than copy it
+//!   under a descriptor stating the current header. A bag with no `graph.yaml`
+//!   (a `cerulion bag record` bag) migrates for the header upgrade alone.
 //! * Every attachment other than `graph.yaml` is copied byte-for-byte,
 //!   including its media type and both timestamps.
 //! * `graph.yaml` is replaced by the re-rendered config, and one new
-//!   attachment, [`MIGRATION_ATTACHMENT`], records what was removed.
+//!   attachment, [`MIGRATION_ATTACHMENT`], records what was removed and which
+//!   topics' frames were upgraded.
 //!
 //! What is NOT preserved, and why: MCAP channel ids are assigned by the writer
 //! from the sorted topic set, so they are a function of the topic list rather
@@ -239,10 +246,14 @@ pub struct MigrationRecord {
     /// provenance checkable: given the original file, anyone can confirm this
     /// really descends from it.
     pub source_bag_sha256: String,
-    /// SHA-256 of the `graph.yaml` attachment that was REPLACED.
-    pub source_graph_yaml_sha256: String,
-    /// SHA-256 of the `graph.yaml` attachment this bag carries.
-    pub migrated_graph_yaml_sha256: String,
+    /// SHA-256 of the `graph.yaml` attachment that was REPLACED; absent for a
+    /// bag with no `graph.yaml` (migrated for its wire header alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_graph_yaml_sha256: Option<String>,
+    /// SHA-256 of the `graph.yaml` attachment this bag carries; absent with
+    /// [`Self::source_graph_yaml_sha256`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_graph_yaml_sha256: Option<String>,
     /// The keys that were removed.
     pub stripped: Vec<StrippedKey>,
     /// The topics whose frames were recorded with the 32-byte wire header
@@ -264,10 +275,14 @@ pub struct MigrationRecord {
 /// Each of these exits non-zero naming what happened; none of them writes
 /// anything:
 ///
-/// * the bag's graph ALREADY parses — there is nothing to migrate, and minting
-///   a copy anyway would hand the user a second file that is identical in
-///   every way that matters;
-/// * the bag carries no `graph.yaml` attachment at all;
+/// * the bag's graph ALREADY parses and its frames carry the current wire
+///   header: there is nothing to migrate, and minting a copy anyway would
+///   hand the user a second file that is identical in every way that matters;
+/// * the bag carries no `graph.yaml` attachment and its frames carry the
+///   current wire header;
+/// * a frame recorded with the 32-byte wire header cannot be upgraded
+///   (shorter than the header, or declaring a size past its end): the copy
+///   would carry it in the old layout under a descriptor stating the new one;
 /// * the bag is not finalized (a torn tail has no summary, so its attachment
 ///   index cannot even be read);
 /// * the graph fails to parse for a reason that is NOT an unknown key — real
@@ -325,28 +340,41 @@ pub fn bag_migrate(
             input.display()
         ))
     })?;
+    // A bag recorded with the 32-byte wire header (version 1) is migrated to
+    // the current header even when its graph parses or it has none: the
+    // message stream this verb copies upgrades every such frame, and the
+    // output's descriptors state the current version.
+    let legacy_topics = reader.legacy_wire_header_topics().map_err(|e| {
+        CliError::Validation(format!("bag migrate: cannot read the channel table: {e}"))
+    })?;
+
     let Some(graph_att) = attachments.iter().find(|a| a.name == GRAPH_ATTACHMENT) else {
-        return Err(CliError::Validation(format!(
-            "bag migrate: bag '{}' carries no `{GRAPH_ATTACHMENT}` attachment, so there is no \
-             embedded graph to migrate. This verb rewrites the graph a `cerulion graph run \
-             --record` bag embeds; a `cerulion bag record` bag has no graph in it and needs \
-             none.",
-            input.display()
-        )));
+        if legacy_topics.is_empty() {
+            return Err(CliError::Validation(format!(
+                "bag migrate: bag '{}' carries no `{GRAPH_ATTACHMENT}` attachment and its frames \
+                 carry the current wire header, so there is nothing to migrate. This verb \
+                 rewrites the graph a `cerulion graph run --record` bag embeds, and upgrades \
+                 frames recorded with the 32-byte wire header; a current `cerulion bag record` \
+                 bag needs neither.",
+                input.display()
+            )));
+        }
+        return migrate_wire_header_only(
+            &reader,
+            input,
+            opts,
+            stamp,
+            is_tty,
+            confirm,
+            &attachments,
+            &legacy_topics,
+        );
     };
     let yaml = std::str::from_utf8(&graph_att.data).map_err(|e| {
         CliError::Validation(format!(
             "bag migrate: the bag's `{GRAPH_ATTACHMENT}` attachment is not valid UTF-8 ({e}), so \
              it cannot be parsed as YAML at all. This is damage the migration cannot repair."
         ))
-    })?;
-
-    // A bag recorded with the 32-byte wire header (version 1) is migrated to
-    // the current header even when its graph parses: the message stream this
-    // verb copies upgrades every such frame, and the output's descriptors state
-    // the current version.
-    let legacy_topics = reader.legacy_wire_header_topics().map_err(|e| {
-        CliError::Validation(format!("bag migrate: cannot read the channel table: {e}"))
     })?;
 
     // THE nothing-to-do gate, decided by literally running the strict parser.
@@ -400,7 +428,7 @@ pub fn bag_migrate(
     let migrated_yaml = crate::graph_cmd::render_effective_graph_yaml(&strip.config)?;
 
     let output = resolve_output_path(input, opts.out.as_deref())?;
-    let preview = render_preview(input, &output, &strip.stripped);
+    let preview = render_preview(input, &output, Some(&strip.stripped), &legacy_topics);
 
     let mut preview_shown = false;
     let outcome = if opts.dry_run {
@@ -411,8 +439,7 @@ pub fn bag_migrate(
             input,
             &output,
             &attachments,
-            &migrated_yaml,
-            &strip,
+            Some((&migrated_yaml, &strip)),
             stamp,
         )?;
         MigrateOutcome::Written
@@ -431,8 +458,7 @@ pub fn bag_migrate(
                 input,
                 &output,
                 &attachments,
-                &migrated_yaml,
-                &strip,
+                Some((&migrated_yaml, &strip)),
                 stamp,
             )?;
             MigrateOutcome::Written
@@ -445,6 +471,63 @@ pub fn bag_migrate(
         input: input.to_path_buf(),
         output,
         stripped: strip.stripped,
+        preview,
+        outcome,
+        preview_shown,
+    })
+}
+
+/// The migration of a bag with no `graph.yaml` whose frames were recorded
+/// with the 32-byte wire header: the frames are upgraded and everything else
+/// is copied, under the same consent ladder as [`bag_migrate`].
+#[allow(clippy::too_many_arguments)]
+fn migrate_wire_header_only(
+    reader: &BagReader,
+    input: &Path,
+    opts: &MigrateOptions,
+    stamp: MigrationStamp,
+    is_tty: bool,
+    confirm: &mut dyn FnMut(&str) -> CliResult<bool>,
+    attachments: &[BagAttachment],
+    legacy_topics: &[String],
+) -> CliResult<MigrateReport> {
+    if let Some(existing) = attachments.iter().find(|a| a.name == MIGRATION_ATTACHMENT) {
+        return Err(CliError::Validation(format!(
+            "bag migrate: bag '{}' already carries a `{MIGRATION_ATTACHMENT}` attachment{} and \
+             still has frames recorded with the 32-byte wire header; migrate the ORIGINAL \
+             recording again with this build. Nothing was written.",
+            input.display(),
+            describe_existing_migration(&existing.data),
+        )));
+    }
+    let output = resolve_output_path(input, opts.out.as_deref())?;
+    let preview = render_preview(input, &output, None, legacy_topics);
+    let mut preview_shown = false;
+    let outcome = if opts.dry_run {
+        MigrateOutcome::DryRun
+    } else if opts.assume_yes {
+        write_migrated_bag(reader, input, &output, attachments, None, stamp)?;
+        MigrateOutcome::Written
+    } else if !is_tty {
+        return Err(CliError::Validation(format!(
+            "bag migrate would write '{}' but stdin is not a TTY and --yes was not passed, so \
+             nothing was written. Re-run with --yes to migrate non-interactively (scripts/CI), \
+             or --dry-run to see what it would change.",
+            output.display()
+        )));
+    } else {
+        preview_shown = true;
+        if confirm(&preview)? {
+            write_migrated_bag(reader, input, &output, attachments, None, stamp)?;
+            MigrateOutcome::Written
+        } else {
+            MigrateOutcome::Declined
+        }
+    };
+    Ok(MigrateReport {
+        input: input.to_path_buf(),
+        output,
+        stripped: Vec::new(),
         preview,
         outcome,
         preview_shown,
@@ -507,28 +590,51 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// What the user is asked to consent to.
-fn render_preview(input: &Path, output: &Path, stripped: &[StrippedKey]) -> String {
+fn render_preview(
+    input: &Path,
+    output: &Path,
+    stripped: Option<&[StrippedKey]>,
+    legacy_topics: &[String],
+) -> String {
     let mut out = String::new();
     out.push_str("cerulion bag migrate\n");
     out.push_str(&format!("  bag: {}\n", input.display()));
     out.push_str(&format!("  out: {}\n", output.display()));
-    out.push_str(&format!(
-        "\nThe embedded `{GRAPH_ATTACHMENT}` carries {} key(s) the graph format no longer \
-         defines.\nThey are REMOVED from the migrated copy:\n\n",
-        stripped.len()
-    ));
-    for s in stripped {
-        out.push_str(&format!("  line {:<5} {}\n", s.line, s.path));
+    if let Some(stripped) = stripped {
+        out.push_str(&format!(
+            "\nThe embedded `{GRAPH_ATTACHMENT}` carries {} key(s) the graph format no longer \
+             defines.\nThey are REMOVED from the migrated copy:\n\n",
+            stripped.len()
+        ));
+        for s in stripped {
+            out.push_str(&format!("  line {:<5} {}\n", s.line, s.path));
+        }
+    }
+    if !legacy_topics.is_empty() {
+        out.push_str(&format!(
+            "\n{} topic(s) were recorded with the 32-byte wire header; their frames are \
+             UPGRADED to the\ncurrent 40-byte header in the migrated copy:\n\n",
+            legacy_topics.len()
+        ));
+        for t in legacy_topics {
+            out.push_str(&format!("  {t}\n"));
+        }
     }
     out.push_str(
         "\nEverything else is copied through unchanged: every recorded frame, the scheduler \
          trace,\nand every other attachment, each with its own timestamps and bytes. The input \
-         bag is\nnever modified.\n\nThe migrated graph is re-rendered from the parsed config, so \
-         YAML comments and key order\ndo not survive it — the same normalization `cerulion graph \
-         run --record` applies to its embedded effective configuration. A `",
+         bag is\nnever modified.\n",
     );
+    if stripped.is_some() {
+        out.push_str(
+            "\nThe migrated graph is re-rendered from the parsed config, so YAML comments and \
+             key order\ndo not survive it: the same normalization `cerulion graph run \
+             --record` applies to its embedded effective configuration.",
+        );
+    }
+    out.push_str("\nA `");
     out.push_str(MIGRATION_ATTACHMENT);
-    out.push_str("` attachment records what was removed.\n");
+    out.push_str("` attachment records what was changed.\n");
     out
 }
 
@@ -1272,10 +1378,9 @@ pub fn user_topic_schemas(channels: &[BagChannel]) -> CliResult<Vec<TopicSchema>
         };
         // A version 1 descriptor differs from the current one only by the wire
         // header version it implies, which the decoder fills in; the hash
-        // fields mean the same thing in both, so it migrates.
-        let descriptor_readable =
-            d.descriptor_version() == 1 || d.descriptor_version() == DESCRIPTOR_VERSION;
-        if !descriptor_readable || d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE {
+        // fields mean the same thing in both, so it migrates. (The decoder
+        // reads no other descriptor version, so only the recipe can differ.)
+        if d.hash_recipe != cerulion_core::trace::bag::HASH_RECIPE {
             return Err(CliError::Validation(format!(
                 "bag migrate: channel '{}' was recorded with schema descriptor version {} / hash \
                  recipe {}, and this build writes version {DESCRIPTOR_VERSION} / recipe {}. A \
@@ -1311,8 +1416,7 @@ fn write_migrated_bag(
     input: &Path,
     output: &Path,
     attachments: &[BagAttachment],
-    migrated_yaml: &str,
-    strip: &GraphStrip,
+    graph: Option<(&str, &GraphStrip)>,
     stamp: MigrationStamp,
 ) -> CliResult<()> {
     let channels = reader.channels().map_err(|e| {
@@ -1350,15 +1454,19 @@ fn write_migrated_bag(
         // the whole bag from disk to hash bytes that are already mapped.
         source_bag_size_bytes: reader.bytes().len() as u64,
         source_bag_sha256: sha256_hex(reader.bytes()),
-        source_graph_yaml_sha256: sha256_hex(
-            &attachments
-                .iter()
-                .find(|a| a.name == GRAPH_ATTACHMENT)
-                .map(|a| a.data.clone())
-                .unwrap_or_default(),
-        ),
-        migrated_graph_yaml_sha256: sha256_hex(migrated_yaml.as_bytes()),
-        stripped: strip.stripped.clone(),
+        source_graph_yaml_sha256: graph.map(|_| {
+            sha256_hex(
+                &attachments
+                    .iter()
+                    .find(|a| a.name == GRAPH_ATTACHMENT)
+                    .map(|a| a.data.clone())
+                    .unwrap_or_default(),
+            )
+        }),
+        migrated_graph_yaml_sha256: graph.map(|(yaml, _)| sha256_hex(yaml.as_bytes())),
+        stripped: graph
+            .map(|(_, strip)| strip.stripped.clone())
+            .unwrap_or_default(),
         wire_header_upgraded_topics: reader.legacy_wire_header_topics().map_err(|e| {
             CliError::Validation(format!("bag migrate: cannot read the channel table: {e}"))
         })?,
@@ -1383,7 +1491,7 @@ fn write_migrated_bag(
         &topics,
         provisioning,
         attachments,
-        migrated_yaml,
+        graph.map(|(yaml, _)| yaml),
         &record_bytes,
     );
     match result {
@@ -1925,7 +2033,7 @@ fn write_bag_contents(
     topics: &[TopicSchema],
     provisioning: std::collections::BTreeMap<String, cerulion_bag::ChannelProvisioning>,
     attachments: &[BagAttachment],
-    migrated_yaml: &str,
+    migrated_yaml: Option<&str>,
     record_bytes: &[u8],
 ) -> CliResult<()> {
     let temp = scratch.path();
@@ -1971,6 +2079,9 @@ fn write_bag_contents(
     }
 
     // Frames, in file order, each with its own timestamps and bytes.
+    // A 32-byte-header frame the stream cannot upgrade comes out unchanged
+    // and is counted; the copy refuses it (below) rather than carry it.
+    let passthrough_before = reader.legacy_passthrough_count();
     let messages = reader.messages().map_err(|e| {
         CliError::Validation(format!(
             "bag migrate: cannot walk the frames of '{}': {e}",
@@ -1994,12 +2105,23 @@ fn write_bag_contents(
             })?;
     }
 
+    let passthrough = reader.legacy_passthrough_count() - passthrough_before;
+    if passthrough > 0 {
+        return Err(CliError::Validation(format!(
+            "bag migrate: '{}' holds {passthrough} frame(s) recorded with the 32-byte wire \
+             header that cannot be upgraded (shorter than the header, or declaring a size past \
+             their end). The copy would carry them in the old layout under a descriptor stating \
+             the current header, so a reader would parse them at the wrong offsets. Nothing was \
+             written; `cerulion bag info` counts them.",
+            input.display()
+        )));
+    }
+
     // Attachments, in the input's own order, with `graph.yaml` replaced.
     for a in attachments {
-        let data: &[u8] = if a.name == GRAPH_ATTACHMENT {
-            migrated_yaml.as_bytes()
-        } else {
-            &a.data
+        let data: &[u8] = match migrated_yaml {
+            Some(yaml) if a.name == GRAPH_ATTACHMENT => yaml.as_bytes(),
+            _ => &a.data,
         };
         writer
             .write_attachment(&a.name, &a.media_type, a.log_time, a.create_time, data)
@@ -3767,8 +3889,8 @@ mod tests {
             source_bag_file_name: "original.mcap".to_string(),
             source_bag_size_bytes: 4096,
             source_bag_sha256: "aa".repeat(32),
-            source_graph_yaml_sha256: "bb".repeat(32),
-            migrated_graph_yaml_sha256: "cc".repeat(32),
+            source_graph_yaml_sha256: Some("bb".repeat(32)),
+            migrated_graph_yaml_sha256: Some("cc".repeat(32)),
             stripped: vec![StrippedKey {
                 key: "policy".into(),
                 path: "nodes[0].policy".into(),
@@ -3901,7 +4023,7 @@ mod tests {
         let preview = render_preview(
             Path::new("/bags/in.mcap"),
             Path::new("/bags/in.migrated.mcap"),
-            &[
+            Some(&[
                 StrippedKey {
                     key: "policy".into(),
                     path: "nodes[0].policy".into(),
@@ -3912,7 +4034,8 @@ mod tests {
                     path: "nodes[0].outputs[0].dpeth".into(),
                     line: 11,
                 },
-            ],
+            ]),
+            &[],
         );
         assert!(preview.contains("/bags/in.mcap"));
         assert!(preview.contains("/bags/in.migrated.mcap"));
@@ -3921,6 +4044,23 @@ mod tests {
         assert!(preview.contains("line 5"));
         assert!(preview.contains("line 11"));
         assert!(preview.contains("2 key(s)"));
+        assert!(preview.contains("input bag is\nnever modified"));
+        assert!(preview.contains(MIGRATION_ATTACHMENT));
+        assert!(!preview.contains("32-byte wire header"));
+    }
+
+    #[test]
+    fn the_preview_of_a_graph_less_header_upgrade_names_the_topics_and_no_keys() {
+        let preview = render_preview(
+            Path::new("/bags/in.mcap"),
+            Path::new("/bags/in.migrated.mcap"),
+            None,
+            &["/imu".to_string(), "/scan".to_string()],
+        );
+        assert!(preview.contains("2 topic(s) were recorded with the 32-byte wire header"));
+        assert!(preview.contains("  /imu\n  /scan\n"));
+        assert!(!preview.contains("key(s)"));
+        assert!(!preview.contains("re-rendered"));
         assert!(preview.contains("input bag is\nnever modified"));
         assert!(preview.contains(MIGRATION_ATTACHMENT));
     }

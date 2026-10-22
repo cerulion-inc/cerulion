@@ -73,9 +73,12 @@ pub fn specifier_for(version: u16) -> TransportResult<AttributeSpecifier> {
         })
 }
 
-/// The requirement a data service is OPENED with: the attribute must state
-/// `version`. Passed to `open_or_create_with_attributes`, it also defines the
-/// attribute when the call creates the service.
+/// A requirement that the attribute states `version`, for a raw iceoryx2
+/// opener that wants iceoryx2 itself to refuse any other service, including
+/// one with no attribute (`open_with_attributes`; passed to
+/// `open_or_create_with_attributes` it also defines the attribute when the
+/// call creates the service). Cerulion's own openers do not use it: they open
+/// plainly and apply [`check_opened`], which accepts an absent attribute.
 // hot-path-alloc-ok-fn: cold, one attribute per service open, never per frame.
 pub fn verifier_for(version: u16) -> TransportResult<AttributeVerifier> {
     let (key, value) = key_and_value(version)?;
@@ -91,7 +94,8 @@ pub fn data_service_specifier() -> TransportResult<AttributeSpecifier> {
     specifier_for(WIRE_HEADER_VERSION)
 }
 
-/// [`verifier_for`] at this build's [`WIRE_HEADER_VERSION`].
+/// [`verifier_for`] at this build's [`WIRE_HEADER_VERSION`], for a raw
+/// iceoryx2 opener (see [`verifier_for`]).
 pub fn data_service_verifier() -> TransportResult<AttributeVerifier> {
     verifier_for(WIRE_HEADER_VERSION)
 }
@@ -132,8 +136,10 @@ pub fn stated(attributes: &AttributeSet) -> StatedWireHeader {
     StatedWireHeader::Other(other.unwrap_or_default())
 }
 
-/// The most topics each once-per-topic log set remembers; past it a new topic
-/// logs at `debug!`, so a machine with unbounded topic churn cannot grow it.
+/// The most topics each once-per-topic log set remembers, so a machine with
+/// unbounded topic churn cannot grow it. Past it, a topic not yet in the set
+/// logs its absent attribute or its mismatch at `debug!` instead (a refusal
+/// still returns its error every time).
 const LOGGED_TOPICS_CAP: usize = 1024;
 
 static WARNED_ABSENT: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new()); // hot-path-alloc-ok: const empty set, filled only at service open
@@ -163,7 +169,9 @@ pub fn check_opened(topic: &str, attributes: &AttributeSet) -> Result<(), String
                     local_wire_header = WIRE_HEADER_VERSION,
                     "this topic's data service states no wire header version (it was created \
                      by a raw iceoryx2 program or an older Cerulion release); its frames are \
-                     assumed to carry this build's header layout"
+                     assumed to carry this build's header layout. If a process from an older \
+                     Cerulion release created it, its frames will be read at the wrong offsets: \
+                     stop that release's processes and run one Cerulion release on this machine"
                 );
             } else {
                 tracing::debug!(topic = %topic, "data service states no wire header version (repeat)");
@@ -186,6 +194,12 @@ pub fn check_opened(topic: &str, attributes: &AttributeSet) -> Result<(), String
                     "refused a data service created by another Cerulion release: it states \
                      another wire header version, so its frames would be read at the wrong \
                      offsets"
+                );
+            } else {
+                tracing::debug!(
+                    topic = %topic,
+                    stated_wire_header = %theirs,
+                    "refused a data service stating another wire header version (repeat)"
                 );
             }
             Err(reason)
@@ -219,8 +233,10 @@ mod tests {
         );
         assert!(verifier.required_keys().is_empty());
 
-        // A service stating version 1 does not satisfy a version 2 opener, and
-        // one stating nothing satisfies no opener.
+        // A service stating version 1 does not satisfy a version 2 verifier,
+        // and one stating nothing satisfies no verifier. (Cerulion's own
+        // openers do not use a verifier; `check_opened` accepts an absent
+        // attribute.)
         assert!(verifier_for(2)
             .unwrap()
             .verify_requirements(specifier_for(1).unwrap().attributes())

@@ -618,11 +618,15 @@ fn the_migration_record_states_what_was_removed_and_which_bag_it_came_from() {
     let src = BagReader::open(&input).unwrap();
     assert_eq!(
         rec.source_graph_yaml_sha256,
-        sha256_of(&src.attachment("graph.yaml").unwrap().unwrap().data)
+        Some(sha256_of(
+            &src.attachment("graph.yaml").unwrap().unwrap().data
+        ))
     );
     assert_eq!(
         rec.migrated_graph_yaml_sha256,
-        sha256_of(&dst.attachment("graph.yaml").unwrap().unwrap().data)
+        Some(sha256_of(
+            &dst.attachment("graph.yaml").unwrap().unwrap().data
+        ))
     );
     assert_ne!(rec.source_graph_yaml_sha256, rec.migrated_graph_yaml_sha256);
 }
@@ -1110,4 +1114,183 @@ fn a_32_byte_header_recording_migrates_to_the_current_header() {
         serde_json::json!([USER_TOPIC_B])
     );
     assert_eq!(v["stripped"], serde_json::json!([]));
+}
+
+/// A current bag of three `Vector3` frames on [`USER_TOPIC_B`], with the clean
+/// graph attached or none; returns the frames.
+fn write_vector3_bag(path: &Path, graph: bool) -> Vec<Vec<u8>> {
+    use cerulion_core::wire::{StepTag, WireHeader};
+    let topic = TopicSchema {
+        topic: USER_TOPIC_B.into(),
+        schema_name: "geometry_msgs/Vector3".into(),
+        schema_hash: 0x0BAD_F00D_DEAD_BEEF,
+        wire_fixed_size: 24,
+    };
+    let frames: Vec<Vec<u8>> = (0..3u32)
+        .map(|i| {
+            let mut f = vec![0u8; WireHeader::SIZE + 24];
+            WireHeader {
+                schema_hash: 0x0BAD_F00D_DEAD_BEEF,
+                total_size: f.len() as u32,
+                offset_table_offset: f.len() as u32,
+                offset_table_count: 0,
+                sequence: i,
+                timestamp_ns: 1_000 + i as u64,
+                step_tag: StepTag::UNTAGGED,
+            }
+            .write_to_buf(&mut f[..WireHeader::SIZE]);
+            f[WireHeader::SIZE..].fill(0x40 + i as u8);
+            f
+        })
+        .collect();
+    let mut w = BagWriter::create(path, BagWriterConfig::default(), &[topic]).unwrap();
+    w.write_chunk(|c| {
+        for (i, f) in frames.iter().enumerate() {
+            c.write_message(USER_TOPIC_B, i as u32, 10 + i as u64, 10 + i as u64, &[f])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    if graph {
+        w.write_attachment("graph.yaml", "application/yaml", 1, 1, &clean_graph_yaml())
+            .unwrap();
+    }
+    w.finalize().unwrap();
+    frames
+}
+
+/// A 32-byte-header bag with no `graph.yaml` (a `cerulion bag record` bag)
+/// migrates for the header upgrade alone: frames upgraded, no graph written,
+/// and the record carries no graph digests.
+#[test]
+fn a_32_byte_header_bag_without_a_graph_migrates_its_frames_alone() {
+    let dir = tmp();
+    let current = dir.path().join("recorded.mcap");
+    let frames = write_vector3_bag(&current, false);
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(
+        &legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap()),
+    )
+    .unwrap();
+    let out = dir.path().join("migrated.mcap");
+    migrate_with_yes(&legacy, Some(out.clone())).expect("a graph-less legacy bag migrates");
+
+    let migrated = BagReader::open(&out).unwrap();
+    assert!(migrated.legacy_wire_header_topics().unwrap().is_empty());
+    let got: Vec<Vec<u8>> = migrated
+        .messages()
+        .unwrap()
+        .map(|m| m.unwrap())
+        .filter(|m| m.topic == USER_TOPIC_B)
+        .map(|m| m.data)
+        .collect();
+    assert_eq!(got, frames);
+    assert!(migrated.attachment("graph.yaml").unwrap().is_none());
+    let record = migrated
+        .attachment(cerulion_cli_engine::bag_migrate::MIGRATION_ATTACHMENT)
+        .unwrap()
+        .expect("a migration record");
+    let v: serde_json::Value = serde_json::from_slice(&record.data).unwrap();
+    assert_eq!(
+        v["wire_header_upgraded_topics"],
+        serde_json::json!([USER_TOPIC_B])
+    );
+    assert!(v.get("source_graph_yaml_sha256").is_none());
+    assert!(v.get("migrated_graph_yaml_sha256").is_none());
+
+    // The current graph-less bag has nothing to migrate.
+    let err = migrate_with_yes(&current, Some(dir.path().join("none.mcap")))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nothing to migrate"), "{err}");
+}
+
+/// A 32-byte-header frame that cannot be upgraded is refused by the
+/// migration (it would be copied in the old layout under a descriptor stating
+/// the new one), and nothing is written.
+#[test]
+fn a_32_byte_header_frame_that_cannot_be_upgraded_refuses_the_migration() {
+    let dir = tmp();
+    let current = dir.path().join("recorded.mcap");
+    write_vector3_bag(&current, true);
+    let legacy = dir.path().join("legacy.mcap");
+    let mut n = 0;
+    std::fs::write(
+        &legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1_editing(
+            &std::fs::read(&current).unwrap(),
+            |_, f| {
+                if n == 1 {
+                    f[8] = f[8].wrapping_add(1); // declares one byte past its end
+                }
+                n += 1;
+            },
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("migrated.mcap");
+    let err = migrate_with_yes(&legacy, Some(out.clone()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("1 frame(s) recorded with the 32-byte wire header that cannot be upgraded"),
+        "{err}"
+    );
+    assert!(!out.exists(), "nothing is written");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".migrating."))
+        .collect();
+    assert!(leftovers.is_empty(), "no scratch left: {leftovers:?}");
+}
+
+/// `bag info` reports a 32-byte-header bag from the recorded bytes: the
+/// served frame size (8 bytes longer), the upgraded topics and the memory a
+/// playback walk would hold, without building that upgraded copy.
+#[test]
+fn bag_info_reports_a_32_byte_header_bag_and_its_upgrade_memory() {
+    let dir = tmp();
+    let current = dir.path().join("recorded.mcap");
+    write_vector3_bag(&current, false);
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(
+        &legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap()),
+    )
+    .unwrap();
+    let reader = BagReader::open(&legacy).unwrap();
+    // A limit below the bag's size: the scan must not need the copy.
+    reader.set_legacy_upgrade_cap_for_test(1);
+    let scan = cerulion_cli_engine::bag_cmd::scan_bag(&reader, &legacy).unwrap();
+    assert_eq!(scan.total_frames, 3);
+    assert_eq!(scan.headerless_frames, 0);
+    assert_eq!(
+        scan.legacy_wire_header_topics,
+        vec![USER_TOPIC_B.to_string()]
+    );
+    assert_eq!(scan.legacy_passthrough_frames, 0);
+    // Each frame is 40 + 24 = 64 bytes served, 3 of them held upgraded.
+    assert_eq!(scan.legacy_upgrade_bytes, 3 * 64);
+    let ch = scan
+        .channels
+        .iter()
+        .find(|c| c.topic == USER_TOPIC_B)
+        .unwrap();
+    assert_eq!(ch.max_frame_len, 64);
+    assert_eq!(
+        (ch.first_log_time, ch.last_log_time),
+        (Some(1_000), Some(1_002))
+    );
+    assert!(
+        reader.user_frames().is_err(),
+        "the walk itself is over the limit"
+    );
+
+    let text = cerulion_cli_engine::bag_cmd::bag_info(&legacy, None).unwrap();
+    assert!(
+        text.contains("playing it holds 192 bytes of upgraded frames in memory"),
+        "{text}"
+    );
 }

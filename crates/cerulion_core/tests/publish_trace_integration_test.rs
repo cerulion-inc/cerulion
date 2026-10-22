@@ -121,7 +121,7 @@ fn publish_trace_is_zero_overhead_when_unattached() {
 
 #[test]
 fn publish_trace_handles_malformed_data_gracefully() {
-    // Publish a payload smaller than WireHeader::SIZE (32 B). The trace
+    // Publish a payload smaller than WireHeader::SIZE (40 B). The trace
     // hook should silently skip (parser returns None on short input).
     let tt = TestTransport::with_buffer_size(16);
     let mut publisher = tt.publisher("test/topic", MaxSliceLen::const_new(4096), 0);

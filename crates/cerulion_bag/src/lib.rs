@@ -75,7 +75,7 @@ pub use provisioning::{
 pub use reader::{
     AdviseCall, AdviseCursor, BagAttachment, BagChannel, BagCompleteness, BagMessage, BagReader,
     FrameSpan, TraceRecordIter, UserFrameWalk, WalkPosition, ADVISE_BEHIND_BATCH_BYTES,
-    ADVISE_MAX_LAG_BYTES,
+    ADVISE_MAX_LAG_BYTES, LEGACY_UPGRADE_CAP_BYTES,
 };
 pub use schema::{
     SchemaDescriptor, DESCRIPTOR_LEN, DESCRIPTOR_V1_LEN, DESCRIPTOR_VERSION,

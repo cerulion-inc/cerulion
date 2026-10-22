@@ -24,12 +24,16 @@ use std::mem::size_of;
 ///
 /// Every place a frame crosses a process or a file states it: the zenoh
 /// demand handshake, the network catalog, the `cerulion-netd` banner, the
-/// iceoryx2 service attribute and the bag schema descriptor. A peer, a
-/// service or a recording at a different version is refused loudly (or, for
-/// a recording, its frames are upgraded on read), never read at the wrong
-/// offsets. Version 1 is the 32-byte header without [`WireHeader::step_tag`];
-/// version 2 is the 40-byte header with it. A version 1 frame read from a
-/// recording is converted with [`upgrade_v1_frame_into`].
+/// iceoryx2 service attribute and the bag schema descriptor. Where this build
+/// can see the other side state a different version, it refuses loudly; a
+/// recording at version 1 is instead upgraded on read. The checks run on this
+/// build's side only: a release older than these fields states nothing (an
+/// iceoryx2 service without the attribute is accepted with a warning) and
+/// cannot refuse this build, so one Cerulion release per machine is the
+/// supported configuration. Version 1 is the 32-byte header without
+/// [`WireHeader::step_tag`]; version 2 is the 40-byte header with it. A
+/// version 1 frame read from a recording is converted with
+/// [`upgrade_v1_frame_into`].
 pub const WIRE_HEADER_VERSION: u16 = 2;
 
 /// The size of a version 1 [`WireHeader`]: every field before
@@ -272,9 +276,9 @@ pub enum FrameUpgradeError {
         /// The source length.
         len: usize,
     },
-    /// The source's `total_size` disagrees with its length, so it is not one
-    /// whole version 1 frame.
-    #[error("the version 1 frame declares total_size {declared} but is {len} bytes")]
+    /// The source's `total_size` is larger than the source, or smaller than a
+    /// version 1 header, so no whole version 1 frame starts it.
+    #[error("the version 1 frame declares total_size {declared} but holds {len} bytes")]
     SizeMismatch {
         /// The declared `total_size`.
         declared: u32,
@@ -303,12 +307,20 @@ pub enum FrameUpgradeError {
 /// when it points past the version 1 header. The body (fixed section, offset
 /// table, variable data) is copied byte for byte: offset table entries are
 /// measured from the start of the body, so none of them moves.
+///
+/// A source longer than its declared `total_size` (trailing bytes after the
+/// frame, as a loaned slot can carry) is upgraded the same way: the frame is
+/// `src[..total_size]`, and the bytes after it are copied after the upgraded
+/// frame unchanged, so the output is still `src.len() + 8` long and its
+/// `total_size` names the upgraded frame alone. Refused (the caller decides
+/// what to do with the bytes) when the source is shorter than a version 1
+/// header, or declares a `total_size` past its end or below the header size.
 pub fn upgrade_v1_frame_into(src: &[u8], dst: &mut [u8]) -> Result<usize, FrameUpgradeError> {
     if src.len() < V1_HEADER_SIZE {
         return Err(FrameUpgradeError::TooShort { len: src.len() });
     }
     let declared = u32::from_le_bytes(src[8..12].try_into().unwrap());
-    if declared as usize != src.len() {
+    if (declared as usize) > src.len() || (declared as usize) < V1_HEADER_SIZE {
         return Err(FrameUpgradeError::SizeMismatch {
             declared,
             len: src.len(),
@@ -316,7 +328,9 @@ pub fn upgrade_v1_frame_into(src: &[u8], dst: &mut [u8]) -> Result<usize, FrameU
     }
     let grow = WireHeader::SIZE - V1_HEADER_SIZE;
     let required = src.len() + grow;
-    let total_size = u32::try_from(required).map_err(|_| FrameUpgradeError::TooLarge)?;
+    // `declared <= src.len()`, so a `required` that fits a u32 bounds this too.
+    u32::try_from(required).map_err(|_| FrameUpgradeError::TooLarge)?;
+    let total_size = declared + grow as u32;
     if dst.len() < required {
         return Err(FrameUpgradeError::DestinationTooSmall {
             required,
@@ -339,6 +353,7 @@ pub fn upgrade_v1_frame_into(src: &[u8], dst: &mut [u8]) -> Result<usize, FrameU
         step_tag: StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut dst[..WireHeader::SIZE]);
+    // The body and any trailing bytes after the declared frame, in order.
     dst[WireHeader::SIZE..required].copy_from_slice(&src[V1_HEADER_SIZE..]);
     Ok(required)
 }
@@ -482,7 +497,7 @@ impl MaxPayloadCapacity {
     /// `const_new` below — so any value produced by this constructor
     /// is also constructible via the validating constructors.
     pub const fn from_max_slice_len(max_slice_len: MaxSliceLen) -> Self {
-        // `WireHeader::SIZE` is 32; the `as u32` is compile-time-known.
+        // `WireHeader::SIZE` is 40; the `as u32` is compile-time-known.
         // `max_slice_len.get() >= WireHeader::SIZE` by `MaxSliceLen::try_new`,
         // so this subtraction never wraps.
         Self(max_slice_len.get() - WireHeader::SIZE as u32)
@@ -501,7 +516,7 @@ impl MaxPayloadCapacity {
     /// bypass (raw `Self(n)` construction is private; `try_new` +
     /// `const_new` are the only constructors).
     pub const fn try_new(n: u32) -> Option<Self> {
-        // `WireHeader::SIZE` is 32; the `as u32` is compile-time-known.
+        // `WireHeader::SIZE` is 40; the `as u32` is compile-time-known.
         if n > u32::MAX - WireHeader::SIZE as u32 {
             return None;
         }
@@ -1241,6 +1256,29 @@ mod tests {
         assert_eq!(h.step_tag, StepTag::UNTAGGED);
     }
 
+    /// A source carrying bytes after its declared frame upgrades the frame and
+    /// keeps the trailing bytes after it: hand-written bytes in and out.
+    #[test]
+    fn a_version_1_frame_with_trailing_bytes_upgrades_and_keeps_them_after_the_frame() {
+        // A header-only version 1 frame (total_size 32) followed by 4 bytes.
+        let mut v1 = [0u8; 36];
+        v1[0] = 0x11; // schema_hash low byte
+        v1[8] = 32; // total_size
+        v1[20] = 9; // sequence
+        v1[32..].copy_from_slice(&[0xA1, 0xA2, 0xA3, 0xA4]);
+        let want: [u8; 44] = [
+            0x11, 0, 0, 0, 0, 0, 0, 0, // schema_hash
+            40, 0, 0, 0, // total_size: the upgraded frame alone
+            0, 0, 0, 0, // offset_table_offset: 0 stays 0
+            0, 0, 0, 0, // offset_table_count
+            9, 0, 0, 0, // sequence
+            0, 0, 0, 0, 0, 0, 0, 0, // timestamp_ns
+            0, 0, 0, 0, 0, 0, 0, 0, // step_tag: untagged
+            0xA1, 0xA2, 0xA3, 0xA4, // the trailing bytes, after the frame
+        ];
+        assert_eq!(upgrade_v1_frame(&v1).unwrap(), want.to_vec());
+    }
+
     /// Every way the source or destination can be wrong is refused.
     #[test]
     fn a_frame_that_is_not_one_whole_version_1_frame_is_refused() {
@@ -1250,11 +1288,19 @@ mod tests {
             Err(FrameUpgradeError::TooShort { len: 31 })
         );
         let mut frame = [0u8; 40];
-        frame[8] = 41; // declares 41, is 40
+        frame[8] = 41; // declares 41, holds 40
         assert_eq!(
             upgrade_v1_frame_into(&frame, &mut dst),
             Err(FrameUpgradeError::SizeMismatch {
                 declared: 41,
+                len: 40
+            })
+        );
+        frame[8] = 31; // declares less than a version 1 header
+        assert_eq!(
+            upgrade_v1_frame_into(&frame, &mut dst),
+            Err(FrameUpgradeError::SizeMismatch {
+                declared: 31,
                 len: 40
             })
         );

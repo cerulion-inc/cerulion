@@ -322,3 +322,77 @@ fn a_current_bag_is_served_byte_for_byte_from_the_map() {
     assert_eq!(user[0].data, frame);
     std::fs::remove_file(&path).ok();
 }
+
+/// A version 1 frame carrying bytes after its declared `total_size` is
+/// upgraded: the frame is the declared prefix, the trailing bytes follow the
+/// upgraded frame unchanged, and nothing is counted as passed through, in
+/// the message stream and the frame walk alike.
+#[test]
+fn a_version_1_frame_with_trailing_bytes_is_upgraded_and_keeps_them() {
+    let mut frames = three_frames();
+    frames[1].extend_from_slice(&[0xB1, 0xB2, 0xB3]); // declares 56, holds 59
+    let mut want = v2_frame(1, 2.5);
+    want.extend_from_slice(&[0xB1, 0xB2, 0xB3]);
+    let r = BagReader::from_bytes(legacy_bag(&frames));
+
+    let user: Vec<Vec<u8>> = r
+        .messages()
+        .unwrap()
+        .map(|m| m.unwrap())
+        .filter(|m| m.topic == "/v3")
+        .map(|m| m.data)
+        .collect();
+    assert_eq!(user, vec![v2_frame(0, 1.5), want.clone(), v2_frame(2, 3.5)]);
+
+    let mut walk = r.user_frames().unwrap();
+    let mut walked = Vec::new();
+    while let Some((_, span)) = walk.next_user_frame().unwrap() {
+        walked.push(r.frame(&span).to_vec());
+    }
+    assert_eq!(walked, vec![v2_frame(0, 1.5), want, v2_frame(2, 3.5)]);
+    assert_eq!(r.legacy_passthrough_count(), 0);
+}
+
+/// A version 1 bag whose upgraded frames exceed the limit is refused by the
+/// frame walk naming `cerulion bag migrate`, while the as-recorded walk still
+/// serves its frames in the 32-byte layout and the message stream still
+/// upgrades them one at a time.
+#[test]
+fn a_version_1_bag_past_the_upgrade_limit_is_refused_by_the_walk_only() {
+    let r = BagReader::from_bytes(legacy_bag(&three_frames()));
+    // Three upgraded frames are 3 * 64 = 192 bytes; allow 191.
+    r.set_legacy_upgrade_cap_for_test(191);
+    match r.user_frames() {
+        Err(cerulion_bag::BagError::LegacyUpgrade { reason }) => {
+            assert!(reason.contains("192 bytes"), "{reason}");
+            assert!(reason.contains("cerulion bag migrate"), "{reason}");
+        }
+        Err(other) => panic!("expected the upgrade limit refusal, got {other}"),
+        Ok(_) => panic!("expected the upgrade limit refusal, got a walk"),
+    }
+    assert!(r.has_readable_footer(), "the bag is intact, not torn");
+
+    let mut walk = r.user_frames_as_recorded().unwrap();
+    let mut recorded = Vec::new();
+    while let Some((_, span)) = walk.next_user_frame().unwrap() {
+        recorded.push(r.frame(&span).to_vec());
+    }
+    assert_eq!(recorded, three_frames());
+
+    let streamed: Vec<Vec<u8>> = r
+        .messages()
+        .unwrap()
+        .map(|m| m.unwrap())
+        .filter(|m| m.topic == "/v3")
+        .map(|m| m.data)
+        .collect();
+    assert_eq!(
+        streamed,
+        vec![v2_frame(0, 1.5), v2_frame(1, 2.5), v2_frame(2, 3.5)]
+    );
+
+    // At exactly the limit the walk is served.
+    let r = BagReader::from_bytes(legacy_bag(&three_frames()));
+    r.set_legacy_upgrade_cap_for_test(192);
+    assert!(r.user_frames().is_ok());
+}

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Test support: rewrite a current bag as the release with the 32-byte wire
 //! header would have written it, so an end-to-end test can drive a version 1
-//! recording through `bag play`, `bag play --resim`, `bag migrate` and the
-//! Python reader without that release's build.
+//! recording through `bag play`, `bag play --resim` and `bag migrate`
+//! without that release's build.
 //!
 //! The rewrite is mechanical and independent of the reader under test: it
 //! re-encodes every `cerulion` schema descriptor in the version 1 layout
@@ -53,6 +53,15 @@ pub fn downgrade_frame(frame: &[u8]) -> Vec<u8> {
 
 /// Rewrite a finalized current bag as a version 1 bag (see the module docs).
 pub fn downgrade_bag_to_v1(bytes: &[u8]) -> Vec<u8> {
+    downgrade_bag_to_v1_editing(bytes, |_, _| {})
+}
+
+/// [`downgrade_bag_to_v1`], handing each downgraded user frame to `edit`
+/// (with its topic) before it is written, so a test can damage one.
+pub fn downgrade_bag_to_v1_editing(
+    bytes: &[u8],
+    mut edit: impl FnMut(&str, &mut Vec<u8>),
+) -> Vec<u8> {
     let summary = mcap::Summary::read(bytes)
         .expect("a readable summary")
         .expect("a finalized bag");
@@ -89,7 +98,9 @@ pub fn downgrade_bag_to_v1(bytes: &[u8]) -> Vec<u8> {
             let m = m.expect("a whole message");
             let (cid, user) = new_id[&m.channel.id];
             let data: Cow<'_, [u8]> = if user {
-                Cow::Owned(downgrade_frame(&m.data))
+                let mut f = downgrade_frame(&m.data);
+                edit(&m.channel.topic, &mut f);
+                Cow::Owned(f)
             } else {
                 m.data
             };

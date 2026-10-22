@@ -75,9 +75,14 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   configuration is one Cerulion release per machine (and one across machines that
   exchange frames). A bag recorded with version 1 descriptors has its user frames
   upgraded on read (`wire::upgrade_v1_frame_into`): per message on the message
-  streams, into one exact-size copy (at most `LEGACY_UPGRADE_CAP_BYTES`, 2 GiB) on
-  the frame walks; a frame that is not one whole frame is served unchanged and
-  counted. The canonical schema-hash recipe lives in
+  streams; on the frame walks, into ONE copy per reader, reserved at its exact
+  size on the first walk and held for the reader's lifetime (refused above
+  `LEGACY_UPGRADE_CAP_BYTES`, 2 GiB, naming `cerulion bag migrate`), because a
+  walk's spans borrow from the reader; `BagReader::user_frames_as_recorded`
+  walks the recorded bytes and builds nothing (`bag info` uses it). A frame with
+  bytes after its declared `total_size` is upgraded with those bytes kept after
+  it; one shorter than the header, or declaring a size past its end or below the
+  header, is served unchanged and counted (`bag migrate` refuses such a bag). The canonical schema-hash recipe lives in
   exactly ONE place: `MessageSchema::schema_hash` (`src/codegen/schema.rs`). Never
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original

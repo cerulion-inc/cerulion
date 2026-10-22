@@ -304,7 +304,7 @@ fn e2e_determinism_spill_path_matches_direct_loan_path() {
 
     {
         // Path B: ceiling exactly = payload size, no spill.
-        // 4 KiB + header(32) + offset table(24) + fixed section(16) = 4168
+        // 4 KiB + header(40) + offset table(24) + fixed section(16) = 4176
         let (tt, mut pub_) = fresh_publisher("e2e/det_b", 8 * 1024, 16);
         let mut sub = tt.subscriber("e2e/det_b");
         // Single tick (cold sizer → loans full max_slice_len).
@@ -725,7 +725,7 @@ fn e2e_spill_allocation_failed_surfaces_to_setter_call() {
                     topic, "e2e/spill_oom",
                     "AllocationFailed must carry the publisher's topic"
                 );
-                // requested == max_capacity == max_slice_len - WireHeader::SIZE = 16K - 32.
+                // requested == max_capacity == max_slice_len - WireHeader::SIZE = 16K - 40.
                 assert_eq!(
                     requested,
                     16 * 1024 - 40,

@@ -2806,14 +2806,18 @@ fn seq_run_hits_window(run: &SeqRun, expected: u32, gap_len: u32) -> bool {
 impl RecordedMessages {
     /// Wrap an already-opened, gate-verified bag: ONE streaming pass over the
     /// user frames computes the per-topic aggregates (`TopicStats`); nothing
-    /// per-frame is retained (the caller typically also hands a clone of the
-    /// same `Arc` to [`RecordedTrace`] — one map, two views).
+    /// per-frame is retained here (the caller typically also hands a clone of
+    /// the same `Arc` to [`RecordedTrace`]: one map, two views). For a bag
+    /// recorded with the 32-byte wire header, the reader's first walk builds
+    /// its one upgraded copy of the frames, held as long as the reader is.
     ///
-    /// Returns the raw [`cerulion_bag::BagError`] — a walk failure means the
-    /// BAG is corrupt (bad footer, torn framing, compressed/foreign chunk), the
-    /// same failure class as every other bag read, so the CALLER maps it to the
-    /// exit-2 `ReplayError::BagOpen` with the bag path (never exit-5 `Internal`,
-    /// which would misroute the operator to "file a tool bug" for a bad bag).
+    /// Returns the raw [`cerulion_bag::BagError`]: a walk failure is a fact
+    /// about the BAG (bad footer, torn framing, compressed or foreign chunk,
+    /// or a 32-byte-header bag too large to upgrade in memory, whose error
+    /// names `cerulion bag migrate`), the same failure class as every other
+    /// bag read, so the CALLER maps it to the exit-2 `ReplayError::BagOpen`
+    /// with the bag path (never exit-5 `Internal`, which would misroute the
+    /// operator to "file a tool bug" for a bag).
     pub fn from_reader(reader: Arc<BagReader>) -> Result<Self, cerulion_bag::BagError> {
         let mut stats: IndexMap<String, TopicStats> = IndexMap::new();
         {

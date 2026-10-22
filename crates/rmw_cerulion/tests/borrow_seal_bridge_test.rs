@@ -1236,7 +1236,7 @@ fn windowed_gate_requires_the_ceiling_to_hold_the_slot_geometry() {
     // The MaxSliceLen legal minimum (a bare WireHeader) must refuse.
     assert!(
         rmw_cerulion::windowed_borrow_geometry(&bridge, WireHeader::SIZE, true).is_none(),
-        "a 32-byte ceiling cannot hold the struct"
+        "a 40-byte ceiling cannot hold the struct"
     );
     // Boundary, both sides.
     assert!(

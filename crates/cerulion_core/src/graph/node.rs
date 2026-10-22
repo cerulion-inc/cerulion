@@ -257,7 +257,7 @@ pub struct OutputMeta {
     /// more. The `MaxSliceLen` newtype encodes
     /// BOTH the upper bound (`u32::MAX`, the wire format's
     /// `WireHeader::total_size` ceiling) AND the lower bound
-    /// (`>= WireHeader::SIZE = 32`). Construction is fallible (via
+    /// (`>= WireHeader::SIZE`, 40 bytes). Construction is fallible (via
     /// `MaxSliceLen::try_new`), so the field stays `pub` safely:
     /// `meta.max_slice_len_default = MaxSliceLen::try_new(8)` returns
     /// `None` — no pathological state ever stored, even on direct
@@ -5195,8 +5195,8 @@ impl DylibNodeEntry {
                     // `MaxSliceLen::try_new` enforces BOTH bounds:
                     // values `> u32::MAX` (theoretically possible
                     // from an older cdylib) become `None`;
-                    // values `< WireHeader::SIZE` (i.e., 0-31)
-                    // become `None`. `n == WireHeader::SIZE` (32) IS
+                    // values `< WireHeader::SIZE` (i.e., 0 to 39)
+                    // become `None`. `n == WireHeader::SIZE` (40) IS
                     // valid (header-only payload). `n == 0` is
                     // dropped silently (interpreted as "unset");
                     // `n in [1, 31]` and `n > u32::MAX` fire a

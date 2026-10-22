@@ -110,7 +110,7 @@ fn write_bag(dir: &Path, name: &str, topics: &[(&str, u64)], frames: &[Recorded]
 
 /// Drain everything a subscriber holds, rebuilding each FULL received frame.
 ///
-/// `header()` is an owned parse of all 32 header bytes and `payload()` is the
+/// `header()` is an owned parse of all 40 header bytes and `payload()` is the
 /// zero-copy slice of everything after them, so their concatenation IS the
 /// received frame — comparable byte-for-byte against what was recorded,
 /// offset-table bytes included. (Same reconstruction the ingress tests

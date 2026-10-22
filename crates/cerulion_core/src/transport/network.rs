@@ -932,8 +932,9 @@ pub struct GetDemandState {
 /// shares one overflow latch, so a hostile or huge network cannot grow it.
 const KEYED_LATCHES_CAP: usize = 256;
 
-/// Flood-suppression latches keyed by peer and topic, bounded at
-/// [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
+/// Flood-suppression latches keyed per (stated version, topic) on the
+/// producer side and per (replying peer, topic) on the demander side, bounded
+/// at [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
 struct KeyedLatches<K: Ord> {
     by_key: std::collections::BTreeMap<K, FailureRegimeLatch>,
     overflow: FailureRegimeLatch,

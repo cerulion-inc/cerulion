@@ -297,7 +297,7 @@ fn tf_oracle(plan: &[(u64, Vec<u8>)]) -> Vec<Received> {
 
 /// Non-blocking: take at most ONE frame off `sub`, rebuilt as a [`Received`]
 /// — the FULL frame slice reconstructed from `header()` (via `write_to_buf`,
-/// `read_from_buf`'s total inverse — the six fields cover all 32 header
+/// `read_from_buf`'s total inverse; the seven fields cover all 40 header
 /// bytes) + `payload()` (everything after the header: offset table +
 /// transforms bytes).
 ///

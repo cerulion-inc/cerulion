@@ -418,13 +418,21 @@ pub struct BagReader {
     legacy_passthrough: AtomicU64,
     /// The topics already warned about a passed-through frame.
     legacy_passthrough_warned: Mutex<std::collections::BTreeSet<String>>,
+    /// The upgraded-copy limit, [`LEGACY_UPGRADE_CAP_BYTES`] unless a test
+    /// lowered it.
+    legacy_cap: AtomicUsize,
 }
 
 /// The most user-frame bytes [`BagReader`] will hold upgraded in memory for a
-/// version 1 bag's frame walks: 2 GiB. A larger version 1 bag is refused by
-/// the frame walk with [`BagError::LegacyUpgrade`]; the message streams
-/// upgrade one message at a time and have no such limit, which is what
-/// `cerulion bag migrate` uses to write a current copy.
+/// version 1 bag's frame walks: 2 GiB. The frame walks hand out slices that
+/// live as long as the reader, so a version 1 bag's frames are upgraded into
+/// ONE copy per reader, reserved at its exact size on the first walk and held
+/// until the reader drops: a version 1 bag costs its user frames' size in
+/// memory, a current bag nothing. A larger version 1 bag is refused by the
+/// frame walk with [`BagError::LegacyUpgrade`] naming `cerulion bag migrate`;
+/// the message streams upgrade one message at a time and have no such limit,
+/// which is what `cerulion bag migrate` uses to write a current copy, and
+/// [`BagReader::user_frames_as_recorded`] reads such a bag without upgrading.
 pub const LEGACY_UPGRADE_CAP_BYTES: usize = 2 << 30;
 
 /// A bag recorded with the version 1 wire header (a version 1 schema
@@ -437,28 +445,37 @@ pub const LEGACY_UPGRADE_CAP_BYTES: usize = 2 << 30;
 /// upgraded copy is held for the reader's lifetime rather than per frame. An
 /// arena span's offset is past the end of the mapped bytes
 /// (`map_len + position`), which is how [`BagReader::frame`] tells the two
-/// apart. A frame that is not one whole version 1 frame is not in the index:
-/// the walk serves it from the map unchanged.
+/// apart. A frame that cannot be upgraded is in the index as
+/// [`LegacySlot::Unchanged`]: the walk serves it from the map as recorded.
 #[derive(Default)]
 struct LegacyFrames {
     /// The user channels whose frames carry the version 1 header.
     channels: std::collections::BTreeSet<u16>,
-    /// `(mapped offset, arena offset, upgraded length)` per upgraded frame, in
+    /// `(mapped offset, slot)` for every user frame of those channels, in
     /// mapped-offset order (the walk's file order).
-    index: Vec<(usize, usize, usize)>,
+    index: Vec<(usize, LegacySlot)>,
     /// The upgraded frames, back to back.
     arena: Vec<u8>,
 }
 
+/// Where one version 1 frame is served from.
+#[derive(Debug, Clone, Copy)]
+enum LegacySlot {
+    /// Upgraded into the arena at `(offset, length)`.
+    Upgraded(usize, usize),
+    /// Served from the map as recorded (it cannot be upgraded; counted).
+    Unchanged,
+}
+
 impl LegacyFrames {
-    /// The arena range a mapped frame was upgraded into.
-    fn lookup(&self, mapped_offset: usize) -> Option<(usize, usize)> {
+    /// How a mapped frame of a version 1 channel is served; `None` only for a
+    /// frame the copy was not built from (unreachable for one walk of one bag).
+    fn lookup(&self, mapped_offset: usize) -> Option<LegacySlot> {
         let i = self
             .index
-            .binary_search_by_key(&mapped_offset, |&(raw, _, _)| raw)
+            .binary_search_by_key(&mapped_offset, |&(raw, _)| raw)
             .ok()?;
-        let (_, at, len) = self.index[i];
-        Some((at, len))
+        Some(self.index[i].1)
     }
 }
 
@@ -529,6 +546,7 @@ impl BagReader {
                 legacy: OnceLock::new(),
                 legacy_passthrough: AtomicU64::new(0),
                 legacy_passthrough_warned: Mutex::new(Default::default()),
+                legacy_cap: AtomicUsize::new(LEGACY_UPGRADE_CAP_BYTES),
             });
         }
         // SAFETY: the only sound-usage requirement `memmap2` places on a
@@ -545,6 +563,7 @@ impl BagReader {
             legacy: OnceLock::new(),
             legacy_passthrough: AtomicU64::new(0),
             legacy_passthrough_warned: Mutex::new(Default::default()),
+            legacy_cap: AtomicUsize::new(LEGACY_UPGRADE_CAP_BYTES),
         })
     }
 
@@ -567,6 +586,7 @@ impl BagReader {
             legacy: OnceLock::new(),
             legacy_passthrough: AtomicU64::new(0),
             legacy_passthrough_warned: Mutex::new(Default::default()),
+            legacy_cap: AtomicUsize::new(LEGACY_UPGRADE_CAP_BYTES),
         }
     }
 
@@ -766,6 +786,14 @@ impl BagReader {
         self.advise.max_lag.store(max_lag, Ordering::Relaxed);
     }
 
+    /// TEST SEAM: lower the upgraded-copy limit (default
+    /// [`LEGACY_UPGRADE_CAP_BYTES`]) so a test can drive the over-limit
+    /// refusal of a version 1 bag without a 2 GiB fixture. Takes effect for a
+    /// copy not yet built.
+    pub fn set_legacy_upgrade_cap_for_test(&self, cap: usize) {
+        self.legacy_cap.store(cap, Ordering::Relaxed);
+    }
+
     /// TEST SEAM: the data-section end (the footer's `summary_start`) so an
     /// eviction-EFFECTIVENESS pin can bound the final advise watermark against
     /// the region the replay actually sweeps (the summary/index tail is never
@@ -820,11 +848,14 @@ impl BagReader {
         Ok(topics)
     }
 
-    /// How many version 1 frames were served UNCHANGED because they are not
-    /// one whole version 1 frame (their `total_size` disagrees with their
-    /// length, or they are shorter than the header). Such a frame is handed
-    /// on as recorded, the way a headerless frame is, rather than refused;
-    /// the first on each topic logs a warning.
+    /// How many version 1 frames were served UNCHANGED because they cannot be
+    /// upgraded: shorter than the 32-byte header, or declaring a `total_size`
+    /// past their end or below the header size. (A frame with bytes after its
+    /// declared `total_size` IS upgraded, the bytes kept after it.) Such a
+    /// frame is handed on as recorded, the way a headerless frame is, rather
+    /// than refused; the first on each topic logs a warning. Counted once per
+    /// accessor that serves it: each message stream, and the reader's one
+    /// upgraded copy.
     pub fn legacy_passthrough_count(&self) -> u64 {
         self.legacy_passthrough.load(Ordering::Relaxed)
     }
@@ -841,8 +872,9 @@ impl BagReader {
             tracing::warn!(
                 topic = %topic,
                 error = %error,
-                "a frame recorded with the version 1 wire header is not one whole frame, so it \
-                 is served unchanged (not upgraded); later ones on this topic are counted only"
+                "a frame recorded with the version 1 wire header cannot be upgraded (it is \
+                 shorter than the header or declares a size past its end), so it is served \
+                 unchanged; later ones on this topic are counted only"
             );
         }
     }
@@ -897,8 +929,8 @@ impl BagReader {
     }
 
     /// The upgraded copies of a version 1 bag's user frames, built on first
-    /// use: one raw walk sizes the copy exactly (refused above
-    /// [`LEGACY_UPGRADE_CAP_BYTES`]), a second fills it. A bag with no such
+    /// use and held for the reader's lifetime: one raw walk sizes the copy
+    /// exactly (refused above [`LEGACY_UPGRADE_CAP_BYTES`]), a second fills it. A bag with no such
     /// channel (or whose channel table cannot be read; the walk that needs the
     /// copy fails on its own then) gets an empty table and pays nothing more.
     // hot-path-alloc-ok-fn: once per reader, a version 1 recording only.
@@ -931,13 +963,14 @@ impl BagReader {
                     total = total.saturating_add(span.len + grow);
                 }
             }
-            if total > LEGACY_UPGRADE_CAP_BYTES {
+            let cap = self.legacy_cap.load(Ordering::Relaxed);
+            if total > cap {
                 return Err(BagError::LegacyUpgrade {
                     reason: format!(
                         "this bag was recorded with the 32-byte wire header and its frames \
-                         would take {total} bytes upgraded in memory, past the \
-                         {LEGACY_UPGRADE_CAP_BYTES}-byte limit; write a current copy with \
-                         `cerulion bag migrate <BAG>` and use that"
+                         would take {total} bytes upgraded in memory, past the {cap}-byte \
+                         limit; write a current copy with `cerulion bag migrate <BAG>` and use \
+                         that"
                     ),
                 });
             }
@@ -953,13 +986,14 @@ impl BagReader {
                 match upgrade_v1_frame_into(src, &mut built.arena[at..]) {
                     Ok(n) => {
                         built.arena.truncate(at + n);
-                        built.index.push((span.offset, at, n));
+                        built.index.push((span.offset, LegacySlot::Upgraded(at, n)));
                     }
                     Err(
                         e @ (FrameUpgradeError::TooShort { .. }
                         | FrameUpgradeError::SizeMismatch { .. }),
                     ) => {
                         built.arena.truncate(at);
+                        built.index.push((span.offset, LegacySlot::Unchanged));
                         self.note_legacy_passthrough(walk.topic(channel_id), &e);
                     }
                     Err(e) => {
@@ -976,6 +1010,18 @@ impl BagReader {
     /// A user-frame walk over the MAPPED bytes only, never translated: the
     /// source the upgraded copy is built from.
     fn raw_user_frames(&self) -> BagResult<UserFrameWalk<'_>> {
+        self.user_frames_as_recorded()
+    }
+
+    /// [`user_frames`](Self::user_frames) without the version 1 upgrade: every
+    /// frame is served from the map exactly as recorded, so a version 1
+    /// channel's frames keep their 32-byte header. Builds nothing and holds
+    /// nothing, at any bag size; a caller that reads headers must check
+    /// [`legacy_wire_header_topics`](Self::legacy_wire_header_topics) and read
+    /// those topics' frames in the version 1 layout. This is how
+    /// `cerulion bag info` reports a version 1 bag past
+    /// [`LEGACY_UPGRADE_CAP_BYTES`].
+    pub fn user_frames_as_recorded(&self) -> BagResult<UserFrameWalk<'_>> {
         let bytes = self.bytes();
         Ok(UserFrameWalk {
             walker: self.frame_walker()?,
@@ -1879,20 +1925,39 @@ impl UserFrameWalk<'_> {
                              (unexpected copy — a compressed or corrupt chunk?)"
                         .to_string(),
                 })?;
-            // A version 1 frame that was not one whole frame has no upgraded
-            // copy and is served from the map as recorded.
-            if let Some((at, len)) = self
-                .legacy
-                .filter(|l| l.channels.contains(&channel_id))
-                .and_then(|l| l.lookup(offset))
-            {
-                return Ok(Some((
-                    channel_id,
-                    FrameSpan {
-                        offset: self.total_len + at,
-                        len,
-                    },
-                )));
+            // A version 1 channel's frame is served from the upgraded copy, or
+            // (one that cannot be upgraded) from the map as recorded. Every
+            // such frame is in the copy's index; a miss would serve 32-byte
+            // header bytes as a current frame, so it is refused.
+            if let Some(legacy) = self.legacy.filter(|l| l.channels.contains(&channel_id)) {
+                match legacy.lookup(offset) {
+                    Some(LegacySlot::Upgraded(at, len)) => {
+                        return Ok(Some((
+                            channel_id,
+                            FrameSpan {
+                                offset: self.total_len + at,
+                                len,
+                            },
+                        )));
+                    }
+                    Some(LegacySlot::Unchanged) => {}
+                    None => {
+                        debug_assert!(false, "a version 1 frame missing from the upgraded copy");
+                        tracing::error!(
+                            topic = %self.walker.topic(channel_id),
+                            offset,
+                            "a version 1 frame is missing from the upgraded copy; refusing \
+                             rather than serving it in the 32-byte layout"
+                        );
+                        return Err(BagError::LegacyUpgrade {
+                            reason: format!(
+                                "a frame on '{}' at byte {offset} is missing from the upgraded \
+                                 copy",
+                                self.walker.topic(channel_id)
+                            ),
+                        });
+                    }
+                }
             }
             return Ok(Some((
                 channel_id,
