@@ -101,6 +101,9 @@ with exact pins matching its own version (`cerulion_core = "=X.Y.Z"` and
 checkout (`cargo install --path crates/cerulion_cli`, or run from its `target/`)
 scaffolds absolute path dependencies into that checkout instead. The command
 prints which one it chose on a `dependencies:` line under `Created workspace`.
+The scaffolded `Cargo.toml` also pins the iceoryx2 crates to the fork revision
+the CLI is built with through `[patch.crates-io]`, so the first build fetches
+that git revision.
 
 To override the default, edit the two entries in the generated root
 `Cargo.toml` under `[workspace.dependencies]`; member manifests inherit them
@@ -138,10 +141,104 @@ no command that rewrites an existing workspace's manifest in place.
 
 | Command | Effect |
 |---|---|
-| `topic list [--all] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (multicast + gossip scouting ON, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer scouting can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
+| `topic list [--all] [-t] [--local] [--no-network] [--connect LOCATOR]... [--listen LOCATOR]... [--scan]` | List LOCAL topics FIRST/instantly, then REMOTE topics discovered over the LAN. The framework's own channels (the recorder's `/bagd/status`, anything under `/__cerulion/`) are HIDDEN from the LOCAL section of the default listing (REMOTE rows are not filtered: a robot's own channel that reaches the announce or demand space, or a local mirror of one, prints as a plain REMOTE row with or without `--all`); when any were, ONE count line says so (`1 internal topic hidden (--all shows it)`), and `--all` lists them with an `internal` marker after the path (the path stays the row's first token; `topic echo`/`info`/`hz` read an internal topic by name either way). Automagic: remote discovery runs BY DEFAULT (the discovery ladder below, gossip scouting on, zenoh multicast scouting only under `CERULION_MULTICAST_SCOUTING=on`, a bounded sub-second query across the demand + announce key-spaces), rendered as a `REMOTE TOPICS` section, so an unpaired robot shows up with no flags; when the bounded gather finds nothing the section collapses to ONE line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)` (a peer that IS reachable, a given locator or a discovered robot, but advertised no topic in time gets a `retry` hint instead of the `--connect` one). `--local` (also spelled `--no-network`) or `CERULION_NETWORK=off` skips the whole remote query, including the discovery ladder and `--scan`; explicit locators are ignored in this scope. Existing shared-memory mirrors remain REMOTE rows attributed to their origin robot. `--connect tcp/192.168.123.99:7683` (repeatable; `--listen` mirrors it) ADDS locators to reach a peer the ladder can't find (7683 is the well-known permissive-gateway port; a graph with an explicit `network:` block listens wherever its `listen:` says); no gating flag required. The remote half is best-effort: a session/query failure is a LOUD note + exit 0 (the local list already printed), never a silently-empty section, never a fake-success. **Discovery ladder:** the LADDER (mDNS `_cerulion._tcp` browse, the PRIMARY rung, plus verified cached peers `~/.cerulion/peers.json` plus the `CERULION_PEERS`/config/`<name>.local` hostname convention, in parallel under a ~1.5 s ceiling) finds robot gateways with zero typed addresses, folds their locators into the query session, and renders a `ROBOTS` section (robot, gateway port, locator, rung) above `REMOTE TOPICS`; nothing discovered = no `ROBOTS` section at all. **`--scan` (rung 4, OPT-IN):** also unicast-sweeps the local `/24`(s) on the well-known gateway port for robots that BOTH multicast and mDNS reflection hide: verify-before-trust (only a gateway that answers a beacon probe is shown), the subnet clamped to the host's `/24`. OFF by default and STRUCTURALLY unreachable without the flag (a horizontal connect sweep reads as port-scan recon to corporate IDS; `--scan` is the sole producer, no env/config path). See `docs/networking.md` "Finding robots". |
 | `topic info <TOPIC> [--local]` | Schema name and schema hash, plus the last message's sequence number and wire timestamp. |
 | `topic echo <TOPIC> [--local] [--truncate-length N]` | Stream messages as YAML, one document per frame: a `# seq=.. ts=..ns schema=0x.. size=..` comment, a `# <type>` comment, the message in the [message YAML](#message-yaml) form, then `---`. Every type the workspace or a robot can name decodes (built-in, `.msg` store, `schemas/*.yaml`); a frame no schema names prints `#` comment lines that say why, with a hex preview of its first 64 payload bytes. `--truncate-length` caps how many elements of each array print (default 128, minimum 1); a cut array ends in `!truncated <n>`, the number left out. Raise it to see a whole payload, lower it to keep a fast topic readable. A frame whose YAML passes 2000 lines prints its first 2000, then a `!truncated` line and a comment; echo stops writing there, so a huge frame costs no more than its first 2000 lines. |
 | `topic hz <TOPIC> [--local]` | Publish-rate measurement. |
+| `topic list -t` (also `--show-types`) | The same listing with each topic's message type after its name: `/robot/camera/image  [sensor_msgs/Image]`. The topic name stays the first token of the row; `--all`'s `internal` marker and a mirror row's `● streaming` marker follow the type. A LOCAL topic is typed from one message, read in batches of 128 topics that each share one one second wait, so a listing costs about one second per 128 local topics (hidden internal topics are not read unless `--all` is given), and named from the built-in, `.msg` store and workspace types; a topic that sent nothing in its batch's second shows `[unknown]`, and a type no local schema names shows its schema hash, `[0x...]`. A REMOTE row is typed from its robot's catalog (the schema name the robot sends, else its schema hash named as above), and a mirror row from its origin robot's catalog only, never from another robot that publishes the same topic name; a row no catalog types, or every remote row under `--local`, shows `[unknown]`. Plain `topic list` output does not change. |
+| `topic type <TOPIC> [--local]` | Print the topic's message type as `package/Type`, or as the bare YAML key for a workspace schema declared with no package. Opens the topic exactly as `topic info` does, so a REMOTE robot's topic works the same way, and names it with the same ladder. Exit 1 with an error naming the topic when it is not found, when it sends no message within the wait (1 s local, 3 s remote), or when no known type names its schema hash. A local topic whose hash no built-in or workspace type names is looked up once on the network, as `topic echo` does, which can add a few seconds; `--local` (or `CERULION_NETWORK=off`) skips that lookup. |
+| `topic find <TYPE> [--local] [--connect LOCATOR] [--listen LOCATOR]` | Print, one per line and sorted, every topic whose type is `TYPE`: each LOCAL topic typed from one message, and each REMOTE robot's topic that `topic list` discovers, typed from its catalog. `--connect` and `--listen` (repeatable) add locators to discovery as on `topic list`, for a robot discovery cannot find. `--local` (or `CERULION_NETWORK=off`) reads local topics only. Each robot's catalog is matched on its own, so a topic two robots publish with different types is found by either type. A mirrored remote topic is searched through its origin robot's catalog only (another robot that publishes the same topic name does not count); when that catalog does not list it (under `--local`, or a failed remote query) one stderr line counts the mirrored topics not searched. A failed remote query prints the `topic list` stderr line and the local result still stands; a robot that served no catalog (it was never asked, did not answer, or refused) is named in one stderr line, since its topics were not searched. A local topic that could not be read (its open, its local lease or its receive failed) is named in one stderr line too, and a local topic that sent no message in the one-second wait (a topic slower than that) in another, since its type is not known. Takes the name `topic type` and `topic list -t` print, as printed: `package/Type`, or a bare `Type` for a workspace schema declared with no package, whose YAML key may be any text (`1scan`, `Scan-2`). The ROS 2 form `package/msg/Type` also finds `package/Type`. A type no topic carries prints nothing and exits 0; a malformed name (an empty part such as `pkg//Type`, or a control character) exits 1 naming it. |
+| `topic bw <TOPIC> [--local] [--window N]` | Print once a second the bandwidth of the topic's message payloads over the newest `N` messages (default 100, from 2 to 100000): `bandwidth: 480 B/s, mean: 24 B, min: 24 B, max: 24 B, window: 100`. Units are decimal (1 KB = 1000 B) up to TB. The rate uses the messages' own wire stamps, so a played-back bag measures what the live run measured. A second with no new message prints a `no messages received` line instead and keeps the window, as `ros2 topic bw` does, so a topic slower than one message a second still measures a rate (a figure can then span a pause until the window fills with new messages). Each publisher of the topic is measured on its own stamps and the topic's rate is their sum, so two publishers whose clocks disagree (a sim clock and a wall clock on one `multi_publisher_topics` topic) still read what they send. A message stamped behind all of its publisher's messages in the window, as when `bag play --loop` starts a new pass, is a clock reset of that publisher: its earlier messages leave the window, so a figure never mixes two passes. Messages that arrive over the network carry the identity of the local publisher that re-injects them, so remote writers that share one re-injector are measured as one. Runs until Ctrl+C; a missing topic exits 1 naming it. |
+
+The discovery verbs map onto the ROS 2 ones:
+
+| ROS 2 | Cerulion |
+|---|---|
+| `ros2 topic list -t` | `cerulion topic list -t` |
+| `ros2 topic type /chatter` | `cerulion topic type /chatter` |
+| `ros2 topic find std_msgs/msg/String` | `cerulion topic find std_msgs/msg/String` (or `std_msgs/String`) |
+| `ros2 topic bw /chatter --window 100` | `cerulion topic bw /chatter --window 100` |
+
+### Message YAML
+
+`topic echo` prints a message in one YAML form, and the same form is how
+Cerulion reads a message from text (the `cerulion_core::dynamic::yaml_to_message`
+API): a message printed whole (no `!truncated` element) is valid input as it
+stands, with or without the `---` line echo prints after it. An unset nested field prints as its zero values, so reading it back
+gives the same values in a full-size frame, not the same bytes.
+
+```yaml
+header:
+  stamp:
+    sec: 1
+    nanosec: 2
+  frame_id: "map"
+name: ["shoulder", "elbow"]
+position: [0.5, 1e-7]
+velocity: []
+effort: [1.5]
+```
+
+- **Keys.** One key per field, in the order the `.msg` or schema YAML
+  declares them. Every field is required on input, and a key that is not a
+  field of the type is an error. A message type with no fields is `{}`
+  (empty input is accepted for it).
+- **Numbers.** Integers are decimal. An integer that does not fit its
+  field is refused as out of range at that field; past 128 bits YAML reads
+  the digits as a float, so the error is `expected uint64, got float`. Floats print in the shortest form that
+  reads back to the same value (`1.0`, `0.1`, `1e-7`, `-0.0`), with `.nan`,
+  `.inf` and `-.inf`; an integer is accepted for a float field. A
+  `float32` reads back to the same bits. The one exception is NaN: every
+  NaN prints `.nan` and reads back as the standard quiet NaN, so its sign
+  and payload bits are not kept.
+- **Strings.** Always double quoted, so `"true"`, `"1"` and `""` stay
+  strings. Control characters and the characters YAML reads as line breaks
+  print as escapes (`\n`, `\t`, `\x1B`, `\u2028`).
+- **Arrays.** Arrays of numbers, booleans and strings are flow sequences
+  (`[1, 2, 3]`); arrays of messages are block sequences (`- x: 1.0`).
+  `uint8[]`, `int8[]` and `bytes` are sequences of integers. A fixed-size
+  array (`float64[9]`) must have exactly its length. An unbounded array of
+  messages with no fields (`std_msgs/Empty[]`) is always `[]`: the wire
+  form holds no count for it, so a longer one is refused. Arrays of
+  strings and messages nest at most 8 deep through variable-size messages
+  (ones holding a string, `bytes` or an unbounded array at any depth): a
+  nonempty ninth level is refused (`arrays of strings and messages nest
+  more than 8 deep here`), because echo could not print it back.
+- **Time and duration.** `builtin_interfaces/Time` and `Duration` are plain
+  messages: `stamp: {sec: 1, nanosec: 2}` in block form.
+- **Constants.** A field that takes a `.msg` constant (`uint8 WARN=1`) is
+  written as the number: `level: 1`, not `level: WARN`.
+- **Bounds.** A `string_fixed[n]` value is at most `n` bytes of UTF-8 and
+  holds no NUL character. A ROS `string<=N` value (or each element of
+  `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
+  `N` elements (`dimensions: expected at most 3 elements, got 4`). A
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, as ROS 2 counts them. Echo prints a frame past its bounds
+  as it is; reading that output back is refused.
+- **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
+  duplicate keys and more than one document are refused. A `!truncated`
+  element is refused with a message that says the array was cut for
+  display.
+- **Size.** A message whose YAML form is longer than 256 MiB is not
+  printed: the error names the field being written when the cap was
+  passed (`inner.rows[0].leaves[9].v: the YAML form passes the
+  268435456-byte output cap`). An unset nested field prints its zero
+  values, so a small frame can name a very large form. Message YAML
+  longer than 257 MiB (the 256 MiB form plus room for echo's comment
+  lines and `---`) is refused before it is read.
+
+Every error names the full field path (`(message)` for the whole message)
+and the expected type or bound:
+
+```text
+pose.position.x: expected float64, got string
+header.stamp.nanosec: -1 is out of range for uint32 (0 to 4294967295)
+pose.positon: unknown field; geometry_msgs/Pose has fields: position, orientation
+pose.orientation.w: missing field required by geometry_msgs/Quaternion
+covariance: expected exactly 36 elements, got 35
+tag: string is 5 bytes, over the bound of 4 bytes
+ranges[4]: this array was cut short for display (elements left out: 310); print the message again with a larger --truncate-length
+```
 
 ### Message YAML
 
@@ -226,7 +323,7 @@ ranges[4]: this array was cut short for display (elements left out: 310); print 
 ### Local scope for runs and topic inspection
 
 This source version accepts `--local` on `graph run`, `node run`, and `topic
-list`, `echo`, `hz`, and `info`. Released CLI 1.0.0 uses `--network off` for
+list`, `echo`, `hz`, `info`, `type`, `find` and `bw`. Released CLI 1.0.0 uses `--network off` for
 runs, `--no-network` for listing, and `CERULION_NETWORK=off` for observers.
 Those spellings remain supported; `--local` adds a consistent spelling.
 
@@ -253,7 +350,12 @@ The environment kill-switch is also honored: unset or whitespace-only
 case-insensitive `off` suppresses networking. Any other nonempty value warns
 and fails closed, preserving the existing behavior. No CLI option overrides
 an engaged environment kill-switch to enable networking. `--local` and the
-legacy run switch may be supplied together.
+legacy run switch may be supplied together. The inspection verbs (`topic
+list`, `echo`, `hz`, `info`, `type`, `find`, `bw`, and `schema info`) also read the network
+daemon's own switch, `CERULION_NETD_NETWORK`, with the daemon's parse (only
+the exact value `off` engages it): engaged, they open no discovery session,
+query and start no network daemon, and look up no schema remotely, and a
+refusal names the variable that engaged the scope.
 
 Local selection applies to the command's runtime/topic plane after the
 existing sign-in gate. A machine that has never signed in still needs
@@ -344,7 +446,7 @@ restriction of its own; it runs wherever the clang engine binary does.
 
 | Command | Effect |
 |---|---|
-| `viz [TOPIC...] [--robot NAME] [--connect LOCATOR]... [--listen LOCATOR]... [--detach]` | Visualize live topics in Cerulion Studio. Zero YAML, zero hand-written nodes. The verb is a thin CLIENT of the long-lived `cerulion-vizd` daemon: it starts the daemon if absent and sends one attach per topic. It starts no viewer: Studio connects to the same daemon and renders whatever is attached, so open Studio to see the topics (before or after the run). The daemon owns the taps, the schema-generic decode and the render. Each `TOPIC` is absolute (a missing leading `/` is added); pin a type with `TOPIC=SCHEMA` (`/go2/cloud=sensor_msgs/PointCloud2`) when it cannot be resolved locally; otherwise a local topic's schema back-fills from its first frame. **With NO arguments** it attaches every decodable local topic the daemon finds (silent or undecodable topics are skipped). `--robot NAME` visualizes a REMOTE robot: the daemon declares gateway ingress, re-injects the robot's frames into desk-local shared memory and taps the mirror; the robot serves raw bytes and nothing else, and each topic's type is resolved from the robot's served catalog, so no schema pin is needed. A topic the robot does not serve is a hard error, not a silent skip. `--connect`/`--listen` (repeatable, each requires `--robot`) add zenoh locators for a robot scouting cannot reach; they are threaded into the daemon's config only when THIS command starts it; a daemon already running keeps its boot-time locators. `--detach` attaches and returns immediately, leaving the daemon up. Without `--detach` the verb stays attached until Ctrl+C, then detaches only the topics it added; the shared daemon keeps running. |
+| `viz [TOPIC...] [--robot NAME] [--connect LOCATOR]... [--listen LOCATOR]... [--detach]` | Visualize live topics in Cerulion Studio. Zero YAML, zero hand-written nodes. The verb is a thin CLIENT of the long-lived `cerulion-vizd` daemon: it starts the daemon if absent and sends one attach per topic. It starts no viewer: Studio connects to the same daemon and renders whatever is attached, so open Studio to see the topics (before or after the run). The daemon owns the taps, the schema-generic decode and the render. Each `TOPIC` is absolute (a missing leading `/` is added); pin a type with `TOPIC=SCHEMA` (`/go2/cloud=sensor_msgs/PointCloud2`) when it cannot be resolved locally; otherwise a local topic's schema back-fills from its first frame. **With NO arguments** it attaches every decodable local topic the daemon finds (silent or undecodable topics are skipped). `--robot NAME` visualizes a REMOTE robot: the daemon declares gateway ingress, re-injects the robot's frames into desk-local shared memory and taps the mirror; the robot serves raw bytes and nothing else, and each topic's type is resolved from the robot's served catalog, so no schema pin is needed. A topic the robot does not serve is a hard error, not a silent skip. `--connect`/`--listen` (repeatable, each requires `--robot`) add zenoh locators for a robot mDNS discovery cannot reach; they are threaded into the daemon's config only when THIS command starts it; a daemon already running keeps its boot-time locators. `--detach` attaches and returns immediately, leaving the daemon up. Without `--detach` the verb stays attached until Ctrl+C, then detaches only the topics it added; the shared daemon keeps running. |
 
 ### `cerulion connect` / `pair` / `login` / `logout` / `account`
 
@@ -352,7 +454,7 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 
 | Command | Effect |
 |---|---|
-| `cerulion pair [ROBOT] [--eid HEX] [--addr IP:PORT]... [--code CODE] [--account HEX] [--label NAME] [--key-file PATH] [--relay-url URL] [--relay-disabled]` | Enroll this desk with a robot, once. `ROBOT` is a 64-char-hex endpoint id or a name resolved from the robot's mDNS record (else `~/.cerulion/robots.toml`); `--eid` gives the id directly. `--code` is the short pairing code the robot owner shared; **prefer omitting it** and typing it at the prompt, because a code passed on the command line is visible in process listings for the ceremony window and it authorizes durable enrollment. `--label` is the name the robot stores on its access-list row so its owner recognizes this desk (default: your hostname). `--key-file` is the desk device key (default `~/.cerulion/desk.key`, created `0600` on first pair and reused after). Pairing writes the robot's name pin, so `cerulion connect <name>` works afterwards. |
+| `cerulion pair [ROBOT] [--eid HEX] [--addr IP:PORT]... [--code CODE] [--account HEX] [--label NAME] [--key-file PATH] [--relay-url URL] [--relay-disabled]` | Enroll this desk with a robot, once. `ROBOT` is a 64-char-hex endpoint id or a name resolved from the robot's mDNS record (else `~/.cerulion/robots.toml`); `--eid` gives the id directly. `--code` is the short pairing code the robot owner shared; **prefer omitting it** and typing it at the prompt, because a code passed on the command line is visible in process listings for the ceremony window and it authorizes durable enrollment. `--label` is the name the robot stores on its access-list row so its owner recognizes this desk (default: your hostname). `--key-file` is the desk device key (default this machine's key `~/.cerulion/identity/device.key`, also named `~/.cerulion/desk.key`, created `0600` on first pair or sign-in and reused after). Pairing writes the robot's name pin, so `cerulion connect <name>` works afterwards. |
 | `cerulion connect [ROBOT] [--eid HEX] [--addr IP:PORT]... [--topic TOPIC]... [--all] [--key-file PATH] [--schemas-dir DIR] [--relay-url URL] [--relay-disabled] [--network off]` | Dial a paired robot's wire plane and re-inject its topics into desk-local shared memory, so `topic echo` and `viz` see them as LOCAL topics. `--topic` (repeatable) selects what to bring across; `--all` brings everything. Runs until Ctrl+C. It spawns the `cerulion-connectd` sibling binary (a separate binary because it links iroh), which it looks for beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it, and `CERULION_CONNECTD_BIN` points at one that lives elsewhere. |
 | `cerulion login` | Sign in to a Cerulion account. Runs the RFC 8628 device-code flow: prints a short code and a verification URL to open on any device, then waits for you to authorize. It is headless-friendly, so it works over SSH. Use it any time to sign in, re-authenticate or switch accounts. Ordinary commands require a signed-in machine: on one that has never signed in, the first command starts this flow at a terminal and refuses with this command's name anywhere else. Exempt: `login` itself, `logout`, `telemetry` (so consent can be read or changed before signing in), `completions`, `clean`, `--help`, `--version`, and the internal `graph run-worker` and `graph run-gateway` subprocess verbs a gated parent spawns. |
 | `cerulion logout` | Sign this machine out. Removes the session and refresh tokens from `~/.cerulion/auth.json` (the account id and the signed-in-before marker stay, the same record Cerulion Studio's "Sign out" writes), then revokes the session at the account service (`POST /v1/auth/revoke`). Every command the login gate covers is then refused (exit 7, "signed out") until the next `cerulion login`; at a terminal that command starts the sign-in instead. STDOUT is one line, `signed_out: account=<id>`, or `not_signed_in` when no session was stored (exit 0, nothing changed). Exit 1 when `auth.json` could not be rewritten (nothing was signed out), or when the machine was signed out but the service did not confirm the revoke (offline, service error): the session then stays valid at the service until it expires. A cached device certificate is left; revoke the device with `cerulion account devices revoke`. |
@@ -370,7 +472,7 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | `cerulion flashback [--note TEXT] [--pin] [--no-wait]` | **Capture the moment** (Unix only): write a bag covering the last ~30 seconds plus the next ~15, from the rolling window every serving `graph run` already holds. Nothing has to be armed in advance; the window is always on. The capture lands in `recordings/flashbacks/` and the verb WAITS until the bag is written (`--no-wait` returns as soon as the capture is accepted; the accepted line already carries the path it will have). `--note` records a sentence into the capture, so a bag found three weeks later says what it was about. `--pin` exempts it from retention rotation. Turn the whole plane off with `CERULION_FLASHBACK=off`; every size and retention knob is under [Environment variables](#environment-variables), and `docs/flashback.md` has the full model. |
 | `cerulion bagd --out PATH ...` | The recorder daemon itself (Unix only): the process `graph run --record` and `cerulion bag record` spawn for you. Run it by hand only when you want to attach a recorder to something already running with settings neither of those verbs exposes; `cerulion bagd --help` lists its full argument surface. Attach-mode channels learn their schema hash from the first frame; configured schema resolution can supply names and definitions. Whole-graph resim additionally requires the graph, environment, scheduler trace and any needed resume checkpoints. `graph run --record` supplies the run context to this same recorder; invoking `bagd` on topics alone does not create it. |
 | `cerulion telemetry status` / `on` / `off` | Show or change usage telemetry for this machine. `status` prints whether it is on and which setting decided it; `on` and `off` persist the choice in `~/.cerulion/telemetry.json` (a build compiled without the `telemetry` feature reports that telemetry is not compiled and writes nothing). `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` override the file. Works without signing in. Only a build carrying a telemetry key sends anything, such as one run with `POSTHOG_API_KEY` set; `status` says when the build has no key. See `docs/telemetry.md` for exactly what is sent. |
-| `cerulion completions <SHELL>` | Print the shell code that enables tab-completion (`zsh` / `bash` / `fish` / `elvish` / `powershell`). Completes subcommands, flags and enum values from the command tree, **plus live names**: topics on `topic echo/info/hz` and `viz`, node types on `node build/run/info/...`, graph names on `graph run/levels/partition/...`, workspace + built-in ROS 2 schemas on `schema info`, robot names on `viz --robot` / `connect` / `pair`, and `.mcap` bags on `bag play` / `bag info`. Install once, per shell (see `docs/cli_completions.md` for the full table); zsh needs TWO lines because the generated script ends in `compdef`, a function `compinit` defines, and macOS's system zshrc never calls it: `echo 'autoload -Uz compinit && (( $+functions[compdef] )) || compinit' >> ~/.zshrc` then `echo 'source <(COMPLETE=zsh cerulion)' >> ~/.zshrc`. These forms regenerate the shell code on demand, so they self-correct across upgrades (redirecting this command into a file also works, but hard-codes the binary's path, so re-run it after an upgrade). **A TAB press never opens the network, never starts a process (`cerulion-netd` least of all), never prints to stderr, and is bounded at 150 ms**: every source is a local directory / `~/.cerulion` file / compile-time static read. Consequence: a REMOTE robot's topics complete only while something HOLDS a mirror of them, and demands are process-scoped; a running `cerulion viz --robot NAME` leaves one standing (vizd holds the demand), `topic echo/info/hz` holds one only for as long as that command runs, and `topic list` demands NOTHING at all (it is a service-directory scan plus a liveliness gather), so with no vizd attach remote topics do not complete. Topic candidates also carry no origin label, because distinguishing a mirror from a local producer costs 620 ms. See `docs/cli_completions.md`. |
+| `cerulion completions <SHELL>` | Print the shell code that enables tab-completion (`zsh` / `bash` / `fish` / `elvish` / `powershell`). Completes subcommands, flags and enum values from the command tree, **plus live names**: topics on `topic echo/info/hz/type/bw` and `viz`, type names on `topic find`, node types on `node build/run/info/...`, graph names on `graph run/levels/partition/...`, workspace + built-in ROS 2 schemas on `schema info`, robot names on `viz --robot` / `connect` / `pair`, and `.mcap` bags on `bag play` / `bag info`. Install once, per shell (see `docs/cli_completions.md` for the full table); zsh needs TWO lines because the generated script ends in `compdef`, a function `compinit` defines, and macOS's system zshrc never calls it: `echo 'autoload -Uz compinit && (( $+functions[compdef] )) || compinit' >> ~/.zshrc` then `echo 'source <(COMPLETE=zsh cerulion)' >> ~/.zshrc`. These forms regenerate the shell code on demand, so they self-correct across upgrades (redirecting this command into a file also works, but hard-codes the binary's path, so re-run it after an upgrade). **A TAB press never opens the network, never starts a process (`cerulion-netd` least of all), never prints to stderr, and is bounded at 150 ms**: every source is a local directory / `~/.cerulion` file / compile-time static read. Consequence: a REMOTE robot's topics complete only while something HOLDS a mirror of them, and demands are process-scoped; a running `cerulion viz --robot NAME` leaves one standing (vizd holds the demand), `topic echo/info/hz` holds one only for as long as that command runs, and `topic list` demands NOTHING at all (it is a service-directory scan plus a liveliness gather), so with no vizd attach remote topics do not complete. Topic candidates also carry no origin label, because distinguishing a mirror from a local producer costs 620 ms. See `docs/cli_completions.md`. |
 | `cerulion tui` | Interactive ratatui dashboard (Nodes / Topics / Echo tabs). |
 | `cerulion clean [--report-only]` | Sweep iceoryx2 bookkeeping for **dead nodes only**; live nodes' state is preserved. **It needs no account.** The sweep reads and clears this machine's own bookkeeping, reaches no network and touches nothing on your account, so it runs on a machine that has never signed in: a CI runner, or a fresh install a `kill -9` left wedged, which is exactly the machine that needs it. On macOS it also reports the `/tmp/*.shm_state` population (the per-segment files `iceoryx2` leaves behind when a process is killed, which every dead-node sweep must then read past) and reclaims the ones whose creating process is **provably gone** (`kill(pid, 0)` says no such process; anything less certain is left in place and reported) **and** whose iceoryx2 namespace has no node registered in any registry the sweep covers: a state file is the whole namespace's name mapping, not one process's, so a namespace that is still in use keeps its file however long ago its first process died. The registries it covers are the one under your configured root path, the one under the compiled-in default root, and any registry one directory below either of them (which is where an isolated test root's registry lives). A process running under a hand-written `root_path` somewhere else entirely is invisible to that search, and its mappings are not protected. The verb makes ONE dead-node sweep: iceoryx2 0.10 removes a dead port's tag with the rest of its stale resources, so the directory that used to fail `rmdir` forever no longer arises and nothing is left to heal. `--report-only` performs **no side effect at all**: it lists the dead nodes it would sweep, each by the entry name it carries under the registry directory the report names, and, for the `.shm_state` half, the size of the job rather than a list: how many state files are there, and how many of those are provably dead. It removes neither, and leaves the registry byte for byte as it found it. Two limits on those figures, both of which the report itself states. Each is what a SHORT scan saw, so each can be a floor. And a count of provably dead files is not a promise they come off: reclamation runs only on a run WITHOUT the flag, and only when that run's own dead-node sweep converged, because a state file is the only name mapping a still-registered dead node has left. A run that leaves one registered says so and stands the reclamation down. The node listing is what the sweep would **attempt**, not a promise each one comes off: iceoryx2 reports insufficient permissions or a version mismatch only when it tries to remove a node, and the report says so under the list. It closes by saying nothing was removed. **You should rarely need this**: `cerulion graph run` sweeps dead nodes at startup under a 2 s budget, and reclaims what it can at graceful EXIT under another 2 s, where the graph is already over, so nothing you are waiting on is delayed. A run killed with `SIGKILL` skips its own exit pass; the next run that ends gracefully picks that residue up, so a desk that runs graphs heals progressively without you doing anything. Reach for `clean` when you want it all cleared at once, or when a run reported that its budget ran out. |
 | `cerulion trace inspect <dir>` | Read legacy publish-trace files (`trace_*.jsonl`, a JSON-Lines record of which topic published which sequence number when, with no payloads) and print a human-readable timeline. `--filter TOPIC`, `--limit N`, `--reverse`. No `cerulion` verb writes these files, so this verb only matters if you already hold some; see [Publish trace (legacy)](#publish-trace-legacy). **Not the recording bag**: `graph run --record` bags are standard **MCAP** (`.mcap`) and are read by `cerulion bag play` (with or without `--resim`), not this command. |
@@ -1840,16 +1942,23 @@ level_assignments:              # optional; node id → DAG level index
 
 ### Cross-machine networking: permissive by default + the `network:` block
 
-A real-clock live run is **network-viewable by default**:
+A real-clock live run is **network-viewable by default on non-Android**:
 `graph run` (monolith OR multi-process), `node run`, and `ros2 attach` each
-spawn ONE network GATEWAY process that opens the robot's single zenoh
-session, listens on the well-known port **7683** (bind-probing upward on
-conflict; override with `CERULION_GATEWAY_PORT`), scouts the LAN, and
-announces every produced topic; one loud breadcrumb prints at start. The
+route egress through ONE network gateway that opens the robot's single
+zenoh session and announces every produced topic when LAN access is open;
+one loud breadcrumb prints at start. On the default Unix path that gateway is hosted by the machine's
+`cerulion-netd`, which listens and advertises itself over mDNS only when
+`CERULION_NETD_LISTEN` is set, so a stock robot is not found by a default
+desk. The per-run fallback gateway child listens on the well-known port
+**7683** (bind-probing upward on conflict; override with
+`CERULION_GATEWAY_PORT`) and advertises itself over mDNS. The
 optional top-level `network:` block below RESTRICTS this (a Strict
 allow-list with verbatim locators) rather than enabling it. Turn networking
 off for a run with `--network off` (or `CERULION_NETWORK=off`). See
 `docs/networking.md` for the full gateway model + a two-machine quickstart.
+On Android, LAN access defaults to `paired`; topic names are withheld until
+the posture is opened. When netd serves a graph, it reports its own posture so
+the startup breadcrumb describes the serving process.
 
 ```yaml
 network:
@@ -1868,16 +1977,17 @@ network:
   to a router without routing traffic. `disabled` (also what an omitted `mode:`
   means) makes the BLOCK inert, which is NOT the same as turning the network
   off: a run treats a disabled block exactly like no block at all, so under the
-  real clock it gets the permissive default above (gateway process, LAN
-  scouting, every produced topic announced). The local-only switch is
+  real clock it gets the permissive default above (gateway process, mDNS
+  discovery, produced topics eligible for announcement when LAN access is
+  open). The local-only switch is
   `--network off` / `CERULION_NETWORK=off`, nothing in this block. `router` is
   deliberately NOT exposed. An unknown mode string is rejected at parse
   listing the valid values.
 - `connect` / `listen`: each entry maps 1:1 onto a zenoh locator string,
   used VERBATIM (a Strict block adds no scouting and no bind ladder), so a
   config-only two-machine deployment needs one side to `listen` and the
-  other to `connect`. (Scouting-ON + the 7683 bind ladder are the
-  permissive-default behavior, not block knobs.)
+  other to `connect`. (Gossip, opt-in multicast scouting and the 7683 bind
+  ladder are permissive-default behavior, not block knobs.)
 - `egress`: topics this graph exports to the network, enforced as a TRUE
   **allow-list**: only declared egress topics ever leave the machine (a
   remote machine's request for any other produced topic is refused at the
@@ -1886,8 +1996,14 @@ network:
   **produced by an in-graph node** (derived names and `topic:` overrides
   both count).
   An entry is a topic name or a map, `{topic: /r/scan, reliability:
-  best_effort}`; `reliability` is `reliable` (the default) or `best_effort`,
-  which puts the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator.
+  best_effort}`; `reliability` is `reliable` or `best_effort`, which puts
+  the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator. An entry
+  with no `reliability` (a bare name included) is put at
+  `default_reliability`.
+- `default_reliability`: `reliable` (the default) or `best_effort`, for
+  every `egress` entry that sets no `reliability`. An entry's own
+  `reliability` wins in both directions: `{topic: /r/cmd, reliability:
+  reliable}` stays reliable under a `best_effort` default.
 - `tls`: absolute PEM paths for `quic/` locators: `certificate` +
   `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh
@@ -1904,7 +2020,7 @@ network:
   validated against the consuming input's schema hash before re-injection.
 
 Validation (at graph load, so `graph validate` and `graph run` both apply it). Every
-rejection names the offending topic and the fix:
+rejection names the offending topic or setting and the fix:
 
 | Rule | Rejected shape |
 |---|---|
@@ -1916,13 +2032,13 @@ rejection names the offending topic and the fix:
 | Duplicates | The same topic twice in one list. |
 | Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
 | Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
-| Best effort | A `reliability: best_effort` topic with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
+| Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
 export-restricted robot). Inspect what remote machines are advertising with
-`cerulion topic list` (remote discovery is automagic, scouting ON by
+`cerulion topic list` (remote discovery is automagic over mDNS by
 default; add `--connect tcp/<host>:7683`, the well-known permissive-gateway
-port, for a peer scouting can't find).
+port, for a peer mDNS can't find).
 
 Runtime controls (`cerulion graph run`, `node run`):
 
@@ -2041,6 +2157,43 @@ use native_ros2_messages::sensor_msgs::Image;
 #[output]
 image: Image,
 ```
+
+### Constants and defaults
+
+A `.msg` constant line (`int8 STATUS_FIX=0`, `string MODE="AUTO"`) becomes an
+associated constant on the generated type, so node code reads it as
+`NavSatStatus::STATUS_FIX`. Constants never reach the wire and do not change the
+schema hash. A constant takes a primitive type or `string`, its name is upper case
+(`A_B2`, not `type` or `Mixed`) as in ROS 2, and its value must fit the type:
+`uint8 X=256` is a parse error that names the line. A `float32` value is refused only
+when it rounds to infinity, the same rule the Rust compiler applies.
+
+A field default (`float64 w 1`, `string frame "map"`, `int32[] ids [1, 2]`,
+`bool[2] mask [true, false]`) is kept and applied by the generated `Default`, so
+`QuaternionSnapshot::default().w` is `1.0`. Defaults work on primitives, strings and
+arrays of primitives or strings, with `[a, b]` list syntax; a fixed-size array default
+must have exactly that many elements, and a `<=N` bound is checked (a `string<=N`
+counts UTF-8 bytes, a `wstring<=N` counts UTF-16 units). A `wstring` is written
+as UTF-8, not the UTF-16 a ROS 2 peer reads, so a non-empty `wstring` default is a
+parse error; an empty one (`""`, `[]`) and a `wstring` constant are accepted. A message-type
+field takes no default, and a fixed-size `string[N]` field does not generate yet,
+with or without a default. A default never changes the wire layout or the schema hash,
+and a loaned output slot still starts zeroed: the default applies when you build a
+value with `Default`.
+
+As in ROS 2, the first `#` on a line starts a comment, inside quotes too, so a
+constant or default cannot hold a `#`: `string s a#b` has the default `a`.
+
+### Service files
+
+A `.srv` file is a request body and a response body split by one `---` line. Each
+part parses as its own message in the package of the service, named as ROS 2 names
+it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
+`std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part. The generated Rust
+types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
+`SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
+code generated from a `.srv` passes `clippy -D warnings`.
 
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
@@ -2885,11 +3038,13 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 
 | Variable | Meaning |
 |---|---|
-| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. The run and query entry points match `off` after trimming, ASCII case-insensitively; an empty or whitespace-only value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by `graph run`, `node run`, `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and `schema info`; on `topic list` it skips the whole remote query, the same scope `--local` selects. `--local` and the legacy `--network off` run flags are the same switch (`--network` accepts only `off`), and `--local` on `topic list` (also spelled `--no-network`), `topic echo`, `topic hz` and `topic info` selects the same scope by flag; no flag enables networking over an engaged kill-switch. `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. |
+| `CERULION_NETWORK` | The network kill-switch. `off` runs LOCAL-ONLY: no gateway process, no zenoh session, a loud notice. The run and query entry points match `off` after trimming, ASCII case-insensitively; an empty or whitespace-only value is treated as unset, and any other non-empty value fails CLOSED: a loud notice names it and the run or query goes LOCAL-ONLY too. Read by `graph run`, `node run`, `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`, and `schema info`; on `topic list` it skips the whole remote query, the same scope `--local` selects. `--local` and the legacy `--network off` run flags are the same switch (`--network` accepts only `off`), and `--local` on `topic list` (also spelled `--no-network`), `topic echo`, `topic hz` and `topic info` selects the same scope by flag; no flag enables networking over an engaged kill-switch. `cerulion connect` and the `cerulion-remoted` daemon honor the switch too: when it is engaged, each warns and exits before starting its network transport. They differ from the run and query entry points only in how they parse the value. `cerulion connect` engages the switch on the exact value `off`; any other non-empty value warns and it still connects. `cerulion-remoted` trims and lowercases the value, so `off` with surrounding whitespace or capitals engages the switch and `on` is accepted explicitly; any other non-empty value warns and its network stays on. `cerulion viz --robot` refuses under the switch, with the run and query parse, before it spawns or contacts `cerulion-vizd`, and `cerulion pair` refuses under it before its mDNS lookup and before it spawns `cerulion-connectd`. |
 | `CERULION_GATEWAY_PORT` | The port the network gateway listens on, instead of the well-known **7683** (which bind-probes upward on conflict). Set it when 7683 is taken by something else on the robot, or to run two gateways on one box. |
 | `CERULION_ROBOT_IDENTITY` | The robot's announced network identity: the name that shows up in `cerulion topic list`'s `ROBOTS` section, in the mDNS `_cerulion._tcp` record, and as the first chunk of every announce key. Default: this machine's hostname (`.local` stripped). Set it on a stock-image fleet where every machine boots with the same hostname, or when the hostname is not the name your operators use. Resolved identically by the gateway and the remote-plane daemon, so the LAN and WAN planes can never advertise two different names. |
+| `CERULION_LAN_ACCESS` | Who may demand this machine's topics over the LAN, read by `cerulion-netd` and the `graph run` gateway. `open` removes the paired-only posture gate, leaving each demand to the configured inner authorizer (which can still deny it); `paired` refuses every LAN topic demand, catalog and schema query with a reason naming the posture, and re-injects no frame a LAN peer publishes into an ingress topic. On a host that runs the paired remote plane (`cerulion-remoted` beside `cerulion-netd`), topic reads and writes then go through that plane; an Android embedded app does not host it, so under `paired` its topics are not reachable over the LAN at all. Unset or whitespace-only selects the platform default: `paired` on Android, `open` elsewhere. Values match after trimming, ASCII case-insensitively; any other value warns and fails CLOSED to `paired`. A non-Unicode value also warns and fails closed to `paired`. Choose the posture at startup with this variable; an Android app sets its posture with the `lan_access` runtime key. Opening access after a paired start does not replay topic announcements withheld while paired. |
+| `CERULION_MULTICAST_SCOUTING` | `on` (trimmed, ASCII case-insensitive) turns zenoh multicast scouting back on: periodic scout packets to UDP `224.0.0.224:7446`. Default off: peers are found through the `_cerulion._tcp` mDNS browse, the peer cache and the hostname rung, and an idle machine sends no discovery traffic after its one mDNS registration. Set it on a network where mDNS does not cross but multicast does, on every machine that should find or be found that way: a session with it off neither sends nor answers scouts. `off` or empty keeps the default; any other value keeps it off and logs a warning. Read by `cerulion-netd` and `cerulion-vizd` at daemon start, by `graph run` for a permissive gateway process it spawns itself, and by the `topic list` discovery session. A running daemon picks a change up only when it restarts, and a permissive `graph run` whose egress rides a running `cerulion-netd` gets that daemon's value. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
-| `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (desk key, `device.cert`, `robots.toml`, `peers.json`, `runs/`). The isolation knob for a test rig or a second identity on one machine. |
+| `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (`auth.json`, the machine key `identity/device.key` and its legacy name `desk.key`, `device.cert`, `robots.toml`, `peers.json`, `config.toml`, `epochs/`, `runs/`, `ros2/`). Empty counts as unset. The isolation knob for a test rig or a second identity on one machine. |
 | `DDS_BRIDGE_CONFIG` | Path to the bridge mapping file a `cerulion ros2 attach` graph's `dds_bridge` node loads. `ros2 attach` sets it absolute when it runs the graph for you; a hand-written `graph run` of an attach graph inherits whatever your shell exported, so export it there. |
 
 ### ROS 2 on Cerulion transport
@@ -3082,7 +3237,7 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_SOCK` / `CERULION_VIZD_SOCK` | Absolute control-socket path, instead of the default `$XDG_RUNTIME_DIR/cerulion/<netd\|vizd>.sock`, then `~/.cerulion/…`, then `/tmp/cerulion-<euid>/…` (per user; two users on one machine never share a socket directory). For running a second, non-default instance. All three daemons apply the same directory rule. A sticky, world-writable directory (mode `1777`) owned by root or by you is accepted as is (`/tmp` itself, or a `1777` directory of your own): the sticky bit stops every *other* user unlinking your socket, and the one user it does not stop, the directory's own owner, is then root or you (a daemon running as root must also not re-mode the machine's `/tmp` from `1777` to `1755`). A directory of yours that no other user can write into is used as is: nothing is changed and nothing is logged: the `0700` directories the ladder creates, or a `~/.cerulion` another Cerulion command created under a `umask 0022`; one created under Ubuntu's default `umask 0002` is `0775` and is tightened once, with the warn, the first time a daemon uses it. The directory must be readable by you as well as searchable: it is judged and, if need be, tightened through one open descriptor (so a symlink swapped in between the check and the change cannot redirect it), and that open needs the read bit; a search-only `0300` directory of yours is refused with "could not be inspected: Permission denied" (no ladder rung has that shape; only an explicitly configured path can). Otherwise a directory of yours that other users could write into (group or world write bit) is tightened automatically: the write bits are stripped, sticky and setgid bits kept, and one `warn!` line says so; a directory of yours whose bits could **not** be stripped (a filesystem with a fixed mode, such as a CIFS home mounted `dir_mode=0777`) is refused with the reason, as is one that is neither yours nor a root-owned `1777` share. Another user's `1777` share is refused too, not accepted the way `/tmp` is: the sticky bit does not bind that directory's own owner, so its owner can unlink your socket and bind an impostor at the same path. A missing directory is created `0700`. |
 | `CERULION_WSD_SOCKET` | Absolute control-socket path for `cerulion-wsd`; defaults to `$XDG_RUNTIME_DIR/cerulion/wsd.sock`, then `~/.cerulion/wsd.sock`, then `/tmp/cerulion-<euid>/wsd.sock`; the same ladder and directory rule as the row above. |
 | `CERULION_WSD_HARD_EXIT_MS` | Deadline for `cerulion-wsd`'s graceful shutdown before in-flight requests are aborted, in ms (default **5000**): a request blocked on a workspace lock must never turn SIGTERM into a zombie holding the socket. |
-| `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. |
+| `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` | `off` forces a strictly LOCAL-ONLY daemon: no zenoh session ever, and a remote demand surfaces a plain "not network-configured" answer instead of hanging. Only the exact value `off` engages it; any other non-empty value warns and the network stays on. Mirrors `CERULION_NETWORK=off` but scoped to the daemon, so it never surprises a `graph run` sharing the machine. The commands that reach the network through the daemon honor it too: with `CERULION_NETD_NETWORK=off`, `topic list`, `topic echo`, `topic hz`, `topic info` and `schema info` stay LOCAL-ONLY, opening no discovery session of their own; with either variable at `off`, `cerulion viz --robot` refuses before contacting the daemon. |
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
@@ -3207,11 +3362,44 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 | `CERULION_NETD_RELAY_DISABLED` | Any non-empty value disables all iroh relays (LAN direct-dial only), for a locked-down or air-gapped desk. WAN builds only. |
 | `CERULION_STATE_ROOT` | The on-robot state root for `cerulion-remoted` (default `/var/lib/cerulion`). Also its `--state-root` flag. |
 
+### Robot Context Protocol
+
+For the `cerulion-rcpd` MCP server. See `docs/rcp.md`.
+
+| Variable | Meaning |
+|---|---|
+| `CERULION_RCP_TOKEN` | The bearer token every streamable HTTP request must carry (`Authorization: Bearer <token>`). `--http` refuses to start when it is unset, empty or whitespace. Not read in stdio mode. |
+
 ### Multi-process execution
 
 | Variable | Meaning |
 |---|---|
 | `CERULION_EXECUTION_MODE` | How the workers of a MULTI-PROCESS `graph run` coordinate their steps. Unset (or `free_run`) is the default: **free-run**, no shared barrier, each rank on its own wall-following clock. `lockstep` OPTS OUT into barrier lockstep, where every rank advances the same handed quantum per step behind a shared barrier, the shape that makes per-step boundary times EQUAL across ranks. Read ONCE per run and threaded to every consumer: the run directory's `gating` label (`recorded_wall` for a free-run run whose ranks mint their scheduler-trace rings, which is every run but `--no-rings`, where it reads `wall`; `quantum` for lockstep), every worker plan, and the `coordination` stamp of a bag `--record` writes (`free_run` / `lockstep`), so no two of them can disagree. Exact-match: any other value keeps the default and warns. The `lockstep` opt-out is kept as the revert path for the free-run default; it is not a long-term part of this surface. On a run that executes no process groups (`--single-process`, a non-Unix host, or an unpartitioned graph under a non-real clock; under the real clock an unpartitioned graph is auto-partitioned and free-runs like any supervisor run) there are no ranks to coordinate: the run is the one-rank lockstep timeline, an explicit `free_run` is inert there and warns, and `lockstep` is simply what that run already is (silent). A partitioned graph under `--time-source virtual` still runs the supervisor (the flag is ignored with a warning) and follows the variable; `external` is rejected outright. See [`docs/multi_process.md`](multi_process.md). |
+
+### Android CLI and node workspaces
+
+The CLI, `cerulion-netd` and `cerulion-wsd` build for Android. Node cdylibs
+must be cross-built on a host with the same Rust compiler as the CLI. On
+Android, graph and node runs search
+`<target-directory>/<target-triple>/<profile>` when that node's cdylib is
+present there, otherwise using `<target-directory>/<profile>` when its library
+is present there; missing-library errors name the cargo-ndk paths. Preserve the
+target-triple directory when copying a workspace to the device. When
+`cerulion node build` cannot find Cargo on Android, it directs you to cross-build
+the workspace on the host with `cargo ndk`.
+
+Workspaces created by `cerulion workspace create` or `cerulion workspace init`
+already carry the complete iceoryx2 family `[patch.crates-io]` block from
+Cerulion's root manifest. A standalone workspace written by hand must carry
+the same block, pinned to one fork revision. Otherwise node initialization
+refuses an iceoryx2 build without Android shared-memory support. `cerulion viz`
+is desktop-only; run it on a desktop host and connect that host to the device's
+topics over the network.
+
+On Android, netd and wsd control sockets use the abstract Unix-socket
+namespace. Their configured paths become abstract names, not filesystem
+entries. Each daemon drops peers whose `SO_PEERCRED` UID differs from its own
+effective UID, as well as peers whose credentials cannot be verified.
 
 ### Android shared memory
 
@@ -3249,8 +3437,9 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 | Feature | On `cerulion_core` | When |
 |---|---|---|
-| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib carries the framework's `CERULION_ABI_VERSION` AND the rustc that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
+| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib's ABI value includes the framework version and its transport kind (the cross-process value remains `CERULION_ABI_VERSION`), plus the rustc fingerprint that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
 | `debug-logging` | yes | Enables `tracing`'s `max_level_trace`. It does NOT put `debug`/`trace` back into a release build: `cerulion_core` sets `release_max_level_info` on its `tracing` dependency, `tracing` consults every `release_max_level_*` feature before any `max_level_*` one in a build without debug assertions, and Cargo unifies features across the binary, so a release binary stays capped at `info` with or without this feature, no matter what `RUST_LOG` says. To get `debug`/`trace` lines, build without cargo's `--release` (a dev-profile build has no ceiling). |
+| `local-transport` | yes, opt-in | Selects an in-process transport for apps whose local publishers, subscribers, and gateway all run in one process. It preserves the zero-copy path within that process. Explicit cross-process configurations, detached pre-creation for other processes, and cdylibs with a different transport kind are refused. Do not enable it for the CLI or daemons. A `local-transport` host refuses every native cdylib node at load: each library carries its own process-local registry, so its frames cannot reach the host. Enable it only for apps whose publishers and subscribers all live in that one process; for cdylib graphs or cross-process setups, build a workspace and run it with `cerulion graph run` on the default transport. |
 | `test-helpers` | yes | Exposes test-only constructors and seams (`ClosureNodeEntry`, the `new_for_test` constructors). Used by integration tests; users shouldn't need it. |
 | `fuzz-helpers` | yes | Fuzz-test entry points. |
 

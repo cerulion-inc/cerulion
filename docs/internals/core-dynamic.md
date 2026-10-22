@@ -46,9 +46,27 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
 - **Warnings are loud twice.** Every `LayoutResolver` warning (unresolved nested target,
   skipped workspace file, …) is `tracing::warn!`ed AND returned in the `Vec<String>`.
   A failed `add_*` leaves the set unchanged.
+- **Nested references bind on identity.** `resolve_fixed_nested`, `LayoutResolver`,
+  `FrameWalker` and the capture-time `header.stamp` locator (`codegen/header_stamp.rs`)
+  all bind a nested reference through one registry
+  (`codegen/nested_index.rs`) keyed on each schema's own `(package, name)`, never on
+  its qualified-name text. A package-less YAML entry named `pkg/Type` keeps that text
+  for name lookups (`layout(name)`, `walk`), where the later definition wins; a store
+  schema's reference to `Type` still binds the store's `(Some("pkg"), "Type")`, the
+  definition the resolver inlined, and both twins stay reachable by their own
+  `schema_hash` (`walk_by_hash`, `layout_for_hash`). A consumer that resolved a name from
+  a hash decodes with `walk_by_hash`, never `walk(name)`, so a twin never decodes under
+  the other twin's layout. A nested reference that does not bind is never a panic, but
+  it is not always an error: `resolve_fixed_nested` warns and leaves the field variable,
+  so the layout still succeeds, and an unresolved array element can decode as
+  `NestedArrayOpaque`. `LayoutError::UnresolvedNested` covers only a fixed stamp that no
+  longer binds in the set, and `WalkError::NestedResolutionFailed` a nested frame whose
+  reference does not bind at walk time. A fixed section whose inlined size overflows
+  `usize` is `LayoutError::FixedSectionOverflow`, and the walker leaves that schema out.
 - `from_schemas` returns `Result` and preflights every build through three gates:
   declared fixed size, composed overflow via `composed_overflow_indices`, and
-  resolved frame prefix ≤ `u32`. `add_*` is all-or-nothing. The workspace loader
+  resolved frame prefix ≤ `u32` for every layout a frame can reach, by name or by hash
+  (a twin hidden from name lookups included). `add_*` is all-or-nothing. The workspace loader
   skips offenders to a fixpoint with warnings. `layout(name)` is a direct name
   lookup, never a hash-index lookup.
 - `dynamic::parse_rosmsg` is the checked parser (`codegen::parse_rosmsg` is the raw
@@ -213,8 +231,10 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   wire bytes: an empty message, or one made only of fixed arrays of them) is printed
   from the schema, and the keeping walk holds none of a fixed array of them, so a
   32-byte frame that declares 2^40 empty elements costs only the output cap. It then
-  prints fields in DECLARATION order from `FrameWalker::schema_for_name` (a `WireLayout` splits fields
-  into a fixed and a variable group and loses that order). The walker's degradations
+  prints fields in DECLARATION order from the resolved schema of the frame's own hash
+  (`FrameWalker::schema_for_hash`; a twin that owns the same qualified name never stands in)
+  and of each nested target (`FrameWalker::nested_target`): a `WireLayout` splits fields
+  into a fixed and a variable group and loses that order. The walker's degradations
   become loud `YamlUnencodable` arms (a string that is not UTF-8, an array that is not
   canonically framed, a primitive array whose bytes end partway through an element,
   a `bool[]` byte other than 0/1). The walker reads an empty `bool[]` blob as an
@@ -223,19 +243,25 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   idiom prints the target's zero values, so the YAML is complete; decoding that YAML
   writes the full sub-frame, so that one frame shape is not byte-preserved.
 - **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
-  rule) and resolves nested types through `FrameWalker::nested_layout` (the walker's
-  own ladder). A body whose
-  fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
-  allocates it, and a string or scalar array past it is refused before its bytes are
-  built. Input past `MAX_YAML_INPUT_BYTES` (the encoder's cap plus 1 MiB for echo's
+  rule) and resolves nested types through `FrameWalker::nested_target` (the walker's
+  own identity binding on the parent's package, which gives the layout and the schema
+  from one slot). `MAX_BODY_BYTES` counts every byte the unfinished bodies and arrays on
+  the build stack hold, since all of them end up in the frame: a body whose fixed
+  section plus offset table does not fit what is left is refused before the builder
+  allocates it, and a string or scalar array that does not fit is refused before its
+  bytes are built. So a few bytes of YAML naming many large fixed sections (unset
+  `string_fixed` fields) are refused at the first one past the cap, not after all are
+  held. Input past `MAX_YAML_INPUT_BYTES` (the encoder's cap plus 1 MiB for echo's
   comment lines and separator) is refused before parsing, which bounds the value tree. One final `---` line (echo's frame separator) is dropped before parsing.
   `parse.rs` builds the `serde_yaml::Value` tree with its own visitor so an integer
   past 64 bits (which `Value` cannot hold, and serde_yaml refuses with no path) is
   kept as its decimal text: an integer field refuses it as `YamlOutOfRange` at its
-  path, a float field reads it like any integer.
+  path, a float field reads it like any integer. A typed tag that spells the
+  parser's mark for such an integer (`!integer%20past%2064%20bits`) is refused as a tag.
   serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
-  block scalars. A block scalar's content is what is more indented than the node that
+  block scalars. It splits lines at every break the parser reads (LF, CR, CRLF, NEL,
+  LS, PS), so a CR-only document is not one long line. A block scalar's content is what is more indented than the node that
   owns it (the key of `- key: |`, not the dash), so a sibling key is still scanned. A multi-line plain scalar whose continuation line starts with `&` or
   `*` is a false refusal (quote the string).
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
@@ -243,7 +269,9 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints
   `.nan` and reads back as the quiet NaN, so a NaN's sign and payload bits are the one
   thing the round trip does not keep.
-- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `MAX_YAML_ARRAY_DEPTH` (the
+- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions, a message (a fieldless `{}`
+  too) and an array of messages a level each (each is one YAML mapping or sequence, so printed YAML stays
+  inside the reader's own nesting limit); `MAX_YAML_ARRAY_DEPTH` (the
   walker's `MAX_NESTED_ARRAY_DEPTH`, 8) on decode: a nonempty element array inside
   that many variable-message elements is refused, since the walker hands it back
   opaque, and an empty one there is written as the empty blob the walker reads as zero
@@ -258,16 +286,17 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   it with a column-0 `!truncated` line;
   `string_fixed[n]` and fixed array lengths are enforced. ROS `<=N` bounds ride on
   `FieldDef::bounds` (kept by the `.msg` parser, outside the wire type and the schema
-  hash) and are enforced on decode only (`YamlTooManyElements`, `YamlStringTooLong`);
-  the encoder prints an over-bound frame as it is. `wstring<=N` counts UTF-16 units, so
-  its bound is not kept.
+  hash) and are enforced on decode only (`YamlTooManyElements`, `YamlStringTooLong`,
+  `YamlWideStringTooLong`); the encoder prints an over-bound frame as it is. A
+  `wstring<=N` bound is kept apart (`max_wstring_units`) and counts UTF-16 code units,
+  not the UTF-8 bytes the wire carries.
 - Neither direction is a publish path (both allocate); the module is outside the
   hot-path allocation sweep.
 
 | Class | `DynamicError` variant |
 |---|---|
 | input bytes / parse / anchor | `YamlInputTooLarge`, `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
-| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
+| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlWideStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 
@@ -280,8 +309,8 @@ turned into frames by `CdrCodec`, against hand-written YAML. `every_corpus_type_
 covers one message of every vendored type against two oracles: the frame from `CdrCodec`
 and the YAML from the test's own `Sample` writer, which spells out the documented form
 with no call into the codec, so encode must print that YAML and decode must build that
-frame; `encoding_is_deterministic_across_runs_and_processes`
-re-runs the corpus in a second process.
+frame; `encoding_is_deterministic_across_runs` re-runs the corpus in the same process, and
+`encoding_is_deterministic_across_processes` (Unix only) re-runs it in a second process.
 
 ## Tests
 

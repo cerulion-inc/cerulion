@@ -11,7 +11,8 @@ use super::encode::{format_f32, format_f64, key, message_to_yaml_capped, quote};
 use super::scan::find_anchor_or_alias;
 use super::*;
 use crate::codegen::{
-    parse_rosmsg, CdrCodec, CdrEndianness, FieldDef, FieldType, FrameWalker, MessageSchema,
+    parse_rosmsg, CdrCodec, CdrEndianness, FieldDef, FieldType, FrameValueKind, FrameWalker,
+    MessageSchema,
 };
 use crate::dynamic::DynamicError;
 use crate::dynamic::SchemaSet;
@@ -523,6 +524,36 @@ fn a_fixed_section_past_the_cap_is_refused_before_it_is_allocated() {
     );
 }
 
+/// The cap counts every body the reader holds, not one body at a time:
+/// `Big` is 520 MiB of fixed section (520 `string_fixed` fields of 1 MiB)
+/// from a few kilobytes of YAML, so the second one in `Pair` is refused at
+/// its field before it is built, not after both are held and copied into
+/// the frame.
+#[test]
+fn bodies_held_together_past_the_cap_are_refused_before_the_next_is_built() {
+    const FIELDS: usize = 520;
+    let mut schema = String::from("schemas:\n  Big:\n    fields:\n");
+    let mut big = String::from("{t: \"\"");
+    for i in 0..FIELDS {
+        schema.push_str(&format!("      string_fixed[1048576] f{i}: {{}}\n"));
+        big.push_str(&format!(", f{i}: \"\""));
+    }
+    big.push('}');
+    schema.push_str("      string t: {}\n  Pair:\n    fields:\n      Big a: {}\n      Big b: {}\n");
+    schema.push_str("  Bigs:\n    fields:\n      Big[] items: {}\n");
+    let set = set_from_yaml(&schema);
+    let w = set.walker();
+    assert_eq!(
+        decode_err(w, "Pair", &format!("a: {big}\nb: {big}\n")),
+        "b: the message is larger than the 1 GiB frame cap"
+    );
+    // The same holds for the elements of an array of messages.
+    assert_eq!(
+        decode_err(w, "Bigs", &format!("items: [{big}, {big}]\n")),
+        "items[1]: the message is larger than the 1 GiB frame cap"
+    );
+}
+
 /// `Path`: an array of fixed messages and a `string[]`, three elements each.
 ///
 /// ```text
@@ -1003,7 +1034,7 @@ fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
 
 #[test]
 fn the_scanner_finds_anchors_at_node_starts_only() {
-    let cases: [(&str, Option<(usize, usize)>); 24] = [
+    let cases: [(&str, Option<(usize, usize)>); 31] = [
         ("a: &x 1", Some((1, 4))),
         ("a: *x", Some((1, 4))),
         ("- *x", Some((1, 3))),
@@ -1025,13 +1056,23 @@ fn the_scanner_finds_anchors_at_node_starts_only() {
         ("{'a':*v}", Some((1, 6))),
         ("\"a\" :*v", Some((1, 6))),
         ("{a:*v}", None),
-        ("{a :*v}", Some((1, 5))),
+        // A plain scalar runs on past a blank: `a :*v` is one string.
+        ("{a :*v}", None),
+        ("[a :*v]", None),
+        ("[a, :*v]", None),
+        ("{a : *v}", Some((1, 6))),
         ("{[a]:*v}", Some((1, 6))),
         // A node after `---` is at column 0 for its block scalar.
         ("--- body: |\n  *text\nb: *x", Some((3, 4))),
         ("a: a*b &c", None),
         ("a: \"*x\" # &y", None),
         ("a: 'it''s *x'", None),
+        // Every YAML line break ends a line, so a block scalar on a CR-only
+        // (or NEL, LS, PS) document does not hide what follows it.
+        ("a: |\r  *text\rb: *x", Some((3, 4))),
+        ("a: |\r\n  *text\r\nb: *x", Some((3, 4))),
+        ("a: |\u{85}  *text\u{85}b: *x", Some((3, 4))),
+        ("a: |\u{2028}  *text\u{2029}b: *x", Some((3, 4))),
     ];
     for (text, want) in cases {
         assert_eq!(find_anchor_or_alias(text), want, "{text:?}");
@@ -1120,6 +1161,44 @@ fn ros_upper_bounds_accept_values_at_the_bound() {
     let empty = "name: \"\"\nids: []\ntags: []\n";
     let frame = yaml_to_message(set.walker(), "demo/Bounded", empty.as_bytes(), TS).unwrap();
     assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), empty);
+}
+
+/// A `wstring<=N` bound counts UTF-16 code units, not UTF-8 bytes: `é` is
+/// one unit in two bytes, `😀` two units in four bytes.
+#[test]
+fn a_wide_string_bound_counts_utf16_units() {
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    set.add_rosmsg_str("wstring<=1 w\nwstring<=2[<=3] ws\n", "Wide", Some("demo"))
+        .unwrap();
+    let w = set.walker();
+    let ok = "w: \"\u{e9}\"\nws: [\"ab\", \"\u{1f600}\"]\n";
+    let frame = yaml_to_message(w, "demo/Wide", ok.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), ok);
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\u{1f600}\"\nws: []\n"),
+        "w: string is 2 UTF-16 code units, over the bound of 1"
+    );
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\"\nws: [\"\", \"abc\"]\n"),
+        "ws[1]: string is 3 UTF-16 code units, over the bound of 2"
+    );
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\"\nws: [\"\", \"\", \"\", \"\"]\n"),
+        "ws: expected at most 3 elements, got 4"
+    );
+    // The largest bound the parser takes, on every bounded kind, reads a
+    // value without overflow.
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    let max = usize::MAX;
+    set.add_rosmsg_str(
+        &format!("wstring<={max} w\nstring<={max} s\nwstring<={max}[<={max}] ws\n"),
+        "Huge",
+        Some("demo"),
+    )
+    .unwrap();
+    let text = "w: \"\"\ns: \"ab\"\nws: [\"\u{1f600}\"]\n";
+    let frame = yaml_to_message(set.walker(), "demo/Huge", text.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
 }
 
 /// A value past a ROS upper bound is refused with the path and the bound.
@@ -1294,6 +1373,12 @@ fn an_anchor_after_a_block_scalar_in_a_sequence_element_is_refused() {
         decode_err(w, "List", text),
         "message YAML uses an anchor or alias at line 4, column 12; write every value out in full"
     );
+    // The parser reads CR as a line break too, so a CR-only copy of the
+    // same text is refused at the same place, not parsed with the alias.
+    assert_eq!(
+        decode_err(w, "List", &text.replace('\n', "\r")),
+        "message YAML uses an anchor or alias at line 4, column 12; write every value out in full"
+    );
     // The same text without the anchor and alias decodes, block scalar and
     // all, so the refusal above is the anchor and nothing else.
     let plain =
@@ -1400,16 +1485,66 @@ fn nesting_past_the_depth_bound_is_refused_both_ways() {
     text.push_str(&format!("{:w$}v: 1\n", "", w = 140));
     assert_eq!(
         decode_err(set.walker(), "L0", &text),
-        format!("{deep_path}: messages nest deeper than 64 levels")
+        format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
     );
     let mut frame = header(set.schema_hash("L0").unwrap(), 33, 33, 0);
     frame.push(1);
     match message_to_yaml(set.walker(), &frame) {
         Err(e) => assert_eq!(
             e.to_string(),
-            format!("{deep_path}: messages nest deeper than 64 levels")
+            format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
         ),
         Ok(t) => panic!("must be refused, got {t}"),
+    }
+}
+
+/// A fieldless message is a level too: `{}` past the bound is refused by
+/// the writer as by the reader, both as a field and as an array element.
+#[test]
+fn an_empty_message_past_the_depth_bound_is_refused_both_ways() {
+    // `L0 -> ... -> L63`, then L64 holds the fieldless `Empty` at depth 65
+    // (field `next`) and L63's twin `A63` holds it as an array element at
+    // depth 65 (`items[0]`).
+    let mut yaml = String::from("schemas:\n  Empty:\n    fields: {}\n");
+    for i in 0..64 {
+        yaml.push_str(&format!(
+            "  L{i}:\n    fields:\n      L{} next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str("  L64:\n    fields:\n      Empty next: {}\n");
+    for i in 0..63 {
+        yaml.push_str(&format!(
+            "  A{i}:\n    fields:\n      A{} next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str("  A63:\n    fields:\n      Empty[1] items: {}\n");
+    let set = set_from_yaml(&yaml);
+    let too_deep = |path: String| {
+        format!("{path}: messages and arrays of messages nest deeper than 64 levels")
+    };
+    // (root, `next:` lines before the last key, last key, its value)
+    let cases = [("L0", 64, "next", "{}"), ("A0", 63, "items", "[{}]")];
+    for (root, nexts, last, leaf) in cases {
+        let mut text = String::new();
+        for i in 0..nexts {
+            text.push_str(&format!("{:w$}next:\n", "", w = 2 * i));
+        }
+        text.push_str(&format!("{:w$}{last}: {leaf}\n", "", w = 2 * nexts));
+        let mut path = vec!["next"; nexts].join(".");
+        path.push_str(if last == "next" { ".next" } else { ".items[0]" });
+        assert_eq!(
+            decode_err(set.walker(), root, &text),
+            too_deep(path.clone()),
+            "{root}"
+        );
+        // Every message in the chain is zero bytes: the frame is a header.
+        let frame = header(set.schema_hash(root).unwrap(), 32, 32, 0);
+        match message_to_yaml(set.walker(), &frame) {
+            Err(e) => assert_eq!(e.to_string(), too_deep(path), "{root}"),
+            Ok(t) => panic!("{root} must be refused, got {t}"),
+        }
     }
 }
 
@@ -1472,6 +1607,16 @@ pose:
         (
             pose.replace("x: 1.0", "x: !meters 1.0"),
             "pose.position.x: YAML tag !meters is not supported",
+        ),
+        // A tag cannot forge the parser's own mark for an integer past 64
+        // bits: a percent escape spells the space it holds.
+        (
+            pose.replace("x: 1.0", "x: !integer%20past%2064%20bits \"5\""),
+            "pose.position.x: YAML tag !integer past 64 bits is not supported",
+        ),
+        (
+            pose.replace("x: 1.0", "x: !<!integer%20past%2064%20bits> \"5\""),
+            "pose.position.x: YAML tag !integer past 64 bits is not supported",
         ),
         (
             "[1]".to_string(),
@@ -1712,6 +1857,33 @@ fn frames_without_a_yaml_form_are_refused_by_field() {
         "more: bool byte 2 is neither 0 nor 1; the frame has no YAML form"
     );
 
+    // A scalar bool byte past 1 too, at the root and in a fixed nested
+    // message: `true` would read back as 1. Other walks still read it as
+    // true.
+    let flags = set_from_yaml(
+        "schemas:\n  Flag:\n    fields:\n      bool b: {}\n  Holder:\n    fields:\n      bool on: {}\n      Flag inner: {}\n",
+    );
+    let holder = |on: u8, b: u8| {
+        let mut f = header(flags.schema_hash("Holder").unwrap(), 34, 34, 0);
+        f.extend_from_slice(&[on, b]);
+        f
+    };
+    assert_eq!(
+        err(&flags, &holder(2, 0)),
+        "on: bool byte 2 is neither 0 nor 1; the frame has no YAML form"
+    );
+    assert_eq!(
+        err(&flags, &holder(1, 7)),
+        "inner.b: bool byte 7 is neither 0 nor 1; the frame has no YAML form"
+    );
+    assert_eq!(
+        message_to_yaml(flags.walker(), &holder(1, 0)).unwrap(),
+        "on: true\ninner:\n  b: false\n"
+    );
+    let two = holder(2, 0);
+    let walked = flags.walker().walk_by_hash(&two).unwrap();
+    assert_eq!(walked.field("on"), Some(&FrameValueKind::Bool(true)));
+
     let names = set_from_yaml("schemas:\n  Names:\n    fields:\n      string[] n: {}\n");
     let mut opaque = header(names.schema_hash("Names").unwrap(), 44, 32, 1);
     opaque.extend_from_slice(&[8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0]);
@@ -1772,11 +1944,11 @@ impl Sample<'_> {
             }
             self.yaml.push_str(&f.name);
             self.yaml.push(':');
-            self.value(&f.field_type, qname, indent);
+            self.value(&f.field_type, schema.package.as_deref(), indent);
         }
     }
 
-    fn target(&self, ft: &FieldType, parent: &str) -> Option<(String, bool)> {
+    fn target(&self, ft: &FieldType, parent: Option<&str>) -> Option<(String, bool)> {
         let FieldType::Nested {
             schema_name,
             package,
@@ -1785,18 +1957,15 @@ impl Sample<'_> {
         else {
             return None;
         };
-        let q = self
+        let (layout, schema) = self
             .walker
-            .nested_layout(schema_name, package, parent)
-            .unwrap()
-            .qualified_name
-            .clone();
-        let empty = self.walker.schema_for_name(&q).unwrap().fields.is_empty();
-        Some((q, empty))
+            .nested_target(schema_name, package, parent)
+            .unwrap();
+        Some((layout.qualified_name.clone(), schema.fields.is_empty()))
     }
 
     /// One field value after its `key:`, to the end of its lines.
-    fn value(&mut self, ft: &FieldType, parent: &str, indent: usize) {
+    fn value(&mut self, ft: &FieldType, parent: Option<&str>, indent: usize) {
         if let Some((q, empty)) = self.target(ft, parent) {
             if empty {
                 self.cdr.u8(0);
@@ -1964,33 +2133,42 @@ fn every_corpus_type_matches_the_oracle_both_ways() {
     }
 }
 
-/// Two runs in one process, and a second process, give the same bytes.
+/// Two runs in one process give the same bytes.
 #[test]
-fn encoding_is_deterministic_across_runs_and_processes() {
+fn encoding_is_deterministic_across_runs() {
     let walker = builtin_walker();
     let (codec, _) = CdrCodec::new(builtin_schemas());
-    let frames = corpus(&walker, &codec);
-    let digest = |walker: &FrameWalker| {
-        frames
-            .iter()
-            .map(|(q, frame, _)| format!("== {q}\n{}", message_to_yaml(walker, frame).unwrap()))
-            .collect::<String>()
-    };
-    let first = digest(&walker);
-    assert_eq!(first, digest(&builtin_walker()));
+    assert_eq!(
+        corpus_digest(&walker, &codec),
+        corpus_digest(&builtin_walker(), &codec)
+    );
+}
 
-    if std::env::var_os("CERULION_YAML_CODEC_CHILD").is_some() {
+/// A second process gives the same bytes. Unix only: the child is told
+/// apart by its parent's process id.
+#[cfg(unix)]
+#[test]
+fn encoding_is_deterministic_across_processes() {
+    let walker = builtin_walker();
+    let (codec, _) = CdrCodec::new(builtin_schemas());
+    let first = corpus_digest(&walker, &codec);
+
+    // Child mode only when THIS test's parent spawned us: the variable
+    // carries the parent's process id, so a value inherited from the shell
+    // never skips the comparison.
+    let parent = std::os::unix::process::parent_id().to_string();
+    if std::env::var_os("CERULION_YAML_CODEC_CHILD").is_some_and(|v| v == parent.as_str()) {
         print!("<<<{first}>>>");
         return;
     }
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "dynamic::message_yaml::tests::encoding_is_deterministic_across_runs_and_processes",
+            "dynamic::message_yaml::tests::encoding_is_deterministic_across_processes",
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CERULION_YAML_CODEC_CHILD", "1")
+        .env("CERULION_YAML_CODEC_CHILD", std::process::id().to_string())
         .output()
         .expect("spawn the test binary");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2001,6 +2179,14 @@ fn encoding_is_deterministic_across_runs_and_processes() {
         first,
         "a second process must print the same YAML"
     );
+}
+
+/// The YAML of every corpus frame, in corpus order.
+fn corpus_digest(walker: &FrameWalker, codec: &CdrCodec) -> String {
+    corpus(walker, codec)
+        .iter()
+        .map(|(q, frame, _)| format!("== {q}\n{}", message_to_yaml(walker, frame).unwrap()))
+        .collect()
 }
 
 /// Zero-size messages: `Row` is 2^20 empty messages and `Big` is 2^20
@@ -2146,4 +2332,131 @@ fn arrays_past_the_walker_depth_are_refused_on_read() {
     );
     let frame = yaml_to_message(w, "M1", eight.as_bytes(), TS).unwrap();
     assert_eq!(message_to_yaml(w, &frame).unwrap(), eight);
+}
+
+/// `pkg2/Root { Leaf leaf; uint8 tag }` beside a real `pkg2/Leaf { float64
+/// v }` AND a package-less schema NAMED `pkg2/Leaf` (`{ uint8 v }`), listed
+/// last so it owns the qualified text. The bare `Leaf` inside `Root` is the
+/// packaged one, so `Root` is leaf@0 size 8, tag@8, padded to 16.
+fn twin_schemas() -> Vec<MessageSchema> {
+    let leaf_ref = FieldType::Nested {
+        schema_name: "Leaf".to_string(),
+        package: None,
+        fixed: None,
+    };
+    let mut leaf = MessageSchema::new_in_package("Leaf", "pkg2");
+    leaf.fields.push(FieldDef::new("v", FieldType::F64));
+    let mut root = MessageSchema::new_in_package("Root", "pkg2");
+    root.fields.push(FieldDef::new("leaf", leaf_ref));
+    root.fields.push(FieldDef::new("tag", FieldType::U8));
+    vec![
+        leaf,
+        root,
+        one_field_schema("pkg2/Leaf", "v", FieldType::U8),
+    ]
+}
+
+/// The `pkg2/Root` frame for leaf.v=2.5, tag=7, by hand: 2.5 is
+/// `0x4004_0000_0000_0000`, then the tag and 7 pad bytes; no variable
+/// fields, so the table offset is the end of the 16-byte fixed section.
+fn twin_root_frame(hash: u64) -> Vec<u8> {
+    let mut f = header(hash, 48, 48, 0);
+    f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40, 7, 0, 0, 0, 0, 0, 0, 0]);
+    f
+}
+
+const TWIN_ROOT_TEXT: &str = "leaf:\n  v: 2.5\ntag: 7\n";
+
+/// The nested field prints with the fields of the schema it binds to (the
+/// packaged `float64 v`), never those of the twin that owns the text.
+#[test]
+fn encode_prints_a_nested_twin_with_the_schema_it_binds_to() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let hash = walker.schema_hash_for("pkg2/Root").unwrap();
+    let yaml = message_to_yaml_with(
+        &walker,
+        &twin_root_frame(hash),
+        YamlEncodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(yaml, TWIN_ROOT_TEXT);
+}
+
+/// Decoding writes the nested field with the layout AND the field list of
+/// the schema it binds to, so the bytes are the hand-written frame.
+#[test]
+fn decode_writes_a_nested_twin_with_the_schema_it_binds_to() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let hash = walker.schema_hash_for("pkg2/Root").unwrap();
+    let frame = yaml_to_message(&walker, "pkg2/Root", TWIN_ROOT_TEXT.as_bytes(), TS).unwrap();
+    assert_eq!(frame, twin_root_frame(hash));
+}
+
+/// A frame of the packaged `pkg2/Leaf` (its own hash) prints with its own
+/// `float64 v`, although the package-less twin owns the name `pkg2/Leaf`.
+#[test]
+fn encode_prints_a_frame_with_the_schema_of_its_own_hash() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let (mut resolver, _) = crate::codegen::layout::LayoutResolver::new(twin_schemas());
+    let packaged = resolver.layout_at(0).unwrap().schema_hash;
+    let owner = walker.schema_hash_for("pkg2/Leaf").unwrap();
+    assert_ne!(packaged, owner, "the twins must carry distinct hashes");
+    let mut frame = header(packaged, 40, 40, 0);
+    frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40]);
+    let yaml = message_to_yaml_with(&walker, &frame, YamlEncodeOptions::default()).unwrap();
+    assert_eq!(yaml, "v: 2.5\n");
+}
+
+/// `C0 { C1[1] next }` .. `C{n-1} { C{n}[1] next }`, `C{n} { uint8 v }`:
+/// `n` fixed arrays of one fixed message, so the frame is the one `v` byte.
+fn fixed_chain_set(n: usize) -> SchemaSet {
+    let mut yaml = String::from("schemas:\n");
+    for i in 0..n {
+        yaml.push_str(&format!(
+            "  C{i}:\n    fields:\n      C{}[1] next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str(&format!("  C{n}:\n    fields:\n      uint8 v: {{}}\n"));
+    set_from_yaml(&yaml)
+}
+
+/// The YAML of [`fixed_chain_set`] with `v: 7`: each level is a `next:`
+/// key and a one-element block sequence, the element's key two columns
+/// past its dash.
+fn fixed_chain_text(n: usize) -> String {
+    let mut text = String::from("next:\n");
+    for k in 1..n {
+        text.push_str(&format!("{:w$}- next:\n", "", w = 4 * k - 2));
+    }
+    text.push_str(&format!("{:w$}- v: 7\n", "", w = 4 * n - 2));
+    text
+}
+
+/// An array of messages is a nesting level of its own, as its sequence is
+/// one more YAML container: 32 arrays of one message (65 mappings and
+/// sequences) print and read back, and 33 are refused both ways at the
+/// same path, so the encoder never prints what the reader cannot read.
+#[test]
+fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
+    let set = fixed_chain_set(32);
+    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    frame.push(7);
+    let text = fixed_chain_text(32);
+    assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
+    assert_eq!(
+        yaml_to_message(set.walker(), "C0", text.as_bytes(), TS).unwrap(),
+        frame
+    );
+
+    let set = fixed_chain_set(33);
+    let deep_path = vec!["next[0]"; 33].join(".");
+    let want = format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels");
+    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    frame.push(7);
+    match message_to_yaml(set.walker(), &frame) {
+        Err(e) => assert_eq!(e.to_string(), want),
+        Ok(t) => panic!("must be refused, got {t}"),
+    }
+    assert_eq!(decode_err(set.walker(), "C0", &fixed_chain_text(33)), want);
 }

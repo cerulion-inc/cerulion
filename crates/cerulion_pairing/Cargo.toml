@@ -69,6 +69,11 @@ thiserror = "2"
 # binary that links this crate (vendor firmware, the Studio sidecar). Capping
 # the max level is a final-binary decision — a library must never make it.
 tracing = { version = "0.1.44" }
+# The config directory rule of the machine identity (`identity`): the home
+# directory when `CERULION_HOME` is unset. Already in the lockfile.
+dirs = "6"
+# OS entropy for a fresh machine key (`identity`). Already in the lockfile.
+getrandom = "0.3"
 
 [dev-dependencies]
 # Tests exercise the real issuer/CA signing API with fixed-seed keys.
@@ -81,3 +86,14 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # (proving the structural magic/version checks run AFTER the MAC verifies).
 hmac = "0.12"
 sha2 = "0.10"
+# Independent checks of the team X.509 profile: x509-parser reads the issued
+# DER field by field, rustls-webpki (the verifier the network links use)
+# accepts it for client and server authentication, rcgen builds certificates
+# that leave the profile for the refusal tests, and data-encoding is the
+# base32 oracle for the alt name URIs.
+x509-parser = "0.18"
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.14"
+data-encoding = "2"
+time = "0.3"

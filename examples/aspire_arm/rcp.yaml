@@ -1,0 +1,48 @@
+# The Robot Context Protocol surface of this workspace: what an agent connected
+# to `cerulion-rcpd --manifest rcp.yaml` may see and do. Tools not listed here
+# do not exist; `estop` is always present and never gated.
+robot: aspire-arm
+graph: graphs/aspire_arm.yaml
+journal:
+  calls_topic: /rcp/calls
+  results_topic: /rcp/results
+state:
+  - name: arm
+    topic: /arm/state
+tools:
+  - name: arm.reset
+    description: >-
+      Put the arm at its home configuration with the gripper open and place
+      the cube on the table at a position chosen by the seed.
+    safety_class: reversible
+    timeout_ms: 2000
+    input_schema:
+      type: object
+      properties:
+        seed:
+          type: integer
+          minimum: 0
+          description: Chooses the cube position; the same seed gives the same scene.
+      required: [seed]
+  - name: arm.step
+    description: >-
+      Advance the arm one 50 ms control period toward a joint target (each
+      joint moves at most 0.05 rad) and the gripper toward a closure in 0..1
+      (at most 0.25 per period). Returns the new state.
+    safety_class: reversible
+    timeout_ms: 2000
+    input_schema:
+      type: object
+      properties:
+        q_target:
+          type: array
+          items: { type: number, minimum: -3.0, maximum: 3.0 }
+          minItems: 6
+          maxItems: 6
+          description: base_yaw, shoulder_pitch, elbow_pitch, wrist_pitch, wrist_roll, tool_roll in radians.
+        gripper:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          description: 0 is open, 1 is closed.
+      required: [q_target, gripper]

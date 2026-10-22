@@ -274,6 +274,18 @@ fn dispatch(cli: Cli) -> ExitCode {
         }
     }
 
+    // The Android viz refusal is hoisted ABOVE the identity gate for the same
+    // reason the resim one is: an unsupported platform must never answer with
+    // a sign-in prompt. `unsupported_viz_message` is a pure platform check, so
+    // the hoist refuses nothing it did not refuse before. It exits 1
+    // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
+    // error through the generic dispatch: the command line is well-formed, so
+    // it is not a usage error (2), and the hoist must not change the code.
+    if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
+        eprintln!("Error: {refusal}");
+        return ExitCode::FAILURE;
+    }
+
     if command_needs_identity(&cli.command) {
         if let Some(refused) = login_gate() {
             return refused;
@@ -2054,99 +2066,32 @@ fn run(cli: Cli) -> CliResult<()> {
                 connect,
                 listen,
                 scan,
+                show_types,
             } => {
-                // LOCAL topics print FIRST/instantly, so a slow or
-                // failing remote query never delays or hides them.
-                //
-                // A LOCAL `*/data` service that is really a
-                // MIRROR of a remote robot (its canonical name is in the
-                // `/__cerulion/mirrors` provenance registry) must NOT present as a
-                // second LOCAL topic (the "one data source = one topic"
-                // decision). Gather provenance (best-effort; instant on a desk with
-                // no live mirror) and PARTITION the local enumeration before
-                // printing: genuine-local topics stay under LOCAL, mirrored ones
-                // fold into the REMOTE section as `● streaming` rows attributed to
-                // their origin robot.
-                //
-                // The framework's own channels (`/bagd/status` while a
-                // recording runs, anything under `/__cerulion/`) are HIDDEN
-                // from this LOCAL section by default and named by a count
-                // line; `--all` shows them with an `internal` marker. REMOTE
-                // rows (network and mirror alike) are never filtered. The renderer is the
-                // engine's oracle-tested `render_local_topics_section`; the
-                // binary prints its string verbatim.
-                let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_identities()?;
-                let (genuine_local, streaming) =
-                    topic_cmd::partition_local_topics(topics, &mirrors);
-                print!(
-                    "{}",
-                    topic_cmd::render_local_topics_section(&genuine_local, all)
-                );
-                // Automagic: remote discovery runs BY DEFAULT with
-                // scouting ON — unpaired robots on the LAN show up with no
-                // flags. `--no-network` skips it (scripts / CI / offline).
-                // The options are built by the ENGINE's unit-pinned builder
-                // (`remote_discovery_options` — the
-                // scouting-ON default lives there, not in an untested literal
-                // here). Because remote discovery is the DEFAULT, a
-                // session/query failure must NOT fail the whole command (the
-                // LOCAL list is already printed) — it is a LOUD note + exit 0.
-                // Never a silent empty, never a fake-success.
-                //
-                // The mirror-streaming rows are LOCAL knowledge (read from
-                // SHM, not the network), so they must ALWAYS render — even under
-                // `--no-network` and even when the network query fails — or a
-                // partitioned-out mirror would vanish entirely. `remote_rendered`
-                // tracks whether an Ok remote render already folded them in.
-                let mut remote_rendered = false;
-                if let Some(opts) = topic_cmd::remote_discovery_options(no_network, connect, listen)
-                {
-                    // Discovery rung 4: `--scan` (opt-in) appends the unicast
-                    // subnet-sweep rung to the discovery ladder. This flag is the
-                    // SOLE producer of a `true` scan — the structural guarantee
-                    // that the sweep never fires on a default run (a horizontal
-                    // SYN sweep reads as port-scan recon to corporate IDS).
-                    match topic_cmd::query_remote_topics_with_scan(&opts, scan) {
-                        Ok(disc) => {
-                            print!(
-                                "{}",
-                                topic_cmd::render_remote_topics_section_with_mirrors(
-                                    &disc,
-                                    opts.has_endpoints(),
-                                    &streaming
-                                )
-                            );
-                            remote_rendered = true;
-                        }
-                        Err(e) => {
-                            // Loud note — the remote half is best-effort;
-                            // the local topics already printed. `--no-network`
-                            // skips this query entirely.
-                            // One line, the shape of the empty-success
-                            // `remote:` line (no header with no rows under it).
-                            // The ENGINE renders it (exact oracle there, the
-                            // docs quote that sentence); printed verbatim, the
-                            // newline is part of the returned string.
-                            eprint!("{}", topic_cmd::render_remote_discovery_unavailable(&e));
-                        }
-                    }
-                }
-                // Render the LOCAL mirror-streaming rows if an Ok remote
-                // render did not already fold them in (--no-network, or a remote
-                // query failure). A mirror is REMOTE regardless of the network
-                // query, since its provenance is read from local SHM.
-                if !remote_rendered && !streaming.is_empty() {
-                    print!(
-                        "{}",
-                        topic_cmd::render_remote_topics_section_with_mirrors(
-                            &topic_cmd::RemoteDiscovery::empty(),
-                            false,
-                            &streaming
-                        )
-                    );
-                }
-                Ok(())
+                // The engine owns the whole listing flow (local first, the
+                // mirror fold, the best-effort remote half) for the plain and
+                // the `-t` listing alike; the binary hands it the parsed flags.
+                // The remote options come from the engine's unit-pinned
+                // builder, which holds the automagic default. Only `-t`
+                // names types, so only `-t` looks for the workspace.
+                let ws = if show_types {
+                    discover_optional_workspace()?
+                } else {
+                    None
+                };
+                topic_cmd::introspect::print_topic_list(
+                    all,
+                    if show_types {
+                        topic_cmd::introspect::TypeColumn::Shown
+                    } else {
+                        topic_cmd::introspect::TypeColumn::Hidden
+                    },
+                    topic_cmd::remote_discovery_options(no_network, connect, listen),
+                    scan,
+                    ws.as_ref().map(|w| w.schemas_dir.as_path()),
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
             }
             TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
@@ -2675,6 +2620,18 @@ fn discover_workspace() -> CliResult<CerulionWorkspace> {
     CerulionWorkspace::discover(&cwd)
 }
 
+/// The workspace for a verb that also works outside one: `None` when the
+/// current directory is in no workspace, and any other discovery failure (a
+/// workspace `Cargo.toml` that cannot be read) returned, so the verb never
+/// quietly drops the workspace types it was asked to name.
+fn discover_optional_workspace() -> CliResult<Option<CerulionWorkspace>> {
+    match discover_workspace() {
+        Ok(ws) => Ok(Some(ws)),
+        Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// `cerulion viz [TOPIC…] [--robot NAME] [--detach]` — the
 /// daemon CLIENT path. `cerulion viz` compiles no graph per run: it
 /// ensures the long-lived `cerulion-vizd` daemon is running (spawning it detached
@@ -2707,6 +2664,11 @@ fn run_viz(
     listen: &[String],
     detach: bool,
 ) -> CliResult<()> {
+    if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
+        return Err(cerulion_cli_engine::error::CliError::Validation(
+            message.to_string(),
+        ));
+    }
     #[cfg(not(unix))]
     {
         let _ = (running, topics, robot, connect, listen, detach);
@@ -2777,11 +2739,17 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
+    // A remote attach under a kill switch is refused after the arg-shape checks
+    // and before any daemon is spawned or contacted.
+    if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
+        return Err(val(refusal));
+    }
+
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are
     //    threaded into its network config (env-at-spawn); a daemon already running
     //    keeps its own boot-time locators (a shared long-lived daemon's config is
-    //    fixed at start — scouting covers the LAN regardless).
+    //    fixed at start).
     let socket = viz_client::vizd_socket_path();
     let log_path = viz_client::vizd_log_path(&socket);
     let log_for_spawn = log_path.clone();
@@ -2823,14 +2791,13 @@ fn run_viz_unix(
 
     // Note to the user: locators given, but the daemon was ALREADY running — this
     // command's locators do not reconfigure a live shared daemon (its network
-    // config is fixed at start). Scouting (on by default) still covers a LAN
-    // robot; restart the daemon to bake in new locators for a robot scouting
-    // can't reach. Never a silent drop (the project's loud-inference rule).
+    // config is fixed at start). Restart the daemon to bake in new locators.
+    // Never a silent drop (the project's loud-inference rule).
     if !spawned && (!connect.is_empty() || !listen.is_empty()) {
         eprintln!(
             "cerulion viz: note — the cerulion-vizd daemon was already running, so \
              --connect/--listen apply only to a daemon THIS command starts; the running daemon \
-             keeps its boot-time locators (scouting still covers LAN robots). Restart it \
+             keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
     }
@@ -3777,6 +3744,17 @@ fn command_needs_identity(command: &Commands) -> bool {
     )
 }
 
+/// The platform refusal for `cerulion viz`, when the platform cannot run it,
+/// lifted out of `run_viz` so `dispatch` can refuse BEFORE the identity gate.
+/// `is_android` is an argument (not a cfg read) so the decision is
+/// oracle-testable on host. PURE.
+fn viz_refusal(command: &Commands, is_android: bool) -> Option<&'static str> {
+    if !matches!(command, Commands::Viz { .. }) {
+        return None;
+    }
+    cerulion_cli_engine::viz_client::unsupported_viz_message(is_android)
+}
+
 /// Install the process-wide shutdown-signal handler and return the shared
 /// `running` flag every long-running verb (`graph run`, `topic echo`/`hz`, …)
 /// polls to exit cleanly.
@@ -3999,6 +3977,28 @@ mod login_gate_exemption_tests {
     }
 
     #[test]
+    fn the_android_viz_refusal_fires_before_the_identity_gate() {
+        // A never-signed-in Android device must see the platform refusal, not
+        // a sign-in prompt: `viz_refusal` is what `dispatch` checks above the
+        // gate, and `viz` stays gated underneath it (it is NOT exempted).
+        let viz = Commands::Viz {
+            topics: vec!["/t".to_string()],
+            robot: None,
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(command_needs_identity(&viz));
+        assert_eq!(
+            viz_refusal(&viz, true),
+            cerulion_cli_engine::viz_client::unsupported_viz_message(true)
+        );
+        assert!(viz_refusal(&viz, true).is_some());
+        assert!(viz_refusal(&viz, false).is_none());
+        assert!(viz_refusal(&Commands::Login, true).is_none());
+    }
+
+    #[test]
     fn ordinary_verbs_are_gated() {
         // A representative spread of user-facing verbs must gate. Without this
         // arm every assertion above would still hold for a build that exempted
@@ -4011,6 +4011,7 @@ mod login_gate_exemption_tests {
                 connect: Vec::new(),
                 listen: Vec::new(),
                 scan: false,
+                show_types: false,
             },
         }));
         assert!(command_needs_identity(&Commands::Graph {

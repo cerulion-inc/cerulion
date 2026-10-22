@@ -345,12 +345,13 @@ extern "C" {
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
 
     /// The introspection accessors, each called inside a `noexcept` C++
-    /// wrapper that catches every exception (Lyrical's `rosidl::Buffer`
-    /// accessors throw on a non-CPU backend) and returns 0 on success,
+    /// wrapper that catches every exception and returns 0 on success,
     /// nonzero when the accessor threw. A nonzero status is a refused frame
     /// on the Rust side, never a foreign unwind. No accessor pointer is
-    /// called directly from Rust; `size_function` is the one exception,
-    /// documented as non-throwing on every backend.
+    /// called directly from Rust except a non-Buffer member's
+    /// `size_function`. A Lyrical `rosidl::Buffer` member, whose accessors
+    /// throw on a non-CPU backend, has its size, bytes and fill read and
+    /// written through [`crate::rosidl_buffer`] instead.
     pub(crate) fn rmw_cerulion_member_get_const(
         f: unsafe extern "C" fn(*const c_void, usize) -> *const c_void,
         m: *const c_void,

@@ -4,6 +4,7 @@ members = [
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
+    "crates/cerulion_android",
     # Local Studio workspace engine daemon. It links cli_engine, so it inherits
     # the workspace AGPL license rather than being a proprietary client library.
     "crates/cerulion_wsd",
@@ -191,6 +192,10 @@ members = [
     # ONLY through the preload, never a static link. Consumed by
     # `cerulion_heaphook/tests/heaphook_e2e_test.rs` (built first on Linux CI).
     "crates/test_fixtures/heaphook_probe",
+    # Compiled codegen fixture: .msg constants and string/array/all-zero
+    # defaults generated at build time; consumed by cerulion_core's
+    # codegen_defaults_compiled_test.
+    "crates/test_fixtures/codegen_fixture_msgs",
     # A trivial second malloc interposer preloaded AHEAD of the hook,
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
@@ -297,6 +302,10 @@ members = [
     # inverted whole-build tree `cargo tree -e normal -i axum` (empty on a default
     # build).
     "crates/cerulion_accountd",
+    # The Robot Context Protocol daemon: an MCP server over the live robot
+    # graph. Hosts streamable HTTP on hyper (already in the default build),
+    # not axum, so its only new crates are rmcp and its small helpers.
+    "crates/cerulion_rcpd",
 ]
 # default-members: the LEAN build set — every workspace member EXCEPT the
 # heavy-tree crates: the `cerulion_viz/*` crates (the `rerun` SDK, ~39 crates) AND
@@ -340,6 +349,9 @@ default-members = [
     "crates/cerulion_wire",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
+    # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
+    # default build: its HTTP side runs on hyper, already here.
+    "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via
@@ -480,6 +492,7 @@ cerulion_core = { path = "crates/cerulion_core", version = "=1.0.0" }
 cerulion_bag = { path = "crates/cerulion_bag", version = "=1.0.0" }
 cerulion_bagd = { path = "crates/cerulion_bagd", version = "=1.0.0" }
 cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=1.0.0" }
+indexmap = "2.8"
 cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=1.0.0" }
 cerulion_dds = { path = "crates/cerulion_dds", version = "=1.0.0", default-features = false }
 cerulion_discovery = { path = "crates/cerulion_discovery", version = "=1.0.0" }
@@ -580,8 +593,9 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # on any `rerun` feature change.
 re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
 
-# A FORK of iceoryx2-bb-posix 0.10.0 removing the process umask from
-# `UnixDatagramSocket::bind`.
+# A FORK of iceoryx2 0.10.0 removing the process umask from
+# `UnixDatagramSocket::bind` (iceoryx2-bb-posix) and fixing the macOS shm
+# descriptor table (iceoryx2-pal-posix, below).
 #
 # `bind` installed a process global umask of `!permission` for the duration of
 # the bind and restored it on scope exit. The umask is per PROCESS, so while one
@@ -606,36 +620,50 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # its `SOCKET_PERMISSIONS` is `OWNER_ALL`, whose complement leaves the search bit
 # alone.
 #
+# The same revision also fixes the macOS shared-memory descriptor table in
+# `iceoryx2-pal-posix`. Each statically linked copy of iceoryx2 (the host and
+# every node cdylib) keeps its own table from a shm descriptor to its
+# `.shm_state` file, and a node cdylib drops the ports the host built for it, so
+# a host descriptor can be closed through the cdylib's copy and leave a stale
+# entry in the host's. The released 0.10.0 then refuses the reused number in
+# `shm_open` (ENFILE, so `graph run` stops at pre-create) and routes a regular
+# file's `fchmod`/`fstat` on that number into the stale side file. The fork
+# replaces a stale entry on `shm_open` and answers lookups only while the
+# descriptor is still a shm object. Pinned by
+# `crates/cerulion_core/tests/cdylib_shm_fd_handoff_iox2_test.rs`.
+#
 # SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
 # follow our published crates, so anyone depending on a released `cerulion_core`
-# resolves the unpatched upstream until the fix merges there.
+# resolves the unpatched upstream until the fixes merge there. Node cdylibs
+# built outside this workspace keep the released copy; the host's fixed copy
+# recovers on its own.
 #
-# EXIT CONDITION: drop this entry when an iceoryx2 release carries the fix.
+# EXIT CONDITION: drop this entry when an iceoryx2 release carries BOTH fixes.
 # THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
 # build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
 # crates.io members keep theirs, and the same types then exist twice. Every
 # member the graph carries is listed so exactly one copy of each is resolved.
 # This pin also provides Android filesystem paths, file-backed named shared
 # memory with private-directory checks, and abstract-namespace Unix datagram sockets.
-iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
-iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "56ddaedad57716d50806d67c116baa02a5808c63" }
+iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }

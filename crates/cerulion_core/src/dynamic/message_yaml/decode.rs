@@ -41,6 +41,7 @@ use crate::wire::WireHeader;
 ///   [`DynamicError::YamlUnknownField`], [`DynamicError::YamlMissingField`],
 ///   [`DynamicError::YamlWrongLength`], [`DynamicError::YamlTooManyElements`],
 ///   [`DynamicError::YamlStringTooLong`],
+///   [`DynamicError::YamlWideStringTooLong`],
 ///   [`DynamicError::YamlNulInFixedString`], [`DynamicError::YamlTruncated`],
 ///   [`DynamicError::YamlTag`].
 /// - Schema shape errors: [`DynamicError::YamlUnsupportedField`],
@@ -65,8 +66,10 @@ pub(super) fn yaml_to_message_capped(
     timestamp_ns: u64,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DynamicError> {
-    let layout = walker
+    // One slot gives both halves (see `FrameWalker::schema_for_name`).
+    let (layout, resolved) = walker
         .layout_for_name(schema)
+        .zip(walker.schema_for_name(schema))
         .ok_or_else(|| DynamicError::UnknownSchema(schema.to_string()))?;
     // The value tree costs a bounded multiple of the text, so the text is
     // bounded before it is parsed.
@@ -92,8 +95,9 @@ pub(super) fn yaml_to_message_capped(
         walker,
         path: String::new(),
         array_depth: 0,
+        held: 0,
     };
-    let payload = builder.body(layout, &value, 0)?;
+    let payload = builder.body((layout, resolved), &value, 0)?;
     let total = WireHeader::SIZE + payload.len();
     let total_size =
         u32::try_from(total).map_err(|_| DynamicError::YamlMessageTooLarge { path: shown("") })?;
@@ -156,17 +160,44 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
+/// A message type the builder writes: its layout and its resolved schema,
+/// both from one walker slot.
+type Target<'w> = (&'w WireLayout, &'w MessageSchema);
+
 struct Builder<'w> {
     walker: &'w FrameWalker,
     path: String,
     /// How many elements of variable-message arrays enclose the value
     /// being built.
     array_depth: usize,
+    /// Bytes the unfinished bodies and arrays on the build stack already
+    /// hold. Every one of them ends up in the frame, so the sum is kept
+    /// under [`MAX_BODY_BYTES`] as it grows: a few bytes of YAML (unset
+    /// `string_fixed` fields, say) cannot make the reader hold more than
+    /// one frame's worth before it refuses.
+    held: usize,
 }
 
 impl<'w> Builder<'w> {
     fn here(&self) -> String {
         shown(&self.path)
+    }
+
+    /// Refuse when `n` more bytes would take the frame past the cap.
+    fn room(&self, n: usize) -> Result<(), DynamicError> {
+        if self.held.checked_add(n).is_none_or(|t| t > MAX_BODY_BYTES) {
+            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
+        }
+        Ok(())
+    }
+
+    /// Count `n` more bytes as held, refusing past the cap. A function that
+    /// returns a buffer gives its holds back first (`held` is reset to its
+    /// value on entry), and the caller holds the returned length.
+    fn hold(&mut self, n: usize) -> Result<(), DynamicError> {
+        self.room(n)?;
+        self.held += n;
+        Ok(())
     }
 
     fn wrong(&self, expected: &FieldType, got: &Value) -> DynamicError {
@@ -226,23 +257,16 @@ impl<'w> Builder<'w> {
         Ok(())
     }
 
-    fn schema(&self, layout: &WireLayout) -> Result<&'w MessageSchema, DynamicError> {
-        self.walker
-            .schema_for_name(&layout.qualified_name)
-            .ok_or_else(|| DynamicError::YamlUnresolvedNested {
-                path: self.here(),
-                target: layout.qualified_name.clone(),
-            })
-    }
-
+    /// The layout and schema a nested reference, written inside a schema
+    /// of package `parent`, resolves to.
     fn nested(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent: &str,
-    ) -> Result<&'w WireLayout, DynamicError> {
+        parent: Option<&str>,
+    ) -> Result<Target<'w>, DynamicError> {
         self.walker
-            .nested_layout(schema_name, package, parent)
+            .nested_target(schema_name, package, parent)
             .ok_or_else(|| DynamicError::YamlUnresolvedNested {
                 path: self.here(),
                 target: match package {
@@ -310,27 +334,26 @@ impl<'w> Builder<'w> {
             .collect()
     }
 
-    /// A headerless body `[fixed][offset table][variable]` for `layout`.
+    /// A headerless body `[fixed][offset table][variable]` for `target`.
     fn body(
         &mut self,
-        layout: &WireLayout,
+        (layout, schema): Target<'w>,
         v: &Value,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         self.too_deep(depth)?;
-        let schema = self.schema(layout)?;
+        let parent = schema.package.as_deref();
         let values = self.fields(schema, v)?;
         // The builder allocates the whole fixed section up front, so a
-        // schema whose fixed section alone passes the cap is refused before
-        // that allocation, not after it: a few bytes of YAML must not make
-        // the reader ask for gigabytes.
+        // fixed section that does not fit what is left of the cap is
+        // refused before that allocation, not after it: a few bytes of YAML
+        // must not make the reader ask for gigabytes.
+        let base = self.held;
         let floor = layout
             .fixed_size
             .checked_add(layout.offset_table_bytes())
-            .filter(|&n| n <= MAX_BODY_BYTES);
-        if floor.is_none() {
-            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
-        }
+            .ok_or_else(|| DynamicError::YamlMessageTooLarge { path: self.here() })?;
+        self.hold(floor)?;
         let mut builder = CanonicalBodyBuilder::new(layout);
         let mut fixed_idx = 0;
         for (field, value) in schema.fields.iter().zip(values) {
@@ -338,8 +361,8 @@ impl<'w> Builder<'w> {
             push_field(&mut self.path, &field.name);
             self.within_bounds(field, value)?;
             if field.field_type.is_variable() {
-                let bytes =
-                    self.variable(&field.field_type, value, &layout.qualified_name, depth)?;
+                let bytes = self.variable(&field.field_type, value, parent, depth)?;
+                self.hold(bytes.len())?;
                 builder
                     .push_variable(bytes)
                     .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })?;
@@ -348,10 +371,11 @@ impl<'w> Builder<'w> {
                 fixed_idx += 1;
                 let range = fl.offset..fl.offset + fl.size;
                 let dst = &mut builder.fixed_mut()[range];
-                self.fixed(&field.field_type, value, dst, &layout.qualified_name, depth)?;
+                self.fixed(&field.field_type, value, dst, parent, depth)?;
             }
             self.path.truncate(mark);
         }
+        self.held = base;
         builder
             .finish()
             .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })
@@ -364,29 +388,38 @@ impl<'w> Builder<'w> {
         let FieldBounds {
             max_elements,
             max_string_bytes,
+            max_wstring_units,
         } = field.bounds;
-        let too_long = |path: String, s: &str, bound: usize| {
-            if s.len() > bound {
+        let too_long = |path: &str, s: &str| {
+            if let Some(bound) = max_string_bytes.filter(|&b| s.len() > b) {
                 return Err(DynamicError::YamlStringTooLong {
-                    path,
+                    path: shown(path),
                     bound,
                     got: s.len(),
                 });
             }
+            if let Some(bound) = max_wstring_units {
+                // No arithmetic on the bound: any `usize` the parser takes,
+                // `usize::MAX` included, is a valid one.
+                let got = s.encode_utf16().count();
+                if got > bound {
+                    return Err(DynamicError::YamlWideStringTooLong {
+                        path: shown(path),
+                        bound,
+                        got,
+                    });
+                }
+            }
             Ok(())
         };
+        let strings_bounded = max_string_bytes.is_some() || max_wstring_units.is_some();
         let is_array = matches!(
             field.field_type,
             FieldType::DynamicArray { .. } | FieldType::FixedArray { .. }
         );
         match v {
-            Value::String(s) if !is_array => match max_string_bytes {
-                Some(bound) => too_long(self.here(), s, bound),
-                None => Ok(()),
-            },
-            Value::Sequence(_)
-                if is_array && (max_elements.is_some() || max_string_bytes.is_some()) =>
-            {
+            Value::String(s) if !is_array => too_long(&self.path, s),
+            Value::Sequence(_) if is_array && (max_elements.is_some() || strings_bounded) => {
                 // A `!truncated` element is refused first, with its own
                 // message, as for any array.
                 let items = self.sequence(&field.field_type, v, None)?;
@@ -399,12 +432,12 @@ impl<'w> Builder<'w> {
                         });
                     }
                 }
-                if let Some(bound) = max_string_bytes {
+                if strings_bounded {
                     for (i, item) in items.iter().enumerate() {
                         if let Value::String(s) = item {
                             let mut path = self.path.clone();
                             push_index(&mut path, i);
-                            too_long(path, s, bound)?;
+                            too_long(&path, s)?;
                         }
                     }
                 }
@@ -420,7 +453,7 @@ impl<'w> Builder<'w> {
         ft: &FieldType,
         v: &Value,
         dst: &mut [u8],
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<(), DynamicError> {
         let v = self.untagged(v)?;
@@ -460,12 +493,13 @@ impl<'w> Builder<'w> {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
                     let start = i * stride;
+                    // The sequence is a level (see `MAX_YAML_DEPTH`).
                     self.fixed(
                         element_type,
                         item,
                         &mut dst[start..start + stride],
                         parent,
-                        depth,
+                        depth + 1,
                     )?;
                     self.path.truncate(mark);
                 }
@@ -477,8 +511,7 @@ impl<'w> Builder<'w> {
                 ..
             } => {
                 self.too_deep(depth + 1)?;
-                let target = self.nested(schema_name, package, parent)?;
-                let schema = self.schema(target)?;
+                let (target, schema) = self.nested(schema_name, package, parent)?;
                 let values = self.fields(schema, v)?;
                 for (field, value) in schema.fields.iter().zip(values) {
                     let fl = target
@@ -496,7 +529,7 @@ impl<'w> Builder<'w> {
                         &field.field_type,
                         value,
                         &mut dst[range],
-                        &target.qualified_name,
+                        schema.package.as_deref(),
                         depth + 1,
                     )?;
                     self.path.truncate(mark);
@@ -607,6 +640,7 @@ impl<'w> Builder<'w> {
                     walker: self.walker,
                     path,
                     array_depth: self.array_depth,
+                    held: self.held,
                 };
                 at.untagged(item)?;
             }
@@ -628,14 +662,14 @@ impl<'w> Builder<'w> {
         &mut self,
         ft: &FieldType,
         v: &Value,
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         let v = self.untagged(v)?;
         match ft {
             FieldType::String => match v {
                 Value::String(s) => {
-                    cap(s.as_bytes(), &self.path)?;
+                    self.room(s.len())?;
                     Ok(s.as_bytes().to_vec())
                 }
                 other => Err(self.wrong(ft, other)),
@@ -675,13 +709,11 @@ impl<'w> Builder<'w> {
         // The payload size is known before any of it is built: refuse one
         // past the cap here, not after building it.
         let size = elem.fixed_size().unwrap_or(1);
-        if items
+        let n = items
             .len()
             .checked_mul(size)
-            .is_none_or(|n| n > MAX_BODY_BYTES)
-        {
-            return Err(DynamicError::YamlMessageTooLarge { path: self.here() });
-        }
+            .ok_or_else(|| DynamicError::YamlMessageTooLarge { path: self.here() })?;
+        self.room(n)?;
         let mut out = Vec::with_capacity(items.len() * size);
         for (i, item) in items.iter().enumerate() {
             let mark = self.path.len();
@@ -698,7 +730,7 @@ impl<'w> Builder<'w> {
         elem: &FieldType,
         v: &Value,
         exact: Option<usize>,
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         match elem {
@@ -718,16 +750,19 @@ impl<'w> Builder<'w> {
                 if let Some(blob) = self.past_array_depth(items)? {
                     return Ok(blob);
                 }
+                let base = self.held;
                 let mut out = count_prefix(items.len(), &self.path)?;
+                self.hold(out.len())?;
                 for (i, item) in items.iter().enumerate() {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
                     let bytes = self.variable(elem, item, parent, depth)?;
+                    self.hold(4 + bytes.len())?;
                     out.extend(len_prefix(bytes.len(), &self.path)?);
                     out.extend(bytes);
                     self.path.truncate(mark);
-                    cap(&out, &self.path)?;
                 }
+                self.held = base;
                 Ok(out)
             }
             FieldType::Nested {
@@ -736,10 +771,11 @@ impl<'w> Builder<'w> {
                 ..
             } => {
                 let target = self.nested(schema_name, package, parent)?;
+                let (layout, _) = target;
                 let items = self.sequence(ft, v, exact)?;
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
-                let counted = !target.is_fixed();
+                let counted = !layout.is_fixed();
                 if let Some(blob) = self.past_array_depth(items)? {
                     return Ok(blob);
                 }
@@ -747,31 +783,35 @@ impl<'w> Builder<'w> {
                 // the wire cannot say how many there were: only the empty
                 // array has a frame, and any other is refused rather than
                 // read back as `[]`.
-                if !counted && target.fixed_size == 0 && !items.is_empty() {
+                if !counted && layout.fixed_size == 0 && !items.is_empty() {
                     return Err(DynamicError::YamlUnsupportedField {
                         path: self.here(),
                         field_type: type_name(ft),
                     });
                 }
+                let base = self.held;
                 let mut out = if counted {
                     count_prefix(items.len(), &self.path)?
                 } else {
                     Vec::new()
                 };
+                self.hold(out.len())?;
                 for (i, item) in items.iter().enumerate() {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
                     self.array_depth += usize::from(counted);
-                    let body = self.body(target, item, depth + 1);
+                    // The sequence and the element mapping are a level each.
+                    let body = self.body(target, item, depth + 2);
                     self.array_depth -= usize::from(counted);
                     let body = body?;
+                    self.hold(if counted { 4 } else { 0 } + body.len())?;
                     if counted {
                         out.extend(len_prefix(body.len(), &self.path)?);
                     }
                     out.extend(body);
                     self.path.truncate(mark);
-                    cap(&out, &self.path)?;
                 }
+                self.held = base;
                 Ok(out)
             }
             _ => Err(DynamicError::YamlUnsupportedField {
@@ -790,13 +830,6 @@ pub(super) fn len_prefix(n: usize, path: &str) -> Result<Vec<u8>, DynamicError> 
     u32::try_from(n)
         .map(|n| n.to_le_bytes().to_vec())
         .map_err(|_| DynamicError::YamlMessageTooLarge { path: shown(path) })
-}
-
-fn cap(out: &[u8], path: &str) -> Result<(), DynamicError> {
-    if out.len() > MAX_BODY_BYTES {
-        return Err(DynamicError::YamlMessageTooLarge { path: shown(path) });
-    }
-    Ok(())
 }
 
 /// The `f32` a YAML float names. The parser hands over the nearest `f64`;

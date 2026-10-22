@@ -445,14 +445,13 @@ const DECLARED_SITES: &[Declared] = &[
     },
     Declared {
         path: "cerulion_netd/src/discovery_fold.rs",
-        interpolation: 5,
+        interpolation: 4,
         pass_through: 0,
         messages: &[
             "cerulion-netd: BUG — explicit {} locators are trusted by fia#62222164",
-            "cerulion-netd: no cached peers to fold — first contact relie#e7cc5b80",
-            "cerulion-netd: no home directory; cannot locate the peer cac#eaa6138a",
-            "every cached peer failed the reachability probe — none diall#8b5497af",
-            "folded verified cached peers into the netd session — first c#32676781",
+            "cerulion-netd: no peer answered the `_cerulion._tcp` browse #4c49cde7",
+            "every discovered peer failed the reachability probe, none di#3243729f",
+            "folded verified discovered peers (mDNS + cache) into the net#e45bfc87",
         ],
         reason: "DEBT (iroh-linking daemon, outside `default-members`): \
                  lines splicing a runtime value into the message. Not migrated: \
@@ -2056,7 +2055,7 @@ fn two_sites_share_a_ledger_key_only_if_they_share_a_message() {
 /// whether this line is the loud first of a regime or a counted repeat.
 const FORMERLY_COLLIDING_PAIR: (&str, &str) = (
     "cerulion_core/src/transport/network.rs",
-    "ingress: local publisher mutex poisoned — validated frame dr",
+    "ingress: local publisher mutex poisoned: validated frame dro",
 );
 
 #[test]

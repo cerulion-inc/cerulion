@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Graph commands: create, run.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +17,48 @@ use crate::workspace_lock::WorkspaceLock;
 use crate::yaml_splice::{
     line_numbers, render_scalar, scan_top_level_block, split_lines, BlockScan,
 };
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("aarch64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("x86_64-linux-android");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("armv7-linux-androideabi");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = Some("i686-linux-android");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_TRIPLE: Option<&str> = None;
+
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("arm64-v8a");
+#[cfg(all(target_os = "android", target_arch = "x86_64"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86_64");
+#[cfg(all(target_os = "android", target_arch = "arm"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("armeabi-v7a");
+#[cfg(all(target_os = "android", target_arch = "x86"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = Some("x86");
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "x86"
+    ))
+))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
+#[cfg(not(target_os = "android"))]
+const ANDROID_CDYLIB_ABI: Option<&str> = None;
 
 /// Which clock drives a `graph run`.
 ///
@@ -694,6 +736,23 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
     let doorbell = resolve_flag(env_doorbell, DOORBELL_ENV);
     cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
+}
+
+/// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
+///
+/// This uses the same environment overrides and target capabilities as `graph run`.
+pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
+    let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
+    let env_doorbell = std::env::var(DOORBELL_ENV).ok();
+    resolve_monitor_wait_policy(MonitorWaitInputs {
+        mode: MonitorWaitMode::Auto,
+        env_monitor_wait: env_monitor_wait.as_deref(),
+        env_doorbell: env_doorbell.as_deref(),
+        is_live: true,
+        primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
+        ns: cerulion_core::doorbell::default_namespace(),
+    })
 }
 
 /// Build a (schema name → recipe-3 `schema_hash`) map from every
@@ -2918,8 +2977,8 @@ fn graph_validate_with_cache(
                             format!("{CDYLIB_CHECK_PREFIX}{}'", node_type),
                             detail,
                             format!(
-                                "node source is newer than this build; run `{}` to rebuild",
-                                rebuild_hint(node_type, lib.release)
+                                "node source is newer than this build; {}",
+                                rebuild_instruction(node_type, lib.release, "to rebuild")
                             ),
                         )
                     } else {
@@ -3569,6 +3628,20 @@ impl NetworkEnvKill {
     pub fn is_off(&self) -> bool {
         !matches!(self, NetworkEnvKill::Unset)
     }
+
+    /// How a refusal names this setting: `CERULION_NETWORK=off`, or the
+    /// unrecognized value that failed closed, trimmed and terminal-sanitized.
+    /// `None` when the variable is unset.
+    pub fn refusal_label(&self) -> Option<String> {
+        match self {
+            NetworkEnvKill::Unset => None,
+            NetworkEnvKill::Off => Some(format!("{NETWORK_ENV}=off")),
+            NetworkEnvKill::Unrecognized(value) => Some(format!(
+                "{NETWORK_ENV}={} (an unrecognized value, which fails closed to local-only)",
+                crate::topic_cmd::sanitize_display(value.trim())
+            )),
+        }
+    }
 }
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
@@ -3579,8 +3652,14 @@ impl NetworkEnvKill {
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
 pub fn network_env_kill() -> NetworkEnvKill {
-    match std::env::var(NETWORK_ENV) {
-        Ok(v) => {
+    network_env_kill_from(std::env::var(NETWORK_ENV).ok())
+}
+
+/// The pure half of [`network_env_kill`]: classify one `CERULION_NETWORK` value
+/// (`None` = the variable is not set).
+pub fn network_env_kill_from(value: Option<String>) -> NetworkEnvKill {
+    match value {
+        Some(v) => {
             let trimmed = v.trim();
             if trimmed.is_empty() {
                 NetworkEnvKill::Unset
@@ -3590,22 +3669,95 @@ pub fn network_env_kill() -> NetworkEnvKill {
                 NetworkEnvKill::Unrecognized(v)
             }
         }
-        Err(_) => NetworkEnvKill::Unset,
+        None => NetworkEnvKill::Unset,
     }
 }
 
-/// Is the REMOTE network tier suppressed by the
-/// `CERULION_NETWORK` kill-switch, for the discovery-side callers that carry no
-/// `GraphConfig` — `schema info`'s remote fetch and `topic echo`'s remote
-/// decode-seed? Uses the SAME parse as [`resolve_run_network`]
-/// ([`network_env_kill`], the ONE env-parse). Emits the fail-closed warn on an
-/// unrecognized value; returns `true` iff the tier must stay LOCAL-ONLY. The
+/// The `cerulion-netd` daemon's own kill switch. The query verbs read it beside
+/// `CERULION_NETWORK` ([`query_network_kill`]), so with it engaged they neither
+/// query netd nor open their own discovery session.
+pub const NETD_NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
+
+/// The kill-switch state the query verbs (`topic list`, `topic echo`,
+/// `topic hz`, `topic info`, `schema info`) act on: `CERULION_NETWORK` under the
+/// [`network_env_kill`] parse, plus [`NETD_NETWORK_ENV`] under netd's own
+/// byte-exact parse (only exactly `off` engages it). Either one engaged makes
+/// the query LOCAL-ONLY. Runs (`graph run`, `node run`, `ros2 attach`) read
+/// `CERULION_NETWORK` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryNetworkKill {
+    /// The `CERULION_NETWORK` decision.
+    pub network: NetworkEnvKill,
+    /// `CERULION_NETD_NETWORK` is exactly `off`.
+    pub netd_off: bool,
+}
+
+impl QueryNetworkKill {
+    /// No switch engaged.
+    pub const UNSET: Self = Self {
+        network: NetworkEnvKill::Unset,
+        netd_off: false,
+    };
+
+    /// True when either switch is engaged: the query must stay LOCAL-ONLY.
+    pub fn is_off(&self) -> bool {
+        self.network.is_off() || self.netd_off
+    }
+
+    /// Both switches are engaged.
+    pub fn both_engaged(&self) -> bool {
+        self.network.is_off() && self.netd_off
+    }
+
+    /// The `unset ...` remedy naming every engaged variable. With only
+    /// `CERULION_NETD_NETWORK` engaged it names that one; otherwise it names
+    /// `CERULION_NETWORK`, plus `CERULION_NETD_NETWORK` when both are engaged.
+    pub fn unset_remedy(&self) -> &'static str {
+        match (self.network.is_off(), self.netd_off) {
+            (false, true) => "unset CERULION_NETD_NETWORK",
+            (true, true) => "unset CERULION_NETWORK and CERULION_NETD_NETWORK",
+            _ => "unset CERULION_NETWORK",
+        }
+    }
+}
+
+/// Classify one `CERULION_NETD_NETWORK` value the way `cerulion-netd` does:
+/// only the exact value `off` engages it (`None` = not set).
+pub fn netd_network_off_from(value: Option<&str>) -> bool {
+    value == Some("off")
+}
+
+/// Read both query-side kill switches from the environment ONCE. Pure over the
+/// environment; it emits no log.
+pub fn query_network_kill() -> QueryNetworkKill {
+    query_network_kill_from(
+        std::env::var(NETWORK_ENV).ok(),
+        std::env::var(NETD_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+/// The pure half of [`query_network_kill`].
+pub fn query_network_kill_from(network: Option<String>, netd: Option<&str>) -> QueryNetworkKill {
+    QueryNetworkKill {
+        network: network_env_kill_from(network),
+        netd_off: netd_network_off_from(netd),
+    }
+}
+
+/// Is the REMOTE network tier suppressed by a query-side kill switch
+/// ([`query_network_kill`]: `CERULION_NETWORK`, or `CERULION_NETD_NETWORK=off`),
+/// for the discovery-side callers that carry no `GraphConfig`: `topic list`,
+/// `schema info`'s remote fetch, and the `topic echo`/`hz`/`info` remote tiers?
+/// `CERULION_NETWORK` goes through the SAME parse as [`resolve_run_network`]
+/// ([`network_env_kill_from`]). Emits the fail-closed warn on an unrecognized
+/// `CERULION_NETWORK` value; returns `true` iff the tier must stay LOCAL-ONLY. The
 /// caller MUST consult this BEFORE opening any discovery session so a
 /// kill-switched run never touches the network (the LOCAL-ONLY
 /// contract).
 pub fn remote_network_suppressed() -> bool {
-    match network_env_kill() {
-        NetworkEnvKill::Unset => false,
+    let kill = query_network_kill();
+    match kill.network {
+        NetworkEnvKill::Unset => kill.netd_off,
         NetworkEnvKill::Off => true,
         NetworkEnvKill::Unrecognized(v) => {
             tracing::warn!(
@@ -3642,6 +3794,26 @@ pub const GATEWAY_BIND_RETRIES: u16 = 8;
 /// so tests pin the exact text.
 pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
 
+fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+    match access {
+        Some(cerulion_core::LanAccess::Open) => {
+            tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        }
+        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+            graph = %graph_name,
+            lan_access = "paired",
+            "LAN access is paired-only: the gateway refuses every LAN peer"
+        ),
+        // netd predates the posture field: report unknown rather than
+        // assuming an open posture it may not have.
+        None => tracing::warn!(
+            graph = %graph_name,
+            lan_access = "unknown",
+            "permissive egress: netd did not report a LAN-access posture (unknown -              older daemon without the field); see `cerulion netd status`"
+        ),
+    }
+}
+
 /// The resolved network decision for a `graph run` — the single
 /// output of [`resolve_run_network`]. There is no
 /// `Option<NetworkConfig>` funnel and no multi-process network rejection.
@@ -3667,9 +3839,10 @@ pub enum RunNetwork {
     /// (verbatim — the user's config is truth).
     Strict(cerulion_core::NetworkConfig),
     /// No (or disabled) `network:` block under the real clock ⇒ run the
-    /// gateway PERMISSIVE: every produced topic is announced + egressable
-    /// (to any LAN peer, no pairing required). Carries the SYNTHESIZED permissive
-    /// `NetworkConfig` (peer mode, scouting ON, no connect endpoints, listen
+    /// gateway PERMISSIVE: every produced topic is egressable, and its announce
+    /// token is declared when LAN access is open. Carries the SYNTHESIZED permissive
+    /// `NetworkConfig` (peer mode, gossip on, multicast scouting per
+    /// `CERULION_MULTICAST_SCOUTING`, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
     /// construction.
     Permissive(cerulion_core::NetworkConfig),
@@ -3825,8 +3998,10 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// The SYNTHESIZED permissive-default `NetworkConfig` — peer mode,
-/// multicast + gossip scouting ON (unpaired robots are LAN-discoverable), NO
+/// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
+/// scouting on, multicast scouting from
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
+/// the gateway's `_cerulion._tcp` mDNS beacon is how peers find it), NO
 /// connect endpoints, listening on the well-known gateway port
 /// ([`GATEWAY_WELL_KNOWN_PORT`], overridable via [`GATEWAY_PORT_ENV`]). The
 /// gateway process bind-probes upward from this base on AddrInUse.
@@ -3836,7 +4011,7 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         mode: cerulion_core::ZenohMode::Peer,
         connect_endpoints: Vec::new(),
         listen_endpoints: vec![format!("tcp/[::]:{port}")],
-        multicast_scouting: true,
+        multicast_scouting: cerulion_core::transport::network::multicast_scouting_from_env(),
         gossip_scouting: true,
         // A gateway keeps zenoh's robust default connect retry (bounded
         // connect is only for the ephemeral `topic list` discovery session).
@@ -4330,8 +4505,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and — for a permissive run — fires the one-shot
-/// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and for a permissive run reports the LAN posture
+/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4398,9 +4573,10 @@ fn spawn_gateway(
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
     // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker.
+    // spawn site, never in a worker. A paired LAN access posture (the gateway child
+    // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
@@ -4659,7 +4835,27 @@ fn register_egress_with_netd(
     ix_config_json: Option<&str>,
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
+    // Check netd's posture BEFORE registering: a registration's topics and
+    // schemas stay served on the shared gateway after release, so refusing an
+    // open netd after registering would not close the LAN access. A paired run
+    // rides only a netd that reports paired; otherwise dropping the client
+    // registers nothing and the caller falls back to a per-run gateway child,
+    // which enforces this run's own posture.
+    let requested = cerulion_core::LanAccess::from_env();
+    if requested == cerulion_core::LanAccess::Paired {
+        let reported = client.lan_access()?;
+        if !netd_posture_acceptable(reported, requested) {
+            drop(client);
+            return Err(netd_posture_refusal(reported));
+        }
+    }
     let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
+    // The register response reports the posture too, so the check never
+    // rests on the probe alone.
+    if !netd_posture_acceptable(resp.lan_access, requested) {
+        drop(client);
+        return Err(netd_posture_refusal(resp.lan_access));
+    }
     tracing::info!(
         graph = %graph_name,
         registered_topics = resp.registered_topics,
@@ -4667,10 +4863,10 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run — parity with the child-spawn path
-    // (`spawn_gateway`), so a permissive desk still gets the exposure notice.
+    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // Missing posture is UNKNOWN (an older daemon) - never assume open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, resp.lan_access);
     }
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
@@ -4679,6 +4875,35 @@ fn register_egress_with_netd(
     // NO reconnect: recovery is not this watch's job.
     let watch = spawn_netd_liveness_watch(client.control_fd(), graph_name.to_string());
     Ok(NetdEgressGuard { watch, client })
+}
+
+/// The error that sends a paired run to its own gateway because netd
+/// `reported` a posture other than paired.
+#[cfg(unix)]
+fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_netd::ClientError {
+    let reported = match reported {
+        Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+        Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+        None => "did not report its LAN access posture (an older daemon)",
+    };
+    cerulion_netd::ClientError::Protocol(format!(
+        "cerulion-netd {reported} and this run requires paired access, so the run uses its \
+         own gateway; restart cerulion-netd with paired access to share its session"
+    ))
+}
+
+/// Whether a run that requires `requested` LAN access may ride a netd
+/// that reported `reported`. A paired run rides only a netd that reports
+/// paired: one that reports open serves its LAN openly, and one that
+/// reports no posture (an older daemon) may. An open run accepts any netd,
+/// because a paired netd is only stricter.
+#[cfg(unix)]
+fn netd_posture_acceptable(
+    reported: Option<cerulion_core::LanAccess>,
+    requested: cerulion_core::LanAccess,
+) -> bool {
+    requested == cerulion_core::LanAccess::Open
+        || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
 /// Establish the network-egress overlay for a real-clock live run. `None`
@@ -4845,8 +5070,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     let mut booted: Option<cerulion_core::GatewayRuntime> = None;
     // The ACTUAL bound listen port of the successful attempt — the
     // mDNS SRV port. Permissive: the ladder value we set below. Strict:
-    // parsed from the verbatim config listen list (`None` ⇒ no tcp/ port, the
-    // mDNS discovery beacon is skipped with a loud warn).
+    // parsed from the verbatim config listen list (`None` ⇒ no usable nonzero
+    // first TCP listen port, the mDNS discovery beacon is skipped with a loud warn).
     let mut resolved_port: Option<u16> = None;
     for attempt in 0..attempts {
         let mut net = base_net.clone();
@@ -4954,12 +5179,12 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             }
         }
         None => {
-            // Strict-with-no-parseable-port: skip the mDNS beacon loudly (never
-            // crash). Permissive always resolves a port, so this is strict-only.
+            // Strict-with-no-usable-first-TCP-port: skip the mDNS beacon loudly
+            // (never crash). Permissive always resolves a port, so this is strict-only.
             tracing::warn!(
                 graph = %graph_name,
                 listen = %base_net.listen_endpoints.join(","),
-                "gateway listen endpoints carry no parseable tcp/ port — the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
+                "gateway listen endpoints provide no usable nonzero TCP listen port; the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
             );
             None
         }
@@ -7507,7 +7732,7 @@ pub fn graph_run_worker(
     // the ~5s boundary timeout. Positioned BEFORE `run_live` (the first barrier
     // arrival), with a hard deadline so a dead supervisor can never hang the
     // worker forever.
-    wait_for_go(
+    let shared_start_epoch = wait_for_go(
         Path::new(&plan.go_path),
         &plan.group,
         &running,
@@ -7719,10 +7944,12 @@ pub fn graph_run_worker(
     // producer-clock values, and cross-rank stamp arithmetic (Sync's window
     // spread, `expect_within`'s elapsed) would otherwise cross unrelated clock
     // domains. Every rank ARMS its placement HERE, after GO, and `run_live`
-    // reads `real_ns()` — machine-wide boot-monotonic, so no distribution is
-    // needed — at its wall-clock anchor, so the ranks' placement instants
-    // differ by the GO fan-out only and not by the seconds of sequential-spawn
-    // skew a build-time placement would bake in. The primitive also re-phases
+    // places it at the deployment's shared start epoch from the GO sentinel
+    // (8.95), a `real_ns()` instant, machine-wide boot-monotonic, so every rank
+    // within one gating quantum of it places the same value; a rank later
+    // places a fresh `real_ns()` at its anchor instead. Either way no rank
+    // bakes in the seconds of sequential-spawn skew a build-time placement
+    // would. The primitive also re-phases
     // the `Period` deadlines and re-seeds the watchdog windows the build
     // anchored at 0 (see `place_gating_epoch` for why a bare `clock.set` would
     // hang on the first step). A lockstep rank keeps its quantum timeline; a
@@ -7749,8 +7976,24 @@ pub fn graph_run_worker(
             group = %plan.group,
             rank = plan.rank,
             "free-run traced rank: gating clock epoch armed for the live loop's wall-clock \
-             anchor (read from real_ns() immediately before the first delta)"
+             anchor (placed at the shared start epoch, or at real_ns() there when more than one \
+             gating quantum late)"
         );
+    }
+    // (8.95) The deployment's SHARED START EPOCH, read from the GO sentinel:
+    // `run_live` waits for it after its prologue; a rank there within one
+    // gating quantum places a traced rank's armed epoch (8.9) at exactly this
+    // value and back-dates its wall anchors to it, and a later one warns and
+    // starts its own timeline. `None` only when Ctrl-C ended the GO wait;
+    // `run_live` then runs its prologue and no step.
+    if let Some(epoch_ns) = shared_start_epoch {
+        if let Err(e) = runtime.start_live_at_shared_epoch(epoch_ns) {
+            runtime.shutdown();
+            return Err(CliError::Validation(format!(
+                "graph run-worker: group '{}' could not arm the shared start epoch: {e}",
+                plan.group
+            )));
+        }
     }
     tracing::info!(group = %plan.group, "worker live loop starting — press Ctrl+C to stop");
     if let Err(e) = runtime.run_live(&running) {
@@ -8281,14 +8524,30 @@ fn credit_open_refusal_message(topic: &str, ns: &str, id: &str, e: &std::io::Err
     }
 }
 
-/// Block until the deployment-wide GO sentinel appears (the supervisor touches it
-/// once ALL workers are built + READY — see `WorkerPlan::go_path` for the
-/// start-gate contract). 20 ms poll; a LOUD error at the deadline — a worker must
-/// never hang forever on a dead supervisor. The deadline is the plan's
-/// `go_deadline_ms` (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned
-/// worker legitimately waits out every later sibling's sequential READY window,
-/// so a fixed deadline would spuriously fail-loud large slow deployments. A
-/// Ctrl-C (`running` flipping false) returns `Ok` early: `run_live` checks
+/// Write the GO sentinel carrying `epoch_ns` so a polling worker never reads a
+/// half-written file: the text goes to a sibling `.tmp` file first and is renamed
+/// over `go_path`, and a rename within one directory is atomic, so `exists()`
+/// turns true only once the whole line is there.
+fn write_go_sentinel(go_path: &Path, epoch_ns: u64) -> std::io::Result<()> {
+    let mut tmp = go_path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, crate::multiprocess::encode_go_sentinel(epoch_ns))?;
+    std::fs::rename(&tmp, go_path)
+}
+
+/// Block until the deployment-wide GO sentinel appears (the supervisor writes it
+/// once ALL workers are built + READY; see `WorkerPlan::go_path` for the
+/// start-gate contract) and return the shared start epoch it carries
+/// (`multiprocess::parse_go_sentinel`). 2 ms poll, so a worker sees GO well
+/// inside the `SHARED_START_LEAD_NS` the supervisor leaves before the epoch. A
+/// LOUD error on a sentinel that cannot be read or does not parse, and a LOUD
+/// error at the deadline, so a worker never hangs forever on a dead
+/// supervisor. The deadline is the plan's `go_deadline_ms`
+/// (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned worker legitimately
+/// waits out every later sibling's sequential READY window, so a fixed deadline
+/// would spuriously fail-loud large slow deployments. A
+/// Ctrl-C (`running` flipping false) returns `Ok(None)` early: `run_live` checks
 /// `running` first and exits immediately, so the worker drains cleanly instead
 /// of sitting out the deadline.
 fn wait_for_go(
@@ -8296,16 +8555,35 @@ fn wait_for_go(
     group: &str,
     running: &AtomicBool,
     deadline: Duration,
-) -> CliResult<()> {
+) -> CliResult<Option<u64>> {
     let start = Instant::now();
     loop {
         if go_path.exists() {
-            tracing::info!(group = %group, "GO observed — entering live loop");
-            return Ok(());
+            let text = std::fs::read_to_string(go_path).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' saw the GO sentinel `{}` but cannot \
+                     read it: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let epoch_ns = crate::multiprocess::parse_go_sentinel(&text).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' cannot use the GO sentinel `{}`: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let now_ns = cerulion_core::real_ns();
+            tracing::info!(
+                group = %group,
+                epoch_ns,
+                lead_ns = epoch_ns as i128 - now_ns as i128,
+                "GO observed; the live loop starts at the shared start epoch"
+            );
+            return Ok(Some(epoch_ns));
         }
         if !running.load(Ordering::Relaxed) {
             tracing::info!(group = %group, "Ctrl-C during GO wait — draining without stepping");
-            return Ok(());
+            return Ok(None);
         }
         if start.elapsed() >= deadline {
             return Err(CliError::Validation(format!(
@@ -8314,7 +8592,7 @@ fn wait_for_go(
                 go_path.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -10194,7 +10472,7 @@ fn graph_run_supervisor(
     #[cfg(unix)]
     let recorded_topics: Option<Vec<cerulion_bagd::RecordedTopic>> = match record_entry_infos {
         Some(infos) => {
-            let recorded = resolve_recorded_topics(workspace_root, &config, infos)?;
+            let recorded = resolve_recorded_topics(workspace_root, &config, infos, None)?;
             if recorded.is_empty() {
                 return Err(CliError::Validation(format!(
                     "`graph run --record`: graph '{}' has no graph-owned (in-graph-producer) \
@@ -11475,7 +11753,9 @@ fn graph_run_supervisor(
     // withholding GO keeps every not-yet-released worker from stepping at all
     // (each exits via `wait_for_go`'s `running` check).
     if running.load(Ordering::Relaxed) {
-        std::fs::write(&go_path, b"go").map_err(|e| {
+        let epoch_ns =
+            cerulion_core::real_ns().saturating_add(crate::multiprocess::SHARED_START_LEAD_NS);
+        write_go_sentinel(Path::new(&go_path), epoch_ns).map_err(|e| {
             CliError::Validation(format!(
                 "graph run (multi-process): cannot write the GO sentinel `{go_path}`: {e} — \
                  deployment aborted (all workers killed)"
@@ -14514,11 +14794,28 @@ impl ResolvedCdylib {
 /// validation details, lookup errors) so the wording and the
 /// `--release` suffix can never drift between surfaces.
 fn rebuild_hint(node_type: &str, release: bool) -> String {
-    format!(
-        "cerulion node build {}{}",
-        node_type,
-        if release { " --release" } else { "" }
-    )
+    if cfg!(target_os = "android") {
+        let abi = ANDROID_CDYLIB_ABI.unwrap_or("unknown");
+        format!(
+            "cross-build the workspace on a host with `cargo ndk -t {abi} --platform 30 build{}` and push the workspace",
+            if release { " --release" } else { "" }
+        )
+    } else {
+        format!(
+            "cerulion node build {}{}",
+            node_type,
+            if release { " --release" } else { "" }
+        )
+    }
+}
+
+fn rebuild_instruction(node_type: &str, release: bool, ending: &str) -> String {
+    let hint = rebuild_hint(node_type, release);
+    if cfg!(target_os = "android") {
+        hint
+    } else {
+        format!("run `{hint}` {ending}")
+    }
 }
 
 /// Emit the stale-build warning for a resolved cdylib.
@@ -14684,6 +14981,304 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
     }
 }
 
+/// The cdylib candidates for one profile, cross-triple dir first then the
+/// plain target dir (cargo-ndk's layout), so a cross-built artifact for the
+/// SAME profile always wins over a host-built one.
+fn cdylib_profile_candidates(
+    base: &Path,
+    cross_triple: Option<&str>,
+    profile: &str,
+    lib_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(triple) = cross_triple {
+        candidates.push(base.join(triple).join(profile).join(lib_name));
+    }
+    candidates.push(base.join(profile).join(lib_name));
+    candidates
+}
+
+/// The ELF `e_machine` a node cdylib must carry to load for `triple`
+/// (EM_AARCH64 183, EM_X86_64 62, EM_ARM 40, EM_386 3). Unknown triples
+/// carry no expectation: their candidates are not filtered.
+fn expected_elf_machine(triple: &str) -> Option<u16> {
+    Some(match triple {
+        "aarch64-linux-android" => 183,
+        "x86_64-linux-android" => 62,
+        "armv7-linux-androideabi" => 40,
+        "i686-linux-android" => 3,
+        _ => return None,
+    })
+}
+
+/// The `e_machine` of an ELF file, honoring its `EI_DATA` endianness.
+/// `None` for a non-ELF, unreadable or truncated file: such a candidate
+/// cannot load for any target and is reported without a machine.
+fn elf_machine(path: &Path) -> Option<u16> {
+    let mut header = [0u8; 20];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut header).ok()?;
+    if header[0..4] != *b"\x7fELF" {
+        return None;
+    }
+    Some(match header[5] {
+        1 => u16::from_le_bytes([header[18], header[19]]),
+        2 => u16::from_be_bytes([header[18], header[19]]),
+        _ => return None,
+    })
+}
+
+/// Why a cross-triple candidate was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdylibRejection {
+    /// The ELF `e_machine` found (None when unreadable or not an ELF).
+    WrongMachine(Option<u16>),
+    /// Right machine but no NDK `.note.android.ident` note: a same-machine
+    /// host build (x86_64 matches the emulator) would otherwise load.
+    MissingAndroidIdent,
+}
+
+/// Total bytes the note scan may read: header-table entries plus note
+/// payloads stay under this even when the header lies about its counts.
+const ELF_NOTE_SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+
+/// Read `n` bytes at `off` of an open file (a bounded seek read - note
+/// sections can sit anywhere in a large artifact, so the whole file is never
+/// slurped), or None when out of bounds or unreadable.
+fn elf_read_at(file: &std::fs::File, off: u64, n: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = file.try_clone().ok()?;
+    file.seek(std::io::SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; usize::try_from(n).ok()?];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// A little- or big-endian `u16`/`u32`/`u64` reader selected once per file.
+fn elf_u16(data: &[u8], off: usize, be: bool) -> Option<u16> {
+    let b: [u8; 2] = data.get(off..off.checked_add(2)?)?.try_into().ok()?;
+    Some(if be {
+        u16::from_be_bytes(b)
+    } else {
+        u16::from_le_bytes(b)
+    })
+}
+fn elf_u32(data: &[u8], off: usize, be: bool) -> Option<u32> {
+    let b: [u8; 4] = data.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    Some(if be {
+        u32::from_be_bytes(b)
+    } else {
+        u32::from_le_bytes(b)
+    })
+}
+fn elf_u64(data: &[u8], off: usize, be: bool) -> Option<u64> {
+    let b: [u8; 8] = data.get(off..off.checked_add(8)?)?.try_into().ok()?;
+    Some(if be {
+        u64::from_be_bytes(b)
+    } else {
+        u64::from_le_bytes(b)
+    })
+}
+
+/// Scan a note region (the payload of an SHT_NOTE section or PT_NOTE
+/// segment) for an entry owned by `owner` (the note's NUL-terminated
+/// `n_namesz` name), returning on the first match. Entries are 4-byte
+/// aligned; a malformed run ends the scan, never the file.
+fn has_note_owner(data: &[u8], be: bool, owner: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos + 12 <= data.len() {
+        let namesz = elf_u32(data, pos, be).unwrap_or(u32::MAX) as usize;
+        let descsz = elf_u32(data, pos + 4, be).unwrap_or(u32::MAX) as usize;
+        pos += 12;
+        if namesz > data.len() || descsz > data.len() {
+            break;
+        }
+        let name_end = pos.saturating_add(namesz);
+        if let Some(name) = data.get(pos..name_end.min(data.len())) {
+            if name.strip_suffix(&[0]).unwrap_or(name) == owner {
+                return true;
+            }
+        }
+        let aligned = |n: usize| (n + 3) & !3;
+        pos = match pos
+            .checked_add(aligned(namesz))
+            .and_then(|p| p.checked_add(aligned(descsz)))
+        {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    false
+}
+
+/// True when the ELF file carries the NDK `.note.android.ident` marker:
+/// an SHT_NOTE section or PT_NOTE segment holding a note owned by
+/// "Android". Headers are parsed bounds-checked for 32/64-bit and either
+/// endianness; a truncated or corrupt file returns false, never panics.
+fn elf_has_android_ident(path: &Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let data: &[u8] = &match elf_read_at(&file, 0, 64) {
+        Some(h) => h,
+        None => return false,
+    };
+    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
+        return false;
+    }
+    let is64 = match data[4] {
+        1 => false,
+        2 => true,
+        _ => return false,
+    };
+    let be = match data[5] {
+        1 => false,
+        2 => true,
+        _ => return false,
+    };
+    let (phoff, phentsize, phnum, shoff, shentsize, shnum) = if is64 {
+        (
+            elf_u64(data, 32, be).unwrap_or(0),
+            elf_u16(data, 54, be).unwrap_or(0) as u64,
+            elf_u16(data, 56, be).unwrap_or(0) as u64,
+            elf_u64(data, 40, be).unwrap_or(0),
+            elf_u16(data, 58, be).unwrap_or(0) as u64,
+            elf_u16(data, 60, be).unwrap_or(0) as u64,
+        )
+    } else {
+        (
+            elf_u32(data, 28, be).unwrap_or(0) as u64,
+            elf_u16(data, 42, be).unwrap_or(0) as u64,
+            elf_u16(data, 44, be).unwrap_or(0) as u64,
+            elf_u32(data, 32, be).unwrap_or(0) as u64,
+            elf_u16(data, 46, be).unwrap_or(0) as u64,
+            elf_u16(data, 48, be).unwrap_or(0) as u64,
+        )
+    };
+    const PT_NOTE: u32 = 4;
+    const SHT_NOTE: u32 = 7;
+    let owner = b"Android";
+    // Untrusted counts and read totals are capped: a header can claim any
+    // phnum/shnum and any note size, so iteration and bytes read stay bounded.
+    let mut bytes_read = data.len() as u64;
+    // Program headers: PT_NOTE segments. Each entry is a bounded seek read;
+    // the note section can sit anywhere in a large artifact.
+    if phentsize > 0 {
+        let min_ph = if is64 { 56 } else { 32 };
+        for i in 0..phnum.min(4096) {
+            let Some(off) = phoff.checked_add(i.saturating_mul(phentsize)) else {
+                break;
+            };
+            let Some(ent) = elf_read_at(&file, off, phentsize) else {
+                break;
+            };
+            bytes_read += phentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || phentsize < min_ph {
+                break;
+            }
+            if elf_u32(&ent, 0, be) != Some(PT_NOTE) {
+                continue;
+            }
+            let (noff, nfilesz) = if is64 {
+                (elf_u64(&ent, 8, be), elf_u64(&ent, 32, be))
+            } else {
+                (
+                    elf_u32(&ent, 4, be).map(|v| v as u64),
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
+                )
+            };
+            if let (Some(noff), Some(nfilesz)) = (noff, nfilesz) {
+                let want = nfilesz.min(1 << 20);
+                // Charge the ATTEMPTED read, not just a successful one: a
+                // crafted file can point every note entry at an unreadable
+                // offset, and failed reads must still count against the
+                // budget.
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    if has_note_owner(&region, be, owner) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Section headers: SHT_NOTE sections.
+    if shentsize > 0 {
+        let min_sh = if is64 { 64 } else { 40 };
+        for i in 0..shnum.min(4096) {
+            let Some(off) = shoff.checked_add(i.saturating_mul(shentsize)) else {
+                break;
+            };
+            let Some(ent) = elf_read_at(&file, off, shentsize) else {
+                break;
+            };
+            bytes_read += shentsize;
+            if bytes_read > ELF_NOTE_SCAN_BUDGET || shentsize < min_sh {
+                break;
+            }
+            if elf_u32(&ent, 4, be) != Some(SHT_NOTE) {
+                continue;
+            }
+            let (noff, nsize) = if is64 {
+                (elf_u64(&ent, 24, be), elf_u64(&ent, 32, be))
+            } else {
+                (
+                    elf_u32(&ent, 16, be).map(|v| v as u64),
+                    elf_u32(&ent, 20, be).map(|v| v as u64),
+                )
+            };
+            if let (Some(noff), Some(nsize)) = (noff, nsize) {
+                let want = nsize.min(1 << 20);
+                bytes_read += want;
+                if bytes_read > ELF_NOTE_SCAN_BUDGET {
+                    break;
+                }
+                if let Some(region) = elf_read_at(&file, noff, want) {
+                    if has_note_owner(&region, be, owner) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Split existing candidates into those a cross run may load and those it
+/// may not. For a cross triple (`expected = Some`) a candidate must carry
+/// BOTH the matching `e_machine` and the NDK `.note.android.ident` note -
+/// the machine alone cannot tell an x86_64 host build from the emulator's.
+/// A candidate that fails to parse is rejected as a wrong-arch artifact.
+/// `None` expected means a host lookup, which keeps every candidate.
+fn arch_filter<'a>(
+    candidates: &[(&'a Path, bool)],
+    expected: Option<u16>,
+) -> (Vec<CdylibCandidate<'a>>, Vec<RejectedCandidate>) {
+    let mut matching = Vec::with_capacity(candidates.len());
+    let mut rejected = Vec::new();
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match expected {
+            Some(machine) if elf_machine(path) != Some(machine) => {
+                rejected.push((
+                    path.to_path_buf(),
+                    CdylibRejection::WrongMachine(elf_machine(path)),
+                ));
+            }
+            Some(_) if !elf_has_android_ident(path) => {
+                rejected.push((path.to_path_buf(), CdylibRejection::MissingAndroidIdent));
+            }
+            _ => matching.push((*path, *release)),
+        }
+    }
+    (matching, rejected)
+}
+
 /// Find the cdylib for a node type.
 ///
 /// Selection:
@@ -14701,8 +15296,13 @@ pub fn cdylib_target_base(workspace_root: &Path) -> std::path::PathBuf {
 ///   a single-profile workspace still resolves. Lets a user pin the
 ///   release profile even when a debug build is newer.
 ///
-/// `<base>` is [`cdylib_target_base`] — `<ws_root>/target` unless
-/// `CARGO_TARGET_DIR` redirects it.
+/// `<base>` is [`cdylib_target_base`]. Candidates are chosen PER PROFILE: for
+/// the profile under consideration the Android target-triple dir is tried
+/// first, then the plain dir, so a cross-built artifact never shadows a
+/// requested-profile artifact that lives only in the other base (the earlier
+/// whole-dir choice could pick `<triple>/debug` over `target/release` on an
+/// explicit `--release` run). If neither profile has the library, the
+/// missing-artifact error names the triple's paths when a triple applies.
 ///
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
@@ -14715,20 +15315,16 @@ fn find_cdylib(
     let lib_name = cdylib_name(node_type);
 
     let base = cdylib_target_base(workspace_root);
-    let debug_path = base.join("debug").join(&lib_name);
-    let release_path = base.join("release").join(&lib_name);
-
-    let resolved = if prefer_release {
-        // Explicit override: force release-first, debug as fallback —
-        // the requested profile wins even if the debug build is newer.
-        first_existing(&[(&release_path, true), (&debug_path, false)])
-    } else {
-        // Default: auto-select the freshest built artifact. When both
-        // profiles exist, the newer mtime wins so a stale build of one
-        // profile never shadows a fresh build of the other; when only
-        // one exists, it wins as a single-profile fallback.
-        freshest_existing(&debug_path, &release_path)
-    };
+    let (resolved, rejected) =
+        resolve_cdylib_in(&base, ANDROID_CDYLIB_TRIPLE, &lib_name, prefer_release);
+    // Error text names the FIRST candidate per profile: the triple's paths
+    // when a cross triple applies, the plain ones otherwise, where
+    // `cargo ndk` (or cargo) would have put it.
+    let release_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "release", &lib_name);
+    let debug_candidates =
+        cdylib_profile_candidates(&base, ANDROID_CDYLIB_TRIPLE, "debug", &lib_name);
+    let (debug_path, release_path) = (&debug_candidates[0], &release_candidates[0]);
 
     if let Some((path, release)) = resolved {
         let node_dir = workspace_root.join("nodes").join(node_type);
@@ -14740,67 +15336,132 @@ fn find_cdylib(
         });
     }
 
-    // Neither profile is built. The hint mirrors the selection mode:
-    // an explicit `--release` run hints at `--release`; the default
-    // freshest-wins mode hints at the plain debug build.
+    // Neither profile produced a loadable artifact. The hint mirrors the
+    // selection mode: an explicit `--release` run hints at `--release`;
+    // the default freshest-wins mode hints at the plain debug build.
+    let mut reason = if prefer_release {
+        format!(
+            "searched {} (preferred, release profile) and {} (fallback)",
+            release_path.display(),
+            debug_path.display(),
+        )
+    } else {
+        format!(
+            "searched {} and {} (debug profile)",
+            debug_path.display(),
+            release_path.display(),
+        )
+    };
+    for (path, rejection) in &rejected {
+        match rejection {
+            CdylibRejection::WrongMachine(machine) => {
+                let found = machine.map_or("unreadable/non-ELF".to_string(), |m| m.to_string());
+                reason.push_str(&format!(
+                    "; skipped {} (ELF e_machine {found} does not match the target)",
+                    path.display(),
+                ));
+            }
+            CdylibRejection::MissingAndroidIdent => {
+                reason.push_str(&format!(
+                    "; skipped {} (no Android NDK .note.android.ident note - a same-machine host build cannot load on the device)",
+                    path.display(),
+                ));
+            }
+        }
+    }
+    reason.push_str(&format!(
+        "; {}",
+        rebuild_instruction(node_type, prefer_release, "first"),
+    ));
     Err(CliError::CdylibNotFound {
         node_type: node_type.to_string(),
-        reason: if prefer_release {
-            format!(
-                "searched {} (preferred, release profile) and {} (fallback); run `{}` first",
-                release_path.display(),
-                debug_path.display(),
-                rebuild_hint(node_type, true),
-            )
-        } else {
-            format!(
-                "searched {} and {} (debug profile); run `{}` first",
-                debug_path.display(),
-                release_path.display(),
-                rebuild_hint(node_type, false),
-            )
-        },
+        reason,
     })
+}
+
+/// Resolve the cdylib under `base` honoring `prefer_release`: an explicit
+/// `--release` tries `release` candidates in BOTH dirs before the debug
+/// fallback; the default takes the freshest artifact across profiles and
+/// dirs. `cross_triple` is an argument (not the const) so the order is
+/// oracle-testable on host.
+/// A cdylib candidate: its path and whether it is a release-profile build.
+type CdylibCandidate<'a> = (&'a Path, bool);
+/// A candidate rejected by the cross filter: its path and why it cannot
+/// load for the target.
+type RejectedCandidate = (PathBuf, CdylibRejection);
+/// The resolution result: the chosen `(path, release)` artifact and every
+/// candidate skipped because its ELF machine did not match the target.
+type CdylibResolution = (Option<(std::path::PathBuf, bool)>, Vec<RejectedCandidate>);
+
+fn resolve_cdylib_in(
+    base: &Path,
+    cross_triple: Option<&str>,
+    lib_name: &str,
+    prefer_release: bool,
+) -> CdylibResolution {
+    let release_candidates = cdylib_profile_candidates(base, cross_triple, "release", lib_name);
+    let debug_candidates = cdylib_profile_candidates(base, cross_triple, "debug", lib_name);
+    let all: Vec<CdylibCandidate<'_>> = release_candidates
+        .iter()
+        .map(|p| (p.as_path(), true))
+        .chain(debug_candidates.iter().map(|p| (p.as_path(), false)))
+        .collect();
+    // A cross lookup may only load a candidate whose ELF machine matches
+    // the triple: a host-arch artifact that happens to sit in the plain
+    // `target/<profile>` dir must never be picked up for the device.
+    let expected = cross_triple.and_then(expected_elf_machine);
+    let (matching, rejected) = arch_filter(&all, expected);
+    if prefer_release {
+        // Explicit override: force the requested profile first in BOTH dirs,
+        // debug as the per-dir fallback.
+        let ordered: Vec<CdylibCandidate<'_>> = matching
+            .iter()
+            .filter(|(_, release)| *release)
+            .copied()
+            .chain(matching.iter().filter(|(_, release)| !*release).copied())
+            .collect();
+        (first_existing(&ordered), rejected)
+    } else {
+        // Default: auto-select the freshest built artifact across both
+        // profiles and both dirs, so a stale build never shadows a fresh one.
+        (freshest_of(matching.into_iter()), rejected)
+    }
 }
 
 /// Return the first `(path, release)` pair whose path exists, in the
 /// given priority order. Used for the explicit `--release` override
 /// where preference, not freshness, picks the winner.
-fn first_existing(candidates: &[(&Path, bool)]) -> Option<(std::path::PathBuf, bool)> {
+fn first_existing(candidates: &[CdylibCandidate<'_>]) -> Option<(std::path::PathBuf, bool)> {
     candidates
         .iter()
         .find(|(path, _)| path.exists())
         .map(|(path, release)| (path.to_path_buf(), *release))
 }
 
-/// Auto-select the *freshest* of the debug and release artifacts.
-/// When both exist, the one with the newer mtime wins
-/// (ties go to release — an equal-mtime tie happens on coarse-grained
-/// filesystems OR when both mtimes are unreadable, and release is the
-/// more likely deploy target). When only one exists, it wins. `None`
-/// is returned *only* when neither file exists — when both exist the
-/// tie-break guarantees a `Some`, even if both mtimes are unreadable.
-fn freshest_existing(debug_path: &Path, release_path: &Path) -> Option<(std::path::PathBuf, bool)> {
-    let debug = debug_path.exists();
-    let release = release_path.exists();
-    match (debug, release) {
-        (true, true) => {
-            // Both built: pick the newer mtime. An unreadable mtime is
-            // treated as the oldest possible so the other profile wins;
-            // if BOTH are unreadable they're considered equal and the
-            // release tie-break applies.
-            let debug_mtime = mtime_or_min(debug_path);
-            let release_mtime = mtime_or_min(release_path);
-            if debug_mtime > release_mtime {
-                Some((debug_path.to_path_buf(), false))
-            } else {
-                Some((release_path.to_path_buf(), true))
-            }
+/// Auto-select the *freshest* existing artifact among `(path, release)`
+/// candidates: the one with the newest mtime wins (ties keep the FIRST
+/// candidate, so the release candidates listed first win an equal-mtime tie
+/// (the more likely deploy target). `None` only when none exists.
+fn freshest_of<'a>(
+    candidates: impl Iterator<Item = (&'a Path, bool)>,
+) -> Option<(std::path::PathBuf, bool)> {
+    let mut best: Option<(std::path::PathBuf, bool, std::time::SystemTime)> = None;
+    for (path, release) in candidates {
+        if !path.exists() {
+            continue;
         }
-        (true, false) => Some((debug_path.to_path_buf(), false)),
-        (false, true) => Some((release_path.to_path_buf(), true)),
-        (false, false) => None,
+        let mtime = mtime_or_min(path);
+        // Strict `>` keeps the FIRST candidate on a tie: the release
+        // candidates listed before the debug ones win an equal-mtime race,
+        // and the cross-triple dir wins within a profile; both the
+        // preferred artifact on an ambiguous clock.
+        if best.as_ref().is_none_or(|(_, was_release, was_mtime)| {
+            mtime > *was_mtime || (mtime == *was_mtime && release && !*was_release)
+        }) {
+            best = Some((path.to_path_buf(), release, mtime));
+        }
     }
+    best.map(|(path, release, _)| (path, release))
 }
 
 /// The file's mtime, or `SystemTime::UNIX_EPOCH` (the oldest value the
@@ -19448,7 +20109,7 @@ fn sweep_worker_recording_rings(tags: &[String]) {
         };
         // SAFETY: shm_unlink(2) with a valid NUL-terminated name; removes the
         // SHM name only (no memory is touched; open mappings persist).
-        let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         if rc == 0 {
             tracing::debug!(
                 tag = %tag,
@@ -19934,7 +20595,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         entry_infos.insert(id.clone(), entry.info()?);
     }
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
-    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos)?;
+    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
         return Err(CliError::Validation(format!(
             "`graph run --record`: graph '{graph_name}' has no graph-owned (in-graph-producer) \
@@ -20696,7 +21357,7 @@ fn resolve_recorded_wire_size(
 ///   `OutputMeta::wire_fixed_size` (`<T as ShmMessage>::WIRE_FIXED_SIZE`,
 ///   the layout the node's Rust type really writes), with the workspace
 ///   `schemas/` set as the CROSS-CHECK and the fallback. See
-///   [`resolve_recorded_wire_size`] for the arms; this moved off
+///   `resolve_recorded_wire_size` for the arms; this moved off
 ///   the file for the same reason the HASH lives on the node:
 ///   a file that describes a different layout mislabels every frame on the
 ///   channel. `0` when neither source can size the port (e.g. a ROS2
@@ -20723,27 +21384,41 @@ fn resolve_recorded_wire_size(
 /// Recording a fabricated hash would mislabel every frame on that channel — a
 /// replay-grade bag with a fabricated hash is worse than no bag — so the
 /// recording ABORTS loudly naming node/output/topic.
+///
+/// `workspace_root` is the workspace directory whose `schemas/` files size
+/// output ports when the producing node does not provide a fixed wire size.
 #[cfg(unix)]
-fn resolve_recorded_topics(
+pub fn resolve_recorded_topics(
     workspace_root: &Path,
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    selected: Option<&std::collections::HashSet<String>>,
 ) -> CliResult<Vec<cerulion_bagd::RecordedTopic>> {
     let wire_sizes = build_workspace_schema_wire_sizes(workspace_root);
     // IndexMap keyed by resolved topic → dedup deterministically (first producer
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
+    // Every graph-produced topic, selected or not: the external-consumer
+    // classification below is about who PRODUCES a topic, not what this
+    // recording selects.
+    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
+            produced.insert(topic.clone());
+            // The selection applies BEFORE the metadata lookup: a names-only
+            // output the recording does not select must not fail startup.
+            if selected.is_some_and(|set| !set.contains(&topic)) {
+                continue;
+            }
             if out.contains_key(&topic) {
                 continue;
             }
             let Some(info) = entry_infos.get(&node_def.id) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: node '{}' (topic '{topic}') has no loaded NodeEntry \
+                    "recording: node '{}' (topic '{topic}') has no loaded NodeEntry \
                      info, so its output's AUTHORITATIVE wire schema hash is unavailable — a \
                      replay-grade bag with a fabricated hash is worse than no bag. Recording \
                      aborted.",
@@ -20752,7 +21427,7 @@ fn resolve_recorded_topics(
             };
             let Some(meta) = info.output_meta().iter().find(|m| m.name == output.name) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: output '{}.{}' (topic '{topic}') carries no \
+                    "recording: output '{}.{}' (topic '{topic}') carries no \
                      OutputMeta — its node reports names-only port info (a raw-FFI cdylib built \
                      without per-port metadata), so the AUTHORITATIVE wire schema hash is \
                      unavailable and the channel would be mislabeled. Recording aborted; rebuild \
@@ -20865,19 +21540,7 @@ fn resolve_recorded_topics(
     // consumed∧¬produced classification `replay_engine::classify_topics`
     // applies at replay time.
     {
-        let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
-        for node_def in &config.nodes {
-            for input in &node_def.inputs {
-                let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
-                if out.contains_key(&topic) {
-                    continue; // graph-produced — recorded, nothing to flag.
-                }
-                let consumers = unrecorded.entry(topic).or_default();
-                if !consumers.contains(&node_def.id) {
-                    consumers.push(node_def.id.clone());
-                }
-            }
-        }
+        let unrecorded = external_consumers(config, &produced);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -20890,6 +21553,31 @@ fn resolve_recorded_topics(
         }
     }
     Ok(out.into_values().collect())
+}
+
+/// The topics a graph consumes but does not produce, each with its consumer
+/// node ids (deduped, config order). A graph-produced topic is never external,
+/// even when a recording's topic selection leaves it out of the bag: replay
+/// re-runs its producer and regenerates it.
+#[cfg(unix)]
+fn external_consumers(
+    config: &GraphConfig,
+    produced: &std::collections::HashSet<String>,
+) -> indexmap::IndexMap<String, Vec<String>> {
+    let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
+    for node_def in &config.nodes {
+        for input in &node_def.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if produced.contains(&topic) {
+                continue; // graph-produced - replay regenerates it.
+            }
+            let consumers = unrecorded.entry(topic).or_default();
+            if !consumers.contains(&node_def.id) {
+                consumers.push(node_def.id.clone());
+            }
+        }
+    }
+    unrecorded
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -21192,6 +21880,21 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paired run rides only a netd that reports paired: an open or an
+    /// unknown posture is refused. An open run accepts every netd. Hand
+    /// oracle over all six (reported, requested) pairs.
+    #[cfg(unix)]
+    #[test]
+    fn netd_posture_acceptable_requires_a_reported_paired_netd_for_a_paired_run() {
+        use cerulion_core::LanAccess::{Open, Paired};
+        assert!(!netd_posture_acceptable(None, Paired));
+        assert!(!netd_posture_acceptable(Some(Open), Paired));
+        assert!(netd_posture_acceptable(Some(Paired), Paired));
+        assert!(netd_posture_acceptable(None, Open));
+        assert!(netd_posture_acceptable(Some(Paired), Open));
+        assert!(netd_posture_acceptable(Some(Open), Open));
+    }
 
     // ======================================================================
     // The scrub fixpoint's NO-PROGRESS fallback, DRIVEN.
@@ -22503,6 +23206,7 @@ nodes:
                 schema_hash: 0x0821_C823_0000_0001,
                 qualified: "pkg/Type".to_string(),
             }],
+            served_topics: vec![],
         };
         let handoff = GatewayHandoff {
             graph_name: "g".to_string(),
@@ -23430,6 +24134,33 @@ nodes:
     /// `pkg13::Type` graph backed by `schemas/pkg13/msg/Type.msg` records
     /// the REAL size (and the normalized provenance spelling). Removing
     /// core's deserializer normalization fails it.
+    /// A recording that selects a subset of outputs must not reclassify an
+    /// unselected graph-produced topic as external: replay re-runs its
+    /// producer. Only a topic no node produces is external.
+    #[cfg(unix)]
+    #[test]
+    fn an_unselected_produced_topic_is_not_an_external_consumer() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let produced: std::collections::HashSet<String> = config
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.outputs.iter().map(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                })
+            })
+            .collect();
+        let external = external_consumers(&config, &produced);
+        assert_eq!(
+            external.into_iter().collect::<Vec<_>>(),
+            vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn r13_a_coloned_graph_spelling_records_the_real_wire_size() {
@@ -23450,7 +24181,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
@@ -23565,7 +24297,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xABCD, None).with_wire_fixed_size(1 << 20)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size,
@@ -23610,7 +24343,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0x5151, None).with_wire_fixed_size(64)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 64,
             "an unregistered schema must not be recorded as a 0-byte layout"
@@ -23663,7 +24397,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xAB, None).with_wire_fixed_size(96)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 96,
             "the node sizes a port the map deliberately refuses to bind"
@@ -23705,7 +24440,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded[0].wire_fixed_size, 0);
         assert_eq!(recorded[0].schema_name, "");
         // The half the name promises: the `is_empty()` gate on the `Unknown`
@@ -23767,7 +24503,8 @@ nodes:
             // `OutputMeta::new` alone: no `with_wire_fixed_size`.
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x7777, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "with no producer claim the workspace file is still the source"
@@ -23835,7 +24572,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xBB, None).with_wire_fixed_size(128)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1, "one topic, one channel");
         assert_eq!(recorded[0].topic, "/tf");
         assert_eq!(
@@ -23893,7 +24631,8 @@ nodes:
         let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
             indexmap::IndexMap::new();
         infos.insert("n".to_string(), info);
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "the workspace file sizes a port whose info block does not"
@@ -23926,8 +24665,8 @@ nodes:
                 ],
             ),
         );
-        let first = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
-        let second = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let first = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
+        let second = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         let render = |v: &[cerulion_bagd::RecordedTopic]| {
             v.iter()
                 .map(|t| {
@@ -23984,7 +24723,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded
                 .iter()
@@ -24070,7 +24810,8 @@ nodes:
                 vec![OutputMeta::new("oa".to_string(), 0xA, None).with_wire_fixed_size(4)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "PREMISE: the two sources agree, so 4 is recorded either way"
@@ -24180,7 +24921,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         // ORACLE: exactly two topics — the derived /rr/cam/img and the
         // override /tf (deduped across cam + cam2); the external consumer-only
@@ -24260,7 +25001,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         let topics: Vec<&str> = recorded.iter().map(|r| r.topic.as_str()).collect();
 
@@ -24297,9 +25038,13 @@ nodes:
             "cam".to_string(),
             NodeInfo::from_names(vec!["ext".to_string()], vec!["img".to_string()]),
         );
-        let err = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let err = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect_err("a names-only NodeInfo must abort the recording");
         let msg = err.to_string();
+        assert!(
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
         assert!(msg.contains("cam.img"), "names node.output: {msg}");
         assert!(msg.contains("/rr/cam/img"), "names the topic: {msg}");
         assert!(
@@ -24317,10 +25062,15 @@ nodes:
         // output-missing message above also contains "cam", so a text-collapse
         // mutation merging the two arms' diagnostics must fail here.
         let empty: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
-        let err = resolve_recorded_topics(tmp.path(), &config, &empty)
+        let err = resolve_recorded_topics(tmp.path(), &config, &empty, None)
             .expect_err("a missing NodeEntry info must abort the recording");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("no loaded NodeEntry info"),
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
+        assert!(
+            msg.contains("no loaded NodeEntry info"),
             "the node-missing arm's DISTINCT diagnostic: {err}"
         );
     }
@@ -24702,10 +25452,13 @@ nodes:
     ///   the `Lockstep` arm of the build-path match (a free-run rank that
     ///   opened the barrier would wait at a generation no sibling arrives at);
     /// * the epoch is ARMED at EXACTLY ONE site (`run_live` places it at its
-    ///   wall-clock anchor), AFTER the GO wait (so the ranks' placement
-    ///   instants differ by the GO fan-out, never by the sequential-spawn
-    ///   skew) and BEFORE `run_live` (an epoch is an origin;
-    ///   the primitive refuses a placement after the first step);
+    ///   wall-clock anchor, at the shared start epoch the GO sentinel carries,
+    ///   or at a fresh real_ns() when more than one gating quantum late),
+    ///   AFTER the GO wait (never baking in the sequential-spawn skew) and
+    ///   BEFORE `run_live` (an epoch is an origin; the primitive refuses a
+    ///   placement after the first step);
+    /// * the shared start is armed at EXACTLY ONE site, from the GO wait's
+    ///   epoch, before `run_live` and under no build-path guard;
     /// * the build-path decision precedes every consumer of it (the clock
     ///   mint, the barrier open, the build, the recording configuration, the
     ///   epoch, the cohort leave).
@@ -24825,6 +25578,38 @@ nodes:
             body[go..epoch].matches("WorkerBuildPath::").count(),
             1,
             "exactly ONE build-path token between GO and the arming — the guard itself"
+        );
+        // The SHARED START: one arming site, fed by the epoch the GO wait
+        // returns, after that wait and before run_live, and under NO build-path
+        // guard: every rank (traced, plain free run, lockstep) starts at the
+        // deployment's shared epoch. Nesting it inside the traced arm above
+        // would leave plain free-run ranks starting one GO poll apart; the
+        // brace balance from the traced guard's line to the call is exactly
+        // the one `if let Some(..)` that opens around it.
+        assert!(
+            body.contains("let shared_start_epoch = wait_for_go("),
+            "the GO wait's returned epoch is bound for the shared start"
+        );
+        assert_eq!(
+            body.matches("start_live_at_shared_epoch(").count(),
+            1,
+            "exactly ONE shared-start arming"
+        );
+        let shared = body.find("start_live_at_shared_epoch(").unwrap();
+        assert!(
+            go < shared && shared < run_live,
+            "the shared start is armed after the GO wait and before run_live"
+        );
+        assert_eq!(
+            body[go..shared].matches("WorkerBuildPath::").count(),
+            1,
+            "no build-path token guards the shared start beyond the traced epoch's own guard"
+        );
+        let depth = body[guard_line..shared].matches('{').count() as i64
+            - body[guard_line..shared].matches('}').count() as i64;
+        assert_eq!(
+            depth, 1,
+            "the shared start sits outside the traced arm, inside only its own `if let Some`"
         );
         // The clock-config half is bound to its arm: the nearest build-path
         // token before `configure_traced_runtime_free_run(` is FreeRunTraced
@@ -27084,7 +27869,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "recorded through the stem binding"
@@ -27155,7 +27941,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x2727, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 — never a guessed document"
@@ -27235,7 +28022,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 with the unknown-size attribution, never the store's 4"
@@ -27387,7 +28175,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 16,
@@ -30899,6 +31688,355 @@ nodes:
         let _env = unset_target_dir_for_test();
         let ws = Path::new("/some/ws");
         assert_eq!(cdylib_target_base(ws), ws.join("target"));
+    }
+
+    #[test]
+    fn cdylib_profile_candidates_order_cross_first_then_plain() {
+        let base = Path::new("/t/target");
+        assert_eq!(
+            cdylib_profile_candidates(base, Some("aarch64-linux-android"), "debug", "libn.so"),
+            vec![
+                base.join("aarch64-linux-android/debug/libn.so"),
+                base.join("debug/libn.so"),
+            ]
+        );
+        assert_eq!(
+            cdylib_profile_candidates(base, None, "release", "libn.so"),
+            vec![base.join("release/libn.so")]
+        );
+    }
+
+    /// The profile is chosen PER PROFILE across both dirs: an explicit
+    /// `--release` run with only `<triple>/debug` and `target/release` on disk
+    /// must pick the requested-profile artifact in the plain dir, never the
+    /// triple's debug library (the earlier whole-dir choice did exactly that).
+    #[test]
+    fn find_cdylib_prefers_requested_profile_across_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_debug, 62);
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        write_android_test_elf(&plain_release, 62);
+
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        let found = found.unwrap();
+        assert_eq!(
+            found.0, plain_release,
+            "--release must pick the requested profile, not the triple's debug artifact"
+        );
+        assert!(found.1);
+    }
+
+    /// The same-dir cross preference survives per-profile resolution: with
+    /// both bases carrying the same profile, the triple's artifact wins.
+    #[test]
+    fn resolve_cdylib_prefers_cross_within_the_same_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        let cross_release = base
+            .join(triple)
+            .join("release")
+            .join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_release.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_release, 62);
+        let plain_release = base.join("release").join(cdylib_name("camera"));
+        std::fs::create_dir_all(plain_release.parent().unwrap()).unwrap();
+        // The same-machine HOST build in the plain dir carries no NDK note:
+        // the note check alone lets the cross artifact win.
+        write_test_elf(&plain_release, 62);
+
+        let (found, _) = resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), true);
+        assert_eq!(found.unwrap().0, cross_release);
+    }
+
+    /// A minimal 64-bit little-endian ELF header whose `e_machine` is
+    /// `machine`: enough for `elf_machine` to read, nothing else. It
+    /// carries NO NDK note, so a cross lookup rejects it.
+    fn write_test_elf(path: &Path, machine: u16) {
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2; // ELFCLASS64
+        header[5] = 1; // ELFDATA2LSB
+        header[18..20].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// A minimal 64-bit little-endian ELF whose `e_machine` is `machine`
+    /// and whose one PT_NOTE segment holds a note owned by "Android" -
+    /// the NDK `.note.android.ident` marker a cross lookup requires.
+    fn write_android_test_elf(path: &Path, machine: u16) {
+        let mut elf = vec![0u8; 144];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+                                                          // The program header: PT_NOTE at offset 120, 24 bytes.
+        elf[64..68].copy_from_slice(&4u32.to_le_bytes()); // p_type
+        elf[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        elf[96..104].copy_from_slice(&24u64.to_le_bytes()); // p_filesz
+                                                            // The note: namesz 8 ("Android\0"), descsz 4, type 1.
+        elf[120..124].copy_from_slice(&8u32.to_le_bytes());
+        elf[124..128].copy_from_slice(&4u32.to_le_bytes());
+        elf[128..132].copy_from_slice(&1u32.to_le_bytes());
+        elf[132..140].copy_from_slice(b"Android\0");
+        std::fs::write(path, elf).unwrap();
+    }
+
+    /// A cross lookup never loads a host-arch artifact: an x86_64
+    /// (host) ELF in the plain dir is skipped for an aarch64 triple,
+    /// and the error path reports the path and the machine found.
+    #[test]
+    fn a_cross_lookup_skips_host_arch_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "aarch64-linux-android";
+        let base = tmp.path().join("target");
+        // The plain debug dir holds a HOST x86_64 artifact: it must not win.
+        let host_debug = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(host_debug.parent().unwrap()).unwrap();
+        write_test_elf(&host_debug, 62);
+        // The triple dir holds a matching aarch64 artifact.
+        let cross_debug = base.join(triple).join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(cross_debug.parent().unwrap()).unwrap();
+        write_android_test_elf(&cross_debug, 183);
+
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert_eq!(found.unwrap().0, cross_debug);
+        assert_eq!(
+            rejected,
+            vec![(host_debug.clone(), CdylibRejection::WrongMachine(Some(62)))]
+        );
+
+        // With ONLY the host artifact on disk nothing resolves.
+        std::fs::remove_file(&cross_debug).unwrap();
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert!(found.is_none());
+        assert_eq!(
+            rejected,
+            vec![(host_debug, CdylibRejection::WrongMachine(Some(62)))]
+        );
+    }
+
+    /// The machine match alone is not enough: a same-machine host build
+    /// (x86_64 matches the emulator) without the NDK note is rejected,
+    /// and a matching artifact carrying `.note.android.ident` is accepted.
+    #[test]
+    fn a_cross_lookup_requires_the_ndk_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-linux-android";
+        let base = tmp.path().join("target");
+        // Right machine (x86_64) but a host build: no Android note.
+        let host_debug = base.join("debug").join(cdylib_name("camera"));
+        std::fs::create_dir_all(host_debug.parent().unwrap()).unwrap();
+        write_test_elf(&host_debug, 62);
+
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert!(found.is_none());
+        assert_eq!(
+            rejected,
+            vec![(host_debug.clone(), CdylibRejection::MissingAndroidIdent)]
+        );
+
+        // The same machine WITH the NDK note loads.
+        write_android_test_elf(&host_debug, 62);
+        let (found, rejected) =
+            resolve_cdylib_in(&base, Some(triple), &cdylib_name("camera"), false);
+        assert_eq!(found.unwrap().0, host_debug);
+        assert!(rejected.is_empty());
+    }
+
+    /// A truncated or corrupt note section is rejected without a panic:
+    /// header reads stay bounds-checked and a malformed note run ends the
+    /// scan rather than the process.
+    #[test]
+    fn the_ndk_note_check_rejects_corrupt_headers_without_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty.so", vec![]),
+            ("magic-only.so", b"\x7fELF".to_vec()),
+            ("header-only.so", vec![0u8; 64]),
+            ("wild-offsets.so", {
+                let mut h = vec![0u8; 64];
+                h[0..4].copy_from_slice(b"\x7fELF");
+                h[4] = 2;
+                h[5] = 1;
+                h[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+                h[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+                h[54..56].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[58..60].copy_from_slice(&u16::MAX.to_le_bytes());
+                h[60..62].copy_from_slice(&u16::MAX.to_le_bytes());
+                h
+            }),
+            ("truncated-note.so", {
+                let mut e = vec![0u8; 144];
+                e[0..4].copy_from_slice(b"\x7fELF");
+                e[4] = 2;
+                e[5] = 1;
+                e[32..40].copy_from_slice(&64u64.to_le_bytes());
+                e[54..56].copy_from_slice(&56u16.to_le_bytes());
+                e[56..58].copy_from_slice(&1u16.to_le_bytes());
+                e[64..68].copy_from_slice(&4u32.to_le_bytes());
+                e[72..80].copy_from_slice(&120u64.to_le_bytes());
+                // p_filesz overruns the file: bounded reads must not panic.
+                e[96..104].copy_from_slice(&(1u64 << 40).to_le_bytes());
+                e.truncate(130);
+                e
+            }),
+        ] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            assert!(!elf_has_android_ident(&p), "{name} must not parse as NDK");
+        }
+    }
+
+    /// A header can claim absurd phnum/shnum: the scan iterates a bounded
+    /// count under a total read budget, returns false, never panics.
+    #[test]
+    fn the_ndk_note_check_bounds_declared_header_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        let mut h = vec![0u8; 64];
+        h[0..4].copy_from_slice(b"\x7fELF");
+        h[4] = 2;
+        h[5] = 1;
+        h[18..20].copy_from_slice(&62u16.to_le_bytes());
+        h[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff (past EOF)
+        h[40..48].copy_from_slice(&4096u64.to_le_bytes()); // e_shoff (past EOF)
+        h[54..56].copy_from_slice(&56u16.to_le_bytes());
+        h[56..58].copy_from_slice(&u16::MAX.to_le_bytes()); // e_phnum
+        h[58..60].copy_from_slice(&64u16.to_le_bytes());
+        h[60..62].copy_from_slice(&u16::MAX.to_le_bytes()); // e_shnum
+        std::fs::write(&p, &h).unwrap();
+        assert!(!elf_has_android_ident(&p));
+    }
+
+    /// A real NDK cdylib is tens of megabytes and its note section can sit
+    /// anywhere in the file: an artifact whose SHT_NOTE payload lives past a
+    /// whole-file read cap is still accepted (bounded seek reads, not a
+    /// slurp). Sparse writes keep this a few pages on disk.
+    #[test]
+    fn a_large_artifact_with_a_note_past_the_old_read_cap_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // 64-byte ELF64 LE header, e_machine = x86_64; section table at
+        // SHOFF (96 MiB - past the old 64 MiB whole-file cap) with one
+        // SHT_NOTE entry whose payload is at NOFF (SHOFF + 64).
+        let shoff: u64 = 96 * 1024 * 1024;
+        let noff: u64 = shoff + 64;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[40..48].copy_from_slice(&shoff.to_le_bytes()); // e_shoff
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&1u16.to_le_bytes()); // e_shnum
+        let mut sh = vec![0u8; 64];
+        sh[4..8].copy_from_slice(&7u32.to_le_bytes()); // sh_type = SHT_NOTE
+        sh[24..32].copy_from_slice(&noff.to_le_bytes()); // sh_offset
+        sh[32..40].copy_from_slice(&24u64.to_le_bytes()); // sh_size
+                                                          // The note payload: namesz 8, descsz 4, type 1, name "Android\0".
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::Write;
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.set_len(noff + 24).unwrap();
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(shoff)).unwrap();
+        f.write_all(&sh).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(elf_has_android_ident(&p));
+    }
+
+    /// A note entry pointing at an unreadable region is not free: the
+    /// attempted read charges the scan budget, so a crafted file cannot
+    /// drive unbounded failed reads or push a later real note inside.
+    #[test]
+    fn failed_note_reads_charge_the_scan_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lib.so");
+        // ELF64 LE, e_machine x86_64, six program headers. The first four
+        // PT_NOTE entries point past EOF (reads fail); the fifth carries a
+        // real "Android" note. Charging only successful reads would reach
+        // it; charging attempted reads exhausts the budget first.
+        let phoff: u64 = 64;
+        let noff: u64 = 1024;
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&phoff.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&5u16.to_le_bytes());
+        let mut ph = vec![0u8; 56 * 5];
+        for i in 0..4 {
+            let b = i * 56;
+            ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes()); // p_type PT_NOTE
+            ph[b + 8..b + 16].copy_from_slice(&(1u64 << 40).to_le_bytes()); // p_offset past EOF
+            ph[b + 32..b + 40].copy_from_slice(&(1u64 << 20).to_le_bytes()); // p_filesz
+        }
+        let b = 4 * 56;
+        ph[b..b + 4].copy_from_slice(&4u32.to_le_bytes());
+        ph[b + 8..b + 16].copy_from_slice(&noff.to_le_bytes());
+        ph[b + 32..b + 40].copy_from_slice(&24u64.to_le_bytes());
+        let mut note = vec![0u8; 24];
+        note[0..4].copy_from_slice(&8u32.to_le_bytes());
+        note[4..8].copy_from_slice(&4u32.to_le_bytes());
+        note[8..12].copy_from_slice(&1u32.to_le_bytes());
+        note[12..20].copy_from_slice(b"Android\0");
+        let f = std::fs::File::create(&p).unwrap();
+        use std::io::{Seek, Write};
+        let mut f = f;
+        f.write_all(&elf).unwrap();
+        f.write_all(&ph).unwrap();
+        f.set_len(noff + 24).unwrap();
+        f.seek(std::io::SeekFrom::Start(noff)).unwrap();
+        f.write_all(&note).unwrap();
+        drop(f);
+        assert!(!elf_has_android_ident(&p));
+    }
+
+    #[test]
+    fn elf_machine_reads_the_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elf = tmp.path().join("lib.so");
+        write_test_elf(&elf, 183);
+        assert_eq!(elf_machine(&elf), Some(183));
+        // Big-endian data is honored.
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 2; // ELFDATA2MSB
+        header[18..20].copy_from_slice(&40u16.to_be_bytes());
+        let be = tmp.path().join("lib-be.so");
+        std::fs::write(&be, header).unwrap();
+        assert_eq!(elf_machine(&be), Some(40));
+        // A non-ELF or truncated file carries no machine.
+        let text = tmp.path().join("not-elf");
+        std::fs::write(&text, b"#!/bin/sh\n").unwrap();
+        assert_eq!(elf_machine(&text), None);
+        let short = tmp.path().join("short.so");
+        std::fs::write(&short, b"\x7fELF").unwrap();
+        assert_eq!(elf_machine(&short), None);
     }
 
     #[test]
@@ -38860,7 +39998,7 @@ mod worker_tests {
         // SAFETY: `cname` is a NUL-terminated POSIX SHM name; the descriptor is
         // closed below on every path.
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 cname.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600 as libc::c_uint,
@@ -38889,7 +40027,7 @@ mod worker_tests {
             .expect_err("an unarmed segment must be refused");
         let elapsed = started.elapsed();
         // SAFETY: unlinking the name this test created; peers hold no mapping.
-        let unlinked = unsafe { libc::shm_unlink(cname.as_ptr()) };
+        let unlinked = unsafe { cerulion_core::posix_shm::shm_unlink(cname.as_ptr()) };
         assert_eq!(
             unlinked,
             0,
@@ -41698,12 +42836,68 @@ mod supervisor_tests {
 
     /// Pre-created GO file → immediate Ok.
     #[test]
-    fn wait_for_go_returns_ok_on_existing_sentinel() {
+    fn wait_for_go_returns_the_epoch_an_existing_sentinel_carries() {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("d.go");
+        write_go_sentinel(&go, 987_654_321).unwrap();
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .expect("existing GO must be Ok");
+        assert_eq!(epoch, Some(987_654_321));
+    }
+
+    /// A sentinel written while the worker polls is picked up, epoch intact.
+    #[test]
+    fn wait_for_go_returns_the_epoch_of_a_sentinel_written_during_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("late.go");
+        let writer_go = go.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            write_go_sentinel(&writer_go, 42).unwrap();
+        });
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("GO arrives");
+        writer.join().unwrap();
+        assert_eq!(epoch, Some(42));
+    }
+
+    /// The atomic write leaves no `.tmp` sibling behind and replaces an older
+    /// sentinel whole.
+    #[test]
+    fn write_go_sentinel_replaces_whole_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("w.go");
+        write_go_sentinel(&go, 1).unwrap();
+        write_go_sentinel(&go, 22).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&go).unwrap(),
+            "cerulion-go-v1 epoch_ns=22\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("w.go")]);
+    }
+
+    /// A sentinel from an older build (bare `go`) is a LOUD error naming the
+    /// file and the build mismatch, never a guessed epoch.
+    #[test]
+    fn wait_for_go_refuses_an_unparseable_sentinel_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("old.go");
         std::fs::write(&go, b"go").unwrap();
         let running = AtomicBool::new(true);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("existing GO must be Ok");
+        let msg = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("cannot use the GO sentinel")
+                && msg.contains("old.go")
+                && msg.contains("not written by this build's supervisor"),
+            "{msg}"
+        );
     }
 
     /// `running` already false (Ctrl-C) → immediate Ok without a sentinel
@@ -41713,8 +42907,9 @@ mod supervisor_tests {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("never.go");
         let running = AtomicBool::new(false);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5))
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
             .expect("Ctrl-C during GO wait must drain cleanly, not error");
+        assert_eq!(epoch, None, "no sentinel was read, so no epoch");
     }
 
     /// No sentinel within the deadline → LOUD Err naming both suspects (a dead

@@ -9,6 +9,7 @@ use super::{
 use crate::codegen::layout::WireLayout;
 use crate::codegen::{FieldType, FrameValue, FrameValueKind, FrameWalker, MessageSchema, PrimType};
 use crate::dynamic::DynamicError;
+use crate::wire::WireHeader;
 
 /// Display options for [`message_to_yaml_with`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub struct YamlEncodeOptions {
 ///   truncated or malformed bytes).
 /// - [`DynamicError::YamlUnencodable`]: a value has no YAML form (a string
 ///   field that is not UTF-8, an array that is not in the canonical element
-///   framing, a `bool[]` byte that is neither 0 nor 1).
+///   framing, a `bool` or `bool[]` byte that is neither 0 nor 1).
 /// - [`DynamicError::YamlUnsupportedField`]: the schema has a field type the
 ///   YAML form does not cover (an array of arrays, an array of
 ///   `string_fixed[n]` outside a fixed array).
@@ -84,8 +85,15 @@ pub fn message_to_yaml_capped(
     max_bytes: usize,
 ) -> Result<String, DynamicError> {
     let keep = options.truncate_arrays.unwrap_or(usize::MAX);
-    let value = walker.walk_by_hash_keeping(frame, keep)?;
-    let schema = schema_of(walker, &value.schema_name, "")?;
+    let value = walker.walk_by_hash_keeping_raw_bools(frame, keep)?;
+    // The walk read a whole header, so `frame` holds one. The hash picks the
+    // schema the walk decoded with: a twin can own `value.schema_name`.
+    let schema = WireHeader::read_from_buf(frame)
+        .and_then(|header| walker.schema_for_hash(header.schema_hash))
+        .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+            path: shown(""),
+            target: value.schema_name.clone(),
+        })?;
     let mut emitter = Emitter {
         walker,
         options,
@@ -111,19 +119,6 @@ pub fn message_to_yaml_capped(
         }
         Err(e) => Err(e),
     }
-}
-
-fn schema_of<'w>(
-    walker: &'w FrameWalker,
-    qname: &str,
-    path: &str,
-) -> Result<&'w MessageSchema, DynamicError> {
-    walker
-        .schema_for_name(qname)
-        .ok_or_else(|| DynamicError::YamlUnresolvedNested {
-            path: shown(path),
-            target: qname.to_string(),
-        })
 }
 
 struct Emitter<'w> {
@@ -215,16 +210,11 @@ impl<'w> Emitter<'w> {
         depth: usize,
         dash: bool,
     ) -> Result<(), DynamicError> {
-        if depth > MAX_YAML_DEPTH {
-            return Err(DynamicError::YamlTooDeep {
-                path: shown(&self.path),
-                max: MAX_YAML_DEPTH,
-            });
-        }
+        self.too_deep(depth)?;
         // An empty variable nested blob decodes to a value with no fields:
         // treat it as the zero default.
         let value = value.filter(|v| !v.fields.is_empty() || schema.fields.is_empty());
-        let qname = schema.qualified_name();
+        let parent = schema.package.as_deref();
         for (i, field) in schema.fields.iter().enumerate() {
             let kind = match value {
                 Some(v) => {
@@ -246,8 +236,19 @@ impl<'w> Emitter<'w> {
                 format!("{:indent$}", "")
             };
             self.put(&format!("{lead}{}:", key(&field.name)))?;
-            self.value(&field.field_type, kind, &qname, indent, depth)?;
+            self.value(&field.field_type, kind, parent, indent, depth)?;
             self.path.truncate(mark);
+        }
+        Ok(())
+    }
+
+    /// Refuse a message nested past [`MAX_YAML_DEPTH`], as the reader does.
+    fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
+        if depth > MAX_YAML_DEPTH {
+            return Err(DynamicError::YamlTooDeep {
+                path: shown(&self.path),
+                max: MAX_YAML_DEPTH,
+            });
         }
         Ok(())
     }
@@ -258,7 +259,7 @@ impl<'w> Emitter<'w> {
         &mut self,
         ft: &FieldType,
         kind: Option<&FrameValueKind<'_>>,
-        parent: &str,
+        parent: Option<&str>,
         indent: usize,
         depth: usize,
     ) -> Result<(), DynamicError> {
@@ -277,6 +278,9 @@ impl<'w> Emitter<'w> {
                     Some(_) => return Err(self.unencodable("decoded value is not a message")),
                 };
                 if target.fields.is_empty() {
+                    // `{}` is a level too: the reader refuses it past the
+                    // bound, so it is never written there.
+                    self.too_deep(depth + 1)?;
                     return self.put(" {}\n");
                 }
                 self.put("\n")?;
@@ -295,27 +299,23 @@ impl<'w> Emitter<'w> {
         }
     }
 
-    /// The layout and schema a nested reference resolves to.
+    /// The layout and schema a nested reference, written inside a schema
+    /// of package `parent`, resolves to.
     fn nested_target(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent: &str,
+        parent: Option<&str>,
     ) -> Result<(&'w WireLayout, &'w MessageSchema), DynamicError> {
-        let target = self
-            .walker
-            .nested_layout(schema_name, package, parent)
+        self.walker
+            .nested_target(schema_name, package, parent)
             .ok_or_else(|| DynamicError::YamlUnresolvedNested {
                 path: shown(&self.path),
                 target: match package {
                     Some(p) => format!("{p}/{schema_name}"),
                     None => schema_name.to_string(),
                 },
-            })?;
-        Ok((
-            target,
-            schema_of(self.walker, &target.qualified_name, &self.path)?,
-        ))
+            })
     }
 
     /// An array of messages: a block sequence (`[]` when empty).
@@ -324,7 +324,7 @@ impl<'w> Emitter<'w> {
         ft: &FieldType,
         element_type: &FieldType,
         kind: Option<&FrameValueKind<'_>>,
-        parent: &str,
+        parent: Option<&str>,
         indent: usize,
         depth: usize,
     ) -> Result<(), DynamicError> {
@@ -383,11 +383,13 @@ impl<'w> Emitter<'w> {
             let mark = self.path.len();
             push_index(&mut self.path, i);
             if target.fields.is_empty() {
+                self.too_deep(depth + 2)?;
                 self.put(&format!("{:w$}- {{}}\n", "", w = indent + 2))?;
             } else {
                 // The element's fields sit at indent + 4; its first line
                 // carries the `- ` at indent + 2.
-                self.mapping(target, elem, indent + 4, depth + 1, true)?;
+                // The sequence and the element mapping are a level each.
+                self.mapping(target, elem, indent + 4, depth + 2, true)?;
             }
             self.path.truncate(mark);
         }
@@ -458,6 +460,11 @@ impl<'w> Emitter<'w> {
         type K<'a> = FrameValueKind<'a>;
         Ok(match (ft, kind) {
             (FieldType::Bool, K::Bool(v)) => v.to_string(),
+            // The walk keeps a bool byte past 1 as its byte: `true` would
+            // read back as 1, so the frame has no YAML form (as in `bool[]`).
+            (FieldType::Bool, K::U8(b)) => {
+                return Err(self.unencodable(format!("bool byte {b} is neither 0 nor 1")))
+            }
             (FieldType::I8, K::I8(v)) => v.to_string(),
             (FieldType::U8, K::U8(v)) => v.to_string(),
             (FieldType::I16, K::I16(v)) => v.to_string(),

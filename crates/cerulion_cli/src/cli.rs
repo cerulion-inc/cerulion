@@ -172,9 +172,9 @@ const COMPLETIONS_LONG_ABOUT: &str = "\
 Print the shell code that enables `cerulion` tab-completion.
 
 Completes everything: subcommands, flags, and enum values from the command
-tree, plus LIVE names: topic names for `topic echo/info/hz`, node types
-for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
-workspace + built-in ROS 2 schemas for `schema info`, and robot names for
+tree, plus LIVE names: topic names for `topic echo/info/hz/type/bw`, node
+types for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
+workspace + built-in ROS 2 schemas for `schema info` and `topic find`, and robot names for
 `viz --robot`.
 
 Install it once, per shell:
@@ -309,7 +309,7 @@ pub enum Commands {
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
         /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found by scouting with no configuration, and
+        /// typical LAN the robot is found over mDNS with no configuration, and
         /// no schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
@@ -317,11 +317,11 @@ pub enum Commands {
         /// A topic the robot does not serve is an error, not a silent skip.
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Additional zenoh gateway locator to CONNECT to, for a robot scouting
-        /// cannot reach, for example `tcp/192.0.2.10:7683`. Repeatable. Requires
-        /// `--robot`. Used when this command STARTS the daemon; a daemon that is
-        /// already running keeps the locators it started with (scouting covers
-        /// the LAN regardless, and the verb says so).
+        /// Additional zenoh gateway locator to CONNECT to, for a robot mDNS
+        /// discovery cannot reach, for example `tcp/192.0.2.10:7683`.
+        /// Repeatable. Requires `--robot`. Used when this command STARTS the
+        /// daemon; a daemon that is already running keeps the locators it
+        /// started with, and the verb says so.
         #[arg(long, value_name = "LOCATOR", requires = "robot")]
         connect: Vec<String>,
         /// Local zenoh locator to LISTEN on for remote discovery and ingress, for
@@ -373,8 +373,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
-        /// omitted, the paired desk key `~/.cerulion/desk.key` is used if it
-        /// exists (written by `cerulion pair`), else an EPHEMERAL key, which an
+        /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
+        /// named `~/.cerulion/desk.key`) is used if it exists (written by
+        /// `cerulion pair` or `cerulion login`), else an EPHEMERAL key, which an
         /// unpaired robot REFUSES, so pair the desk first with `cerulion pair`.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
@@ -407,9 +408,10 @@ pub enum Commands {
     ///
     /// The robot owner starts code pairing on the robot and shares a short code;
     /// you supply it here (`--code`, else typed at the prompt or piped on stdin).
-    /// The desk device key is created at `~/.cerulion/desk.key` on the first pair
-    /// (0600 permissions) and reused afterwards. An existing key is never
-    /// overwritten.
+    /// The desk device key is this machine's key,
+    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
+    /// created on the first pair or sign-in (0600 permissions) and reused
+    /// afterwards. An existing key is never overwritten.
     ///
     /// STDOUT carries deterministic, machine-parseable state lines:
     /// `pairing: robot=<name> eid=<hex>`, then on success
@@ -454,7 +456,8 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         label: Option<String>,
         /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
-        /// `~/.cerulion/desk.key` (created 0600 on the first pair, reused after).
+        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
+        /// the first pair or sign-in, reused after).
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         key_file: Option<PathBuf>,
         /// Self-hosted relay URL. Default: n0 public relays.
@@ -1518,9 +1521,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// announces every produced topic on the LAN, viewable by any peer
-        /// without pairing. Restrict exposure with a `network:` block, or pass
-        /// `off` for local-only.
+        /// can announce every produced topic when LAN access is open. Android
+        /// defaults to paired-only access, which withholds topic announcements.
+        /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
         /// Cap, in entries, on the in-memory fire trace. The trace is a BOUNDED
@@ -1789,8 +1792,9 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (multicast and gossip scouting
-    /// on), so robots on the LAN show up with no flags and no pairing; when it
+    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
+    /// cache and the hostname rung), so robots on the LAN show up with no
+    /// flags and no pairing; when it
     /// finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
@@ -1799,7 +1803,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--local` to skip the remote
+    /// peers discovery cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1819,11 +1823,11 @@ pub enum TopicAction {
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// OPT-IN: also sweep the local /24 subnets, one address at a time, on
@@ -1837,6 +1841,13 @@ pub enum TopicAction {
         /// appears as a robot.
         #[arg(long)]
         scan: bool,
+        /// Show each topic's message type after its name, as
+        /// `/topic  [package/Type]` (`ros2 topic list -t`). A LOCAL topic is
+        /// typed from one message (the listing waits up to one second in
+        /// all); a REMOTE topic from its robot's catalog. A type that is not
+        /// known shows `[unknown]`.
+        #[arg(short = 't', long = "show-types")]
+        show_types: bool,
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
@@ -2364,7 +2375,7 @@ mod pair_dispatch_tests {
                 assert!(label.is_none(), "the label defaults to the desk hostname");
                 assert!(
                     key_file.is_none(),
-                    "the key file defaults to ~/.cerulion/desk.key"
+                    "the key file defaults to this machine's key"
                 );
                 assert!(relay_url.is_none());
                 assert!(!relay_disabled);
@@ -3704,8 +3715,10 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        show_types,
                     },
             } => {
+                assert!(!show_types, "a bare list prints no types");
                 assert!(!no_network, "bare list must default to remote-discovery ON");
                 assert!(connect.is_empty());
                 assert!(listen.is_empty());
@@ -3713,6 +3726,21 @@ mod topic_list_network_flag_tests {
                 assert!(!all, "internal topics must be HIDDEN on a bare list");
             }
             _ => panic!("expected Topic::List"),
+        }
+    }
+
+    #[test]
+    fn topic_list_t_and_show_types_ask_for_types() {
+        for flag in ["-t", "--show-types"] {
+            match Cli::try_parse_from(["cerulion", "topic", "list", flag])
+                .expect("`topic list -t` must parse")
+                .command
+            {
+                Commands::Topic {
+                    action: TopicAction::List { show_types, .. },
+                } => assert!(show_types, "{flag}"),
+                _ => panic!("expected Topic::List"),
+            }
         }
     }
 
@@ -3794,6 +3822,7 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        ..
                     },
             } => {
                 assert!(!no_network);

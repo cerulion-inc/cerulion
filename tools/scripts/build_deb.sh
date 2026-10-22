@@ -2,7 +2,7 @@
 #
 # Assemble a Cerulion Debian package from an existing release archive.
 #
-# The archive carries the three binaries and four license notices: LICENSE
+# The archive carries the four binaries and four license notices: LICENSE
 # (the AGPL-3.0-only text the combined work is under), NOTICE (third-party
 # attributions), LICENSE-BSD-3-CLAUSE (the license of the vendored ROS 2
 # message packages that carry it) and THIRD-PARTY-LICENSES.md (the generated
@@ -108,7 +108,7 @@ tar -xzf "$archive" -C "$workdir" ||
 archive_dir="$workdir/$archive_stem"
 [ -d "$archive_dir" ] || die "archive is missing top-level directory $archive_stem"
 
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     if [ ! -f "$archive_dir/$binary" ] || [ -L "$archive_dir/$binary" ]; then
         die "archive is missing $binary"
     fi
@@ -156,7 +156,7 @@ stage="$workdir/root"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/doc/cerulion"
 chmod 0755 "$stage" "$stage/DEBIAN" "$stage/usr" "$stage/usr/bin" \
     "$stage/usr/share" "$stage/usr/share/doc" "$stage/usr/share/doc/cerulion"
-for binary in cerulion cerulion-netd cerulion-connectd; do
+for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
     cp "$archive_dir/$binary" "$stage/usr/bin/$binary"
     chmod 0755 "$stage/usr/bin/$binary"
 done
@@ -239,11 +239,12 @@ Recommends: cerulion-archive-keyring, build-essential, git, curl
 Suggests: ros-jazzy-ros-base
 Description: Zero-copy deterministic communication for real-time robotics
  Cerulion provides deterministic, zero-copy communication tools for robotics.
- The package includes the CLI and its network and desk-side daemon siblings,
- plus librmw_cerulion.so, the ROS 2 Jazzy rmw that cerulion ros2 run and
- cerulion ros2 launch load, and libcerulion_heaphook.so, the heap hook those
- verbs preload into ROS 2 nodes. ROS 2 Jazzy itself (ros-jazzy-ros-base on
- Ubuntu 24.04) is installed separately.
+ The package includes the CLI and its daemon siblings (network, desk-side
+ connect and robot-side remote access), plus librmw_cerulion.so, the ROS 2
+ Jazzy rmw that cerulion ros2 run and cerulion ros2 launch load, and
+ libcerulion_heaphook.so, the heap hook those verbs preload into ROS 2 nodes.
+ ROS 2 Jazzy itself (ros-jazzy-ros-base on Ubuntu 24.04) is installed
+ separately.
 EOF
 chmod 0644 "$stage/DEBIAN/control"
 
