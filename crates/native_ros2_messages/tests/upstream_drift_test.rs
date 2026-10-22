@@ -1390,12 +1390,31 @@ fn refresh_manifest_from_upstream_tree() {
     }
 }
 
-/// A corpus root that does not exist contributes nothing: a checkout without
-/// a `srv/` directory still walks its `.msg` files.
+/// A corpus root that does not exist contributes nothing, and only that
+/// root: a checkout without a `srv/` directory still walks its `.msg` files,
+/// and one without `msg/` still walks its `.srv` files.
 #[test]
 fn a_missing_corpus_root_contributes_nothing() {
-    let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no_such_corpus_root");
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let missing = crate_dir.join("no_such_corpus_root");
     assert!(common::corpus_sources(&missing, &missing).is_empty());
+
+    let header = std::fs::read_to_string(crate_dir.join("msg/std_msgs/Header.msg")).unwrap();
+    let messages = common::corpus_sources(&crate_dir.join("msg"), &missing);
+    assert_eq!(
+        messages.get(&("std_msgs".to_string(), "Header".to_string())),
+        Some(&header),
+        "the .msg files are walked without a srv/ root"
+    );
+    assert!(!messages.contains_key(&("std_srvs".to_string(), "Trigger_Request".to_string())));
+
+    let services = common::corpus_sources(&missing, &crate_dir.join("srv"));
+    assert_eq!(
+        services.get(&("std_srvs".to_string(), "Trigger_Response".to_string())),
+        Some(&"bool success   # indicate successful run of triggered service\nstring message # informational, e.g. for error messages\n".to_string()),
+        "the .srv files are walked without a msg/ root"
+    );
+    assert!(!services.contains_key(&("std_msgs".to_string(), "Header".to_string())));
 }
 
 /// A corpus root that exists but cannot be listed is an error, not an empty
