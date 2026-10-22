@@ -163,11 +163,21 @@ reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
 #                  run at LOAD. Excluded rather than swept: a real sweep
 #                  of its 125 findings has not been done, and the exclusion
 #                  says so instead of annotating them away here.
+#   launch_args.rs launch-argument resolution (`args:` defaults, `name:=value`
+#                  overrides) and the `${name}` substitution into the graph
+#                  document; runs once per graph parse, before the graph types
+#                  read the YAML and before any transport resource exists.
+#   params.rs      param resolution (default, then graph YAML) and the JSON
+#                  handoff to a cdylib; runs once per node at graph build, before
+#                  any transport resource exists. The tick path reads a plain
+#                  struct field the build wrote once.
+#   param_resume.rs the resume rule for params: one comparison per resumed
+#                  node, before the first step of a resumed replay.
 #   partition.rs   the auto-partitioner; runs at `graph run` preflight.
 #   topology.rs    the STATIC build-time dataflow model; `build()`/`validate()`
 #                  run once at graph build.
 #   validation.rs  build-time graph validation.
-GRAPH_EXCLUDE="chain.rs config.rs node.rs partition.rs topology.rs validation.rs"
+GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs param_resume.rs params.rs partition.rs topology.rs validation.rs"
 
 # cerulion_core/src/scheduler — the fire/decide engine.
 #

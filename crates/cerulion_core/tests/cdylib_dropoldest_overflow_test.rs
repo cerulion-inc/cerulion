@@ -138,6 +138,7 @@ fn run_sweep() -> SweepResult {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -146,6 +147,7 @@ fn run_sweep() -> SweepResult {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "slow_drain_consumer".to_string(),
@@ -157,6 +159,7 @@ fn run_sweep() -> SweepResult {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "drain".to_string(),

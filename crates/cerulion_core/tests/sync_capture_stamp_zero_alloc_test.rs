@@ -160,6 +160,7 @@ fn fusion_graph(
         identity: format!("capza_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            params: Default::default(),
             fuse: None,
             ros2: None,
             id: "fuse".to_string(),

@@ -1,0 +1,11 @@
+error: `#[param]` field `gain` cannot be conditional (`#[cfg]` / `#[cfg_attr]`): every param is declared, delivered and applied in every build; make the field unconditional, or read the setting another way
+  --> tests/ui/param_cfg_field.rs:10:5
+   |
+10 |     #[cfg(any())]
+   |     ^^^^^^^^^^^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_cfg_field.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^

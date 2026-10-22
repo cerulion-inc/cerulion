@@ -63,6 +63,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
         prefix: "ingress_preflight".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "snapshot_fail".to_string(),
