@@ -70,12 +70,47 @@ jobs:
         env:
           # The same toolchain the `build` job pins for the binaries.
           CERULION_RMW_TOOLCHAIN: 1.95.0
-        run: tools/scripts/build_rmw_jazzy.sh . "$RUNNER_TEMP/rmw"
+        run: tools/scripts/build_rmw.sh jazzy . "$RUNNER_TEMP/rmw"
 
       - name: Upload rmw library and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rmw-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/rmw/librmw_cerulion.so
+            ${{ runner.temp }}/rmw/librmw_cerulion.so.evidence.txt
+            ${{ runner.temp }}/rmw/build-env.txt
+          if-no-files-found: error
+
+  # The ROS 2 Lyrical rmw, built the same way inside `ros:lyrical` for every
+  # release (build_rmw.sh refuses a library whose bindings were not
+  # generated). It is uploaded as build evidence beside the Jazzy one; the
+  # archives and the deb carry the Jazzy library only.
+  rmw-lyrical:
+    name: Build rmw_cerulion for Lyrical ${{ matrix.target }}
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build librmw_cerulion.so inside ros:lyrical
+        env:
+          CERULION_RMW_TOOLCHAIN: 1.95.0
+        run: tools/scripts/build_rmw.sh lyrical . "$RUNNER_TEMP/rmw"
+
+      - name: Upload rmw library and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmw-lyrical-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/rmw/librmw_cerulion.so
             ${{ runner.temp }}/rmw/librmw_cerulion.so.evidence.txt
@@ -379,14 +414,15 @@ jobs:
   release:
     name: Publish GitHub Release assets
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: [build, verify-rmw]
+    needs: [build, verify-rmw, rmw-lyrical]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      # Only the `cerulion-*` artifacts are release assets. The `rmw-*`
-      # library artifacts and the `rmw-verify-*` logs are build evidence, not
-      # downloads: the library ships inside the Linux archives.
+      # Only the `cerulion-*` artifacts are release assets. The `rmw-*` and
+      # `rmw-lyrical-*` library artifacts and the `rmw-verify-*` logs are
+      # build evidence, not downloads: the Jazzy library ships inside the Linux
+      # archives.
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
