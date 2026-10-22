@@ -870,7 +870,8 @@ class ResizedArray:
 class GrowingArray:
     """An array-like that gains `grow_by` items the first time it is read,
     as a NumPy array another thread appends to looks to the reader: every
-    read is bounded and honest, so only its length shows the change."""
+    read gives exactly the items it asks for, so only its length shows
+    the change."""
 
     def __init__(self, ndim, items, grow_by):
         self.ndim = ndim
