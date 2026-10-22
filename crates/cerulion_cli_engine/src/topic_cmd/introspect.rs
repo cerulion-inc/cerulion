@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use super::{TopicScope, TopicSource};
 use crate::error::{CliError, CliResult};
 
-/// One received frame as `topic bw` sees it: the publisher's wire stamp and
-/// the payload size in bytes.
+/// One received frame as `topic bw` sees it: the publisher's wire stamp, the
+/// payload size in bytes and which publisher sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BwFrame {
     /// The frame's wire `timestamp_ns` (the publisher's stamp, so a replayed
@@ -26,6 +26,12 @@ pub struct BwFrame {
     pub timestamp_ns: u64,
     /// The payload size in bytes.
     pub size_bytes: u64,
+    /// The publisher identity of the frame (the receive path's
+    /// `ReceivedMessage::origin`). Stamps are compared only between frames of
+    /// one publisher, because two publishers of a `multi_publisher_topics`
+    /// topic can run on clocks that do not agree. A frame re-injected from
+    /// the network carries the identity of its local re-injecting publisher.
+    pub publisher: u128,
 }
 
 /// What [`bandwidth`] computes over one window of frames.
@@ -45,29 +51,33 @@ pub struct BwStats {
 
 /// The bandwidth of a window of frames.
 ///
-/// The rate is the bytes that arrived AFTER the earliest stamp divided by the
-/// time from the earliest stamp to the latest one: `n` frames span `n - 1`
-/// intervals, so a steady stream of `S` bytes every `T` seconds measures
-/// exactly `S / T`. Every frame ON the earliest stamp opens the span and is
-/// left out of the rate (two frames stamped together at the start are one
-/// instant, not one interval). `None` when the window cannot give a rate: no
-/// frame, one frame, or every frame on one stamp (no time span). Integer
-/// arithmetic in `u128`, so the largest sizes and spans never overflow; a
-/// rate above `u64::MAX` saturates.
+/// Each publisher's rate is measured on its own clock: the bytes it sent
+/// AFTER its earliest stamp divided by the time from its earliest stamp to
+/// its latest one. `n` frames span `n - 1` intervals, so a steady stream of
+/// `S` bytes every `T` seconds measures exactly `S / T`. Every frame ON a
+/// publisher's earliest stamp opens its span and is left out of its rate
+/// (two frames stamped together at the start are one instant, not one
+/// interval). The topic's rate is the sum of the publisher rates, so two
+/// publishers whose clocks disagree (a sim clock and a wall clock) still
+/// measure what each one sends. A publisher with no time span yet (one
+/// frame, or every frame on one stamp) adds no rate. `None` when no
+/// publisher in the window has a span. The frame count and the sizes cover
+/// the whole window. Integer arithmetic in `u128`, so the largest sizes and
+/// spans never overflow; a rate above `u64::MAX` saturates. No allocation:
+/// the window is read once per publisher it holds.
 pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
-    let first_ns = window.iter().map(|f| f.timestamp_ns).min()?;
-    let last_ns = window.iter().map(|f| f.timestamp_ns).max()?;
-    let span_ns = u128::from(last_ns - first_ns);
-    if span_ns == 0 {
-        return None;
+    let mut rate: Option<u128> = None;
+    for (i, frame) in window.iter().enumerate() {
+        // Measure each publisher once, at its first frame in the window.
+        if window[..i].iter().any(|f| f.publisher == frame.publisher) {
+            continue;
+        }
+        if let Some(r) = publisher_rate(window, frame.publisher) {
+            rate = Some(rate.unwrap_or(0).saturating_add(r));
+        }
     }
+    let rate = rate?;
     let total: u128 = window.iter().map(|f| u128::from(f.size_bytes)).sum();
-    let after_first: u128 = window
-        .iter()
-        .filter(|f| f.timestamp_ns != first_ns)
-        .map(|f| u128::from(f.size_bytes))
-        .sum();
-    let rate = (after_first * 1_000_000_000 + span_ns / 2) / span_ns;
     let frames = window.len();
     Some(BwStats {
         bytes_per_sec: u64::try_from(rate).unwrap_or(u64::MAX),
@@ -76,6 +86,24 @@ pub fn bandwidth(window: &[BwFrame]) -> Option<BwStats> {
         min_size: window.iter().map(|f| f.size_bytes).min().unwrap_or(0),
         max_size: window.iter().map(|f| f.size_bytes).max().unwrap_or(0),
     })
+}
+
+/// The rate in bytes per second of `publisher`'s frames in `window`, on that
+/// publisher's own stamps and rounded to the nearest byte (see
+/// [`bandwidth`]). `None` when its frames span no time.
+fn publisher_rate(window: &[BwFrame], publisher: u128) -> Option<u128> {
+    let own = || window.iter().filter(move |f| f.publisher == publisher);
+    let first_ns = own().map(|f| f.timestamp_ns).min()?;
+    let last_ns = own().map(|f| f.timestamp_ns).max()?;
+    let span_ns = u128::from(last_ns - first_ns);
+    if span_ns == 0 {
+        return None;
+    }
+    let after_first: u128 = own()
+        .filter(|f| f.timestamp_ns != first_ns)
+        .map(|f| u128::from(f.size_bytes))
+        .sum();
+    Some((after_first * 1_000_000_000 + span_ns / 2) / span_ns)
 }
 
 /// The decimal unit prefixes `topic bw` scales by (1 KB = 1000 B, as
@@ -1003,19 +1031,24 @@ pub fn topic_type_with_scope(
 
 /// Add `frame` to the bandwidth `ring` of at most `window` frames.
 ///
-/// A frame stamped before the ring's newest frame AND no later than its
-/// oldest frame is a publisher clock reset (a `bag play --loop` pass that
-/// starts again, or a restarted sim clock): the ring is cleared first, so a
-/// figure never mixes frames from both sides of the reset. A frame that is
-/// only a little out of order (later than the oldest frame) is kept, and a
-/// silent gap never clears the ring, because its stamps still go forward.
-/// The check reads the two ends of the ring only, so it is constant time
-/// and never allocates. `window` is never zero, so the ring always stays
-/// bounded: a full ring drops its oldest frame before the new one goes in.
+/// Stamps are compared only with the frames of the SAME publisher, because
+/// another publisher of the topic can run on a clock that does not agree. A
+/// frame stamped before its publisher's newest frame in the ring AND no later
+/// than that publisher's oldest one is a clock reset of that publisher (a
+/// `bag play --loop` pass that starts again, or a restarted sim clock): that
+/// publisher's frames leave the ring first, so its rate never mixes frames
+/// from both sides of the reset, and the other publishers keep their frames.
+/// A frame that is only a little out of order (later than its publisher's
+/// oldest frame) is kept, and a silent gap never clears anything, because its
+/// stamps still go forward. With one publisher the two frames compared are
+/// the two ends of the ring, so the check is constant time; it never
+/// allocates. `window` is never zero, so the ring always stays bounded: a
+/// full ring drops its oldest frame before the new one goes in.
 pub fn push_bw_frame(ring: &mut VecDeque<BwFrame>, window: NonZeroUsize, frame: BwFrame) {
-    if let (Some(oldest), Some(newest)) = (ring.front(), ring.back()) {
+    let same = |f: &&BwFrame| f.publisher == frame.publisher;
+    if let (Some(oldest), Some(newest)) = (ring.iter().find(same), ring.iter().rev().find(same)) {
         if frame.timestamp_ns < newest.timestamp_ns && frame.timestamp_ns <= oldest.timestamp_ns {
-            ring.clear();
+            ring.retain(|f| f.publisher != frame.publisher);
         }
     }
     if ring.len() >= window.get() {
@@ -1059,7 +1092,8 @@ pub fn bw_report_line(
 /// a ring allocated once before the loop, so the receive callback never
 /// allocates. A second with no new frame prints a silence line instead of
 /// repeating the last figure, and keeps the window (see [`bw_report_line`]);
-/// a publisher clock reset clears it (see [`push_bw_frame`]).
+/// a publisher clock reset clears that publisher's frames (see
+/// [`push_bw_frame`]).
 /// A closed output (a reader that left the pipe) ends the command cleanly;
 /// any other write failure is returned.
 pub fn topic_bw_with_scope(
@@ -1097,6 +1131,7 @@ pub fn topic_bw_with_scope(
                 BwFrame {
                     timestamp_ns: msg.header().timestamp_ns,
                     size_bytes: msg.payload().len() as u64,
+                    publisher: msg.origin(),
                 },
             );
             delivered += 1;
@@ -1169,9 +1204,15 @@ mod tests {
     use super::*;
 
     fn frame(timestamp_ns: u64, size_bytes: u64) -> BwFrame {
+        from(1, timestamp_ns, size_bytes)
+    }
+
+    /// A frame from the publisher with identity `publisher`.
+    fn from(publisher: u128, timestamp_ns: u64, size_bytes: u64) -> BwFrame {
         BwFrame {
             timestamp_ns,
             size_bytes,
+            publisher,
         }
     }
 
@@ -1629,6 +1670,116 @@ mod tests {
     fn a_full_window_drops_its_oldest_frame() {
         let ring = pushed(2, &[frame(0, 1), frame(SEC, 2), frame(2 * SEC, 3)]);
         assert_eq!(ring, [frame(SEC, 2), frame(2 * SEC, 3)]);
+    }
+
+    /// Two publishers whose clocks disagree by 1000 s: A (sim clock near
+    /// 5 s) sends 100 bytes every 100 ms, B (wall clock near 1000 s) sends
+    /// 10 bytes every 100 ms, interleaved. The topic sends 1100 B/s (1000
+    /// from A, 100 from B), worked by hand, not by the code under test.
+    fn disagreeing_clocks(pairs: u64) -> Vec<BwFrame> {
+        (0..pairs)
+            .flat_map(|i| {
+                [
+                    from(0xA, 5 * SEC + i * SEC / 10, 100),
+                    from(0xB, 1000 * SEC + i * SEC / 10, 10),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn publishers_on_disagreeing_clocks_measure_their_sum() {
+        let mut ring = pushed(100, &disagreeing_clocks(10));
+        assert_eq!(ring.len(), 20, "no frame of either publisher is a reset");
+        // A: 9 x 100 bytes over 0.9 s is 1000 B/s; B: 9 x 10 over 0.9 s is
+        // 100 B/s. Mean (1000 + 100) / 20 = 55.
+        assert_eq!(
+            bw_report_line(&mut ring, 20, Duration::ZERO, "local SHM"),
+            "bandwidth: 1.10 KB/s, mean: 55 B, min: 10 B, max: 100 B, window: 20"
+        );
+    }
+
+    #[test]
+    fn a_small_window_keeps_both_publishers_of_disagreeing_clocks() {
+        // In a window of 4 the lower clock (A) is behind every frame of B,
+        // yet it is no reset of B: the window ends with the last two frames
+        // of each publisher.
+        let frames = disagreeing_clocks(10);
+        let ring = pushed(4, &frames);
+        assert_eq!(ring, &frames[16..]);
+        let mut ring = ring;
+        // A: 100 bytes over 0.1 s, B: 10 bytes over 0.1 s.
+        assert_eq!(
+            bw_report_line(&mut ring, 4, Duration::ZERO, "local SHM"),
+            "bandwidth: 1.10 KB/s, mean: 55 B, min: 10 B, max: 100 B, window: 4"
+        );
+    }
+
+    #[test]
+    fn a_reset_of_one_publisher_keeps_the_other_publishers_frames() {
+        // A loops back to 0 s; B keeps going. Only A's earlier frames leave.
+        let ring = pushed(
+            100,
+            &[
+                from(0xA, 4 * SEC, 1),
+                from(0xB, 900 * SEC, 2),
+                from(0xA, 5 * SEC, 1),
+                from(0xB, 901 * SEC, 2),
+                from(0xA, 0, 3),
+            ],
+        );
+        assert_eq!(
+            ring,
+            [
+                from(0xB, 900 * SEC, 2),
+                from(0xB, 901 * SEC, 2),
+                from(0xA, 0, 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_publisher_with_one_frame_adds_no_rate() {
+        // B has one frame (no interval yet); the rate is A's alone, but the
+        // sizes and the count cover the whole window.
+        let window = [
+            from(0xA, 0, 100),
+            from(0xB, 7 * SEC, 1000),
+            from(0xA, SEC, 100),
+        ];
+        assert_eq!(
+            bandwidth(&window),
+            Some(BwStats {
+                bytes_per_sec: 100,
+                frames: 3,
+                mean_size: 400,
+                min_size: 100,
+                max_size: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn the_rate_does_not_depend_on_how_publishers_interleave() {
+        // The same frames, all of A then all of B, read the same figure as
+        // the interleaved order.
+        let interleaved = disagreeing_clocks(10);
+        let mut grouped: Vec<BwFrame> = interleaved
+            .iter()
+            .filter(|f| f.publisher == 0xA)
+            .copied()
+            .collect();
+        grouped.extend(interleaved.iter().filter(|f| f.publisher == 0xB));
+        assert_eq!(bandwidth(&grouped), bandwidth(&interleaved));
+        assert_eq!(bandwidth(&grouped).map(|s| s.bytes_per_sec), Some(1100));
+    }
+
+    #[test]
+    fn publishers_with_no_span_have_no_bandwidth() {
+        assert_eq!(
+            bandwidth(&[from(0xA, SEC, 10), from(0xB, 2 * SEC, 10)]),
+            None
+        );
     }
 
     #[test]

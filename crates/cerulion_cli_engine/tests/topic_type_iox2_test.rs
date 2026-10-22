@@ -95,7 +95,7 @@ impl Drop for EnvGuard {
 struct RawTopicWriter {
     // Order-independent liveness holders; the publisher is the port we send on.
     _node: iceoryx2::node::Node<RawService>,
-    _data_service:
+    data_service:
         iceoryx2::service::port_factory::publish_subscribe::PortFactory<RawService, [u8], ()>,
     publisher: iceoryx2::port::publisher::Publisher<RawService, [u8], ()>,
     /// Present only for the NOTIFYING fixture; `None` = pure data writer
@@ -121,6 +121,8 @@ impl RawTopicWriter {
             .publish_subscribe::<[u8]>()
             // Room for several frames between the observer's drains.
             .subscriber_max_buffer_size(16)
+            // Room for the second port of `second_publisher`.
+            .max_publishers(2)
             .create()
             .expect("raw data service");
         let publisher = data_service
@@ -150,7 +152,7 @@ impl RawTopicWriter {
 
         Self {
             _node: node,
-            _data_service: data_service,
+            data_service,
             publisher,
             notifier,
             _event_service: event_service,
@@ -161,8 +163,27 @@ impl RawTopicWriter {
     /// event ONLY if this writer was built notifying. The adversarial
     /// fixture never notifies, forcing the observer's timeout-drain path.
     fn publish(&self, frame: &[u8]) {
-        let mut sample = self
-            .publisher
+        self.publish_on(&self.publisher, frame);
+    }
+
+    /// A second publisher port on this writer's `{topic}/data` service, with
+    /// its own iceoryx2 publisher identity. Send on it with
+    /// [`Self::publish_on`].
+    fn second_publisher(&self) -> iceoryx2::port::publisher::Publisher<RawService, [u8], ()> {
+        self.data_service
+            .publisher_builder()
+            .initial_max_slice_len(4096)
+            .create()
+            .expect("second raw publisher")
+    }
+
+    /// [`Self::publish`] on `publisher` instead of this writer's own port.
+    fn publish_on(
+        &self,
+        publisher: &iceoryx2::port::publisher::Publisher<RawService, [u8], ()>,
+        frame: &[u8],
+    ) {
+        let mut sample = publisher
             .loan_slice_uninit(frame.len())
             .expect("raw publisher loan");
         let buf = sample.payload_mut();
@@ -172,7 +193,6 @@ impl RawTopicWriter {
         // SAFETY: bytes [0, frame.len()) were all initialized above.
         let sample = unsafe { sample.assume_init() };
         sample.send().expect("raw publisher send");
-
         if let Some(notifier) = &self.notifier {
             notifier
                 .notify_with_custom_event_id(PubSubEvent::SentSample.into())
@@ -509,12 +529,15 @@ fn bw_measures_a_publisher_slower_than_one_report_a_second() {
         })
     };
     await_subscribers(&topic, 1);
-    // A 300 byte payload (an 8 byte string header and 292 bytes) every 2.5 s:
-    // at least one whole one-second report between the two frames is silent.
+    // Two 300 byte payloads (an 8 byte string header and 292 bytes) sent
+    // 2.5 s apart, so at least one whole one-second report between them is
+    // silent. Their wire stamps are 10 s apart, NOT 2.5 s: the rate must come
+    // from the stamps (Replay = Live), so a figure taken from arrival times
+    // (120 B/s) is a different number from the right one.
     let text = "b".repeat(292);
     writer.publish(&build_string_frame(0, 0, &text));
     std::thread::sleep(Duration::from_millis(2_500));
-    writer.publish(&build_string_frame(1, 2_500_000_000, &text));
+    writer.publish(&build_string_frame(1, 10_000_000_000, &text));
     // Let the next report, which sees the second frame, print.
     std::thread::sleep(Duration::from_millis(1_200));
     running.store(false, Ordering::Relaxed);
@@ -523,11 +546,71 @@ fn bw_measures_a_publisher_slower_than_one_report_a_second() {
         report.contains("no messages received: attached to"),
         "a silent second prints its notice:\n{report}"
     );
-    // The two frames' stamps are 2.5 s apart: 300 bytes over 2.5 s is 120 B/s.
+    // The two frames' stamps are 10 s apart: 300 bytes over 10 s is 30 B/s.
     assert!(
         report
             .lines()
-            .any(|l| l == "bandwidth: 120 B/s, mean: 300 B, min: 300 B, max: 300 B, window: 2"),
-        "the slow publisher measures a rate:\n{report}"
+            .any(|l| l == "bandwidth: 30 B/s, mean: 300 B, min: 300 B, max: 300 B, window: 2"),
+        "the slow publisher measures its rate on the wire stamps:\n{report}"
+    );
+    assert!(
+        !report.contains("bandwidth: 120 B/s"),
+        "the rate never comes from arrival times:\n{report}"
+    );
+}
+
+/// Two publishers of one topic on clocks 995 s apart (a sim clock near 5 s,
+/// a wall clock near 1000 s), each sending 100 byte payloads stamped 100 ms
+/// apart. Each one is measured on its own stamps, so the topic reads the sum:
+/// 1000 B/s from each is 2000 B/s, worked by hand. One window over both
+/// clocks would span about 995 s and print a few bytes a second, or keep
+/// clearing itself on the lower clock and wait for more messages.
+#[test]
+#[serial]
+fn bw_sums_publishers_whose_clocks_disagree() {
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let _net = EnvGuard::set("CERULION_NETWORK", "off");
+    let topic = unique_topic("bw_two_clocks");
+    let writer = RawTopicWriter::new(&topic, true);
+    let second = writer.second_publisher();
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let topic = topic.clone();
+        let running = Arc::clone(&running);
+        std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            topic_bw_with_scope(
+                &topic,
+                None,
+                running,
+                &mut out,
+                TopicScope::Local,
+                NonZeroUsize::new(10).unwrap(),
+            )
+            .expect("topic bw");
+            String::from_utf8(out).expect("utf-8 report")
+        })
+    };
+    await_subscribers(&topic, 1);
+    // An 8 byte string header and 92 bytes: a 100 byte payload.
+    let text = "c".repeat(92);
+    const SIM_NS: u64 = 5_000_000_000;
+    const WALL_NS: u64 = 1_000_000_000_000;
+    for i in 0..25u32 {
+        let step = u64::from(i) * 100_000_000;
+        writer.publish(&build_string_frame(i, SIM_NS + step, &text));
+        writer.publish_on(&second, &build_string_frame(i, WALL_NS + step, &text));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    running.store(false, Ordering::Relaxed);
+    let report = handle.join().expect("bw thread");
+    assert!(
+        report
+            .lines()
+            .any(|l| l == "bandwidth: 2.00 KB/s, mean: 100 B, min: 100 B, max: 100 B, window: 10"),
+        "each publisher is measured on its own clock and the rates add:\n{report}"
     );
 }
