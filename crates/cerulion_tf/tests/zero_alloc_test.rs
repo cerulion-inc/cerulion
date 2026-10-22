@@ -216,6 +216,9 @@ fn every_buffer_operation(b: &mut TfBuffer) {
     black_box(b.lookup_latest_ids(lidar, odom)).unwrap();
     black_box(b.frame_name(odom));
     black_box(b.edge("base"));
+    for edge in b.static_edges() {
+        black_box(edge);
+    }
     black_box(b.contains_frame("odom"));
     black_box((b.expired(), b.replacements(), b.epoch()));
 

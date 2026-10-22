@@ -196,6 +196,17 @@ pub struct EdgeInfo<'a> {
     pub jump_refusals: u64,
 }
 
+/// One static edge, read through [`TfBuffer::static_edges`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StaticEdge<'a> {
+    /// The parent frame of the edge (`header.frame_id`).
+    pub parent: &'a str,
+    /// The child frame of the edge (`child_frame_id`).
+    pub child: &'a str,
+    /// `T_parent_child`, the last transform inserted for the edge.
+    pub transform: Transform,
+}
+
 /// A buffer of stamped transforms, queried by `lookup(parent, child, time)`.
 ///
 /// # The tree
@@ -453,6 +464,30 @@ impl TfBuffer {
             window_refusals: frame.window_refusals,
             jump_refusals: frame.jump_refusals,
         })
+    }
+
+    /// Every static edge, one per child frame, in the order the child
+    /// frames were registered.
+    ///
+    /// Each edge holds the last transform [`Self::insert_static`] gave it:
+    /// inserting a static transform for a child the buffer already holds
+    /// replaces it. A node that publishes `/tf_static` keeps its static set
+    /// in a buffer and writes every edge of this iterator into each
+    /// `TFMessage` it sends, so its one latched message holds its whole set,
+    /// merged by child frame. Reads only; never allocates.
+    pub fn static_edges(&self) -> impl Iterator<Item = StaticEdge<'_>> + '_ {
+        self.frames[..self.active()]
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.is_static)
+            .filter_map(|(c, frame)| {
+                let p = frame.parent?;
+                Some(StaticEdge {
+                    parent: self.names.name(p),
+                    child: self.names.name(c),
+                    transform: frame.static_transform,
+                })
+            })
     }
 
     /// Records `T_parent_child` at `stamp_ns` on the edge's ring, written by
@@ -800,10 +835,19 @@ impl TfBuffer {
                 }
             }
         }
-        let new_frames = usize::from(p.is_none()) + usize::from(c.is_none());
-        if self.active() + new_frames > self.frames.len() {
+        // The parent registers first, so the refusal names the first frame
+        // that finds no slot: the parent when none is left, the child when
+        // the parent takes the last one.
+        let after_parent = self.active() + usize::from(p.is_none());
+        let after_child = after_parent + usize::from(c.is_none());
+        if after_child > self.frames.len() {
+            let frame = if after_parent > self.frames.len() {
+                parent_name
+            } else {
+                child_name
+            };
             return Err(TfError::FrameTableFull {
-                frame: FrameLabel::of(if p.is_none() { parent_name } else { child_name }),
+                frame: FrameLabel::of(frame),
                 capacity: self.frames.len(),
             });
         }

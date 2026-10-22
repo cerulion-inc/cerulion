@@ -9,8 +9,8 @@
 //! never read off the buffer.
 
 use cerulion_tf::{
-    EdgeInfo, EdgePolicy, FrameId, FrameLabel, TfBuffer, TfBufferConfig, TfError, Transform,
-    UnitQuaternion, WriterId,
+    EdgeInfo, EdgePolicy, FrameId, FrameLabel, StaticEdge, TfBuffer, TfBufferConfig, TfError,
+    Transform, UnitQuaternion, WriterId,
 };
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
@@ -1181,14 +1181,29 @@ fn a_new_epoch_clears_a_pending_jump() {
 
 #[test]
 fn a_frame_beyond_the_capacity_is_refused_naming_the_frame_that_does_not_fit() {
-    // The fixture holds 3 of 4 frames: one more fits, two do not.
+    // The fixture holds 3 of 4 frames: one more fits, two do not. The
+    // parent `x` takes the last slot, so the child `y` is the frame that
+    // does not fit.
     refusal_leaves_the_buffer_untouched(
         |b| b.insert(W, "x", "y", 1, tf(1.0)),
         |_| TfError::FrameTableFull {
-            frame: FrameLabel::new("x"),
+            frame: FrameLabel::new("y"),
             capacity: 4,
         },
     );
+    // No slot left: the parent, registered first, is the frame that does
+    // not fit, and nothing changes.
+    let mut b = small(2, 4);
+    b.insert(W, "a", "b", 1, tf(1.0)).unwrap();
+    assert_eq!(
+        b.insert(W, "x", "y", 1, tf(1.0)),
+        Err(TfError::FrameTableFull {
+            frame: FrameLabel::new("x"),
+            capacity: 2
+        })
+    );
+    assert_eq!(b.frame_count(), 2);
+    assert!(b.frame_id("x").is_none());
     // One new frame fits; the refusal names the child when the parent is known.
     let mut b = small(4, 4);
     b.insert(W, "odom", "base", 1, tf(1.0)).unwrap();
@@ -1441,4 +1456,135 @@ fn the_error_stays_small_enough_to_return_by_value() {
         std::mem::size_of::<TfError>()
     );
     assert!(std::mem::size_of::<Result<Transform, TfError>>() < 128);
+}
+
+/// The static set as `(parent, child, x)` triples, `x` the translation's
+/// first component, in iteration order.
+fn static_set(b: &TfBuffer) -> Vec<(String, String, f64)> {
+    b.static_edges()
+        .map(|e| {
+            (
+                e.parent.to_string(),
+                e.child.to_string(),
+                e.transform.translation()[0],
+            )
+        })
+        .collect()
+}
+
+fn triple(parent: &str, child: &str, x: f64) -> (String, String, f64) {
+    (parent.to_string(), child.to_string(), x)
+}
+
+#[test]
+fn static_edges_list_one_edge_per_child_in_registration_order() {
+    let mut b = TfBuffer::new();
+    assert_eq!(
+        b.static_edges().count(),
+        0,
+        "an empty buffer has no static edge"
+    );
+    b.insert_static(W, "base", "lidar", tf(0.25)).unwrap();
+    b.insert_static(W, "/base", "/cam", tf(0.5)).unwrap();
+    b.insert_static(W, "lidar", "lidar_optical", tf(0.75))
+        .unwrap();
+    assert_eq!(
+        static_set(&b),
+        vec![
+            triple("base", "lidar", 0.25),
+            triple("base", "cam", 0.5),
+            triple("lidar", "lidar_optical", 0.75),
+        ]
+    );
+    let first = b.static_edges().next().unwrap();
+    assert_eq!(
+        first,
+        StaticEdge {
+            parent: "base",
+            child: "lidar",
+            transform: tf(0.25),
+        }
+    );
+}
+
+#[test]
+fn a_republished_static_transform_replaces_the_one_for_its_child() {
+    let mut b = TfBuffer::new();
+    b.insert_static(W, "base", "lidar", tf(0.25)).unwrap();
+    b.insert_static(W, "base", "cam", tf(0.5)).unwrap();
+    // The same child again, moved: one edge, the new transform, same place.
+    b.insert_static(W, "base", "lidar", tf(0.3)).unwrap();
+    assert_eq!(
+        static_set(&b),
+        vec![triple("base", "lidar", 0.3), triple("base", "cam", 0.5)]
+    );
+    assert_eq!(b.replacements(), 1);
+    // The same transform again changes nothing and counts nothing.
+    b.insert_static(W, "base", "lidar", tf(0.3)).unwrap();
+    assert_eq!(b.replacements(), 1);
+    assert_eq!(b.static_edges().count(), 2);
+    assert_eq!(b.lookup("base", "lidar", 0).unwrap(), tf(0.3));
+}
+
+#[test]
+fn static_edges_skip_dynamic_edges_and_take_an_edge_made_static() {
+    let mut b = TfBuffer::new();
+    b.insert(W, "odom", "base", 100, tf(1.0)).unwrap();
+    b.insert(W, "base", "arm", 100, tf(2.0)).unwrap();
+    b.set_edge_policy("map", "odom", EdgePolicy::HoldLast { max_age_ns: 10 })
+        .unwrap();
+    assert_eq!(
+        b.static_edges().count(),
+        0,
+        "dynamic and declared edges are not static"
+    );
+    // A static insert on a dynamic edge makes it static, in the child's
+    // original place.
+    b.insert_static(W, "odom", "base", tf(1.5)).unwrap();
+    b.insert_static(W, "base", "lidar", tf(0.25)).unwrap();
+    assert_eq!(
+        static_set(&b),
+        vec![triple("odom", "base", 1.5), triple("base", "lidar", 0.25)]
+    );
+}
+
+#[test]
+fn a_refused_static_insert_leaves_the_static_set_as_it_was() {
+    let mut b = TfBuffer::new();
+    b.insert_static(W, "base", "lidar", tf(0.25)).unwrap();
+    // A second writer, a second parent and a cycle are refused.
+    assert!(matches!(
+        b.insert_static(W2, "base", "lidar", tf(9.0)),
+        Err(TfError::SecondWriter { .. })
+    ));
+    assert!(matches!(
+        b.insert_static(W, "map", "lidar", tf(9.0)),
+        Err(TfError::SecondParent { .. })
+    ));
+    assert!(matches!(
+        b.insert_static(W, "lidar", "base", tf(9.0)),
+        Err(TfError::Cycle { .. })
+    ));
+    assert_eq!(static_set(&b), vec![triple("base", "lidar", 0.25)]);
+}
+
+#[test]
+fn two_buffers_fed_the_same_static_set_list_it_identically() {
+    let feed = |b: &mut TfBuffer| {
+        b.insert_static(W, "base", "cam", tf(0.5)).unwrap();
+        b.insert_static(W, "base", "lidar", tf(0.25)).unwrap();
+        b.insert_static(W, "base", "cam", tf(0.6)).unwrap();
+    };
+    let (mut a, mut c) = (TfBuffer::new(), TfBuffer::new());
+    feed(&mut a);
+    feed(&mut c);
+    let expected = vec![triple("base", "cam", 0.6), triple("base", "lidar", 0.25)];
+    assert_eq!(static_set(&a), expected);
+    assert_eq!(static_set(&c), expected);
+    for (x, y) in a.static_edges().zip(c.static_edges()) {
+        assert_eq!(
+            x.transform.translation()[0].to_bits(),
+            y.transform.translation()[0].to_bits()
+        );
+    }
 }
