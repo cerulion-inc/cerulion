@@ -52,6 +52,12 @@ impl PrinterNode {
 /// from `i32::MAX` to `i32::MIN`, so the step is taken in that same wrapping
 /// space: one step is no miss, and a count that did not move forward (a
 /// repeat, or a restarted timer) is no miss either.
+///
+/// In a 32-bit wrapping counter a forward gap of `d` and a backward step of
+/// `2^32 - d` are the same bits, so one rule must choose. The rule is the
+/// half range: a step of 1 to `i32::MAX` is forward, which caps the missed
+/// count at `i32::MAX - 1`; a larger forward gap reads as a step back, the
+/// same as a restarted timer, and counts no miss.
 fn missed_between(last: i32, value: i32) -> u64 {
     match value.wrapping_sub(last) {
         step if step > 1 => u64::from(step.unsigned_abs() - 1),
@@ -77,6 +83,12 @@ mod tests {
             // A repeat, or a timer that started over, is no miss.
             (7, 7, 0),
             (500, 1, 0),
+            // The largest forward step, i32::MAX, is the largest miss.
+            (0, i32::MAX, (i32::MAX - 1) as u64),
+            (i32::MIN, -1, (i32::MAX - 1) as u64),
+            // One past the half range reads as a step back: no miss.
+            (0, i32::MIN, 0),
+            (-1, i32::MAX, 0),
         ];
         for &(last, value, want) in vectors {
             assert_eq!(missed_between(last, value), want, "{last} then {value}");

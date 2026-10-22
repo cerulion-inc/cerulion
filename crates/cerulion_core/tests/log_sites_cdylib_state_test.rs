@@ -17,6 +17,10 @@
 //!   10 ms before the tick runs, so the throttle word is 10_000_001;
 //! - a fresh instance restored from those bytes captures them back byte for
 //!   byte: the section crossed the wall in both directions;
+//! - that restored instance then runs on the restored words: ticks at 10 to
+//!   250 ms are inside the 250 ms period of the saved 10 ms emit, so neither
+//!   word moves; a tick at 260 ms emits the throttle site, whose word becomes
+//!   260_000_001, and the once word stays 1;
 //! - an instance that ticked, restored from the field-only bytes, captures
 //!   the field-only bytes: its own live log state is gone, the table is the
 //!   checkpoint's.
@@ -115,6 +119,38 @@ fn restore(runtime: &mut GraphRuntime, node: &Arc<Mutex<Box<dyn NodeEntry>>>, pa
     assert_eq!(report.restored, vec!["chatter".to_string()]);
 }
 
+/// The `(id, word)` pairs of a capture's log section, in byte order. The
+/// section starts after the 4-byte field, the tag and the count.
+fn log_table(capture: &[u8]) -> Vec<(u64, u64)> {
+    assert_eq!(&capture[4..8], b"CLOG");
+    let count = u32::from_le_bytes(capture[8..12].try_into().unwrap()) as usize;
+    assert_eq!(capture.len(), 12 + count * 16, "{capture:?}");
+    let word = |o: usize| u64::from_le_bytes(capture[o..o + 8].try_into().unwrap());
+    (0..count)
+        .map(|i| (word(12 + i * 16), word(20 + i * 16)))
+        .collect()
+}
+
+/// The one id in `table` whose word is `word`.
+fn site_with_word(table: &[(u64, u64)], word: u64) -> u64 {
+    let hits: Vec<u64> = table
+        .iter()
+        .filter(|&&(_, w)| w == word)
+        .map(|&(id, _)| id)
+        .collect();
+    assert_eq!(hits.len(), 1, "one site holds word {word}: {table:?}");
+    hits[0]
+}
+
+/// The word `table` holds for `id`.
+fn word_of(table: &[(u64, u64)], id: u64) -> u64 {
+    table
+        .iter()
+        .find(|&&(i, _)| i == id)
+        .map(|&(_, w)| w)
+        .unwrap_or_else(|| panic!("site {id} is in {table:?}"))
+}
+
 /// The graph time of the first tick: one `step(10 ms)` from a virtual clock
 /// at 0.
 const TICK_NS: u64 = 10_000_000;
@@ -139,19 +175,14 @@ fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_byt
     assert_eq!(after_one_tick[..4], 1u32.to_le_bytes(), "ticks");
     assert_eq!(&after_one_tick[4..8], b"CLOG");
     assert_eq!(after_one_tick[8..12], 2u32.to_le_bytes(), "two sites ran");
-    let pair = |at: usize| {
-        let word = |o: usize| u64::from_le_bytes(after_one_tick[o..o + 8].try_into().unwrap());
-        (word(at), word(at + 8))
-    };
-    let ((id_a, word_a), (id_b, word_b)) = (pair(12), pair(28));
-    assert!(id_a < id_b, "ascending ids");
-    let mut words = [word_a, word_b];
-    words.sort_unstable();
-    assert_eq!(
-        words,
-        [1, TICK_NS + 1],
-        "the once word, then the throttle word: the tick's graph time plus one"
-    );
+    let table = log_table(&after_one_tick);
+    let ids: Vec<u64> = table.iter().map(|&(id, _)| id).collect();
+    assert!(ids[0] < ids[1], "ascending ids");
+    // Each word stays with its own id. The once site is the id whose word is
+    // 1, the throttle site the id whose word is the tick's graph time plus one.
+    let once_id = site_with_word(&table, 1);
+    let throttle_id = site_with_word(&table, TICK_NS + 1);
+    assert_ne!(once_id, throttle_id);
 
     // A fresh instance takes the section from the bytes, and gives it back.
     let (mut fresh_rt, fresh) = built("fresh");
@@ -160,6 +191,42 @@ fn a_cdylib_checkpoint_carries_its_log_state_and_a_restore_takes_it_from_the_byt
         capture(&fresh),
         after_one_tick,
         "the section crossed the wall"
+    );
+
+    // The restored words drive the restored instance. Its next 25 ticks run
+    // at 10, 20, .., 250 ms, all less than 250 ms after the saved throttle
+    // emit at 10 ms: inside the period, so the throttle word does not move,
+    // and the once word stays.
+    for _ in 0..25 {
+        fresh_rt.step(Duration::from_nanos(TICK_NS));
+    }
+    let inside = capture(&fresh);
+    assert_eq!(
+        inside[..4],
+        26u32.to_le_bytes(),
+        "the restored tick, then 25"
+    );
+    assert_eq!(
+        log_table(&inside),
+        vec![
+            (ids[0], word_of(&table, ids[0])),
+            (ids[1], word_of(&table, ids[1]))
+        ],
+        "both sites kept the saved word"
+    );
+    // One more tick at 260 ms is 250 ms after the saved emit: the throttle
+    // site emits and takes 260 ms plus one, the once site stays at 1.
+    fresh_rt.step(Duration::from_nanos(TICK_NS));
+    let resumed = log_table(&capture(&fresh));
+    assert_eq!(
+        word_of(&resumed, once_id),
+        1,
+        "the once site stays suppressed"
+    );
+    assert_eq!(
+        word_of(&resumed, throttle_id),
+        260_000_001,
+        "the throttle site resumed from the saved time"
     );
 
     // The ticked instance, restored from field-only bytes, drops its own
