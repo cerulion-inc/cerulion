@@ -38,8 +38,12 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
 5. **`generate_schema`** per schema, emitting three items per message: the unit
    marker (`pub struct <Name>;` carrying `impl ShmMessage`), the SHM-backed accessor
    `<Name>Shm`, and the heap-owned `<Name>Snapshot` replay/round-trip companion.
-6. **Service markers**: per `.srv`, `generate_service_marker` emits `pub struct <Name>;`
-   with `impl cerulion_core::message::ServiceType` naming the two parts. In workspace
+6. **Service markers**: per `.srv`, `generate_service_marker` emits one
+   `cerulion_core::__service_marker!` call. With `cerulion_core`'s `unstable-services`
+   feature on it declares `pub struct <Name>;` with
+   `impl cerulion_core::message::ServiceType` naming the two parts (`SERVICE_HASH`
+   comes from the trait default); with it off it expands to nothing. The feature is
+   read in `cerulion_core`, so a crate of generated code needs no feature of its own. In workspace
    mode a marker is left out, with a cargo warning, when a part is not generated, when
    a message takes the marker's name (`service_marker_conflict`), or when the workspace
    replaces a part, or any message a part embeds at any depth, with a definition whose

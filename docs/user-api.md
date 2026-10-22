@@ -2334,10 +2334,14 @@ types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
 `SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
 code generated from a `.srv` passes `clippy -D warnings`.
 
-`std_srvs/Trigger.srv` generates `std_srvs::Trigger_Request`, `std_srvs::Trigger_Response`
-and the service marker `std_srvs::Trigger`, which implements
-`cerulion_core::message::ServiceType` and names the two parts
-(`type Request = Trigger_Request`). Either part can be empty (`std_srvs/Empty` is a
+`std_srvs/Trigger.srv` generates `std_srvs::Trigger_Request` and
+`std_srvs::Trigger_Response`. With the opt-in `unstable-services` cargo feature (off
+by default, on `native_ros2_messages` or `cerulion_core`) it also generates the
+service marker `std_srvs::Trigger`, which implements
+`cerulion_core::message::ServiceType`, names the two parts
+(`type Request = Trigger_Request`) and carries `SERVICE_HASH`: FNV-1a 64 over the
+length-prefixed service name and the request and response schema hashes, so it
+changes when the name or either part's schema changes. Either part can be empty (`std_srvs/Empty` is a
 lone `---`). A missing `---`, a second `---` or a bad field in either part is an error
 that names the file and the line. The part name is what you write as `schema:` in
 graph YAML and what `cerulion schema list` prints.
@@ -2353,8 +2357,8 @@ The built-in corpus carries these service types:
 `ParameterValue`, `ParameterType`, `ParameterDescriptor`, `FloatingPointRange`,
 `IntegerRange`, `ListParametersResult`, `SetParametersResult`). Service types are
 message definitions only: a node does not yet serve or call a service through them,
-and the `ServiceType` trait is experimental: its shape can change when nodes can
-serve and call services.
+and the `ServiceType` trait is experimental, which is why it sits behind
+`unstable-services`: its shape can change when nodes can serve and call services.
 
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN

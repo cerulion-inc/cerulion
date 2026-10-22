@@ -57,18 +57,13 @@ fn controller_publishes_stop_or_cruise_for_close_clear_empty_and_nan_scans() {
 // The built-in corpus ships the standard ROS 2 service types as message pairs,
 // so a workspace names `std_srvs/SetBool_Request` or `std_srvs/Trigger_Response`
 // without defining them. A node cannot serve or call a service yet; this pins
-// that the parts are in the built-in registry the workspace lookup reads, that
-// each marker names its own pair, and that the parts build with their declared
-// fields.
+// that the parts are in the built-in registry the workspace lookup reads and
+// that they build with their declared fields. The parts are ordinary messages;
+// the service markers that pair them sit behind the opt-in `unstable-services`
+// feature, which this node does not turn on.
 #[test]
 fn std_srvs_service_types_resolve_from_the_workspace() {
-    // `ServiceType` is not in the prelude: it is experimental until nodes can
-    // serve and call services.
-    use cerulion_core::message::{ServiceType, ShmMessage};
-    use native_ros2_messages::std_srvs::{
-        SetBool, SetBool_Request, SetBool_RequestSnapshot, Trigger, Trigger_Response,
-        Trigger_ResponseSnapshot,
-    };
+    use native_ros2_messages::std_srvs::{SetBool_RequestSnapshot, Trigger_ResponseSnapshot};
 
     // The registry the CLI and the workspace lookup resolve built-ins from
     // holds each part under its qualified name.
@@ -84,16 +79,6 @@ fn std_srvs_service_types_resolve_from_the_workspace() {
         );
     }
 
-    assert_eq!(<Trigger as ServiceType>::NAME, "std_srvs/Trigger");
-    assert_eq!(<SetBool as ServiceType>::NAME, "std_srvs/SetBool");
-    assert_eq!(
-        <<SetBool as ServiceType>::Request as ShmMessage>::SCHEMA_HASH,
-        SetBool_Request::SCHEMA_HASH
-    );
-    assert_eq!(
-        <<Trigger as ServiceType>::Response as ShmMessage>::SCHEMA_HASH,
-        Trigger_Response::SCHEMA_HASH
-    );
     // Construction is the check: a missing or renamed field fails to compile.
     let _enable = SetBool_RequestSnapshot { data: true };
     let _done = Trigger_ResponseSnapshot {

@@ -50,6 +50,11 @@ path = "src/lib.rs"
 # in `cerulion_core/tests/` enable this feature via the dev-dep propagation
 # pattern (see `cerulion_core/Cargo.toml`).
 test-helpers = []
+# Declares the generated `.srv` service markers (`std_srvs::Trigger` and the
+# rest) and the experimental `cerulion_core::message::ServiceType` trait they
+# implement. Off by default. The `<Name>_Request` and `<Name>_Response`
+# messages are always generated.
+unstable-services = ["cerulion_core/unstable-services"]
 
 [dependencies]
 cerulion_core = { workspace = true }
@@ -76,7 +81,7 @@ cerulion_core = { workspace = true }
 # regular [dependencies] entry above stays feature-free for library builds).
 [dev-dependencies]
 paste = "1"
-cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+cerulion_core = { path = "../cerulion_core", features = ["test-helpers", "unstable-services"] }
 # `tests/serde_corpus_test.rs` needs a concrete serde FORMAT
 # to prove the generated derives actually round-trip (the corpus walk only
 # reads text). Dev-only — the library itself still has no serde dependency.

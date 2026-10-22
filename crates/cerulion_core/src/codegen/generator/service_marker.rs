@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Service marker emission: one `pub struct <Name>;` with `impl ServiceType`
-//! per `.srv` file. The two parts are ordinary schemas that
+//! Service marker emission: one `cerulion_core::__service_marker!` call per
+//! `.srv` file, which declares `pub struct <Name>;` with `impl ServiceType`
+//! when `cerulion_core`'s `unstable-services` feature is on. The two parts are ordinary schemas that
 //! [`super::generate_schema`] emits.
 
 use crate::codegen::rossrv_parser::ServiceDefinition;
@@ -8,8 +9,9 @@ use crate::codegen::schema::{FieldType, MessageSchema};
 
 /// Generate the service marker for a parsed `.srv` file.
 ///
-/// Emits `pub struct <Name>;` with `impl ServiceType` naming the request and
-/// response markers. The two message types themselves come from
+/// Emits a `cerulion_core::__service_marker!` call that declares
+/// `pub struct <Name>;` with `impl ServiceType` naming the request and
+/// response markers, or nothing with the `unstable-services` feature off. The two message types themselves come from
 /// [`super::generate_schema`] over `service.request` and `service.response`, in the
 /// same module.
 pub fn generate_service_marker(service: &ServiceDefinition) -> String {
@@ -17,30 +19,25 @@ pub fn generate_service_marker(service: &ServiceDefinition) -> String {
 
     let mut out = String::new();
     let (name, request, response) = (&service.name, &service.request.name, &service.response.name);
-    writeln!(out, "/// Service `{}`.", service.qualified_name()).unwrap();
-    writeln!(out, "///").unwrap();
+    writeln!(out, "cerulion_core::__service_marker! {{").unwrap();
+    writeln!(out, "    /// Service `{}`.", service.qualified_name()).unwrap();
+    writeln!(out, "    ///").unwrap();
     writeln!(
         out,
-        "/// Service marker. Zero-sized. The request is [`{request}`] and the response"
-    )
-    .unwrap();
-    writeln!(out, "/// is [`{response}`].").unwrap();
-    writeln!(out, "#[derive(Debug, Clone, Copy, Default)]").unwrap();
-    writeln!(out, "pub struct {name};").unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "impl cerulion_core::message::ServiceType for {name} {{"
+        "    /// Service marker. Zero-sized. The request is [`{request}`] and the response"
     )
     .unwrap();
     writeln!(
         out,
-        "    const NAME: &'static str = {:?};",
+        "    /// is [`{response}`]. Declared only with the `unstable-services` feature."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    {name}, {:?}, {request}, {response}",
         service.qualified_name()
     )
     .unwrap();
-    writeln!(out, "    type Request = {request};").unwrap();
-    writeln!(out, "    type Response = {response};").unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
     out
@@ -208,19 +205,17 @@ fn same_definition(a: &MessageSchema, b: &MessageSchema) -> bool {
 mod tests {
     use super::*;
 
-    /// A service marker names its two parts through `ServiceType`.
+    /// A service marker is one marker macro call naming the service and its
+    /// two parts.
     #[test]
     fn test_generate_service_marker() {
         let srv = trigger();
         let code = generate_service_marker(&srv);
-        let expected = "#[derive(Debug, Clone, Copy, Default)]\n\
-            pub struct Trigger;\n\
-            \n\
-            impl cerulion_core::message::ServiceType for Trigger {\n\
-            \x20   const NAME: &'static str = \"std_srvs/Trigger\";\n\
-            \x20   type Request = Trigger_Request;\n\
-            \x20   type Response = Trigger_Response;\n\
-            }\n";
+        let expected = "    Trigger, \"std_srvs/Trigger\", Trigger_Request, Trigger_Response\n}\n";
+        assert!(
+            code.starts_with("cerulion_core::__service_marker! {\n"),
+            "service marker is not a marker macro call:\n{code}"
+        );
         assert!(code.contains(expected), "service marker missing:\n{code}");
         assert_eq!(code, generate_service_marker(&srv), "deterministic");
     }

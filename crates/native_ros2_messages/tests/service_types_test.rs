@@ -8,7 +8,11 @@
 //! the right pair, that the parts carry the declared constants and defaults,
 //! that a part publishes and decodes like any message (a real loan over an
 //! isolated `TestTransport`, then the `FrameWalker` over the embedded
-//! registry), and that the parts' snapshots go through serde.
+//! registry), that the parts' snapshots go through serde, and that each
+//! marker's service hash is pinned and follows its parts.
+//!
+//! The markers need the `unstable-services` feature, which the crate's
+//! dev-dependency on `cerulion_core` turns on for these tests.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -66,6 +70,73 @@ fn each_std_srvs_marker_names_its_own_request_and_response() {
             hash_of::<Empty_Response>()
         )
     );
+}
+
+/// The service hash of `std_srvs/Trigger` and `std_srvs/SetBool`, written
+/// here by hand: FNV-1a 64 over the name length (`u64` little-endian), the
+/// name bytes, then the request and the response schema hashes (each `u64`
+/// little-endian), computed outside this crate from the part hashes that
+/// `service_part_hashes_are_pinned` pins. A failure is a service identity
+/// break: do not copy the new value in.
+#[test]
+fn service_hashes_are_pinned() {
+    assert_eq!(Trigger::SERVICE_HASH, 0xf307_a411_94e5_db20);
+    assert_eq!(SetBool::SERVICE_HASH, 0xa1ba_4277_988b_13b5);
+}
+
+/// A service with Trigger's name but SetBool's request.
+struct OtherRequest;
+impl ServiceType for OtherRequest {
+    const NAME: &'static str = "std_srvs/Trigger";
+    type Request = SetBool_Request;
+    type Response = Trigger_Response;
+}
+
+/// A service with Trigger's name but SetBool's response.
+struct OtherResponse;
+impl ServiceType for OtherResponse {
+    const NAME: &'static str = "std_srvs/Trigger";
+    type Request = Trigger_Request;
+    type Response = SetBool_Response;
+}
+
+/// A service with Trigger's parts in swapped order.
+struct Swapped;
+impl ServiceType for Swapped {
+    const NAME: &'static str = "std_srvs/Trigger";
+    type Request = Trigger_Response;
+    type Response = Trigger_Request;
+}
+
+/// Same name, other request or other response: the service hash changes,
+/// so a peer whose parts differ never takes the service for the same one.
+#[test]
+fn the_service_hash_changes_with_either_part_schema() {
+    let base = Trigger::SERVICE_HASH;
+    assert_ne!(OtherRequest::SERVICE_HASH, base, "request schema differs");
+    assert_ne!(OtherResponse::SERVICE_HASH, base, "response schema differs");
+    assert_ne!(Swapped::SERVICE_HASH, base, "parts swapped");
+}
+
+/// Every vendored service has its own service hash.
+#[test]
+fn service_hashes_are_pairwise_distinct() {
+    let hashes = [
+        Empty::SERVICE_HASH,
+        SetBool::SERVICE_HASH,
+        Trigger::SERVICE_HASH,
+        DescribeParameters::SERVICE_HASH,
+        GetParameterTypes::SERVICE_HASH,
+        GetParameters::SERVICE_HASH,
+        ListParameters::SERVICE_HASH,
+        SetParameters::SERVICE_HASH,
+        SetParametersAtomically::SERVICE_HASH,
+    ];
+    for (i, a) in hashes.iter().enumerate() {
+        for b in &hashes[i + 1..] {
+            assert_ne!(a, b, "two services share a service hash");
+        }
+    }
 }
 
 #[test]
