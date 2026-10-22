@@ -22,18 +22,28 @@ use cerulion_cli_engine::graph_cmd::{
 use cerulion_cli_engine::node_inspector::NodeInspector;
 use cerulion_core::graph::NodeInfo;
 
-/// Records every path it is asked to read and answers with an empty info.
+/// Records every path it is asked to read and answers with an info that
+/// declares one param, `gain: f64`, so the params check has a line to write
+/// for every node of the type.
 struct Counting {
     reads: Mutex<Vec<String>>,
 }
 
 impl NodeInspector for Counting {
     fn inspect(&self, cdylib: &Path, _label: &str) -> CliResult<NodeInfo> {
+        use cerulion_core::graph::params::{ParamSpec, ParamType, ParamValue};
         self.reads
             .lock()
             .unwrap()
             .push(cdylib.display().to_string());
-        Ok(NodeInfo::default())
+        Ok(NodeInfo::default().with_params(vec![ParamSpec {
+            name: "gain".into(),
+            ty: ParamType::F64,
+            default: ParamValue::Float(1.0),
+            min: None,
+            max: None,
+            description: None,
+        }]))
     }
 }
 
@@ -72,10 +82,21 @@ fn validate_reads_each_node_library_once_across_its_checks() {
         reads: Mutex::new(Vec::new()),
     };
     let report = graph_validate_with_inspector(root, "g", false, &counting).expect("validate");
-    // ANTI-VACUITY: both reading checks ran, so a single read is a shared
+    // ANTI-VACUITY: both reading checks ran (the ingress line and one params
+    // line per node), so a single read is a shared
     // one and not a skipped check.
     let labels: Vec<&str> = report.checks.iter().map(|c| c.label.as_str()).collect();
     assert!(labels.contains(&"network ingress"), "{labels:?}");
+    for node in ["left", "right"] {
+        let label = format!("params '{node}'");
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.label == label)
+            .unwrap_or_else(|| panic!("no {label} line: {labels:?}"));
+        assert!(check.passed, "{label}: {}", check.detail);
+        assert_eq!(check.detail, "gain=1.0", "{label}");
+    }
     let reads = counting.reads.lock().unwrap().clone();
     assert_eq!(
         reads,
