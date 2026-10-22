@@ -39,7 +39,7 @@
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole: 23, all of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 24, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
 //!
 //! A process-per-arm runner shortens that list, it does not empty it. The process
@@ -244,9 +244,9 @@ const SUPPORT_SPAWN_HELPERS: &[&str] = &["spawn_mp_record", "spawn_graph_run_gra
 /// Reached by the derivation and deliberately NOT waived, as `(path, why)`.
 ///
 /// The derivation selects every binary that can reach a plugin load, which is wider
-/// than the set that fails: three of these spawn a `--single-process` child, which loads
-/// the plugins and creates its resources once, the fourth spawns a run that is rejected
-/// before any plugin loads, and all are observed PASSING on macOS. Naming them here,
+/// than the set that fails: these spawn a `--single-process` child, which loads the
+/// plugins and creates its resources once, or a run that is rejected before any plugin
+/// loads, and all are observed PASSING on macOS. Naming them here,
 /// rather than narrowing the rule until it excluded them, is what keeps the next such
 /// suite a decision instead of a silent omission: a file reached by the walk must
 /// appear in one list or the other.
@@ -258,6 +258,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/flashback_resim_e2e_test.rs",
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
+    ),
+    (
+        "crates/cerulion_cli/tests/graph_launch_args_e2e_test.rs",
+        "spawns `graph run --single-process` (and one multi-process run its `--yes` guard \
+         refuses before any node plugin loads); its 4 macOS arms passed on Darwin 27 \
+         under `-- --test-threads=1`",
     ),
     (
         "crates/cerulion_cli/tests/graph_params_e2e_test.rs",
@@ -290,8 +296,8 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 23 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Four of the 23,
+/// THE COVERAGE THIS COSTS, stated once: 24 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Four of the 24,
 /// `ros2_graph_e2e_test`, `network_gateway_e2e_test`, `mp_supervisor_box_test` and
 /// `mp_live_determinism_box_test`, are in the set BY THE RULE rather than by
 /// measurement: no run has observed them failing. Of those four, every arm of
@@ -308,6 +314,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_cli/tests/flashback_argv_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/graph_launch_args_mp_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (

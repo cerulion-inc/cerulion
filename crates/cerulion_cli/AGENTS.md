@@ -9,7 +9,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
 - Never gate `Completions` or `Clean` behind `command_needs_identity` - a shell rc file
-  and a desk that never signed in must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
+  and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
 - Multi-value flags use exact `num_args = N`, never a range - clap's default Append action
   flattens repeated invocations into one Vec, making two partial ones indistinguishable from one
   full one. Length guards run BEFORE any positional access.
@@ -21,8 +21,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   `src/completion_wiring_tests.rs` fails until you do, and for a path arg the fix is the hint.
 - New top-level verb: a `src/families/` module + a `FAMILIES` entry, not a
   `Commands` variant (cli.md §14)
-- Create verbs (`node|graph|schema create`) deliberately complete nothing - the existing
-  name set is exactly what a create verb rejects.
+- Create verbs (`node|graph|schema create`) complete nothing - the existing
+  name set is what they reject.
 
 ## Testing
 
@@ -42,14 +42,14 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
     `mp_auto_partition`: those two + `..._trigger_block_cdylib`
   - `signal_matrix`: `period` only. `credit_death`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`.
-    `graph_params_e2e`: `period` + `param`
+    `graph_params_e2e`: `period` + `param`. `graph_launch_args*`: `param` + `data_trigger`.
 
 ## Gotchas
 
 - Signal tests assert exit code EXACTLY 0: a signal-killed process reports `code()==None`, so 0
   proves the handler drove a graceful shutdown, not a default-disposition kill. Don't loosen it.
 - Gateway-teardown tests require the gateway's own shutdown log line, not just
-  exit 0 + child reaped - reap alone also passes a kill-on-drop teardown.
+  exit 0 + reaped - a reap alone passes kill-on-drop too.
 - `mp_support::ChildGuard` has NO public field: `spawn_group_leader` if the child owns a
   subtree (workers, gateway, ros2 entry), else `single_process`; reap/poll via its METHODS
   (`wait_bounded`, `try_wait_noting`) so it notes live workers first, and it never caches an
