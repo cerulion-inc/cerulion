@@ -62,6 +62,15 @@ fn entry_path(entry: std::io::Result<std::fs::DirEntry>, dir: &Path) -> PathBuf 
         .path()
 }
 
+/// Whether a corpus entry is a directory; an entry whose metadata cannot be
+/// read panics (`Path::is_dir` would read it as "not a directory" and skip
+/// the package).
+fn is_dir(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("read the metadata of {}: {e}", path.display()))
+        .is_dir()
+}
+
 /// `(pkg, stem, path)` of every `<root>/<pkg>/*.<ext>`, with `build.rs`'s
 /// package-name sanitization applied.
 fn files_with_extension(root: &Path, ext: &str) -> Vec<(String, String, PathBuf)> {
@@ -71,7 +80,7 @@ fn files_with_extension(root: &Path, ext: &str) -> Vec<(String, String, PathBuf)
         Err(e) => panic!("read {}: {e}", root.display()),
     };
     let mut out = Vec::new();
-    for pkg_dir in entries.map(|e| entry_path(e, root)).filter(|p| p.is_dir()) {
+    for pkg_dir in entries.map(|e| entry_path(e, root)).filter(|p| is_dir(p)) {
         let pkg = pkg_dir
             .file_name()
             .expect("package dir name")

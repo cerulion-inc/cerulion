@@ -860,9 +860,18 @@ fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Whether a corpus entry is a directory. `Path::is_dir` reads a metadata
+/// error as "not a directory", which would drop a package without a word, so
+/// an entry whose metadata cannot be read fails the build.
+fn is_dir(path: &Path) -> bool {
+    fs::metadata(path)
+        .unwrap_or_else(|e| panic!("failed to read the metadata of {}: {}", path.display(), e))
+        .is_dir()
+}
+
 fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, String)>>) {
     for path in sorted_dir_paths(dir) {
-        if !path.is_dir() {
+        if !is_dir(&path) {
             continue;
         }
         // This is a package directory
@@ -887,7 +896,7 @@ fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, St
 /// sorted order. Like a `.msg`, an unreadable `.srv` fails the build.
 fn collect_srv_files(dir: &Path) -> Vec<(String, String, String, String)> {
     let mut out = Vec::new();
-    let pkg_dirs = sorted_dir_paths(dir).into_iter().filter(|p| p.is_dir());
+    let pkg_dirs = sorted_dir_paths(dir).into_iter().filter(|p| is_dir(p));
     for pkg_dir in pkg_dirs {
         let package = sanitize_package_name(&pkg_dir.file_name().unwrap().to_string_lossy());
         let files = sorted_dir_paths(&pkg_dir)
