@@ -264,7 +264,9 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints
   `.nan` and reads back as the quiet NaN, so a NaN's sign and payload bits are the one
   thing the round trip does not keep.
-- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions; `MAX_YAML_ARRAY_DEPTH` (the
+- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions, a message and an array of
+  messages a level each (each is one YAML mapping or sequence, so printed YAML stays
+  inside the reader's own nesting limit); `MAX_YAML_ARRAY_DEPTH` (the
   walker's `MAX_NESTED_ARRAY_DEPTH`, 8) on decode: a nonempty element array inside
   that many variable-message elements is refused, since the walker hands it back
   opaque, and an empty one there is written as the empty blob the walker reads as zero

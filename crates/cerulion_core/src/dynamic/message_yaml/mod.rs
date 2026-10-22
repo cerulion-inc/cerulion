@@ -61,8 +61,11 @@ use crate::codegen::FieldType;
 pub const YAML_TRUNCATED_TAG: &str = "!truncated";
 
 /// How deep messages may nest, on either direction, before the codec
-/// refuses. Real ROS 2 types nest well under 10 levels; the bound keeps a
-/// self-referencing schema from recursing without end.
+/// refuses. A message is one level and an array of messages one more, as
+/// each is one YAML mapping or sequence: printed YAML then stays inside the
+/// nesting the YAML reader accepts. Real ROS 2 types nest well under 10
+/// levels; the bound keeps a self-referencing schema from recursing without
+/// end.
 pub const MAX_YAML_DEPTH: usize = 64;
 
 /// How deep arrays of strings and messages may nest through variable

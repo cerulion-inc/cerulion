@@ -1003,7 +1003,7 @@ fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
 
 #[test]
 fn the_scanner_finds_anchors_at_node_starts_only() {
-    let cases: [(&str, Option<(usize, usize)>); 24] = [
+    let cases: [(&str, Option<(usize, usize)>); 27] = [
         ("a: &x 1", Some((1, 4))),
         ("a: *x", Some((1, 4))),
         ("- *x", Some((1, 3))),
@@ -1025,7 +1025,11 @@ fn the_scanner_finds_anchors_at_node_starts_only() {
         ("{'a':*v}", Some((1, 6))),
         ("\"a\" :*v", Some((1, 6))),
         ("{a:*v}", None),
-        ("{a :*v}", Some((1, 5))),
+        // A plain scalar runs on past a blank: `a :*v` is one string.
+        ("{a :*v}", None),
+        ("[a :*v]", None),
+        ("[a, :*v]", None),
+        ("{a : *v}", Some((1, 6))),
         ("{[a]:*v}", Some((1, 6))),
         // A node after `---` is at column 0 for its block scalar.
         ("--- body: |\n  *text\nb: *x", Some((3, 4))),
@@ -1400,14 +1404,14 @@ fn nesting_past_the_depth_bound_is_refused_both_ways() {
     text.push_str(&format!("{:w$}v: 1\n", "", w = 140));
     assert_eq!(
         decode_err(set.walker(), "L0", &text),
-        format!("{deep_path}: messages nest deeper than 64 levels")
+        format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
     );
     let mut frame = header(set.schema_hash("L0").unwrap(), 33, 33, 0);
     frame.push(1);
     match message_to_yaml(set.walker(), &frame) {
         Err(e) => assert_eq!(
             e.to_string(),
-            format!("{deep_path}: messages nest deeper than 64 levels")
+            format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
         ),
         Ok(t) => panic!("must be refused, got {t}"),
     }
@@ -1976,7 +1980,11 @@ fn encoding_is_deterministic_across_runs_and_processes() {
     let first = digest(&walker);
     assert_eq!(first, digest(&builtin_walker()));
 
-    if std::env::var_os("CERULION_YAML_CODEC_CHILD").is_some() {
+    // Child mode only when THIS test's parent spawned us: the variable
+    // carries the parent's process id, so a value inherited from the shell
+    // never skips the comparison.
+    let parent = std::os::unix::process::parent_id().to_string();
+    if std::env::var_os("CERULION_YAML_CODEC_CHILD").is_some_and(|v| v == parent.as_str()) {
         print!("<<<{first}>>>");
         return;
     }
@@ -1987,7 +1995,7 @@ fn encoding_is_deterministic_across_runs_and_processes() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CERULION_YAML_CODEC_CHILD", "1")
+        .env("CERULION_YAML_CODEC_CHILD", std::process::id().to_string())
         .output()
         .expect("spawn the test binary");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -2216,4 +2224,58 @@ fn encode_prints_a_frame_with_the_schema_of_its_own_hash() {
     frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40]);
     let yaml = message_to_yaml_with(&walker, &frame, YamlEncodeOptions::default()).unwrap();
     assert_eq!(yaml, "v: 2.5\n");
+}
+
+/// `C0 { C1[1] next }` .. `C{n-1} { C{n}[1] next }`, `C{n} { uint8 v }`:
+/// `n` fixed arrays of one fixed message, so the frame is the one `v` byte.
+fn fixed_chain_set(n: usize) -> SchemaSet {
+    let mut yaml = String::from("schemas:\n");
+    for i in 0..n {
+        yaml.push_str(&format!(
+            "  C{i}:\n    fields:\n      C{}[1] next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str(&format!("  C{n}:\n    fields:\n      uint8 v: {{}}\n"));
+    set_from_yaml(&yaml)
+}
+
+/// The YAML of [`fixed_chain_set`] with `v: 7`: each level is a `next:`
+/// key and a one-element block sequence, the element's key two columns
+/// past its dash.
+fn fixed_chain_text(n: usize) -> String {
+    let mut text = String::from("next:\n");
+    for k in 1..n {
+        text.push_str(&format!("{:w$}- next:\n", "", w = 4 * k - 2));
+    }
+    text.push_str(&format!("{:w$}- v: 7\n", "", w = 4 * n - 2));
+    text
+}
+
+/// An array of messages is a nesting level of its own, as its sequence is
+/// one more YAML container: 32 arrays of one message (65 mappings and
+/// sequences) print and read back, and 33 are refused both ways at the
+/// same path, so the encoder never prints what the reader cannot read.
+#[test]
+fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
+    let set = fixed_chain_set(32);
+    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    frame.push(7);
+    let text = fixed_chain_text(32);
+    assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
+    assert_eq!(
+        yaml_to_message(set.walker(), "C0", text.as_bytes(), TS).unwrap(),
+        frame
+    );
+
+    let set = fixed_chain_set(33);
+    let deep_path = vec!["next[0]"; 33].join(".");
+    let want = format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels");
+    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    frame.push(7);
+    match message_to_yaml(set.walker(), &frame) {
+        Err(e) => assert_eq!(e.to_string(), want),
+        Ok(t) => panic!("must be refused, got {t}"),
+    }
+    assert_eq!(decode_err(set.walker(), "C0", &fixed_chain_text(33)), want);
 }

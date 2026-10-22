@@ -48,9 +48,10 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
         // (blanks aside): a `:` there is a value indicator even with no
         // blank after it (`{"a":*x}`), as YAML allows for a JSON-like key.
         let mut after_close = false;
-        // True inside a plain scalar (up to a blank): in a flow collection a
-        // `:` there is text unless a blank or a flow indicator follows, and
-        // anywhere else it is a value indicator.
+        // True inside a plain scalar, blanks included (`a :*v` is one
+        // string): in a flow collection a `:` there is text unless a blank
+        // or a flow indicator follows, and anywhere else it is a value
+        // indicator.
         let mut in_plain = false;
         let mut i = 0;
         // Document markers: `---` / `...` followed by a blank or the end.
@@ -86,7 +87,6 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
                 break;
             }
             if c == ' ' || c == '\t' {
-                in_plain = false;
                 i += 1;
                 continue;
             }

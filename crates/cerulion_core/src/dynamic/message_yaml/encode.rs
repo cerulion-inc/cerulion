@@ -372,7 +372,8 @@ impl<'w> Emitter<'w> {
             } else {
                 // The element's fields sit at indent + 4; its first line
                 // carries the `- ` at indent + 2.
-                self.mapping(target, elem, indent + 4, depth + 1, true)?;
+                // The sequence and the element mapping are a level each.
+                self.mapping(target, elem, indent + 4, depth + 2, true)?;
             }
             self.path.truncate(mark);
         }

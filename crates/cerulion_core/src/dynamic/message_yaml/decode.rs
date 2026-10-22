@@ -458,12 +458,13 @@ impl<'w> Builder<'w> {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
                     let start = i * stride;
+                    // The sequence is a level (see `MAX_YAML_DEPTH`).
                     self.fixed(
                         element_type,
                         item,
                         &mut dst[start..start + stride],
                         parent,
-                        depth,
+                        depth + 1,
                     )?;
                     self.path.truncate(mark);
                 }
@@ -760,7 +761,8 @@ impl<'w> Builder<'w> {
                     let mark = self.path.len();
                     push_index(&mut self.path, i);
                     self.array_depth += usize::from(counted);
-                    let body = self.body(target, item, depth + 1);
+                    // The sequence and the element mapping are a level each.
+                    let body = self.body(target, item, depth + 2);
                     self.array_depth -= usize::from(counted);
                     let body = body?;
                     if counted {

@@ -481,8 +481,8 @@ pub enum DynamicError {
         target: String,
     },
 
-    /// Messages nest deeper than the codec allows.
-    #[error("{path}: messages nest deeper than {max} levels")]
+    /// Messages and arrays of messages nest deeper than the codec allows.
+    #[error("{path}: messages and arrays of messages nest deeper than {max} levels")]
     YamlTooDeep {
         /// The field path where the bound was passed.
         path: String,
