@@ -470,61 +470,64 @@ def test_a_dict_that_contains_itself_is_refused(schemas):
     assert str(err.value) == "y." * 30 + "...: the value nests deeper than 129 levels"
 
 
-def test_the_deepest_dict_the_yaml_reader_takes_encodes(schemas):
-    # The YAML reader takes 128 nested collections: the root dict, 63
-    # levels of a one-element array holding one message, and the bottom
-    # `float64[1]`. Every message is fixed size: arrays of variable messages
-    # stop at a shallower bound of their own. With a NumPy array at the
-    # bottom, its `tolist()` is one level more.
-    np = pytest.importorskip("numpy")
-    deep = cerulion.SchemaSet()
+def array_chain(levels):
+    # L<n> holds a one-element array of L<n-1>, down to L0's `float64[1]`.
+    chain = cerulion.SchemaSet()
     lines = ["schemas:", "  L0:", "    fields:", "      float64[1] v: {}"]
-    for level in range(1, 64):
+    for level in range(1, levels + 1):
         lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[1] inner: {{}}"]
-    deep.add_yaml("\n".join(lines) + "\n")
+    chain.add_yaml("\n".join(lines) + "\n")
+    return chain
+
+
+def test_the_deepest_message_the_codec_takes_converts_every_way():
+    # The codec counts a message and an array of messages as one level
+    # each, up to 64: the root L32 and 32 levels of a one-element array
+    # holding one message make 65. Every frame it prints reads back, so
+    # the deepest one is a dict too, and a NumPy array at the bottom (one
+    # level more for its `tolist()`) encodes the same frame.
+    np = pytest.importorskip("numpy")
+    deep = array_chain(32)
     values = {"v": np.array([2.5])}
     plain = {"v": [2.5]}
-    text = "v: [2.5]"
-    for _ in range(63):
+    flow = "v: [2.5]"
+    for _ in range(32):
         values = {"inner": [values]}
         plain = {"inner": [plain]}
-        text = f"inner: [{{{text}}}]"
-    frame = deep.dict_to_message("L63", values)
-    assert frame == deep.dict_to_message("L63", plain)
-    assert frame == deep.yaml_to_message("L63", text + "\n")
-    # One level more is past the reader, as YAML text or as a dict.
-    with pytest.raises(cerulion.EncodeError) as err:
-        deep.dict_to_message("L63", {"inner": [values]})
-    assert err.value.kind == "DictTooDeep"
-    with pytest.raises(cerulion.EncodeError) as err:
-        deep.yaml_to_message("L63", f"inner: [{{{text}}}]\n")
-    assert err.value.kind == "YamlSyntax"
-
-
-def test_a_frame_deeper_than_the_yaml_reader_prints_but_is_no_dict():
-    # L64 is 64 levels of a one-element message array above L0's
-    # `float64[1]`: within the codec's 64-level message bound, so it
-    # prints, but its YAML is 130 nested collections, past the 128 the
-    # reader takes (and past what any dict may hold).
-    deep = cerulion.SchemaSet()
-    lines = ["schemas:", "  L0:", "    fields:", "      float64[1] v: {}"]
-    for level in range(1, 65):
-        lines += [f"  L{level}:", "    fields:", f"      L{level - 1}[1] inner: {{}}"]
-    deep.add_yaml("\n".join(lines) + "\n")
-    frame = header(deep, "L64", 40, 8, 0) + struct.pack("<d", 2.5)
+        flow = f"inner: [{{{flow}}}]"
+    frame = header(deep, "L32", 40, 8, 0) + struct.pack("<d", 2.5)
+    assert deep.dict_to_message("L32", values) == frame
+    assert deep.dict_to_message("L32", plain) == frame
+    assert deep.yaml_to_message("L32", flow + "\n") == frame
     # Block style: each array level indents its `- inner:` four more.
-    text = "inner:\n"
-    for level in range(1, 64):
-        text += " " * (4 * level - 2) + "- inner:\n"
-    text += " " * (4 * 64 - 2) + "- v: [2.5]\n"
-    assert deep.message_to_yaml(frame) == text
-    with pytest.raises(cerulion.DecodeError) as err:
-        deep.message_to_dict(frame)
-    assert err.value.kind == "DictTooDeep"
-    assert str(err.value) == (
-        "the dict of this frame nests deeper than the 128 collections a dict may "
-        "hold; read it with to_yaml()"
-    )
+    block = "inner:\n"
+    for level in range(1, 32):
+        block += " " * (4 * level - 2) + "- inner:\n"
+    block += " " * (4 * 32 - 2) + "- v: [2.5]\n"
+    assert deep.message_to_yaml(frame) == block
+    assert deep.message_to_dict(frame) == plain
+
+
+def test_one_message_level_past_the_codec_bound_is_a_schema_error_every_way():
+    deep = array_chain(33)
+    path = ".".join(["inner[0]"] * 33)
+    message = f"{path}: messages and arrays of messages nest deeper than 64 levels"
+    values = {"v": [2.5]}
+    flow = "v: [2.5]"
+    for _ in range(33):
+        values = {"inner": [values]}
+        flow = f"inner: [{{{flow}}}]"
+    frame = header(deep, "L33", 40, 8, 0) + struct.pack("<d", 2.5)
+    for convert in (
+        lambda: deep.dict_to_message("L33", values),
+        lambda: deep.yaml_to_message("L33", flow + "\n"),
+        lambda: deep.message_to_yaml(frame),
+        lambda: deep.message_to_dict(frame),
+    ):
+        with pytest.raises(cerulion.SchemaError) as err:
+            convert()
+        assert err.value.kind == "YamlTooDeep"
+        assert str(err.value) == message
 
 
 def test_a_dict_whose_yaml_passes_the_cap_is_refused(schemas):
@@ -655,7 +658,9 @@ def test_messages_nested_past_the_codec_bound_are_a_schema_error():
     with pytest.raises(cerulion.SchemaError) as err:
         deep.dict_to_message("L65", values)
     assert err.value.kind == "YamlTooDeep"
-    assert str(err.value).endswith(": messages nest deeper than 64 levels")
+    assert str(err.value).endswith(
+        ": messages and arrays of messages nest deeper than 64 levels"
+    )
 
 
 def test_arrays_nested_past_the_walker_depth_are_an_encode_error():

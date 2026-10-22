@@ -416,8 +416,8 @@ frame can name a very large dict. `message_to_dict` bounds the dict by the
 frame: its YAML form may take 64 bytes per frame byte plus 16 MiB (else
 `DecodeError` `YamlOutputTooLarge`), and it may hold 4 Python values (each
 dict, list, key and scalar) per frame byte plus 1048576 (else `DecodeError`
-`DictTooLarge`); a frame whose YAML nests past the 128 collections a dict may hold
-(such as 64 levels of one-element message arrays) raises `DecodeError` `DictTooDeep`.
+`DictTooLarge`). A frame nested past the codec's 64 levels (a message and an array of
+messages are one level each) raises `SchemaError` `YamlTooDeep` on both paths.
 `message_to_yaml` keeps the codec's 256 MiB cap, so a frame past the dict bounds still prints.
 
 `Message.copy()` is not this conversion: it materializes a view (a
