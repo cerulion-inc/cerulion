@@ -293,8 +293,10 @@ effort: [1.5]
   holds no NUL character. A ROS `string<=N` value (or each element of
   `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
   `N` elements (`dimensions: expected at most 3 elements, got 4`). A
-  `wstring<=N` bound is not checked. Echo prints a frame past its bounds
-  as it is; reading that output back is refused.
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, so `é` counts 1 and an emoji such as `😀` counts 2;
+  a longer value is refused (`YamlWideStringTooLong`). Echo prints a frame
+  past its bounds as it is; reading that output back is refused.
 - **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
   duplicate keys and more than one document are refused. A `!truncated`
   element is refused with a message that says the array was cut for

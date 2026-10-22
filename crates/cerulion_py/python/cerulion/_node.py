@@ -578,8 +578,12 @@ def node(
 
         # A whole message from message YAML or a dict, through the codec
         # `topic echo` uses: the frame is byte-identical to the one the Rust
-        # codec builds from the same text. An explicit call, never part of
-        # the tick's own publish path.
+        # codec builds from the same text.
+        # hot-path-alloc-ok: an explicit cold call, never the tick's own
+        # publish path. Text in has to be parsed, and the parse allocates, so
+        # no form of this call is alloc-free; the loan's size comes from the
+        # built frame's offset table, so the frame exists before the loan
+        # does. The zero-copy publish path is `self.out` and `self.loan()`.
         def publish_yaml(self, name, text, /):
             frame = self._cer_schemas.yaml_to_message(_output_schema(name), text)
             self._cer_publish_frame(name, frame)
