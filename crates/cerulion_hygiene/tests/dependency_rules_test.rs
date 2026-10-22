@@ -208,9 +208,9 @@ const LEAN_CRATES: &[LeanCrate] = &[
     },
     LeanCrate {
         package: "cerulion_hygiene",
-        allowed: &["libc", "tracing"],
-        source: "crates/cerulion_hygiene/Cargo.toml: \"std + libc + tracing ONLY: no \
-                 transport, no tokio (the wsd wrapper converts to a tokio listener \
+        allowed: &["libc", "rustix", "tracing"],
+        source: "crates/cerulion_hygiene/Cargo.toml: \"std + libc + rustix peer \
+                 credentials + tracing ONLY: no transport, no tokio (the wsd wrapper converts to a tokio listener \
                  itself), so it adds nothing to the default build.\"",
     },
 ];
@@ -275,6 +275,10 @@ const CONFINED_CRATES: &[ConfinedCrate] = &[
 /// pre-authorises the next departure. Two entries carry no heavy tree and say
 /// so; they are here because completeness is the property being asserted.
 const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
+    (
+        "cerulion_android",
+        "the JNI bindings (an Android app cdylib, built per ABI with cargo ndk)",
+    ),
     ("cerulion_netd", "iroh (its `wan` feature is default-on)"),
     ("cerulion_link", "iroh"),
     (

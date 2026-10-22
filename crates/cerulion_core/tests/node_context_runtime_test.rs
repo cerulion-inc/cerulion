@@ -175,6 +175,7 @@ fn graph_runtime_run_until_shutdown_exits_when_signal_fires() {
         prefix: "smoke".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),

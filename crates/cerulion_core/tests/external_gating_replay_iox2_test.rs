@@ -250,6 +250,7 @@ impl SeqRecvConsumer {
 fn producer_only_node(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "ext_producer".to_string(),
@@ -286,6 +287,7 @@ fn producer_consumer_graph(
             producer_only_node("producer"),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "seq_recv_consumer".to_string(),

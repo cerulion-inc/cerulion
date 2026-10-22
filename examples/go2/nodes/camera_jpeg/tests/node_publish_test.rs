@@ -198,6 +198,7 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "camera".to_string(),
             node_type: "camera_jpeg".to_string(),

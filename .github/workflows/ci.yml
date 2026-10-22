@@ -359,8 +359,8 @@ jobs:
         id: version
         run: echo "version=$(tools/scripts/workspace_version.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Build the three release binaries
-        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd
+      - name: Build the four release binaries
+        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted
 
       # build_deb.sh requires every license notice the archive ships, so this
       # smoke has to produce the generated one like the release does. Doing it
@@ -394,10 +394,11 @@ jobs:
           cp target/debug/cerulion "$stage/cerulion"
           cp target/debug/cerulion-netd "$stage/cerulion-netd"
           cp target/debug/cerulion-connectd "$stage/cerulion-connectd"
+          cp target/debug/cerulion-remoted "$stage/cerulion-remoted"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
-          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd
+          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           deb=$(tools/scripts/build_deb.sh "$archive" amd64 "$RUNNER_TEMP/debs")
           test "$(printf '%s\n' "$deb" | wc -l)" -eq 1
@@ -551,6 +552,8 @@ jobs:
                 test -x /usr/bin/cerulion
                 test -x /usr/bin/cerulion-netd
                 test -x /usr/bin/cerulion-connectd
+                test -x /usr/bin/cerulion-remoted
+                cerulion-remoted --version
                 test "$(dirname "$(readlink -f "$(command -v cerulion)")")" = \
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"
               '
@@ -1133,8 +1136,8 @@ jobs:
   # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
   # except aarch64-linux trips `dead_code = deny` ONLY there — invisible to the
   # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
-  # aarch64-macOS machines). `cargo check` (no link, no cross C/C++ toolchain
-  # needed) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
+  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
+  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
   # cost on the critical path.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -1199,7 +1202,23 @@ jobs:
           restore-keys: |
             cargo-cross-aarch64-
 
+      # ring (through the QUIC link's rustls) compiles C in its build script,
+      # so the check needs the aarch64 C compiler that release-artifacts.yml
+      # installs for the same target.
+      # The hosted image ships a packages.microsoft.com apt source; apt-get
+      # update exits 100 when that source refuses or fails its signature check,
+      # even though both packages come from the Ubuntu archives. Deleting its
+      # list first keeps that source out of the update; rm -f exits 0 when the
+      # file is absent.
+      - name: Install aarch64 C compiler
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
       - name: cargo check (aarch64-unknown-linux-gnu)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo check -p cerulion_core --target aarch64-unknown-linux-gnu
 
   # MSRV enforcement. Pins the toolchain to the declared MSRV
@@ -1352,6 +1371,7 @@ jobs:
             || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
             || contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
             || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_dds')
+            || contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
           ) }}
     # `actions: write` is for the cache prune step only. The default cache-save
     # policy does not include this namespace, so it restores but does not save
@@ -1413,6 +1433,12 @@ jobs:
             -p rmw_cerulion \
             -p cerulion_dds
 
+      - name: Check local-transport on Android
+        run: cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core --features local-transport
+
+      - name: Build cerulion_android on Android
+        run: cargo ndk -t arm64-v8a --platform 30 build -p cerulion_android
+
       - name: Cache cargo (prune the namespace to the current key)
         id: cache-prune
         if: >-
@@ -1436,6 +1462,92 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+
+  local-transport:
+    name: Local transport
+    needs: [changes]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 50
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
+            cargo-crates-${{ runner.os }}-
+
+      - name: local-transport kind tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo test -p cerulion_core --features local-transport --lib transport::kind -- --test-threads=1
+
+      - name: local-transport integration tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          cargo build -p test_node_macro_cdylib -p test_node_cdylib
+          cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1
+
+      - name: local-transport zero-allocation tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo test -p cerulion_core --features local-transport --test zero_alloc_test -- --test-threads=1
+
+      - name: local-transport zero-copy tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo test -p cerulion_core --features local-transport --test zero_copy_hot_path_test -- --test-threads=1
+
+      - name: local-transport gateway tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo test -p cerulion_core --features local-transport --test gateway_iox2_test -- --test-threads=1
+
+      - name: local-transport cdylib delivery tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          cargo build -p test_node_macro_cdylib --features cerulion_core/local-transport
+          # DylibNodeEntry::load refuses every cdylib under local-transport,
+          # so load-and-run tests live in the regular lanes; the refusal arm
+          # covers the path here. The ABI-tag test only reads metadata.
+          for test_filter in \
+            macro_cdylib_abi_version_carries_the_transport_kind; do
+            cargo test -p cerulion_core --features local-transport --test macro_cdylib_test -- --test-threads=1 \
+              --exact "$test_filter"
+          done
+          cargo build -p test_node_raw_ffi_template_cdylib --features cerulion_core/local-transport
+          # loads_via_dylib_node_entry is refused under local-transport;
+          # init_tick_shutdown dlopens the fixture directly and runs it.
+          for test_filter in \
+            test_raw_ffi_template_cdylib_init_tick_shutdown_happy_path; do
+            cargo test -p cerulion_core --features local-transport --test node_raw_ffi_template_test -- --test-threads=1 \
+              --exact "$test_filter"
+          done
+          # The matching-tag refusal arm is #[ignore]d because it needs the
+          # fixture built WITH the feature - which this step just did.
+          cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1 \
+            --ignored --exact loader_refuses_a_matching_local_transport_cdylib
+
+      - name: selection marker, cerulion_core
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_core (selected: $SELECTED)"
 
   examples:
     name: Examples (cargo check)
@@ -1499,6 +1611,9 @@ jobs:
 
       - name: Obstacle avoidance source regressions
         run: cd examples/obstacle_avoidance && cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
+
+      - name: Simulated arm plant (examples/aspire_arm)
+        run: cd examples/aspire_arm && cargo test -p arm_sim --lib
 
   # The Go2 demo workspace (examples/go2) is ISOLATED: not a member of
   # the root cargo workspace, and deliberately skipped by `examples` (its
@@ -2478,6 +2593,54 @@ jobs:
       - name: CLI engine tests
         if: matrix.shard == 2
         run: cargo test -p cerulion_cli_engine
+      - name: cerulion_android host tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --lib -- --test-threads=1
+      - name: Build the Android runtime test fixture
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo build -p test_node_macro_period_cdylib -p test_node_macro_external_cdylib -p test_node_hang_cdylib -p test_node_failing_cdylib
+      - name: cerulion_android embedded runtime integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
+      - name: cerulion_android graph finish integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+      - name: cerulion_android graph launch refusal integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_graph_launch_refusal_test -- --test-threads=1
+      - name: cerulion_android component failure integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_component_failure_test -- --test-threads=1
+      - name: cerulion_android schema restart integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android gateway exclusivity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
+      - name: cerulion_android identity integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_identity_test -- --test-threads=1
+      - name: cerulion_android LAN access integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
+      - name: cerulion_android LAN ownership tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
+      - name: cerulion_android gateway owner tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test gateway_owner_test -- --test-threads=1
+      - name: cerulion_android gateway restart baseline tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test gateway_restart_baseline_test -- --test-threads=1
+      - name: cerulion_android first start failure tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
+      - name: selection marker, cerulion_android
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android (selected: $SELECTED)"
       # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
       - name: CLI binary tests
         if: matrix.shard == 1
@@ -3569,6 +3732,8 @@ jobs:
   # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
   # (their own headers say "parallel-safe without `#[serial]`"), which is the
   # same property that lets the `cerulion_connectd` step above run parallel.
+  # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
+  # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
   # binds 127.0.0.1:0; `cerulion_link` runs loopback iroh with per-test
   # identities; `cerulion_pairing` / `cerulion-wire` / `cerulion_mdns` are pure
@@ -3748,6 +3913,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_rcpd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        run: cargo test -p cerulion_rcpd
+      - name: selection marker, cerulion_rcpd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_rcpd (selected: $SELECTED)"
       - name: cerulion_remoted tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
@@ -3812,7 +3986,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_tf (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
-      # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
+      # `cerulion_wsd`'s three production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
       # `libloading` at RUNTIME — `cargo tree -p cerulion_wsd -i
       # test_node_cdylib` matches no package, so nothing `cargo test -p
@@ -3823,9 +3997,9 @@ jobs:
       # passing test's stderr: a skip reports `ok` and proves nothing — the
       # "a pin that cannot fail a PR is not a gate" class this job's header
       # names. Default profile and target dir, matching the `cargo test` below.
-      - name: Build the cerulion_wsd --inspect-node fixture cdylib
+      - name: Build the cerulion_wsd --inspect-node fixture cdylibs
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
-        run: cargo build -p test_node_cdylib
+        run: cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib
       - name: cerulion_wsd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd
@@ -3945,8 +4119,10 @@ jobs:
       contents: read
       actions: write
     # The cargo cache for this job is restore-only (see the save step), so
-    # every run builds cold: about 30-44 minutes before pytest starts.
-    timeout-minutes: 60
+    # every run builds cold: about 30-46 minutes before pytest starts, and
+    # pytest itself takes up to 14 minutes on macOS. 60 minutes cancelled a
+    # run whose every step had passed, so the budget is 90.
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: crates/cerulion_py

@@ -16,13 +16,17 @@
 //! alongside the `Message` trait itself.
 
 use super::types::{field_type_to_rust, field_type_to_rust_shm};
-use super::{escape_keyword, has_large_array, needs_manual_default};
-use crate::codegen::schema::{FieldDef, FieldType, MessageSchema};
+use super::{
+    escape_keyword, field_has_direct_large_array, field_has_large_array, field_has_nonzero_default,
+    has_large_array, needs_manual_default,
+};
+use crate::codegen::schema::{DefaultLiteral, FieldDef, FieldType, MessageSchema, ScalarLiteral};
 use std::fmt::Write;
 
 /// Emit the unit marker `pub struct <Name>;` that carries `impl ShmMessage`.
 ///
-/// The marker is zero-sized and has no inherent methods. User code references
+/// The marker is zero-sized; its only inherent items are the message's
+/// constants (`<Name>::FOO`). User code references
 /// it (e.g. `OutputProxy<'_, Twist>`); the actual SHM-backed accessor type is
 /// `<<Name> as ShmMessage>::Writer<'a>` (= `<Name>Shm[<'a>]`). The proxy
 /// derefs to that accessor via the GAT, so `proxy.field = value` reaches the
@@ -195,7 +199,69 @@ pub(super) fn generate_marker_struct(out: &mut String, schema: &MessageSchema) {
     // (the canonical pattern for `#[cerulion_node(... zero_copy)]` user
     // structs that hold port markers as fields).
     writeln!(out, "#[derive(Debug, Clone, Copy, Default)]").unwrap();
+    emit_type_name_lint_allow(out, &schema.name);
     writeln!(out, "pub struct {};", schema.name).unwrap();
+    writeln!(out).unwrap();
+
+    generate_marker_constants(out, schema);
+}
+
+/// Associated-item names of `ShmMessage`. An inherent constant with one of
+/// these names would shadow the trait item on `<Name>::NAME` paths.
+const SHM_MESSAGE_ITEM_NAMES: &[&str] = &[
+    "SCHEMA_HASH",
+    "VARIABLE_FIELD_COUNT",
+    "WIRE_FIXED_SIZE",
+    "MAX_SLICE_LEN",
+    "_SHM_INVARIANTS",
+];
+
+/// Emit the message's constants (`uint8 FOO=1`) as associated constants on
+/// the marker: `<Name>::FOO`. Nothing is emitted for a schema without
+/// constants. A constant named like a `ShmMessage` item is a
+/// `compile_error!`, since it would shadow that item.
+fn generate_marker_constants(out: &mut String, schema: &MessageSchema) {
+    if schema.constants.is_empty() {
+        return;
+    }
+    let clashes: Vec<String> = schema
+        .constants
+        .iter()
+        .filter(|c| SHM_MESSAGE_ITEM_NAMES.contains(&c.name.as_str()))
+        .map(|c| format!("`{}`", c.name))
+        .collect();
+    if !clashes.is_empty() {
+        writeln!(
+            out,
+            "compile_error!(\"schema `{}`: constant name(s) {} are reserved for the ShmMessage trait items; rename the constant(s).\");",
+            schema.name,
+            clashes.join(", ")
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+        return;
+    }
+    writeln!(out, "impl {} {{", schema.name).unwrap();
+    for c in &schema.constants {
+        let rust_type = match &c.field_type {
+            FieldType::String => "&'static str".to_string(),
+            other => field_type_to_rust(other),
+        };
+        writeln!(
+            out,
+            "    /// Constant `{}` declared in the message.",
+            c.name
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const {}: {rust_type} = {};",
+            c.name,
+            scalar_literal_expr(&c.value)
+        )
+        .unwrap();
+    }
+    writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 }
 
@@ -348,6 +414,7 @@ pub(super) fn generate_shm_struct(out: &mut String, schema: &MessageSchema) {
             writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Default)]").unwrap()
         }
     }
+    emit_type_name_lint_allow(out, &shm_name);
     writeln!(out, "pub struct {shm_name} {{").unwrap();
 
     for field in &schema.fields {
@@ -601,37 +668,155 @@ fn generate_shm_default_impl(out: &mut String, schema: &MessageSchema, shm_name:
 }
 
 /// Default-value expression for an SHM-backed field, honoring a non-zero
-/// scalar .msg default when present (`float64 w 1` →
+/// .msg default when present (`float64 w 1` →
 /// `QuaternionShm::default().w == 1.0`).
 fn shm_field_default_expr(field: &FieldDef) -> String {
-    if let Some(d) = &field.default_literal {
-        if !d.is_zero() {
-            return d.shm_expr();
-        }
+    match &field.default_literal {
+        Some(d) if field_has_nonzero_default(field) => shm_default_literal_expr(d),
+        _ => shm_field_default_value(&field.field_type),
     }
-    shm_field_default_value(&field.field_type)
 }
 
 /// Snapshot default-value expression for a FIXED schema's field, honoring
-/// a non-zero scalar .msg default when present.
+/// a non-zero .msg default when present.
 fn fixed_snapshot_field_default_expr(field: &FieldDef) -> String {
-    if let Some(d) = &field.default_literal {
-        if !d.is_zero() {
-            return d.snapshot_expr();
+    match &field.default_literal {
+        Some(d) if field_has_nonzero_default(field) => {
+            snapshot_default_literal_expr(d, &field.field_type)
         }
+        _ => field_type_default_value(&field.field_type),
     }
-    field_type_default_value(&field.field_type)
 }
 
 /// Snapshot default-value expression for a VARIABLE schema's field,
-/// honoring a non-zero scalar .msg default when present.
+/// honoring a non-zero .msg default when present.
 fn var_snapshot_field_default_expr(field: &FieldDef) -> String {
-    if let Some(d) = &field.default_literal {
-        if !d.is_zero() {
-            return d.snapshot_expr();
+    match &field.default_literal {
+        Some(d) if field_has_nonzero_default(field) => {
+            snapshot_default_literal_expr(d, &field.field_type)
+        }
+        _ => snapshot_field_default_value(&field.field_type),
+    }
+}
+
+/// Rust literal for one scalar value in snapshot or constant position
+/// (`bool` stays `bool`). `{:?}` keeps a float's decimal point (`1.0`, not
+/// `1`) so the literal is float-typed, and renders a string as a valid,
+/// escaped Rust string literal.
+fn scalar_literal_expr(v: &ScalarLiteral) -> String {
+    match v {
+        ScalarLiteral::Bool(b) => b.to_string(),
+        ScalarLiteral::Int(i) => i.to_string(),
+        ScalarLiteral::Float(f) => format!("{f:?}"),
+        ScalarLiteral::Str(s) => format!("{s:?}"),
+    }
+}
+
+fn array_items_expr(items: &[ScalarLiteral], render: fn(&ScalarLiteral) -> String) -> String {
+    items.iter().map(render).collect::<Vec<_>>().join(", ")
+}
+
+/// Rust expression for a default in a `<Name>Snapshot` field of type `ft`.
+///
+/// A `string` becomes an owned `String`; a primitive or `string[N]` array
+/// becomes an array literal (`[String; N]` for `string[N]`; the rest of
+/// a message with a `string[N]` field does not generate yet, with or
+/// without a default), and a dynamic
+/// primitive array a `Vec` literal. Only a `string[]` / `string[<=N]`
+/// snapshot field (a dynamic array of strings) holds the field's raw wire
+/// payload, so its default is the canonical encoding of the strings: a
+/// `u32` count, then each string as a `u32` length and its UTF-8 bytes,
+/// all little-endian.
+fn snapshot_default_literal_expr(d: &DefaultLiteral, ft: &FieldType) -> String {
+    match d {
+        DefaultLiteral::Scalar(v) => snapshot_element_expr(v),
+        DefaultLiteral::Array(items) if is_complex_variable(ft) => {
+            let texts: Option<Vec<&str>> = items
+                .iter()
+                .map(|item| match item {
+                    ScalarLiteral::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // The parser builds only `Str` elements for a string array; any
+            // other element fails the generated code's build, loudly,
+            // instead of writing a wrong payload.
+            let Some(texts) = texts else {
+                return "::core::compile_error!(\"a string[] default holds a non-string element\")"
+                    .to_string();
+            };
+            let list = canonical_string_array_bytes(&texts)
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("::std::vec![{list}]")
+        }
+        DefaultLiteral::Array(items) => {
+            let list = array_items_expr(items, snapshot_element_expr);
+            match ft {
+                FieldType::FixedArray { .. } => format!("[{list}]"),
+                _ => format!("::std::vec![{list}]"),
+            }
         }
     }
-    snapshot_field_default_value(&field.field_type)
+}
+
+/// One value in snapshot position: a string is an owned `String` (the
+/// snapshot holds `String` / `[String; N]`), anything else a scalar.
+fn snapshot_element_expr(v: &ScalarLiteral) -> String {
+    match v {
+        ScalarLiteral::Str(s) => format!("::std::string::String::from({s:?})"),
+        other => scalar_literal_expr(other),
+    }
+}
+
+/// The canonical `string[]` payload: `u32` count, then per element a `u32`
+/// byte length and the UTF-8 bytes, little-endian (the encoding
+/// `CdrCodec` writes and the `FrameWalker` reads).
+fn canonical_string_array_bytes(texts: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(texts.len() as u32).to_le_bytes());
+    for text in texts {
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
+    out
+}
+
+/// Rust expression for a default in an SHM overlay field (`bool` stored
+/// as `u8`). Only fixed-section fields reach here: primitives and fixed
+/// arrays of primitives.
+fn shm_default_literal_expr(d: &DefaultLiteral) -> String {
+    fn shm_scalar(v: &ScalarLiteral) -> String {
+        match v {
+            ScalarLiteral::Bool(b) => if *b { "1u8" } else { "0u8" }.to_string(),
+            other => scalar_literal_expr(other),
+        }
+    }
+    match d {
+        DefaultLiteral::Scalar(v) => shm_scalar(v),
+        DefaultLiteral::Array(items) => format!("[{}]", array_items_expr(items, shm_scalar)),
+    }
+}
+
+/// True when the `<Name>FixedSection` overlay of a VARIABLE schema needs a
+/// manual `Default`: a direct large array, or a non-zero default, on one of
+/// its OWN fields. A variable field (a string, a `T[]`, a `Header[33]` of a
+/// variable `Header`) lives only in the snapshot and the payload region, so
+/// it must not force a manual overlay impl: clippy `derivable_impls` rejects
+/// a manual `Default` that derive could produce.
+fn fixed_section_needs_manual_default(schema: &MessageSchema) -> bool {
+    fixed_section_fields(schema)
+        .any(|f| field_has_direct_large_array(&f.field_type) || field_has_nonzero_default(f))
+}
+
+/// True when a field of the `<Name>FixedSection` overlay holds a large
+/// array (directly or inside an embedded resolved-fixed nested type), so
+/// the overlay cannot derive `Debug`. Variable fields are not in the
+/// overlay, so they do not count.
+fn fixed_section_has_large_array(schema: &MessageSchema) -> bool {
+    fixed_section_fields(schema).any(|f| field_has_large_array(&f.field_type))
 }
 
 /// Default-value expression for an SHM-backed field. Like
@@ -934,6 +1119,25 @@ const BIG_ARRAY_PATH: &str = "::cerulion_core::codegen::big_array";
 /// line to its `Cargo.toml`.
 const STATE_PATH: &str = "::cerulion_core::state::CerulionState";
 
+/// Emit `#[allow(non_camel_case_types)]` before a generated type whose name
+/// the `non_camel_case_types` lint rejects. A ROS 2 service names its request
+/// and response messages `<Srv>_Request` and `<Srv>_Response`; codegen keeps
+/// those names, so the marker and every type derived from it (`<Name>Shm`,
+/// `<Name>Snapshot`, `<Name>FixedSection`) carry an underscore. The test is
+/// wider than the lint (any underscore, or a lowercase first letter); an
+/// unneeded allow is harmless. A plain UpperCamelCase name writes nothing, so
+/// its output is byte-identical to earlier codegen.
+fn emit_type_name_lint_allow(out: &mut String, type_name: &str) {
+    if !is_upper_camel_case(type_name) {
+        writeln!(out, "#[allow(non_camel_case_types)]").unwrap();
+    }
+}
+
+/// True when `name` starts with a non-lowercase letter and has no underscore.
+fn is_upper_camel_case(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| !c.is_lowercase()) && !name.contains('_')
+}
+
 /// Emit the `#[derive(...)]` (and its `#[serde(crate = ...)]` companion) for a
 /// `<Name>Snapshot` struct. Shared by the fixed and variable emitters so the
 /// two can never disagree about what a snapshot derives.
@@ -1078,6 +1282,7 @@ pub(super) fn generate_snapshot_struct(out: &mut String, schema: &MessageSchema)
     writeln!(out, "/// [`{name}Shm::write_from_snapshot`].").unwrap();
 
     emit_snapshot_derives(out, schema);
+    emit_type_name_lint_allow(out, &snapshot_name);
     writeln!(out, "pub struct {snapshot_name} {{").unwrap();
 
     for field in &schema.fields {
@@ -1392,6 +1597,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
         "/// `proxy.<field> = value` writes directly into the loaned SHM slot."
     )
     .unwrap();
+    emit_type_name_lint_allow(out, &shm_name);
     writeln!(out, "pub struct {shm_name}<'a> {{").unwrap();
     writeln!(
         out,
@@ -1929,7 +2135,10 @@ fn generate_variable_fixed_section_struct(
     // fixed nested type) only poisons `Debug` and MUST derive `Default`
     // (clippy `derivable_impls`). Eq/Hash always skipped — float fields
     // disallow them.
-    match (needs_manual_default(schema), has_large_array(schema)) {
+    match (
+        fixed_section_needs_manual_default(schema),
+        fixed_section_has_large_array(schema),
+    ) {
         (true, true) => writeln!(out, "#[derive(Clone, Copy, PartialEq)]").unwrap(),
         (true, false) => writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap(),
         (false, true) => writeln!(out, "#[derive(Clone, Copy, PartialEq, Default)]").unwrap(),
@@ -1937,6 +2146,7 @@ fn generate_variable_fixed_section_struct(
             writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Default)]").unwrap()
         }
     }
+    emit_type_name_lint_allow(out, fixed_section_name);
     writeln!(out, "pub struct {fixed_section_name} {{").unwrap();
 
     if has_fixed {
@@ -1967,7 +2177,7 @@ fn generate_variable_fixed_section_struct(
 
     // Manual Default when forced (direct large array or non-zero scalar
     // defaults); transitive-only cases derive it (clippy `derivable_impls`).
-    if needs_manual_default(schema) {
+    if fixed_section_needs_manual_default(schema) {
         generate_fixed_section_default_impl(out, schema, fixed_section_name);
     }
 
@@ -4688,6 +4898,7 @@ pub(super) fn generate_variable_snapshot_struct(out: &mut String, schema: &Messa
     .unwrap();
 
     emit_snapshot_derives(out, schema);
+    emit_type_name_lint_allow(out, &snapshot_name);
     writeln!(out, "pub struct {snapshot_name} {{").unwrap();
 
     for field in &schema.fields {

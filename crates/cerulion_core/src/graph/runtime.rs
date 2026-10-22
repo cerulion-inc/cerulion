@@ -3098,6 +3098,13 @@ pub struct GraphRuntime {
     /// anchor — armed by [`Self::place_gating_epoch_at_live_anchor`], spent by
     /// `run_live` in the same breath as its first `Instant::now()`.
     pending_live_epoch: bool,
+    /// The deployment's shared start epoch (`real_ns()` nanoseconds), armed by
+    /// [`Self::start_live_at_shared_epoch`] and spent by `run_live`: the loop
+    /// waits for this instant before its first step; when it got there within
+    /// one gating quantum, a pending epoch placement places the gating clock at
+    /// exactly this value and the wall anchors are back-dated to it, and
+    /// otherwise the rank warns and starts its own timeline.
+    live_start_epoch_ns: Option<u64>,
     /// Where the live loop's wall pace meets the gating timeline: the
     /// `(watch_clock, gating)` pair read at `run_live` entry. `live_timeout` /
     /// `spin_budget` size their waits against Period deadlines that live in the
@@ -3510,6 +3517,9 @@ pub struct GraphRuntime {
     /// (helper threads included — see the `external_bindings` doc) rather than
     /// re-querying / re-spawning.
     external_sources_collected: bool,
+    /// Every native node's params as this build resolved them, keyed by node
+    /// id: what [`Self::param_differences`] compares a recording against.
+    params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -4125,6 +4135,39 @@ impl GraphRuntime {
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
     ) -> TransportResult<Self> {
+        // `None` reproduces the pre-recording-seam behaviour exactly; the
+        // recorded-topic raise lives on the `_and_recorded` sibling below.
+        Self::build_live_with_schema_hashes_policy_and_recorded(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            policy,
+            None,
+        )
+    }
+
+    /// [`Self::build_live_with_schema_hashes_and_policy`] plus the
+    /// `recorded_topics` recording-provisioning seam on the LIVE (RealClock)
+    /// build path. `Some(set)` raises `subscriber_max_borrowed_samples` to
+    /// `RECORDING_SUBSCRIBER_MAX_BORROWED` and the
+    /// `subscriber_max_buffer_size` ceiling to
+    /// `recording_tap_buffer_depth(max_slice_len)` on each listed topic (see
+    /// `build_with_scheduler`), giving the in-process `bagd` recorder's
+    /// open-only taps the same deep receive queues the CLI `--record` path
+    /// provisions. `None` reproduces
+    /// [`Self::build_live_with_schema_hashes_and_policy`] exactly.
+    // hot-path-alloc-ok-fn: cold: graph BUILD runs once per process, before the first step
+    pub fn build_live_with_schema_hashes_policy_and_recorded(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<dyn Clock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
+    ) -> TransportResult<Self> {
         Self::build_live_core(
             config,
             node_factories,
@@ -4132,6 +4175,7 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            recorded_topics,
             // Single-process live build — the local graph
             // IS the full graph, so there is no cross-group requirement union
             // and no split `block` edge to bind.
@@ -4189,13 +4233,21 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            // A free-run rank is non-recording on this
+            // path (the record arm is `build_live_deterministic_free_run`).
+            None,
             cross_process,
         )
     }
 
-    /// The shared body of [`Self::build_live_with_schema_hashes_and_policy`]
-    /// (union `None`) and [`Self::build_live_free_run`] (union stamped): ONE
+    /// The shared body of
+    /// [`Self::build_live_with_schema_hashes_policy_and_recorded`] (union
+    /// `None`) and [`Self::build_live_free_run`] (union stamped): ONE
     /// implementation of the RealClock live wiring, so the two cannot drift.
+    // Eight parameters, one past clippy's bar: every parameter is a DISTINCT
+    // type, so positional call sites carry no swap hazard; same suppression,
+    // for the same reason, as the private funnel `build_with_scheduler`.
+    #[allow(clippy::too_many_arguments)]
     // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
     fn build_live_core(
         config: GraphConfig,
@@ -4204,6 +4256,7 @@ impl GraphRuntime {
         clock: Arc<dyn Clock>,
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
         cross_process: CrossProcessWiring<'_>,
     ) -> TransportResult<Self> {
         super::validation::validate_graph_with(&config, cross_process.validation_options())?;
@@ -4223,11 +4276,13 @@ impl GraphRuntime {
             scheduler,
             schema_hashes,
             policy,
-            // This NON-deterministic live path (RealClock gating)
-            // is not the recording path — recording builds via
-            // `build_live_deterministic_with_schema_hashes_and_policy` (or, per
-            // free-run rank, `build_live_deterministic_free_run`).
-            None,
+            // `None` on every caller that is not
+            // recording (`build_live*`, `build_live_free_run`); the embedded
+            // recording caller (`build_live_with_schema_hashes_policy_and_recorded`)
+            // threads the recorded set so its bagd taps get the raised
+            // provisioning. The deterministic recording builds reach the same
+            // raise through their own ctor.
+            recorded_topics,
             cross_process,
             // A live build exists to be driven.
             BuildPurpose::Execution,
@@ -5048,6 +5103,33 @@ impl GraphRuntime {
         // "compile-time" check. This model also drives the backpressure
         // wiring below and is the DAG edge model the levelization reuses.
         let topology = GraphTopology::build(&config, &entry_infos)?;
+        // Resolve every node's `params:` against what its type declares,
+        // HERE, before any transport resource exists: an unknown name, a
+        // wrong type or an out-of-range value refuses the graph by node and
+        // param. The resolved maps are handed to each entry just before its
+        // `init` below.
+        let resolved_params = crate::graph::params::resolve_graph_params(&config, &entry_infos)?;
+        // Kept on the runtime for a resume, which compares each restored
+        // node's values in force with the ones the recording names
+        // (`crate::graph::param_resume`).
+        // hot-path-alloc-ok: cold: graph build, one map per node
+        let params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce> =
+            resolved_params
+                .iter()
+                .map(|(id, values)| {
+                    let specs = entry_infos
+                        .get(id)
+                        .map(|info| info.params().to_vec())
+                        .unwrap_or_default();
+                    (
+                        id.clone(),
+                        crate::graph::param_resume::ParamsInForce {
+                            specs,
+                            values: values.clone(),
+                        },
+                    )
+                })
+                .collect();
         // The `(topic, consumer node, consumer input)` key set of
         // every cross-process `block` edge this build carries a credit word
         // for. Derived ONCE and read twice — by `validate_with_credit_edges`
@@ -7984,6 +8066,13 @@ impl GraphRuntime {
             if purpose == BuildPurpose::PlanningOnly {
                 context.silence_teardown_reconciliation();
             }
+            // The node's resolved params, checked in the pre-pass above,
+            // reach it BEFORE `init` so its own `init` and first tick read
+            // the graph's values. A node that declares none gets an empty
+            // map, which every entry accepts.
+            if let Some(values) = resolved_params.get(&node_def.id) {
+                entry.set_params(values)?;
+            }
             entry.init(context)?;
 
             // Share entry between the
@@ -9111,6 +9200,7 @@ impl GraphRuntime {
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
             external_sources_collected: false,
+            params_in_force,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -9159,6 +9249,7 @@ impl GraphRuntime {
             // quantum / wall-delta behavior unchanged.
             gating_follows_wall: false,
             pending_live_epoch: false,
+            live_start_epoch_ns: None,
             live_pace_anchor: None,
             liveliness_watches,
             liveliness_sweep_accum_ns: 0,
@@ -14123,6 +14214,65 @@ impl GraphRuntime {
             .get_or_init(|| matches!(std::env::var("CERULION_MW_SINGLE_PARK").as_deref(), Ok("1")))
     }
 
+    /// Run [`Self::run_live`]'s fallible launch setup without entering the
+    /// loop: collect the external ingress wake sources (refusing a graph with
+    /// an external node that is provably inert at launch,
+    /// [`TransportError::ExternalNodesInertAtLaunch`]) and build the WaitSet
+    /// reactor when the loop needs one ([`TransportError::LiveReactorBuild`]).
+    ///
+    /// An embedding host calls this on the thread that will run the loop and
+    /// reports the graph ready only after it returns `Ok`, so a launch failure
+    /// surfaces as a start failure instead of after start reported success.
+    /// `run_live` runs the same setup first, so calling this is optional.
+    /// Idempotent, with the same sticky refusal: the `run_live` that follows
+    /// reuses the collected bindings and the parked reactor. (A cross-process
+    /// rank's armed gating epoch is placed by `run_live` itself, at its clock
+    /// anchor; its refusals are made earlier, when the epoch is armed.)
+    pub fn prepare_live(&mut self) -> TransportResult<()> {
+        self.collect_external_sources()?;
+        if self.reactor.is_none() && self.live_loop_needs_reactor() {
+            self.reactor = Some(self.build_live_reactor()?);
+        }
+        Ok(())
+    }
+
+    /// Whether the live loop idles on the WaitSet reactor. A parked run idles
+    /// in `monitor_wait_block` instead (the `park_active()` branch in
+    /// `live_step` PRECEDES the WaitSet branch), and so does a barrier
+    /// participant or a run with credit edges, so those need no reactor.
+    fn live_loop_needs_reactor(&self) -> bool {
+        !(self.park_active() || self.barrier_participant.is_some() || self.has_credit_edges())
+    }
+
+    /// Build the live loop's WaitSet reactor, sized for data-trigger + sync +
+    /// external attachments (a `DeviceFd` / `Notified` doorbell each attaches
+    /// one WaitSet source).
+    fn build_live_reactor(&self) -> TransportResult<waitset::WaitSetReactor> {
+        waitset::WaitSetReactor::new(
+            (self.data_trigger_bindings.len()
+                + self.sync_input_bindings.len()
+                + self.external_bindings.len())
+            .max(1),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "run_live: cannot build WaitSet reactor; aborting live loop"
+            );
+            // Propagate the failure. Returning `Ok(())` from `run_live` (a
+            // bare `()` meaning "ran") would let `cerulion graph run` exit 0
+            // for a live run that never executed a single step - a false
+            // success. So the underlying iceoryx2 `WaitSetCreateError` is
+            // surfaced and the CLI exits non-zero.
+            TransportError::LiveReactorBuild {
+                // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
+                // arm, which aborts the live loop
+                graph: self.config.identity().to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+
     /// The production event-driven live loop.
     ///
     /// Drives the graph from real iceoryx2 wakeups instead of fixed-`delta`
@@ -14239,43 +14389,8 @@ impl GraphRuntime {
         // reused regardless (harmless if the park is active — it just sits idle).
         let mut reactor: Option<waitset::WaitSetReactor> = match self.reactor.take() {
             Some(r) => Some(r),
-            // A barrier participant idles in `monitor_wait_block`
-            // even when the park is off (see `live_step`), so it needs no
-            // reactor either.
-            None if self.park_active()
-                || self.barrier_participant.is_some()
-                || self.has_credit_edges() =>
-            {
-                None
-            }
-            // Size for data-trigger + sync + external
-            // attachments (a `DeviceFd` / `Notified` doorbell each attaches one
-            // WaitSet source).
-            None => match waitset::WaitSetReactor::new(
-                (self.data_trigger_bindings.len()
-                    + self.sync_input_bindings.len()
-                    + self.external_bindings.len())
-                .max(1),
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "run_live: cannot build WaitSet reactor; aborting live loop"
-                    );
-                    // Propagate the failure. Returning
-                    // `Ok(())` here (a bare `()` meaning "ran") would let
-                    // `cerulion graph run` exit 0 for a live run that never executed
-                    // a single step — a false success. So the underlying iceoryx2
-                    // `WaitSetCreateError` is surfaced and the CLI exits non-zero.
-                    return Err(TransportError::LiveReactorBuild {
-                        // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
-                        // arm, which aborts the live loop
-                        graph: self.config.identity().to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            None if !self.live_loop_needs_reactor() => None,
+            None => Some(self.build_live_reactor()?),
         };
 
         // Worker-visible wait-policy line (once per run_live entry, after
@@ -14338,15 +14453,71 @@ impl GraphRuntime {
         // wall-following clock's anchor, so the controlled clock and boot-monotonic
         // time meet to within one clock read (see
         // `place_gating_epoch_at_live_anchor`).
-        self.place_pending_live_epoch()?;
-        self.anchor_live_pace();
+        //
+        // A shared start epoch (`start_live_at_shared_epoch`) is waited for
+        // first. A rank that got here within one gating quantum of it places an
+        // armed epoch at exactly the shared value and takes the overshoot off
+        // both wall anchors, so its timeline starts AT the epoch, the same point
+        // as every other rank's. A rank later than that would pay the whole delay
+        // as one first-step delta (a Period catch-up burst on a recording rank),
+        // so it starts its own timeline now instead, as it did before the shared
+        // epoch existed, and says by how much it missed.
+        let shared_start = self.live_start_epoch_ns.take();
+        let start = match shared_start {
+            Some(epoch_ns) => {
+                wait_for_real_ns(epoch_ns, running);
+                let start = shared_start_decision(
+                    epoch_ns,
+                    crate::clock::real_ns(),
+                    self.live_gating_quantum
+                        .filter(|_| self.gating_follows_wall),
+                    running.load(Relaxed),
+                );
+                if let SharedStart::Missed { late_ns } = start {
+                    tracing::warn!(
+                        graph = %self.config.identity(),
+                        epoch_ns,
+                        late_ns,
+                        "live loop reached the deployment's shared start epoch more than one \
+                         gating quantum late; this rank starts its own timeline now instead"
+                    );
+                }
+                start
+            }
+            None => SharedStart::Unarmed,
+        };
+        let placed_at = match start {
+            SharedStart::OnTime(epoch_ns) | SharedStart::Stopped(epoch_ns) => Some(epoch_ns),
+            SharedStart::Missed { .. } | SharedStart::Unarmed => None,
+        };
+        self.place_pending_live_epoch(placed_at)?;
+        // The back-date is read AFTER the placement, so it covers the
+        // placement's own time; the anchors' wall reads follow it.
+        let back_date = match start {
+            SharedStart::OnTime(epoch_ns) => {
+                Duration::from_nanos(crate::clock::real_ns().saturating_sub(epoch_ns))
+            }
+            SharedStart::Stopped(_) | SharedStart::Missed { .. } | SharedStart::Unarmed => {
+                Duration::ZERO
+            }
+        };
+        let now = std::time::Instant::now();
+        self.anchor_live_pace(back_date);
         // A resumed `run_live` measures paused time from here, not from a previous
         // session's last step.
         #[cfg(unix)]
         if let Some(page) = self.pause.as_ref() {
             self.pause_seen_ns = page.paused_ns();
         }
-        let mut last = std::time::Instant::now();
+        let mut last = now.checked_sub(back_date).unwrap_or(now);
+        if let SharedStart::OnTime(epoch_ns) = start {
+            tracing::info!(
+                graph = %self.config.identity(),
+                epoch_ns,
+                overshoot_ns = back_date.as_nanos() as u64,
+                "live loop started at the deployment's shared start epoch"
+            );
+        }
         // A barrier-boundary timeout TERMINALLY poisons the runtime (a peer
         // stalled/crashed): `step_live` sets `barrier_failed` and then early-
         // returns every step. Break the loop on it so a poisoned run RETURNS
@@ -14517,7 +14688,7 @@ impl GraphRuntime {
     /// the timeout the loop would actually wait without spawning it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn anchor_live_pace_for_test(&mut self) {
-        self.anchor_live_pace();
+        self.anchor_live_pace(Duration::ZERO);
     }
 
     /// Pin the wall→gating mapping the wait sizing uses (see
@@ -14525,9 +14696,15 @@ impl GraphRuntime {
     /// deferred epoch is placed, so a resumed run re-anchors at its own start and
     /// the pause never becomes a catch-up burst. On a gating == wall build the
     /// anchor is a no-op mapping and the wall clock is read directly.
-    fn anchor_live_pace(&mut self) {
+    /// `back_date` moves the wall side of the pair that far into the past: a
+    /// shared start places the gating clock at the epoch while the wall has
+    /// already moved past it by `back_date`.
+    fn anchor_live_pace(&mut self, back_date: Duration) {
         self.live_pace_anchor = self.live_gating_quantum.map(|_| LivePaceAnchor {
-            wall_ns: self.watch_clock.now_ns(),
+            wall_ns: self
+                .watch_clock
+                .now_ns()
+                .saturating_sub(back_date.as_nanos() as u64),
             gating_ns: self.scheduler.gating_now_ns(),
         });
     }
@@ -14777,6 +14954,16 @@ impl GraphRuntime {
         // no progress; the error was already logged when the poison was set).
         if self.barrier_failed {
             return;
+        }
+        // A shared start epoch is spent only by `run_live` too; stepped
+        // through the polled seam, the runtime never waits for it. Said ONCE.
+        if self.live_start_epoch_ns.is_some() && self.scheduler.steps_begun() == 0 {
+            tracing::warn!(
+                graph = %self.config.identity(),
+                "a shared start epoch armed for run_live is still PENDING while the runtime is \
+                 stepped through the polled seam; this step does not wait for it; arm the \
+                 shared start only on a run_live-driven runtime"
+            );
         }
         // An epoch armed for `run_live`'s anchor is
         // spent only there — a runtime stepped through the polled seam instead
@@ -16044,9 +16231,11 @@ impl GraphRuntime {
     /// restores one cross-rank stamp domain, matching the non-record arm up to
     /// wall-follow telescoping error. The worker ARMS this after GO via
     /// [`Self::place_gating_epoch_at_live_anchor`] and `run_live` performs the
-    /// placement at its wall-clock anchor, so the placement instants across
-    /// ranks differ by the GO fan-out only — never by the seconds of
-    /// sequential-spawn skew a build-time placement would bake in.
+    /// placement at its wall-clock anchor, at the deployment's shared start
+    /// epoch when one is armed ([`Self::start_live_at_shared_epoch`]), so every
+    /// rank that reaches it within one gating quantum places the same value
+    /// and none bakes in the seconds of sequential-spawn skew a build-time
+    /// placement would.
     ///
     /// # Why it is a PRIMITIVE and not `clock.set(epoch)`
     ///
@@ -16112,9 +16301,11 @@ impl GraphRuntime {
     /// its own `run_live` setup time — a constant per-rank offset (unmeasured
     /// for a worker; the prologue collects external sources and builds the
     /// reactor), which is exactly the cross-rank skew the epoch exists to
-    /// remove. Armed here, the epoch is read from `real_ns()` in the
-    /// same breath as the anchor, so the two domains meet to within one clock
-    /// read.
+    /// remove. Armed here, the epoch is placed in the same breath as the
+    /// anchor: at the shared start epoch when one is armed and the loop reached
+    /// it within one gating quantum (the anchor is then back-dated to it), and
+    /// otherwise at a `real_ns()` read there, so the two domains meet to within
+    /// one clock read.
     ///
     /// Every refusal [`Self::place_gating_epoch`] makes is made HERE, at arm
     /// time, so a mis-built rank is refused before it ever waits for GO; the
@@ -16134,23 +16325,95 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// The pending live-anchor placement, spent: reads `real_ns()` and places
-    /// it. `Ok(None)` when nothing is pending. Called by `run_live` immediately
-    /// before its wall-clock anchor, and by the test seam.
-    fn place_pending_live_epoch(&mut self) -> TransportResult<Option<u64>> {
+    /// The pending live-anchor placement, spent: places `shared_start` when
+    /// the deployment handed one (see [`Self::start_live_at_shared_epoch`]),
+    /// otherwise reads `real_ns()` and places that. `Ok(None)` when nothing is
+    /// pending. Called by `run_live` immediately before its wall-clock anchor,
+    /// and by the test seam.
+    fn place_pending_live_epoch(
+        &mut self,
+        shared_start: Option<u64>,
+    ) -> TransportResult<Option<u64>> {
         if !self.pending_live_epoch {
             return Ok(None);
         }
-        let epoch_ns = crate::clock::real_ns();
+        let epoch_ns = shared_start.unwrap_or_else(crate::clock::real_ns);
         self.place_gating_epoch(epoch_ns)?;
         self.pending_live_epoch = false;
         tracing::info!(
             graph = %self.config.identity(),
             epoch_ns,
-            "free-run recording: gating clock placed at the shared real_ns() epoch, at the \
-             live loop's wall-clock anchor"
+            shared = shared_start.is_some(),
+            "free-run recording: gating clock placed at the live loop's epoch"
         );
         Ok(Some(epoch_ns))
+    }
+
+    /// Start the live loop at the deployment's shared start epoch.
+    ///
+    /// `epoch_ns` is a [`crate::clock::real_ns`] instant every rank of one
+    /// deployment receives (the supervisor writes it into the GO sentinel).
+    /// `run_live` then, after its prologue and before its first step:
+    ///
+    /// 1. waits until `real_ns()` reaches `epoch_ns` (returns early on Ctrl-C);
+    /// 2. if it got there within one gating quantum of `epoch_ns`, places a
+    ///    pending epoch (armed by [`Self::place_gating_epoch_at_live_anchor`])
+    ///    at exactly `epoch_ns` instead of at a fresh `real_ns()` read, and
+    ///    back-dates its wall anchors by the overshoot, so the first step's
+    ///    delta covers the time since the epoch;
+    /// 3. if it got there later than that, warns with the lateness and starts
+    ///    as it would with no shared epoch (placement at a fresh `real_ns()`,
+    ///    nothing back-dated), because the whole delay as one first delta
+    ///    would mint a burst of Period catch-up fires on a recording rank.
+    ///
+    /// Every rank that reaches the wait before the epoch, or within one gating
+    /// quantum after it, therefore starts its timeline at the same instant,
+    /// whatever its spawn order, GO poll phase or prologue time. Works on every
+    /// build: a rank whose gating clock does not follow the wall (RealClock,
+    /// lockstep) only waits and back-dates its first wall delta, whatever its
+    /// lateness.
+    ///
+    /// # Refusals
+    ///
+    /// * after the first step: a start epoch is an origin;
+    /// * an `epoch_ns` more than one second ahead of `real_ns()` now: the
+    ///   supervisor writes the epoch `SHARED_START_LEAD_NS` ahead, so a further
+    ///   one would stall the rank in the wait. An epoch already past is
+    ///   accepted at any distance, and `run_live` treats it as late (3. above).
+    pub fn start_live_at_shared_epoch(&mut self, epoch_ns: u64) -> TransportResult<()> {
+        const MAX_LEAD_NS: u64 = 1_000_000_000;
+        let steps = self.scheduler.steps_begun();
+        if steps > 0 {
+            return Err(TransportError::GraphError {
+                // hot-path-alloc-ok: cold: a build-time miswiring refusal, before the first step
+                reason: format!(
+                    "start_live_at_shared_epoch({epoch_ns}): the scheduler has already begun \
+                     {steps} step(s); a start epoch is an origin and must be set before the \
+                     first step"
+                ),
+            });
+        }
+        let now_ns = crate::clock::real_ns();
+        if epoch_ns > now_ns && epoch_ns - now_ns > MAX_LEAD_NS {
+            return Err(TransportError::GraphError {
+                // hot-path-alloc-ok: cold: a build-time miswiring refusal, before the first step
+                reason: format!(
+                    "start_live_at_shared_epoch({epoch_ns}): the epoch is {} ns ahead of \
+                     real_ns() ({now_ns}), more than the {MAX_LEAD_NS} ns a deployment's start \
+                     epoch may lead; it was not written on this machine's clock",
+                    epoch_ns - now_ns
+                ),
+            });
+        }
+        self.live_start_epoch_ns = Some(epoch_ns);
+        Ok(())
+    }
+
+    /// Test seam: the shared start epoch armed by
+    /// [`Self::start_live_at_shared_epoch`] and not yet spent by `run_live`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn live_start_epoch_for_test(&self) -> Option<u64> {
+        self.live_start_epoch_ns
     }
 
     /// Test seam for [`Self::place_gating_epoch_at_live_anchor`]: spend the
@@ -16158,7 +16421,7 @@ impl GraphRuntime {
     /// read (`None` when nothing was armed).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn place_pending_live_epoch_for_test(&mut self) -> TransportResult<Option<u64>> {
-        self.place_pending_live_epoch()
+        self.place_pending_live_epoch(None)
     }
 
     /// The runtime-level refusals shared by the immediate and the deferred
@@ -17052,6 +17315,35 @@ impl GraphRuntime {
         Ok(out)
     }
 
+    /// RESUME: every param of a node in `recorded` whose value in force
+    /// differs from the recorded one, in the graph's declaration order, one
+    /// [`ParamDifference`](crate::graph::param_resume::ParamDifference) per
+    /// param. A param is not node state, so a restore never writes one and a
+    /// resumed node runs on the values this build handed it; the caller
+    /// compares BEFORE it restores and refuses on any difference unless the
+    /// operator chose the current values.
+    ///
+    /// `recorded` maps node id to the params the recording names for it. A
+    /// node of `recorded` that this graph does not run, or that declares no
+    /// params and has none recorded, contributes nothing.
+    // hot-path-alloc-ok-fn: cold: once per resumed replay, before the first step
+    pub fn param_differences(
+        &self,
+        recorded: &std::collections::BTreeMap<String, crate::graph::params::ParamValues>,
+    ) -> Vec<crate::graph::param_resume::ParamDifference> {
+        let none = crate::graph::param_resume::ParamsInForce::default();
+        self.nodes
+            .keys()
+            .filter_map(|id| recorded.get(id).map(|values| (id, values)))
+            .flat_map(|(id, values)| {
+                self.params_in_force
+                    .get(id)
+                    .unwrap_or(&none)
+                    .differences(id, values)
+            })
+            .collect()
+    }
+
     /// Get the graph config.
     pub fn config(&self) -> &GraphConfig {
         &self.config
@@ -17306,6 +17598,111 @@ impl GraphRuntime {
     }
 }
 
+/// How `run_live` met a shared start epoch, decided once after the wait.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SharedStart {
+    /// Reached within one gating quantum of the epoch: place and back-date to it.
+    OnTime(u64),
+    /// Later than that: start the timeline now, as without a shared epoch.
+    Missed {
+        /// How far past the epoch the loop got.
+        late_ns: u64,
+    },
+    /// `running` turned false during the wait: no step will run; an armed
+    /// placement still lands on the epoch, with nothing back-dated.
+    Stopped(u64),
+    /// No shared epoch was armed.
+    Unarmed,
+}
+
+/// The shared-start decision, pure: `now_ns` is `real_ns()` read after the
+/// wait, `quantum` the gating quantum of a build whose gating clock follows the
+/// wall. A build whose gating clock does not follow the wall (RealClock, or a
+/// fixed-quantum lockstep rank) mints no catch-up fires from its first delta,
+/// so it is passed no quantum and any lateness is on time for it.
+fn shared_start_decision(
+    epoch_ns: u64,
+    now_ns: u64,
+    quantum: Option<Duration>,
+    running: bool,
+) -> SharedStart {
+    if !running {
+        return SharedStart::Stopped(epoch_ns);
+    }
+    let late_ns = now_ns.saturating_sub(epoch_ns);
+    let ceiling_ns = quantum.map_or(u64::MAX, |q| q.as_nanos() as u64);
+    if late_ns <= ceiling_ns {
+        SharedStart::OnTime(epoch_ns)
+    } else {
+        SharedStart::Missed { late_ns }
+    }
+}
+
+#[cfg(test)]
+mod shared_start_decision_tests {
+    use super::{shared_start_decision, SharedStart};
+    use std::time::Duration;
+
+    const Q: Option<Duration> = Some(Duration::from_millis(4));
+
+    #[test]
+    fn before_or_at_the_epoch_is_on_time() {
+        assert_eq!(
+            shared_start_decision(1_000, 900, Q, true),
+            SharedStart::OnTime(1_000)
+        );
+        assert_eq!(
+            shared_start_decision(1_000, 1_000, Q, true),
+            SharedStart::OnTime(1_000)
+        );
+    }
+
+    #[test]
+    fn late_by_up_to_one_quantum_is_on_time_and_one_more_ns_is_missed() {
+        assert_eq!(
+            shared_start_decision(1_000, 1_000 + 4_000_000, Q, true),
+            SharedStart::OnTime(1_000)
+        );
+        assert_eq!(
+            shared_start_decision(1_000, 1_000 + 4_000_001, Q, true),
+            SharedStart::Missed { late_ns: 4_000_001 }
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_gating_quantum_is_never_missed() {
+        assert_eq!(
+            shared_start_decision(1_000, u64::MAX, None, true),
+            SharedStart::OnTime(1_000)
+        );
+    }
+
+    #[test]
+    fn a_stopped_run_is_stopped_whatever_its_lateness() {
+        assert_eq!(
+            shared_start_decision(1_000, 0, Q, false),
+            SharedStart::Stopped(1_000)
+        );
+        assert_eq!(
+            shared_start_decision(1_000, 1_000_000_000, Q, false),
+            SharedStart::Stopped(1_000)
+        );
+    }
+}
+
+/// Block until [`crate::clock::real_ns`] reaches `epoch_ns`, or `running`
+/// turns false. Sleeps in slices of at most 1 ms so a Ctrl-C is seen promptly;
+/// the last slice is the remaining time, so the overshoot is one wake latency.
+fn wait_for_real_ns(epoch_ns: u64, running: &AtomicBool) {
+    loop {
+        let now_ns = crate::clock::real_ns();
+        if now_ns >= epoch_ns || !running.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(Duration::from_nanos((epoch_ns - now_ns).min(1_000_000)));
+    }
+}
+
 impl Drop for GraphRuntime {
     /// Belt-and-suspenders — if the runtime
     /// is dropped without an explicit `shutdown()` / `run_until_shutdown`
@@ -17334,6 +17731,14 @@ impl Drop for GraphRuntime {
         // An armed epoch that was never spent —
         // `run_live` never reached its wall-clock anchor (never entered, or
         // refused before it). Principle #3: the arm must not vanish in silence.
+        if let Some(epoch_ns) = self.live_start_epoch_ns {
+            tracing::warn!(
+                graph = %self.config.identity(),
+                epoch_ns,
+                "a shared start epoch armed for run_live was never spent: run_live never \
+                 reached its live anchor on this runtime"
+            );
+        }
         if self.pending_live_epoch {
             tracing::warn!(
                 graph = %self.config.identity(),
@@ -19011,6 +19416,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: id.to_string(),
                     node_type: "t".to_string(),
@@ -19283,6 +19689,7 @@ mod tests {
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "me".to_string(),
             node_type: "me".to_string(),
@@ -19650,6 +20057,7 @@ mod tests {
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -19707,6 +20115,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -19728,6 +20137,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),

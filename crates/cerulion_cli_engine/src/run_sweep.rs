@@ -690,7 +690,7 @@ fn unlink_shm_name(name: &str) -> UnlinkOutcome {
         // SAFETY: FFI unlink of a NUL-terminated name derived from this run's
         // own ledger; `shm_unlink` has no precondition a caller can violate, and
         // it removes only the NAME (a live mapping of the object survives).
-        let rc = unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        let rc = unsafe { cerulion_core::posix_shm::shm_unlink(c_name.as_ptr()) };
         if rc == 0 {
             return UnlinkOutcome::Removed;
         }
@@ -1107,7 +1107,7 @@ mod tests {
         let c = std::ffi::CString::new(name.clone()).expect("nul-free");
         // SAFETY: FFI create of a NUL-terminated name this test owns.
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 c.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600 as libc::c_uint,

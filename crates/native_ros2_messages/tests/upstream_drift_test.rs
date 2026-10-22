@@ -200,10 +200,11 @@ fn signature(text: &str, msg: &str, pkg: &str) -> Result<Vec<String>, String> {
 
 /// Scan constant declarations (`TYPE NAME=VALUE`) out of raw `.msg` text.
 ///
-/// `parse_rosmsg` deliberately SKIPS constants (they are not fields and do
-/// not reach the wire), so they have to be read here. A string constant's
-/// value runs to end of line and may contain `#`, so comment stripping is
-/// conditional on the declared type.
+/// The manifest records each constant's value TEXT as declared, which
+/// `parse_rosmsg`'s typed `constants` do not keep (they hold the parsed
+/// value), so the text is read here. A string constant's value runs to end
+/// of line and may contain `#`, so comment stripping is conditional on the
+/// declared type.
 fn parse_constants(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw in text.lines() {

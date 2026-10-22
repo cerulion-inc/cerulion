@@ -96,6 +96,7 @@ fn build_single(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "node".to_string(),
             node_type: node_type.to_string(),
@@ -234,6 +235,7 @@ fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "node".to_string(),
             node_type: "sync_node".to_string(),
@@ -391,6 +393,7 @@ fn raw_ffi_cdylib_no_policy_emits_default_policy_warn() {
         prefix: "ctsw".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "raw".to_string(),
             node_type: "raw".to_string(),
@@ -440,6 +443,7 @@ fn run_live_refuses_loaded_host_driven_cdylib() {
         prefix: "ctsr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "camera".to_string(),
             node_type: "external_node".to_string(),

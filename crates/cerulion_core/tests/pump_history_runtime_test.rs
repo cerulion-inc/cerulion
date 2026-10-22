@@ -66,6 +66,7 @@ fn build_spy_graph() -> (GraphRuntime, Arc<AtomicU64>) {
         prefix: "phr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "spy".to_string(),
             node_type: "pump_spy".to_string(),
@@ -165,6 +166,7 @@ fn pump_history_recovers_after_a_tick_panic_poisons_the_entry_mutex() {
         prefix: "phpr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "panic_spy".to_string(),
             node_type: "panic_tick_spy".to_string(),

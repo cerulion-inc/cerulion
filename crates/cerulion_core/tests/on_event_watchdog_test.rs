@@ -125,6 +125,7 @@ fn expect_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -139,6 +140,7 @@ fn expect_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "expect_watch_consumer".to_string(),
@@ -357,6 +359,7 @@ fn promise_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -371,6 +374,7 @@ fn promise_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "plain_drain_consumer".to_string(),

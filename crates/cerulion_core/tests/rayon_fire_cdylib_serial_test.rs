@@ -90,6 +90,7 @@ impl CdylibFeederProducer {
 fn producer_def(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "cdylib_feeder_producer".to_string(),
@@ -177,6 +178,7 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
     // decision order; routed serial by serial_fire_node_ids (set A).
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "gated_cdylib".to_string(),
         node_type: "period_input".to_string(),

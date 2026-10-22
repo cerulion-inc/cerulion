@@ -165,6 +165,11 @@ pub fn validate_process_groups(config: &GraphConfig) -> TransportResult<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "local-transport")]
+    if let Err(reason) = crate::transport::kind::refuse_cross_process_peer("process_groups") {
+        return Err(TransportError::GraphError { reason });
+    }
+
     // Only NATIVE nodes join process groups: a `ros2:` entry is spawned by
     // `graph run` as its own supervised process (no barrier participation, no
     // rank), so it is neither required below (the orphan check) nor allowed
@@ -3240,6 +3245,7 @@ mod block_colocation_tests {
     fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

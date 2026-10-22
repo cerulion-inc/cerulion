@@ -398,6 +398,7 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "sparse_two_out".to_string(),
@@ -406,6 +407,7 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink_w".to_string(),
                 node_type: "vec3_sink".to_string(),
@@ -417,6 +419,7 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink_s".to_string(),
                 node_type: "vec3_sink".to_string(),
@@ -590,6 +593,7 @@ fn alternating_write_empty_ticks_never_flood_discard_errors() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "alternating_var_writer".to_string(),
@@ -598,6 +602,7 @@ fn alternating_write_empty_ticks_never_flood_discard_errors() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "str_sink".to_string(),
@@ -687,6 +692,7 @@ fn partial_write_still_discards_loudly() {
         prefix: unique_prefix("lazy_partial"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "dut".to_string(),
             node_type: "partial_var_writer".to_string(),
@@ -849,6 +855,7 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "empty_heartbeat".to_string(),
@@ -857,6 +864,7 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink_p".to_string(),
                 node_type: "empty_sink".to_string(),
@@ -868,6 +876,7 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink_q".to_string(),
                 node_type: "empty_sink".to_string(),
@@ -997,6 +1006,7 @@ fn read_back_after_write_sees_just_written_value() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
                 node_type: "read_back_writer".to_string(),
@@ -1005,6 +1015,7 @@ fn read_back_after_write_sees_just_written_value() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "vec3_xy_sink".to_string(),

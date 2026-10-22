@@ -266,6 +266,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "depth_feed_producer".to_string(),
@@ -289,6 +290,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

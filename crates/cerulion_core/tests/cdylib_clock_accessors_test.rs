@@ -139,6 +139,7 @@ fn clockprobe_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "probe".to_string(),
                 node_type: "clock_probe".to_string(),
@@ -153,6 +154,7 @@ fn clockprobe_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "clock_drain".to_string(),

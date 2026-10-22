@@ -183,6 +183,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
         prefix: "drain".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tf_viz".to_string(),
             node_type: "tf_drain_consumer".to_string(),

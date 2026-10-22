@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 use cerulion_core::graph::node::{
     AnyPublisher, AnySubscriber, DylibNodeEntry, NodeContext, NodeEntry,
 };
+#[cfg(not(feature = "local-transport"))]
 use cerulion_core::testing::TestTransport;
 use cerulion_core::transport::TransportManager;
 use indexmap::IndexMap;
@@ -51,6 +52,7 @@ fn unique_topic(base: &str) -> String {
 /// The owning [`TestTransport`] is returned as the first tuple element: it
 /// must outlive every publisher/subscriber/NodeContext it created, so callers
 /// bind it to a live local for the duration of the test.
+#[cfg(not(feature = "local-transport"))]
 fn make_in_process_context() -> (
     TestTransport,
     NodeContext,
@@ -93,7 +95,38 @@ fn make_in_process_context() -> (
 #[test]
 fn test_macro_cdylib_loads() {
     let path = find_macro_cdylib();
-    let _node = DylibNodeEntry::load(&path).expect("should load macro cdylib");
+    let result = DylibNodeEntry::load(&path);
+    if cfg!(feature = "local-transport") {
+        // A local-transport host cannot deliver cdylib frames (each node
+        // library carries its own process-local registry, issue #301):
+        // the loader must refuse it loudly, not load-then-silence.
+        let error = result.err().expect("local-transport must refuse a cdylib");
+        assert!(
+            error.to_string().contains("local-transport"),
+            "the refusal must name the local-transport limitation: {error}"
+        );
+    } else {
+        result.expect("should load macro cdylib");
+    }
+}
+
+#[test]
+fn macro_cdylib_abi_version_carries_the_transport_kind() {
+    let path = find_macro_cdylib();
+    // SAFETY: this workspace fixture is built by the macro and exports the
+    // ABI-version getter with the declared signature.
+    let library = unsafe { libloading::Library::new(&path) }.expect("open macro cdylib");
+    let abi_version = unsafe {
+        let symbol: libloading::Symbol<unsafe extern "C" fn() -> u32> = library
+            .get(b"cerulion_abi_version\0")
+            .expect("macro cdylib exports cerulion_abi_version");
+        symbol()
+    };
+
+    assert_eq!(
+        abi_version,
+        cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
+    );
 }
 
 // ============================================================
@@ -101,6 +134,8 @@ fn test_macro_cdylib_loads() {
 // ============================================================
 
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_macro_cdylib_info_matches() {
     let path = find_macro_cdylib();
     let node = DylibNodeEntry::load(&path).expect("load");
@@ -171,6 +206,8 @@ fn test_macro_cdylib_info_matches() {
 // semantics. The tick must still succeed.
 
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_macro_cdylib_tick_works() {
     let path = find_macro_cdylib();
     let mut node = DylibNodeEntry::load(&path).expect("load");
@@ -190,6 +227,8 @@ fn test_macro_cdylib_tick_works() {
 // ============================================================
 
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_macro_cdylib_multi_instance() {
     let path = find_macro_cdylib();
     let mut node1 = DylibNodeEntry::load(&path).expect("load 1");
@@ -242,6 +281,18 @@ fn test_macro_cdylib_multi_instance() {
 #[test]
 fn test_macro_cdylib_data_flows_through_ffi() {
     let path = find_macro_cdylib();
+    if cfg!(feature = "local-transport") {
+        // The loader refuses cdylib nodes under local-transport (issue
+        // #301); there is no FFI data flow to prove here.
+        let error = DylibNodeEntry::load(&path)
+            .err()
+            .expect("local-transport must refuse a cdylib");
+        assert!(
+            error.to_string().contains("local-transport"),
+            "the refusal must name the local-transport limitation: {error}"
+        );
+        return;
+    }
     let mut node = DylibNodeEntry::load(&path).expect("load cdylib for data-flow");
 
     let mgr = TransportManager::get_or_init().expect("init iceoryx2 transport manager");
@@ -336,6 +387,7 @@ fn find_macro_cdylib() -> std::path::PathBuf {
 /// Find the external-macro test cdylib. It exports the OPTIONAL
 /// `cerulion_node_external_source` symbol (the macro emits it for an
 /// `#[cerulion_node(external)]` node).
+#[cfg(not(feature = "local-transport"))]
 fn find_external_macro_cdylib() -> std::path::PathBuf {
     cerulion_core::testing::find_fixture_cdylib("test_node_macro_external_cdylib")
 }
@@ -344,6 +396,7 @@ fn find_external_macro_cdylib() -> std::path::PathBuf {
 /// does NOT export `cerulion_node_external_source`. Used for the
 /// back-compat contract (missing symbol → `external_source() == None`, no ABI
 /// error).
+#[cfg(not(feature = "local-transport"))]
 fn find_raw_cdylib() -> std::path::PathBuf {
     cerulion_core::testing::find_fixture_cdylib("test_node_cdylib")
 }
@@ -359,6 +412,8 @@ fn find_raw_cdylib() -> std::path::PathBuf {
 /// node is `init`'d first with a context carrying the fixture's single `cmd`
 /// output.
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_external_macro_cdylib_reports_host_driven() {
     use cerulion_core::graph::node::ExternalSource;
 
@@ -399,6 +454,8 @@ fn test_external_macro_cdylib_reports_host_driven() {
 /// with no crash. `external_source()` short-circuits on the absent symbol, so no
 /// `init` is needed.
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_raw_cdylib_without_external_source_symbol_is_none() {
     let path = find_raw_cdylib();
     let mut node = DylibNodeEntry::load(&path).expect("raw cdylib must still load (no ABI bump)");
@@ -421,6 +478,7 @@ fn test_raw_cdylib_without_external_source_symbol_is_none() {
 /// writes `self.out.x = 0.0` then returns `Err` in the default
 /// `CER_FAIL_MODE=tick_logic` mode: the EXACT Err-tick shape (partial write
 /// on a fixed-only schema — nothing trips the variable-field discard).
+#[cfg(not(feature = "local-transport"))]
 fn find_failing_cdylib() -> std::path::PathBuf {
     cerulion_core::testing::find_fixture_cdylib("test_node_failing_cdylib")
 }
@@ -436,6 +494,8 @@ fn find_failing_cdylib() -> std::path::PathBuf {
 /// `tick_logic`): no test in this binary mutates that env var, so no
 /// serialization is needed.
 #[test]
+// The host loader refuses cdylib nodes under local-transport (issue #301).
+#[cfg(not(feature = "local-transport"))]
 fn test_err_ticking_cdylib_publishes_nothing() {
     let path = find_failing_cdylib();
     let mut node = DylibNodeEntry::load(&path).expect("load failing cdylib");

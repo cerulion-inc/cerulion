@@ -74,6 +74,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -88,6 +89,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),
@@ -155,6 +157,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -169,6 +172,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),
@@ -233,6 +237,7 @@ fn build_fails_when_macro_data_trigger_input_name_not_in_yaml_inputs() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "consumer".to_string(),
@@ -294,6 +299,7 @@ fn build_fails_when_macro_data_trigger_input_loops_to_self() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -367,6 +373,7 @@ fn build_fails_when_macro_data_trigger_loops_to_own_overridden_output() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
             node_type: "looper".to_string(),
@@ -444,6 +451,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
                 node_type: "src".to_string(),
@@ -467,6 +475,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "consumer".to_string(),

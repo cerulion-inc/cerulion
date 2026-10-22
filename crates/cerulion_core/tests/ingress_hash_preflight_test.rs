@@ -64,6 +64,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
         prefix: "ingress_preflight".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "snapshot_fail".to_string(),
@@ -84,6 +85,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
             egress: vec![],
             ingress: vec![INGRESS_TOPIC.to_string()],
             tls: None,
+            default_reliability: cerulion_core::EgressReliability::Reliable,
         }),
     }
 }

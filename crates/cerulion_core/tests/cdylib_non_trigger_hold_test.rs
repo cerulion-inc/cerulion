@@ -230,6 +230,7 @@ fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -238,6 +239,7 @@ fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cdy".to_string(),
                 node_type: "period_input".to_string(),
@@ -249,6 +251,7 @@ fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "recording_sink".to_string(),

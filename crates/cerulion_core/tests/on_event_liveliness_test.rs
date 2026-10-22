@@ -129,6 +129,7 @@ fn liveliness_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "feed_producer".to_string(),
@@ -143,6 +144,7 @@ fn liveliness_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "liveliness_consumer".to_string(),
@@ -335,6 +337,7 @@ fn dual_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "slow_feed_producer".to_string(),
@@ -349,6 +352,7 @@ fn dual_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "dual_liveliness_consumer".to_string(),

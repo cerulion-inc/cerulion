@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//! DylibNodeEntry::load refuses every cdylib on a local-transport host, so
+//! this whole parity suite is compiled out there; the refusal arm lives in
+//! `local_transport_test.rs`.
+#![cfg(not(feature = "local-transport"))]
 //! Cdylib PARITY for **trigger-scoped Sync** (the
 //! no-inert-shipping rule) — the FFI path must prove the same semantics the
 //! in-process tests pinned (`sync_fire_iox2_test.rs`).
@@ -154,6 +158,7 @@ fn build_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -181,6 +186,7 @@ fn build_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),
@@ -544,6 +550,7 @@ fn build_seq_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "sync_nontrigger_node".to_string(),
@@ -571,6 +578,7 @@ fn build_seq_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sync_nontrigger_sink".to_string(),

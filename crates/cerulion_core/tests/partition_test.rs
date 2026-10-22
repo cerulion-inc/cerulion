@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// Process groups split a graph across processes, which local-transport refuses.
 //! Spine dep (c): cross-process partition derivation + validation.
 //!
 //! Pure derivation/validation — NO iceoryx2, so parallel-safe (no `#[serial]`).
@@ -21,6 +23,7 @@ const PREFIX: &str = "p";
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: id.to_string(),

@@ -192,6 +192,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drain_feed_producer".to_string(),
@@ -206,6 +207,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fwd".to_string(),
                 node_type: "data_trigger_node".to_string(),
@@ -223,6 +225,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "cdylib_drain_sink".to_string(),
@@ -420,6 +423,7 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "drain_feed_producer".to_string(),
@@ -434,6 +438,7 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "drain_fail_node".to_string(),

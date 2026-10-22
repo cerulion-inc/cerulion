@@ -109,6 +109,15 @@ exists; `none` means the principle is enforced by the conventions in
   a silently-defaulted one, the misleading-surface rule applied to config. Adding a field
   to a graph config type therefore means adding it to the round-trip and rejection oracles
   in `config_deny_unknown_fields_test`, or the gate that catches the typo class goes stale.
+- **Launch arguments resolve at parse.** `args:` and `${name}` resolve in
+  `graph/launch_args.rs` (pure): the section is lifted out of the YAML tree and substituted
+  before `GraphConfig` reads it, so `GraphConfig` has no `args` field and every reader sees a
+  resolved graph. A document with no `args:` and no overrides is read AS WRITTEN (`$`
+  included, nothing substituted), so a recorded `graph.yaml` reads back exactly as recorded:
+  resolution is a fixed point (Replay = Live). Only `parse_graph_raw_with_launch_args` takes
+  overrides (`graph run`), and it returns the `ArgProvenance` beside the config;
+  `parse_graph_as_written` keeps references for an edit that writes a value back into the
+  file. A new substitution site is a case in that module's walker, never a struct field.
 - Unified trigger drain: eligible data-trigger consumers drain trigger + body on one
   subscriber. `NodeEntry::unifies_trigger_drain` decouples drain eligibility from the
   rayon-eligibility flag (`performs_input_snapshot`). `CERULION_DRAIN_DISCIPLINE=separate`

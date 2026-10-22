@@ -87,6 +87,56 @@ pub const READY_BUDGET_MS: u64 = 60_000;
 /// worst legitimate wait.
 pub const GO_BASE_MS: u64 = 120_000;
 
+/// How far past the GO write the supervisor places the deployment's shared
+/// start epoch (nanoseconds of [`cerulion_core::real_ns`]). Every worker waits
+/// for that instant before its first step, so the ranks start together to
+/// within one wake instead of one GO poll apart, and a recording rank that
+/// reaches it within one gating quantum places its gating clock at exactly that
+/// value. The lead has to cover a worker's GO poll
+/// (2 ms) plus everything it does between GO and its first step (the C-state
+/// cap, the state ring and wedge page attach, the live loop's prologue); a rank
+/// that misses the epoch by more than one gating quantum starts its own
+/// timeline instead (`GraphRuntime::start_live_at_shared_epoch`).
+pub const SHARED_START_LEAD_NS: u64 = 20_000_000;
+
+/// The first token of every GO sentinel. A worker refuses a sentinel that does
+/// not start with it, so a file left by a different build is never read as an
+/// epoch.
+const GO_SENTINEL_MAGIC: &str = "cerulion-go-v1";
+
+/// The text the supervisor writes into the GO sentinel: the magic token and the
+/// shared start epoch, one line.
+pub fn encode_go_sentinel(epoch_ns: u64) -> String {
+    format!("{GO_SENTINEL_MAGIC} epoch_ns={epoch_ns}\n")
+}
+
+/// The shared start epoch a GO sentinel carries.
+///
+/// Accepts exactly what [`encode_go_sentinel`] writes: the magic token, one
+/// space, `epoch_ns=` and a decimal `u64`, with an optional trailing newline.
+/// Anything else is an `Err` naming what was wrong, never a guessed epoch.
+pub fn parse_go_sentinel(text: &str) -> Result<u64, String> {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let rest = line
+        .strip_prefix(GO_SENTINEL_MAGIC)
+        .and_then(|r| r.strip_prefix(" epoch_ns="))
+        .ok_or_else(|| {
+            format!(
+                "the GO sentinel does not start with `{GO_SENTINEL_MAGIC} epoch_ns=` \
+                 (read {} byte(s)); it was not written by this build's supervisor",
+                text.len()
+            )
+        })?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "the GO sentinel's epoch_ns field is not a decimal integer ({} byte(s))",
+            rest.len()
+        ));
+    }
+    rest.parse::<u64>()
+        .map_err(|e| format!("the GO sentinel's epoch_ns does not fit in u64: {e}"))
+}
+
 /// One rank's wedge-page binding — the SHM tag and the slot order.
 ///
 /// The two travel together because the tag alone is unusable: a slot index means
@@ -726,7 +776,8 @@ pub struct WorkerPlan {
     /// `cerulion_{graph}_{nonce}.go`; the supervisor roots it under the plan
     /// directory, like [`ready_path`](Self::ready_path)). The worker blocks
     /// between writing its READY sentinel and entering `run_live` until this
-    /// file appears — the supervisor touches it only once EVERY worker is
+    /// file appears: the supervisor writes it (the shared start epoch, by an
+    /// atomic rename; see `encode_go_sentinel`) only once EVERY worker is
     /// built + READY, so no worker publishes before every worker's subscribers
     /// exist. Closes two startup races: (a) an early worker's first publishes
     /// racing a later worker's subscriber connect (run-to-run startup
@@ -2482,7 +2533,7 @@ fn ready_path(graph: &str, group: &str, nonce: &str) -> String {
 
 /// The deployment-wide GO-sentinel filename (bare name; the supervisor roots it
 /// under the plan directory). ONE file per deployment — every worker carries the
-/// SAME value (no `group` component), so one supervisor `fs::write` releases
+/// SAME value (no `group` component), so one supervisor write (`write_go_sentinel`) releases
 /// them all. Components sanitized like [`ready_path`] (a raw `/` in the graph
 /// name would break the supervisor's rooted GO write the same way). See
 /// [`WorkerPlan::go_path`] for the start-gate contract.
@@ -2672,6 +2723,85 @@ pub fn planning_ix_config(graph: &str, nonce: &str) -> TransportResult<iceoryx2:
 }
 
 #[cfg(test)]
+mod go_sentinel_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_sentinel_reads_back_as_the_epoch_it_carries() {
+        assert_eq!(
+            encode_go_sentinel(1_234_567_890_123),
+            "cerulion-go-v1 epoch_ns=1234567890123\n"
+        );
+        for epoch in [0, 1, 5_000_000, 1_234_567_890_123, u64::MAX] {
+            assert_eq!(parse_go_sentinel(&encode_go_sentinel(epoch)), Ok(epoch));
+        }
+    }
+
+    #[test]
+    fn sentinel_without_the_trailing_newline_still_parses() {
+        assert_eq!(
+            parse_go_sentinel("cerulion-go-v1 epoch_ns=42"),
+            Ok(42),
+            "the newline is optional"
+        );
+    }
+
+    #[test]
+    fn bare_go_from_an_older_build_is_refused_naming_the_build_mismatch() {
+        let err = parse_go_sentinel("go").unwrap_err();
+        assert!(
+            err.contains("not written by this build's supervisor"),
+            "{err}"
+        );
+        assert!(err.contains("2 byte(s)"), "{err}");
+    }
+
+    #[test]
+    fn empty_sentinel_is_refused() {
+        let err = parse_go_sentinel("").unwrap_err();
+        assert!(err.contains("does not start with"), "{err}");
+    }
+
+    #[test]
+    fn non_decimal_epochs_are_refused() {
+        for bad in [
+            "cerulion-go-v1 epoch_ns=",
+            "cerulion-go-v1 epoch_ns=-5",
+            "cerulion-go-v1 epoch_ns=+5",
+            "cerulion-go-v1 epoch_ns=5 ",
+            "cerulion-go-v1 epoch_ns=0x10",
+            "cerulion-go-v1 epoch_ns=5\n\n",
+        ] {
+            let err = parse_go_sentinel(bad).unwrap_err();
+            assert!(err.contains("not a decimal integer"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn epoch_past_u64_is_refused_not_wrapped() {
+        let err = parse_go_sentinel("cerulion-go-v1 epoch_ns=18446744073709551616").unwrap_err();
+        assert!(err.contains("does not fit in u64"), "{err}");
+    }
+
+    #[test]
+    fn wrong_spacing_or_key_is_refused() {
+        for bad in [
+            "cerulion-go-v1  epoch_ns=5",
+            "cerulion-go-v1 epoch=5",
+            "cerulion-go-v2 epoch_ns=5",
+            " cerulion-go-v1 epoch_ns=5",
+        ] {
+            assert!(parse_go_sentinel(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn lead_is_twenty_milliseconds() {
+        assert_eq!(SHARED_START_LEAD_NS, 20_000_000);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cerulion_core::graph::config::{InputDef, NodeDef, OutputDef};
@@ -2690,6 +2820,7 @@ mod tests {
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),
@@ -4393,6 +4524,7 @@ mod tests {
             prefix: PREFIX.to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
@@ -5515,6 +5647,7 @@ mod tests {
     fn abs_node(id: &str, inputs: &[(&str, &str)], out_topic: Option<&str>) -> NodeDef {
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: id.to_string(),

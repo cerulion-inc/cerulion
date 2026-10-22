@@ -57,6 +57,7 @@ fn ext_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn No
         prefix: "extf".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ext".to_string(),
             node_type: "ext_node".to_string(),

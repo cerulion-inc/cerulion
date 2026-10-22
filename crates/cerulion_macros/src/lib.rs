@@ -81,6 +81,7 @@ mod codegen;
 mod determinism;
 mod impl_macro;
 mod input_accumulate;
+mod param_attr;
 mod parse;
 mod registry;
 mod state_derive;
@@ -164,7 +165,12 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
     codegen::strip_state_derive(&mut out.attrs);
     if let syn::Data::Struct(ref mut data) = out.data {
         for field in data.fields.iter_mut() {
-            field.attrs.retain(|a| !a.path().is_ident("cerulion"));
+            // `param` joins the strip for the same reason: no inert helper
+            // attribute of that name exists, so left in place it would add a
+            // "cannot find attribute `param`" line under the real diagnostic.
+            field
+                .attrs
+                .retain(|a| !a.path().is_ident("cerulion") && !a.path().is_ident("param"));
         }
     }
     out
@@ -306,6 +312,40 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// |---|---|
 /// | `#[output]` | The form for every message type. There is no field list: assignment in `tick` resolves fixed and variable-length fields at compile time |
 /// | `#[output(promise_within_ms = N)]` | Publish watchdog. If `N` ms pass without a publish, `promise_within_missed_count` increments and a `warn` is logged |
+///
+/// # `#[param(...)]` field attribute
+///
+/// Declares a typed setting on a PLAIN field (not a port). The field type is
+/// the param type, the node reads it as `self.<field>`, and a graph file
+/// sets it per node under `params:`. A value is fixed at graph load for the
+/// whole run; the precedence is the `default` here, then the graph file.
+///
+/// ```text
+/// #[param(default = 2.0, min = 0.0, max = 5.0, description = "loop gain")]
+/// gain: f64,
+/// #[param(default = "base_link")]
+/// frame_id: String,
+/// ```
+///
+/// | Key | Meaning |
+/// |---|---|
+/// | `default = <literal>` | Required. The value the node holds when the graph sets none. It must have the field's type exactly: a float field takes `2.0`, never `2` |
+/// | `min = <literal>`, `max = <literal>` | Inclusive bounds, on integer and float fields only. A graph value outside them is refused at load |
+/// | `description = "..."` | Shown by `cerulion node info` |
+///
+/// Field types: `bool`, `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `String`.
+/// Names are flat: a param is a field, so `gain`, never `motor.gain`.
+///
+/// Rejected at compile time: any other key (the error lists these four), a
+/// missing `default`, a `default`, `min` or `max` of the wrong type or outside
+/// the field's width, `min` above `max`, a `default` outside the bounds,
+/// bounds on a `bool` or `String` field, a field that is also a port, and
+/// `live`, which is reserved for a later tier and not yet supported.
+///
+/// A graph file that names a param the node does not declare, gives a value
+/// of the wrong type, or gives a value outside the bounds is refused when the
+/// graph loads, before any node runs; the error names the node, the param
+/// and the fix.
 ///
 /// # Internals: what the macro generates
 ///

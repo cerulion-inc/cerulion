@@ -152,6 +152,7 @@ fn build_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "text_producer".to_string(),
@@ -166,6 +167,7 @@ fn build_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "portwrite".to_string(),
                 node_type: "port_write".to_string(),
@@ -183,6 +185,7 @@ fn build_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),
                 node_type: "image_drain".to_string(),

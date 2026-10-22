@@ -237,6 +237,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: producer_type.to_string(),
@@ -245,6 +246,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "qos".to_string(),
                 node_type: "qos_node".to_string(),
@@ -256,6 +258,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "drain".to_string(),
@@ -484,6 +487,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "flood_depth".to_string(),
@@ -492,6 +496,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth_probe".to_string(),

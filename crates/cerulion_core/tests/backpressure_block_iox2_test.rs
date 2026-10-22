@@ -84,6 +84,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -98,6 +99,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "stalled_block_consumer".to_string(),
@@ -241,6 +243,7 @@ fn draining_block_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -255,6 +258,7 @@ fn draining_block_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "draining_block_consumer".to_string(),
@@ -434,6 +438,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -448,6 +453,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
                 node_type: "mixed_block_consumer".to_string(),
@@ -459,6 +465,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
                 node_type: "drop_oldest_consumer".to_string(),
@@ -560,6 +567,7 @@ fn block_declared_depth_honored_beyond_global_default() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -574,6 +582,7 @@ fn block_declared_depth_honored_beyond_global_default() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "deep_block_consumer".to_string(),
@@ -704,6 +713,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "mixed_flood_producer".to_string(),
@@ -718,6 +728,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
                 node_type: "degraded_block_consumer".to_string(),
@@ -729,6 +740,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
                 node_type: "drop_oldest_consumer".to_string(),
@@ -978,6 +990,7 @@ fn a_trace_driven_plan_reaches_the_block_and_non_block_level_seams() {
     config.prefix = "bpplan".to_string();
     config.nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
         node_type: "solo_ticker".to_string(),
@@ -1072,6 +1085,7 @@ fn the_graph_runtime_pause_wrappers_drive_the_seam_on_the_fused_block_path() {
     // the two seams (`producer` idx 0, `consumer` idx 1, `solo` idx 2).
     config.nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
         node_type: "solo_ticker".to_string(),
@@ -1361,6 +1375,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
                 inputs: vec![],
@@ -1375,6 +1390,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 id: "listener".to_string(),
                 node_type: "drain_all_listener".to_string(),
                 inputs: vec![InputDef {

@@ -164,6 +164,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         prefix: "lgc".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
             node_type: "ticker".to_string(),
@@ -218,6 +219,7 @@ fn humanoid_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fast".to_string(),
                 node_type: "fast".to_string(),
@@ -226,6 +228,7 @@ fn humanoid_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "slow".to_string(),
                 node_type: "slow".to_string(),
@@ -270,6 +273,7 @@ fn quantum_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "lgcq".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "qn".to_string(),
             node_type: "qn".to_string(),
@@ -631,6 +635,7 @@ fn liveliness_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn
         prefix: "lgcl".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "cons".to_string(),
             node_type: "live_consumer".to_string(),

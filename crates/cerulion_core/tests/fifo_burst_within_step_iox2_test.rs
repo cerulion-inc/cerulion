@@ -611,6 +611,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fwd".to_string(),
                 node_type: "data_trigger_node".to_string(),
@@ -628,6 +629,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "fbws_cdylib_sink".to_string(),
@@ -1078,6 +1080,7 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
             ping_node(),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "burst_ctx_node".to_string(),
@@ -1219,6 +1222,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
 fn ping_node() -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "ping".to_string(),
         node_type: "burst_ping".to_string(),
@@ -1237,6 +1241,7 @@ fn ping_node() -> NodeDef {
 fn record_node() -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "record".to_string(),
         node_type: "fbws_pair_record".to_string(),
@@ -1261,6 +1266,7 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
             ping_node(),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "collapsed_pong".to_string(),
@@ -1316,6 +1322,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
             ping_node(),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ctxsrc".to_string(),
                 node_type: "burst_ctx_source".to_string(),
@@ -1333,6 +1340,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "collapsed_pong".to_string(),
@@ -1456,6 +1464,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
                 node_type: "burst_ping".to_string(),
@@ -1470,6 +1479,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "collapsed".to_string(),
                 node_type: "collapsed_pong".to_string(),
@@ -1493,6 +1503,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "record".to_string(),
                 node_type: "fbws_collapse_record".to_string(),
@@ -1528,6 +1539,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
                 node_type: "burst_ping".to_string(),
@@ -1542,6 +1554,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "burst_pong".to_string(),
@@ -1577,6 +1590,7 @@ fn external_source_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "burst_pong".to_string(),

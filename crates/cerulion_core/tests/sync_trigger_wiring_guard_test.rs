@@ -91,6 +91,7 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "source".to_string(),
                 node_type: "source".to_string(),
@@ -99,6 +100,7 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "fuse".to_string(),

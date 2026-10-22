@@ -42,6 +42,12 @@
 //!   arm-time refusal names the ARM entry point, never a placement of `0`;
 //!   an armed runtime stepped through the POLLED seam warns once, and one
 //!   dropped with the arm pending warns at `Drop`.
+//! * **Shared start arms:** an armed epoch is placed at the deployment's shared
+//!   start epoch exactly; `run_live` takes no step before that epoch; a rank
+//!   that misses it by more than one quantum starts fresh with no catch-up
+//!   burst; two runtimes armed with one epoch fire on identical deadlines; an
+//!   epoch more than a second ahead and an arm after a step are refused; a
+//!   RealClock build accepts the start and only waits.
 //!
 //! Every manager is an `init_for_test` per-test SHM root; nothing here touches
 //! the process-global singleton, so the file is parallel-safe and needs no
@@ -171,6 +177,7 @@ fn one_node_config(prefix: &str, id: &str, node_type: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.to_string(),
             node_type: node_type.to_string(),
@@ -1246,4 +1253,231 @@ fn both_cross_process_build_cores_hand_the_sibling_topics_to_validation() {
             ))
         }
     });
+}
+
+// ===========================================================================
+// The deployment's shared start epoch (`start_live_at_shared_epoch`).
+// ===========================================================================
+
+/// The deterministic free-run ticker, built fresh for one shared-start arm.
+fn shared_start_ticker(prefix: &str, fires: Arc<AtomicU64>) -> (GraphRuntime, Arc<VirtualClock>) {
+    let clock = Arc::new(VirtualClock::new());
+    let mgr = manager(prefix, clock.clone());
+    let (config, factories) = ticker_graph(prefix, fires);
+    let rt = GraphRuntime::build_live_deterministic_free_run(
+        config,
+        factories,
+        &mgr,
+        Arc::clone(&clock),
+        None,
+        cerulion_core::MonitorWaitPolicy::off(),
+        None,
+        CrossProcessWiring::requirements_only(None),
+    )
+    .expect("build the free-run deterministic ticker");
+    (rt, clock)
+}
+
+/// **An armed epoch is placed at the shared start epoch EXACTLY**, not at a
+/// fresh `real_ns()` read. The epoch is 200 ms ahead and `running` is
+/// pre-flipped, so `run_live` ends its wait at once (a Ctrl-C never sits out
+/// the wait), places the clock at the hand-picked value, and spends the arm.
+#[test]
+fn run_live_places_the_armed_epoch_at_the_shared_start_epoch_exactly() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let (mut rt, clock) = shared_start_ticker("frc_shared_exact", Arc::clone(&fires));
+    let epoch = real_ns() + 200_000_000;
+    rt.place_gating_epoch_at_live_anchor()
+        .expect("a fresh deterministic free-run build accepts an armed epoch");
+    rt.start_live_at_shared_epoch(epoch)
+        .expect("an epoch 200 ms ahead is accepted");
+    assert_eq!(rt.live_start_epoch_for_test(), Some(epoch));
+    let started = std::time::Instant::now();
+    rt.run_live(&std::sync::atomic::AtomicBool::new(false))
+        .expect("run_live with a pre-flipped running flag runs no step");
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "a pre-flipped running flag ends the wait at once, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(clock.now_ns(), epoch, "the clock sits at the shared epoch");
+    assert_eq!(rt.live_start_epoch_for_test(), None, "run_live spent it");
+    assert_eq!(
+        rt.place_pending_live_epoch_for_test().expect("spent"),
+        None,
+        "the armed placement was spent too"
+    );
+    assert_eq!(fires.load(Ordering::SeqCst), 0, "zero steps ran");
+    rt.shutdown();
+}
+
+/// **`run_live` waits for the shared start epoch before its first step.** The
+/// epoch is 40 ms ahead; a flipper ends the run about 10 ms after the epoch.
+/// The 4 ms ticker fires at most `(return - epoch) / 4 + 2` times; with the
+/// wait deleted the loop would step from entry, 40 ms earlier, and fire about
+/// 10 more times. At least one fire proves it stepped.
+#[test]
+fn run_live_takes_no_step_before_the_shared_start_epoch() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let (mut rt, _clock) = shared_start_ticker("frc_shared_wait", Arc::clone(&fires));
+    rt.set_gating_follows_wall(true)
+        .expect("the deterministic free-run build accepts the wall-following clock");
+    let epoch = real_ns() + 40_000_000;
+    rt.place_gating_epoch_at_live_anchor().expect("arm");
+    rt.start_live_at_shared_epoch(epoch).expect("arm the start");
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flip = Arc::clone(&running);
+    let flipper = std::thread::spawn(move || {
+        while real_ns() < epoch + 10_000_000 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        flip.store(false, Ordering::SeqCst);
+    });
+    rt.run_live(&running).expect("run_live");
+    let returned = real_ns();
+    flipper.join().unwrap();
+    let fired = fires.load(Ordering::SeqCst);
+    assert!(
+        fired >= 1,
+        "the run stepped past the epoch and fired the ticker"
+    );
+    // Bounded by the time from the EPOCH to the return, so a flipper that runs
+    // late on a loaded machine widens the bound with it; a loop that stepped
+    // from entry would add the 40 ms wait, 10 more fires.
+    let window_ms = (returned - epoch) / 1_000_000;
+    assert!(
+        fired <= window_ms / PERIOD_MS + 2,
+        "{fired} fires in the {window_ms} ms from the epoch to the return: the loop stepped \
+         before the epoch"
+    );
+    rt.shutdown();
+}
+
+/// **A rank that misses the shared start by more than one gating quantum
+/// starts its own timeline, with no catch-up burst.** The epoch is 60 ms in
+/// the past when `run_live` begins (a rank that saw GO very late), the
+/// ticker's quantum is 4 ms. Back-dating to the epoch would make the first
+/// delta 60 ms and fire the ticker about 15 times in step 0; starting fresh,
+/// the run fires at most `(its wall time) / 4 + 2` times, and the
+/// wall-following clock ends near `real_ns()`.
+#[test]
+fn a_rank_that_misses_the_shared_start_starts_fresh_without_a_burst() {
+    let fires = Arc::new(AtomicU64::new(0));
+    let (mut rt, clock) = shared_start_ticker("frc_shared_late", Arc::clone(&fires));
+    rt.set_gating_follows_wall(true).expect("wall-following");
+    let epoch = real_ns() - 60_000_000;
+    rt.place_gating_epoch_at_live_anchor().expect("arm");
+    rt.start_live_at_shared_epoch(epoch)
+        .expect("an epoch 60 ms in the past is accepted");
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flip = Arc::clone(&running);
+    let flipper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(15));
+        flip.store(false, Ordering::SeqCst);
+    });
+    let entered = real_ns();
+    rt.run_live(&running).expect("run_live");
+    let returned = real_ns();
+    flipper.join().unwrap();
+    let fired = fires.load(Ordering::SeqCst);
+    // Bounded by the run's own wall time, so a late flipper widens it; paying
+    // the 60 ms lateness as a burst would add about 15 fires on top.
+    let window_ms = (returned - entered) / 1_000_000;
+    assert!(
+        fired <= window_ms / PERIOD_MS + 2,
+        "{fired} fires in a {window_ms} ms run: the 60 ms lateness was paid as a catch-up burst"
+    );
+    let gating = clock.now_ns();
+    assert!(
+        gating <= returned,
+        "the gating clock ran ahead of real time"
+    );
+    assert!(
+        returned - gating < 30_000_000,
+        "the gating clock trails real time by {} ns",
+        returned - gating
+    );
+    assert!(
+        gating > epoch + 60_000_000,
+        "the clock was placed fresh, not at the stale epoch"
+    );
+    rt.shutdown();
+}
+
+/// **Two ranks armed with one shared epoch place identical clocks and fire on
+/// identical first deadlines** (the determinism arm). Both stop before any
+/// live step; one fixed-quantum step each then fires the ticker at exactly
+/// `epoch + period`, the hand oracle a build at the epoch gives.
+#[test]
+fn two_runtimes_armed_with_one_shared_epoch_place_identical_timelines() {
+    let epoch = real_ns() + 200_000_000;
+    let mut fire_times = Vec::new();
+    for prefix in ["frc_shared_det_a", "frc_shared_det_b"] {
+        let (mut rt, clock) = shared_start_ticker(prefix, Arc::new(AtomicU64::new(0)));
+        rt.place_gating_epoch_at_live_anchor().expect("arm");
+        rt.start_live_at_shared_epoch(epoch).expect("arm the start");
+        rt.run_live(&std::sync::atomic::AtomicBool::new(false))
+            .expect("run_live");
+        assert_eq!(clock.now_ns(), epoch, "{prefix} sits at the shared epoch");
+        rt.run_live_step_once_for_test(STEP_TIMEOUT);
+        fire_times.push(
+            rt.trace()
+                .iter()
+                .filter(|e| &*e.node_id == "ticker")
+                .map(|e| e.fire_time_ns)
+                .collect::<Vec<u64>>(),
+        );
+        rt.shutdown();
+    }
+    assert_eq!(fire_times[0], vec![epoch + PERIOD_NS]);
+    assert_eq!(fire_times[0], fire_times[1]);
+}
+
+/// **The shared start's refusals, each loud and leaving nothing armed:** an
+/// epoch more than a second ahead (not written on this clock), and an arm
+/// after a step. An epoch long past is accepted (the late-rank arm above runs
+/// it). A RealClock build, which has no gating clock to place, still
+/// accepts the start (it only waits), and `run_live` spends it.
+#[test]
+fn shared_start_refusals_and_the_real_clock_build() {
+    let (mut rt, _clock) = shared_start_ticker("frc_shared_ref", Arc::new(AtomicU64::new(0)));
+    let err = rt
+        .start_live_at_shared_epoch(real_ns() + 5_000_000_000)
+        .expect_err("an epoch 5 s ahead is refused");
+    assert!(
+        err.to_string().contains("ahead of") && err.to_string().contains("not written"),
+        "{err}"
+    );
+    assert_eq!(
+        rt.live_start_epoch_for_test(),
+        None,
+        "a refusal arms nothing"
+    );
+    rt.run_live_step_once_for_test(STEP_TIMEOUT);
+    let err = rt
+        .start_live_at_shared_epoch(real_ns())
+        .expect_err("an arm after a step is refused");
+    assert!(err.to_string().contains("already begun 1 step(s)"), "{err}");
+    assert_eq!(rt.live_start_epoch_for_test(), None);
+    rt.shutdown();
+
+    let real: Arc<dyn Clock> = Arc::new(RealClock);
+    let mgr = manager("frc_shared_real", Arc::clone(&real));
+    let (config, factories) = ticker_graph("frcsr", Arc::new(AtomicU64::new(0)));
+    let mut rt_r = GraphRuntime::build_live_free_run(
+        config,
+        factories,
+        &mgr,
+        real,
+        None,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::requirements_only(None),
+    )
+    .expect("build the RealClock free-run ticker");
+    rt_r.start_live_at_shared_epoch(real_ns())
+        .expect("a RealClock build accepts a shared start");
+    rt_r.run_live(&std::sync::atomic::AtomicBool::new(false))
+        .expect("run_live");
+    assert_eq!(rt_r.live_start_epoch_for_test(), None, "run_live spent it");
+    rt_r.shutdown();
 }

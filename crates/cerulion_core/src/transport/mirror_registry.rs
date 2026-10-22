@@ -1698,6 +1698,7 @@ fn build_reader_node() -> TransportResult<Node<CerService>> {
             .map_err(|e| TransportError::Internal {
                 reason: format!("mirror registry: invalid reader node name: {e:?}"),
             })?;
+    super::refuse_unsupported_android_shm("cerulion-mirror-reader")?;
     iceoryx2::prelude::NodeBuilder::new()
         .name(&node_name)
         .config(&config)
