@@ -446,6 +446,10 @@ pub struct FieldBounds {
     /// `string<=N`: the string, or each string element of an array, is at
     /// most `N` bytes.
     pub max_string_bytes: Option<usize>,
+    /// `wstring<=N`: the string, or each string element of an array, is at
+    /// most `N` UTF-16 code units, the unit ROS 2 counts for a wide string
+    /// (the wire carries it as UTF-8).
+    pub max_wstring_units: Option<usize>,
 }
 
 /// One validated scalar or string value: a constant's value, a scalar

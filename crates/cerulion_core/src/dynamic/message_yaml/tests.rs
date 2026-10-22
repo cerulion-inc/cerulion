@@ -1163,6 +1163,31 @@ fn ros_upper_bounds_accept_values_at_the_bound() {
     assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), empty);
 }
 
+/// A `wstring<=N` bound counts UTF-16 code units, not UTF-8 bytes: `é` is
+/// one unit in two bytes, `😀` two units in four bytes.
+#[test]
+fn a_wide_string_bound_counts_utf16_units() {
+    let (mut set, _) = SchemaSet::from_schemas(Vec::new()).unwrap();
+    set.add_rosmsg_str("wstring<=1 w\nwstring<=2[<=3] ws\n", "Wide", Some("demo"))
+        .unwrap();
+    let w = set.walker();
+    let ok = "w: \"\u{e9}\"\nws: [\"ab\", \"\u{1f600}\"]\n";
+    let frame = yaml_to_message(w, "demo/Wide", ok.as_bytes(), TS).unwrap();
+    assert_eq!(message_to_yaml(w, &frame).unwrap(), ok);
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\u{1f600}\"\nws: []\n"),
+        "w: string is 2 UTF-16 code units, over the bound of 1"
+    );
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\"\nws: [\"\", \"abc\"]\n"),
+        "ws[1]: string is 3 UTF-16 code units, over the bound of 2"
+    );
+    assert_eq!(
+        decode_err(w, "demo/Wide", "w: \"\"\nws: [\"\", \"\", \"\", \"\"]\n"),
+        "ws: expected at most 3 elements, got 4"
+    );
+}
+
 /// A value past a ROS upper bound is refused with the path and the bound.
 #[test]
 fn ros_upper_bounds_refuse_values_past_the_bound() {

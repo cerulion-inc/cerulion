@@ -212,7 +212,8 @@ effort: [1.5]
   holds no NUL character. A ROS `string<=N` value (or each element of
   `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
   `N` elements (`dimensions: expected at most 3 elements, got 4`). A
-  `wstring<=N` bound is not checked. Echo prints a frame past its bounds
+  `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
+  UTF-16 code units, as ROS 2 counts them. Echo prints a frame past its bounds
   as it is; reading that output back is refused.
 - **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
   duplicate keys and more than one document are refused. A `!truncated`

@@ -284,16 +284,17 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   it with a column-0 `!truncated` line;
   `string_fixed[n]` and fixed array lengths are enforced. ROS `<=N` bounds ride on
   `FieldDef::bounds` (kept by the `.msg` parser, outside the wire type and the schema
-  hash) and are enforced on decode only (`YamlTooManyElements`, `YamlStringTooLong`);
-  the encoder prints an over-bound frame as it is. `wstring<=N` counts UTF-16 units, so
-  its bound is not kept.
+  hash) and are enforced on decode only (`YamlTooManyElements`, `YamlStringTooLong`,
+  `YamlWideStringTooLong`); the encoder prints an over-bound frame as it is. A
+  `wstring<=N` bound is kept apart (`max_wstring_units`) and counts UTF-16 code units,
+  not the UTF-8 bytes the wire carries.
 - Neither direction is a publish path (both allocate); the module is outside the
   hot-path allocation sweep.
 
 | Class | `DynamicError` variant |
 |---|---|
 | input bytes / parse / anchor | `YamlInputTooLarge`, `YamlInputNotUtf8`, `YamlSyntax`, `YamlAnchorOrAlias` |
-| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
+| value | `YamlWrongType`, `YamlOutOfRange`, `YamlUnknownField`, `YamlMissingField`, `YamlWrongLength`, `YamlTooManyElements`, `YamlStringTooLong`, `YamlWideStringTooLong`, `YamlNulInFixedString`, `YamlTruncated`, `YamlTag` |
 | schema shape | `YamlUnsupportedField`, `YamlUnresolvedNested`, `YamlTooDeep`, `YamlMessageTooLarge` |
 | encode | `YamlUnencodable`, `YamlOutputTooLarge` (plus `Walk` for a frame the walker refuses) |
 

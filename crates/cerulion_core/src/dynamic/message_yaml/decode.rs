@@ -41,6 +41,7 @@ use crate::wire::WireHeader;
 ///   [`DynamicError::YamlUnknownField`], [`DynamicError::YamlMissingField`],
 ///   [`DynamicError::YamlWrongLength`], [`DynamicError::YamlTooManyElements`],
 ///   [`DynamicError::YamlStringTooLong`],
+///   [`DynamicError::YamlWideStringTooLong`],
 ///   [`DynamicError::YamlNulInFixedString`], [`DynamicError::YamlTruncated`],
 ///   [`DynamicError::YamlTag`].
 /// - Schema shape errors: [`DynamicError::YamlUnsupportedField`],
@@ -387,29 +388,38 @@ impl<'w> Builder<'w> {
         let FieldBounds {
             max_elements,
             max_string_bytes,
+            max_wstring_units,
         } = field.bounds;
-        let too_long = |path: String, s: &str, bound: usize| {
-            if s.len() > bound {
+        let too_long = |path: &str, s: &str| {
+            if let Some(bound) = max_string_bytes.filter(|&b| s.len() > b) {
                 return Err(DynamicError::YamlStringTooLong {
-                    path,
+                    path: shown(path),
                     bound,
                     got: s.len(),
                 });
             }
+            if let Some(bound) = max_wstring_units {
+                // Past `bound` units the count stops: a long string is not
+                // walked to its end.
+                let got = s.encode_utf16().take(bound + 1).count();
+                if got > bound {
+                    return Err(DynamicError::YamlWideStringTooLong {
+                        path: shown(path),
+                        bound,
+                        got: s.encode_utf16().count(),
+                    });
+                }
+            }
             Ok(())
         };
+        let strings_bounded = max_string_bytes.is_some() || max_wstring_units.is_some();
         let is_array = matches!(
             field.field_type,
             FieldType::DynamicArray { .. } | FieldType::FixedArray { .. }
         );
         match v {
-            Value::String(s) if !is_array => match max_string_bytes {
-                Some(bound) => too_long(self.here(), s, bound),
-                None => Ok(()),
-            },
-            Value::Sequence(_)
-                if is_array && (max_elements.is_some() || max_string_bytes.is_some()) =>
-            {
+            Value::String(s) if !is_array => too_long(&self.path, s),
+            Value::Sequence(_) if is_array && (max_elements.is_some() || strings_bounded) => {
                 // A `!truncated` element is refused first, with its own
                 // message, as for any array.
                 let items = self.sequence(&field.field_type, v, None)?;
@@ -422,12 +432,12 @@ impl<'w> Builder<'w> {
                         });
                     }
                 }
-                if let Some(bound) = max_string_bytes {
+                if strings_bounded {
                     for (i, item) in items.iter().enumerate() {
                         if let Value::String(s) = item {
                             let mut path = self.path.clone();
                             push_index(&mut path, i);
-                            too_long(path, s, bound)?;
+                            too_long(&path, s)?;
                         }
                     }
                 }

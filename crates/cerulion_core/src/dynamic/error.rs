@@ -434,6 +434,18 @@ pub enum DynamicError {
         got: usize,
     },
 
+    /// A string is longer than its ROS 2 `wstring<=N` bound, counted in
+    /// UTF-16 code units.
+    #[error("{path}: string is {got} UTF-16 code units, over the bound of {bound}")]
+    YamlWideStringTooLong {
+        /// The field path.
+        path: String,
+        /// The bound `N`, in UTF-16 code units.
+        bound: usize,
+        /// The UTF-16 length written.
+        got: usize,
+    },
+
     /// A `string_fixed[n]` value contains a NUL character (the wire form
     /// ends the string at the first NUL).
     #[error("{path}: a string_fixed value cannot contain a NUL character")]

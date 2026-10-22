@@ -613,11 +613,12 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
         return Ok(FieldType::String);
     }
     // A `wstring` bound counts UTF-16 code units, not the UTF-8 bytes the
-    // wire carries, so it is checked but not kept.
+    // wire carries, so it is kept apart from the `string` one.
     if let Some(bound_str) = ros_type.strip_prefix("wstring<=") {
-        bound_str
+        let bound = bound_str
             .parse::<usize>()
             .map_err(|_| format!("invalid string bound: {ros_type}"))?;
+        bounds.max_wstring_units = Some(bound);
         return Ok(FieldType::String);
     }
 
@@ -885,9 +886,10 @@ string<=64 name
 int32[<=8] ids
 wstring<=10 wname
 string<=4[<=3] tags
+wstring<=2[<=5] wtags
 "#;
         let schema = parse_rosmsg(msg, "Bounded", None).unwrap();
-        assert_eq!(schema.fields.len(), 4);
+        assert_eq!(schema.fields.len(), 5);
         assert_eq!(schema.fields[0].field_type, FieldType::String);
         assert!(matches!(
             &schema.fields[1].field_type,
@@ -898,24 +900,26 @@ string<=4[<=3] tags
             &schema.fields[3].field_type,
             FieldType::DynamicArray { element_type } if **element_type == FieldType::String
         ));
-        // The bounds are kept beside the wire type (wstring's is not).
-        let b = |max_elements, max_string_bytes| FieldBounds {
+        // The bounds are kept beside the wire type.
+        let b = |max_elements, max_string_bytes, max_wstring_units| FieldBounds {
             max_elements,
             max_string_bytes,
+            max_wstring_units,
         };
         let kept: Vec<FieldBounds> = schema.fields.iter().map(|f| f.bounds).collect();
         assert_eq!(
             kept,
             [
-                b(None, Some(64)),
-                b(Some(8), None),
-                b(None, None),
-                b(Some(3), Some(4))
+                b(None, Some(64), None),
+                b(Some(8), None, None),
+                b(None, None, Some(10)),
+                b(Some(3), Some(4), None),
+                b(Some(5), None, Some(2)),
             ]
         );
         // The hash is the unbounded twin's: bounds are not wire shape.
         let twin = parse_rosmsg(
-            "string name\nint32[] ids\nwstring wname\nstring[] tags\n",
+            "string name\nint32[] ids\nwstring wname\nstring[] tags\nwstring[] wtags\n",
             "Bounded",
             None,
         )
