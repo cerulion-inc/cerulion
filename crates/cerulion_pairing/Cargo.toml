@@ -45,8 +45,8 @@ pake-cpace = "0.1.7"
 # SHA-256 + HMAC-SHA256 for the tamper-evident trust-store MAC, the chassis
 # secret hash, and PAKE key-confirmation tags. (CPace's own hashing is
 # HMAC-SHA512, internal to pake-cpace.)
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 # Constant-time comparison for MAC tags, confirmation tags, and the chassis
 # secret — never a data-dependent `==` on a secret.
 subtle = "2"
@@ -71,9 +71,9 @@ thiserror = "2"
 tracing = { version = "0.1.44" }
 # The config directory rule of the machine identity (`identity`): the home
 # directory when `CERULION_HOME` is unset. Already in the lockfile.
-dirs = "6"
+dirs = "7"
 # OS entropy for a fresh machine key (`identity`). Already in the lockfile.
-getrandom = "0.3"
+getrandom = "0.4"
 
 [dev-dependencies]
 # Tests exercise the real issuer/CA signing API with fixed-seed keys.
@@ -84,8 +84,8 @@ tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Recompute a VALID HMAC over a corrupted header in the store tamper tests
 # (proving the structural magic/version checks run AFTER the MAC verifies).
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 # Independent checks of the team X.509 profile: x509-parser reads the issued
 # DER field by field, rustls-webpki (the verifier the network links use)
 # accepts it for client and server authentication, rcgen builds certificates
