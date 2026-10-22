@@ -12,7 +12,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, FrameWalker, MessageSchema};
+use cerulion_core::codegen::{
+    parse_rosmsg, parse_rossrv, service_part_replaced, FrameValueKind, FrameWalker, MessageSchema,
+};
 use cerulion_core::message::{ServiceType, ShmMessage};
 use cerulion_core::testing::TestTransport;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
@@ -313,4 +315,122 @@ fn a_set_bool_response_snapshot_round_trips_through_serde() {
     assert_eq!(json, r#"{"success":true,"message":"motor enabled"}"#);
     let back: SetBool_ResponseSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, value);
+}
+
+/// Every vendored `.srv`, as `(package, name, text)`.
+const VENDORED_SRVS: &[(&str, &str, &str)] = &[
+    (
+        "rcl_interfaces",
+        "DescribeParameters",
+        include_str!("../srv/rcl_interfaces/DescribeParameters.srv"),
+    ),
+    (
+        "rcl_interfaces",
+        "GetParameterTypes",
+        include_str!("../srv/rcl_interfaces/GetParameterTypes.srv"),
+    ),
+    (
+        "rcl_interfaces",
+        "GetParameters",
+        include_str!("../srv/rcl_interfaces/GetParameters.srv"),
+    ),
+    (
+        "rcl_interfaces",
+        "ListParameters",
+        include_str!("../srv/rcl_interfaces/ListParameters.srv"),
+    ),
+    (
+        "rcl_interfaces",
+        "SetParameters",
+        include_str!("../srv/rcl_interfaces/SetParameters.srv"),
+    ),
+    (
+        "rcl_interfaces",
+        "SetParametersAtomically",
+        include_str!("../srv/rcl_interfaces/SetParametersAtomically.srv"),
+    ),
+    (
+        "std_srvs",
+        "Empty",
+        include_str!("../srv/std_srvs/Empty.srv"),
+    ),
+    (
+        "std_srvs",
+        "SetBool",
+        include_str!("../srv/std_srvs/SetBool.srv"),
+    ),
+    (
+        "std_srvs",
+        "Trigger",
+        include_str!("../srv/std_srvs/Trigger.srv"),
+    ),
+];
+
+/// The services whose marker a workspace override of `pkg/name` drops,
+/// over the real corpus: the check `build.rs` runs before it emits markers.
+fn services_dropped_by(pkg: &str, name: &str, override_text: &str) -> Vec<String> {
+    let vendored: Vec<MessageSchema> = native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .map(|&(p, n, text)| parse_rosmsg(text, n, Some(p)).expect("vendored text parses"))
+        .collect();
+    let held: Vec<MessageSchema> = vendored
+        .iter()
+        .map(|s| {
+            if s.package.as_deref() == Some(pkg) && s.name == name {
+                parse_rosmsg(override_text, name, Some(pkg)).expect("override parses")
+            } else {
+                s.clone()
+            }
+        })
+        .collect();
+    let find = |set: &[MessageSchema], p: &str, n: &str| -> Option<usize> {
+        set.iter()
+            .position(|s| s.package.as_deref() == Some(p) && s.name == n)
+    };
+    VENDORED_SRVS
+        .iter()
+        .filter_map(|&(p, n, text)| {
+            let srv = parse_rossrv(text, n, Some(p), &format!("{p}/{n}.srv")).expect("srv parses");
+            service_part_replaced(
+                &srv,
+                |p, n| find(&vendored, p, n).map(|i| &vendored[i]),
+                |p, n| find(&held, p, n).map(|i| &held[i]),
+            )
+            .map(|_| format!("{p}/{n}"))
+        })
+        .collect()
+}
+
+/// A workspace that redefines `rcl_interfaces/ParameterValue` changes the
+/// wire type of every parameter service that carries a value, two levels
+/// deep for `SetParameters` (request `Parameter[]`, each `Parameter` a
+/// `ParameterValue`), although no part's own field list changes. Those
+/// markers are left out; the services that never carry a value keep theirs.
+#[test]
+fn a_parameter_value_override_drops_every_marker_that_embeds_it() {
+    let dropped = services_dropped_by(
+        "rcl_interfaces",
+        "ParameterValue",
+        "uint8 type\nint64 integer_value\n",
+    );
+    assert_eq!(
+        dropped,
+        [
+            "rcl_interfaces/GetParameters",
+            "rcl_interfaces/SetParameters",
+            "rcl_interfaces/SetParametersAtomically",
+        ]
+    );
+}
+
+/// An override that keeps the vendored fields (only comments differ) drops
+/// no marker.
+#[test]
+fn an_override_with_the_vendored_fields_drops_no_marker() {
+    let (_, _, text) = native_ros2_messages::BUILTIN_MSGS
+        .iter()
+        .find(|&&(p, n, _)| p == "rcl_interfaces" && n == "ParameterValue")
+        .expect("ParameterValue is vendored");
+    let commented = format!("# a workspace copy\n{text}");
+    assert!(services_dropped_by("rcl_interfaces", "ParameterValue", &commented).is_empty());
 }

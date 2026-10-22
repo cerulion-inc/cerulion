@@ -146,23 +146,19 @@ fn main() {
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from);
     let workspace_mode = workspace.is_some();
-    // A service whose part the workspace replaces with another definition
-    // keeps the replacement as a message, but loses its marker: the marker
-    // would name the replacement as the standard request or response.
+    // A service whose part, or a message a part embeds at any depth, the
+    // workspace replaces with another definition keeps the replacement as a
+    // message, but loses its marker: the marker would name a request or
+    // response whose wire type is no longer the standard one.
     let mut replaced_services: BTreeSet<(String, String)> = BTreeSet::new();
     if let Some(root) = &workspace {
+        let vendored = all_schemas.clone();
         all_schemas = workspace_message_set(root, all_schemas);
         for (package, defs) in &services {
-            let held = all_schemas
-                .get(package)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
             for service in defs {
-                let in_set = |part: &str| {
-                    let qualified = format!("{package}/{part}");
-                    held.iter().find(|s| s.name == part || s.name == qualified)
-                };
-                if let Some(why) = service_part_replaced(service, in_set) {
+                let declared = |pkg: &str, name: &str| find_schema(&vendored, pkg, name);
+                let in_set = |pkg: &str, name: &str| find_schema(&all_schemas, pkg, name);
+                if let Some(why) = service_part_replaced(service, declared, in_set) {
                     println!("cargo:warning=workspace messages: {why}");
                     replaced_services.insert((package.clone(), service.name.clone()));
                 }
@@ -457,6 +453,19 @@ const ROOT_MODULE: &str = "__workspace_root";
 /// root. Every warning the set reports (a file it skipped, a built-in an
 /// override dropped) is printed for the build log, since the type a warning
 /// names is then absent from the generated crate.
+/// The schema `set` holds as `package/name`, under its bare name or, for a
+/// package-less YAML schema named `package/Name`, its qualified one.
+fn find_schema<'a>(
+    set: &'a BTreeMap<String, Vec<MessageSchema>>,
+    package: &str,
+    name: &str,
+) -> Option<&'a MessageSchema> {
+    let qualified = format!("{package}/{name}");
+    set.get(package)?
+        .iter()
+        .find(|s| s.name == name || s.name == qualified)
+}
+
 fn workspace_message_set(
     root: &Path,
     builtins: BTreeMap<String, Vec<MessageSchema>>,
