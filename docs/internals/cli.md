@@ -962,6 +962,8 @@ own binary.
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
 | `topic_network_live_test.rs` | Live loopback remote-topic e2e (real zenoh sessions, no shared memory) | no | none |
 | `mdns_live_test.rs` | Real-multicast mDNS loopback | `#[ignore]` (hardware only) | none |
+| `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck, its batches (more topics than one batch holds) and a topic that sends nothing, and `topic bw` on a publisher slower than one report a second (stamped apart from its send delay) and on two publishers whose clocks disagree | yes (process-global transport singleton) | none |
+| `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
@@ -1245,3 +1247,29 @@ or a derived enum with no variant or with several). `the_registered_families_bui
 runs the production registry through it. The public-surface doc check reads the verbs
 of the families `FAMILIES` names, so a family file with no entry is not a verb there
 either.
+
+### Nested verbs: adding a verb under an existing verb
+
+A new `cerulion <parent> <verb>` under a verb that already exists (a `Commands` verb
+or a family) is a nested-verb set in `crates/cerulion_cli/src/families/nested/`, not a
+new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `find`,
+`bw`) is the worked example.
+
+1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";`, the verbs as
+   ONE `#[derive(Subcommand)]` enum, and a unit struct implementing `NestedVerbs`:
+   `parent`, `commands` (`nested::derived_verbs::<YourVerbs>()`), `log_class`,
+   `needs_identity` and `run`. Each method that takes matches gets the PARENT's
+   sub-matches, so `YourVerbs::from_arg_matches` parses them.
+2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
+3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
+   for a family.
+
+`families::route` tries the nested sets first, then the families, with the same
+logging, bridge and login-gate order. A set hands over its verbs and never sees the
+parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
+refuses, when the command is built, a parent that is not a verb, a verb with no name
+and a verb name the parent already selects (a built-in name or alias, `help`, an
+earlier set's verb). `the_registered_nested_verbs_attach` runs the production registry
+through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
+files them under the verb their `PARENT` names. A flag on a built-in verb (such as
+`topic list -t`) is still a field of that verb.

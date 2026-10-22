@@ -1131,12 +1131,36 @@ impl DrainOutcome {
 pub struct ReceivedMessage<'a> {
     header: WireHeader,
     payload: &'a [u8],
+    origin: u128,
 }
 
 impl<'a> ReceivedMessage<'a> {
-    /// Create a new received message from header and payload.
+    /// Create a new received message from header and payload. Its
+    /// [`Self::origin`] is `0`, the "no publisher identity" value, because a
+    /// message built by hand came from no publisher port.
     pub fn new(header: WireHeader, payload: &'a [u8]) -> Self {
-        Self { header, payload }
+        Self::from_publisher(header, payload, 0)
+    }
+
+    /// The message a receive path delivers: header, payload and the
+    /// publisher identity of the sample it was read from.
+    pub(crate) fn from_publisher(header: WireHeader, payload: &'a [u8], origin: u128) -> Self {
+        Self {
+            header,
+            payload,
+            origin,
+        }
+    }
+
+    /// The PUBLISHER IDENTITY of the frame: iceoryx2's `UniquePublisherId` of
+    /// the port that committed it, raw, as [`OwnedInboundSample::origin`]
+    /// returns it. Two frames with the same value came from one publisher,
+    /// so an observer can keep the streams of a `multi_publisher_topics`
+    /// topic apart. Sample metadata: reading it parses and allocates nothing.
+    /// The id is run random, so it is compared only within one run; `0` for
+    /// a message built with [`Self::new`].
+    pub fn origin(&self) -> u128 {
+        self.origin
     }
 
     /// Returns the wire header.
@@ -2917,7 +2941,11 @@ impl CerulionSubscriber {
                 continue;
             }
             let payload = &raw[WireHeader::SIZE..total_size];
-            callback(ReceivedMessage::new(header, payload));
+            callback(ReceivedMessage::from_publisher(
+                header,
+                payload,
+                sample.origin().value(),
+            ));
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
             self.record_service_cursor_from(&header);
@@ -3139,7 +3167,9 @@ impl CerulionSubscriber {
                 // read again here: the served sequence and the cursor below both
                 // want the same thirty-two bytes.
                 removals.set(removals.get() + 1);
-                if let Some(header) = deliver_raw_frame(topic, sample.payload(), callback) {
+                if let Some(header) =
+                    deliver_raw_frame(topic, sample.payload(), sample.origin().value(), callback)
+                {
                     count.set(count.get() + 1);
                     // The served-sequence parse follows the CAPTURE bit or the
                     // GRANT, either of which consumes it: the record below
@@ -5585,10 +5615,16 @@ fn build_inbound_view<T: ShmMessage, R>(
 }
 
 /// Validate a raw wire frame and deliver it to `callback` as a
-/// `ReceivedMessage`. Returns the frame's parsed `WireHeader` if delivered,
-/// `None` if skipped (a `warn` was emitted). Used by the `drain_samples` receive
-/// path.
-fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> Option<WireHeader>
+/// `ReceivedMessage` that carries `origin`, the publisher identity of the
+/// sample `raw` was read from. Returns the frame's parsed `WireHeader` if
+/// delivered, `None` if skipped (a `warn` was emitted). Used by the
+/// `drain_samples` receive path.
+fn deliver_raw_frame<F>(
+    topic: &str,
+    raw: &[u8],
+    origin: u128,
+    callback: &mut F,
+) -> Option<WireHeader>
 where
     F: FnMut(ReceivedMessage<'_>),
 {
@@ -5628,7 +5664,7 @@ where
         return None;
     }
     let payload = &raw[WireHeader::SIZE..total_size];
-    callback(ReceivedMessage::new(header, payload));
+    callback(ReceivedMessage::from_publisher(header, payload, origin));
     Some(header)
 }
 
