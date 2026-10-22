@@ -42,6 +42,7 @@ use crate::clock::Clock;
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::clock::RealClock;
 use crate::error::{NodeErrorKind, TransportError, TransportResult};
+use crate::graph::params::{ParamSpec, ParamValues};
 use crate::message::ShmMessage;
 use crate::transport::input_view::InputView;
 use crate::transport::output_proxy::OutputProxy;
@@ -446,6 +447,11 @@ pub struct NodeInfo {
     /// runtime consumes it through `NodeInfo::throttle_ms` to install the
     /// pre-fire time-gate.
     pub(crate) throttle_ms: Option<u64>,
+    /// The node's declared `#[param]` fields, in declaration order. Empty
+    /// for a node without params. The graph build resolves a node's
+    /// `params:` against this list (`crate::graph::params`); the cdylib info
+    /// JSON carries it under `"params"`.
+    pub(crate) params: Vec<ParamSpec>,
     /// Capture-time Sync matching: when `Some`, this Sync node aligns its
     /// trigger inputs on each message's `header.stamp` instead of publish
     /// time, and the map gives every trigger input's resolved stamp location,
@@ -647,6 +653,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
             sync_capture: None,
         }
     }
@@ -686,6 +693,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
             sync_capture: None,
         }
     }
@@ -730,6 +738,7 @@ impl NodeInfo {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
             sync_capture: None,
         }
     }
@@ -785,6 +794,39 @@ impl NodeInfo {
     /// The node-level producer rate cap (ms), if declared.
     pub fn throttle_ms(&self) -> Option<u64> {
         self.throttle_ms
+    }
+
+    /// Builder that attaches the node's declared `#[param]` specs. Emitted
+    /// by `#[cerulion_node]` in declaration order; chains with the other
+    /// builders.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a duplicate param name or a spec that fails
+    /// [`ParamSpec::validate`]: macro structs cannot produce either (Rust
+    /// rejects duplicate fields and the macro checks every literal at
+    /// expansion), and the cdylib info-JSON ingress validates and returns
+    /// `Err` before reaching this builder, so only a direct embedder call
+    /// can get here, and that is a programming error worth one.
+    pub fn with_params(mut self, params: Vec<ParamSpec>) -> Self {
+        assert_unique_port_names(
+            params.iter().map(|p| p.name.as_str()),
+            "with_params",
+            "param",
+        );
+        for spec in &params {
+            if let Err(reason) = spec.validate() {
+                panic!("NodeInfo::with_params: {reason}");
+            }
+        }
+        self.params = params;
+        self
+    }
+
+    /// The node's declared `#[param]` specs, in declaration order. Empty
+    /// for a node without params.
+    pub fn params(&self) -> &[ParamSpec] {
+        &self.params
     }
 
     /// Read-only access to the per-node
@@ -3031,6 +3073,32 @@ pub trait NodeEntry: Send {
     /// (`ClosureNodeEntry`, macro-generated entries) always return `Ok`.
     fn info(&self) -> TransportResult<NodeInfo>;
 
+    /// Hand the node its resolved `params:` values.
+    ///
+    /// Called by the graph build after [`Self::info`] and BEFORE
+    /// [`Self::init`], once, with every declared param present (the default
+    /// or the graph's value, already checked against the node's
+    /// [`NodeInfo::params`]). An implementation holds the values and
+    /// writes them into its fields inside `init`, ahead of the node's own
+    /// `init`, so node code and the first tick both read them.
+    ///
+    /// The default REFUSES a non-empty map: a node that declares no params
+    /// has nowhere to put a value, and silently dropping one is the
+    /// dead-key class this surface exists to prevent. An empty map is the
+    /// no-params case and is accepted.
+    fn set_params(&mut self, params: &ParamValues) -> TransportResult<()> {
+        if params.is_empty() {
+            return Ok(());
+        }
+        Err(TransportError::GraphError {
+            reason: format!(
+                "node accepts no params, but {} were supplied ({})",
+                params.len(),
+                params.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        })
+    }
+
     /// Initialize the node with its transport context.
     ///
     /// Called once before any `tick()`. The context provides pre-created
@@ -3832,6 +3900,20 @@ pub struct DylibNodeEntry {
     /// fails on every `info()` call.
     info_cache: std::cell::OnceCell<NodeInfo>,
     handle: Option<u64>,
+    /// The OPTIONAL params handoff symbol
+    /// (`cerulion_node_init_with_params(ctx, json_ptr, json_len) -> u64`):
+    /// `cerulion_node_init` plus the node's resolved `params:` as one JSON
+    /// object. Resolved best-effort by `load`; `None` for a raw-FFI or older
+    /// cdylib. ADDITIVE, no ABI bump: symbol PRESENCE is the capability.
+    /// [`NodeEntry::set_params`] refuses a non-empty handoff when it is
+    /// `None`, so `params:` on such a node is a load error, never a
+    /// silently dead key; `init` calls it instead of `init_fn` when a
+    /// handoff is pending.
+    init_with_params_fn: Option<unsafe extern "C" fn(*mut NodeContext, *const u8, usize) -> u64>,
+    /// The JSON the graph build handed over through
+    /// [`NodeEntry::set_params`], held until `init` crosses the FFI with
+    /// it. `None` when the node has no params to deliver.
+    pending_params_json: Option<String>,
     /// Flood-control latch for `pump_history` logging.
     /// The pump runs every live-loop iteration, so a PERSISTENT non-zero FFI
     /// return (e.g. a poisoned cdylib `NODES` mutex) would re-log at `error!`
@@ -4465,6 +4547,22 @@ impl DylibNodeEntry {
             }
         };
 
+        // OPTIONAL params handoff symbol, resolved best-effort like the
+        // snapshot symbols above. Every macro-generated cdylib exports it; a
+        // raw-FFI or older cdylib lacks it, loads unchanged, and is refused
+        // by name in `set_params` the moment a graph hands it a value
+        // (ADDITIVE; the ABI version is deliberately NOT bumped).
+        // Safety: same convention as the other symbol lookups: resolve by
+        // name + signature; a present symbol is trusted to match the ABI.
+        let init_with_params_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn(*mut NodeContext, *const u8, usize) -> u64>(
+                    b"cerulion_node_init_with_params\0",
+                )
+                .ok()
+                .map(|sym| *sym)
+        };
+
         // OPTIONAL external-source symbol — resolved best-effort,
         // exactly like the snapshot symbols above. The macro emits it ONLY for
         // `#[cerulion_node(external)]` nodes, so a non-external node (or an
@@ -4711,6 +4809,8 @@ impl DylibNodeEntry {
             cer_probe_ffi,
             info_cache: std::cell::OnceCell::new(),
             handle: None,
+            init_with_params_fn,
+            pending_params_json: None,
             pump_history_error_latched: false,
             snapshot_error_latched: false,
             drain_trigger_ffi,
@@ -4834,6 +4934,13 @@ impl DylibNodeEntry {
             tick_within_ms: Option<u64>,
             #[serde(default)]
             throttle_ms: Option<u64>,
+            // The node's declared `#[param]` specs. Absent on a node
+            // without params and on a library built before params existed;
+            // both mean "declares no params", so `params:` on such a node
+            // is refused at graph build by name. Each spec is re-checked
+            // below (a hand-written info block has no macro behind it).
+            #[serde(default)]
+            params: Option<Vec<ParamSpec>>,
         }
 
         // ABI v6: each `inputs` entry is either a
@@ -5059,6 +5166,7 @@ impl DylibNodeEntry {
             "policy",
             "tick_within_ms",
             "throttle_ms",
+            "params",
         ];
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json_str) {
             // Same `unknown_key` field name and the same did-you-mean as the
@@ -5342,10 +5450,31 @@ impl DylibNodeEntry {
         // Names are already proven unique by the explicit `Err`-returning
         // checks above, so `with_meta`'s unique-name assert cannot fire
         // here (it remains defense-in-depth for in-crate literal callers).
+        // The declared params, checked here rather than trusted: a
+        // duplicate name or an inconsistent spec (a default of the wrong
+        // type, `min` above `max`, bounds on a `String`) from a hand-written
+        // info block must refuse the load, never panic in `with_params` and
+        // never load with a bound the host cannot enforce.
+        let params = parsed.params.unwrap_or_default();
+        for (idx, spec) in params.iter().enumerate() {
+            if params[..idx].iter().any(|p| p.name == spec.name) {
+                return Err(format!(
+                    "duplicate param name '{}' in cerulion_node_info() JSON; each param may \
+                     be declared once",
+                    spec.name
+                ));
+            }
+            if let Err(reason) = spec.validate() {
+                return Err(format!(
+                    "invalid param spec in cerulion_node_info() JSON: {reason}"
+                ));
+            }
+        }
         let mut info = NodeInfo::with_meta(input_meta, output_meta);
         info.policy = policy;
         info.tick_within_ms = parsed.tick_within_ms;
         info.throttle_ms = parsed.throttle_ms;
+        info.params = params;
         Ok(info)
     }
 }
@@ -5384,36 +5513,21 @@ impl DylibNodeEntry {
         let c_str = unsafe { CStr::from_ptr(ptr) };
         Ok(c_str.to_string_lossy().into_owned())
     }
-}
 
-impl NodeEntry for DylibNodeEntry {
-    /// Read the cdylib's port + policy metadata.
-    ///
-    /// **Caching note:** `info()` populates
-    /// `info_cache` (a `OnceCell`, interior mutability) on its FIRST
-    /// successful call. On the production node-load path `info()` is
-    /// called twice — once by `runtime.rs` to read `macro_policy` for
-    /// trigger-policy synthesis, and once by `init()` to seed the cache —
-    /// but only the FIRST call re-enters the FFI; the second returns the
-    /// cached value. This closes the prior double-FFI hazard where a
-    /// non-idempotent `cerulion_node_info()` could return different bytes
-    /// across the two calls, wiring publishers from one `NodeInfo` while
-    /// caching another. Failed parses are NOT cached, so a corrupt node
-    /// fails on every call.
-    ///
-    /// **Failure semantics:** if `cerulion_node_info()`
-    /// returns null OR returns malformed JSON, this method returns
-    /// `Err(TransportError::NodeInfoParse)` carrying the diagnostic
-    /// label (cdylib path), the raw JSON byte length, and the first
-    /// 80 bytes of the offending payload. `GraphRuntime::build` /
-    /// `build_in_process` propagate this as a load-time failure —
-    /// earlier the method silently fell back to
-    /// `NodeInfo::default()` (empty wiring) and the node loaded but
-    /// never fired.
-    fn info(&self) -> TransportResult<NodeInfo> {
-        if let Some(cached) = self.info_cache.get() {
-            return Ok(cached.clone());
-        }
+    /// The raw info document AFTER the host's full read accepted it: ONE
+    /// `cerulion_node_info()` call, parsed and checked exactly as
+    /// [`NodeEntry::info`] checks it, and that same document returned. For a
+    /// caller that forwards the raw document (the isolated inspector child
+    /// hands it to its parent): reading the document a second time could
+    /// return different bytes from a library whose metadata varies per call,
+    /// so the forwarded document would not be the one that passed the checks.
+    pub fn checked_info_json(&self) -> TransportResult<String> {
+        self.checked_info().map(|(_, json)| json)
+    }
+
+    /// One FFI read of the info document, parsed and checked, as the
+    /// `(NodeInfo, raw document)` pair. Populates `info_cache` on success.
+    fn checked_info(&self) -> TransportResult<(NodeInfo, String)> {
         let json_str = self.info_json()?;
 
         // The labeled variant, so the unknown-key WARN names this
@@ -5446,6 +5560,29 @@ impl NodeEntry for DylibNodeEntry {
                 }
             })?;
 
+        // A library that DECLARES params but exports no
+        // `cerulion_node_init_with_params` symbol (a raw-FFI node with a
+        // hand-written info block, or an info block copied from a macro
+        // node) could never receive a value: the graph build hands every
+        // node its full resolved map, defaults included, so such a node
+        // would be refused on every run, even with no `params:` set. Refuse
+        // it HERE, where `graph validate`, `graph run` and `node info` all
+        // read the library, so the three agree and the message names the
+        // real fix. Not cached: a refused info is re-read on every call.
+        if !parsed.params.is_empty() && self.init_with_params_fn.is_none() {
+            let names: Vec<&str> = parsed.params.iter().map(|p| p.name.as_str()).collect();
+            return Err(TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason: format!(
+                    "cerulion_node_info() declares params ({}) but this node library exports no \
+                     cerulion_node_init_with_params symbol, so no value could reach them; \
+                     rebuild the node against this core (`cerulion node build <type>`), or \
+                     remove `params` from the library's node info",
+                    names.join(", ")
+                ),
+            });
+        }
+
         // Populate the cache on the FIRST successful
         // parse so a later `info()` (e.g. the one inside `init()`) reuses
         // this exact value instead of re-entering the FFI. `set` only
@@ -5453,7 +5590,72 @@ impl NodeEntry for DylibNodeEntry {
         // hit here — `info()` is single-threaded per node); in that case
         // the already-cached value is authoritative, so ignore the Err.
         let _ = self.info_cache.set(parsed.clone());
-        Ok(parsed)
+        Ok((parsed, json_str))
+    }
+}
+
+impl NodeEntry for DylibNodeEntry {
+    /// Read the cdylib's port + policy metadata.
+    ///
+    /// **Caching note:** `info()` populates
+    /// `info_cache` (a `OnceCell`, interior mutability) on its FIRST
+    /// successful call. On the production node-load path `info()` is
+    /// called twice (once by `runtime.rs` to read `macro_policy` for
+    /// trigger-policy synthesis, and once by `init()` to seed the cache),
+    /// but only the FIRST call re-enters the FFI; the second returns the
+    /// cached value. This closes the prior double-FFI hazard where a
+    /// non-idempotent `cerulion_node_info()` could return different bytes
+    /// across the two calls, wiring publishers from one `NodeInfo` while
+    /// caching another. Failed parses are NOT cached, so a corrupt node
+    /// fails on every call.
+    ///
+    /// **Failure semantics:** if `cerulion_node_info()`
+    /// returns null OR returns malformed JSON, this method returns
+    /// `Err(TransportError::NodeInfoParse)` carrying the diagnostic
+    /// label (cdylib path), the raw JSON byte length, and the first
+    /// 80 bytes of the offending payload. `GraphRuntime::build` /
+    /// `build_in_process` propagate this as a load-time failure;
+    /// earlier the method silently fell back to
+    /// `NodeInfo::default()` (empty wiring) and the node loaded but
+    /// never fired.
+    fn info(&self) -> TransportResult<NodeInfo> {
+        if let Some(cached) = self.info_cache.get() {
+            return Ok(cached.clone());
+        }
+        self.checked_info().map(|(info, _)| info)
+    }
+
+    /// Hold the graph's resolved values as JSON for `init` to carry across
+    /// the FFI. A non-empty handoff to a cdylib WITHOUT the optional symbol
+    /// is refused here, by name, so the graph build fails before any
+    /// transport resource exists rather than running the node on its
+    /// defaults with the values silently dropped. On the graph build path
+    /// this arm is unreachable: a library without the symbol either declares
+    /// no params (so its resolved map is empty and `params:` on it is
+    /// refused earlier as an unknown name) or is refused by `info()`.
+    fn set_params(&mut self, params: &ParamValues) -> TransportResult<()> {
+        if params.is_empty() {
+            return Ok(());
+        }
+        if self.init_with_params_fn.is_none() {
+            return Err(TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason: format!(
+                    "params ({}) were handed to this node library, but it exports no \
+                     cerulion_node_init_with_params symbol, so it cannot receive them; \
+                     rebuild the node against this core (`cerulion node build <type>`)",
+                    params.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+        let json = crate::graph::params::params_to_json(params).map_err(|e| {
+            TransportError::NodeError {
+                node_id: self.diag_label.clone(),
+                reason: format!("params could not be encoded for the node library: {e}"),
+            }
+        })?;
+        self.pending_params_json = Some(json);
+        Ok(())
     }
 
     fn init(&mut self, context: NodeContext) -> TransportResult<()> {
@@ -5479,7 +5681,29 @@ impl NodeEntry for DylibNodeEntry {
         // Safety: The cdylib always consumes the pointer via Box::from_raw()
         // as its first action after null check, on both success and failure paths.
         let ctx_ptr = Box::into_raw(Box::new(context));
-        let handle = unsafe { (self.init_fn)(ctx_ptr) };
+        // With a pending handoff, cross through the params symbol so the
+        // values are in the fields before the node's own `init` runs.
+        // `set_params` proved the symbol exists when it accepted the handoff.
+        let handle = match (self.pending_params_json.take(), self.init_with_params_fn) {
+            (Some(json), Some(init_with_params)) => unsafe {
+                init_with_params(ctx_ptr, json.as_ptr(), json.len())
+            },
+            (None, _) => unsafe { (self.init_fn)(ctx_ptr) },
+            (Some(_), None) => {
+                // Unreachable by construction (`set_params` refused the handoff
+                // without the symbol); refuse loudly rather than run the node on
+                // its defaults with the graph's values dropped. The context is
+                // consumed either way: the plain init takes the Box so no state
+                // is leaked, and its result is discarded for the error below.
+                let _ = unsafe { (self.init_fn)(ctx_ptr) };
+                return Err(TransportError::NodeError {
+                    node_id: self.diag_label.clone(),
+                    reason: "params were handed over but the node library exports no \
+                             cerulion_node_init_with_params symbol"
+                        .to_string(),
+                });
+            }
+        };
         if handle == 0 {
             // Pull the cdylib's
             // detailed error message instead of returning the bare
@@ -6596,7 +6820,8 @@ fn safe_utf8_prefix(s: &str, max_bytes: usize) -> &str {
 /// edit distance — the "did you mean" half of the info-JSON unknown-key
 /// warn. `legal` is a compile-time non-empty set; ties resolve to the
 /// earlier entry (stable, deterministic). Cold path (node load only).
-fn nearest_legal_key<'a>(unknown: &str, legal: &[&'a str]) -> &'a str {
+/// `pub(crate)`: `graph::params` reuses it for the unknown-param suggestion.
+pub(crate) fn nearest_legal_key<'a>(unknown: &str, legal: &[&'a str]) -> &'a str {
     fn levenshtein(a: &str, b: &str) -> usize {
         let a: Vec<char> = a.chars().collect();
         let b: Vec<char> = b.chars().collect();
@@ -8226,6 +8451,7 @@ mod tests {
             policy: None,
             tick_within_ms: None,
             throttle_ms: None,
+            params: Vec::new(),
             sync_capture: None,
         };
         assert_eq!(info.input_meta.len(), 1);

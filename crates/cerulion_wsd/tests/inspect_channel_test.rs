@@ -74,6 +74,10 @@ const SLEEPER_PID_MARKER: &str = "CER_WSD_SLEEPER_PID=";
 
 /// The fixture cdylib the production arms inspect.
 const FIXTURE_CRATE: &str = "test_node_cdylib";
+/// A raw-FFI fixture whose info JSON declares a param but which exports no
+/// `cerulion_node_init_with_params` symbol: the host refuses it when its info
+/// is read, and the helper must refuse it the same way.
+const DECLARES_WITHOUT_SYMBOL_CRATE: &str = "test_node_params_no_symbol_cdylib";
 
 // ───────────────────────────────────────────────────────────────────────────
 // The self-re-exec probe
@@ -275,6 +279,10 @@ fn a_closed_stderr_is_refused_before_the_document_fd_is_taken() {
 /// its parent: a harness that cannot locate itself is a broken harness, never
 /// a reason to report two green pins.
 fn fixture_cdylib() -> PathBuf {
+    fixture_cdylib_of(FIXTURE_CRATE)
+}
+
+fn fixture_cdylib_of(fixture_crate: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary must know its own path");
     let dir = exe
         .parent()
@@ -287,7 +295,7 @@ fn fixture_cdylib() -> PathBuf {
     } else {
         dir
     };
-    let file = cerulion_cli_engine::graph_cmd::cdylib_name(FIXTURE_CRATE);
+    let file = cerulion_cli_engine::graph_cmd::cdylib_name(fixture_crate);
     // The SAME profile as this test binary, and only that one: a release
     // fixture must not satisfy a debug run (or the reverse), or the arm would
     // inspect an artifact built under different settings from the binary it
@@ -300,7 +308,7 @@ fn fixture_cdylib() -> PathBuf {
         return candidate;
     }
     panic!(
-        "fixture cdylib `{file}` not found at {} — run `cargo build -p {FIXTURE_CRATE}` \
+        "fixture cdylib `{file}` not found at {}: run `cargo build -p {fixture_crate}` \
          first, under the SAME CARGO_TARGET_DIR and profile as this test (a sibling \
          profile's copy is deliberately not accepted). This arm runs the SHIPPED binary \
          and cannot be skipped: libtest discards a passing test's stderr, so a skip \
@@ -310,9 +318,18 @@ fn fixture_cdylib() -> PathBuf {
 }
 
 fn inspect_node_output(fixture: &std::path::Path) -> std::process::Output {
+    inspect_node_output_with_env(fixture, &[])
+}
+
+/// [`inspect_node_output`] with extra environment for the child.
+fn inspect_node_output_with_env(
+    fixture: &std::path::Path,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_cerulion-wsd"))
         .arg("--inspect-node")
         .arg(fixture)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -369,6 +386,107 @@ fn the_production_child_writes_the_whole_document_and_only_the_document() {
         format!("{from_child:?}"),
         format!("{from_engine:?}"),
         "the subprocess document and the in-process inspection must describe the same node"
+    );
+}
+
+/// The helper applies the host's FULL read, not only the parse: a library
+/// whose info declares params it has no symbol to receive is refused by
+/// `DylibNodeEntry::info()`, and the parent only ever sees the raw document,
+/// so the helper must refuse it too, or a daemon's `graph validate` would pass
+/// a library `graph run` refuses.
+#[test]
+fn a_library_that_declares_params_without_the_symbol_is_refused_by_the_helper() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = inspect_node_output(&fixture);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "a declared param with no symbol to deliver it must not inspect cleanly (stdout: {stdout:?})"
+    );
+    assert!(
+        stderr.contains("--inspect-node")
+            && stderr.contains("declares params (gain)")
+            && stderr.contains("cerulion_node_init_with_params"),
+        "the refusal must name the symbol and the params on stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "the document channel must stay empty when the library is refused: {stdout:?}"
+    );
+}
+
+/// The parent parses the forwarded document again and logs its own
+/// diagnostics, so the child's check must not log them too: an unknown key
+/// would otherwise reach the operator twice, the second time inside the
+/// child's relayed stderr.
+#[test]
+fn the_child_does_not_log_the_unknown_key_warning_the_parent_logs() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = inspect_node_output_with_env(
+        &fixture,
+        &[("CER_INFO_UNKNOWN_KEY", "1"), ("RUST_LOG", "warn")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "an unknown key is a warning, never a refusal: {} / {stderr}",
+        out.status
+    );
+    assert_eq!(
+        stdout, r#"{"inputs":[],"outputs":[],"polciy":"x"}"#,
+        "the document is forwarded as read"
+    );
+    assert!(
+        !stderr.contains("unknown key") && !stderr.contains("polciy"),
+        "the child must leave the unknown-key warning to the parent: {stderr:?}"
+    );
+}
+
+/// Only WARNINGS are left to the parent. Info that does not parse is refused
+/// in the child, so the parent never gets a document to log it from: the
+/// host's ERROR for it must still reach the child's stderr.
+#[test]
+fn the_child_still_logs_the_error_for_unparseable_info() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = inspect_node_output_with_env(&fixture, &[("CER_INFO_MALFORMED", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "unparseable info is refused: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("ERROR") && stderr.contains("returned unparseable JSON"),
+        "the host's ERROR event must reach stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no document for refused info: {stdout:?}"
+    );
+}
+
+/// The child forwards the document that PASSED the checks, from one read. The
+/// fixture, under `CER_INFO_FIRST_READ_PLAIN=1`, answers its first info call
+/// with a plain document the host accepts and every later call with one that
+/// declares a param it cannot receive. A child that checked one read and
+/// forwarded a second would hand the parent the declaring document, which the
+/// run refuses; this one hands it the plain document it checked.
+#[test]
+fn the_child_forwards_the_document_it_checked_not_a_second_read() {
+    let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
+    let out = inspect_node_output_with_env(&fixture, &[("CER_INFO_FIRST_READ_PLAIN", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the first read is a plain document the host accepts: {} / {stderr}",
+        out.status
+    );
+    assert_eq!(
+        stdout, r#"{"inputs":[],"outputs":[]}"#,
+        "the document on the pipe must be the one that passed the checks"
     );
 }
 

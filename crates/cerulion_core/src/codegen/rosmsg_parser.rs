@@ -16,7 +16,7 @@
 //! int64, uint64, float32, float64, string, pkg/MsgType, T[], T[N]
 
 use super::schema::{
-    ConstantDef, DefaultLiteral, FieldDef, FieldType, MessageSchema, ScalarLiteral,
+    ConstantDef, DefaultLiteral, FieldBounds, FieldDef, FieldType, MessageSchema, ScalarLiteral,
 };
 
 /// Parse a ROS2 .msg file content into a MessageSchema.
@@ -185,7 +185,8 @@ fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantD
     if !is_valid_constant_name(name) {
         return Err(format!("invalid constant name: {name}"));
     }
-    let field_type = parse_ros_type(type_token)?;
+    // A constant keeps no bounds: `string_bound` checks its value below.
+    let field_type = parse_ros_type(type_token, &mut FieldBounds::default())?;
     if !is_scalar_or_string(&field_type) {
         return Err(format!(
             "constant {name}: type {type_token} is not a primitive type or a string"
@@ -237,12 +238,14 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
         });
     }
 
-    let field_type = parse_ros_type(ros_type).map_err(|e| ParseError::InvalidType {
-        line_num,
-        message: e,
-    })?;
+    let mut bounds = FieldBounds::default();
+    let field_type =
+        parse_ros_type(ros_type, &mut bounds).map_err(|e| ParseError::InvalidType {
+            line_num,
+            message: e,
+        })?;
 
-    let mut field = FieldDef::new(field_name, field_type);
+    let mut field = FieldDef::new(field_name, field_type).with_bounds(bounds);
 
     // Everything after the name is the default value (`float64 w 1`,
     // `string s "a b"`, `int32[] v [1, 2]`); the comment is already cut.
@@ -559,7 +562,9 @@ fn parse_string_literal(token: &str, kind: ValueKind) -> Result<String, String> 
     Err(format!("unterminated string {}: {token}", kind.word()))
 }
 
-fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
+/// Parse one `.msg` type token. ROS 2 upper bounds (`T[<=N]`,
+/// `string<=N`) land in `bounds`; they do not change the wire type.
+fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType, String> {
     // Check for array types: T[], T[N], or bounded T[<=N]
     if let Some(bracket_pos) = ros_type.find('[') {
         if !ros_type.ends_with(']') {
@@ -569,7 +574,7 @@ fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
         let base_type = &ros_type[..bracket_pos];
         let length_str = &ros_type[bracket_pos + 1..ros_type.len() - 1];
 
-        let element_type = parse_ros_type(base_type)?;
+        let element_type = parse_ros_type(base_type, bounds)?;
 
         if length_str.is_empty() {
             // Dynamic array: T[]
@@ -579,9 +584,10 @@ fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
         } else if let Some(bound_str) = length_str.strip_prefix("<=") {
             // Bounded array: T[<=N] (ROS2 IDL). The bound is an upper
             // limit, not a fixed length — wire-wise it is a dynamic array.
-            bound_str
+            let bound = bound_str
                 .parse::<usize>()
                 .map_err(|_| format!("invalid array bound: {length_str}"))?;
+            bounds.max_elements = Some(bound);
             return Ok(FieldType::DynamicArray {
                 element_type: Box::new(element_type),
             });
@@ -600,15 +606,19 @@ fn parse_ros_type(ros_type: &str) -> Result<FieldType, String> {
     // Bounded string: string<=N (ROS2 IDL). The bound is an upper limit —
     // wire-wise it is an ordinary variable-length string.
     if let Some(bound_str) = ros_type.strip_prefix("string<=") {
-        bound_str
+        let bound = bound_str
             .parse::<usize>()
             .map_err(|_| format!("invalid string bound: {ros_type}"))?;
+        bounds.max_string_bytes = Some(bound);
         return Ok(FieldType::String);
     }
+    // A `wstring` bound counts UTF-16 code units, not the UTF-8 bytes the
+    // wire carries, so it is kept apart from the `string` one.
     if let Some(bound_str) = ros_type.strip_prefix("wstring<=") {
-        bound_str
+        let bound = bound_str
             .parse::<usize>()
             .map_err(|_| format!("invalid string bound: {ros_type}"))?;
+        bounds.max_wstring_units = Some(bound);
         return Ok(FieldType::String);
     }
 
@@ -876,9 +886,10 @@ string<=64 name
 int32[<=8] ids
 wstring<=10 wname
 string<=4[<=3] tags
+wstring<=2[<=5] wtags
 "#;
         let schema = parse_rosmsg(msg, "Bounded", None).unwrap();
-        assert_eq!(schema.fields.len(), 4);
+        assert_eq!(schema.fields.len(), 5);
         assert_eq!(schema.fields[0].field_type, FieldType::String);
         assert!(matches!(
             &schema.fields[1].field_type,
@@ -889,6 +900,31 @@ string<=4[<=3] tags
             &schema.fields[3].field_type,
             FieldType::DynamicArray { element_type } if **element_type == FieldType::String
         ));
+        // The bounds are kept beside the wire type.
+        let b = |max_elements, max_string_bytes, max_wstring_units| FieldBounds {
+            max_elements,
+            max_string_bytes,
+            max_wstring_units,
+        };
+        let kept: Vec<FieldBounds> = schema.fields.iter().map(|f| f.bounds).collect();
+        assert_eq!(
+            kept,
+            [
+                b(None, Some(64), None),
+                b(Some(8), None, None),
+                b(None, None, Some(10)),
+                b(Some(3), Some(4), None),
+                b(Some(5), None, Some(2)),
+            ]
+        );
+        // The hash is the unbounded twin's: bounds are not wire shape.
+        let twin = parse_rosmsg(
+            "string name\nint32[] ids\nwstring wname\nstring[] tags\nwstring[] wtags\n",
+            "Bounded",
+            None,
+        )
+        .unwrap();
+        assert_eq!(schema.schema_hash(), twin.schema_hash());
     }
 
     /// Malformed qualified references are rejected, not silently mangled.

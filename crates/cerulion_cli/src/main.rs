@@ -471,6 +471,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report,
         tolerance,
         strict_state,
+        allow_param_change,
         record_out,
         ..
     } = action
@@ -489,6 +490,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         report: report.clone(),
         tolerance: tolerance.clone(),
         strict_state: *strict_state,
+        allow_param_change: *allow_param_change,
         record_out: record_out.clone(),
     })
 }
@@ -521,6 +523,7 @@ fn is_resim_family(action: &BagAction) -> bool {
             report,
             tolerance,
             strict_state,
+            allow_param_change,
             record_out,
             ..
         } => {
@@ -552,6 +555,7 @@ fn is_resim_family(action: &BagAction) -> bool {
                 || report.is_some()
                 || tolerance.is_some()
                 || *strict_state
+                || *allow_param_change
                 || record_out.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
@@ -626,6 +630,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             report,
             tolerance,
             strict_state,
+            allow_param_change,
             record_out,
         } => {
             // A `--resim` invocation never reaches here — `main`
@@ -644,6 +649,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     report,
                     tolerance,
                     strict_state,
+                    allow_param_change,
                     record_out,
                 },
             )
@@ -1679,6 +1685,8 @@ fn run(cli: Cli) -> CliResult<()> {
                             // `node run` is a monolith, which mints no
                             // trace ring on any path, so there is nothing to decline.
                             false,
+                            // The temp graph declares no launch arguments.
+                            &[],
                         );
 
                         // Clean up temporary graph
@@ -1736,6 +1744,17 @@ fn run(cli: Cli) -> CliResult<()> {
                             );
                         }
                     }
+                    // The `#[param]` table comes from the BUILT library's node
+                    // info, the document a graph's `params:` is checked against.
+                    let declared = cerulion_cli_engine::node_params_info::declared_params(
+                        &ws.root,
+                        &node_type,
+                        &cerulion_cli_engine::node_inspector::InProcessInspector,
+                    );
+                    print!(
+                        "{}",
+                        cerulion_cli_engine::node_params_info::render_params(&node_type, &declared)
+                    );
                     Ok(())
                 }
             }
@@ -1750,6 +1769,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 }
                 GraphAction::Run {
                     name,
+                    launch_args,
                     time_source,
                     no_validate,
                     release,
@@ -1767,6 +1787,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     auto_partition,
                     yes,
                 } => {
+                    // The typed parse of the override words. Their shape was
+                    // checked at clap parse (`check_override_word`), so a
+                    // malformed word was a usage error before this point and
+                    // this parse of the same words reads each value's type.
+                    let launch_args =
+                        cerulion_cli_engine::graph_launch_args::parse_overrides(&launch_args)?;
                     let started = std::time::Instant::now();
                     let handler = setup_ctrlc_handler();
                     telemetry::emit(
@@ -1817,6 +1843,7 @@ fn run(cli: Cli) -> CliResult<()> {
                         // `--no-rings` — decline this run's per-rank
                         // scheduler-trace rings and its window recorder.
                         no_rings,
+                        &launch_args,
                     );
                     telemetry::emit(
                         telemetry_events::GRAPH_RUN_COMPLETED,
@@ -2066,99 +2093,32 @@ fn run(cli: Cli) -> CliResult<()> {
                 connect,
                 listen,
                 scan,
+                show_types,
             } => {
-                // LOCAL topics print FIRST/instantly, so a slow or
-                // failing remote query never delays or hides them.
-                //
-                // A LOCAL `*/data` service that is really a
-                // MIRROR of a remote robot (its canonical name is in the
-                // `/__cerulion/mirrors` provenance registry) must NOT present as a
-                // second LOCAL topic (the "one data source = one topic"
-                // decision). Gather provenance (best-effort; instant on a desk with
-                // no live mirror) and PARTITION the local enumeration before
-                // printing: genuine-local topics stay under LOCAL, mirrored ones
-                // fold into the REMOTE section as `● streaming` rows attributed to
-                // their origin robot.
-                //
-                // The framework's own channels (`/bagd/status` while a
-                // recording runs, anything under `/__cerulion/`) are HIDDEN
-                // from this LOCAL section by default and named by a count
-                // line; `--all` shows them with an `internal` marker. REMOTE
-                // rows (network and mirror alike) are never filtered. The renderer is the
-                // engine's oracle-tested `render_local_topics_section`; the
-                // binary prints its string verbatim.
-                let topics = topic_cmd::topic_list()?;
-                let mirrors = topic_cmd::gather_mirror_identities()?;
-                let (genuine_local, streaming) =
-                    topic_cmd::partition_local_topics(topics, &mirrors);
-                print!(
-                    "{}",
-                    topic_cmd::render_local_topics_section(&genuine_local, all)
-                );
-                // Automagic: remote discovery runs BY DEFAULT (the mDNS /
-                // cache / hostname ladder), unpaired robots on the LAN show
-                // up with no flags. `--no-network` skips it (scripts / CI / offline).
-                // The options are built by the ENGINE's unit-pinned builder
-                // (`remote_discovery_options` — the
-                // automagic default lives there, not in an untested literal
-                // here). Because remote discovery is the DEFAULT, a
-                // session/query failure must NOT fail the whole command (the
-                // LOCAL list is already printed) — it is a LOUD note + exit 0.
-                // Never a silent empty, never a fake-success.
-                //
-                // The mirror-streaming rows are LOCAL knowledge (read from
-                // SHM, not the network), so they must ALWAYS render — even under
-                // `--no-network` and even when the network query fails — or a
-                // partitioned-out mirror would vanish entirely. `remote_rendered`
-                // tracks whether an Ok remote render already folded them in.
-                let mut remote_rendered = false;
-                if let Some(opts) = topic_cmd::remote_discovery_options(no_network, connect, listen)
-                {
-                    // Discovery rung 4: `--scan` (opt-in) appends the unicast
-                    // subnet-sweep rung to the discovery ladder. This flag is the
-                    // SOLE producer of a `true` scan — the structural guarantee
-                    // that the sweep never fires on a default run (a horizontal
-                    // SYN sweep reads as port-scan recon to corporate IDS).
-                    match topic_cmd::query_remote_topics_with_scan(&opts, scan) {
-                        Ok(disc) => {
-                            print!(
-                                "{}",
-                                topic_cmd::render_remote_topics_section_with_mirrors(
-                                    &disc,
-                                    opts.has_endpoints(),
-                                    &streaming
-                                )
-                            );
-                            remote_rendered = true;
-                        }
-                        Err(e) => {
-                            // Loud note — the remote half is best-effort;
-                            // the local topics already printed. `--no-network`
-                            // skips this query entirely.
-                            // One line, the shape of the empty-success
-                            // `remote:` line (no header with no rows under it).
-                            // The ENGINE renders it (exact oracle there, the
-                            // docs quote that sentence); printed verbatim, the
-                            // newline is part of the returned string.
-                            eprint!("{}", topic_cmd::render_remote_discovery_unavailable(&e));
-                        }
-                    }
-                }
-                // Render the LOCAL mirror-streaming rows if an Ok remote
-                // render did not already fold them in (--no-network, or a remote
-                // query failure). A mirror is REMOTE regardless of the network
-                // query, since its provenance is read from local SHM.
-                if !remote_rendered && !streaming.is_empty() {
-                    print!(
-                        "{}",
-                        topic_cmd::render_remote_topics_section_with_mirrors(
-                            &topic_cmd::RemoteDiscovery::empty(),
-                            false,
-                            &streaming
-                        )
-                    );
-                }
-                Ok(())
+                // The engine owns the whole listing flow (local first, the
+                // mirror fold, the best-effort remote half) for the plain and
+                // the `-t` listing alike; the binary hands it the parsed flags.
+                // The remote options come from the engine's unit-pinned
+                // builder, which holds the automagic default. Only `-t`
+                // names types, so only `-t` looks for the workspace.
+                let ws = if show_types {
+                    discover_optional_workspace()?
+                } else {
+                    None
+                };
+                topic_cmd::introspect::print_topic_list(
+                    all,
+                    if show_types {
+                        topic_cmd::introspect::TypeColumn::Shown
+                    } else {
+                        topic_cmd::introspect::TypeColumn::Hidden
+                    },
+                    topic_cmd::remote_discovery_options(no_network, connect, listen),
+                    scan,
+                    ws.as_ref().map(|w| w.schemas_dir.as_path()),
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
             }
             TopicAction::Info { topic, local } => {
                 // Pass the workspace `schemas/` dir (when in a
@@ -2625,6 +2585,7 @@ fn run(cli: Cli) -> CliResult<()> {
                                     // path (the gating clock is wall-driven), so
                                     // there is nothing to decline.
                                     false, // no_rings
+                                    &[],   // launch_args: the generated graph declares none
                                 );
                                 telemetry::emit(
                                     telemetry_events::GRAPH_RUN_COMPLETED,
@@ -2685,6 +2646,18 @@ fn ros_attach_confirm(preview: &str) -> CliResult<bool> {
 fn discover_workspace() -> CliResult<CerulionWorkspace> {
     let cwd = std::env::current_dir()?;
     CerulionWorkspace::discover(&cwd)
+}
+
+/// The workspace for a verb that also works outside one: `None` when the
+/// current directory is in no workspace, and any other discovery failure (a
+/// workspace `Cargo.toml` that cannot be read) returned, so the verb never
+/// quietly drops the workspace types it was asked to name.
+fn discover_optional_workspace() -> CliResult<Option<CerulionWorkspace>> {
+    match discover_workspace() {
+        Ok(ws) => Ok(Some(ws)),
+        Err(cerulion_cli_engine::error::CliError::WorkspaceNotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// `cerulion viz [TOPIC…] [--robot NAME] [--detach]` — the
@@ -4066,6 +4039,7 @@ mod login_gate_exemption_tests {
                 connect: Vec::new(),
                 listen: Vec::new(),
                 scan: false,
+                show_types: false,
             },
         }));
         assert!(command_needs_identity(&Commands::Graph {
@@ -4903,6 +4877,9 @@ mod resim_flag_mapping_tests {
             report: Some(PathBuf::from("/tmp/r.json")),
             tolerance: Some(PathBuf::from("/tmp/t.yaml")),
             strict_state,
+            // The other bool that is inert on a step-0 bag rides the same
+            // switch, so both arms below cover it.
+            allow_param_change: strict_state,
             record_out: Some(PathBuf::from("/tmp/o.mcap")),
         }
     }
@@ -4933,6 +4910,10 @@ mod resim_flag_mapping_tests {
             f.strict_state,
             "`--strict-state` must survive the variant -> PlayFlags mapping"
         );
+        assert!(
+            f.allow_param_change,
+            "`--allow-param-change` must survive the variant -> PlayFlags mapping"
+        );
     }
 
     #[test]
@@ -4941,6 +4922,7 @@ mod resim_flag_mapping_tests {
         // every bool would pass the arm above.
         let f = play_flags_of(&play(false, false)).expect("a `bag play` maps");
         assert!(!f.strict_state);
+        assert!(!f.allow_param_change);
         assert!(!f.verify);
         assert!(!f.repeat);
         assert!(f.rate.is_none());
@@ -4986,6 +4968,7 @@ mod is_resim_family_tests {
         report: Option<PathBuf>,
         tolerance: Option<PathBuf>,
         strict_state: bool,
+        allow_param_change: bool,
         record_out: Option<PathBuf>,
     }
 
@@ -5002,6 +4985,7 @@ mod is_resim_family_tests {
             report: f.report,
             tolerance: f.tolerance,
             strict_state: f.strict_state,
+            allow_param_change: f.allow_param_change,
             record_out: f.record_out,
         }
     }
@@ -5098,6 +5082,13 @@ mod is_resim_family_tests {
                 "--strict-state",
                 play(Flags {
                     strict_state: true,
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--allow-param-change",
+                play(Flags {
+                    allow_param_change: true,
                     ..Flags::default()
                 }),
             ),

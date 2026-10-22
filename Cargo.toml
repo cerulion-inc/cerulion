@@ -77,6 +77,12 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # Four #[param] fields across the cdylib FFI: specs in the info JSON,
+    # values through the optional cerulion_node_init_with_params symbol.
+    "crates/test_fixtures/test_node_macro_param_cdylib",
+    # Raw-FFI cdylib whose info JSON declares a param but which exports no
+    # cerulion_node_init_with_params symbol; the host must refuse it at info time.
+    "crates/test_fixtures/test_node_params_no_symbol_cdylib",
     # A period cdylib with an `#[input(accumulate)]` input, for the
     # in-process vs cdylib parity pin of the keep-every-message read.
     "crates/test_fixtures/test_node_macro_accumulate_cdylib",
@@ -305,6 +311,10 @@ members = [
     # inverted whole-build tree `cargo tree -e normal -i axum` (empty on a default
     # build).
     "crates/cerulion_accountd",
+    # The Robot Context Protocol daemon: an MCP server over the live robot
+    # graph. Hosts streamable HTTP on hyper (already in the default build),
+    # not axum, so its only new crates are rmcp and its small helpers.
+    "crates/cerulion_rcpd",
 ]
 # default-members: the LEAN build set — every workspace member EXCEPT the
 # heavy-tree crates: the `cerulion_viz/*` crates (the `rerun` SDK, ~39 crates) AND
@@ -348,6 +358,9 @@ default-members = [
     "crates/cerulion_wire",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
+    # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
+    # default build: its HTTP side runs on hyper, already here.
+    "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via

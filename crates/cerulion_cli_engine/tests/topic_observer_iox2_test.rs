@@ -52,8 +52,7 @@ fn unique_topic(tag: &str) -> String {
 }
 
 /// Build a wire frame for a `std_msgs/String`-shaped payload that
-/// `topic_echo`'s `decode_string_payload` pretty-prints as
-/// `std_msgs/String: "<s>"`.
+/// `topic_echo` prints as the YAML line `data: "<s>"`.
 ///
 /// Layout: 32-byte [`WireHeader`] (schema hash = the pinned
 /// `std_msgs/String` hash so echo recognizes it), then the payload — an
@@ -390,7 +389,7 @@ fn echo_displays_all_distinct_notified_frames_exactly_once() {
 
     // Hand oracle: EVERY distinct payload appears EXACTLY once.
     for seq in 0..N {
-        let needle = format!("std_msgs/String: \"obs-notify-{seq}\"");
+        let needle = format!("data: \"obs-notify-{seq}\"");
         let count = out.matches(&needle).count();
         assert_eq!(
             count, 1,
@@ -399,7 +398,7 @@ fn echo_displays_all_distinct_notified_frames_exactly_once() {
         );
     }
     assert_eq!(
-        out.matches("std_msgs/String: \"obs-notify-").count(),
+        out.matches("data: \"obs-notify-").count(),
         N as usize,
         "exactly the {N} published frames must display; got:\n{out}"
     );
@@ -505,7 +504,7 @@ fn echo_displays_non_notifying_publisher_via_timeout_drain() {
     // NO event was ever fired — the timeout drain accumulates ALL frames
     // (a drain-to-latest regression would show only the newest per drain).
     for seq in 0..N {
-        let needle = format!("std_msgs/String: \"obs-drain-{seq}\"");
+        let needle = format!("data: \"obs-drain-{seq}\"");
         let count = out.matches(&needle).count();
         assert_eq!(
             count, 1,
@@ -514,7 +513,7 @@ fn echo_displays_non_notifying_publisher_via_timeout_drain() {
         );
     }
     assert_eq!(
-        out.matches("std_msgs/String: \"obs-drain-").count(),
+        out.matches("data: \"obs-drain-").count(),
         N as usize,
         "exactly the {N} published frames must display; got:\n{out}"
     );
@@ -677,8 +676,8 @@ fn echo_gap_marker_accounts_for_queue_overflow_loss() {
         // The anchor + the newest frame must have displayed. Absence is the
         // slow-attach flavor of the same VM-stall class (echo subscribed or
         // drained too late) — non-probative, retry on a fresh topic.
-        let anchors_displayed = out.contains("std_msgs/String: \"obs-ovf-0\"")
-            && out.contains(&format!("std_msgs/String: \"obs-ovf-{LAST_SEQ}\""));
+        let anchors_displayed = out.contains("data: \"obs-ovf-0\"")
+            && out.contains(&format!("data: \"obs-ovf-{LAST_SEQ}\""));
         if !anchors_displayed {
             eprintln!(
                 "attempt {attempt}/{MAX_ATTEMPTS}: display anchors missing \
@@ -691,11 +690,11 @@ fn echo_gap_marker_accounts_for_queue_overflow_loss() {
         // every gap marker's N and every displayed frame; published ==
         // displayed + sum(gaps) EXACTLY. This is the feature-correctness
         // half and is never deferred to a retry.
-        let displayed = out.lines().filter(|l| l.starts_with("seq=")).count();
+        let displayed = out.lines().filter(|l| l.starts_with("# seq=")).count();
         let gap_total: u64 = out
             .lines()
             .filter_map(|l| {
-                l.strip_prefix("[gap: ")
+                l.strip_prefix("# [gap: ")
                     .and_then(|rest| rest.split(' ').next())
                     .and_then(|n| n.parse::<u64>().ok())
             })
@@ -1063,7 +1062,7 @@ fn echo_under_a_progress_free_event_flood_shows_no_phantom_frames_but_still_show
     // Hand oracle: EXACTLY the one real frame, despite tens of thousands of
     // events. An event is not a message.
     assert_eq!(
-        out.matches("std_msgs/String: \"real\"").count(),
+        out.matches("data: \"real\"").count(),
         1,
         "the one real frame must display exactly once under the flood; saw:\n{out}"
     );

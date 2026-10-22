@@ -1,0 +1,11 @@
+error: `min` is not accepted on the String param `frame_id`; bounds apply to integer and float params only
+  --> tests/ui/param_bounds_on_string.rs:10:42
+   |
+10 |     #[param(default = "base_link", min = 0)]
+   |                                          ^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_bounds_on_string.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^

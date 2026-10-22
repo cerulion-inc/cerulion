@@ -1205,8 +1205,14 @@ jobs:
       # ring (through the QUIC link's rustls) compiles C in its build script,
       # so the check needs the aarch64 C compiler that release-artifacts.yml
       # installs for the same target.
+      # The hosted image ships a packages.microsoft.com apt source; apt-get
+      # update exits 100 when that source refuses or fails its signature check,
+      # even though both packages come from the Ubuntu archives. Deleting its
+      # list first keeps that source out of the update; rm -f exits 0 when the
+      # file is absent.
       - name: Install aarch64 C compiler
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
@@ -1605,6 +1611,9 @@ jobs:
 
       - name: Obstacle avoidance source regressions
         run: cd examples/obstacle_avoidance && cargo test -p laser_scanner -p safety_controller --lib -- --test-threads=1
+
+      - name: Simulated arm plant (examples/aspire_arm)
+        run: cd examples/aspire_arm && cargo test -p arm_sim --lib
 
   # The Go2 demo workspace (examples/go2) is ISOLATED: not a member of
   # the root cargo workspace, and deliberately skipped by `examples` (its
@@ -3725,6 +3734,8 @@ jobs:
   # mint ISOLATED per-test SHM roots via `TransportManager::init_for_test`
   # (their own headers say "parallel-safe without `#[serial]`"), which is the
   # same property that lets the `cerulion_connectd` step above run parallel.
+  # `cerulion_rcpd` does the same (`init_for_test` per test, plus a
+  # 127.0.0.1:0 HTTP listener).
   # `cerud` binds per-test Unix sockets under a tempdir; `cerulion_accountd`
   # binds 127.0.0.1:0; `cerulion_link` runs loopback iroh with per-test
   # identities; `cerulion_pairing` / `cerulion-wire` / `cerulion_mdns` are pure
@@ -3904,6 +3915,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_rcpd tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        run: cargo test -p cerulion_rcpd
+      - name: selection marker, cerulion_rcpd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_rcpd (selected: $SELECTED)"
       - name: cerulion_remoted tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
         run: cargo test -p cerulion_remoted
@@ -3968,7 +3988,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_tf (selected: $SELECTED)"
       # The ONE non-`cargo test` step here, and it is load-bearing.
-      # `cerulion_wsd`'s two production `--inspect-node` arms run the SHIPPED
+      # `cerulion_wsd`'s three production `--inspect-node` arms run the SHIPPED
       # binary against a real node cdylib, and a cdylib is opened with
       # `libloading` at RUNTIME — `cargo tree -p cerulion_wsd -i
       # test_node_cdylib` matches no package, so nothing `cargo test -p
@@ -3979,9 +3999,9 @@ jobs:
       # passing test's stderr: a skip reports `ok` and proves nothing — the
       # "a pin that cannot fail a PR is not a gate" class this job's header
       # names. Default profile and target dir, matching the `cargo test` below.
-      - name: Build the cerulion_wsd --inspect-node fixture cdylib
+      - name: Build the cerulion_wsd --inspect-node fixture cdylibs
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
-        run: cargo build -p test_node_cdylib
+        run: cargo build -p test_node_cdylib -p test_node_params_no_symbol_cdylib
       - name: cerulion_wsd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wsd')
         run: cargo test -p cerulion_wsd

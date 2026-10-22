@@ -15,7 +15,7 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 ## 1. `cerulion bag play --resim`: exit-code contract
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
-[--strict-state] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
+[--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -254,6 +254,26 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
   derived partition).
+- **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
+  `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
+  with no overrides, so every verb sees the resolved graph. The resolution is
+  `cerulion_core::graph::launch_args` (pure): it lifts `args:` out of the YAML tree and
+  substitutes `${name}` into `prefix`, output `topic`, input `source` and `params:` values
+  before `GraphConfig` deserializes, so `GraphConfig` carries no `args` field and keeps
+  `deny_unknown_fields`. The words are checked by a clap value parser at parse (a word that is
+  not `name:=value` is a usage error, which keeps the bare `--record` positional contract), and
+  the run's embedded config is the resolved graph, so the recorded `graph.yaml` has no `args:`
+  and no reference, and a resim resolves nothing: a document with no `args:` and no overrides is
+  read as written, `$` included, so resolution is a fixed point (Replay = Live over a `$$`
+  escape or a `$$` in an override value). The parse returns an `ArgProvenance` beside the
+  config (which argument fed which whole-reference `params:` value); `graph_read_raw_with_launch_args`
+  threads it to `graph_params_check`, whose refusal names the argument and the override.
+  `graph_edit` wires from `parse_graph_as_written` (the output's `topic` text with its
+  reference) while judging and guarding on the resolved config. `graph run --yes` under
+  overrides that change the wiring (`graph_launch_args::overrides_change_wiring`, judged on the
+  bytes read, before the prefix fill) runs the pre-flight with saving off, so it never writes;
+  when the outcome would have written (`InMemory`) the `--yes` run is refused, and when the file
+  already carries exactly the derived partition (`AlreadyCurrent`) the run proceeds.
 
 ### Engine library migration from 1.0.0
 
@@ -669,6 +689,15 @@ empty, never a hang.
   malformed-frame storm. The load-bearing test assertion is the pacing counter
   (`observer_pacing_engaged_count`), never a CPU percentage; CPU gates fail open on a
   loaded runner.
+- **Echo renders through the message YAML codec** (`cerulion_core::dynamic::
+  message_to_yaml_with`, arrays cut at `--truncate-length`), local walker first, then
+  the remote-seeded one. Every line that is not the message is a `#` comment and each
+  frame ends with `---`, so a frame block is valid YAML and an uncut message is valid
+  input to anything that reads the codec. There are no per-type printers: one render
+  path means one YAML form. The 2000-line cap (`ECHO_MAX_LINES`) is passed to the codec
+  as `YamlEncodeOptions::max_lines`, so the encoder stops writing at the cap (a small
+  frame that names a huge zero-default form costs 2000 lines of work, not the whole form)
+  and ends the cut frame with a column-0 `!truncated` line that no YAML reader accepts.
 
 ---
 
@@ -954,6 +983,7 @@ own binary.
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
 | `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |
@@ -962,6 +992,8 @@ own binary.
 | `discovery_ladder_test.rs` | Hermetic injected-rung ladder pins | no | none |
 | `topic_network_live_test.rs` | Live loopback remote-topic e2e (real zenoh sessions, no shared memory) | no | none |
 | `mdns_live_test.rs` | Real-multicast mDNS loopback | `#[ignore]` (hardware only) | none |
+| `topic_type_iox2_test.rs` | `topic type` error arms (silent topic, unnamed hash), the retry past a sample-less event, the typed listing's mirror recheck, its batches (more topics than one batch holds) and a topic that sends nothing, and `topic bw` on a publisher slower than one report a second (stamped apart from its send delay) and on two publishers whose clocks disagree | yes (process-global transport singleton) | none |
+| `topic_types_network_live_test.rs` | `topic list -t` / `find` remote typing from a loopback robot's catalog, and the `topic type` remote-walker ladder | no | none |
 | `topic_observer_iox2_test.rs` | `topic echo`/`hz` observer loops: multiplicity oracle, timeout drain, rate-line math, notify-flood pacing counter | yes (process-global transport singleton) | none |
 | `viz_attach_convergence_test.rs` | Viz attach convergence against a scripted fake daemon (served-request count is the oracle; deadline arm asserts the error KIND, never a wall band) | no | none |
 | `convergence_adoption_test.rs` | Structural walk: the observer seams adopt the converged query verbs | no | none |
@@ -993,6 +1025,8 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
 | `tests/viz_interrupt_e2e_test.rs` | A SIGINT'd viz attach exits 0 with no absence-claim vocabulary | no | none |
 | `tests/ros2_run_e2e_test.rs` | Both `cerulion ros2` verbs over the real binary with a fixture `ros2` first on PATH: exit-code INHERITANCE through `exec()` (42 → 42) on EACH verb, LEADING-hyphen verbatim forwarding (the raw-argv intercept pin), the heap-hook auto-inject + kill switch + explicit preload, the staged env + ament symlink, and the 69 / 127 / 2 contract; plus the `--adopt-take` refusal over the real binary (both verbs, exit 69, `ros2` never exec'd, the cause and the direct-launch recipe on stderr, with a flagless control that still execs; and that the refusal is decided BEFORE any staging, so it creates nothing) and the pin that `cerulion ros2 --help` says the flag is REFUSED rather than that it arms the child; no ROS 2 needed | no (per-child env only) | none |
+| `tests/graph_launch_args_e2e_test.rs` | Launch arguments over the real binary: a graph with `args:` referenced in `prefix`, an output `topic`, an input `source` and `params:` runs once with defaults and once with `name:=value` overrides; the delivered topic names and the recorded frames match hand oracles from the two fixture bodies, `graph validate` lists the resolved param values, the recorded `graph.yaml` is the resolved graph (overrides applied, no `args:`, no reference) and `bag play --resim all --verify` passes for both bags; a `$$` escape in the file and a `$$` in an override value reach the node once and resim byte for byte from the recorded graph read as written; `--yes` under an override that moves a topic is refused and nothing is written (the graph file byte-identical, no backup); each load error (unknown override, undeclared reference, unterminated reference, wrong type from an override and from a default naming the argument behind the param, a word that is not `name:=value`) exits non-zero naming the argument, and a mistake in the file names its location | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `tests/graph_launch_args_mp_e2e_test.rs` | The other side of the `--yes` guard over a real multi-process run (Linux only, the iceoryx2 2034 waiver): with the declared partition saved by `graph partition --yes`, `graph run side:=right --auto-partition --yes` finds the file already carries the derived partition, reaches the supervisor GO, exits 0 on Ctrl-C with its workers reaped, and leaves the file byte-identical with no backup | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/ros2_graph_e2e_test.rs` | `ros2:` graph entries over the real binary: spawn on `rmw_cerulion` with the declared argv, graceful SIGINT fan-out recorded by the child + no orphan, `--peer-loss fail` stops the run / `continue` runs degraded, missing rmw refuses before spawning, `validate` + `levels` accept the mixed graph, the multi-process default arm; the record→resim round trip (a mixed bag resims exit-0, the skip warn + report JSON name the entry, no respawn); plus an `#[ignore]`d real-`demo_nodes_cpp` machine arm with its recipe | yes | `test_node_macro_period_cdylib` |
 | `tests/ros2_migrate_cli_test.rs` | `ros2 migrate` over the real binary with a stub engine script + stub `colcon` on the child PATH: the production `ClangToolEngine` spawn path, write/commit/patch + the exact colcon argv, failing-build exit 1 naming the revert commit, engine-absent exit 69, `--yes`-without-`--write` usage error | no (per-child env only) | none |
 | `tests/verb_family_golden_test.rs` | The `schema` family byte for byte against its capture from before it moved onto the verb-family registry: root and family help, usage errors, a representative run of each verb, the `-v` log path, and completion (registration script and candidates) for all five shells. A diff is a user-visible change: fix the code, never re-capture | no | none |
@@ -1245,3 +1279,29 @@ or a derived enum with no variant or with several). `the_registered_families_bui
 runs the production registry through it. The public-surface doc check reads the verbs
 of the families `FAMILIES` names, so a family file with no entry is not a verb there
 either.
+
+### Nested verbs: adding a verb under an existing verb
+
+A new `cerulion <parent> <verb>` under a verb that already exists (a `Commands` verb
+or a family) is a nested-verb set in `crates/cerulion_cli/src/families/nested/`, not a
+new variant of the parent's action enum. `topic_introspect.rs` (`topic type`, `find`,
+`bw`) is the worked example.
+
+1. Add `families/nested/<set>.rs` with `const PARENT: &str = "<parent>";`, the verbs as
+   ONE `#[derive(Subcommand)]` enum, and a unit struct implementing `NestedVerbs`:
+   `parent`, `commands` (`nested::derived_verbs::<YourVerbs>()`), `log_class`,
+   `needs_identity` and `run`. Each method that takes matches gets the PARENT's
+   sub-matches, so `YourVerbs::from_arg_matches` parses them.
+2. Register it: `mod <set>;` and one entry in `NESTED` in `families/nested/mod.rs`.
+3. Give every value-taking arg a completer, a hint or a free-form inventory entry, as
+   for a family.
+
+`families::route` tries the nested sets first, then the families, with the same
+logging, bridge and login-gate order. A set hands over its verbs and never sees the
+parent, so it cannot change a built-in verb or the parent's help. `nested::attach`
+refuses, when the command is built, a parent that is not a verb, a verb with no name
+and a verb name the parent already selects (a built-in name or alias, `help`, an
+earlier set's verb). `the_registered_nested_verbs_attach` runs the production registry
+through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
+files them under the verb their `PARENT` names. A flag on a built-in verb (such as
+`topic list -t`) is still a field of that verb.

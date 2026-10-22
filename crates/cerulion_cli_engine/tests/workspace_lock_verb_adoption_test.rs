@@ -109,6 +109,7 @@ fn the_cheaply_drivable_verbs_top_up_a_pre_lock_gitignore() {
         "perception",
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "camera".to_string(),
             node_type: "camera".to_string(),
