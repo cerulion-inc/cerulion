@@ -3,7 +3,8 @@
 //! `rcl_interfaces` parameter services, against the REAL generated bindings.
 //!
 //! A `.srv` file generates a service marker plus two ordinary messages
-//! (`<Name>Request`, `<Name>Response`). These tests check the marker names
+//! (`<Name>_Request`, `<Name>_Response`, the names ROS 2 gives them). These
+//! tests check the marker names
 //! the right pair, that the parts carry the declared constants and defaults,
 //! that a part publishes and decodes like any message (a real loan over an
 //! isolated `TestTransport`, then the `FrameWalker` over the embedded
@@ -18,12 +19,12 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::CerulionSubscriber;
 
 use native_ros2_messages::rcl_interfaces::{
-    DescribeParameters, GetParameterTypes, GetParameters, ListParameters, ListParametersRequest,
+    DescribeParameters, GetParameterTypes, GetParameters, ListParameters, ListParameters_Request,
     ParameterDescriptorSnapshot, ParameterType, SetParameters, SetParametersAtomically,
 };
 use native_ros2_messages::std_srvs::{
-    Empty, EmptyRequest, EmptyResponse, SetBool, SetBoolRequest, SetBoolResponse,
-    SetBoolResponseSnapshot, Trigger, TriggerRequest, TriggerResponse,
+    Empty, Empty_Request, Empty_Response, SetBool, SetBool_Request, SetBool_Response,
+    SetBool_ResponseSnapshot, Trigger, Trigger_Request, Trigger_Response,
 };
 
 static TOPIC_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,24 +44,24 @@ fn each_std_srvs_marker_names_its_own_request_and_response() {
         pair::<Trigger>(),
         (
             "std_srvs/Trigger",
-            hash_of::<TriggerRequest>(),
-            hash_of::<TriggerResponse>()
+            hash_of::<Trigger_Request>(),
+            hash_of::<Trigger_Response>()
         )
     );
     assert_eq!(
         pair::<SetBool>(),
         (
             "std_srvs/SetBool",
-            hash_of::<SetBoolRequest>(),
-            hash_of::<SetBoolResponse>()
+            hash_of::<SetBool_Request>(),
+            hash_of::<SetBool_Response>()
         )
     );
     assert_eq!(
         pair::<Empty>(),
         (
             "std_srvs/Empty",
-            hash_of::<EmptyRequest>(),
-            hash_of::<EmptyResponse>()
+            hash_of::<Empty_Request>(),
+            hash_of::<Empty_Response>()
         )
     );
 }
@@ -94,13 +95,13 @@ fn the_rcl_interfaces_parameter_services_are_named_by_their_qualified_names() {
 #[test]
 fn service_part_hashes_are_pairwise_distinct() {
     let hashes = [
-        hash_of::<EmptyRequest>(),
-        hash_of::<EmptyResponse>(),
+        hash_of::<Empty_Request>(),
+        hash_of::<Empty_Response>(),
         hash_of::<native_ros2_messages::std_msgs::Empty>(),
-        hash_of::<TriggerRequest>(),
-        hash_of::<TriggerResponse>(),
-        hash_of::<SetBoolRequest>(),
-        hash_of::<SetBoolResponse>(),
+        hash_of::<Trigger_Request>(),
+        hash_of::<Trigger_Response>(),
+        hash_of::<SetBool_Request>(),
+        hash_of::<SetBool_Response>(),
     ];
     for (i, a) in hashes.iter().enumerate() {
         for b in &hashes[i + 1..] {
@@ -111,41 +112,41 @@ fn service_part_hashes_are_pairwise_distinct() {
 
 /// The wire hash of each `std_srvs` part, written here by hand. A bag records
 /// these numbers, so a change to how a `.srv` splits into parts or to how a
-/// part is named (for example `Trigger_Request` in place of `TriggerRequest`)
+/// part is named (ROS 2 names them `Trigger_Request` and `Trigger_Response`)
 /// would stop old recordings matching on replay. Such a change must fail here
 /// first. A failure is a wire-compatibility break: do not copy the new value in.
 #[test]
 fn service_part_hashes_are_pinned() {
     let pinned: [(&str, u64, u64); 6] = [
         (
-            "std_srvs/EmptyRequest",
-            hash_of::<EmptyRequest>(),
-            0x78cb_d57f_cdcd_38c7,
+            "std_srvs/Empty_Request",
+            hash_of::<Empty_Request>(),
+            0x3ee8_ab5e_1858_0aa3,
         ),
         (
-            "std_srvs/EmptyResponse",
-            hash_of::<EmptyResponse>(),
-            0xde13_77f6_19f3_0b7e,
+            "std_srvs/Empty_Response",
+            hash_of::<Empty_Response>(),
+            0xc145_3c0b_3907_74a6,
         ),
         (
-            "std_srvs/TriggerRequest",
-            hash_of::<TriggerRequest>(),
-            0xd3f4_21a1_f52e_85fa,
+            "std_srvs/Trigger_Request",
+            hash_of::<Trigger_Request>(),
+            0x8c6c_bf82_ecbc_302c,
         ),
         (
-            "std_srvs/TriggerResponse",
-            hash_of::<TriggerResponse>(),
-            0x7f18_953d_08e1_9c8b,
+            "std_srvs/Trigger_Response",
+            hash_of::<Trigger_Response>(),
+            0x4816_15eb_ca66_da0d,
         ),
         (
-            "std_srvs/SetBoolRequest",
-            hash_of::<SetBoolRequest>(),
-            0x6772_e6b3_1a6b_064b,
+            "std_srvs/SetBool_Request",
+            hash_of::<SetBool_Request>(),
+            0x532a_9017_f928_93c9,
         ),
         (
-            "std_srvs/SetBoolResponse",
-            hash_of::<SetBoolResponse>(),
-            0xc42b_1bc3_5b20_eb6f,
+            "std_srvs/SetBool_Response",
+            hash_of::<SetBool_Response>(),
+            0x2019_f962_535a_2ee1,
         ),
     ];
     let drifted: Vec<String> = pinned
@@ -160,6 +161,67 @@ fn service_part_hashes_are_pinned() {
     );
 }
 
+/// The schema `rmw_cerulion` builds for a service part on a ROS 2 peer: the
+/// part's own lines, named `<pkg>/<Name>_Request` or `<pkg>/<Name>_Response`
+/// from the rosidl introspection (namespace `std_srvs__srv` gives package
+/// `std_srvs`). `body` is one side of the vendored `.srv`, split at its `---`.
+fn rmw_peer_hash(body: &str, rosidl_message_name: &str) -> u64 {
+    parse_rosmsg(body, rosidl_message_name, Some("std_srvs"))
+        .unwrap_or_else(|e| panic!("{rosidl_message_name} must parse: {e}"))
+        .schema_hash()
+}
+
+/// Split a vendored `.srv` at its one `---` line into request and response.
+fn srv_sides(text: &str) -> (String, String) {
+    let lines: Vec<&str> = text.lines().collect();
+    let sep = lines
+        .iter()
+        .position(|l| l.trim() == "---")
+        .expect("a .srv has a --- line");
+    let join = |part: &[&str]| part.iter().map(|l| format!("{l}\n")).collect::<String>();
+    (join(&lines[..sep]), join(&lines[sep + 1..]))
+}
+
+/// Each native `std_srvs` part hashes like the part a ROS 2 peer on
+/// `rmw_cerulion` announces for the same service, so the two can match on the
+/// wire.
+#[test]
+fn each_std_srvs_part_hashes_like_the_rmw_cerulion_peer_part() {
+    let cases: [(&str, &str, u64, u64); 3] = [
+        (
+            "Empty",
+            include_str!("../srv/std_srvs/Empty.srv"),
+            hash_of::<Empty_Request>(),
+            hash_of::<Empty_Response>(),
+        ),
+        (
+            "SetBool",
+            include_str!("../srv/std_srvs/SetBool.srv"),
+            hash_of::<SetBool_Request>(),
+            hash_of::<SetBool_Response>(),
+        ),
+        (
+            "Trigger",
+            include_str!("../srv/std_srvs/Trigger.srv"),
+            hash_of::<Trigger_Request>(),
+            hash_of::<Trigger_Response>(),
+        ),
+    ];
+    for (name, text, native_request, native_response) in cases {
+        let (request, response) = srv_sides(text);
+        assert_eq!(
+            native_request,
+            rmw_peer_hash(&request, &format!("{name}_Request")),
+            "std_srvs/{name}_Request"
+        );
+        assert_eq!(
+            native_response,
+            rmw_peer_hash(&response, &format!("{name}_Response")),
+            "std_srvs/{name}_Response"
+        );
+    }
+}
+
 /// `ParameterType` is constants only; `ListParameters`' request declares
 /// `DEPTH_RECURSIVE`. Values from the upstream files.
 #[test]
@@ -168,7 +230,7 @@ fn parameter_constants_are_on_the_generated_types() {
     assert_eq!(string_type, 4);
     assert_eq!(ParameterType::PARAMETER_NOT_SET, 0);
     assert_eq!(ParameterType::PARAMETER_STRING_ARRAY, 9);
-    let depth: u64 = ListParametersRequest::DEPTH_RECURSIVE;
+    let depth: u64 = ListParameters_Request::DEPTH_RECURSIVE;
     assert_eq!(depth, 0);
 }
 
@@ -223,7 +285,7 @@ fn a_trigger_response_frame_decodes_through_the_frame_walker() {
     let subscriber = tt.subscriber(&topic);
     {
         let mut proxy = publisher
-            .loan_proxy::<TriggerResponse>()
+            .loan_proxy::<Trigger_Response>()
             .expect("loan_proxy");
         proxy.success = 1;
         proxy.set_message("calibrated").expect("set_message");
@@ -231,7 +293,7 @@ fn a_trigger_response_frame_decodes_through_the_frame_walker() {
     let frame = last_frame(&subscriber);
     let fv = builtin_walker()
         .walk_by_hash(&frame)
-        .expect("walk the TriggerResponse frame by its header hash");
+        .expect("walk the Trigger_Response frame by its header hash");
     assert_eq!(fv.field("success"), Some(&FrameValueKind::Bool(true)));
     assert_eq!(
         fv.field("message"),
@@ -243,12 +305,12 @@ fn a_trigger_response_frame_decodes_through_the_frame_walker() {
 /// hand-built value.
 #[test]
 fn a_set_bool_response_snapshot_round_trips_through_serde() {
-    let value = SetBoolResponseSnapshot {
+    let value = SetBool_ResponseSnapshot {
         success: true,
         message: "motor enabled".to_string(),
     };
     let json = serde_json::to_string(&value).expect("serialize");
     assert_eq!(json, r#"{"success":true,"message":"motor enabled"}"#);
-    let back: SetBoolResponseSnapshot = serde_json::from_str(&json).expect("deserialize");
+    let back: SetBool_ResponseSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, value);
 }

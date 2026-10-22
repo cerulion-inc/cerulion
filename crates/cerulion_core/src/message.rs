@@ -296,9 +296,9 @@ pub trait ShmMessage: Sized {
 ///
 /// Codegen emits a unit marker `pub struct <Name>;` per `.srv` file and
 /// implements `ServiceType` on it, next to the two message markers the
-/// `.srv` parts generate (`<Name>Request`, `<Name>Response`). For example
-/// `std_srvs::Trigger` names `std_srvs::TriggerRequest` and
-/// `std_srvs::TriggerResponse`. Each part is an ordinary [`ShmMessage`],
+/// `.srv` parts generate (`<Name>_Request`, `<Name>_Response`). For example
+/// `std_srvs::Trigger` names `std_srvs::Trigger_Request` and
+/// `std_srvs::Trigger_Response`. Each part is an ordinary [`ShmMessage`],
 /// with its own schema hash, so it is published, recorded and replayed like
 /// any other message.
 ///

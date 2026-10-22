@@ -3,7 +3,7 @@
 Vendored ROS 2 `.msg` + `.srv` corpus + build-time codegen. `src/lib.rs` is only
 `include!(OUT_DIR)` of `build.rs` output - to change a type, edit the `.msg` under
 `msg/<pkg>/` (or the `.srv` under `srv/<pkg>/`) and `cargo build`. A `.srv` is two
-messages (`<Name>Request`, `<Name>Response`) plus a `ServiceType` marker. A green
+messages (`<Name>_Request`, `<Name>_Response`) plus a `ServiceType` marker. A green
 crate suite does NOT prove the corpus matches upstream ROS 2: only
 `upstream_drift_test` compares against an external truth (`upstream_msg_manifest.txt`);
 the sibling tests diff the tree against itself.

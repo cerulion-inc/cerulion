@@ -343,25 +343,25 @@ fn computed_layout_matches_generated_constants_for_all_schemas() {
     assert_layout_matches!(r, rcl_interfaces, ParameterType);
     assert_layout_matches!(r, rcl_interfaces, ParameterValue);
     assert_layout_matches!(r, rcl_interfaces, SetParametersResult);
-    assert_layout_matches!(r, rcl_interfaces, DescribeParametersRequest);
-    assert_layout_matches!(r, rcl_interfaces, DescribeParametersResponse);
-    assert_layout_matches!(r, rcl_interfaces, GetParameterTypesRequest);
-    assert_layout_matches!(r, rcl_interfaces, GetParameterTypesResponse);
-    assert_layout_matches!(r, rcl_interfaces, GetParametersRequest);
-    assert_layout_matches!(r, rcl_interfaces, GetParametersResponse);
-    assert_layout_matches!(r, rcl_interfaces, ListParametersRequest);
-    assert_layout_matches!(r, rcl_interfaces, ListParametersResponse);
-    assert_layout_matches!(r, rcl_interfaces, SetParametersRequest);
-    assert_layout_matches!(r, rcl_interfaces, SetParametersResponse);
-    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomicallyRequest);
-    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomicallyResponse);
+    assert_layout_matches!(r, rcl_interfaces, DescribeParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, DescribeParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, GetParameterTypes_Request);
+    assert_layout_matches!(r, rcl_interfaces, GetParameterTypes_Response);
+    assert_layout_matches!(r, rcl_interfaces, GetParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, GetParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, ListParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, ListParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, SetParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, SetParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomically_Request);
+    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomically_Response);
     // std_srvs
-    assert_layout_matches!(r, std_srvs, EmptyRequest);
-    assert_layout_matches!(r, std_srvs, EmptyResponse);
-    assert_layout_matches!(r, std_srvs, SetBoolRequest);
-    assert_layout_matches!(r, std_srvs, SetBoolResponse);
-    assert_layout_matches!(r, std_srvs, TriggerRequest);
-    assert_layout_matches!(r, std_srvs, TriggerResponse);
+    assert_layout_matches!(r, std_srvs, Empty_Request);
+    assert_layout_matches!(r, std_srvs, Empty_Response);
+    assert_layout_matches!(r, std_srvs, SetBool_Request);
+    assert_layout_matches!(r, std_srvs, SetBool_Response);
+    assert_layout_matches!(r, std_srvs, Trigger_Request);
+    assert_layout_matches!(r, std_srvs, Trigger_Response);
 }
 
 /// Field-offset spot checks via `offset_of!` on the trickiest layouts.

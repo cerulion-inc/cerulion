@@ -707,12 +707,12 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // with 300-char descriptions is about 300 KB, past SMALL even
         // before the x 4. All are request/response traffic, not streams, so
         // there is no ingress depth to trade.
-        | "rcl_interfaces/DescribeParametersResponse"
-        | "rcl_interfaces/GetParametersResponse"
+        | "rcl_interfaces/DescribeParameters_Response"
+        | "rcl_interfaces/GetParameters_Response"
         | "rcl_interfaces/Parameter"
         | "rcl_interfaces/ParameterValue"
-        | "rcl_interfaces/SetParametersAtomicallyRequest"
-        | "rcl_interfaces/SetParametersRequest"
+        | "rcl_interfaces/SetParametersAtomically_Request"
+        | "rcl_interfaces/SetParameters_Request"
         => Some(TIER_MEDIUM),
 
         // ─────────────── TIER_SMALL — 256 KiB ───────────────
@@ -1038,14 +1038,14 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // NAMES (and one type byte or one result per name). A node with
         // 1,000 parameters at 40-char names is about 44 KB of names; x 4 =
         // about 176 KB, inside SMALL, past TINY.
-        | "rcl_interfaces/DescribeParametersRequest"
-        | "rcl_interfaces/GetParameterTypesRequest"
-        | "rcl_interfaces/GetParameterTypesResponse"
-        | "rcl_interfaces/GetParametersRequest"
-        | "rcl_interfaces/ListParametersRequest"
-        | "rcl_interfaces/ListParametersResponse"
+        | "rcl_interfaces/DescribeParameters_Request"
+        | "rcl_interfaces/GetParameterTypes_Request"
+        | "rcl_interfaces/GetParameterTypes_Response"
+        | "rcl_interfaces/GetParameters_Request"
+        | "rcl_interfaces/ListParameters_Request"
+        | "rcl_interfaces/ListParameters_Response"
         | "rcl_interfaces/ListParametersResult"
-        | "rcl_interfaces/SetParametersResponse"
+        | "rcl_interfaces/SetParameters_Response"
         => Some(TIER_SMALL),
 
         // ─────────────── TIER_TINY — 16 KiB ───────────────
@@ -1206,10 +1206,10 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // a normal one; x 4 = 4 KB). A set result and the std_srvs responses
         // are a bool plus a reason or message string.
         | "rcl_interfaces/ParameterDescriptor"
-        | "rcl_interfaces/SetParametersAtomicallyResponse"
+        | "rcl_interfaces/SetParametersAtomically_Response"
         | "rcl_interfaces/SetParametersResult"
-        | "std_srvs/SetBoolResponse"
-        | "std_srvs/TriggerResponse"
+        | "std_srvs/SetBool_Response"
+        | "std_srvs/Trigger_Response"
         => Some(TIER_TINY),
 
         // ─────────────── Unlisted: `None` — POLICY LIVES IN THE CALLERS ───

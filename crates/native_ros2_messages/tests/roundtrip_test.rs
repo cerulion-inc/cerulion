@@ -1165,58 +1165,58 @@ roundtrip_var!(rcl_interfaces, SetParametersResult, |s| {
     s.successful = true;
     s.reason = "ok".into();
 });
-roundtrip_var!(rcl_interfaces, DescribeParametersRequest, |s| {
+roundtrip_var!(rcl_interfaces, DescribeParameters_Request, |s| {
     s.names = vec![0x00, 0x00, 0x00, 0x00];
 });
-roundtrip_var!(rcl_interfaces, DescribeParametersResponse, |s| {
+roundtrip_var!(rcl_interfaces, DescribeParameters_Response, |s| {
     s.descriptors = vec![0x01, 0x02];
 });
-roundtrip_var!(rcl_interfaces, GetParameterTypesRequest, |s| {
+roundtrip_var!(rcl_interfaces, GetParameterTypes_Request, |s| {
     s.names = vec![0x00, 0x00, 0x00, 0x00];
 });
-roundtrip_var!(rcl_interfaces, GetParameterTypesResponse, |s| {
+roundtrip_var!(rcl_interfaces, GetParameterTypes_Response, |s| {
     s.types = vec![1, 4, 9];
 });
-roundtrip_var!(rcl_interfaces, GetParametersRequest, |s| {
+roundtrip_var!(rcl_interfaces, GetParameters_Request, |s| {
     s.names = vec![0x00, 0x00, 0x00, 0x00];
 });
-roundtrip_var!(rcl_interfaces, GetParametersResponse, |s| {
+roundtrip_var!(rcl_interfaces, GetParameters_Response, |s| {
     s.values = vec![0x05, 0x06];
 });
-roundtrip_var!(rcl_interfaces, ListParametersRequest, |s| {
+roundtrip_var!(rcl_interfaces, ListParameters_Request, |s| {
     s.prefixes = vec![0x00, 0x00, 0x00, 0x00];
     s.depth = 3;
 });
-roundtrip_var!(rcl_interfaces, ListParametersResponse, |s| {
+roundtrip_var!(rcl_interfaces, ListParameters_Response, |s| {
     s.result = vec![0x07];
 });
-roundtrip_var!(rcl_interfaces, SetParametersRequest, |s| {
+roundtrip_var!(rcl_interfaces, SetParameters_Request, |s| {
     s.parameters = vec![0x08, 0x09];
 });
-roundtrip_var!(rcl_interfaces, SetParametersResponse, |s| {
+roundtrip_var!(rcl_interfaces, SetParameters_Response, |s| {
     s.results = vec![0x0A];
 });
-roundtrip_var!(rcl_interfaces, SetParametersAtomicallyRequest, |s| {
+roundtrip_var!(rcl_interfaces, SetParametersAtomically_Request, |s| {
     s.parameters = vec![0x0B];
 });
-roundtrip_var!(rcl_interfaces, SetParametersAtomicallyResponse, |s| {
+roundtrip_var!(rcl_interfaces, SetParametersAtomically_Response, |s| {
     s.result = vec![0x0C];
 });
 
 // -------------------------------------------------------------
 // std_srvs (3 services: 6 parts, 4 fixed + 2 variable)
 // -------------------------------------------------------------
-roundtrip_fixed!(std_srvs, EmptyRequest);
-roundtrip_fixed!(std_srvs, EmptyResponse);
-roundtrip_fixed!(std_srvs, SetBoolRequest, |s| {
+roundtrip_fixed!(std_srvs, Empty_Request);
+roundtrip_fixed!(std_srvs, Empty_Response);
+roundtrip_fixed!(std_srvs, SetBool_Request, |s| {
     s.data = true;
 });
-roundtrip_var!(std_srvs, SetBoolResponse, |s| {
+roundtrip_var!(std_srvs, SetBool_Response, |s| {
     s.success = true;
     s.message = "enabled".into();
 });
-roundtrip_fixed!(std_srvs, TriggerRequest);
-roundtrip_var!(std_srvs, TriggerResponse, |s| {
+roundtrip_fixed!(std_srvs, Trigger_Request);
+roundtrip_var!(std_srvs, Trigger_Response, |s| {
     s.success = false;
     s.message = "not ready".into();
 });

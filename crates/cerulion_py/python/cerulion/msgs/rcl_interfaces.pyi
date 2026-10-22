@@ -7,16 +7,16 @@ from numpy.typing import ArrayLike as _ArrayLike, NDArray as _NDArray
 from cerulion import Message as _Message, SchemaSet as _SchemaSet
 
 
-class DescribeParametersRequest(_Message):
-    """The rcl_interfaces/DescribeParametersRequest message."""
+class DescribeParameters_Request(_Message):
+    """The rcl_interfaces/DescribeParameters_Request message."""
     @property
     def names(self) -> list[str]: ...
     @names.setter
     def names(self, value: bytes) -> None: ...
 
 
-class DescribeParametersResponse(_Message):
-    """The rcl_interfaces/DescribeParametersResponse message."""
+class DescribeParameters_Response(_Message):
+    """The rcl_interfaces/DescribeParameters_Response message."""
     @property
     def descriptors(self) -> list[ParameterDescriptor]: ...
     @descriptors.setter
@@ -39,32 +39,32 @@ class FloatingPointRange(_Message):
     def step(self, value: float) -> None: ...
 
 
-class GetParameterTypesRequest(_Message):
-    """The rcl_interfaces/GetParameterTypesRequest message."""
+class GetParameterTypes_Request(_Message):
+    """The rcl_interfaces/GetParameterTypes_Request message."""
     @property
     def names(self) -> list[str]: ...
     @names.setter
     def names(self, value: bytes) -> None: ...
 
 
-class GetParameterTypesResponse(_Message):
-    """The rcl_interfaces/GetParameterTypesResponse message."""
+class GetParameterTypes_Response(_Message):
+    """The rcl_interfaces/GetParameterTypes_Response message."""
     @property
     def types(self) -> _NDArray[_np.uint8]: ...
     @types.setter
     def types(self, value: _ArrayLike) -> None: ...
 
 
-class GetParametersRequest(_Message):
-    """The rcl_interfaces/GetParametersRequest message."""
+class GetParameters_Request(_Message):
+    """The rcl_interfaces/GetParameters_Request message."""
     @property
     def names(self) -> list[str]: ...
     @names.setter
     def names(self, value: bytes) -> None: ...
 
 
-class GetParametersResponse(_Message):
-    """The rcl_interfaces/GetParametersResponse message."""
+class GetParameters_Response(_Message):
+    """The rcl_interfaces/GetParameters_Response message."""
     @property
     def values(self) -> list[ParameterValue]: ...
     @values.setter
@@ -87,26 +87,6 @@ class IntegerRange(_Message):
     def step(self, value: int) -> None: ...
 
 
-class ListParametersRequest(_Message):
-    """The rcl_interfaces/ListParametersRequest message."""
-    @property
-    def depth(self) -> int: ...
-    @depth.setter
-    def depth(self, value: int) -> None: ...
-    @property
-    def prefixes(self) -> list[str]: ...
-    @prefixes.setter
-    def prefixes(self, value: bytes) -> None: ...
-
-
-class ListParametersResponse(_Message):
-    """The rcl_interfaces/ListParametersResponse message."""
-    @property
-    def result(self) -> ListParametersResult: ...
-    @result.setter
-    def result(self, value: _Mapping[str, _Any] | bytes) -> None: ...
-
-
 class ListParametersResult(_Message):
     """The rcl_interfaces/ListParametersResult message."""
     @property
@@ -117,6 +97,26 @@ class ListParametersResult(_Message):
     def prefixes(self) -> list[str]: ...
     @prefixes.setter
     def prefixes(self, value: bytes) -> None: ...
+
+
+class ListParameters_Request(_Message):
+    """The rcl_interfaces/ListParameters_Request message."""
+    @property
+    def depth(self) -> int: ...
+    @depth.setter
+    def depth(self, value: int) -> None: ...
+    @property
+    def prefixes(self) -> list[str]: ...
+    @prefixes.setter
+    def prefixes(self, value: bytes) -> None: ...
+
+
+class ListParameters_Response(_Message):
+    """The rcl_interfaces/ListParameters_Response message."""
+    @property
+    def result(self) -> ListParametersResult: ...
+    @result.setter
+    def result(self, value: _Mapping[str, _Any] | bytes) -> None: ...
 
 
 class Parameter(_Message):
@@ -215,36 +215,20 @@ class ParameterValue(_Message):
     def string_array_value(self, value: bytes) -> None: ...
 
 
-class SetParametersAtomicallyRequest(_Message):
-    """The rcl_interfaces/SetParametersAtomicallyRequest message."""
+class SetParametersAtomically_Request(_Message):
+    """The rcl_interfaces/SetParametersAtomically_Request message."""
     @property
     def parameters(self) -> list[Parameter]: ...
     @parameters.setter
     def parameters(self, value: bytes) -> None: ...
 
 
-class SetParametersAtomicallyResponse(_Message):
-    """The rcl_interfaces/SetParametersAtomicallyResponse message."""
+class SetParametersAtomically_Response(_Message):
+    """The rcl_interfaces/SetParametersAtomically_Response message."""
     @property
     def result(self) -> SetParametersResult: ...
     @result.setter
     def result(self, value: _Mapping[str, _Any] | bytes) -> None: ...
-
-
-class SetParametersRequest(_Message):
-    """The rcl_interfaces/SetParametersRequest message."""
-    @property
-    def parameters(self) -> list[Parameter]: ...
-    @parameters.setter
-    def parameters(self, value: bytes) -> None: ...
-
-
-class SetParametersResponse(_Message):
-    """The rcl_interfaces/SetParametersResponse message."""
-    @property
-    def results(self) -> list[SetParametersResult]: ...
-    @results.setter
-    def results(self, value: bytes) -> None: ...
 
 
 class SetParametersResult(_Message):
@@ -257,3 +241,19 @@ class SetParametersResult(_Message):
     def reason(self) -> str: ...
     @reason.setter
     def reason(self, value: str | bytes) -> None: ...
+
+
+class SetParameters_Request(_Message):
+    """The rcl_interfaces/SetParameters_Request message."""
+    @property
+    def parameters(self) -> list[Parameter]: ...
+    @parameters.setter
+    def parameters(self, value: bytes) -> None: ...
+
+
+class SetParameters_Response(_Message):
+    """The rcl_interfaces/SetParameters_Response message."""
+    @property
+    def results(self) -> list[SetParametersResult]: ...
+    @results.setter
+    def results(self, value: bytes) -> None: ...

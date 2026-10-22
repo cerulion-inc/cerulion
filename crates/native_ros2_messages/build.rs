@@ -3,7 +3,7 @@
 //!
 //! Scans the msg/ and srv/ directories, parses .msg and .srv files, and
 //! generates Rust code. A `.srv` file splits into two messages,
-//! `<Name>Request` and `<Name>Response`, that join the package's message
+//! `<Name>_Request` and `<Name>_Response`, that join the package's message
 //! set (and the embedded registry) exactly like vendored `.msg` files, plus
 //! a `<Name>` service marker.
 //!

@@ -65,23 +65,23 @@ fn std_srvs_service_types_resolve_from_the_workspace() {
     // serve and call services.
     use cerulion_core::message::{ServiceType, ShmMessage};
     use native_ros2_messages::std_srvs::{
-        SetBool, SetBoolRequest, SetBoolRequestSnapshot, Trigger, TriggerResponse,
-        TriggerResponseSnapshot,
+        SetBool, SetBool_Request, SetBool_RequestSnapshot, Trigger, Trigger_Response,
+        Trigger_ResponseSnapshot,
     };
 
     assert_eq!(<Trigger as ServiceType>::NAME, "std_srvs/Trigger");
     assert_eq!(<SetBool as ServiceType>::NAME, "std_srvs/SetBool");
     assert_eq!(
         <<SetBool as ServiceType>::Request as ShmMessage>::SCHEMA_HASH,
-        SetBoolRequest::SCHEMA_HASH
+        SetBool_Request::SCHEMA_HASH
     );
     assert_eq!(
         <<Trigger as ServiceType>::Response as ShmMessage>::SCHEMA_HASH,
-        TriggerResponse::SCHEMA_HASH
+        Trigger_Response::SCHEMA_HASH
     );
     // Construction is the check: a missing or renamed field fails to compile.
-    let _enable = SetBoolRequestSnapshot { data: true };
-    let _done = TriggerResponseSnapshot {
+    let _enable = SetBool_RequestSnapshot { data: true };
+    let _done = Trigger_ResponseSnapshot {
         success: true,
         message: "stopped".to_string(),
     };

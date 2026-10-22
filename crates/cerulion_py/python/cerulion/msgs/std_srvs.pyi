@@ -7,24 +7,24 @@ from numpy.typing import ArrayLike as _ArrayLike, NDArray as _NDArray
 from cerulion import Message as _Message, SchemaSet as _SchemaSet
 
 
-class EmptyRequest(_Message):
-    """The std_srvs/EmptyRequest message."""
+class Empty_Request(_Message):
+    """The std_srvs/Empty_Request message."""
 
 
-class EmptyResponse(_Message):
-    """The std_srvs/EmptyResponse message."""
+class Empty_Response(_Message):
+    """The std_srvs/Empty_Response message."""
 
 
-class SetBoolRequest(_Message):
-    """The std_srvs/SetBoolRequest message."""
+class SetBool_Request(_Message):
+    """The std_srvs/SetBool_Request message."""
     @property
     def data(self) -> bool: ...
     @data.setter
     def data(self, value: bool) -> None: ...
 
 
-class SetBoolResponse(_Message):
-    """The std_srvs/SetBoolResponse message."""
+class SetBool_Response(_Message):
+    """The std_srvs/SetBool_Response message."""
     @property
     def success(self) -> bool: ...
     @success.setter
@@ -35,12 +35,12 @@ class SetBoolResponse(_Message):
     def message(self, value: str | bytes) -> None: ...
 
 
-class TriggerRequest(_Message):
-    """The std_srvs/TriggerRequest message."""
+class Trigger_Request(_Message):
+    """The std_srvs/Trigger_Request message."""
 
 
-class TriggerResponse(_Message):
-    """The std_srvs/TriggerResponse message."""
+class Trigger_Response(_Message):
+    """The std_srvs/Trigger_Response message."""
     @property
     def success(self) -> bool: ...
     @success.setter

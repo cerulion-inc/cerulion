@@ -90,8 +90,8 @@ mod tests {
             \n\
             impl cerulion_core::message::ServiceType for Trigger {\n\
             \x20   const NAME: &'static str = \"std_srvs/Trigger\";\n\
-            \x20   type Request = TriggerRequest;\n\
-            \x20   type Response = TriggerResponse;\n\
+            \x20   type Request = Trigger_Request;\n\
+            \x20   type Response = Trigger_Response;\n\
             }\n";
         assert!(code.contains(expected), "service marker missing:\n{code}");
         assert_eq!(code, generate_service_marker(&srv), "deterministic");
@@ -110,7 +110,7 @@ mod tests {
     /// Both parts generated and the name free: the marker is declared.
     #[test]
     fn a_marker_with_both_parts_and_a_free_name_has_no_conflict() {
-        let generated = ["TriggerRequest", "TriggerResponse", "Other"];
+        let generated = ["Trigger_Request", "Trigger_Response", "Other"];
         assert_eq!(
             service_marker_conflict(&trigger(), |n| generated.contains(&n)),
             None
@@ -121,10 +121,10 @@ mod tests {
     /// exactly the missing part.
     #[test]
     fn a_missing_request_part_is_named() {
-        let generated = ["TriggerResponse"];
+        let generated = ["Trigger_Response"];
         assert_eq!(
             service_marker_conflict(&trigger(), |n| generated.contains(&n)).as_deref(),
-            Some("service 'std_srvs/Trigger' is not generated: its part(s) TriggerRequest are not generated")
+            Some("service 'std_srvs/Trigger' is not generated: its part(s) Trigger_Request are not generated")
         );
     }
 
@@ -133,14 +133,14 @@ mod tests {
     fn both_missing_parts_are_named_in_order() {
         assert_eq!(
             service_marker_conflict(&trigger(), |_| false).as_deref(),
-            Some("service 'std_srvs/Trigger' is not generated: its part(s) TriggerRequest, TriggerResponse are not generated")
+            Some("service 'std_srvs/Trigger' is not generated: its part(s) Trigger_Request, Trigger_Response are not generated")
         );
     }
 
     /// A generated message of the marker's own name blocks the marker.
     #[test]
     fn a_message_of_the_marker_name_is_a_conflict() {
-        let generated = ["Trigger", "TriggerRequest", "TriggerResponse"];
+        let generated = ["Trigger", "Trigger_Request", "Trigger_Response"];
         assert_eq!(
             service_marker_conflict(&trigger(), |n| generated.contains(&n)).as_deref(),
             Some("service 'std_srvs/Trigger' is not generated: a message of the same name takes its name")

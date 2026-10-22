@@ -2,8 +2,8 @@
 //! The vendored corpus, walked off disk, for the corpus tests.
 //!
 //! One entry per message the build generates: every `msg/<pkg>/<Name>.msg`,
-//! and the two parts of every `srv/<pkg>/<Name>.srv` as `<Name>Request` and
-//! `<Name>Response`. The walk is independent of `build.rs` (it reads the
+//! and the two parts of every `srv/<pkg>/<Name>.srv` as `<Name>_Request` and
+//! `<Name>_Response`. The walk is independent of `build.rs` (it reads the
 //! files, not the generated registry), so a test comparing the two still
 //! compares two separate enumerations.
 
