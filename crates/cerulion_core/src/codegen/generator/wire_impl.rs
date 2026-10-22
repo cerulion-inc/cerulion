@@ -709,9 +709,14 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // result (TINY, below) with a free-text reason per parameter set, so
         // 1,000 rejections with 300-char reasons is also about 300 KB. All
         // are request/response traffic, not streams, so there is no ingress
-        // depth to trade.
+        // depth to trade. `ListParameters`' result carries no value but two
+        // string lists, names and prefixes: 1,000 entries of 40 chars in
+        // each is about 88 KB; x 4 = about 352 KB, past SMALL, so the result
+        // and the response that holds it ride MEDIUM too.
         | "rcl_interfaces/DescribeParameters_Response"
         | "rcl_interfaces/GetParameters_Response"
+        | "rcl_interfaces/ListParameters_Response"
+        | "rcl_interfaces/ListParametersResult"
         | "rcl_interfaces/Parameter"
         | "rcl_interfaces/ParameterValue"
         | "rcl_interfaces/SetParametersAtomically_Request"
@@ -1038,17 +1043,17 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/Classification"
         | "vision_msgs/Detection2D"
         | "vision_msgs/Detection3D"
-        // rcl_interfaces parameter services, SMALL group: lists of parameter
-        // NAMES (and one type byte per name). A node with
-        // 1,000 parameters at 40-char names is about 44 KB of names; x 4 =
-        // about 176 KB, inside SMALL, past TINY.
+        // rcl_interfaces parameter services, SMALL group: ONE list of
+        // parameter names or prefixes (and one type byte per name). A node
+        // with 1,000 parameters at 40-char names is about 44 KB of names;
+        // x 4 = about 176 KB, inside SMALL, past TINY. `ListParameters`'
+        // response is not here: it carries two such lists (see the MEDIUM
+        // group).
         | "rcl_interfaces/DescribeParameters_Request"
         | "rcl_interfaces/GetParameterTypes_Request"
         | "rcl_interfaces/GetParameterTypes_Response"
         | "rcl_interfaces/GetParameters_Request"
         | "rcl_interfaces/ListParameters_Request"
-        | "rcl_interfaces/ListParameters_Response"
-        | "rcl_interfaces/ListParametersResult"
         => Some(TIER_SMALL),
 
         // ─────────────── TIER_TINY — 16 KiB ───────────────

@@ -15,8 +15,9 @@ set -euo pipefail
 
 # Three of these are cargo's own: `.cargo_vcs_info.json` (the commit the package was
 # built from, added inside any git checkout), `Cargo.toml.orig` and `Cargo.lock`.
-# `upstream_msg_manifest.txt` is native_ros2_messages' vendored-message manifest.
-allowed='^(\.cargo_vcs_info\.json|Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|README\.md|LICENSE([-A-Z0-9]+)?|NOTICE|upstream_msg_manifest\.txt|build\.rs|src/.*|msg/.*|benches/.*|examples/.*)$'
+# `upstream_msg_manifest.txt` is native_ros2_messages' vendored-message manifest,
+# and `msg/` and `srv/` hold its vendored .msg and .srv definitions.
+allowed='^(\.cargo_vcs_info\.json|Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|README\.md|LICENSE([-A-Z0-9]+)?|NOTICE|upstream_msg_manifest\.txt|build\.rs|src/.*|msg/.*|srv/.*|benches/.*|examples/.*)$'
 fail=0
 
 check_listing() {
