@@ -1571,18 +1571,24 @@ dependencies = [
 name = "cerulion_pairing"
 version = "1.0.0"
 dependencies = [
+ "data-encoding",
  "dirs",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
  "hmac",
  "pake-cpace",
  "postcard",
+ "rcgen",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "sha2 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 2.0.17",
+ "time",
  "tracing",
+ "x509-parser",
  "zeroize",
 ]
 

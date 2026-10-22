@@ -9,7 +9,7 @@
 //! (rollback floor, revocation, ownership lifecycle) lives on the store.
 
 mod access;
-mod chain;
+pub(crate) mod chain;
 mod store;
 
 pub use access::{AccessRow, EpochOutcome, OwnershipState, PairingSource};
