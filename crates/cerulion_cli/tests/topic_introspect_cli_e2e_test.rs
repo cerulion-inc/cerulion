@@ -517,6 +517,8 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
         "one echoed frame block; full stdout:\n{echo_log}"
     );
     serde_yaml::from_str::<serde_yaml::Value>(&body).expect("an echoed block is YAML");
+    // The block as a user copies it: with echo's closing `---` line.
+    let copied = format!("{body}---\n");
 
     let schemas = native_ros2_messages::BUILTIN_MSGS
         .iter()
@@ -526,10 +528,10 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
     let frame = cerulion_core::dynamic::yaml_to_message(
         &walker,
         "geometry_msgs/Vector3",
-        body.as_bytes(),
+        copied.as_bytes(),
         0,
     )
-    .expect("an echoed message is message YAML input");
+    .expect("an echoed block, separator included, is message YAML input");
     let mut oracle = Vector3::SCHEMA_HASH.to_le_bytes().to_vec();
     // total_size 56, offset table at 32 + 24, no variable fields, seq 0, ts 0.
     oracle.extend_from_slice(&[56, 0, 0, 0, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
