@@ -294,7 +294,7 @@ effort: [1.5]
   `string<=N[]`) is at most `N` bytes, and a `T[<=N]` array holds at most
   `N` elements (`dimensions: expected at most 3 elements, got 4`). A
   `wstring<=N` value (or each element of `wstring<=N[]`) is at most `N`
-  UTF-16 code units, so `é` counts 1 and an emoji such as `😀` counts 2;
+  UTF-16 code units, so `é` counts 1 and a character past U+FFFF counts 2;
   a longer value is refused (`YamlWideStringTooLong`). Echo prints a frame
   past its bounds as it is; reading that output back is refused.
 - **Refused input.** Anchors (`&a`), aliases (`*a`), tags (`!name`),
