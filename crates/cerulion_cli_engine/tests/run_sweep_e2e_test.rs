@@ -65,9 +65,11 @@ struct ShmName(String);
 impl ShmName {
     fn create(name: &str) -> Self {
         let c = std::ffi::CString::new(name).expect("shm name is NUL-free");
-        // SAFETY: FFI create of a NUL-terminated name this test owns.
+        // SAFETY: FFI create of a NUL-terminated name this test owns. The
+        // posix_shm wrapper keeps the object visible to `shm_object_exists`
+        // on Android (it is the same libc call elsewhere).
         let fd = unsafe {
-            libc::shm_open(
+            cerulion_core::posix_shm::shm_open(
                 c.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600 as libc::c_uint,
@@ -96,7 +98,7 @@ impl Drop for ShmName {
     fn drop(&mut self) {
         if let Ok(c) = std::ffi::CString::new(self.0.as_str()) {
             // SAFETY: best-effort FFI unlink of a valid NUL-terminated name.
-            unsafe { libc::shm_unlink(c.as_ptr()) };
+            unsafe { cerulion_core::posix_shm::shm_unlink(c.as_ptr()) };
         }
     }
 }

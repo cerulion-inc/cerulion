@@ -65,8 +65,10 @@ pub(super) fn yaml_to_message_capped(
     timestamp_ns: u64,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DynamicError> {
-    let layout = walker
+    // One slot gives both halves (see `FrameWalker::schema_for_name`).
+    let (layout, resolved) = walker
         .layout_for_name(schema)
+        .zip(walker.schema_for_name(schema))
         .ok_or_else(|| DynamicError::UnknownSchema(schema.to_string()))?;
     // The value tree costs a bounded multiple of the text, so the text is
     // bounded before it is parsed.
@@ -93,7 +95,7 @@ pub(super) fn yaml_to_message_capped(
         path: String::new(),
         array_depth: 0,
     };
-    let payload = builder.body(layout, &value, 0)?;
+    let payload = builder.body((layout, resolved), &value, 0)?;
     let total = WireHeader::SIZE + payload.len();
     let total_size =
         u32::try_from(total).map_err(|_| DynamicError::YamlMessageTooLarge { path: shown("") })?;
@@ -155,6 +157,10 @@ fn kind(v: &Value) -> &'static str {
         Value::Tagged(_) => "tagged value",
     }
 }
+
+/// A message type the builder writes: its layout and its resolved schema,
+/// both from one walker slot.
+type Target<'w> = (&'w WireLayout, &'w MessageSchema);
 
 struct Builder<'w> {
     walker: &'w FrameWalker,
@@ -226,23 +232,16 @@ impl<'w> Builder<'w> {
         Ok(())
     }
 
-    fn schema(&self, layout: &WireLayout) -> Result<&'w MessageSchema, DynamicError> {
-        self.walker
-            .schema_for_name(&layout.qualified_name)
-            .ok_or_else(|| DynamicError::YamlUnresolvedNested {
-                path: self.here(),
-                target: layout.qualified_name.clone(),
-            })
-    }
-
+    /// The layout and schema a nested reference, written inside a schema
+    /// of package `parent`, resolves to.
     fn nested(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent: &str,
-    ) -> Result<&'w WireLayout, DynamicError> {
+        parent: Option<&str>,
+    ) -> Result<Target<'w>, DynamicError> {
         self.walker
-            .nested_layout(schema_name, package, parent)
+            .nested_target(schema_name, package, parent)
             .ok_or_else(|| DynamicError::YamlUnresolvedNested {
                 path: self.here(),
                 target: match package {
@@ -310,15 +309,15 @@ impl<'w> Builder<'w> {
             .collect()
     }
 
-    /// A headerless body `[fixed][offset table][variable]` for `layout`.
+    /// A headerless body `[fixed][offset table][variable]` for `target`.
     fn body(
         &mut self,
-        layout: &WireLayout,
+        (layout, schema): Target<'w>,
         v: &Value,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         self.too_deep(depth)?;
-        let schema = self.schema(layout)?;
+        let parent = schema.package.as_deref();
         let values = self.fields(schema, v)?;
         // The builder allocates the whole fixed section up front, so a
         // schema whose fixed section alone passes the cap is refused before
@@ -338,8 +337,7 @@ impl<'w> Builder<'w> {
             push_field(&mut self.path, &field.name);
             self.within_bounds(field, value)?;
             if field.field_type.is_variable() {
-                let bytes =
-                    self.variable(&field.field_type, value, &layout.qualified_name, depth)?;
+                let bytes = self.variable(&field.field_type, value, parent, depth)?;
                 builder
                     .push_variable(bytes)
                     .map_err(|_| DynamicError::YamlMessageTooLarge { path: self.here() })?;
@@ -348,7 +346,7 @@ impl<'w> Builder<'w> {
                 fixed_idx += 1;
                 let range = fl.offset..fl.offset + fl.size;
                 let dst = &mut builder.fixed_mut()[range];
-                self.fixed(&field.field_type, value, dst, &layout.qualified_name, depth)?;
+                self.fixed(&field.field_type, value, dst, parent, depth)?;
             }
             self.path.truncate(mark);
         }
@@ -420,7 +418,7 @@ impl<'w> Builder<'w> {
         ft: &FieldType,
         v: &Value,
         dst: &mut [u8],
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<(), DynamicError> {
         let v = self.untagged(v)?;
@@ -477,8 +475,7 @@ impl<'w> Builder<'w> {
                 ..
             } => {
                 self.too_deep(depth + 1)?;
-                let target = self.nested(schema_name, package, parent)?;
-                let schema = self.schema(target)?;
+                let (target, schema) = self.nested(schema_name, package, parent)?;
                 let values = self.fields(schema, v)?;
                 for (field, value) in schema.fields.iter().zip(values) {
                     let fl = target
@@ -496,7 +493,7 @@ impl<'w> Builder<'w> {
                         &field.field_type,
                         value,
                         &mut dst[range],
-                        &target.qualified_name,
+                        schema.package.as_deref(),
                         depth + 1,
                     )?;
                     self.path.truncate(mark);
@@ -628,7 +625,7 @@ impl<'w> Builder<'w> {
         &mut self,
         ft: &FieldType,
         v: &Value,
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         let v = self.untagged(v)?;
@@ -698,7 +695,7 @@ impl<'w> Builder<'w> {
         elem: &FieldType,
         v: &Value,
         exact: Option<usize>,
-        parent: &str,
+        parent: Option<&str>,
         depth: usize,
     ) -> Result<Vec<u8>, DynamicError> {
         match elem {
@@ -736,10 +733,11 @@ impl<'w> Builder<'w> {
                 ..
             } => {
                 let target = self.nested(schema_name, package, parent)?;
+                let (layout, _) = target;
                 let items = self.sequence(ft, v, exact)?;
                 // Fixed elements are back to back with no count; variable
                 // ones carry a count and a length per element.
-                let counted = !target.is_fixed();
+                let counted = !layout.is_fixed();
                 if let Some(blob) = self.past_array_depth(items)? {
                     return Ok(blob);
                 }
@@ -747,7 +745,7 @@ impl<'w> Builder<'w> {
                 // the wire cannot say how many there were: only the empty
                 // array has a frame, and any other is refused rather than
                 // read back as `[]`.
-                if !counted && target.fixed_size == 0 && !items.is_empty() {
+                if !counted && layout.fixed_size == 0 && !items.is_empty() {
                     return Err(DynamicError::YamlUnsupportedField {
                         path: self.here(),
                         field_type: type_name(ft),

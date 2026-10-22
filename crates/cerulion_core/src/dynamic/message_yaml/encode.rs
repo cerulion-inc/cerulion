@@ -9,6 +9,7 @@ use super::{
 use crate::codegen::layout::WireLayout;
 use crate::codegen::{FieldType, FrameValue, FrameValueKind, FrameWalker, MessageSchema, PrimType};
 use crate::dynamic::DynamicError;
+use crate::wire::WireHeader;
 
 /// Display options for [`message_to_yaml_with`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -79,7 +80,14 @@ pub(super) fn message_to_yaml_capped(
 ) -> Result<String, DynamicError> {
     let keep = options.truncate_arrays.unwrap_or(usize::MAX);
     let value = walker.walk_by_hash_keeping(frame, keep)?;
-    let schema = schema_of(walker, &value.schema_name, "")?;
+    // The walk read a whole header, so `frame` holds one. The hash picks the
+    // schema the walk decoded with: a twin can own `value.schema_name`.
+    let schema = WireHeader::read_from_buf(frame)
+        .and_then(|header| walker.schema_for_hash(header.schema_hash))
+        .ok_or_else(|| DynamicError::YamlUnresolvedNested {
+            path: shown(""),
+            target: value.schema_name.clone(),
+        })?;
     let mut emitter = Emitter {
         walker,
         options,
@@ -105,19 +113,6 @@ pub(super) fn message_to_yaml_capped(
         }
         Err(e) => Err(e),
     }
-}
-
-fn schema_of<'w>(
-    walker: &'w FrameWalker,
-    qname: &str,
-    path: &str,
-) -> Result<&'w MessageSchema, DynamicError> {
-    walker
-        .schema_for_name(qname)
-        .ok_or_else(|| DynamicError::YamlUnresolvedNested {
-            path: shown(path),
-            target: qname.to_string(),
-        })
 }
 
 struct Emitter<'w> {
@@ -218,7 +213,7 @@ impl<'w> Emitter<'w> {
         // An empty variable nested blob decodes to a value with no fields:
         // treat it as the zero default.
         let value = value.filter(|v| !v.fields.is_empty() || schema.fields.is_empty());
-        let qname = schema.qualified_name();
+        let parent = schema.package.as_deref();
         for (i, field) in schema.fields.iter().enumerate() {
             let kind = match value {
                 Some(v) => {
@@ -240,7 +235,7 @@ impl<'w> Emitter<'w> {
                 format!("{:indent$}", "")
             };
             self.put(&format!("{lead}{}:", key(&field.name)))?;
-            self.value(&field.field_type, kind, &qname, indent, depth)?;
+            self.value(&field.field_type, kind, parent, indent, depth)?;
             self.path.truncate(mark);
         }
         Ok(())
@@ -252,7 +247,7 @@ impl<'w> Emitter<'w> {
         &mut self,
         ft: &FieldType,
         kind: Option<&FrameValueKind<'_>>,
-        parent: &str,
+        parent: Option<&str>,
         indent: usize,
         depth: usize,
     ) -> Result<(), DynamicError> {
@@ -289,27 +284,23 @@ impl<'w> Emitter<'w> {
         }
     }
 
-    /// The layout and schema a nested reference resolves to.
+    /// The layout and schema a nested reference, written inside a schema
+    /// of package `parent`, resolves to.
     fn nested_target(
         &self,
         schema_name: &str,
         package: &Option<String>,
-        parent: &str,
+        parent: Option<&str>,
     ) -> Result<(&'w WireLayout, &'w MessageSchema), DynamicError> {
-        let target = self
-            .walker
-            .nested_layout(schema_name, package, parent)
+        self.walker
+            .nested_target(schema_name, package, parent)
             .ok_or_else(|| DynamicError::YamlUnresolvedNested {
                 path: shown(&self.path),
                 target: match package {
                     Some(p) => format!("{p}/{schema_name}"),
                     None => schema_name.to_string(),
                 },
-            })?;
-        Ok((
-            target,
-            schema_of(self.walker, &target.qualified_name, &self.path)?,
-        ))
+            })
     }
 
     /// An array of messages: a block sequence (`[]` when empty).
@@ -318,7 +309,7 @@ impl<'w> Emitter<'w> {
         ft: &FieldType,
         element_type: &FieldType,
         kind: Option<&FrameValueKind<'_>>,
-        parent: &str,
+        parent: Option<&str>,
         indent: usize,
         depth: usize,
     ) -> Result<(), DynamicError> {

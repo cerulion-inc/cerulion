@@ -3,6 +3,7 @@
 
 mod cli;
 mod completion;
+mod families;
 mod install_marker;
 mod telemetry;
 mod telemetry_events;
@@ -29,9 +30,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{CommandFactory, FromArgMatches};
+use clap::FromArgMatches;
 
-use cerulion_cli_engine::error::{render_user_error, CliResult};
+use cerulion_cli_engine::error::CliResult;
 use cerulion_cli_engine::ipc_cleanup::SweepMode;
 use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
@@ -42,7 +43,7 @@ use cerulion_cli_engine::{
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
-    Ros2Action, SchemaAction, TopicAction, TraceAction, WorkspaceAction,
+    Ros2Action, TopicAction, TraceAction, WorkspaceAction,
 };
 
 /// The migration error for the REMOVED `cerulion ros` family (`ros attach`
@@ -64,10 +65,11 @@ fn main() -> ExitCode {
     // garbage in the user's shell — and because a completion should pay none
     // of the startup below (logging, the iceoryx2 log bridge, the login gate).
     //
-    // The factory it takes is the SAME `Cli::command` this binary parses with,
+    // The factory it takes is the SAME `families::cli_command` this binary
+    // parses with (the `Commands` verbs plus every registered verb family),
     // which is what makes every subcommand, flag and enum value complete for
     // free and keeps completions from drifting out of sync with the CLI.
-    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+    clap_complete::CompleteEnv::with_factory(families::cli_command).complete();
 
     // Quiet iceoryx2's own logger by default. It writes a `[W] Notifier { ... }`
     // pretty-print of internal state on every notify path, which dwarfs our
@@ -98,22 +100,65 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = families::cli_command().get_matches();
     // One `cli_command_run` per invocation, recorded around the whole
     // dispatch so every intercept below is covered. `None` (nothing is
     // recorded or sent) without a key, without consent, for the internal
     // subprocess verbs, and on the run that prints the first-run notice.
     let command_run = telemetry::CommandRun::start(&matches);
-    let code = dispatch(cli);
+    // A registered verb family owns its own dispatch, after the same logging
+    // setup, iceoryx2 bridge and login gate a `Commands` verb gets in
+    // [`dispatch`]; every other verb is a `Commands` variant and takes the
+    // generic path.
+    let verbose = matches.get_flag("verbose");
+    let family_code = families::route(
+        families::FAMILIES,
+        &matches,
+        |class| {
+            init_logging(verbose, class.is_quiet_default());
+            let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
+        },
+        login_gate,
+    );
+    let code = match family_code {
+        Some(code) => code,
+        None => dispatch(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())),
+    };
     if let Some(command_run) = command_run {
         command_run.finish(code);
     }
     code
 }
 
-/// Everything `main` does after parsing: the intercepts, the login gate and
-/// the generic [`run`] dispatch.
+/// The first-need runtime login gate (see [`dispatch`] for the rules).
+/// `Some(exit code)` when the gate refused and the command must not run.
+fn login_gate() -> Option<ExitCode> {
+    // The id is asked for, and claimed, only if the gate runs a login.
+    let gate =
+        login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
+    if let Ok(Some(outcome)) = &gate {
+        telemetry::login_completed(outcome);
+    }
+    match gate {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            // Exit 7 (not the generic FAILURE=1): the login gate is a
+            // "command did not run" refusal, and 1 collides with `bag play
+            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
+            // auth-refusal apart from a data violation. The constant lives in
+            // `login_cmd` (the platform-independent login gate), NOT the
+            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
+            // target; the full exit-code registry is documented in `replay_cmd`.
+            Some(ExitCode::from(
+                cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED,
+            ))
+        }
+    }
+}
+
+/// Everything `main` does after parsing a `Commands` verb: the intercepts, the
+/// login gate and the generic [`run`] dispatch.
 fn dispatch(cli: Cli) -> ExitCode {
     // bagd is folded into `cerulion` as a subcommand: dispatch
     // the recorder subcommand BEFORE `init_logging` so `bagd_cli_main` installs
@@ -229,23 +274,21 @@ fn dispatch(cli: Cli) -> ExitCode {
         }
     }
 
+    // The Android viz refusal is hoisted ABOVE the identity gate for the same
+    // reason the resim one is: an unsupported platform must never answer with
+    // a sign-in prompt. `unsupported_viz_message` is a pure platform check, so
+    // the hoist refuses nothing it did not refuse before. It exits 1
+    // (FAILURE), the same code `run_viz` gives this refusal as a `Validation`
+    // error through the generic dispatch: the command line is well-formed, so
+    // it is not a usage error (2), and the hoist must not change the code.
+    if let Some(refusal) = viz_refusal(&cli.command, cfg!(target_os = "android")) {
+        eprintln!("Error: {refusal}");
+        return ExitCode::FAILURE;
+    }
+
     if command_needs_identity(&cli.command) {
-        // The id is asked for, and claimed, only if the gate runs a login.
-        let gate =
-            login_cmd::ensure_login_gate_carrying(&mut std::io::stderr(), telemetry::login_anon_id);
-        if let Ok(Some(outcome)) = &gate {
-            telemetry::login_completed(outcome);
-        }
-        if let Err(e) = gate {
-            eprintln!("Error: {e}");
-            // Exit 7 (not the generic FAILURE=1): the login gate is a
-            // "command did not run" refusal, and 1 collides with `bag play
-            // --resim --verify`'s EXIT_VIOLATION. A distinct code lets a CI caller tell
-            // auth-refusal apart from a data violation. The constant lives in
-            // `login_cmd` (the platform-independent login gate), NOT the
-            // `#[cfg(unix)]` `replay_cmd`, so this reference compiles on every
-            // target; the full exit-code registry is documented in `replay_cmd`.
-            return ExitCode::from(cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED);
+        if let Some(refused) = login_gate() {
+            return refused;
         }
     }
 
@@ -332,18 +375,12 @@ fn dispatch(cli: Cli) -> ExitCode {
         };
     }
 
-    match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {}", render_user_error(&e));
-            ExitCode::from(cli_error_exit_code(&e))
-        }
-    }
+    families::exit_code_of(run(cli))
 }
 
-/// The process exit status for an error `run` returned: `EXIT_NODE_FATAL` (3)
-/// for a run that stopped a node on a fatal error, in process or in a worker
-/// group, and 1 for every other error.
+/// The process exit status for an error a verb returned, built-in or family:
+/// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
+/// process or in a worker group, and 1 for every other error.
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
@@ -2058,12 +2095,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     "{}",
                     topic_cmd::render_local_topics_section(&genuine_local, all)
                 );
-                // Automagic: remote discovery runs BY DEFAULT with
-                // scouting ON — unpaired robots on the LAN show up with no
-                // flags. `--no-network` skips it (scripts / CI / offline).
+                // Automagic: remote discovery runs BY DEFAULT (the mDNS /
+                // cache / hostname ladder), unpaired robots on the LAN show
+                // up with no flags. `--no-network` skips it (scripts / CI / offline).
                 // The options are built by the ENGINE's unit-pinned builder
                 // (`remote_discovery_options` — the
-                // scouting-ON default lives there, not in an untested literal
+                // automagic default lives there, not in an untested literal
                 // here). Because remote discovery is the DEFAULT, a
                 // session/query failure must NOT fail the whole command (the
                 // LOCAL list is already printed) — it is a LOUD note + exit 0.
@@ -2357,130 +2394,6 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Bagd(_) => unreachable!("`cerulion bagd` is dispatched in main() before run()"),
         #[cfg(not(unix))]
         Commands::Bagd => unreachable!("`cerulion bagd` is rejected in main() before run()"),
-        Commands::Schema { action } => {
-            match action {
-                // Create/Delete WRITE into the workspace `schemas/` dir, so a
-                // workspace is required (loud error naming `workspace create`).
-                SchemaAction::Create { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_create(&ws.schemas_dir, &name)?;
-                    println!("Created schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Delete { name } => {
-                    let ws = discover_workspace()?;
-                    schema_cmd::schema_delete(&ws.schemas_dir, &name)?;
-                    println!("Deleted schema '{}'", name);
-                    Ok(())
-                }
-                SchemaAction::Info { name } => {
-                    // `schema info` does NOT require a
-                    // workspace — the intended use is a brand-new laptop
-                    // resolving a robot's types with zero setup. A missing
-                    // workspace ⇒ skip the workspace + `.msg`-store tiers and
-                    // resolve builtin → remote exactly as designed; a workspace
-                    // present ⇒ the full resolution ladder (workspace
-                    // wins). `schema_info_unified_opt` keeps the provenance
-                    // accurate either way.
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    // Unified lookup — workspace schemas first,
-                    // then the embedded built-in ROS 2 registry (the exact
-                    // .msg text the generated types compiled against), with
-                    // ONE renderer for both sources. Replaces the sibling
-                    // `../native_ros2_messages/msg` path probe, which only
-                    // worked for workspaces created inside this repository.
-                    let info = match schema_cmd::schema_info_unified_opt(schemas_dir, &name) {
-                        Ok(info) => info,
-                        // Unresolvable locally (neither workspace
-                        // nor built-in). If it is a QUALIFIED `pkg/Type` and robots
-                        // are discoverable, ask THEM — the automagic bar: a desk
-                        // with zero local knowledge of a robot's custom types can
-                        // still `schema info` them. Best-effort: a failed/empty
-                        // fetch re-raises the original local error (exit code
-                        // unchanged). A found remote schema prints with a loud
-                        // provenance header, then returns Ok.
-                        Err(
-                            local_err @ cerulion_cli_engine::error::CliError::SchemaNotFound {
-                                ..
-                            },
-                        ) => match schema_cmd::remote_fetch_target(&name) {
-                            Some(requested) => {
-                                let opts = topic_cmd::RemoteTopicsOptions {
-                                    connect: vec![],
-                                    listen: vec![],
-                                    scouting: true,
-                                };
-                                // An empty remote answer means two different
-                                // things. Only a SETTLED discovery licenses re-raising
-                                // the terminal local "schema not found"; a cold
-                                // `cerulion-netd` (or a transient gather that read
-                                // nothing) searched NOTHING, so saying the type does
-                                // not exist would be a claim with no evidence — the
-                                // same false absence already removed from the topic
-                                // path.
-                                //
-                                // The variant match lives in
-                                // `topic_cmd::schema_info_remote_outcome`, NOT here —
-                                // as a `match` in this file the mapping has no test,
-                                // and a mutation reverting its cold-start arm would pass
-                                // the whole suite. One `?` leaves no arm to mis-route.
-                                let fetched = topic_cmd::fetch_remote_schema(&requested, &opts)?;
-                                let reply = topic_cmd::schema_info_remote_outcome(
-                                    &requested, fetched, local_err,
-                                )?;
-                                print!("{}", schema_cmd::render_remote_schema(&reply));
-                                return Ok(());
-                            }
-                            None => return Err(local_err),
-                        },
-                        Err(e) => return Err(e),
-                    };
-                    // A workspace schema colliding with a
-                    // built-in name is LOUD — one stderr warning per
-                    // (workspace schema, shadowed built-in) pair, BEFORE
-                    // the rendered output. `shadowed_builtin` is only
-                    // `Some` on workspace results; the ", "-joined list
-                    // splits back losslessly (names carry no commas).
-                    if let Some(shadowed) = &info.shadowed_builtin {
-                        for builtin in shadowed.split(", ") {
-                            let bare = builtin.rsplit('/').next().unwrap_or(builtin);
-                            for entry in &info.result.entries {
-                                // The ONE canonical identity (the engine's
-                                // `shadowed_builtin_names` decided the shadow
-                                // that way): an entry declared `pkg::Type`
-                                // must get the warning its `pkg/Type` twin
-                                // gets, or the loud line goes missing on
-                                // exactly the spelling the engine flagged.
-                                let declared =
-                                    cerulion_cli_engine::schema_cmd::normalize_schema(&entry.name);
-                                if declared == builtin || declared == bare {
-                                    eprintln!(
-                                        "WARNING: workspace schema '{}' shadows built-in '{}' \
-                                         — workspace wins for schema info",
-                                        entry.name, builtin
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    print!("{}", info);
-                    Ok(())
-                }
-                SchemaAction::List => {
-                    // Workspace-local schemas + the embedded
-                    // built-in ROS 2 registry grouped by package, with
-                    // shadowed built-ins marked inline. One renderer.
-                    // Workspace-OPTIONAL — no workspace ⇒ the
-                    // built-in registry alone (never a stray cwd `schemas/`).
-                    let ws = discover_workspace().ok();
-                    let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                    let listing = schema_cmd::schema_list_opt(schemas_dir);
-                    print!("{}", listing);
-                    Ok(())
-                }
-            }
-        }
         // The REMOVED `cerulion ros` family: `main` intercepts it above the
         // login gate and exits 2 with the migration message. Belt-and-braces
         // here in case a future reorder lets it through — the same message,
@@ -2806,6 +2719,11 @@ fn run_viz(
     listen: &[String],
     detach: bool,
 ) -> CliResult<()> {
+    if let Some(message) = viz_client::unsupported_viz_message(cfg!(target_os = "android")) {
+        return Err(cerulion_cli_engine::error::CliError::Validation(
+            message.to_string(),
+        ));
+    }
     #[cfg(not(unix))]
     {
         let _ = (running, topics, robot, connect, listen, detach);
@@ -2876,11 +2794,17 @@ fn run_viz_unix(
         Some(topics.iter().map(|a| parse_viz_topic_arg(a)).collect())
     };
 
+    // A remote attach under a kill switch is refused after the arg-shape checks
+    // and before any daemon is spawned or contacted.
+    if let Some(refusal) = robot.and_then(cerulion_cli_engine::viz_cmd::remote_viz_refusal) {
+        return Err(val(refusal));
+    }
+
     // 1. Ensure the daemon is running (spawn it detached if absent), then connect.
     //    When THIS command starts the daemon, the --connect/--listen locators are
     //    threaded into its network config (env-at-spawn); a daemon already running
     //    keeps its own boot-time locators (a shared long-lived daemon's config is
-    //    fixed at start — scouting covers the LAN regardless).
+    //    fixed at start).
     let socket = viz_client::vizd_socket_path();
     let log_path = viz_client::vizd_log_path(&socket);
     let log_for_spawn = log_path.clone();
@@ -2922,14 +2846,13 @@ fn run_viz_unix(
 
     // Note to the user: locators given, but the daemon was ALREADY running — this
     // command's locators do not reconfigure a live shared daemon (its network
-    // config is fixed at start). Scouting (on by default) still covers a LAN
-    // robot; restart the daemon to bake in new locators for a robot scouting
-    // can't reach. Never a silent drop (the project's loud-inference rule).
+    // config is fixed at start). Restart the daemon to bake in new locators.
+    // Never a silent drop (the project's loud-inference rule).
     if !spawned && (!connect.is_empty() || !listen.is_empty()) {
         eprintln!(
             "cerulion viz: note — the cerulion-vizd daemon was already running, so \
              --connect/--listen apply only to a daemon THIS command starts; the running daemon \
-             keeps its boot-time locators (scouting still covers LAN robots). Restart it \
+             keeps its boot-time locators. Restart it \
              (stop the daemon, then re-run) to bake in these locators."
         );
     }
@@ -3876,6 +3799,17 @@ fn command_needs_identity(command: &Commands) -> bool {
     )
 }
 
+/// The platform refusal for `cerulion viz`, when the platform cannot run it,
+/// lifted out of `run_viz` so `dispatch` can refuse BEFORE the identity gate.
+/// `is_android` is an argument (not a cfg read) so the decision is
+/// oracle-testable on host. PURE.
+fn viz_refusal(command: &Commands, is_android: bool) -> Option<&'static str> {
+    if !matches!(command, Commands::Viz { .. }) {
+        return None;
+    }
+    cerulion_cli_engine::viz_client::unsupported_viz_message(is_android)
+}
+
 /// Install the process-wide shutdown-signal handler and return the shared
 /// `running` flag every long-running verb (`graph run`, `topic echo`/`hz`, …)
 /// polls to exit cleanly.
@@ -4095,6 +4029,28 @@ mod login_gate_exemption_tests {
         assert!(!command_needs_identity(&Commands::Clean {
             report_only: false
         }));
+    }
+
+    #[test]
+    fn the_android_viz_refusal_fires_before_the_identity_gate() {
+        // A never-signed-in Android device must see the platform refusal, not
+        // a sign-in prompt: `viz_refusal` is what `dispatch` checks above the
+        // gate, and `viz` stays gated underneath it (it is NOT exempted).
+        let viz = Commands::Viz {
+            topics: vec!["/t".to_string()],
+            robot: None,
+            connect: Vec::new(),
+            listen: Vec::new(),
+            detach: false,
+        };
+        assert!(command_needs_identity(&viz));
+        assert_eq!(
+            viz_refusal(&viz, true),
+            cerulion_cli_engine::viz_client::unsupported_viz_message(true)
+        );
+        assert!(viz_refusal(&viz, true).is_some());
+        assert!(viz_refusal(&viz, false).is_none());
+        assert!(viz_refusal(&Commands::Login, true).is_none());
     }
 
     #[test]

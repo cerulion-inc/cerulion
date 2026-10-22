@@ -368,8 +368,9 @@ impl GatewayBeacon {
                 tracing::info!(
                     listen = ?listen,
                     "cerulion-netd is NOT advertising this machine over mDNS \
-                     (`_cerulion._tcp`) — it has no dialable tcp/ listen endpoint, so there is no \
-                     port a peer could dial. On a DESK this is correct and expected: a desk is \
+                     (`_cerulion._tcp`); it has no dialable tcp/ listen endpoint (port 0 and \
+                     loopback hosts are not advertised), so there is no port another machine \
+                     could dial. On a DESK this is correct and expected: a desk is \
                      not a robot and must not appear in `cerulion topic list`'s ROBOTS section. \
                      On a machine that is MEANT to serve topics to other machines, this line is \
                      WHY it is undiscoverable — give cerulion-netd a listen locator \
@@ -434,7 +435,7 @@ mod tests {
     /// A network config shaped like the one `network_config_from_env` builds.
     fn cfg(identity: Option<&str>, listen: &[&str]) -> NetworkConfig {
         NetworkConfig {
-            multicast_scouting: true,
+            multicast_scouting: false,
             gossip_scouting: true,
             listen_endpoints: listen.iter().map(|s| s.to_string()).collect(),
             robot_identity: identity.map(str::to_string),

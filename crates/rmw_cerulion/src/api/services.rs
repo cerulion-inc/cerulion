@@ -309,6 +309,7 @@ pub unsafe extern "C" fn rmw_send_response(
             sequence: (*request_header).sequence_number,
         };
         // Flatten the response through the bridge into the service payload.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.service_name);
         let payload = match data.response_bridge.flatten_payload_only(ros_response) {
             Ok(p) => p,
             Err(e) => {
@@ -503,6 +504,7 @@ pub unsafe extern "C" fn rmw_send_request(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*client).data as *const ClientData);
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.service_name);
         let payload = match data.request_bridge.flatten_payload_only(ros_request) {
             Ok(p) => p,
             Err(e) => {

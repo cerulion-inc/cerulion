@@ -1772,11 +1772,11 @@ impl Sample<'_> {
             }
             self.yaml.push_str(&f.name);
             self.yaml.push(':');
-            self.value(&f.field_type, qname, indent);
+            self.value(&f.field_type, schema.package.as_deref(), indent);
         }
     }
 
-    fn target(&self, ft: &FieldType, parent: &str) -> Option<(String, bool)> {
+    fn target(&self, ft: &FieldType, parent: Option<&str>) -> Option<(String, bool)> {
         let FieldType::Nested {
             schema_name,
             package,
@@ -1785,18 +1785,15 @@ impl Sample<'_> {
         else {
             return None;
         };
-        let q = self
+        let (layout, schema) = self
             .walker
-            .nested_layout(schema_name, package, parent)
-            .unwrap()
-            .qualified_name
-            .clone();
-        let empty = self.walker.schema_for_name(&q).unwrap().fields.is_empty();
-        Some((q, empty))
+            .nested_target(schema_name, package, parent)
+            .unwrap();
+        Some((layout.qualified_name.clone(), schema.fields.is_empty()))
     }
 
     /// One field value after its `key:`, to the end of its lines.
-    fn value(&mut self, ft: &FieldType, parent: &str, indent: usize) {
+    fn value(&mut self, ft: &FieldType, parent: Option<&str>, indent: usize) {
         if let Some((q, empty)) = self.target(ft, parent) {
             if empty {
                 self.cdr.u8(0);
@@ -2146,4 +2143,77 @@ fn arrays_past_the_walker_depth_are_refused_on_read() {
     );
     let frame = yaml_to_message(w, "M1", eight.as_bytes(), TS).unwrap();
     assert_eq!(message_to_yaml(w, &frame).unwrap(), eight);
+}
+
+/// `pkg2/Root { Leaf leaf; uint8 tag }` beside a real `pkg2/Leaf { float64
+/// v }` AND a package-less schema NAMED `pkg2/Leaf` (`{ uint8 v }`), listed
+/// last so it owns the qualified text. The bare `Leaf` inside `Root` is the
+/// packaged one, so `Root` is leaf@0 size 8, tag@8, padded to 16.
+fn twin_schemas() -> Vec<MessageSchema> {
+    let leaf_ref = FieldType::Nested {
+        schema_name: "Leaf".to_string(),
+        package: None,
+        fixed: None,
+    };
+    let mut leaf = MessageSchema::new_in_package("Leaf", "pkg2");
+    leaf.fields.push(FieldDef::new("v", FieldType::F64));
+    let mut root = MessageSchema::new_in_package("Root", "pkg2");
+    root.fields.push(FieldDef::new("leaf", leaf_ref));
+    root.fields.push(FieldDef::new("tag", FieldType::U8));
+    vec![
+        leaf,
+        root,
+        one_field_schema("pkg2/Leaf", "v", FieldType::U8),
+    ]
+}
+
+/// The `pkg2/Root` frame for leaf.v=2.5, tag=7, by hand: 2.5 is
+/// `0x4004_0000_0000_0000`, then the tag and 7 pad bytes; no variable
+/// fields, so the table offset is the end of the 16-byte fixed section.
+fn twin_root_frame(hash: u64) -> Vec<u8> {
+    let mut f = header(hash, 48, 48, 0);
+    f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40, 7, 0, 0, 0, 0, 0, 0, 0]);
+    f
+}
+
+const TWIN_ROOT_TEXT: &str = "leaf:\n  v: 2.5\ntag: 7\n";
+
+/// The nested field prints with the fields of the schema it binds to (the
+/// packaged `float64 v`), never those of the twin that owns the text.
+#[test]
+fn encode_prints_a_nested_twin_with_the_schema_it_binds_to() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let hash = walker.schema_hash_for("pkg2/Root").unwrap();
+    let yaml = message_to_yaml_with(
+        &walker,
+        &twin_root_frame(hash),
+        YamlEncodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(yaml, TWIN_ROOT_TEXT);
+}
+
+/// Decoding writes the nested field with the layout AND the field list of
+/// the schema it binds to, so the bytes are the hand-written frame.
+#[test]
+fn decode_writes_a_nested_twin_with_the_schema_it_binds_to() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let hash = walker.schema_hash_for("pkg2/Root").unwrap();
+    let frame = yaml_to_message(&walker, "pkg2/Root", TWIN_ROOT_TEXT.as_bytes(), TS).unwrap();
+    assert_eq!(frame, twin_root_frame(hash));
+}
+
+/// A frame of the packaged `pkg2/Leaf` (its own hash) prints with its own
+/// `float64 v`, although the package-less twin owns the name `pkg2/Leaf`.
+#[test]
+fn encode_prints_a_frame_with_the_schema_of_its_own_hash() {
+    let (walker, _) = FrameWalker::new(twin_schemas());
+    let (mut resolver, _) = crate::codegen::layout::LayoutResolver::new(twin_schemas());
+    let packaged = resolver.layout_at(0).unwrap().schema_hash;
+    let owner = walker.schema_hash_for("pkg2/Leaf").unwrap();
+    assert_ne!(packaged, owner, "the twins must carry distinct hashes");
+    let mut frame = header(packaged, 40, 40, 0);
+    frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40]);
+    let yaml = message_to_yaml_with(&walker, &frame, YamlEncodeOptions::default()).unwrap();
+    assert_eq!(yaml, "v: 2.5\n");
 }
