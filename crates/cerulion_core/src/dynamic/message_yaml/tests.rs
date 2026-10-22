@@ -523,6 +523,36 @@ fn a_fixed_section_past_the_cap_is_refused_before_it_is_allocated() {
     );
 }
 
+/// The cap counts every body the reader holds, not one body at a time:
+/// `Big` is 520 MiB of fixed section (520 `string_fixed` fields of 1 MiB)
+/// from a few kilobytes of YAML, so the second one in `Pair` is refused at
+/// its field before it is built, not after both are held and copied into
+/// the frame.
+#[test]
+fn bodies_held_together_past_the_cap_are_refused_before_the_next_is_built() {
+    const FIELDS: usize = 520;
+    let mut schema = String::from("schemas:\n  Big:\n    fields:\n");
+    let mut big = String::from("{t: \"\"");
+    for i in 0..FIELDS {
+        schema.push_str(&format!("      string_fixed[1048576] f{i}: {{}}\n"));
+        big.push_str(&format!(", f{i}: \"\""));
+    }
+    big.push('}');
+    schema.push_str("      string t: {}\n  Pair:\n    fields:\n      Big a: {}\n      Big b: {}\n");
+    schema.push_str("  Bigs:\n    fields:\n      Big[] items: {}\n");
+    let set = set_from_yaml(&schema);
+    let w = set.walker();
+    assert_eq!(
+        decode_err(w, "Pair", &format!("a: {big}\nb: {big}\n")),
+        "b: the message is larger than the 1 GiB frame cap"
+    );
+    // The same holds for the elements of an array of messages.
+    assert_eq!(
+        decode_err(w, "Bigs", &format!("items: [{big}, {big}]\n")),
+        "items[1]: the message is larger than the 1 GiB frame cap"
+    );
+}
+
 /// `Path`: an array of fixed messages and a `string[]`, three elements each.
 ///
 /// ```text
@@ -1003,7 +1033,7 @@ fn keys_are_plain_only_for_identifiers_yaml_reads_as_strings() {
 
 #[test]
 fn the_scanner_finds_anchors_at_node_starts_only() {
-    let cases: [(&str, Option<(usize, usize)>); 27] = [
+    let cases: [(&str, Option<(usize, usize)>); 31] = [
         ("a: &x 1", Some((1, 4))),
         ("a: *x", Some((1, 4))),
         ("- *x", Some((1, 3))),
@@ -1036,6 +1066,12 @@ fn the_scanner_finds_anchors_at_node_starts_only() {
         ("a: a*b &c", None),
         ("a: \"*x\" # &y", None),
         ("a: 'it''s *x'", None),
+        // Every YAML line break ends a line, so a block scalar on a CR-only
+        // (or NEL, LS, PS) document does not hide what follows it.
+        ("a: |\r  *text\rb: *x", Some((3, 4))),
+        ("a: |\r\n  *text\r\nb: *x", Some((3, 4))),
+        ("a: |\u{85}  *text\u{85}b: *x", Some((3, 4))),
+        ("a: |\u{2028}  *text\u{2029}b: *x", Some((3, 4))),
     ];
     for (text, want) in cases {
         assert_eq!(find_anchor_or_alias(text), want, "{text:?}");
@@ -1298,6 +1334,12 @@ fn an_anchor_after_a_block_scalar_in_a_sequence_element_is_refused() {
         decode_err(w, "List", text),
         "message YAML uses an anchor or alias at line 4, column 12; write every value out in full"
     );
+    // The parser reads CR as a line break too, so a CR-only copy of the
+    // same text is refused at the same place, not parsed with the alias.
+    assert_eq!(
+        decode_err(w, "List", &text.replace('\n', "\r")),
+        "message YAML uses an anchor or alias at line 4, column 12; write every value out in full"
+    );
     // The same text without the anchor and alias decodes, block scalar and
     // all, so the refusal above is the anchor and nothing else.
     let plain =
@@ -1414,6 +1456,56 @@ fn nesting_past_the_depth_bound_is_refused_both_ways() {
             format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
         ),
         Ok(t) => panic!("must be refused, got {t}"),
+    }
+}
+
+/// A fieldless message is a level too: `{}` past the bound is refused by
+/// the writer as by the reader, both as a field and as an array element.
+#[test]
+fn an_empty_message_past_the_depth_bound_is_refused_both_ways() {
+    // `L0 -> ... -> L63`, then L64 holds the fieldless `Empty` at depth 65
+    // (field `next`) and L63's twin `A63` holds it as an array element at
+    // depth 65 (`items[0]`).
+    let mut yaml = String::from("schemas:\n  Empty:\n    fields: {}\n");
+    for i in 0..64 {
+        yaml.push_str(&format!(
+            "  L{i}:\n    fields:\n      L{} next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str("  L64:\n    fields:\n      Empty next: {}\n");
+    for i in 0..63 {
+        yaml.push_str(&format!(
+            "  A{i}:\n    fields:\n      A{} next: {{}}\n",
+            i + 1
+        ));
+    }
+    yaml.push_str("  A63:\n    fields:\n      Empty[1] items: {}\n");
+    let set = set_from_yaml(&yaml);
+    let too_deep = |path: String| {
+        format!("{path}: messages and arrays of messages nest deeper than 64 levels")
+    };
+    // (root, `next:` lines before the last key, last key, its value)
+    let cases = [("L0", 64, "next", "{}"), ("A0", 63, "items", "[{}]")];
+    for (root, nexts, last, leaf) in cases {
+        let mut text = String::new();
+        for i in 0..nexts {
+            text.push_str(&format!("{:w$}next:\n", "", w = 2 * i));
+        }
+        text.push_str(&format!("{:w$}{last}: {leaf}\n", "", w = 2 * nexts));
+        let mut path = vec!["next"; nexts].join(".");
+        path.push_str(if last == "next" { ".next" } else { ".items[0]" });
+        assert_eq!(
+            decode_err(set.walker(), root, &text),
+            too_deep(path.clone()),
+            "{root}"
+        );
+        // Every message in the chain is zero bytes: the frame is a header.
+        let frame = header(set.schema_hash(root).unwrap(), 32, 32, 0);
+        match message_to_yaml(set.walker(), &frame) {
+            Err(e) => assert_eq!(e.to_string(), too_deep(path), "{root}"),
+            Ok(t) => panic!("{root} must be refused, got {t}"),
+        }
     }
 }
 

@@ -245,18 +245,23 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
 - **Decode** builds every body through `CanonicalBodyBuilder` (the shared placement
   rule) and resolves nested types through `FrameWalker::nested_target` (the walker's
   own identity binding on the parent's package, which gives the layout and the schema
-  from one slot). A body whose
-  fixed section plus offset table passes `MAX_BODY_BYTES` is refused before the builder
-  allocates it, and a string or scalar array past it is refused before its bytes are
-  built. Input past `MAX_YAML_INPUT_BYTES` (the encoder's cap plus 1 MiB for echo's
+  from one slot). `MAX_BODY_BYTES` counts every byte the unfinished bodies and arrays on
+  the build stack hold, since all of them end up in the frame: a body whose fixed
+  section plus offset table does not fit what is left is refused before the builder
+  allocates it, and a string or scalar array that does not fit is refused before its
+  bytes are built. So a few bytes of YAML naming many large fixed sections (unset
+  `string_fixed` fields) are refused at the first one past the cap, not after all are
+  held. Input past `MAX_YAML_INPUT_BYTES` (the encoder's cap plus 1 MiB for echo's
   comment lines and separator) is refused before parsing, which bounds the value tree. One final `---` line (echo's frame separator) is dropped before parsing.
   `parse.rs` builds the `serde_yaml::Value` tree with its own visitor so an integer
   past 64 bits (which `Value` cannot hold, and serde_yaml refuses with no path) is
   kept as its decimal text: an integer field refuses it as `YamlOutOfRange` at its
-  path, a float field reads it like any integer.
+  path, a float field reads it like any integer. A typed tag that spells the
+  parser's mark for such an integer (`!integer%20past%2064%20bits`) is refused as a tag.
   serde_yaml expands aliases silently, so `scan.rs` refuses an anchor or
   alias before parsing: `&`/`*` at the start of a node, outside quotes, comments and
-  block scalars. A block scalar's content is what is more indented than the node that
+  block scalars. It splits lines at every break the parser reads (LF, CR, CRLF, NEL,
+  LS, PS), so a CR-only document is not one long line. A block scalar's content is what is more indented than the node that
   owns it (the key of `- key: |`, not the dash), so a sibling key is still scanned. A multi-line plain scalar whose continuation line starts with `&` or
   `*` is a false refusal (quote the string).
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
@@ -264,8 +269,8 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints
   `.nan` and reads back as the quiet NaN, so a NaN's sign and payload bits are the one
   thing the round trip does not keep.
-- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions, a message and an array of
-  messages a level each (each is one YAML mapping or sequence, so printed YAML stays
+- **Bounds**: `MAX_YAML_DEPTH` (64) on both directions, a message (a fieldless `{}`
+  too) and an array of messages a level each (each is one YAML mapping or sequence, so printed YAML stays
   inside the reader's own nesting limit); `MAX_YAML_ARRAY_DEPTH` (the
   walker's `MAX_NESTED_ARRAY_DEPTH`, 8) on decode: a nonempty element array inside
   that many variable-message elements is refused, since the walker hands it back

@@ -22,8 +22,7 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
     // key's column, past the dash, and must still be scanned.
     let mut block_scalar_parent: Option<usize> = None;
 
-    for (line_idx, line) in text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for (line_idx, line) in yaml_lines(text).enumerate() {
         let indent = line.len() - line.trim_start_matches(' ').len();
         if let Some(parent) = block_scalar_parent {
             if line.trim().is_empty() || indent > parent {
@@ -163,4 +162,33 @@ pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// The lines of `text`, split at every line break the YAML parser reads:
+/// LF, CR, CRLF (one break), and the Unicode breaks NEL (U+0085), LS
+/// (U+2028) and PS (U+2029). Splitting at LF alone would make a CR-only
+/// document one line, so a block scalar on it would hide every anchor
+/// after it.
+fn yaml_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let s = rest?;
+        match s
+            .char_indices()
+            .find(|&(_, c)| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+        {
+            Some((i, c)) => {
+                let mut next = i + c.len_utf8();
+                if c == '\r' && s[next..].starts_with('\n') {
+                    next += 1;
+                }
+                rest = Some(&s[next..]);
+                Some(&s[..i])
+            }
+            None => {
+                rest = None;
+                Some(s)
+            }
+        }
+    })
 }

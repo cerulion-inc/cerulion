@@ -204,12 +204,7 @@ impl<'w> Emitter<'w> {
         depth: usize,
         dash: bool,
     ) -> Result<(), DynamicError> {
-        if depth > MAX_YAML_DEPTH {
-            return Err(DynamicError::YamlTooDeep {
-                path: shown(&self.path),
-                max: MAX_YAML_DEPTH,
-            });
-        }
+        self.too_deep(depth)?;
         // An empty variable nested blob decodes to a value with no fields:
         // treat it as the zero default.
         let value = value.filter(|v| !v.fields.is_empty() || schema.fields.is_empty());
@@ -241,6 +236,17 @@ impl<'w> Emitter<'w> {
         Ok(())
     }
 
+    /// Refuse a message nested past [`MAX_YAML_DEPTH`], as the reader does.
+    fn too_deep(&self, depth: usize) -> Result<(), DynamicError> {
+        if depth > MAX_YAML_DEPTH {
+            return Err(DynamicError::YamlTooDeep {
+                path: shown(&self.path),
+                max: MAX_YAML_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
     /// Emit one field value after its `key:`; writes the rest of the line
     /// (` <inline>\n`) or a newline plus a block.
     fn value(
@@ -266,6 +272,9 @@ impl<'w> Emitter<'w> {
                     Some(_) => return Err(self.unencodable("decoded value is not a message")),
                 };
                 if target.fields.is_empty() {
+                    // `{}` is a level too: the reader refuses it past the
+                    // bound, so it is never written there.
+                    self.too_deep(depth + 1)?;
                     return self.put(" {}\n");
                 }
                 self.put("\n")?;
@@ -368,6 +377,7 @@ impl<'w> Emitter<'w> {
             let mark = self.path.len();
             push_index(&mut self.path, i);
             if target.fields.is_empty() {
+                self.too_deep(depth + 2)?;
                 self.put(&format!("{:w$}- {{}}\n", "", w = indent + 2))?;
             } else {
                 // The element's fields sit at indent + 4; its first line
