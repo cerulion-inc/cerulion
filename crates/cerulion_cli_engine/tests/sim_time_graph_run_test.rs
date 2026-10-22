@@ -197,6 +197,7 @@ fn run(args: RunArgs<'_>) -> Result<(), String> {
         RecordCpu::Auto,
         None,
         false,
+        &[],
     )
     .map_err(|e| e.to_string())
 }
