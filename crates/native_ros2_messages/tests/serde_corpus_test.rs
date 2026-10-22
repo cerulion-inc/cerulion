@@ -135,7 +135,10 @@ fn count_vendored_msg_files() -> usize {
             .unwrap_or_else(|e| panic!("cannot read the vendored tree at {}: {e}", dir.display()))
         {
             let path = entry.expect("read_dir entry").path();
-            if path.is_dir() {
+            let is_dir = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("cannot read the metadata of {}: {e}", path.display()))
+                .is_dir();
+            if is_dir {
                 recurse(&path, ext, count);
             } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
                 *count += 1;

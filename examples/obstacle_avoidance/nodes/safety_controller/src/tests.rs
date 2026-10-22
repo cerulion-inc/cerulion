@@ -55,10 +55,11 @@ fn controller_publishes_stop_or_cruise_for_close_clear_empty_and_nan_scans() {
 }
 
 // The built-in corpus ships the standard ROS 2 service types as message pairs,
-// so a workspace names `std_srvs/SetBool` or `std_srvs/Trigger` without
-// defining them. A node cannot serve or call a service yet; this pins that the
-// types resolve from a workspace, that each marker names its own pair, and
-// that the parts build with their declared fields.
+// so a workspace names `std_srvs/SetBool_Request` or `std_srvs/Trigger_Response`
+// without defining them. A node cannot serve or call a service yet; this pins
+// that the parts are in the built-in registry the workspace lookup reads, that
+// each marker names its own pair, and that the parts build with their declared
+// fields.
 #[test]
 fn std_srvs_service_types_resolve_from_the_workspace() {
     // `ServiceType` is not in the prelude: it is experimental until nodes can
@@ -68,6 +69,20 @@ fn std_srvs_service_types_resolve_from_the_workspace() {
         SetBool, SetBool_Request, SetBool_RequestSnapshot, Trigger, Trigger_Response,
         Trigger_ResponseSnapshot,
     };
+
+    // The registry the CLI and the workspace lookup resolve built-ins from
+    // holds each part under its qualified name.
+    for (package, name) in [
+        ("std_srvs", "SetBool_Request"),
+        ("std_srvs", "Trigger_Response"),
+    ] {
+        assert!(
+            native_ros2_messages::BUILTIN_MSGS
+                .iter()
+                .any(|(p, n, _)| *p == package && *n == name),
+            "{package}/{name} is not in the built-in registry"
+        );
+    }
 
     assert_eq!(<Trigger as ServiceType>::NAME, "std_srvs/Trigger");
     assert_eq!(<SetBool as ServiceType>::NAME, "std_srvs/SetBool");

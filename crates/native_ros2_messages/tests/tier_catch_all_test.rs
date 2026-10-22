@@ -62,9 +62,15 @@ fn vendored_package_dirs() -> BTreeSet<String> {
         out.extend(
             std::fs::read_dir(&root)
                 .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
+                .map(|e| {
+                    e.unwrap_or_else(|e| panic!("read an entry of {}: {e}", root.display()))
+                        .path()
+                })
+                .filter(|p| {
+                    std::fs::metadata(p)
+                        .unwrap_or_else(|e| panic!("read the metadata of {}: {e}", p.display()))
+                        .is_dir()
+                })
                 .map(|p| {
                     p.file_name()
                         .expect("package dir name")
