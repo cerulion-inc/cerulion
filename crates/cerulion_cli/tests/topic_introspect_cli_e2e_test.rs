@@ -46,8 +46,9 @@
 //!   (never a silent empty string — an I/O failure must be distinguishable
 //!   from "the child wrote nothing").
 //!
-//! Needs `cargo build -p test_node_macro_period_cdylib` first (panics with
-//! that instruction if the fixture artifact is missing).
+//! Needs `cargo build -p test_node_macro_period_cdylib -p
+//! test_node_macro_clockprobe_cdylib` first (panics with the instruction if a
+//! fixture artifact is missing).
 //!
 //! Runs on the GLOBAL iceoryx2 namespace (no isolation seam at this layer);
 //! `#[serial]` + a unique per-test prefix keep it safe.
@@ -595,4 +596,180 @@ fn topic_hz_subcommand_e2e_reports_a_rate() {
     let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
         .expect("graph run did not exit after SIGINT");
     assert!(status.success(), "graph run must exit 0, got {status:?}");
+}
+
+/// [`build_workspace`] plus a second node of ANOTHER type and payload, so
+/// the two topics differ in both: `/{prefix}/ticker/cmd` carries a 24-byte
+/// `geometry_msgs/Vector3` every 50 ms and `/{prefix}/prober/out` a 48-byte
+/// `geometry_msgs/Twist` every 5 ms (`test_node_macro_clockprobe_cdylib`). A
+/// verb that ignored its topic argument would give both the same answer.
+fn build_two_type_workspace(root: &Path, prefix: &str) {
+    build_workspace(root, prefix);
+    std::fs::create_dir_all(root.join("nodes/prober/src")).unwrap();
+    let fixture_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("test_fixtures/test_node_macro_clockprobe_cdylib/src/lib.rs");
+    std::fs::copy(&fixture_src, root.join("nodes/prober/src/lib.rs")).expect("copy prober src");
+    std::fs::copy(
+        cerulion_core::testing::find_fixture_cdylib("test_node_macro_clockprobe_cdylib"),
+        root.join("target/debug").join(dylib_file("prober")),
+    )
+    .expect("copy prober cdylib");
+    std::fs::write(
+        root.join("graphs/demo.yaml"),
+        format!(
+            "name: demo\nprefix: {prefix}\nnodes:\n\
+             - id: ticker\n  type: ticker\n  inputs: []\n  outputs:\n  - name: cmd\n    \
+             schema: geometry_msgs/Vector3\n\
+             - id: prober\n  type: prober\n  inputs: []\n  outputs:\n  - name: out\n    \
+             schema: geometry_msgs/Twist\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Run a `cerulion topic ...` verb that exits on its own (local only) and
+/// return its exit code, stdout and stderr.
+fn run_topic_once(root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .arg("topic")
+        .args(args)
+        .current_dir(root)
+        .env("CERULION_NETWORK", "off")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn cerulion topic {args:?}: {e}"));
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The lines of `stdout` that belong to this test's graph: the shared
+/// namespace may hold other processes' topics, so the oracle covers ours.
+fn rows_of(stdout: &str, prefix: &str) -> Vec<String> {
+    let ours = format!("/{prefix}/");
+    stdout
+        .lines()
+        .filter(|l| l.starts_with(&ours))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `topic type`, `topic find` and `topic list -t` against a real
+/// `cerulion graph run` of two nodes of different types, checked against
+/// hand-written expected output, twice, with identical results; then
+/// `topic bw` reports each topic's own payload size.
+#[test]
+#[serial]
+fn topic_type_find_list_t_and_bw_e2e_against_a_running_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = "topicintroc";
+    build_two_type_workspace(tmp.path(), prefix);
+    let (mut guard, stderr_path) = spawn_graph_run(tmp.path());
+    wait_for_log_line(
+        &stderr_path,
+        "starting graph (live)",
+        Duration::from_secs(30),
+    );
+    let prober = format!("/{prefix}/prober/out");
+    let ticker = format!("/{prefix}/ticker/cmd");
+
+    let observe = || -> Vec<(Option<i32>, Vec<String>)> {
+        let mut seen = Vec::new();
+        for args in [
+            vec!["type", ticker.as_str()],
+            vec!["type", prober.as_str(), "--local"],
+            vec!["find", "geometry_msgs/Vector3"],
+            vec!["find", "geometry_msgs/msg/Twist"],
+            vec!["find", "sensor_msgs/Image"],
+            vec!["list", "-t", "--local"],
+            vec!["list", "--local"],
+        ] {
+            let (code, stdout, stderr) = run_topic_once(tmp.path(), &args);
+            assert_eq!(code, Some(0), "topic {args:?}\n{stdout}\n{stderr}");
+            let rows = if args[0] == "type" {
+                stdout.lines().map(str::to_string).collect()
+            } else {
+                rows_of(&stdout, prefix)
+            };
+            seen.push((code, rows));
+        }
+        seen
+    };
+    let first = observe();
+    let expected: Vec<(Option<i32>, Vec<String>)> = vec![
+        (Some(0), vec!["geometry_msgs/Vector3".to_string()]),
+        (Some(0), vec!["geometry_msgs/Twist".to_string()]),
+        (Some(0), vec![ticker.clone()]),
+        (Some(0), vec![prober.clone()]),
+        (Some(0), vec![]),
+        (
+            Some(0),
+            vec![
+                format!("{prober}  [geometry_msgs/Twist]"),
+                format!("{ticker}  [geometry_msgs/Vector3]"),
+            ],
+        ),
+        // Plain `topic list` is unchanged: the name alone on each row.
+        (Some(0), vec![prober.clone(), ticker.clone()]),
+    ];
+    assert_eq!(first, expected);
+    assert_eq!(observe(), first, "a second run must print the same");
+
+    // `topic bw` on each topic: the figure is that topic's own payload.
+    for (topic, size, rates) in [
+        // A Vector3 is three f64 fields, 24 bytes every 50 ms: 480 B/s.
+        (&ticker, "24 B", 400..=600),
+        // A Twist is two Vector3s, 48 bytes every 5 ms: 9600 B/s.
+        (&prober, "48 B", 7_000..=12_000),
+    ] {
+        let bw_log = run_topic_verb_until(
+            tmp.path(),
+            "bw",
+            topic,
+            VERB_OUTPUT_DEADLINE,
+            Some(&mut guard.0),
+            |s| any_complete_line(s, |l| l.starts_with("bandwidth: ")),
+        );
+        let line = bw_log
+            .lines()
+            .find(|l| l.starts_with("bandwidth: "))
+            .unwrap_or_else(|| panic!("no bandwidth line for {topic} in:\n{bw_log}"));
+        assert!(
+            line.contains(&format!(
+                ", mean: {size}, min: {size}, max: {size}, window: "
+            )),
+            "{topic}: {line}"
+        );
+        // The stamps carry the period's jitter, so the rate is a band.
+        let rate = bw_rate_bytes_per_sec(line);
+        assert!(rates.contains(&rate), "{topic}: {line}");
+    }
+
+    send_signal(guard.0.id(), libc::SIGINT);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+        .expect("graph run did not exit after SIGINT");
+    assert!(status.success(), "graph run must exit 0, got {status:?}");
+}
+
+/// The bytes per second a `topic bw` line reports (`bandwidth: 480 B/s` or
+/// `bandwidth: 9.60 KB/s`), as a whole number of bytes.
+fn bw_rate_bytes_per_sec(line: &str) -> u64 {
+    let mut words = line
+        .strip_prefix("bandwidth: ")
+        .unwrap_or_else(|| panic!("not a bandwidth line: {line}"))
+        .split([' ', ',']);
+    let figure = words.next().unwrap_or_default();
+    let scale: f64 = match words.next().unwrap_or_default() {
+        "B/s" => 1.0,
+        "KB/s" => 1_000.0,
+        "MB/s" => 1_000_000.0,
+        unit => panic!("unexpected unit {unit:?} in {line}"),
+    };
+    let value: f64 = figure
+        .parse()
+        .unwrap_or_else(|_| panic!("no B/s figure in {line}"));
+    (value * scale).round() as u64
 }

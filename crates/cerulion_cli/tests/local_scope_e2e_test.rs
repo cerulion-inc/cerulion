@@ -172,7 +172,7 @@ fn topic_list_under_a_kill_switch_opens_no_zenoh_session_or_discovery_ladder() {
 #[test]
 #[cfg(debug_assertions)]
 fn observers_under_the_netd_switch_refuse_without_a_session_or_daemon() {
-    for verb in ["echo", "hz", "info"] {
+    for verb in ["echo", "hz", "info", "type", "bw"] {
         let root = tempfile::tempdir().unwrap();
         let output = run_with(
             root.path(),
@@ -190,6 +190,117 @@ fn observers_under_the_netd_switch_refuse_without_a_session_or_daemon() {
         );
         assert!(!error.contains(SESSION_MARKER), "{verb}: {error}");
         assert!(output.stdout.is_empty(), "{verb}");
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn topic_find_under_a_kill_switch_reads_local_topics_only() {
+    let args = [
+        "topic",
+        "find",
+        "std_msgs/String",
+        "--listen",
+        "tcp/127.0.0.1:0",
+    ];
+    // Control: with no switch the same command opens a session and runs the
+    // ladder, so the markers' absence below is the switch's doing.
+    let root = tempfile::tempdir().unwrap();
+    let control = run_with(root.path(), &args, &[("RUST_LOG", NETWORK_MARKER_FILTER)]);
+    let log = String::from_utf8_lossy(&control.stderr);
+    assert!(control.status.success(), "{log}");
+    assert!(
+        log.contains(SESSION_MARKER),
+        "control opened no session:\n{log}"
+    );
+    assert!(log.contains(LADDER_MARKER), "control ran no ladder:\n{log}");
+
+    // A genuine local `std_msgs/String` publisher in the runs' own registry,
+    // sending for the whole loop, so an empty answer cannot pass: under each
+    // switch the local scan must still find it.
+    let root = short_tempdir();
+    let topic = "/scope/find-local-string";
+    let publisher = LocalStringPublisher::start(root.path(), topic);
+    for switches in KILL_SWITCHES {
+        let output = run_with(root.path(), &args, &with_markers(switches));
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{switches:?}: {log}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout, format!("{topic}\n"), "{switches:?}:\n{log}");
+        assert!(!log.contains(SESSION_MARKER), "{switches:?}:\n{log}");
+        assert!(!log.contains(LADDER_MARKER), "{switches:?}:\n{log}");
+    }
+    assert!(publisher.stop() > 0, "the local publisher sent nothing");
+}
+
+/// A temporary root with a short path, so iceoryx2's event socket paths stay
+/// below the Unix pathname length limit.
+#[cfg(debug_assertions)]
+fn short_tempdir() -> tempfile::TempDir {
+    #[cfg(unix)]
+    return tempfile::tempdir_in("/tmp").unwrap();
+    #[cfg(not(unix))]
+    return tempfile::tempdir().unwrap();
+}
+
+/// A local publisher of `std_msgs/String` frames on `topic` in the private
+/// registry under `root`, sending one frame every 10 ms on its own thread
+/// until [`stop`](Self::stop).
+#[cfg(debug_assertions)]
+struct LocalStringPublisher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<u64>,
+}
+
+#[cfg(debug_assertions)]
+impl LocalStringPublisher {
+    fn start(root: &Path, topic: &str) -> Self {
+        use cerulion_core::wire::MaxSliceLen;
+        use cerulion_core::{TransportConfig, TransportManager, WireHeader};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let file = registry_config(root);
+        let config =
+            iceoryx2::config::Config::from_file(&file.to_str().unwrap().try_into().unwrap())
+                .unwrap();
+        let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+        // A `std_msgs/String` frame carrying "x": the string's offset and
+        // length, then its byte.
+        let mut frame = vec![0u8; WireHeader::SIZE + 9];
+        let mut header = WireHeader::new(
+            cerulion_cli_engine::topic_cmd::STD_MSGS_STRING_SCHEMA_HASH,
+            0,
+            1_000,
+        );
+        header.total_size = frame.len() as u32;
+        header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+        let payload = &mut frame[WireHeader::SIZE..];
+        payload[0..4].copy_from_slice(&8u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload[8] = b'x';
+        let mut publisher = manager
+            .create_publisher(topic, MaxSliceLen::const_new(256), 0)
+            .unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let _manager = manager;
+                let mut sent = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    publisher.publish_raw(&frame).unwrap();
+                    sent += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                sent
+            })
+        };
+        Self { stop, thread }
+    }
+
+    /// Stop sending and return how many frames were sent.
+    fn stop(self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap()
     }
 }
 
@@ -281,7 +392,7 @@ fn remote_viz_under_a_kill_switch_refuses_before_any_daemon() {
 
 #[test]
 fn local_observers_refuse_missing_topics_without_remote_search_or_daemon() {
-    for verb in ["echo", "hz", "info"] {
+    for verb in ["echo", "hz", "info", "type", "bw"] {
         let root = tempfile::tempdir().unwrap();
         let output = run(
             root.path(),
@@ -396,7 +507,7 @@ fn unattributed_network_mirrors_stay_remote_in_real_local_list_and_observers() {
                 .contains(topic),
             "{listing}"
         );
-        for verb in ["echo", "hz", "info"] {
+        for verb in ["echo", "hz", "info", "type", "bw"] {
             let output = run(root.path(), &["topic", verb, topic, "--local"], None);
             let error = String::from_utf8_lossy(&output.stderr);
             assert_eq!(output.status.code(), Some(1), "{error}");

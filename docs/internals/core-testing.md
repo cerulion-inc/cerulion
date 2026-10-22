@@ -356,6 +356,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `recording_honest_clock_iox2_test.rs` | The replay-grade recording clock model (runtime half). | `#[serial]` tt1 | none |
 | `recording_provisioning_iox2_test.rs` | The record-side tap provisioning raise through the real `recorded_topics` build seam. | `#[serial]` | none |
 | `publish_trace_integration_test.rs` | The publish trace captures wire-header metadata from real publishes. | parallel | none |
+| `received_message_origin_iox2_test.rs` | `ReceivedMessage::origin` names the publisher of every frame on a two-publisher topic, through `wait_for_message` and `try_receive_one`; a hand-built message reads `0`. | parallel (per-test isolated root) | none |
 | `read_outcome_capture_iox2_test.rs` | Per-edge READ-OUTCOME capture over real iceoryx2, including the per-site `role_view` arms. | `#[serial]` | none |
 | `read_outcome_cdylib_capture_iox2_test.rs` | Read-outcome capture for a **cdylib** node over a real POSIX-SHM trace ring: the capture sites run inside the cdylib's OWN statically linked copy of `cerulion_core`, which no in-process arm reaches. | `#[serial]` | `test_node_macro_period_input_cdylib` |
 

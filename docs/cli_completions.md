@@ -74,7 +74,8 @@ it: re-run the command after an upgrade or a move.
 | Where you press TAB | What you get | Source |
 |---|---|---|
 | any position | subcommands, flags, `--time-source real\|virtual\|external`, … | the clap command tree |
-| `topic echo\|info\|hz <TAB>`, `bag record <TAB>` | topic names | the local iceoryx2 service directory |
+| `topic echo\|info\|hz\|type\|bw <TAB>`, `bag record <TAB>` | topic names | the local iceoryx2 service directory |
+| `topic find <TAB>` | workspace schemas, the `.msg` store, and all built-in ROS 2 types | `schemas/`, `native_ros2_messages` |
 | `viz <TAB>` | topic names | same |
 | `node delete\|modify\|build\|stage\|run\|info <TAB>` | node types | `nodes/*` in your workspace |
 | `graph run\|validate\|levels\|profile\|partition <TAB>`, `node stage -g <TAB>` | graph names | `graphs/*.yaml` stems |

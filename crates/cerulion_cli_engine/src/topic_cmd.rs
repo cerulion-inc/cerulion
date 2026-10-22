@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod introspect;
+
 use crate::discovery_ladder::{DiscoveredPeer, DiscoveryRung};
 use crate::error::{CliError, CliResult};
 
@@ -246,15 +248,31 @@ pub const INTERNAL_TOPIC_MARKER: &str = "internal";
 /// non-topic line stays free of a leading `/` so a row parser cannot mistake it
 /// for a topic. Oracle-tested below.
 pub fn render_local_topics_section(local: &[TopicInfo], show_all: bool) -> String {
+    render_local_topic_rows(local.iter().map(|t| (t.name.as_str(), None)), show_all)
+}
+
+/// The one LOCAL-section renderer behind [`render_local_topics_section`] and
+/// the typed `topic list -t` listing: each row is a topic name and an optional
+/// column printed two spaces after it (the type of `-t`), before the
+/// `internal` marker. The hide, count and empty rules are the ones
+/// [`render_local_topics_section`] documents.
+pub(crate) fn render_local_topic_rows<'a>(
+    local: impl IntoIterator<Item = (&'a str, Option<String>)>,
+    show_all: bool,
+) -> String {
     let mut rows = String::new();
     let mut hidden = 0usize;
-    for topic in local {
-        let internal = is_internal_topic(&topic.name);
+    for (name, column) in local {
+        let internal = is_internal_topic(name);
         if internal && !show_all {
             hidden += 1;
             continue;
         }
-        rows.push_str(&topic.name);
+        rows.push_str(name);
+        if let Some(column) = column {
+            rows.push_str("  ");
+            rows.push_str(&column);
+        }
         if internal {
             rows.push_str("  ");
             rows.push_str(INTERNAL_TOPIC_MARKER);
@@ -1377,6 +1395,22 @@ pub fn query_remote_topics_with_scan(
     opts: &RemoteTopicsOptions,
     scan: bool,
 ) -> CliResult<RemoteDiscovery> {
+    query_remote_topics_and_catalogs(opts, scan).map(|(disc, _catalogs)| disc)
+}
+
+/// The per-robot catalog gather: the replies (each entry's schema name and
+/// hash) and the robots whose worker panicked, so a caller that claims an
+/// absence can tell a partial gather from a complete one.
+pub type CatalogGather =
+    cerulion_core::transport::discovery::GatherReplies<cerulion_core::CatalogReply>;
+
+/// [`query_remote_topics_with_scan`] that also returns the per-robot catalog
+/// gather, for the typed `topic list -t` and `topic find`. Its replies are
+/// empty when no robot answered its catalog GET.
+pub fn query_remote_topics_and_catalogs(
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
     // This machine's own netd and gateway processes answer the browse under its
@@ -1389,7 +1423,7 @@ pub fn query_remote_topics_with_scan(
     } else {
         Vec::new()
     };
-    query_remote_topics_with_candidates(opts, ladder_peers)
+    query_remote_topics_and_catalogs_with_candidates(opts, ladder_peers)
 }
 
 /// Remote discovery over an EXPLICITLY-supplied set
@@ -1427,6 +1461,15 @@ pub fn query_remote_topics_with_candidates(
     opts: &RemoteTopicsOptions,
     ladder_peers: Vec<DiscoveredPeer>,
 ) -> CliResult<RemoteDiscovery> {
+    query_remote_topics_and_catalogs_with_candidates(opts, ladder_peers).map(|(disc, _)| disc)
+}
+
+/// [`query_remote_topics_with_candidates`] that also returns the catalog
+/// gather (see [`query_remote_topics_and_catalogs`]).
+pub fn query_remote_topics_and_catalogs_with_candidates(
+    opts: &RemoteTopicsOptions,
+    ladder_peers: Vec<DiscoveredPeer>,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // ── Syntax gate (BEFORE any probing): explicit `--connect` locators are
     //    USER INPUT, so a SYNTACTICALLY malformed one (a typo with no
     //    proto/host:port shape) is a HARD, actionable error — never a silent
@@ -1567,7 +1610,7 @@ pub fn query_remote_topics_with_candidates(
     // an unknown wire version falls back to its announce-derived listing (already
     // folded into `all` below). Runs while the session is OPEN, so it MUST precede
     // `mgr.close()` and the result unwraps below.
-    let catalog_topics: Vec<String> = match &announce {
+    let catalogs: CatalogGather = match &announce {
         Ok(entries) => {
             // Distinct robot identities from the announce gather (the proven
             // direction) → EXPLICIT-robot catalog GETs (never a mid-key wildcard).
@@ -1578,26 +1621,22 @@ pub fn query_remote_topics_with_candidates(
                 .into_iter()
                 .map(|robot| robot.to_string())
                 .collect();
-            // `.replies` alone. This is the ENRICHMENT path — the result
-            // is folded into a topic listing and no absence is claimed from it, so a
-            // robot lost to a panicked worker costs its rows and nothing else. The
-            // gather has already named it at ERROR. The two sites below DO claim an
-            // absence and read `is_complete()` accordingly.
-            let catalogs = cerulion_core::transport::discovery::query_robot_catalogs(
+            // The whole gather, `panicked` included. Folded into the topic
+            // listing below, a robot lost to a panicked worker costs its rows
+            // and nothing else (the gather has already named it at ERROR); but
+            // `topic find` claims an absence from these replies, so it reads
+            // `panicked` and says which robots it could not search.
+            let gather = cerulion_core::transport::discovery::query_robot_catalogs(
                 session,
                 &robots,
                 CATALOG_GATHER_WINDOW,
-            )
-            .replies;
-            warn_on_catalog_refusals(&catalogs);
-            catalogs
-                .into_iter()
-                .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
-                .collect()
+            );
+            warn_on_catalog_refusals(&gather.replies);
+            gather
         }
         // A failed announce gather yields no robot identities — the demand-space
         // topics still carry the run; the announce error is surfaced on unwrap.
-        Err(_) => Vec::new(),
+        Err(_) => CatalogGather::default(),
     };
     // The gathers are done and joined, so this ephemeral
     // discovery session is finished — close it in order (deterministic resource
@@ -1647,14 +1686,22 @@ pub fn query_remote_topics_with_candidates(
     // `normalize_remote_topics` dedups a catalog topic against its announce twin,
     // so a robot that answered contributes any catalog-only topics while a robot
     // that did NOT answer is unaffected (its announce topics above stand).
-    all.extend(catalog_topics);
+    all.extend(
+        catalogs
+            .replies
+            .iter()
+            .flat_map(|catalog| catalog.entries.iter().map(|entry| entry.topic.clone())),
+    );
 
-    Ok(RemoteDiscovery {
-        topics: normalize_remote_topics(all),
-        robots,
-        peers: ladder_peers,
-        announce_entries,
-    })
+    Ok((
+        RemoteDiscovery {
+            topics: normalize_remote_topics(all),
+            robots,
+            peers: ladder_peers,
+            announce_entries,
+        },
+        catalogs,
+    ))
 }
 
 /// Seed a [`FrameWalker`](cerulion_core::codegen::FrameWalker)
@@ -3254,6 +3301,24 @@ fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> Strin
 /// FAILURE never reaches this renderer; it stays a distinct loud error at the
 /// dispatch site.
 pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool) -> String {
+    render_remote_topic_rows(disc, had_endpoints, &[], &|_| None)
+}
+
+/// The one REMOTE-section renderer behind [`render_remote_topics_section`],
+/// [`render_remote_topics_section_with_mirrors`] and the typed `topic list -t`
+/// listing. `column` gives a row an optional column printed two spaces after
+/// the topic name (the type of `-t`), before any streaming marker; it is
+/// printed as given, so the caller sanitizes it. Every other rule is the one
+/// those two renderers document.
+pub(crate) fn render_remote_topic_rows(
+    disc: &RemoteDiscovery,
+    had_endpoints: bool,
+    streaming: &[MirrorStreamRow],
+    column: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    if !streaming.is_empty() {
+        return render_remote_rows_with_mirrors(disc, streaming, column);
+    }
     let mut out = render_robots_section(&disc.robots, &disc.peers);
     let topics = &disc.topics;
     if topics.is_empty() {
@@ -3280,9 +3345,18 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
     out.push_str("\nREMOTE TOPICS\n");
     for t in topics {
         out.push_str(&sanitize_display(t));
+        push_column(&mut out, column(t));
         out.push('\n');
     }
     out
+}
+
+/// Append a row's optional column, two spaces after what precedes it.
+fn push_column(out: &mut String, column: Option<String>) {
+    if let Some(column) = column {
+        out.push_str("  ");
+        out.push_str(&column);
+    }
 }
 
 /// The ONE line `topic list` prints in place of the `REMOTE TOPICS` section
@@ -3381,11 +3455,18 @@ pub fn render_remote_topics_section_with_mirrors(
     had_endpoints: bool,
     streaming: &[MirrorStreamRow],
 ) -> String {
-    if streaming.is_empty() {
-        // No mirrors ⇒ identical to the mirror-less renderer (incl. its
-        // one-line none-discovered arms).
-        return render_remote_topics_section(disc, had_endpoints);
-    }
+    // No mirrors ⇒ identical to the mirror-less renderer (incl. its
+    // one-line none-discovered arms).
+    render_remote_topic_rows(disc, had_endpoints, streaming, &|_| None)
+}
+
+/// The merged-rows half of [`render_remote_topic_rows`] (at least one
+/// streaming row).
+fn render_remote_rows_with_mirrors(
+    disc: &RemoteDiscovery,
+    streaming: &[MirrorStreamRow],
+    column: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let mut out = render_robots_section(&disc.robots, &disc.peers);
     out.push_str("\nREMOTE TOPICS\n");
     // Union rows keyed by canonical topic: streaming (Some robot) wins over an
@@ -3402,6 +3483,7 @@ pub fn render_remote_topics_section_with_mirrors(
     }
     for (topic, robot) in rows {
         out.push_str(&sanitize_display(topic));
+        push_column(&mut out, column(topic));
         if let Some(robot) = robot {
             out.push_str("  ● streaming  ");
             out.push_str(&sanitize_display(robot));
