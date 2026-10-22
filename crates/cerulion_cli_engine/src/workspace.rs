@@ -12,6 +12,54 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
 
+const ICEORYX2_FORK_GIT: &str = "https://github.com/cerulion-inc/iceoryx2";
+const ICEORYX2_FORK_REV: &str = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51";
+/// Keep these names aligned with the root Cargo.toml pin; a test enforces it.
+const ICEORYX2_FORK_CRATES: &[&str] = &[
+    "iceoryx2",
+    "iceoryx2-bb-concurrency",
+    "iceoryx2-bb-container",
+    "iceoryx2-bb-derive-macros",
+    "iceoryx2-bb-elementary",
+    "iceoryx2-bb-elementary-traits",
+    "iceoryx2-bb-flatbuffers",
+    "iceoryx2-bb-linux",
+    "iceoryx2-bb-lock-free",
+    "iceoryx2-bb-loggers",
+    "iceoryx2-bb-memory",
+    "iceoryx2-bb-posix",
+    "iceoryx2-bb-print",
+    "iceoryx2-bb-system-types",
+    "iceoryx2-cal",
+    "iceoryx2-log",
+    "iceoryx2-log-types",
+    "iceoryx2-pal-concurrency-sync",
+    "iceoryx2-pal-configuration",
+    "iceoryx2-pal-os-api",
+    "iceoryx2-pal-posix",
+    "iceoryx2-pal-print",
+];
+
+/// The build-environment variable that joins a workspace's `schemas/` to the
+/// generated message crate: `native_ros2_messages`' build script reads the
+/// workspace root from it and generates the workspace's `.msg` and YAML types
+/// beside the built-ins. The workspace scaffold sets it in `.cargo/config.toml`
+/// (`[env]`, relative to the workspace root), which cargo passes to every
+/// build script, so `cargo build`, `cerulion node build` and an editor's
+/// rust-analyzer see the same types.
+pub const WORKSPACE_MSGS_ENV: &str = "CERULION_WORKSPACE_MSGS";
+
+/// Whether the workspace at `root` generates its messages into the message
+/// crate: its `.cargo/config.toml` parses and sets [`WORKSPACE_MSGS_ENV`] under
+/// `[env]`. A missing or unparseable file is `false`.
+pub fn workspace_generates_messages(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(".cargo").join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("env").and_then(|env| env.as_table()).cloned())
+        .is_some_and(|env| env.contains_key(WORKSPACE_MSGS_ENV))
+}
+
 /// Discovered Cerulion workspace.
 #[derive(Debug)]
 pub struct CerulionWorkspace {
@@ -285,10 +333,15 @@ pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     std::fs::create_dir_all(&cargo_dir)?;
     std::fs::write(
         cargo_dir.join("config.toml"),
-        r#"[env]
+        format!(
+            r#"[env]
 IOX2_LOG_LEVEL = "error"
-RUST_LOG = { value = "warn", force = false }
-"#,
+RUST_LOG = {{ value = "warn", force = false }}
+# The workspace's schemas/ (.msg packages and YAML) generate into the message
+# crate beside the built-in ROS 2 types.
+{WORKSPACE_MSGS_ENV} = {{ value = ".", relative = true }}
+"#
+        ),
     )?;
 
     Ok(CerulionWorkspace {
@@ -451,7 +504,7 @@ fn stable_toolchain_manifest(release: &str) -> Option<String> {
 }
 
 fn workspace_manifest(base: Option<&Path>, version: &str) -> String {
-    if let Some(base) = base {
+    let manifest = if let Some(base) = base {
         let core_path = base
             .join("crates/cerulion_core")
             .display()
@@ -483,11 +536,30 @@ cerulion_core = "={version}"
 native_ros2_messages = "={version}"
 "#
         )
-    }
+    };
+    format!("{manifest}\n{}", iceoryx2_fork_patch())
+}
+
+fn iceoryx2_fork_patch() -> String {
+    let entries = ICEORYX2_FORK_CRATES
+        .iter()
+        .map(|name| {
+            format!("{name} = {{ git = \"{ICEORYX2_FORK_GIT}\", rev = \"{ICEORYX2_FORK_REV}\" }}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# Node libraries link the same iceoryx2 build as the cerulion CLI. Android\n\
+         # shared memory needs it; keep every entry on one revision.\n\
+         [patch.crates-io]\n\
+         {entries}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     const OFFICIAL_FINGERPRINT: &str = "1.93.0 (1111111111111111111111111111111111111111)";
@@ -712,9 +784,54 @@ mod tests {
         assert!(ws.nodes_dir.is_dir());
         assert!(ws.schemas_dir.is_dir());
         assert!(ws.root.join(".cargo/config.toml").exists());
+        assert!(
+            workspace_generates_messages(&ws.root),
+            "a new workspace generates its schemas into the message crate"
+        );
         assert_eq!(
             std::fs::read_to_string(ws.root.join(".gitignore")).unwrap(),
             ".cerulion/\n"
+        );
+    }
+
+    #[test]
+    fn workspace_messages_need_the_env_key_under_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo = tmp.path().join(".cargo");
+        assert!(!workspace_generates_messages(tmp.path()), "no config file");
+        std::fs::create_dir_all(&cargo).unwrap();
+        for (text, expected) in [
+            ("[env]\nIOX2_LOG_LEVEL = \"error\"\n", false),
+            ("[build]\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            ("# CERULION_WORKSPACE_MSGS = \".\"\n[env]\n", false),
+            ("[env\nCERULION_WORKSPACE_MSGS = \".\"\n", false),
+            (
+                "[env]\nCERULION_WORKSPACE_MSGS = { value = \".\", relative = true }\n",
+                true,
+            ),
+            ("[env]\nCERULION_WORKSPACE_MSGS = \"/abs/ws\"\n", true),
+        ] {
+            std::fs::write(cargo.join("config.toml"), text).unwrap();
+            assert_eq!(
+                workspace_generates_messages(tmp.path()),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_crate_reads_the_variable_the_scaffold_sets() {
+        // The two spellings live in two crates; this pins them together.
+        let build_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../native_ros2_messages/build.rs");
+        let text = std::fs::read_to_string(&build_rs).unwrap();
+        assert!(
+            text.contains(&format!(
+                "const WORKSPACE_ENV: &str = \"{WORKSPACE_MSGS_ENV}\";"
+            )),
+            "{} must read {WORKSPACE_MSGS_ENV}",
+            build_rs.display()
         );
     }
 
@@ -955,6 +1072,58 @@ mod tests {
         assert!(manifest.contains(r#"cerulion_core = "=0.0.1-alpha""#));
         assert!(manifest.contains(r#"native_ros2_messages = "=0.0.1-alpha""#));
         assert!(!manifest.contains("path ="));
+    }
+
+    #[test]
+    fn generated_manifests_patch_the_whole_iceoryx2_family_at_the_root_pin() {
+        fn iceoryx2_patch(manifest: &str) -> BTreeMap<String, (String, String)> {
+            let document: toml::Value = toml::from_str(manifest).unwrap();
+            document
+                .get("patch")
+                .and_then(|patch| patch.get("crates-io"))
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with("iceoryx2"))
+                .map(|(name, entry)| {
+                    let entry = entry.as_table().unwrap();
+                    (
+                        name.clone(),
+                        (
+                            entry
+                                .get("git")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                            entry
+                                .get("rev")
+                                .and_then(toml::Value::as_str)
+                                .unwrap()
+                                .to_owned(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+
+        let root_manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .unwrap();
+        let root_patch = iceoryx2_patch(&root_manifest);
+        assert!(!root_patch.is_empty());
+
+        let checkout_manifest =
+            workspace_manifest(Some(Path::new("/tmp/cerulion-src")), "0.0.1-alpha");
+        let registry_manifest = workspace_manifest(None, "0.0.1-alpha");
+        let example_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/basic_timer/Cargo.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(iceoryx2_patch(&checkout_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&registry_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&example_manifest), root_patch);
     }
 
     #[test]

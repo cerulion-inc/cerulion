@@ -798,12 +798,15 @@ pub use scheduler::{
     RefillOutcome, Scheduler, SyncAlignSite, SyncHeadOp, SyncOpAnswer, TraceEntry, TriggerPolicy,
 };
 pub use transport::bridge::{DemandSignal, TopicBridgeManager};
+pub use transport::carrier::{
+    classify_locator, Carrier, EgressQos, EgressReliability, MixedRel, NetworkTls,
+};
 pub use transport::cerulion_q::{
     CatalogEntry, CatalogProvenance, CatalogReply, RunEntry, RunEntryState, RunsCompleteness,
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,
 };
 pub use transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
 pub use transport::events::PubSubEvent;

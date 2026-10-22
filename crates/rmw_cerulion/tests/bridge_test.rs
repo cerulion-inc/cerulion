@@ -1977,48 +1977,71 @@ fn loan_pad_ranges_cover_exactly_the_padding() {
     );
 }
 
+#[cfg(cerulion_has_is_rosidl_buffer)]
+extern "C" {
+    fn rmw_cerulion_fixture_buffer_u8_new(
+        data: *const u8,
+        len: usize,
+        backend: *const std::os::raw::c_char,
+        throw_on_copy: std::os::raw::c_int,
+    ) -> *mut c_void;
+    fn rmw_cerulion_fixture_buffer_u8_delete(b: *mut c_void);
+}
+
 /// Lyrical and Rolling: a top-level `uint8[]` INSTANCE whose header says
-/// Buffer-backed holds a Buffer object behind `data`, not elements. The
-/// size pass, the write pass and the fill all refuse it (a bogus non-null
-/// pointer would be read or freed if any of them did not), and the same
-/// message with the flag clear goes through.
+/// Buffer-backed holds a `rosidl::Buffer<uint8_t>` behind `data`, not
+/// elements. The size pass and the write pass read it through the Buffer and
+/// produce the frame a plain sequence with the same bytes produces, and the
+/// fill writes an owned Buffer in place (the pointer is kept, the bytes are
+/// the frame's). `tests/rosidl_buffer_downgrade_test.rs` covers the non-CPU
+/// backends and the Buffer a sequence does not own.
 #[cfg(cerulion_has_is_rosidl_buffer)]
 #[test]
-fn c_buffer_backed_top_level_instance_is_refused_by_size_flatten_and_fill() {
+fn c_buffer_backed_top_level_instance_is_read_and_filled_through_its_buffer() {
     let bridge = unsafe { BridgedMessage::new(u8_seq_members()) }.expect("bridge");
-    let mut backing = [1u8, 2, 3];
+    let bytes = [1u8, 2, 3];
+    let buffer = unsafe {
+        rmw_cerulion_fixture_buffer_u8_new(bytes.as_ptr(), bytes.len(), std::ptr::null(), 0)
+    };
     let mut msg = CU8SeqMsg {
         data: CU8Seq {
-            data: backing.as_mut_ptr(),
-            size: backing.len(),
-            capacity: backing.len(),
+            data: buffer as *mut u8,
+            size: bytes.len(),
+            capacity: 0,
             is_rosidl_buffer: true,
-            owns_rosidl_buffer: false,
+            owns_rosidl_buffer: true,
         },
     };
-    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) };
-    assert!(
-        size.is_err(),
-        "the size pass must refuse a Buffer-backed instance"
-    );
-    let frame = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) };
-    let err = frame.expect_err("the write pass must refuse a Buffer-backed instance");
-    assert!(err.to_string().contains("rosidl Buffer"), "got: {err}");
-    // The fill refuses the same instance and leaves its pointer untouched.
     let plain = CU8SeqMsg {
-        data: u8_seq(&[9, 8, 7]),
+        data: u8_seq(&bytes),
     };
-    let good = unsafe { bridge.flatten(&plain as *const _ as *const c_void, 0, 0) }.expect("plain");
+    let plain_size =
+        unsafe { bridge.frame_size(&plain as *const _ as *const c_void) }.expect("plain size");
+    let size =
+        unsafe { bridge.frame_size(&msg as *const _ as *const c_void) }.expect("Buffer size");
+    assert_eq!(
+        size, plain_size,
+        "the size pass reads the Buffer's own size"
+    );
+    let plain_frame =
+        unsafe { bridge.flatten(&plain as *const _ as *const c_void, 0, 0) }.expect("plain");
+    let frame = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("Buffer");
+    assert_eq!(&frame[WireHeader::SIZE..], &plain_frame[WireHeader::SIZE..]);
+
+    let other = CU8SeqMsg {
+        data: u8_seq(&[9, 8, 7, 6]),
+    };
+    let good = unsafe { bridge.flatten(&other as *const _ as *const c_void, 0, 0) }.expect("other");
     let ok =
         unsafe { bridge.unflatten(&good[WireHeader::SIZE..], &mut msg as *mut _ as *mut c_void) };
-    assert!(!ok, "the fill must refuse a Buffer-backed instance");
-    assert_eq!(msg.data.data as usize, backing.as_mut_ptr() as usize);
-    assert_eq!(msg.data.size, 3);
-    // Control: the flag is the ONLY difference.
-    msg.data.is_rosidl_buffer = false;
-    let size = unsafe { bridge.frame_size(&msg as *const _ as *const c_void) }.expect("plain size");
-    assert!(size > 0);
-    let frame =
-        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("plain flatten");
-    assert!(frame.len() > WireHeader::SIZE);
+    assert!(ok, "the fill writes an owned Buffer");
+    assert_eq!(
+        msg.data.data as *mut c_void, buffer,
+        "the owned Buffer is kept"
+    );
+    assert!(msg.data.is_rosidl_buffer && msg.data.owns_rosidl_buffer);
+    assert_eq!(msg.data.size, 4);
+    let again = unsafe { bridge.flatten(&msg as *const _ as *const c_void, 0, 0) }.expect("again");
+    assert_eq!(&again[WireHeader::SIZE..], &good[WireHeader::SIZE..]);
+    unsafe { rmw_cerulion_fixture_buffer_u8_delete(buffer) };
 }

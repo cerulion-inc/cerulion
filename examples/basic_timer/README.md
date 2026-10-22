@@ -88,6 +88,16 @@ cerulion topic echo /basic_timer/timer/count
 cerulion topic hz /basic_timer/timer/count
 ```
 
+Ask what type a topic carries, which topics carry a type, and how many bytes
+a second flow (the `ros2 topic type`, `find`, `list -t` and `bw` verbs):
+
+```bash
+cerulion topic type /basic_timer/timer/count   # std_msgs/Int32
+cerulion topic find std_msgs/Int32             # /basic_timer/timer/count
+cerulion topic list -t
+cerulion topic bw /basic_timer/timer/count
+```
+
 ## Verify the recording
 
 Stop the run with **Ctrl+C**; Cerulion prints the recording's path. Re-execute

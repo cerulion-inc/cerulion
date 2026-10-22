@@ -29,12 +29,14 @@ pub mod config;
 pub mod drain_latch;
 pub mod launch_args;
 pub mod node;
+pub mod param_resume;
 pub mod params;
 pub mod partition;
 pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
 // direction, so the producer gate cannot be handed the set it reads.
 pub mod sibling_topics;
+pub(crate) mod sync_capture;
 // Replay exit-3 widening: per-node tick-failure flood-suppression latch
 // (the DrainWarnLatch sibling — pure state machine, mapped to tracing
 // levels in runtime.rs).

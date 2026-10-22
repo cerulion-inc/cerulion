@@ -68,7 +68,10 @@ cannot also be a port. The module emits three things from one parsed list: the
 `.with_params(vec![ParamSpec{..}])` chain in `info()`, the `,"params":[..]` fragment of the
 cdylib info JSON, and `__cer_apply_param_defaults` (called by the wrapper's `new()`) plus
 `__cer_apply_params` (called by `init` before the user's `init`, on the values
-`NodeEntry::set_params` held). Resolution against a graph's `params:` is core's
+`NodeEntry::set_params` held). `__cer_param_values` snapshots every param right after that
+write and `__cer_changed_param` compares the fields with the snapshot (floats by bit
+pattern); the wrapper's `capture_state` and the cdylib `cerulion_node_capture_state`
+refuse a capture once a param changed, because an anchor does not carry params. Resolution against a graph's `params:` is core's
 `graph::params::resolve_params`. The `inputs(...)`/`outputs(...)` args are rejected at parse
 time with a hint pointing at field attributes (`PORT_ARGS_NOT_ACCEPTED_HINT` in
 `parse.rs` centralizes that wording); `type_name` is rejected separately with a
@@ -166,7 +169,7 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
 | Symbol | Role |
 |---|---|
-| `cerulion_abi_version` | Must return `CERULION_ABI_VERSION`; the loader hard-rejects a mismatch or a missing symbol. |
+| `cerulion_abi_version` | Returns `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for cross-process nodes, with the transport id above bit 16 for in-process nodes. A host built before the transport id rejects an in-process node as an ABI mismatch; a missing symbol is rejected. |
 | `cerulion_rustc_fingerprint` | Must return `RUSTC_FINGERPRINT` (ABI v22); the loader hard-rejects a mismatch or a missing symbol, checked immediately after `cerulion_abi_version`, because two different rustc releases can agree on every struct size and offset the ABI check proves and still encode a niche-holding `Option::None` differently. |
 | `cerulion_node_info` | Node metadata JSON (ports, policy, capabilities). Parsed host-side into `PolicyJson`; corrupt JSON refuses the load. |
 | `cerulion_node_init` / `cerulion_node_tick` / `cerulion_node_shutdown` / `cerulion_node_pump_history` | Lifecycle. Shared return-code semantics below. |
@@ -174,11 +177,14 @@ loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 | `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
 | `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
 | `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build, and a cdylib whose info JSON declares params without exporting it is refused when its info is read (`DylibNodeEntry::info`). |
+| `cerulion_take_last_error_kind` | OPTIONAL typed error kind: the `NodeErrorKind` wire code of the last error (`0` = none), read by the host after a code-1 / handle-0 return so a node error arrives as `TransportError::NodeFailed`. Absent: the error stays the untyped `NodeError` (and a `Fatal` does not stop the node). |
 
 Return-code semantics (part of the ABI; the host and the replay verdicts classify on
 them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
 panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex is poisoned; `4`
-handle not found.
+handle not found. The macros convert a user `NodeError` at the boundary with
+`NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
+part of the same contract (never renumber one).
 
 **The ABI rule**: any change to a generated FFI signature or to these return-code
 semantics MUST bump `CERULION_ABI_VERSION` (`crates/cerulion_core/src/lib.rs`; name the
@@ -255,7 +261,7 @@ test file's header names its exact prereqs.
 | `cdylib_non_trigger_hold_test.rs` | Optional snapshot symbol pair: capability by presence; symbol-less cdylib is a safe no-op | yes | `test_node_macro_period_input_cdylib`, `test_node_cdylib` |
 | `cdylib_unified_drain_test.rs` | Optional drain symbol: capability by presence; FFI failure maps to a safe empty drain | yes | see header (3 fixtures) |
 | `cdylib_iox2_log_level_test.rs` | Generated + hand-written inits apply `IOX2_LOG_LEVEL` (repo-walk guard) | yes | `test_node_discard_probe_cdylib`, `test_node_cdylib` |
-| `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init` | no | none |
+| `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init`, a param written in `init` or `tick` refuses the state capture | no | none |
 | `cdylib_params_test.rs` | `#[param]` across the FFI: specs in the info JSON, values through the optional `cerulion_node_init_with_params` symbol, two instances differ, a symbol-less cdylib refuses a handoff, a library that declares params without the symbol is refused when its info is read | yes | `test_node_macro_param_cdylib`, `test_node_cdylib`, `test_node_params_no_symbol_cdylib` |
 | `tests/ui/param_*.rs` | The six `#[param]` compile-fail diagnostics (unknown key, wrong-type default, `min` above `max`, default outside bounds, bounds on a `String`, `live` reserved) and `pass/param_fields_pass.rs` | no | none |
 

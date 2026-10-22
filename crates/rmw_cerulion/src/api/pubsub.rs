@@ -80,6 +80,35 @@ const BRIDGED_VARIABLE_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(128 * 102
 /// [`TopicServiceConfig::create_borrow_floor`]: cerulion_core::transport::TopicServiceConfig::create_borrow_floor
 pub(crate) const RMW_TAKE_LOAN_BORROW_BUDGET: usize = 4;
 
+/// The publisher slots a ROS topic's iceoryx2 service is CREATED with by an
+/// rmw endpoint. Every ROS node publishes `/rosout` (and `/parameter_events`
+/// and `/tf` are shared the same way), and iceoryx2's create default is 2
+/// publishers, so a third node on a topic could not attach its publisher and
+/// `rcl_node_init` failed on the `/rosout` one. 32 is the number of nodes
+/// that can publish one topic. iceoryx2 separately caps the processes
+/// attached to one service at its `max_nodes` default (20), and the rmw is
+/// one iceoryx2 node per process, so with one ROS node per process that
+/// limit is reached first.
+///
+/// Applied as [`TopicServiceConfig::create_publisher_floor`]: create-leg
+/// only, so an rmw endpoint still attaches to a service another opener
+/// created with fewer slots (a native graph's single-writer topic, a
+/// `cerulion topic echo`), whose slots then bind as created.
+///
+/// [`TopicServiceConfig::create_publisher_floor`]: cerulion_core::transport::TopicServiceConfig::create_publisher_floor
+pub(crate) const ROS_TOPIC_CREATE_PUBLISHERS: usize = 32;
+
+/// The subscriber-slot twin of [`ROS_TOPIC_CREATE_PUBLISHERS`] (iceoryx2's
+/// create default is 8; `/clock` under `use_sim_time` and `/tf` carry one
+/// subscription per node). Each slot adds
+/// `subscriber_max_buffer_size + subscriber_max_borrowed_samples` slice-sized
+/// slots to every publisher's pool on the topic: virtual address space,
+/// demand-paged, not resident memory. Applied as
+/// [`TopicServiceConfig::create_subscriber_floor`].
+///
+/// [`TopicServiceConfig::create_subscriber_floor`]: cerulion_core::transport::TopicServiceConfig::create_subscriber_floor
+pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
+
 /// Windowed borrow: the
 /// iceoryx2 `publisher_max_loaned_samples` a LOANABLE rmw topic's publisher
 /// port is created with (fixed-type loans and windowed borrows alike; the
@@ -134,11 +163,9 @@ pub(crate) const RMW_BORROW_MAX_GAP_BYTES: usize = 4 * 1024 * 1024;
 /// exits. A leaked sample keeps the port's on-disk tag alive, and a
 /// DEREGISTERED port with a live tag wedges every later dead-node sweep of
 /// this process's node (the teardown block cites the iceoryx2 file:line
-/// facts). The slot cost is stated there too: rmw topics carry iceoryx2's default
-/// `max_publishers = 2`, so a re-create on the same ROS topic still
-/// succeeds only while the topic's OTHER slot is free (it takes that slot)
-/// and the next returns NULL — with any other live publisher already on
-/// the topic (the `/rosout` shape) the first re-create is the refused one.
+/// facts). The slot cost is stated there too: the leaked port holds one of
+/// the topic's publisher slots ([`ROS_TOPIC_CREATE_PUBLISHERS`] on a service
+/// an rmw endpoint created) for the life of the process.
 static BORROW_DESTROY_LEAKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Unconditional running total of windowed slots leaked at publisher
@@ -507,6 +534,8 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // LOWERS the stock default (a depth-1 /tf_static topic needs no raise:
         // 1 <= default*3/4).
         let mut topic_config = rt.transport.default_topic_config();
+        topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
+        topic_config.create_subscriber_floor = Some(ROS_TOPIC_CREATE_SUBSCRIBERS);
         topic_config.history_size = history;
         if history > 0 {
             topic_config.subscriber_max_buffer_size = topic_config
@@ -1055,22 +1084,16 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
             // "disconnected" about a port that still counts as attached — an
             // event/count contradiction, not a remedy. Slot cost: the port
             // holds one of the topic's publisher slots for the life of this
-            // process. rmw topics are provisioned at iceoryx2's
-            // default `max_publishers = 2` (`default_topic_config` leaves
-            // `max_publishers: None` and declares
-            // `PublisherProvisioning::External`, so no single-writer pre-check
-            // fires), so a re-create on the same ROS topic still succeeds
-            // ONLY while the topic's other slot is free — it takes that slot —
-            // and the next is refused (with any other live publisher already
-            // on the topic, the `/rosout` shape, the FIRST re-create is the
-            // refused one):
+            // process. A service an rmw endpoint created carries
+            // `ROS_TOPIC_CREATE_PUBLISHERS` slots (a service another opener
+            // created carries that opener's count), so each leak lowers the
+            // topic's remaining publisher slots by one; once none remain,
             // `create_publisher_with_topic_config` fails with
-            // `ExceedsMaxSupportedPublishers` ("all 2 of the topic's publisher
-            // slots are attached"), `rmw_create_publisher` logs `publisher
-            // creation failed` and returns NULL. Pinned in-process by
-            // `rmw_borrow_publish_test` (port count + the 2-slot consequence)
-            // and cross-process by `rmw_leak_at_destroy_registry_test` (a
-            // dead node with a leaked port is swept clean).
+            // `ExceedsMaxSupportedPublishers`, `rmw_create_publisher` logs
+            // `publisher creation failed` and returns NULL. Pinned in-process by
+            // `rmw_borrow_publish_test` (port count + the held slot) and
+            // cross-process by `rmw_leak_at_destroy_registry_test` (a dead node
+            // with a leaked port is swept clean).
             std::mem::forget(data);
         } else {
             drop(data);
@@ -1097,6 +1120,8 @@ pub unsafe extern "C" fn rmw_publish(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
             Err(_) => 0,
@@ -1887,6 +1912,8 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let key = ros_message as usize;
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
@@ -2152,6 +2179,38 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let Some(ros_topic) = ffi::cstr(topic_name) else {
             return std::ptr::null_mut();
         };
+        // Lyrical and Rolling: `acceptable_buffer_backends`. CPU is always
+        // acceptable and is the only backend this rmw has, so a subscription
+        // naming another backend is created, logs one warning naming the
+        // backends it ignores, and receives CPU data. Malformed input fails
+        // the create (null, the RMW_RET_ERROR of a constructor) with the
+        // reason on rcl's error channel.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        {
+            let requested = (*subscription_options).acceptable_buffer_backends;
+            let requested =
+                (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+            match crate::rosidl_buffer::validate_acceptable_buffer_backends(requested) {
+                Ok(ignored) if !ignored.is_empty() => {
+                    tracing::warn!(
+                        topic = %ros_topic,
+                        ignored_backends = %ignored.join(","),
+                        "acceptable_buffer_backends names backends rmw_cerulion does not have; \
+                         this subscription receives every frame as CPU data"
+                    );
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        topic = %ros_topic,
+                        reason = %reason,
+                        "subscription creation refused: acceptable_buffer_backends is malformed"
+                    );
+                    let _ = ffi::rcutils_set_error_state_best_effort(&reason);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
         let Ok(rt) = runtime::runtime() else {
             return std::ptr::null_mut();
         };
@@ -2185,13 +2244,17 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let requested_depth = (*qos).depth;
         let provisioned_depth = rt.transport.subscriber_buffer_size();
         // Same create-config shape as `create_subscriber` (the
-        // transport defaults — see the note above), with ONE
-        // addition for loanable (plain) types: the create-leg borrow floor,
-        // so a subscription-first create also mints the service loan-ready
+        // transport defaults; see the note above), plus the port floors on
+        // every type and, for loanable (plain) types, the create-leg borrow
+        // floor, so a subscription-first create also mints the service loan-ready
         // (order-independent with the publisher-side floor; the core keeps
         // the OPEN leg requirement-free, so a pre-existing smaller service
         // still attaches).
         let mut topic_config = rt.transport.default_topic_config();
+        // Whichever endpoint creates the service sizes its port caps, so the
+        // subscription carries the publisher's floors too.
+        topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
+        topic_config.create_subscriber_floor = Some(ROS_TOPIC_CREATE_SUBSCRIBERS);
         // The take-side gate (fixed types AND forgeable-
         // sequence types) — distinct from the publisher's `can_loan`.
         let can_loan_take = bridge.can_loan_take();

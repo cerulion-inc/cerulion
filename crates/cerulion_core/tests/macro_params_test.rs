@@ -385,3 +385,137 @@ fn two_nodes_given_the_same_params_publish_identical_frames() {
     // "odom" is four bytes.
     assert_eq!(frames, vec![(3.25, 0.0, 4.0), (3.25, 0.0, 4.0)]);
 }
+
+/// A param is not node state: the fold-in leaves every `#[param]` field out
+/// of the shape, so the shape holds the struct name and `probe_tag` alone.
+/// Changing a param's type or name therefore never refuses an anchor.
+#[test]
+fn a_nodes_shape_leaves_every_param_out() {
+    use cerulion_core::state::{CerulionState, StateShape};
+    // HAND ORACLE: the struct name, then ONLY the one non-param, non-port
+    // field. A shape that folded `gain`, `offset`, `frame_id` or `enabled`
+    // could not match this.
+    let expected = StateShape::of("ParamNode")
+        .field("probe_tag", <String as CerulionState>::STATE_SHAPE)
+        .finish();
+    assert_eq!(<ParamNode as CerulionState>::STATE_SHAPE, expected);
+    // A node whose only non-port fields are params has an empty shape.
+    assert_eq!(
+        <RawNameNode as CerulionState>::STATE_SHAPE,
+        StateShape::of("RawNameNode").finish()
+    );
+}
+
+/// The resume rule at the node seam: an anchor captured while `gain` was 2.0,
+/// restored into a node the graph built with `gain` 3.0, keeps 3.0 for
+/// `init` and the first tick, while the node's own state (`probe_tag`) is
+/// restored from the anchor.
+#[test]
+fn a_restore_keeps_the_graphs_param_values_and_restores_the_rest() {
+    use cerulion_core::state::VecSink;
+    let anchored = ParamNodeEntry::with_state(ParamNode {
+        gain: 2.0,
+        offset: 5,
+        frame_id: "odom".into(),
+        enabled: true,
+        probe_tag: "anchored".into(),
+        ..Default::default()
+    });
+    let mut payload = VecSink::new();
+    anchored.capture_state(&mut payload).expect("capture");
+
+    let (_tt, ctx, mut sub) = wire("restore");
+    let mut resumed = ParamNodeEntry::new();
+    resumed
+        .set_params(&values(&[("gain", ParamValue::Float(3.0))]))
+        .expect("set_params");
+    resumed.init(ctx).expect("init");
+    resumed.restore_state(payload.as_slice()).expect("restore");
+    assert_eq!(
+        resumed.inner.probe_tag, "anchored",
+        "the node's own state comes from the anchor"
+    );
+    resumed.tick().expect("tick");
+    // gain 3.0 from the graph, offset 0 and "base_link" (nine bytes) from the
+    // defaults: no param value comes from the anchor.
+    assert_eq!(read_cmd(&mut sub), (3.0, 0.0, 9.0));
+}
+
+/// A node that WRITES its params: `tick` flips the sign of `gain` (so `0.0`
+/// becomes `-0.0`, equal under `==` but not the same value) and `init`
+/// renames `frame_id` when asked.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct WritesParamsNode {
+    #[output]
+    cmd: Vector3,
+    #[param(default = 0.0)]
+    gain: f64,
+    #[param(default = "base_link")]
+    frame_id: String,
+    rename_in_init: bool,
+}
+
+#[cerulion_node_impl]
+impl WritesParamsNode {
+    fn init(&mut self, _ctx: &mut NodeContext) -> Result<(), NodeError> {
+        if self.rename_in_init {
+            self.frame_id.push_str("_moved");
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.gain = -self.gain;
+        self.cmd.x = self.gain;
+        Ok(())
+    }
+}
+
+/// A param is fixed for the run and an anchor does not carry it, so a node
+/// that writes one after the graph set it could not resume as it ran. The
+/// capture refuses, naming the param, instead of recording that anchor.
+#[test]
+fn a_capture_refuses_once_the_node_wrote_a_param_in_tick() {
+    use cerulion_core::state::VecSink;
+    let (_tt, ctx, _sub) = wire("writes_tick");
+    let mut entry = WritesParamsNodeEntry::new();
+    entry
+        .set_params(&values(&[("gain", ParamValue::Float(0.0))]))
+        .expect("set_params");
+    entry.init(ctx).expect("init");
+    // ANTI-TAUTOLOGY: before the write the same node captures.
+    entry
+        .capture_state(&mut VecSink::new())
+        .expect("an unwritten param captures");
+    entry.tick().expect("tick");
+    assert_eq!(entry.inner.gain.to_bits(), (-0.0_f64).to_bits());
+    let err = entry
+        .capture_state(&mut VecSink::new())
+        .expect_err("a written param refuses the capture")
+        .to_string();
+    assert!(
+        err.contains("param 'gain' changed after the graph set it"),
+        "{err}"
+    );
+}
+
+/// A write in the user's `init` is a change too: the values a param holds
+/// for the run are the ones the graph handed over, taken before `init`.
+#[test]
+fn a_capture_refuses_a_param_the_users_init_wrote() {
+    use cerulion_core::state::VecSink;
+    let (_tt, ctx, _sub) = wire("writes_init");
+    let mut entry = WritesParamsNodeEntry::new();
+    entry.inner.rename_in_init = true;
+    entry.init(ctx).expect("init");
+    assert_eq!(entry.inner.frame_id, "base_link_moved");
+    let err = entry
+        .capture_state(&mut VecSink::new())
+        .expect_err("a param written in init refuses the capture")
+        .to_string();
+    assert!(
+        err.contains("param 'frame_id' changed after the graph set it"),
+        "{err}"
+    );
+}

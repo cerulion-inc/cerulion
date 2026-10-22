@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::{CatalogReply, SchemaReply};
 
-use cerulion_core::{GatewayPlan, SchemaServing};
+use cerulion_core::{GatewayPlan, LanAccess, SchemaServing};
 
 use crate::convergence::{Converged, ConvergenceWait, WaitDecision, WaitOutcome};
 use crate::hygiene::{default_socket_path, SOCKET_ENV};
@@ -1550,6 +1550,43 @@ impl NetdClient {
         }
     }
 
+    /// The shared gateway's LAN access posture, read with a `status`
+    /// round-trip that registers nothing. `None` means the daemon does not
+    /// report one (an older daemon, or one without a network manager), which
+    /// is UNKNOWN, never open. A run that requires paired access asks BEFORE
+    /// [`Self::register_egress`]: a registration's topics and schemas stay
+    /// served on the shared gateway after release, so refusing an open daemon
+    /// after registering would not close the access.
+    ///
+    /// Like `register_egress`, the FIRST request on a connection can race the
+    /// daemon's idle exit, so it is retried ONCE over a fresh connection.
+    pub fn lan_access(&mut self) -> Result<Option<LanAccess>, ClientError> {
+        let first_request = self.next_id == 1;
+        match self.lan_access_once() {
+            Err(e) if first_request && is_closed_early(&e) => {
+                self.reconnect()?;
+                self.lan_access_once()
+            }
+            other => other,
+        }
+    }
+
+    /// One `status` round-trip for [`Self::lan_access`].
+    fn lan_access_once(&mut self) -> Result<Option<LanAccess>, ClientError> {
+        let id = self.next_request_id();
+        match self.round_trip(&Request::Status { id })? {
+            Response::Status(s) => Ok(s.lan_access),
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "expected a status response, got {other:?}"
+            ))),
+        }
+    }
+
     /// Release THIS connection's egress registration: the explicit
     /// EARLY release (the inverse of [`Self::register_egress`]). A no-op if this
     /// connection holds none. Dropping the whole client releases it implicitly (the
@@ -1821,7 +1858,7 @@ impl NetdEventClient {
 /// [`io::ErrorKind::ConnectionRefused`] means "no daemon is listening" (see
 /// [`is_not_running`]); any other error is a real failure.
 fn try_connect(socket: &Path) -> io::Result<UnixStream> {
-    UnixStream::connect(socket)
+    cerulion_hygiene::connect_control_socket(socket)
 }
 
 /// What the readiness wait knows about the spawned daemon process.
@@ -1894,10 +1931,10 @@ fn stall_notice_due(elapsed: Duration, notice_after: Duration, already_notified:
     !already_notified && elapsed >= notice_after
 }
 
-/// Whether a [`UnixStream::connect`] error means "no daemon is running" (so the
-/// client should spawn one) vs a real error to surface. A missing socket file is
-/// `NotFound`; a stale socket left by a crashed daemon is `ConnectionRefused`. Pure
-/// — oracle-tested.
+/// Whether a control-socket connection error means "no daemon is running" (so the
+/// client should spawn one) vs a real error to surface. A missing pathname is
+/// `NotFound`; a missing abstract name or stale pathname socket is `ConnectionRefused`.
+/// Pure - oracle-tested.
 pub fn is_not_running(e: &io::Error) -> bool {
     matches!(
         e.kind(),

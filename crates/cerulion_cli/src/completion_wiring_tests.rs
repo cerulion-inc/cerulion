@@ -8,7 +8,8 @@
 //! and the feature still dead if the `add =` attribute is on the wrong arg or
 //! missing.
 //!
-//! Everything here runs IN-PROCESS against the real `Cli::command()` and the
+//! Everything here runs IN-PROCESS against the real `families::cli_command()`
+//! (the `Commands` verbs plus every registered verb family) and the
 //! real `clap_complete::engine::complete()` — the same function the generated
 //! shell script calls back into — so a regression in the attributes fails here
 //! rather than only on a live TAB press.
@@ -26,10 +27,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use clap::CommandFactory;
 use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate};
 
-use crate::cli::Cli;
+use crate::families::cli_command;
 
 /// Serializes the tests that mutate the process cwd / `HOME`.
 ///
@@ -168,7 +168,7 @@ fn enter_workspace() -> Fixture {
 /// This is the same entry point `Zsh::write_complete` / `Bash::write_complete`
 /// call, so a wiring regression shows up here exactly as it would on a TAB.
 fn complete(words: &[&str]) -> Vec<String> {
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     let args: Vec<OsString> = words.iter().map(OsString::from).collect();
     let index = args.len() - 1;
     let cwd = std::env::current_dir().ok();
@@ -419,7 +419,7 @@ fn wired_args() -> Vec<String> {
             walk(sub, &format!("{path} {}", sub.get_name()), out);
         }
     }
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let mut out = Vec::new();
     walk(&cmd, "cerulion", &mut out);
@@ -471,9 +471,13 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         // The one arg whose source needs a LIVE iceoryx2 topic — behaviourally
         // unreachable in a hermetic test, so the structural pin is what covers
         // it. A live positive is in `topic hz`'s own e2e transcript.
+        "cerulion topic bw::topic",
         "cerulion topic echo::topic",
         "cerulion topic hz::topic",
         "cerulion topic info::topic",
+        "cerulion topic type::topic",
+        // `topic find` offers the known type names (`schema info`'s set).
+        "cerulion topic find::type_name",
         "cerulion schema delete::name",
         "cerulion schema info::name",
         "cerulion viz::robot",
@@ -506,7 +510,7 @@ fn the_help_text_quotes_the_same_install_line_the_hint_prints() {
     // of them are code, so pin them against each other: whatever
     // `install_hint` says must appear VERBATIM in the long help. (The doc file
     // is prose and cannot be pinned here; these two cannot drift.)
-    let mut cmd = crate::cli::Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let long_about = cmd
         .get_subcommands()
@@ -558,7 +562,7 @@ fn args_completing_nothing() -> Vec<String> {
             walk(sub, &format!("{path} {}", sub.get_name()), out);
         }
     }
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     cmd.build();
     let mut out = Vec::new();
     walk(&cmd, "cerulion", &mut out);
@@ -641,6 +645,8 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion pair::addrs",
         "cerulion pair::relay_url",
         "cerulion ros2 attach::iface",
+        "cerulion topic find::connect",
+        "cerulion topic find::listen",
         "cerulion topic list::connect",
         "cerulion topic list::listen",
         "cerulion viz::connect",
@@ -714,6 +720,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion ros2 attach::domain",
         "cerulion ros2 attach::timeout",
         "cerulion topic echo::truncate_length",
+        "cerulion topic bw::window",
         "cerulion trace inspect::limit",
         // ---- `cerulion bagd` (the recorder daemon `graph run --record`
         // spawns). Its args live in `cerulion_bagd::BagdArgs`, so wiring a

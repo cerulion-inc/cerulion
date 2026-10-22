@@ -681,6 +681,11 @@ fn gen_wrapper(
             /// takes them; a node run with no `params:` keeps the defaults
             /// `new()` wrote.
             __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            /// Every `#[param]` field's value just after `init` wrote the
+            /// graph's values, before the user's own `init`. A param is
+            /// fixed for the run, so a state capture refuses once a field no
+            /// longer holds its value here. `None` before `init`.
+            __cer_params_at_init: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
             /// The node's `#[input(accumulate)]` buffers (empty for a node
             /// with none), filled at the step-boundary freeze and served to
             /// the tick.
@@ -700,6 +705,7 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
                         ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
@@ -715,9 +721,27 @@ fn gen_wrapper(
                     context: None,
                     __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
+                    __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
                         ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
                 }
+            }
+
+            /// Why this node's state cannot be captured because of a param,
+            /// or `None`: a `#[param]` field no longer holds the value it
+            /// held when `init` began. A param is not node state, so an
+            /// anchor taken now would resume on the graph's value, not on
+            /// the one the node runs on. No allocation unless it refuses.
+            fn __cer_param_change(&self) -> ::std::option::Option<::std::string::String> {
+                let at_init = self.__cer_params_at_init.as_ref()?;
+                let param = self.inner.__cer_changed_param(at_init)?;
+                ::std::option::Option::Some(::std::format!(
+                    "param '{}' changed after the graph set it. A param is fixed for the \
+                     run and an anchor does not carry it, so a resume would run on the \
+                     graph's value. Fix: keep a value the node changes in a field that \
+                     is not a #[param]",
+                    param,
+                ))
             }
         }
     }
@@ -998,6 +1022,19 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             &self,
             out: &mut dyn ::cerulion_core::state::StateSink,
         ) -> ::cerulion_core::error::TransportResult<()> {
+            // A param the node wrote after the graph set it cannot ride an
+            // anchor (a param is not state), so a resume would run on the
+            // graph's value instead: refuse the capture rather than record
+            // an anchor that does not reproduce the live run.
+            if let ::std::option::Option::Some(reason) = self.__cer_param_change() {
+                return ::std::result::Result::Err(
+                    ::cerulion_core::error::TransportError::GraphError {
+                        reason: ::std::format!(
+                            "node '{}' state capture failed: {}", #diag_label, reason,
+                        ),
+                    },
+                );
+            }
             // The user's fields, then the node's accumulate buffers (which
             // write nothing for a node without an accumulate input).
             ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
@@ -1194,6 +1231,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                         }
                     })?;
                 }
+                // What every param holds for the run. Taken BEFORE the
+                // user's `init`, so a write there is a change too. Cold: one
+                // map per node at graph build.
+                self.__cer_params_at_init =
+                    ::std::option::Option::Some(self.inner.__cer_param_values());
                 // Overwrite the user struct's hidden
                 // runtime-context fields with the live clock + shared
                 // shutdown signal from NodeContext, so `self.now_ns()` /
@@ -1337,6 +1379,9 @@ fn json_escape(s: &str) -> String {
 /// - `cerulion_node_tick(u64) -> i32` — tick by handle
 /// - `cerulion_node_pump_history(u64) -> i32` — service quiescent late joiners by handle (ABI v7)
 /// - `cerulion_node_shutdown(u64) -> i32` — shutdown by handle, removes from map
+/// - `cerulion_take_last_error_kind() -> u32`: OPTIONAL (no ABI bump): the
+///   `NodeErrorKind` wire code of the last error (0 = none), so a node error's
+///   kind crosses the boundary typed
 ///
 /// The JSON returned by `cerulion_node_info()` carries
 /// no `node_type` field. The shape is `{"inputs": [...], "outputs": [...]}` —
@@ -1840,17 +1885,56 @@ fn gen_cdylib(
                     = const { ::std::cell::RefCell::new(::std::option::Option::None) };
             }
 
+            // The typed kind of the last error, as a `NodeErrorKind` wire code
+            // (0 = no typed kind). Every `__cer_set_last_error` resets it, so a
+            // kind can never outlive the message it belongs to; the three
+            // node-error arms (init / tick / shutdown) set it right after.
+            ::std::thread_local! {
+                static LAST_ERROR_KIND: ::std::cell::Cell<u32> = const { ::std::cell::Cell::new(0) };
+            }
+
             fn __cer_set_last_error(msg: ::std::string::String) {
                 let cstring = ::std::ffi::CString::new(msg.replace('\0', "\\0"))
                     .unwrap_or_else(|_| ::std::ffi::CString::new("error message contained nul byte").unwrap());
                 LAST_ERROR.with(|cell| {
                     *cell.borrow_mut() = ::std::option::Option::Some(cstring);
                 });
+                LAST_ERROR_KIND.with(|cell| cell.set(0));
+            }
+
+            fn __cer_set_last_error_kind(e: &::cerulion_core::error::TransportError) {
+                let code = e.node_error_kind().map_or(0, |k| k.code());
+                LAST_ERROR_KIND.with(|cell| cell.set(code));
+            }
+
+            // A failed tick / shutdown: message and kind. A typed node error
+            // (`NodeFailed`) crosses as the node's OWN message, the text an
+            // in-process macro node reports, so the host's fatal log line and
+            // `Error:` verdict read the same for both build forms. Any other
+            // error keeps the `<phase> failed: <error>` text.
+            fn __cer_set_node_failure(phase: &str, e: &::cerulion_core::error::TransportError) {
+                let msg = match e {
+                    ::cerulion_core::error::TransportError::NodeFailed { reason, .. } => {
+                        reason.clone()
+                    }
+                    other => ::std::format!("{} failed: {}", phase, other),
+                };
+                __cer_set_last_error(msg);
+                __cer_set_last_error_kind(e);
+            }
+
+            // OPTIONAL export (additive, no ABI bump): the typed kind of the
+            // last error, taken (reset to 0) by the read. The host calls it
+            // after `cerulion_take_last_error` on a failed init / tick /
+            // shutdown; a cdylib without it reports an untyped error.
+            #[no_mangle]
+            pub extern "C" fn cerulion_take_last_error_kind() -> u32 {
+                LAST_ERROR_KIND.with(|cell| cell.replace(0))
             }
 
             #[no_mangle]
             pub extern "C" fn cerulion_abi_version() -> u32 {
-                ::cerulion_core::CERULION_ABI_VERSION
+                ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
             }
 
             // ABI v22: reports the rustc that compiled THIS cdylib, so the
@@ -1939,7 +2023,35 @@ fn gen_cdylib(
             // generic class label.
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
-            //
+
+            // `cerulion_node_platform_check`: the loader calls this at load,
+            // before init, so the probe runs against THIS cdylib's iceoryx2
+            // copy rather than the host's. Required on Android. 0 = supported;
+            // nonzero sets LAST_ERROR.
+            #[no_mangle]
+            pub extern "C" fn cerulion_node_platform_check() -> i32 {
+                let result = ::std::panic::catch_unwind(|| {
+                    ::cerulion_core::graph::node::cdylib_platform_check()
+                });
+                match result {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(e)) => {
+                        __cer_set_last_error(::std::format!(
+                            "node library {}: {}",
+                            stringify!(#node_name),
+                            e,
+                        ));
+                        1
+                    }
+                    Err(_) => {
+                        __cer_set_last_error(::std::string::String::from(
+                            "cerulion_node_platform_check: panic caught by catch_unwind",
+                        ));
+                        2
+                    }
+                }
+            }
+
             // ONE body serves both init symbols: `cerulion_node_init` (no
             // params) and the OPTIONAL `cerulion_node_init_with_params`
             // (the graph's resolved `params:` as one JSON object), so the two
@@ -1963,6 +2075,17 @@ fn gen_cdylib(
                     // We always consume the pointer here — on both success and failure paths
                     // the Box drops naturally (either stored in entry or dropped on error).
                     let ctx = unsafe { *Box::from_raw(ctx_ptr) };
+
+                    if let ::std::result::Result::Err(e) =
+                        ::cerulion_core::graph::node::cdylib_platform_check()
+                    {
+                        __cer_set_last_error(::std::format!(
+                            "node library {}: {}",
+                            stringify!(#node_name),
+                            e,
+                        ));
+                        return 0_u64;
+                    }
 
                     // STOPGAP: install a cdylib-local stderr tracing
                     // subscriber so node-side `tracing` events (including
@@ -2030,6 +2153,7 @@ fn gen_cdylib(
                     }
                     if let ::std::result::Result::Err(e) = entry.init(ctx) {
                         __cer_set_last_error(::std::format!("init failed: {}", e));
+                        __cer_set_last_error_kind(&e);
                         return 0;
                     }
 
@@ -2112,7 +2236,7 @@ fn gen_cdylib(
                         Some(node) => match node.tick() {
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
-                                __cer_set_last_error(::std::format!("tick failed: {}", e));
+                                __cer_set_node_failure("tick", &e);
                                 1
                             }
                         },
@@ -2206,7 +2330,7 @@ fn gen_cdylib(
                         }
                     };
                     if let ::std::result::Result::Err(e) = node.shutdown() {
-                        __cer_set_last_error(::std::format!("shutdown failed: {}", e));
+                        __cer_set_node_failure("shutdown", &e);
                         return 1_i32;
                     }
                     0
@@ -3132,6 +3256,15 @@ fn gen_cdylib(
                                 written: 0,
                                 refused: false,
                             };
+                            // A param written after `init` began refuses
+                            // the capture, as in process: an anchor does not
+                            // carry params, so it could not resume as it ran.
+                            if let ::std::option::Option::Some(reason) = node.__cer_param_change() {
+                                __cer_set_last_error(::std::format!(
+                                    "cerulion_node_capture_state: {}", reason,
+                                ));
+                                return -5_i32;
+                            }
                             // Drive the user's encoder under an
                             // INNER `catch_unwind` so a panicking
                             // `CerulionState` impl does NOT unwind through the
@@ -3448,6 +3581,62 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_abi_version_carries_the_transport_kind() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+
+        assert!(
+            expansion.contains("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()")
+        );
+        assert!(!expansion.contains(concat!("cerulion_transport", "_kind")));
+    }
+
+    #[test]
+    fn cdylib_init_checks_platform_before_constructing_the_node() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        // Both init exports share ONE body, so the order is checked there.
+        let init = expansion
+            .split("fn__cer_init_with(")
+            .nth(1)
+            .expect("the shared cdylib init body");
+        let null_check = init.find("ctx_ptr.is_null()").expect("null check");
+        let platform_check = init
+            .find("cdylib_platform_check()")
+            .expect("platform check");
+        let constructor = init
+            .find("ProbeNodeEntry::new()")
+            .expect("node constructor");
+
+        assert!(null_check < platform_check);
+        assert!(platform_check < constructor);
+        assert!(init.contains("nodelibrary{}:{}"));
+        assert!(init.contains("stringify!(ProbeNode)"));
+    }
+
+    #[test]
+    fn cdylib_exports_its_own_platform_check() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        let export = expansion
+            .split("pubextern\"C\"fncerulion_node_platform_check()->i32")
+            .nth(1)
+            .expect("platform check export");
+        let export = export.split("#[no_mangle]").next().expect("export body");
+        assert!(export.contains("cdylib_platform_check()"));
+        assert!(export.contains("stringify!(ProbeNode)"));
     }
 
     /// A node-level attribute, the declaration that sets it, and the marker

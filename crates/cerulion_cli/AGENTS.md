@@ -4,7 +4,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 `cerulion_cli_engine` - read that crate's AGENTS.md first; behavior changes go there.
 
 ## Invariants
-- `clap_complete::CompleteEnv::with_factory(Cli::command).complete()` is the FIRST
+- `clap_complete::CompleteEnv::with_factory(families::cli_command).complete()` is the FIRST
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
@@ -19,6 +19,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   `String`-typed path arg completes NOTHING without an explicit `value_hint`. Every new
   value-taking arg needs a completer/hint or a free-form inventory entry -
   `src/completion_wiring_tests.rs` fails until you do, and for a path arg the fix is the hint.
+- New top-level verb: a `src/families/` module + a `FAMILIES` entry, not a
+  `Commands` variant (cli.md §14)
 - Create verbs (`node|graph|schema create`) complete nothing - the existing
   name set is exactly what they reject.
 
@@ -55,5 +57,4 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
   and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
-Deep reference: docs/internals/cli.md - command contracts (replay exit codes, completions,
-discovery ladder, topics/local scope, graph run/profile/partition), test map for both crates.
+Reference: docs/internals/cli.md (contracts, completion, verb families, test maps).

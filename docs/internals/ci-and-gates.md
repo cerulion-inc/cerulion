@@ -15,6 +15,18 @@ mirrors the externally configured branch-protection and merge-queue checks, whic
 this workflow does not change. Its cache namespace is `android-arm64`; the default
 save policy is restore-only until that namespace is opted in.
 
+## Android emulator e2e
+
+`Android emulator e2e (x86_64, API 30)` builds the CLI, netd, the basic timer
+workspace, and the Android app, then runs them on a real API 30 Google APIs
+emulator. It decodes values from device and host topic echo, checks recorded
+MCAP frame counts and schemas, and checks paired and open app access. Pull
+requests and pushes to `main` run when Android-affecting paths change. The
+workflow also runs nightly at 06:13 UTC because a path filter cannot see a
+regression introduced by a shared dependency outside those paths. It is not a
+required context. Its `android-emulator` Cargo cache restores by default and
+saves only when the cache policy opts that namespace in.
+
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
@@ -97,7 +109,8 @@ near-spelling of a standard field name. Contracts worth knowing before editing a
 
 `./tools/scripts/check_hot_path_allocs.sh` runs in the `lint` job alongside its own `--self-test`
 step. It scans `crates/cerulion_core/src/transport/`, `.../graph/` and `.../scheduler/`, each minus
-a reasoned exclusion list; a new file in a scanned directory is linted BY DEFAULT.
+a reasoned exclusion list, and all of `crates/cerulion_tf/src/` (the frame math a node tick calls);
+a new file in a scanned directory is linted BY DEFAULT.
 
 The pattern set covers collection BUILDING as well as the obvious constructors:
 `.collect(` / `.collect::<`, `.to_owned()`, the map/set/deque constructors (`HashMap::new`,
@@ -369,13 +382,14 @@ harnesses under `tools/` and `benches/` that launch the binary themselves.
 
 That list used to live only in this paragraph.
 `crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs` now holds it as
-`GATE_CARRIERS` and asserts each entry really sets the variable to `off`, and it walks
-`.github/workflows/`, `tools/` and `benches/` for a command whose head is the binary: a
-file that runs it and is in neither list fails, naming this section. A match the detector
-cannot tell from a command (a sentence inside a multi-line string, the public-surface
-gate's own fixture) is recorded in `NOT_AN_INVOCATION` with its reason, and a line there
-that stops matching fails too. `cerulion --version` is not an invocation for this purpose:
-clap answers it above the gate.
+`GATE_CARRIERS` and asserts each entry has a line of its own that sets the variable to
+`off` for its own process (the same words inside a quoted command run on another host do
+not count), and it walks `.github/workflows/`, `tools/` and `benches/` for a command whose
+head is the binary: a file that runs it and is in neither list fails, naming this
+section. A match the detector cannot tell from a command (a sentence inside a multi-line
+string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION` with
+its reason, and a line there that stops matching fails too. `cerulion --version` is not
+an invocation for this purpose: clap answers it above the gate.
 
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,
@@ -557,8 +571,8 @@ regression script.
 
 ## Scheduled workflows
 
-Four workflows run on a clock, and none of them reports a required status context.
-Three of the four run on nothing but the clock and a manual dispatch:
+Five workflows run on a clock, and none of them reports a required status context.
+Three of the five run on nothing but the clock and a manual dispatch:
 `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
 and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
 dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
@@ -567,7 +581,9 @@ the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pul
 request, both path-filtered to `examples/perception/**` and its own file, so for that
 one the clock is the second trigger rather than the only one: it is what notices a
 change outside the filter breaking the demo. Every minute is off the hour, where
-GitHub queues the world's hourly crons at once.
+GitHub queues the world's hourly crons at once. The fifth,
+`.github/workflows/android-e2e.yml`, runs at 06:13 UTC and also on
+Android-affecting pushes and pull requests.
 
 `advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
 check advisories` and nothing else. Licences, bans and sources are decided by

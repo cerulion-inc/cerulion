@@ -244,7 +244,7 @@ fn mp_record_contracts_under_signal(
                 "both free-run recording workers arm the shared epoch; log was:\n{log}"
             );
             assert_eq!(
-                log.matches("gating clock placed at the shared real_ns() epoch")
+                log.matches("gating clock placed at the live loop's epoch")
                     .count(),
                 2,
                 "…and both place it at their live-loop anchor; log was:\n{log}"

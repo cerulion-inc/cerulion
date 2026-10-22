@@ -1013,7 +1013,7 @@ pub fn builtin_layout_resolver() -> (LayoutResolver, Vec<String>) {
 /// already parsed at build time to emit the types this crate links
 /// against. It panics loudly rather than silently degrade the registry
 /// if that codegen invariant is ever broken.
-pub(crate) fn parse_builtin_schemas() -> Vec<MessageSchema> {
+pub fn parse_builtin_schemas() -> Vec<MessageSchema> {
     let entries = native_ros2_messages::BUILTIN_MSGS;
     let mut schemas = Vec::with_capacity(entries.len());
     for &(package, name, text) in entries {
@@ -3766,10 +3766,10 @@ fn shadowed_builtin_names(result: &SchemaInfoResult) -> Option<String> {
 /// surfaces can never drift. `bare` is already `::`-normalized and carries
 /// no `/`. EXISTENCE + IDENTITY ONLY — deliberately not
 /// [`store_schema_lookup`]: that one builds a full [`SchemaEntry`], which
-/// RESOLVES the schema's layout, and layout resolution PANICS on fixed-array
-/// size overflow (`cerulion_core`'s `layout.rs`: `fixed-array size overflow
-/// (8 x 18446744073709551615)`). Calling it from `port_schema_exists` —
-/// which only ever asks a yes/no question — meant a single
+/// RESOLVES the schema's layout, and layout resolution PANICKED on fixed-array
+/// size overflow when this probe was written (`cerulion_core`'s `layout.rs`,
+/// now a typed `FixedSectionOverflow`). Calling it from `port_schema_exists`,
+/// which only ever asks a yes/no question, meant a single
 /// hostile-but-parseable `.msg` anywhere in `schemas/` CRASHED `cerulion
 /// graph validate` and `graph run`. `float64[18446744073709551615]
 /// a` in a store `.msg`, referenced by a graph output, panics the verb; with
@@ -4021,10 +4021,10 @@ pub enum PortSchemaProvenance {
     /// parity; workspace YAML outranks the store on qualified names too)
     /// — VALIDATED against the store rather than passed through blind.
     /// `schema` is the normalized string unchanged; the arm a prior STORE
-    /// resolver output lands on when fed back in (idempotence). Scaffold
-    /// call sites REFUSE this provenance via
-    /// [`refuse_store_port_scaffold`] — a store type has no generated
-    /// Rust type to import.
+    /// resolver output lands on when fed back in (idempotence). Rust
+    /// scaffold call sites gate this provenance through
+    /// [`refuse_store_port_scaffold`]: the store type has a generated Rust
+    /// type only where the workspace generates its messages.
     QualifiedStore,
     /// A bare name resolved to exactly ONE built-in ROS 2 message.
     /// `qualified` is its canonical `pkg/Name` form.
@@ -4041,10 +4041,10 @@ pub enum PortSchemaProvenance {
     /// workspace YAML schema and WINS over same-short-named built-ins.
     /// `qualified` is the store's `pkg/Type`; `shadowed` carries the
     /// qualified built-in(s) the store hit outranks (comma-joined), `None`
-    /// when the bare name collides with no built-in. Scaffold call sites
-    /// REFUSE this provenance via [`refuse_store_port_scaffold`] — a store
-    /// type has no generated Rust type to import — so the outranked
-    /// built-in is never silently scaffolded in its place either.
+    /// when the bare name collides with no built-in. Rust scaffold call
+    /// sites gate this provenance through [`refuse_store_port_scaffold`]
+    /// (generated only where the workspace generates its messages), and the
+    /// outranked built-in is never silently scaffolded in its place.
     ResolvedStore {
         qualified: String,
         shadowed: Option<String>,
@@ -4068,20 +4068,26 @@ pub struct ResolvedPortSchema {
     pub provenance: PortSchemaProvenance,
 }
 
-/// Refuse a port-schema resolution the NODE SCAFFOLDER cannot honor.
+/// Refuse a port-schema resolution the RUST node scaffolder cannot honor.
 ///
-/// A `.msg` store type has no generated Rust type: `templates::
-/// schema_to_import` maps every qualified name to
-/// `native_ros2_messages::pkg::Type`, and that crate holds ONLY the
-/// built-in corpus — so a port scaffolded from a store type mints a node
-/// crate whose `use` can NEVER compile (unlike a bare workspace-YAML name,
-/// which the author can satisfy in-crate). Until the store codegen front
-/// door exists, the scaffold-consuming call sites (`node create` /
-/// `node modify`, engine AND CLI) call this to refuse LOUDLY with the
-/// remedy; store resolutions stay fully valid on every surface that needs
-/// only the name/hash (`port_schema_exists`, `graph validate`'s identity
-/// comparison, the combined-set hash/wire-size/replay folds).
-pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> CliResult<()> {
+/// A `.msg` store type gets a generated Rust type only in a workspace whose
+/// `.cargo/config.toml` names it to the message crate's build script
+/// ([`crate::workspace::WORKSPACE_MSGS_ENV`]; every workspace `workspace
+/// create` / `workspace init` makes has the line): `native_ros2_messages` then
+/// generates the store's packages beside the built-ins, so
+/// `templates::schema_to_import`'s `native_ros2_messages::pkg::Type` compiles.
+/// Without the line that import could never compile, so the Rust
+/// scaffold-consuming call sites (`node create` / `node modify`, engine AND
+/// CLI) call this to refuse LOUDLY with the line to add. A Python node never
+/// calls it: `cerulion.msgs` reads the store at import. Store resolutions stay
+/// valid on every surface that needs only the name/hash
+/// (`port_schema_exists`, `graph validate`'s identity comparison, the
+/// combined-set hash/wire-size/replay folds).
+pub fn refuse_store_port_scaffold(
+    resolved: &ResolvedPortSchema,
+    raw: &str,
+    schemas_dir: &Path,
+) -> CliResult<()> {
     let qualified = match &resolved.provenance {
         PortSchemaProvenance::ResolvedStore { qualified, .. } => qualified.as_str(),
         PortSchemaProvenance::QualifiedStore => resolved.schema.as_str(),
@@ -4089,12 +4095,18 @@ pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> C
         | PortSchemaProvenance::ResolvedBuiltin { .. }
         | PortSchemaProvenance::Workspace { .. } => return Ok(()),
     };
+    let root = schemas_dir.parent().unwrap_or(schemas_dir);
+    if crate::workspace::workspace_generates_messages(root) {
+        return Ok(());
+    }
     Err(CliError::Validation(format!(
-        "schema '{raw}' names the workspace .msg store type '{qualified}', which has no \
-         generated Rust type — the scaffolded `use native_ros2_messages::...;` import \
-         could never compile, so no node port is created. For node ports use a built-in \
-         ROS 2 type or a workspace YAML schema (`cerulion schema create`); `.msg` store \
-         types remain first-class for `graph validate`, recording and replay."
+        "schema '{raw}' names the workspace .msg store type '{qualified}', and this \
+         workspace does not generate its .msg types into the message crate, so the \
+         scaffolded `use native_ros2_messages::...;` import could not compile and no \
+         node port is created. Add `{env} = {{ value = \".\", relative = true }}` under \
+         `[env]` in {config} (new workspaces have it), then run the command again.",
+        env = crate::workspace::WORKSPACE_MSGS_ENV,
+        config = root.join(".cargo/config.toml").display(),
     )))
 }
 
@@ -4149,10 +4161,11 @@ pub fn refuse_store_port_scaffold(resolved: &ResolvedPortSchema, raw: &str) -> C
 ///      today is to remove one of the two definitions; naming one of them is
 ///      not supported.
 ///
-///    NOTE: resolution succeeding is not scaffolding consent — the
+///    NOTE: resolution succeeding is not scaffolding consent: the Rust
 ///    scaffold-consuming call sites (`node create` / `node modify`) refuse
-///    BOTH store provenances via [`refuse_store_port_scaffold`], because a
-///    store type has no generated Rust type to import.
+///    BOTH store provenances via [`refuse_store_port_scaffold`] in a
+///    workspace that does not generate its store types into the message
+///    crate.
 /// 5. Bare + in neither workspace tier → resolved against the built-in
 ///    registry by unique short name:
 ///    - exactly 1 built-in → [`PortSchemaProvenance::ResolvedBuiltin`];
@@ -6670,7 +6683,7 @@ mod tests {
     /// layout — a hostile-but-parseable `.msg` crashed `graph validate`.
     ///
     /// `store_schema_lookup` builds a full `SchemaEntry`, which resolves the
-    /// layout, and layout resolution PANICS on fixed-array size overflow. The
+    /// layout, and layout resolution PANICKED on fixed-array size overflow. The
     /// `.msg`-store tier added one commit earlier called it, so a single
     /// `float64[18446744073709551615] a` anywhere in `schemas/` panicked
     /// `cerulion graph validate` and `graph run` on the real

@@ -50,11 +50,19 @@ fn find_raw_ffi_template_cdylib() -> std::path::PathBuf {
 fn test_raw_ffi_template_cdylib_loads_via_dylib_node_entry() {
     let path = find_raw_ffi_template_cdylib();
     let result = DylibNodeEntry::load(&path);
-    assert!(
-        result.is_ok(),
-        "DylibNodeEntry::load failed on raw-FFI template cdylib: {:?}",
-        result.err(),
-    );
+    if cfg!(feature = "local-transport") {
+        let error = result.err().expect("local-transport must refuse a cdylib");
+        assert!(
+            error.to_string().contains("local-transport"),
+            "the refusal must name the local-transport limitation: {error}"
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "DylibNodeEntry::load failed on raw-FFI template cdylib: {:?}",
+            result.err(),
+        );
+    }
 }
 
 // ─── Direct FFI-symbol tests via libloading ────────────────────────────

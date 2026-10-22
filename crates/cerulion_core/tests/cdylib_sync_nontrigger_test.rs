@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//! DylibNodeEntry::load refuses every cdylib on a local-transport host, so
+//! this whole parity suite is compiled out there; the refusal arm lives in
+//! `local_transport_test.rs`.
+#![cfg(not(feature = "local-transport"))]
 //! Cdylib PARITY for **trigger-scoped Sync** (the
 //! no-inert-shipping rule) — the FFI path must prove the same semantics the
 //! in-process tests pinned (`sync_fire_iox2_test.rs`).

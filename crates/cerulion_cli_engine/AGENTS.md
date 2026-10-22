@@ -18,6 +18,9 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - `node build`'s PATH rustc probe is advisory: Cargo compiler overrides may differ.
   Only the built cdylib's full fingerprint is authoritative, checked at load.
+- Android: per node, cdylib lookup prefers cargo-ndk's `<target>/<triple>/<profile>`,
+  then `<target>/<profile>`; no Cargo => `node build` points at host `cargo ndk`;
+  `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source. Raw-FFI markers optional; only `INFO_END` before `INFO_START` is fatal.
 - Never hand-compute pinned schema hashes; run `pinned_hashes` after a recipe change
   and copy its values into `topic_cmd.rs`.
@@ -43,8 +46,8 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.
-- `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`:
-  `-- --test-threads=1`, last two share iox2 ns; build
+- Serial: `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`,
+  `topic_type_iox2_test` (last 3 share iox2 ns); build
   `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use

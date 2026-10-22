@@ -218,6 +218,59 @@ naming here because they are easy to get wrong:
   an unverified input and destroy arrived complete sets. Death is evaluated BEFORE descent,
   so a provably unmatchable frame is classified UNMATCHABLE (something is wrong) rather than
   PASSED-OVER (the feature working).
+- **Sync can match on CAPTURE time.** By default a head's stamp is the frame's WIRE stamp
+  (publish time). A node whose `NodeInfo` carries capture-stamp locations
+  (`NodeInfo::with_sync_capture_stamps`) aligns on each message's `header.stamp` instead,
+  the ROS 2 `message_filters` ApproximateTime analogue. The matcher is unchanged: the graph
+  runtime wraps the node's head ops (`graph/sync_capture.rs`) and, after an op places a
+  head or a staged next, decodes `header.stamp` off THAT frame (`NodeEntry::sync_capture_stamp`,
+  a read-only slot accessor) through the pure layer `scheduler/sync_stamp.rs`. The pure
+  layer keeps rule (1) true for stamps the producer does not keep monotone: a head stamp
+  below the input's newest accepted one (its capture high-water) by at most the window is
+  DISCARDED and counted (`sync_capture_backwards_drops`), a drop of more than the window is a
+  clock restart left to the ordinary epoch reset, and an undecodable stamp is discarded and
+  counted (`sync_capture_decode_failures`); each of the two discard kinds has its own
+  `FailureRegimeLatch` (loud first `warn!`, counted repeats, recovery line). A staged next
+  that would not be accepted answers "nothing to descend to" and is judged when it becomes
+  the head; an op that gives up after 256 discards voids the last one, so each frame is
+  counted once, and answers "no head" (never a failure, which would fire a tuple whose member
+  the op popped). The capture high-water follows the scheduler's own: an accepted new-epoch
+  head clears every partner's (as the epoch reset does), and a `Void` of an accepted head
+  clears its own (the scheduler voids one only to discard it). The decode reads only inside
+  the frame the wire header declares (`total_size`), reads a `header` table entry only when
+  the wire header's declared offset table (`offset_table_offset`, `offset_table_count`) sits
+  where the schema puts it and holds that index, and refuses an entry below the parent's data
+  floor. Only a `sync_window_ms` node may opt in: without a window a clock restart
+  cannot be told from out-of-order frames, so `unbounded_sync` is refused at build. Every
+  decision is a function of frame bytes and accepted stamps, so two runs over the same frames
+  select the same sets. The framework section carries each input's capture high-water in its
+  own version-3 table (`NodeFrameworkState::sync_capture_high_water`), because a fired head
+  leaves the head map but its stamp still decides which frames are backwards; a RESTORE seeds
+  it from that table (`GraphRuntime::restore_sync_capture_high_water`) and from each restored
+  head (`GraphRuntime::restore_sync_input_timestamps`), so a resumed run drops what live
+  dropped. Both seams also raise the scheduler's wire-stamp epoch high-water for that input to
+  the same stamp, because on a capture-time node the epoch reset runs on capture stamps: a
+  clock restart right after the resume then re-bases the node as it did live, instead of
+  keeping the held old-epoch partner and discarding the new frame. The section also carries
+  the node's epoch floor in a version-4 tail after that table (`sync_epoch_floor`, restored by
+  `GraphRuntime::restore_sync_epoch_floor`; a version-3 section ends at the table, so a
+  checkpoint written before the floor existed still reads, with no floor). Both the Flashback
+  anchor and `GraphRuntime::node_framework_state` fill these two fields through one helper,
+  so an anchor states the same Sync state as the read seam: a restart re-bases every partner, and a re-based
+  partner's frames are tested against that floor, so a run resumed before the partner's first
+  new-epoch frame discards the same old-epoch straggler live discarded. The block-credit check
+  counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in
+  builds only per-set, so there is no legacy port to decline over. The replay verifier cannot re-derive capture-time sets from
+  the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
+  locations are resolved once per input from the schema (`codegen::header_stamp_location`,
+  the writers' own `LayoutResolver`), and `graph::validation::resolve_capture_sync_stamps`
+  refuses an unstamped input with `TransportError::SyncCaptureStamp` naming node and input.
+  The build also refuses the opt-in on a non-sync node, a location for an input that is not a
+  trigger input, and an entry without frame access (`NodeEntry::supports_sync_capture_stamps`
+  is `false`): today that is every `#[cerulion_node]` node, in-process or cdylib, because the
+  macro forwards the head ops but not the stamp accessor; only `ClosureNodeEntry` opts in. The opt-in is the `#[doc(hidden)]` builder
+  `NodeInfo::with_sync_capture_stamps`: no macro key or graph-load path sets it yet. Nodes
+  that do not opt in run the publish-time path unchanged.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert

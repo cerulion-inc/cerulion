@@ -213,7 +213,7 @@ impl Client {
     /// always read under `PROTOCOL_READ_TIMEOUT`, and the caller's value is installed
     /// only once hello has been parsed.
     fn connect_with_timeout(sock: &Path, read_timeout: Duration) -> (Client, Hello) {
-        let stream = UnixStream::connect(sock).expect("connect");
+        let stream = cerulion_hygiene::connect_control_socket(sock).expect("connect");
         stream
             .set_read_timeout(Some(PROTOCOL_READ_TIMEOUT))
             .unwrap();

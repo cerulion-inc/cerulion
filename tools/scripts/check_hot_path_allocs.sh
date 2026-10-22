@@ -171,11 +171,13 @@ reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs"
 #                  handoff to a cdylib; runs once per node at graph build, before
 #                  any transport resource exists. The tick path reads a plain
 #                  struct field the build wrote once.
+#   param_resume.rs the resume rule for params: one comparison per resumed
+#                  node, before the first step of a resumed replay.
 #   partition.rs   the auto-partitioner; runs at `graph run` preflight.
 #   topology.rs    the STATIC build-time dataflow model; `build()`/`validate()`
 #                  run once at graph build.
 #   validation.rs  build-time graph validation.
-GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs params.rs partition.rs topology.rs validation.rs"
+GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs param_resume.rs params.rs partition.rs topology.rs validation.rs"
 
 # cerulion_core/src/scheduler — the fire/decide engine.
 #
@@ -192,10 +194,18 @@ GRAPH_EXCLUDE="chain.rs config.rs launch_args.rs node.rs params.rs partition.rs 
 # Everything else is per-step code or a pure state machine, and is scanned.
 SCHEDULER_EXCLUDE="catchup_clamp_wiring_tests.rs wake.rs"
 
+# cerulion_tf/src: the SE(3) frame math a node tick calls for every lookup.
+#
+# Pure arithmetic with no cold half, so nothing is excluded: an allocation
+# anywhere in it is a finding. `crates/cerulion_tf/tests/zero_alloc_test.rs`
+# is the runtime half of the same contract.
+TF_EXCLUDE=""
+
 TARGETS=(
     "crates/cerulion_core/src/transport|$TRANSPORT_EXCLUDE"
     "crates/cerulion_core/src/graph|$GRAPH_EXCLUDE"
     "crates/cerulion_core/src/scheduler|$SCHEDULER_EXCLUDE"
+    "crates/cerulion_tf/src|$TF_EXCLUDE"
 )
 
 # nullglob: a missing/empty target dir must yield an empty array (and trip the

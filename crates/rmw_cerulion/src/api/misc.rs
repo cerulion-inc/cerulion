@@ -94,6 +94,7 @@ pub unsafe extern "C" fn rmw_serialize(
                 return RMW_RET_ERROR;
             }
         };
+        let _downgrades = crate::rosidl_buffer::PublishScope::open("<rmw_serialize>");
         let frame = match bridge.flatten(ros_message, 0, 0) {
             Ok(f) => f,
             Err(e) => {
@@ -784,12 +785,11 @@ pub unsafe extern "C" fn rmw_get_node_names(
         // nodes in different namespaces are distinct.
         let names: Vec<String> = graph.nodes.keys().map(|(_, n)| n.clone()).collect();
         let namespaces: Vec<String> = graph.nodes.keys().map(|(ns, _)| ns.clone()).collect();
-        // Use the default allocator embedded in the arrays (rcl pre-inits
-        // them with one).
-        let alloc_names = (*node_names).allocator;
-        let alloc_ns = (*node_namespaces).allocator;
-        let mut a1 = alloc_names;
-        let mut a2 = alloc_ns;
+        // rcl passes zero-initialized arrays (every allocator fn pointer
+        // NULL); those are filled with the default allocator, which the fill
+        // records in the array for `rcutils_string_array_fini`.
+        let mut a1 = ffi::effective_allocator((*node_names).allocator);
+        let mut a2 = ffi::effective_allocator((*node_namespaces).allocator);
         let ret = fill_string_array(node_names, &mut a1, &names);
         if ret != RMW_RET_OK {
             return ret;
@@ -832,19 +832,22 @@ pub unsafe extern "C" fn rmw_get_node_names_with_enclaves(
             let values: Vec<String> = graph.nodes.keys().map(|_| "/".to_string()).collect();
             (names, namespaces, values)
         };
-        let mut a1 = (*node_names).allocator;
+        // Zero-initialized arrays take the default allocator, as in
+        // `rmw_get_node_names`. The fill records the allocator it used in
+        // each array, so the rollback frees below read it back from there.
+        let mut a1 = ffi::effective_allocator((*node_names).allocator);
         let ret = fill_string_array(node_names, &mut a1, &names);
         if ret != RMW_RET_OK {
             return ret;
         }
-        let mut a2 = (*node_namespaces).allocator;
+        let mut a2 = ffi::effective_allocator((*node_namespaces).allocator);
         let ret = fill_string_array(node_namespaces, &mut a2, &namespaces);
         if ret != RMW_RET_OK {
             let mut a1 = (*node_names).allocator;
             free_string_array(node_names, &mut a1);
             return ret;
         }
-        let mut a3 = (*enclaves).allocator;
+        let mut a3 = ffi::effective_allocator((*enclaves).allocator);
         let ret = fill_string_array(enclaves, &mut a3, &values);
         if ret != RMW_RET_OK {
             let mut a1 = (*node_names).allocator;

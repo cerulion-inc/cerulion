@@ -7,7 +7,8 @@ use native_ros2_messages::builtin_interfaces::Time;
 use native_ros2_messages::sensor_msgs::Image;
 
 use crate::frame::{
-    capture_len, publish_and_requeue, BYTES_PER_PIXEL, ENCODING, FRAME_HEIGHT, FRAME_WIDTH,
+    capture_len, dequeue_error, publish_and_requeue, BYTES_PER_PIXEL, ENCODING, FRAME_HEIGHT,
+    FRAME_WIDTH,
 };
 
 // Pure format, layout and bookkeeping helpers. No kernel calls: these run in
@@ -131,8 +132,9 @@ impl V4l2CameraNode {
         // with no frame ready (`Ok(None)`) returns without touching `image`: an
         // output a tick never writes is never loaned, so nothing is published
         // and nothing is discarded. A backlog drains over consecutive steps,
-        // because the fd stays readable while frames remain.
-        let Some(frame) = device::dequeue_frame(fd)? else {
+        // because the fd stays readable while frames remain. An unplugged
+        // camera stops this node (`dequeue_error`).
+        let Some(frame) = device::dequeue_frame(fd).map_err(dequeue_error)? else {
             return Ok(());
         };
 

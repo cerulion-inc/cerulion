@@ -677,7 +677,13 @@ setup_path_for_shells() {
 
 # The programs that get a link in a bin directory the shell already searches.
 # The libraries stay beside the real binaries, where the CLI looks for them.
-LINKED_PROGRAMS='cerulion cerulion-netd cerulion-connectd'
+# A program missing from the install directory gets no link, and this
+# installer's own link to it is removed: archives from releases before
+# cerulion-remoted shipped carry the other three only.
+LINKED_PROGRAMS='cerulion cerulion-netd cerulion-connectd cerulion-remoted'
+# The links link_programs removed, one per line; a rolled back install puts
+# each one back (cleanup_install).
+removed_own_links=
 
 # The directory a shell searches for programs without any setup: ~/.local/bin
 # is on the default PATH of Debian and Ubuntu logins (through ~/.profile, once
@@ -728,6 +734,17 @@ link_programs() {
     for link_program in $LINKED_PROGRAMS; do
         link_path="$link_dir/$link_program"
         link_target="$link_source/$link_program"
+        if [ ! -e "$link_target" ]; then
+            if link_is_ours "$link_path" "$link_target"; then
+                # Recorded before the removal, so a signal handled right
+                # after it still finds the link in the list.
+                removed_own_links="${removed_own_links}${link_path}
+"
+                rm -f "$link_path" ||
+                    printf 'warning: could not remove %s\n' "$link_path" >&2
+            fi
+            continue
+        fi
         if link_is_ours "$link_path" "$link_target"; then
             continue
         fi
@@ -777,14 +794,83 @@ dir_reachable_by_all() {
     return 0
 }
 
+# 0 when no account other than root and this one can change $1 or any
+# directory above it. Two chains are walked up to /: the path as written
+# (made absolute), where each component is followed through a symlink and the
+# symlink's own directory is the next component up, and the physical path.
+# The directories above a symlink's target are on the physical chain only
+# when that target is part of the resolved path.
+# Each directory has to pass path_safe_from_others. On a nonzero return,
+# unsafe_dir names the first directory that failed; safe_physical holds the
+# physical path that was checked.
+dir_safe_from_others() {
+    unsafe_dir=$1
+    safe_physical=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd) || return 1
+    case "$1" in
+        /*) safe_written=$1 ;;
+        *) safe_written="$(pwd)/$1" ;;
+    esac
+    safe_uid=$(id -u)
+    # The same test seam as dir_reachable_by_all: the walk ends below the
+    # self-test's scratch root, whose parents are the machine's temporary
+    # directories. Both spellings of the root end it.
+    safe_stop_written=
+    safe_stop_physical=
+    if [ -n "${CERULION_SELF_TEST_REACH_ROOT:-}" ]; then
+        safe_stop_written=${CERULION_SELF_TEST_REACH_ROOT%/}
+        safe_stop_physical=$(CDPATH='' cd -P -- "$CERULION_SELF_TEST_REACH_ROOT" 2>/dev/null && pwd) ||
+            safe_stop_physical=
+    fi
+    for safe_dir in "$safe_written" "$safe_physical"; do
+        while [ "$safe_dir" != / ] && [ "${safe_dir%/}" != "$safe_dir" ]; do
+            safe_dir=${safe_dir%/}
+        done
+        while [ -n "$safe_dir" ] && [ "$safe_dir" != "$safe_stop_written" ] &&
+            [ "$safe_dir" != "$safe_stop_physical" ]; do
+            path_safe_from_others "$safe_dir" "$safe_uid" || return 1
+            [ "$safe_dir" != / ] || break
+            safe_dir=${safe_dir%/*}
+            [ -n "$safe_dir" ] || safe_dir=/
+        done
+    done
+    return 0
+}
+
+# 0 when $1 (followed through a symlink) is owned by uid 0 or uid $2 and has
+# neither the group nor the other write bit; sets unsafe_dir to $1 otherwise.
+# A sticky world-writable directory fails. On Linux a POSIX ACL entry that
+# grants write also sets the group write bit ls prints (the ACL mask). A macOS
+# ACL is separate from the mode, so the entries `ls -le` lists are read too,
+# and one that allows any kind of write fails; where ls has no ACL listing
+# (GNU, busybox) no entry line is printed and the mode decides.
+path_safe_from_others() {
+    unsafe_dir=$1
+    # shellcheck disable=SC2012
+    safe_mode=$(ls -dLn -- "$1" 2>/dev/null | awk -v uid="$2" '
+        NR == 1 {
+            if (($3 == 0 || $3 == uid) && substr($1, 6, 1) != "w" && substr($1, 9, 1) != "w")
+                print $1
+        }
+    ')
+    [ -n "$safe_mode" ] || return 1
+    # shellcheck disable=SC2010  # the ACL entry lines are read, not file names
+    if ls -dLle -- "$1" 2>/dev/null |
+        grep -E '^ *[0-9]+: .* allow .*(write|add_file|add_subdirectory|delete_child|append|delete|chown)' >/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # A piped installer cannot change the PATH of the shell that ran it, so the
 # programs are linked into a directory that shell may already search: always
 # ~/.local/bin, and /usr/local/bin as well when ~/.local/bin is not on this
 # PATH but /usr/local/bin is, already exists and is writable without sudo
 # (in practice root). The shared directory is skipped when another account
 # could not follow the link into the install directory (root's 0700 home, a
-# macOS home), and when a different cerulion is already on this PATH, which a
-# link earlier on the PATH would hide. The links are made only after every
+# macOS home), when a different cerulion is already on this PATH, which a
+# link earlier on the PATH would hide, and with a warning when another
+# account could change the shared directory, the install directory or a
+# linked program (system_link_safe). The links are made only after every
 # binary is activated, and a failure is a warning.
 link_into_path_dirs() {
     path_link_source=$1
@@ -803,10 +889,34 @@ link_into_path_dirs() {
         if [ -n "$path_link_existing" ] &&
             ! [ "$path_link_existing" -ef "$path_link_source/cerulion" ]; then
             :
+        elif ! system_link_safe "$path_link_system" "$path_link_source"; then
+            printf 'warning: not linking the Cerulion programs into %s: another account can change %s; add %s to PATH to run cerulion by name\n' \
+                "$path_link_system" "$unsafe_dir" "$path_link_home" >&2
         else
-            link_programs "$path_link_system" "$path_link_source" || :
+            # The links name the physical install directory, so running one
+            # follows no symlink outside the chain system_link_safe checked.
+            link_programs "$path_link_system" "$system_safe_root" || :
         fi
     fi
+}
+
+# 0 when a link in the shared directory $1 to the programs in $2 runs only
+# what root or this account put there: both directories pass
+# dir_safe_from_others and so does each linked program that exists. Sets
+# system_safe_root to the physical path of $2.
+system_link_safe() {
+    dir_safe_from_others "$1" || return 1
+    dir_safe_from_others "$2" || return 1
+    # The string that was checked is the one linked to: a second resolution
+    # could follow a symlink changed after the check.
+    system_safe_root=$safe_physical
+    system_safe_uid=$(id -u)
+    for system_safe_program in $LINKED_PROGRAMS; do
+        [ -e "$system_safe_root/$system_safe_program" ] || continue
+        path_safe_from_others "$system_safe_root/$system_safe_program" "$system_safe_uid" ||
+            return 1
+    done
+    return 0
 }
 
 # The last line of an install: whether `cerulion` already runs in the shell
@@ -931,6 +1041,8 @@ $(system_bin_dir)"
     else
         un_link_dirs=$(system_bin_dir)
     fi
+    # The system links name the physical install directory.
+    un_physical=$(CDPATH='' cd -P -- "$un_dir" 2>/dev/null && pwd) || un_physical=
     un_old_ifs=$IFS
     set -f
     IFS='
@@ -940,7 +1052,8 @@ $(system_bin_dir)"
         for un_program in $LINKED_PROGRAMS; do
             un_link="$un_link_dir/$un_program"
             if link_is_ours "$un_link" "$un_abs/$un_program" ||
-                link_is_ours "$un_link" "$un_dir/$un_program"; then
+                link_is_ours "$un_link" "$un_dir/$un_program" ||
+                { [ -n "$un_physical" ] && link_is_ours "$un_link" "$un_physical/$un_program"; }; then
                 if rm -f "$un_link"; then
                     printf 'Removed %s\n' "$un_link"
                     un_removed=1
@@ -956,7 +1069,7 @@ $(system_bin_dir)"
     if [ ! -d "$un_dir" ]; then
         printf 'Nothing installed in %s\n' "$un_dir"
     else
-        for un_file in cerulion cerulion-netd cerulion-connectd \
+        for un_file in cerulion cerulion-netd cerulion-connectd cerulion-remoted \
             librmw_cerulion.so libcerulion_heaphook.so .cerulion-provenance.json; do
             if [ -f "$un_dir/$un_file" ] || [ -L "$un_dir/$un_file" ]; then
                 rm -f "$un_dir/$un_file" || {
@@ -1552,12 +1665,26 @@ EOF
     signal_archive_root="$signal_fixture_dir/$signal_archive_stem"
     signal_bin="$owner_test_dir/signal-bin"
     mkdir -p "$signal_source_dir" "$signal_archive_root" "$signal_bin"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "new-$binary" > "$signal_archive_root/$binary"
     done
     printf '%s\n' 'license' > "$signal_archive_root/LICENSE"
     tar -czf "$signal_source_dir/$signal_archive_name" \
         -C "$signal_fixture_dir" "$signal_archive_stem"
+    # The archive of a release that predates cerulion-remoted: the other
+    # three programs only.
+    legacy_fixture_dir="$owner_test_dir/legacy-fixture"
+    legacy_archive_root="$legacy_fixture_dir/$signal_archive_stem"
+    mkdir -p "$legacy_fixture_dir/v0.1.0" "$legacy_archive_root"
+    for binary in cerulion cerulion-netd cerulion-connectd; do
+        printf '%s\n' "new-$binary" > "$legacy_archive_root/$binary"
+    done
+    printf '%s\n' 'license' > "$legacy_archive_root/LICENSE"
+    tar -czf "$legacy_fixture_dir/v0.1.0/$signal_archive_name" \
+        -C "$legacy_fixture_dir" "$signal_archive_stem"
+    legacy_checksum=$(sha256_digest "$legacy_fixture_dir/v0.1.0/$signal_archive_name") ||
+        die "self-test: could not checksum the legacy archive"
+    printf '%s\n' "$legacy_checksum" > "$legacy_fixture_dir/v0.1.0/$signal_archive_name.sha256"
     if ! signal_checksum=$(sha256_digest "$signal_source_dir/$signal_archive_name"); then
         die "neither sha256sum nor shasum is available; self-test cannot run without a checksum tool"
     fi
@@ -1600,7 +1727,7 @@ EOF
         signal_child_pid="$signal_dir/child.pid"
         mkdir -p "$signal_dir" "$signal_install_dir"
         rm -f "$signal_child_pid"
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             printf '%s\n' "old-$binary" > "$signal_install_dir/$binary"
         done
         PATH="$signal_bin:$signal_previous_path"
@@ -1662,7 +1789,7 @@ EOF
         done < "$signal_child_pid"
         [ ! -e "$signal_install_dir/.cerulion-install.lock" ] ||
             die "self-test: $signal install stranded its lock"
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$signal_install_dir/$binary")" = "old-$binary" ] ||
                 die "self-test: $signal install did not restore old $binary bytes"
         done
@@ -1679,7 +1806,7 @@ EOF
     signal_release="$signal_dir/release"
     signal_child_pid="$signal_dir/child.pid"
     mkdir -p "$signal_dir" "$signal_install_dir"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "old-$binary" > "$signal_install_dir/$binary"
     done
     PATH="$signal_bin:$signal_previous_path"
@@ -1724,7 +1851,7 @@ EOF
     done < "$signal_child_pid"
     [ ! -e "$signal_install_dir/.cerulion-install.lock" ] ||
         die "self-test: double-signal install stranded its lock"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ "$(cat "$signal_install_dir/$binary")" = "old-$binary" ] ||
             die "self-test: double-signal install did not restore old $binary bytes"
     done
@@ -1761,7 +1888,7 @@ EOF
         grep -F 'warning: WSL2 is unverified and unsupported; proceeding with the Linux artifact' \
             "$wsl_case_error" >/dev/null ||
             die "self-test: WSL $wsl_case warning was not emitted"
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$wsl_case_install_dir/$binary")" = "new-$binary" ] ||
                 die "self-test: WSL $wsl_case warning arm did not install $binary"
         done
@@ -1801,7 +1928,7 @@ EOF
             cat "$toolchain_case_error" >&2
             die "self-test: C toolchain $toolchain_case arm failed to install"
         fi
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$toolchain_case_install_dir/$binary")" = "new-$binary" ] ||
                 die "self-test: C toolchain $toolchain_case arm did not install $binary"
         done
@@ -1850,7 +1977,7 @@ EOF
     upgrade_output="$owner_test_dir/upgrade-output"
     upgrade_error="$owner_test_dir/upgrade-error"
     mkdir -p "$upgrade_install_dir"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "old-$binary" > "$upgrade_install_dir/$binary"
     done
     if ! "$0" --version v0.1.0 \
@@ -1859,7 +1986,7 @@ EOF
         >"$upgrade_output" 2>"$upgrade_error"; then
         die "self-test: existing installation upgrade failed"
     fi
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ "$(cat "$upgrade_install_dir/$binary")" = "new-$binary" ] ||
             die "self-test: upgrade did not install new $binary bytes"
     done
@@ -1973,7 +2100,7 @@ EOF
         marker_case_release="$marker_case_dir/release"
         marker_case_child_pid="$marker_case_dir/child.pid"
         mkdir -p "$marker_case_install" "$marker_case_home"
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             printf '%s\n' "old-$binary" > "$marker_case_install/$binary"
         done
         if [ -n "$marker_case_previous" ]; then
@@ -2041,7 +2168,7 @@ EOF
     }
     # Every binary carries its previous bytes again after a rolled back run.
     assert_marker_case_rolled_back() {
-        for binary in cerulion cerulion-netd cerulion-connectd; do
+        for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$marker_case_install/$binary")" = "old-$binary" ] ||
                 die "self-test: marker $marker_case install did not restore old $binary bytes"
         done
@@ -2182,7 +2309,7 @@ EOF
     rmw_output="$owner_test_dir/rmw-output"
     rmw_error="$owner_test_dir/rmw-error"
     mkdir -p "$rmw_source_dir" "$rmw_archive_root" "$rmw_install_dir"
-    for binary in cerulion cerulion-netd cerulion-connectd \
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted \
         librmw_cerulion.so libcerulion_heaphook.so; do
         printf '%s\n' "new-$binary" > "$rmw_archive_root/$binary"
     done
@@ -2200,7 +2327,7 @@ EOF
         cat "$rmw_error" >&2
         die "self-test: install of an archive carrying the rmw library failed"
     fi
-    for binary in cerulion cerulion-netd cerulion-connectd \
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted \
         librmw_cerulion.so libcerulion_heaphook.so; do
         [ "$(cat "$rmw_install_dir/$binary")" = "new-$binary" ] ||
             die "self-test: rmw archive install did not place new $binary bytes"
@@ -2283,7 +2410,7 @@ EOF
         die "self-test: directory lock claim did not exercise the race"
     [ -d "$directory_lock_install_dir/.cerulion-install.lock" ] ||
         die "self-test: directory lock race did not create its directory"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ ! -e "$directory_lock_install_dir/$binary" ] ||
             die "self-test: directory lock race installed $binary"
     done
@@ -2338,7 +2465,7 @@ EOF
         die "self-test: replaced lock claim did not exercise the race"
     [ "$(cat "$replacement_install_dir/.cerulion-install.lock")" = "replacement-owner" ] ||
         die "self-test: replaced lock claim was removed"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ ! -e "$replacement_install_dir/$binary" ] ||
             die "self-test: replaced lock claim installed $binary"
     done
@@ -2351,7 +2478,7 @@ EOF
     partial_output="$owner_test_dir/partial-upgrade-output"
     partial_error="$owner_test_dir/partial-upgrade-error"
     mkdir -p "$partial_install_dir" "$partial_bin"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "old-$binary" > "$partial_install_dir/$binary"
     done
     partial_real_mv=$(command -v mv)
@@ -2382,7 +2509,7 @@ EOF
         >"$partial_output" 2>"$partial_error"; then
         die "self-test: partial activation failure unexpectedly succeeded"
     fi
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ "$(cat "$partial_install_dir/$binary")" = "old-$binary" ] ||
             die "self-test: rollback did not restore old $binary bytes"
     done
@@ -2394,6 +2521,20 @@ EOF
             continue
         die "self-test: failed upgrade left temporary files"
     done
+    # The same failure while installing an archive without cerulion-remoted
+    # puts back the cerulion-remoted that the install had removed.
+    rm -f "$partial_marker"
+    if "$0" --version v0.1.0 \
+        --dir "$partial_install_dir" \
+        --base-url "file://$legacy_fixture_dir" \
+        >"$partial_output.legacy" 2>"$partial_error.legacy"; then
+        die "self-test: partial activation failure of the legacy archive unexpectedly succeeded"
+    fi
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
+        [ "$(cat "$partial_install_dir/$binary")" = "old-$binary" ] ||
+            die "self-test: legacy rollback did not restore old $binary bytes"
+    done
+    rm -f "$partial_output.legacy" "$partial_error.legacy"
     grep -F 'could not activate cerulion-netd' "$partial_error" >/dev/null ||
         die "self-test: activation failure did not report its binary"
     PATH=$signal_previous_path
@@ -2405,7 +2546,7 @@ EOF
     directory_output="$owner_test_dir/activation-directory-output"
     directory_error="$owner_test_dir/activation-directory-error"
     mkdir -p "$directory_install_dir" "$directory_bin"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "old-$binary" > "$directory_install_dir/$binary"
     done
     directory_real_mv=$(command -v mv)
@@ -2439,7 +2580,7 @@ EOF
     fi
     [ -e "$directory_marker" ] ||
         die "self-test: activation directory race did not exercise the race"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         [ "$(cat "$directory_install_dir/$binary")" = "old-$binary" ] ||
             die "self-test: activation directory race did not restore old $binary bytes"
         if [ -d "$directory_install_dir/$binary" ]; then
@@ -2463,7 +2604,7 @@ EOF
     checksum_output="$owner_test_dir/activation-checksum-output"
     checksum_error="$owner_test_dir/activation-checksum-error"
     mkdir -p "$checksum_install_dir" "$checksum_bin"
-    for binary in cerulion cerulion-netd cerulion-connectd; do
+    for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
         printf '%s\n' "old-$binary" > "$checksum_install_dir/$binary"
     done
     checksum_real_mv=$(command -v mv)
@@ -2554,6 +2695,12 @@ EOF
             "install.sh self-test: skipping FIFO destination arm because mkfifo is unavailable" >&2
     fi
 
+    # tar applies the umask to the programs it extracts, and a group-writable
+    # program is never linked into the system bin directory, so the arms up to
+    # the system link uninstall run under 022 whatever umask started the
+    # self-test.
+    self_test_umask=$(umask)
+    umask 022
     path_setup_root="$owner_test_dir/path-setup"
     mkdir -p "$path_setup_root"
     # The PATH of the shell the arms pretend to run in: this one's, minus any
@@ -2572,6 +2719,7 @@ EOF
     path_run_shell=/bin/sh
     path_run_system="$path_setup_root/no-system-bin"
     path_run_reach_root=/
+    path_run_base_url="file://$signal_fixture_dir"
     run_path_setup_install() {
         path_run_home=$1
         path_run_install=$2
@@ -2591,7 +2739,7 @@ EOF
             CERULION_SELF_TEST_REACH_ROOT="$path_run_reach_root" \
             "$0" --version v0.1.0 \
             --dir "$path_run_install" \
-            --base-url "file://$signal_fixture_dir" \
+            --base-url "$path_run_base_url" \
             "$@" \
             >"$path_run_output" 2>"$path_run_error"
     }
@@ -2709,6 +2857,95 @@ EOF
             die "self-test: the second run changed the $path_program link"
     done
 
+    # An archive from a release that predates cerulion-remoted carries the
+    # other three programs only. It installs, and links those three, with no
+    # cerulion-remoted file and no link that names a missing program.
+    legacy_home="$path_setup_root/legacy-home"
+    legacy_install="$path_setup_root/legacy-install"
+    mkdir -p "$legacy_home" "$legacy_install"
+    path_run_base_url="file://$legacy_fixture_dir"
+    run_path_setup_install "$legacy_home" "$legacy_install" \
+        "$path_setup_root/legacy-output" "$path_setup_root/legacy-error" ||
+        die "self-test: the install of an archive without cerulion-remoted failed: $(cat "$path_setup_root/legacy-error")"
+    path_run_base_url="file://$signal_fixture_dir"
+    for binary in cerulion cerulion-netd cerulion-connectd; do
+        [ "$(cat "$legacy_install/$binary")" = "new-$binary" ] ||
+            die "self-test: the archive without cerulion-remoted did not install $binary"
+        [ "$(readlink "$legacy_home/.local/bin/$binary")" = "$legacy_install/$binary" ] ||
+            die "self-test: the archive without cerulion-remoted did not link $binary"
+    done
+    if [ -e "$legacy_install/cerulion-remoted" ] ||
+        [ -e "$legacy_home/.local/bin/cerulion-remoted" ] ||
+        [ -L "$legacy_home/.local/bin/cerulion-remoted" ]; then
+        die "self-test: an archive without cerulion-remoted produced a cerulion-remoted file or link"
+    fi
+    if grep -Fq 'cerulion-remoted' "$path_setup_root/legacy-error"; then
+        die "self-test: an archive without cerulion-remoted warned about it: $(cat "$path_setup_root/legacy-error")"
+    fi
+
+    # Installing that archive over a release that carried cerulion-remoted
+    # removes the file and this installer's link to it.
+    downgrade_home="$path_setup_root/downgrade-home"
+    downgrade_install="$path_setup_root/downgrade-install"
+    mkdir -p "$downgrade_home" "$downgrade_install"
+    run_path_setup_install "$downgrade_home" "$downgrade_install" \
+        "$path_setup_root/downgrade-first-output" "$path_setup_root/downgrade-first-error" ||
+        die "self-test: the install before the downgrade failed"
+    [ "$(readlink "$downgrade_home/.local/bin/cerulion-remoted")" = "$downgrade_install/cerulion-remoted" ] ||
+        die "self-test: the install before the downgrade did not link cerulion-remoted"
+    path_run_base_url="file://$legacy_fixture_dir"
+    run_path_setup_install "$downgrade_home" "$downgrade_install" \
+        "$path_setup_root/downgrade-output" "$path_setup_root/downgrade-error" ||
+        die "self-test: the downgrade to an archive without cerulion-remoted failed: $(cat "$path_setup_root/downgrade-error")"
+    path_run_base_url="file://$signal_fixture_dir"
+    if [ -e "$downgrade_install/cerulion-remoted" ] ||
+        [ -L "$downgrade_home/.local/bin/cerulion-remoted" ]; then
+        die "self-test: the downgrade left cerulion-remoted or its link in place"
+    fi
+    for binary in cerulion cerulion-netd cerulion-connectd; do
+        [ "$(readlink "$downgrade_home/.local/bin/$binary")" = "$downgrade_install/$binary" ] ||
+            die "self-test: the downgrade changed the $binary link"
+    done
+
+    # A TERM that arrives while the downgrade removes the cerulion-remoted link
+    # rolls the install back: the file and the link both come back. The rm
+    # stub signals the installer that ran it, which handles the TERM once the
+    # stub exits.
+    downgrade_term_home="$path_setup_root/downgrade-term-home"
+    downgrade_term_install="$path_setup_root/downgrade-term-install"
+    downgrade_term_bin="$path_setup_root/downgrade-term-bin"
+    mkdir -p "$downgrade_term_home" "$downgrade_term_install" "$downgrade_term_bin"
+    run_path_setup_install "$downgrade_term_home" "$downgrade_term_install" \
+        "$path_setup_root/downgrade-term-first-output" "$path_setup_root/downgrade-term-first-error" ||
+        die "self-test: the install before the interrupted downgrade failed"
+    downgrade_term_real_rm=$(command -v rm)
+    cat > "$downgrade_term_bin/rm" <<'EOF'
+#!/bin/sh
+for argument do
+    if [ "$argument" = "$CERULION_SELF_TEST_TERM_LINK" ]; then
+        kill -TERM "$PPID"
+    fi
+done
+exec "$CERULION_SELF_TEST_REAL_RM" "$@"
+EOF
+    chmod +x "$downgrade_term_bin/rm"
+    export CERULION_SELF_TEST_REAL_RM="$downgrade_term_real_rm"
+    export CERULION_SELF_TEST_TERM_LINK="$downgrade_term_home/.local/bin/cerulion-remoted"
+    downgrade_term_previous_path=$path_run_path
+    path_run_path="$downgrade_term_bin:$path_clean"
+    path_run_base_url="file://$legacy_fixture_dir"
+    if run_path_setup_install "$downgrade_term_home" "$downgrade_term_install" \
+        "$path_setup_root/downgrade-term-output" "$path_setup_root/downgrade-term-error"; then
+        die "self-test: the interrupted downgrade unexpectedly succeeded"
+    fi
+    path_run_base_url="file://$signal_fixture_dir"
+    path_run_path=$downgrade_term_previous_path
+    unset CERULION_SELF_TEST_REAL_RM CERULION_SELF_TEST_TERM_LINK
+    [ "$(cat "$downgrade_term_install/cerulion-remoted")" = "new-cerulion-remoted" ] ||
+        die "self-test: the interrupted downgrade did not restore cerulion-remoted"
+    [ "$(readlink "$downgrade_term_home/.local/bin/cerulion-remoted")" = "$downgrade_term_install/cerulion-remoted" ] ||
+        die "self-test: the interrupted downgrade did not restore the cerulion-remoted link"
+
     # A shell that already searches ~/.local/bin runs cerulion straight away,
     # and the installer says so in one line instead of naming the env file.
     onpath_home="$path_setup_root/onpath-home"
@@ -2795,14 +3032,187 @@ EOF
         [ ! -L "$guard_system/cerulion" ] ||
             die "self-test: the $guard_case case still linked into the system bin directory"
     done
+    # Nor when another account could change what the shared links run: a
+    # group- or world-writable directory on the way to the install directory,
+    # a world-writable sticky one included, or a group-writable system bin
+    # directory. The skip is a warning that names the directory.
+    unsafe_system="$path_setup_root/unsafe-system-bin"
+    mkdir -p "$unsafe_system"
+    chmod 0755 "$unsafe_system"
+    path_run_system=$unsafe_system
+    path_run_path="$unsafe_system:$path_clean"
+    for unsafe_case in group-parent world-sticky-parent group-install group-system; do
+        unsafe_home="$path_setup_root/unsafe-$unsafe_case-home"
+        unsafe_parent="$path_setup_root/unsafe-$unsafe_case-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        case "$unsafe_case" in
+            group-parent) unsafe_named=$unsafe_parent && chmod 0775 "$unsafe_parent" ;;
+            world-sticky-parent) unsafe_named=$unsafe_parent && chmod 1777 "$unsafe_parent" ;;
+            group-install) unsafe_named=$unsafe_install && chmod 0775 "$unsafe_install" ;;
+            group-system) unsafe_named=$unsafe_system && chmod 0775 "$unsafe_system" ;;
+        esac
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-$unsafe_case-output" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case install failed"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: the $unsafe_case case linked $path_program into the system bin directory"
+            fi
+            [ -L "$unsafe_home/.local/bin/$path_program" ] ||
+                die "self-test: the $unsafe_case case did not link $path_program into ~/.local/bin"
+        done
+        grep -Fq "warning: not linking the Cerulion programs into $unsafe_system: another account can change $unsafe_named" \
+            "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case case did not warn about $unsafe_named: $(cat "$path_setup_root/unsafe-$unsafe_case-error")"
+        grep -Fq "add $unsafe_home/.local/bin to PATH" "$path_setup_root/unsafe-$unsafe_case-error" ||
+            die "self-test: the $unsafe_case warning did not name the ~/.local/bin fix"
+        chmod 0755 "$unsafe_parent" "$unsafe_system"
+    done
+    # A program file another account can write is refused the same way. The
+    # arm calls the linking step directly on stub programs, so no install
+    # rewrites the file mode it sets.
+    (
+        file_home="$path_setup_root/unsafe-group-file-home"
+        file_install="$path_setup_root/unsafe-group-file-install"
+        mkdir -p "$file_home" "$file_install"
+        chmod 0755 "$file_install"
+        for path_program in $LINKED_PROGRAMS; do
+            printf '#!/bin/sh\n' > "$file_install/$path_program"
+            chmod 0755 "$file_install/$path_program"
+        done
+        chmod 0775 "$file_install/cerulion-netd"
+        HOME=$file_home PATH="$unsafe_system:$path_clean" \
+            CERULION_SYSTEM_BIN_DIR=$unsafe_system \
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root \
+            link_into_path_dirs "$file_install" \
+            >"$path_setup_root/unsafe-group-file-output" 2>"$path_setup_root/unsafe-group-file-error"
+        for path_program in $LINKED_PROGRAMS; do
+            if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+                die "self-test: a group-writable program let $path_program be linked into the system bin directory"
+            fi
+        done
+        grep -Fq "another account can change $(CDPATH='' cd -P -- "$file_install" && pwd)/cerulion-netd" \
+            "$path_setup_root/unsafe-group-file-error" ||
+            die "self-test: the group-writable program case did not warn: $(cat "$path_setup_root/unsafe-group-file-error")"
+    ) || exit 1
+    # Ownership: a directory another non-root account owns is refused. Only
+    # root can hand a directory to another account, so the arm runs as root.
+    if [ "$(id -u)" -eq 0 ]; then
+        unsafe_home="$path_setup_root/unsafe-owner-home"
+        unsafe_parent="$path_setup_root/unsafe-owner-parent"
+        unsafe_install="$unsafe_parent/install"
+        mkdir -p "$unsafe_home" "$unsafe_install"
+        chmod 0755 "$unsafe_parent" "$unsafe_install"
+        chown 65534 "$unsafe_parent"
+        run_path_setup_install "$unsafe_home" "$unsafe_install" \
+            "$path_setup_root/unsafe-owner-output" "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner install failed"
+        [ ! -L "$unsafe_system/cerulion" ] ||
+            die "self-test: an install under another account's directory was linked into the system bin directory"
+        grep -Fq "another account can change $unsafe_parent" \
+            "$path_setup_root/unsafe-owner-error" ||
+            die "self-test: the foreign-owner case did not warn"
+        chown 0 "$unsafe_parent"
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the foreign-owner system link arm because it needs root" >&2
+    fi
+    # The check itself: / and a 0755 tree are safe, 0775 and 1777 are not.
+    dir_safe_from_others / ||
+        die "self-test: / was reported writable by another account: $unsafe_dir"
+    (
+        CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+        unit_dir="$path_setup_root/unit/a/b"
+        mkdir -p "$unit_dir"
+        chmod 0755 "$path_setup_root/unit" "$path_setup_root/unit/a" "$unit_dir"
+        dir_safe_from_others "$unit_dir" ||
+            die "self-test: a 0755 tree was reported writable by another account: $unsafe_dir"
+        for unit_mode in 0775 0757 1777; do
+            chmod "$unit_mode" "$path_setup_root/unit/a"
+            if dir_safe_from_others "$unit_dir"; then
+                die "self-test: a mode $unit_mode parent was reported safe"
+            fi
+            [ "$unsafe_dir" = "$path_setup_root/unit/a" ] ||
+                die "self-test: the mode $unit_mode check named $unsafe_dir"
+        done
+        chmod 0755 "$path_setup_root/unit/a"
+    ) || exit 1
+    # A symlink on the way to the install directory is checked where it sits:
+    # one inside a group-writable directory is refused, though the directory
+    # it points at passes.
+    unsafe_home="$path_setup_root/unsafe-symlink-home"
+    unsafe_parent="$path_setup_root/unsafe-symlink-parent"
+    unsafe_real="$path_setup_root/unsafe-symlink-real"
+    mkdir -p "$unsafe_home" "$unsafe_parent" "$unsafe_real/install"
+    chmod 0755 "$unsafe_real" "$unsafe_real/install"
+    ln -s "$unsafe_real" "$unsafe_parent/link"
+    chmod 0775 "$unsafe_parent"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/unsafe-symlink-output" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the install through a symlink failed"
+    [ ! -L "$unsafe_system/cerulion" ] ||
+        die "self-test: an install through a symlink in a group-writable directory was linked into the system bin directory"
+    grep -Fq "another account can change $unsafe_parent" "$path_setup_root/unsafe-symlink-error" ||
+        die "self-test: the symlink case did not name its directory: $(cat "$path_setup_root/unsafe-symlink-error")"
+    chmod 0755 "$unsafe_parent"
+    # In a tree nobody else can change, the same install is linked, and the
+    # system links name the physical directory rather than the symlink.
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-output" "$path_setup_root/safe-symlink-error" ||
+        die "self-test: the install through a safe symlink failed"
+    unsafe_real_physical=$(CDPATH='' cd -P -- "$unsafe_real/install" && pwd)
+    for path_program in $LINKED_PROGRAMS; do
+        [ "$(readlink "$unsafe_system/$path_program")" = "$unsafe_real_physical/$path_program" ] ||
+            die "self-test: the $path_program system link through a safe symlink reads $(readlink "$unsafe_system/$path_program")"
+    done
+    # --uninstall through the symlink takes those links back, the one whose
+    # program is already gone included.
+    rm -f "$unsafe_real/install/cerulion-connectd"
+    run_path_setup_install "$unsafe_home" "$unsafe_parent/link/install" \
+        "$path_setup_root/safe-symlink-uninstall-output" "$path_setup_root/safe-symlink-uninstall-error" --uninstall ||
+        die "self-test: --uninstall through a safe symlink failed: $(cat "$path_setup_root/safe-symlink-uninstall-error")"
+    for path_program in $LINKED_PROGRAMS; do
+        if [ -e "$unsafe_system/$path_program" ] || [ -L "$unsafe_system/$path_program" ]; then
+            die "self-test: --uninstall through a symlink left the $path_program system link"
+        fi
+    done
+    # A macOS ACL entry that lets another account write is refused although
+    # the mode bits pass; the stock home entry (everyone deny delete) is not.
+    acl_dir="$path_setup_root/unit-acl"
+    mkdir -p "$acl_dir"
+    chmod 0755 "$acl_dir"
+    if chmod +a "everyone deny delete" "$acl_dir" 2>/dev/null; then
+        # The entries come off before a failure exits: the deny entry would
+        # stop the scratch tree's removal.
+        acl_status=0
+        (
+            CERULION_SELF_TEST_REACH_ROOT=$path_setup_root
+            dir_safe_from_others "$acl_dir" ||
+                die "self-test: a deny-only ACL was reported writable by another account"
+            chmod +a "everyone allow add_file,delete_child" "$acl_dir" ||
+                die "self-test: could not add an allow ACL entry"
+            if dir_safe_from_others "$acl_dir"; then
+                die "self-test: an ACL that lets everyone add files was reported safe"
+            fi
+        ) || acl_status=1
+        chmod -N "$acl_dir"
+        [ "$acl_status" -eq 0 ] || exit 1
+    else
+        printf '%s\n' \
+            "install.sh self-test: skipping the macOS ACL arm because chmod +a is unavailable" >&2
+    fi
     path_run_system="$path_setup_root/system-bin"
+    chmod 0755 "$path_run_system"
+    system_install_physical=$(CDPATH='' cd -P -- "$system_install" && pwd)
     path_run_path="$path_run_system:$path_clean"
     path_run_shell=/usr/bin/fish
     run_path_setup_install "$system_home" "$system_install" \
         "$path_setup_root/system-output" "$path_setup_root/system-error" ||
         die "self-test: the install with a writable system bin directory failed"
     for path_program in $LINKED_PROGRAMS; do
-        [ "$(readlink "$path_run_system/$path_program")" = "$system_install/$path_program" ] ||
+        [ "$(readlink "$path_run_system/$path_program")" = "$system_install_physical/$path_program" ] ||
             die "self-test: a writable system bin directory on PATH did not get the $path_program link"
         [ -L "$system_home/.local/bin/$path_program" ] ||
             die "self-test: the system bin links replaced the ~/.local/bin ones"
@@ -2816,7 +3226,7 @@ EOF
     run_path_setup_install "$fish_home" "$fish_install" \
         "$path_setup_root/fish-output" "$path_setup_root/fish-error" ||
         die "self-test: the install under fish failed"
-    [ "$(readlink "$path_run_system/cerulion")" = "$system_install/cerulion" ] ||
+    [ "$(readlink "$path_run_system/cerulion")" = "$system_install_physical/cerulion" ] ||
         die "self-test: a system bin directory off this PATH was linked"
     if grep -Fq "$path_run_system" "$path_setup_root/fish-error"; then
         die "self-test: an install with the system bin directory off PATH tried to link there"
@@ -2878,6 +3288,7 @@ EOF
     [ ! -L "$path_run_system/cerulion" ] ||
         die "self-test: --uninstall left the system bin link"
     path_run_system="$path_setup_root/no-system-bin"
+    umask "$self_test_umask"
     unmarked_home="$path_setup_root/unmarked-home"
     unmarked_install="$path_setup_root/unmarked-install"
     mkdir -p "$unmarked_home/.cerulion" "$unmarked_install"
@@ -3215,6 +3626,12 @@ for binary in $archive_files; do
     [ -f "$archive_dir/$binary" ] ||
         die "archive is missing $binary"
 done
+# cerulion-remoted, the robot-side remote-access daemon, is installed beside
+# the other programs. It is taken when the archive carries it rather than
+# required, so releases that predate it still install.
+if [ -f "$archive_dir/cerulion-remoted" ]; then
+    archive_files="$archive_files cerulion-remoted"
+fi
 # The ROS 2 Jazzy rmw and the heap hook ship in the Linux archives and are
 # installed beside the CLI, where `cerulion ros2 run` looks for both. Each is
 # taken when the archive carries it rather than required, so releases that
@@ -3423,6 +3840,25 @@ cleanup_install() {
             fi
         done
     fi
+    # A link removed for a program this install took out is put back once the
+    # rollback above restored that program, unless the name is taken again.
+    if [ "$status" -ne 0 ] && [ -n "$removed_own_links" ]; then
+        restore_old_ifs=$IFS
+        IFS='
+'
+        set -f
+        for restore_link in $removed_own_links; do
+            restore_target="$install_dir_absolute/${restore_link##*/}"
+            if [ -e "$restore_target" ] && [ ! -e "$restore_link" ] && [ ! -L "$restore_link" ]; then
+                if ! ln -s "$restore_target" "$restore_link"; then
+                    rollback_failed=1
+                    not_restored="$not_restored $restore_link"
+                fi
+            fi
+        done
+        set +f
+        IFS=$restore_old_ifs
+    fi
     # A signal between the marker's temporary file and its move leaves that
     # file beside the binaries; it belongs to this transaction.
     if [ "$status" -ne 0 ] && [ -n "$marker_tmp" ] && [ -f "$marker_tmp" ] && [ ! -L "$marker_tmp" ]; then
@@ -3490,6 +3926,25 @@ for binary in $archive_files; do
         die "installation destination is a non-regular, non-symlink file ($(destination_type "$install_dir/$binary")): $install_dir/$binary"
     fi
 done
+# An archive without cerulion-remoted removes the one a later release left in
+# the install directory, so the directory holds the programs of one release.
+# The removal is backed up and recorded like an activation, so a failed
+# install puts the file back.
+case " $archive_files " in
+    *" cerulion-remoted "*) ;;
+    *)
+        if [ -L "$install_dir/cerulion-remoted" ] || [ -f "$install_dir/cerulion-remoted" ]; then
+            run_foreground cp -pP "$install_dir/cerulion-remoted" \
+                "$transaction_dir/backup/cerulion-remoted" ||
+                die "could not back up installation destination: $install_dir/cerulion-remoted"
+            replaced_binaries="$replaced_binaries cerulion-remoted"
+            lock_claim_is_current ||
+                die "could not remove cerulion-remoted: installer lock changed"
+            rm -f "$install_dir/cerulion-remoted" ||
+                die "could not remove $install_dir/cerulion-remoted, which this release does not carry"
+        fi
+        ;;
+esac
 # Recorded BEFORE the move: a signal caught in the gap after a completed move
 # would otherwise leave that binary new and its siblings behind. Rolling back a
 # move that never happened is a no-op.
