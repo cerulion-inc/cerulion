@@ -960,6 +960,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             __cer_inline_safe_of(&self.inner)
         }
 
+        // The probe asks one question: is a lock in the captured state held
+        // right now? `false` skips the WHOLE anchor (no node is captured or
+        // restored from it), never this node alone. The accumulate buffers and
+        // the log-site table that `capture_state` appends hold no lock (the
+        // table is atomics only), so they can never answer `false`, and the
+        // user's fields are the only part that needs probing.
         fn cer_probe(&self) -> bool {
             ::cerulion_core::state::CerulionState::cer_probe(&self.inner)
         }
