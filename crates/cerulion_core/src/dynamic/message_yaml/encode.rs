@@ -43,7 +43,7 @@ pub struct YamlEncodeOptions {
 ///   truncated or malformed bytes).
 /// - [`DynamicError::YamlUnencodable`]: a value has no YAML form (a string
 ///   field that is not UTF-8, an array that is not in the canonical element
-///   framing, a `bool[]` byte that is neither 0 nor 1).
+///   framing, a `bool` or `bool[]` byte that is neither 0 nor 1).
 /// - [`DynamicError::YamlUnsupportedField`]: the schema has a field type the
 ///   YAML form does not cover (an array of arrays, an array of
 ///   `string_fixed[n]` outside a fixed array).
@@ -79,7 +79,7 @@ pub(super) fn message_to_yaml_capped(
     max_bytes: usize,
 ) -> Result<String, DynamicError> {
     let keep = options.truncate_arrays.unwrap_or(usize::MAX);
-    let value = walker.walk_by_hash_keeping(frame, keep)?;
+    let value = walker.walk_by_hash_keeping_raw_bools(frame, keep)?;
     // The walk read a whole header, so `frame` holds one. The hash picks the
     // schema the walk decoded with: a twin can own `value.schema_name`.
     let schema = WireHeader::read_from_buf(frame)
@@ -454,6 +454,11 @@ impl<'w> Emitter<'w> {
         type K<'a> = FrameValueKind<'a>;
         Ok(match (ft, kind) {
             (FieldType::Bool, K::Bool(v)) => v.to_string(),
+            // The walk keeps a bool byte past 1 as its byte: `true` would
+            // read back as 1, so the frame has no YAML form (as in `bool[]`).
+            (FieldType::Bool, K::U8(b)) => {
+                return Err(self.unencodable(format!("bool byte {b} is neither 0 nor 1")))
+            }
             (FieldType::I8, K::I8(v)) => v.to_string(),
             (FieldType::U8, K::U8(v)) => v.to_string(),
             (FieldType::I16, K::I16(v)) => v.to_string(),

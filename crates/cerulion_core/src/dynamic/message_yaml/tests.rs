@@ -11,7 +11,8 @@ use super::encode::{format_f32, format_f64, key, message_to_yaml_capped, quote};
 use super::scan::find_anchor_or_alias;
 use super::*;
 use crate::codegen::{
-    parse_rosmsg, CdrCodec, CdrEndianness, FieldDef, FieldType, FrameWalker, MessageSchema,
+    parse_rosmsg, CdrCodec, CdrEndianness, FieldDef, FieldType, FrameValueKind, FrameWalker,
+    MessageSchema,
 };
 use crate::dynamic::DynamicError;
 use crate::dynamic::SchemaSet;
@@ -1817,6 +1818,33 @@ fn frames_without_a_yaml_form_are_refused_by_field() {
         err(&shapes, &bad_bool),
         "more: bool byte 2 is neither 0 nor 1; the frame has no YAML form"
     );
+
+    // A scalar bool byte past 1 too, at the root and in a fixed nested
+    // message: `true` would read back as 1. Other walks still read it as
+    // true.
+    let flags = set_from_yaml(
+        "schemas:\n  Flag:\n    fields:\n      bool b: {}\n  Holder:\n    fields:\n      bool on: {}\n      Flag inner: {}\n",
+    );
+    let holder = |on: u8, b: u8| {
+        let mut f = header(flags.schema_hash("Holder").unwrap(), 34, 34, 0);
+        f.extend_from_slice(&[on, b]);
+        f
+    };
+    assert_eq!(
+        err(&flags, &holder(2, 0)),
+        "on: bool byte 2 is neither 0 nor 1; the frame has no YAML form"
+    );
+    assert_eq!(
+        err(&flags, &holder(1, 7)),
+        "inner.b: bool byte 7 is neither 0 nor 1; the frame has no YAML form"
+    );
+    assert_eq!(
+        message_to_yaml(flags.walker(), &holder(1, 0)).unwrap(),
+        "on: true\ninner:\n  b: false\n"
+    );
+    let two = holder(2, 0);
+    let walked = flags.walker().walk_by_hash(&two).unwrap();
+    assert_eq!(walked.field("on"), Some(&FrameValueKind::Bool(true)));
 
     let names = set_from_yaml("schemas:\n  Names:\n    fields:\n      string[] n: {}\n");
     let mut opaque = header(names.schema_hash("Names").unwrap(), 44, 32, 1);

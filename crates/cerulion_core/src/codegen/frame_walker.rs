@@ -793,6 +793,23 @@ impl FrameWalker {
         self.walk_by_hash_reach(frame, Reach::keeping(keep))
     }
 
+    /// [`walk_by_hash_keeping`](Self::walk_by_hash_keeping) that keeps a
+    /// scalar `bool` byte other than 0 or 1 as [`FrameValueKind::U8`] with
+    /// that byte, not as `Bool(true)`. The YAML writer refuses such a frame
+    /// (`true` would read back as 1, so the frame has no YAML form); every
+    /// other caller reads any nonzero byte as true.
+    pub(crate) fn walk_by_hash_keeping_raw_bools<'a>(
+        &self,
+        frame: &'a [u8],
+        keep: usize,
+    ) -> Result<FrameValue<'a>, WalkError> {
+        let reach = Reach {
+            raw_bools: true,
+            ..Reach::keeping(keep)
+        };
+        self.walk_by_hash_reach(frame, reach)
+    }
+
     fn walk_by_hash_reach<'a>(
         &self,
         frame: &'a [u8],
@@ -989,6 +1006,7 @@ impl FrameWalker {
         reach: Reach,
     ) -> Result<FrameValueKind<'a>, WalkError> {
         Ok(match ft {
+            FieldType::Bool if reach.raw_bools && bytes[0] > 1 => FrameValueKind::U8(bytes[0]),
             FieldType::Bool => FrameValueKind::Bool(bytes[0] != 0),
             FieldType::I8 => FrameValueKind::I8(bytes[0] as i8),
             FieldType::U8 => FrameValueKind::U8(bytes[0]),
@@ -1591,6 +1609,9 @@ struct Reach {
     keep: usize,
     keep_zero_size: usize,
     nest: u32,
+    /// Keep a scalar `bool` byte past 1 as `U8` (see
+    /// [`FrameWalker::walk_by_hash_keeping_raw_bools`]).
+    raw_bools: bool,
 }
 
 impl Reach {
@@ -1599,6 +1620,7 @@ impl Reach {
         keep: usize::MAX,
         keep_zero_size: usize::MAX,
         nest: 0,
+        raw_bools: false,
     };
 
     /// What [`FrameWalker::walk_keeping`] holds.
@@ -1607,6 +1629,7 @@ impl Reach {
             keep,
             keep_zero_size: 0,
             nest: 0,
+            raw_bools: false,
         }
     }
 

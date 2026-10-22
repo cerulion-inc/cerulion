@@ -104,12 +104,15 @@ fn dylib_file(name: &str) -> String {
     }
 }
 
-/// The prebuilt fixture cdylib (`test_node_macro_period_cdylib` — a
-/// `#[cerulion_node(period_ms = 50)]` node with one `cmd: Vector3` output).
-/// PANICS with the build instruction if missing (the repo's fixture pattern).
-fn fixture_cdylib() -> PathBuf {
-    cerulion_core::testing::find_fixture_cdylib("test_node_macro_period_cdylib")
-}
+/// The ticker fixture (a `#[cerulion_node(period_ms = 50)]` node with one
+/// `cmd: Vector3` output): publishes an all-zero `Vector3` every 50 ms. Its
+/// prebuilt cdylib is found with `find_fixture_cdylib`, which PANICS with the
+/// build instruction if it is missing (the repo's fixture pattern).
+const PERIOD_FIXTURE: &str = "test_node_macro_period_cdylib";
+
+/// Its twin with the same ports and schedule, publishing `x = 1000.0`: a
+/// nonzero payload for tests that must see the published values.
+const PERTURBED_FIXTURE: &str = "test_node_macro_period_perturbed_cdylib";
 
 /// Hand-build a minimal single-node graph workspace in `root`: `Cargo.toml` +
 /// `graphs/demo.yaml` (one `ticker` period node producing
@@ -119,6 +122,11 @@ fn fixture_cdylib() -> PathBuf {
 /// `graph_record_e2e_test.rs`'s `build_workspace`, minus the recording bits
 /// this file doesn't need.
 fn build_workspace(root: &Path, prefix: &str) {
+    build_workspace_with(root, prefix, PERIOD_FIXTURE);
+}
+
+/// [`build_workspace`] with the ticker built from the `fixture` crate.
+fn build_workspace_with(root: &Path, prefix: &str, fixture: &str) {
     std::fs::create_dir_all(root.join("graphs")).unwrap();
     std::fs::create_dir_all(root.join("nodes/ticker/src")).unwrap();
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
@@ -138,10 +146,12 @@ fn build_workspace(root: &Path, prefix: &str) {
     let fixture_src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("test_fixtures/test_node_macro_period_cdylib/src/lib.rs");
+        .join("test_fixtures")
+        .join(fixture)
+        .join("src/lib.rs");
     std::fs::copy(&fixture_src, root.join("nodes/ticker/src/lib.rs")).expect("copy fixture src");
     std::fs::copy(
-        fixture_cdylib(),
+        cerulion_core::testing::find_fixture_cdylib(fixture),
         root.join("target/debug").join(dylib_file("ticker")),
     )
     .expect("copy fixture cdylib");
@@ -474,7 +484,8 @@ fn topic_echo_subcommand_e2e_displays_delivered_frames() {
 /// `cerulion topic echo` prints for the ticker's `geometry_msgs/Vector3`
 /// output is the hand-written YAML below, it parses as YAML, and the codec
 /// reads message YAML with decodes it back into the frame the node publishes
-/// (every field zero), byte for byte.
+/// (`x = 1000.0`, so an echo that ignored the payload would fail), byte for
+/// byte.
 #[test]
 #[serial]
 fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
@@ -484,7 +495,7 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
 
     let tmp = tempfile::tempdir().unwrap();
     let prefix = "topicintroy";
-    build_workspace(tmp.path(), prefix);
+    build_workspace_with(tmp.path(), prefix, PERTURBED_FIXTURE);
     let (mut guard, stderr_path) = spawn_graph_run(tmp.path());
     wait_for_log_line(
         &stderr_path,
@@ -514,7 +525,7 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
         .collect();
     let body = block.join("\n") + "\n";
     assert_eq!(
-        body, "# geometry_msgs/Vector3\nx: 0.0\ny: 0.0\nz: 0.0\n",
+        body, "# geometry_msgs/Vector3\nx: 1000.0\ny: 0.0\nz: 0.0\n",
         "one echoed frame block; full stdout:\n{echo_log}"
     );
     serde_yaml::from_str::<serde_yaml::Value>(&body).expect("an echoed block is YAML");
@@ -536,7 +547,10 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
     let mut oracle = Vector3::SCHEMA_HASH.to_le_bytes().to_vec();
     // total_size 56, offset table at 32 + 24, no variable fields, seq 0, ts 0.
     oracle.extend_from_slice(&[56, 0, 0, 0, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    oracle.extend_from_slice(&[0u8; 8 + 24]);
+    oracle.extend_from_slice(&[0u8; 8]);
+    // The fixed section: x = 1000.0 (0x408F400000000000), then y and z zero.
+    oracle.extend_from_slice(&[0, 0, 0, 0, 0, 0x40, 0x8F, 0x40]);
+    oracle.extend_from_slice(&[0u8; 16]);
     assert_eq!(frame, oracle);
 
     send_signal(guard.0.id(), libc::SIGINT);
