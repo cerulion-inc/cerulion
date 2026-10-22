@@ -22,5 +22,9 @@ cerulion_core = { path = "../../cerulion_core" }
 [build-dependencies]
 cerulion_core = { path = "../../cerulion_core" }
 
+# The build-script-generated code in OUT_DIR, which `src/lib.rs` includes, names `::cerulion_core` paths; machete reads only the sources.
+[package.metadata.cargo-machete]
+ignored = ["cerulion_core"]
+
 [lints]
 workspace = true
