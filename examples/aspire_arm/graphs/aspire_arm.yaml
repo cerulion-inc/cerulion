@@ -1,0 +1,19 @@
+# One simulated arm driven over the Robot Context Protocol.
+#
+# `cerulion-rcpd` (outside the graph) publishes each agent tool call on the
+# absolute topic /rcp/calls; arm_sim answers on /rcp/results and publishes its
+# state on /arm/state.
+prefix: aspire_arm
+nodes:
+  - id: arm_sim
+    type: arm_sim
+    inputs:
+      - name: calls
+        source: /rcp/calls
+    outputs:
+      - name: results
+        schema: std_msgs/String
+        topic: /rcp/results
+      - name: state
+        schema: std_msgs/String
+        topic: /arm/state

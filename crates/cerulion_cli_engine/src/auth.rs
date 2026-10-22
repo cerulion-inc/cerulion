@@ -37,7 +37,7 @@
 //! ## Config-dir isolation
 //!
 //! The cerulion dir resolves from `CERULION_HOME` (used verbatim as the config
-//! dir) when set, else `dirs::home_dir()/.cerulion`. Tests and CI jobs seed a
+//! dir) when set, else `~/.cerulion` ([`cerulion_config_dir`]). Tests and CI jobs seed a
 //! valid [`AuthState`] into an isolated `CERULION_HOME` via [`seed_logged_in_at`]
 //! (or `tools/ci/seed_test_login.sh` for a shell harness) so the gate reads
 //! provisioned state rather than a real login. That is the sanctioned shape and
