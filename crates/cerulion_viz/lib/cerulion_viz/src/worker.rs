@@ -338,7 +338,7 @@ enum VizMsg {
     /// no network yet), rebuilds the walker and hands it down this channel. In
     /// FIFO order with `Batch`, so frames enqueued after the swap decode against
     /// the new walker and frames before it against the old — deterministic. The
-    /// `FrameWalker` is two `BTreeMap`s (~48 bytes), so the enum stays small.
+    /// `FrameWalker` is two `BTreeMap`s and a `Box` (~56 bytes), so the enum stays small.
     SwapWalker(FrameWalker),
     /// Runtime layout: apply a client-driven blueprint (the
     /// `set_blueprint` verb). Handled ON the worker — the ONE thread that owns

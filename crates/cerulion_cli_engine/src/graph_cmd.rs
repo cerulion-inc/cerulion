@@ -738,6 +738,23 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
 }
 
+/// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
+///
+/// This uses the same environment overrides and target capabilities as `graph run`.
+pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
+    let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
+    let env_doorbell = std::env::var(DOORBELL_ENV).ok();
+    resolve_monitor_wait_policy(MonitorWaitInputs {
+        mode: MonitorWaitMode::Auto,
+        env_monitor_wait: env_monitor_wait.as_deref(),
+        env_doorbell: env_doorbell.as_deref(),
+        is_live: true,
+        primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
+        ns: cerulion_core::doorbell::default_namespace(),
+    })
+}
+
 /// Build a (schema name → recipe-3 `schema_hash`) map from every
 /// `*.yaml` in the workspace `schemas/` directory PLUS every workspace
 /// `.msg` store schema (`schemas/<pkg>/msg/<Type>.msg`, read via the shared
@@ -3611,6 +3628,20 @@ impl NetworkEnvKill {
     pub fn is_off(&self) -> bool {
         !matches!(self, NetworkEnvKill::Unset)
     }
+
+    /// How a refusal names this setting: `CERULION_NETWORK=off`, or the
+    /// unrecognized value that failed closed, trimmed and terminal-sanitized.
+    /// `None` when the variable is unset.
+    pub fn refusal_label(&self) -> Option<String> {
+        match self {
+            NetworkEnvKill::Unset => None,
+            NetworkEnvKill::Off => Some(format!("{NETWORK_ENV}=off")),
+            NetworkEnvKill::Unrecognized(value) => Some(format!(
+                "{NETWORK_ENV}={} (an unrecognized value, which fails closed to local-only)",
+                crate::topic_cmd::sanitize_display(value.trim())
+            )),
+        }
+    }
 }
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
@@ -3621,8 +3652,14 @@ impl NetworkEnvKill {
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
 pub fn network_env_kill() -> NetworkEnvKill {
-    match std::env::var(NETWORK_ENV) {
-        Ok(v) => {
+    network_env_kill_from(std::env::var(NETWORK_ENV).ok())
+}
+
+/// The pure half of [`network_env_kill`]: classify one `CERULION_NETWORK` value
+/// (`None` = the variable is not set).
+pub fn network_env_kill_from(value: Option<String>) -> NetworkEnvKill {
+    match value {
+        Some(v) => {
             let trimmed = v.trim();
             if trimmed.is_empty() {
                 NetworkEnvKill::Unset
@@ -3632,22 +3669,95 @@ pub fn network_env_kill() -> NetworkEnvKill {
                 NetworkEnvKill::Unrecognized(v)
             }
         }
-        Err(_) => NetworkEnvKill::Unset,
+        None => NetworkEnvKill::Unset,
     }
 }
 
-/// Is the REMOTE network tier suppressed by the
-/// `CERULION_NETWORK` kill-switch, for the discovery-side callers that carry no
-/// `GraphConfig` — `schema info`'s remote fetch and `topic echo`'s remote
-/// decode-seed? Uses the SAME parse as [`resolve_run_network`]
-/// ([`network_env_kill`], the ONE env-parse). Emits the fail-closed warn on an
-/// unrecognized value; returns `true` iff the tier must stay LOCAL-ONLY. The
+/// The `cerulion-netd` daemon's own kill switch. The query verbs read it beside
+/// `CERULION_NETWORK` ([`query_network_kill`]), so with it engaged they neither
+/// query netd nor open their own discovery session.
+pub const NETD_NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
+
+/// The kill-switch state the query verbs (`topic list`, `topic echo`,
+/// `topic hz`, `topic info`, `schema info`) act on: `CERULION_NETWORK` under the
+/// [`network_env_kill`] parse, plus [`NETD_NETWORK_ENV`] under netd's own
+/// byte-exact parse (only exactly `off` engages it). Either one engaged makes
+/// the query LOCAL-ONLY. Runs (`graph run`, `node run`, `ros2 attach`) read
+/// `CERULION_NETWORK` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryNetworkKill {
+    /// The `CERULION_NETWORK` decision.
+    pub network: NetworkEnvKill,
+    /// `CERULION_NETD_NETWORK` is exactly `off`.
+    pub netd_off: bool,
+}
+
+impl QueryNetworkKill {
+    /// No switch engaged.
+    pub const UNSET: Self = Self {
+        network: NetworkEnvKill::Unset,
+        netd_off: false,
+    };
+
+    /// True when either switch is engaged: the query must stay LOCAL-ONLY.
+    pub fn is_off(&self) -> bool {
+        self.network.is_off() || self.netd_off
+    }
+
+    /// Both switches are engaged.
+    pub fn both_engaged(&self) -> bool {
+        self.network.is_off() && self.netd_off
+    }
+
+    /// The `unset ...` remedy naming every engaged variable. With only
+    /// `CERULION_NETD_NETWORK` engaged it names that one; otherwise it names
+    /// `CERULION_NETWORK`, plus `CERULION_NETD_NETWORK` when both are engaged.
+    pub fn unset_remedy(&self) -> &'static str {
+        match (self.network.is_off(), self.netd_off) {
+            (false, true) => "unset CERULION_NETD_NETWORK",
+            (true, true) => "unset CERULION_NETWORK and CERULION_NETD_NETWORK",
+            _ => "unset CERULION_NETWORK",
+        }
+    }
+}
+
+/// Classify one `CERULION_NETD_NETWORK` value the way `cerulion-netd` does:
+/// only the exact value `off` engages it (`None` = not set).
+pub fn netd_network_off_from(value: Option<&str>) -> bool {
+    value == Some("off")
+}
+
+/// Read both query-side kill switches from the environment ONCE. Pure over the
+/// environment; it emits no log.
+pub fn query_network_kill() -> QueryNetworkKill {
+    query_network_kill_from(
+        std::env::var(NETWORK_ENV).ok(),
+        std::env::var(NETD_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+/// The pure half of [`query_network_kill`].
+pub fn query_network_kill_from(network: Option<String>, netd: Option<&str>) -> QueryNetworkKill {
+    QueryNetworkKill {
+        network: network_env_kill_from(network),
+        netd_off: netd_network_off_from(netd),
+    }
+}
+
+/// Is the REMOTE network tier suppressed by a query-side kill switch
+/// ([`query_network_kill`]: `CERULION_NETWORK`, or `CERULION_NETD_NETWORK=off`),
+/// for the discovery-side callers that carry no `GraphConfig`: `topic list`,
+/// `schema info`'s remote fetch, and the `topic echo`/`hz`/`info` remote tiers?
+/// `CERULION_NETWORK` goes through the SAME parse as [`resolve_run_network`]
+/// ([`network_env_kill_from`]). Emits the fail-closed warn on an unrecognized
+/// `CERULION_NETWORK` value; returns `true` iff the tier must stay LOCAL-ONLY. The
 /// caller MUST consult this BEFORE opening any discovery session so a
 /// kill-switched run never touches the network (the LOCAL-ONLY
 /// contract).
 pub fn remote_network_suppressed() -> bool {
-    match network_env_kill() {
-        NetworkEnvKill::Unset => false,
+    let kill = query_network_kill();
+    match kill.network {
+        NetworkEnvKill::Unset => kill.netd_off,
         NetworkEnvKill::Off => true,
         NetworkEnvKill::Unrecognized(v) => {
             tracing::warn!(
@@ -3684,6 +3794,26 @@ pub const GATEWAY_BIND_RETRIES: u16 = 8;
 /// so tests pin the exact text.
 pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
 
+fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+    match access {
+        Some(cerulion_core::LanAccess::Open) => {
+            tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        }
+        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+            graph = %graph_name,
+            lan_access = "paired",
+            "LAN access is paired-only: the gateway refuses every LAN peer"
+        ),
+        // netd predates the posture field: report unknown rather than
+        // assuming an open posture it may not have.
+        None => tracing::warn!(
+            graph = %graph_name,
+            lan_access = "unknown",
+            "permissive egress: netd did not report a LAN-access posture (unknown -              older daemon without the field); see `cerulion netd status`"
+        ),
+    }
+}
+
 /// The resolved network decision for a `graph run` — the single
 /// output of [`resolve_run_network`]. There is no
 /// `Option<NetworkConfig>` funnel and no multi-process network rejection.
@@ -3709,9 +3839,10 @@ pub enum RunNetwork {
     /// (verbatim — the user's config is truth).
     Strict(cerulion_core::NetworkConfig),
     /// No (or disabled) `network:` block under the real clock ⇒ run the
-    /// gateway PERMISSIVE: every produced topic is announced + egressable
-    /// (to any LAN peer, no pairing required). Carries the SYNTHESIZED permissive
-    /// `NetworkConfig` (peer mode, scouting ON, no connect endpoints, listen
+    /// gateway PERMISSIVE: every produced topic is egressable, and its announce
+    /// token is declared when LAN access is open. Carries the SYNTHESIZED permissive
+    /// `NetworkConfig` (peer mode, gossip on, multicast scouting per
+    /// `CERULION_MULTICAST_SCOUTING`, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
     /// construction.
     Permissive(cerulion_core::NetworkConfig),
@@ -3867,8 +3998,10 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// The SYNTHESIZED permissive-default `NetworkConfig` — peer mode,
-/// multicast + gossip scouting ON (unpaired robots are LAN-discoverable), NO
+/// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
+/// scouting on, multicast scouting from
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
+/// the gateway's `_cerulion._tcp` mDNS beacon is how peers find it), NO
 /// connect endpoints, listening on the well-known gateway port
 /// ([`GATEWAY_WELL_KNOWN_PORT`], overridable via [`GATEWAY_PORT_ENV`]). The
 /// gateway process bind-probes upward from this base on AddrInUse.
@@ -3878,7 +4011,7 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         mode: cerulion_core::ZenohMode::Peer,
         connect_endpoints: Vec::new(),
         listen_endpoints: vec![format!("tcp/[::]:{port}")],
-        multicast_scouting: true,
+        multicast_scouting: cerulion_core::transport::network::multicast_scouting_from_env(),
         gossip_scouting: true,
         // A gateway keeps zenoh's robust default connect retry (bounded
         // connect is only for the ephemeral `topic list` discovery session).
@@ -4372,8 +4505,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and — for a permissive run — fires the one-shot
-/// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and for a permissive run reports the LAN posture
+/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4440,9 +4573,10 @@ fn spawn_gateway(
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
     // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker.
+    // spawn site, never in a worker. A paired LAN access posture (the gateway child
+    // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
@@ -4701,7 +4835,27 @@ fn register_egress_with_netd(
     ix_config_json: Option<&str>,
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
+    // Check netd's posture BEFORE registering: a registration's topics and
+    // schemas stay served on the shared gateway after release, so refusing an
+    // open netd after registering would not close the LAN access. A paired run
+    // rides only a netd that reports paired; otherwise dropping the client
+    // registers nothing and the caller falls back to a per-run gateway child,
+    // which enforces this run's own posture.
+    let requested = cerulion_core::LanAccess::from_env();
+    if requested == cerulion_core::LanAccess::Paired {
+        let reported = client.lan_access()?;
+        if !netd_posture_acceptable(reported, requested) {
+            drop(client);
+            return Err(netd_posture_refusal(reported));
+        }
+    }
     let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
+    // The register response reports the posture too, so the check never
+    // rests on the probe alone.
+    if !netd_posture_acceptable(resp.lan_access, requested) {
+        drop(client);
+        return Err(netd_posture_refusal(resp.lan_access));
+    }
     tracing::info!(
         graph = %graph_name,
         registered_topics = resp.registered_topics,
@@ -4709,10 +4863,10 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run — parity with the child-spawn path
-    // (`spawn_gateway`), so a permissive desk still gets the exposure notice.
+    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // Missing posture is UNKNOWN (an older daemon) - never assume open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, resp.lan_access);
     }
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
@@ -4721,6 +4875,35 @@ fn register_egress_with_netd(
     // NO reconnect: recovery is not this watch's job.
     let watch = spawn_netd_liveness_watch(client.control_fd(), graph_name.to_string());
     Ok(NetdEgressGuard { watch, client })
+}
+
+/// The error that sends a paired run to its own gateway because netd
+/// `reported` a posture other than paired.
+#[cfg(unix)]
+fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_netd::ClientError {
+    let reported = match reported {
+        Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+        Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+        None => "did not report its LAN access posture (an older daemon)",
+    };
+    cerulion_netd::ClientError::Protocol(format!(
+        "cerulion-netd {reported} and this run requires paired access, so the run uses its \
+         own gateway; restart cerulion-netd with paired access to share its session"
+    ))
+}
+
+/// Whether a run that requires `requested` LAN access may ride a netd
+/// that reported `reported`. A paired run rides only a netd that reports
+/// paired: one that reports open serves its LAN openly, and one that
+/// reports no posture (an older daemon) may. An open run accepts any netd,
+/// because a paired netd is only stricter.
+#[cfg(unix)]
+fn netd_posture_acceptable(
+    reported: Option<cerulion_core::LanAccess>,
+    requested: cerulion_core::LanAccess,
+) -> bool {
+    requested == cerulion_core::LanAccess::Open
+        || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
 /// Establish the network-egress overlay for a real-clock live run. `None`
@@ -4887,8 +5070,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     let mut booted: Option<cerulion_core::GatewayRuntime> = None;
     // The ACTUAL bound listen port of the successful attempt — the
     // mDNS SRV port. Permissive: the ladder value we set below. Strict:
-    // parsed from the verbatim config listen list (`None` ⇒ no tcp/ port, the
-    // mDNS discovery beacon is skipped with a loud warn).
+    // parsed from the verbatim config listen list (`None` ⇒ no usable nonzero
+    // first TCP listen port, the mDNS discovery beacon is skipped with a loud warn).
     let mut resolved_port: Option<u16> = None;
     for attempt in 0..attempts {
         let mut net = base_net.clone();
@@ -4996,12 +5179,12 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             }
         }
         None => {
-            // Strict-with-no-parseable-port: skip the mDNS beacon loudly (never
-            // crash). Permissive always resolves a port, so this is strict-only.
+            // Strict-with-no-usable-first-TCP-port: skip the mDNS beacon loudly
+            // (never crash). Permissive always resolves a port, so this is strict-only.
             tracing::warn!(
                 graph = %graph_name,
                 listen = %base_net.listen_endpoints.join(","),
-                "gateway listen endpoints carry no parseable tcp/ port — the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
+                "gateway listen endpoints provide no usable nonzero TCP listen port; the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
             );
             None
         }
@@ -10289,7 +10472,7 @@ fn graph_run_supervisor(
     #[cfg(unix)]
     let recorded_topics: Option<Vec<cerulion_bagd::RecordedTopic>> = match record_entry_infos {
         Some(infos) => {
-            let recorded = resolve_recorded_topics(workspace_root, &config, infos)?;
+            let recorded = resolve_recorded_topics(workspace_root, &config, infos, None)?;
             if recorded.is_empty() {
                 return Err(CliError::Validation(format!(
                     "`graph run --record`: graph '{}' has no graph-owned (in-graph-producer) \
@@ -20412,7 +20595,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         entry_infos.insert(id.clone(), entry.info()?);
     }
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
-    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos)?;
+    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
         return Err(CliError::Validation(format!(
             "`graph run --record`: graph '{graph_name}' has no graph-owned (in-graph-producer) \
@@ -21174,7 +21357,7 @@ fn resolve_recorded_wire_size(
 ///   `OutputMeta::wire_fixed_size` (`<T as ShmMessage>::WIRE_FIXED_SIZE`,
 ///   the layout the node's Rust type really writes), with the workspace
 ///   `schemas/` set as the CROSS-CHECK and the fallback. See
-///   [`resolve_recorded_wire_size`] for the arms; this moved off
+///   `resolve_recorded_wire_size` for the arms; this moved off
 ///   the file for the same reason the HASH lives on the node:
 ///   a file that describes a different layout mislabels every frame on the
 ///   channel. `0` when neither source can size the port (e.g. a ROS2
@@ -21201,27 +21384,41 @@ fn resolve_recorded_wire_size(
 /// Recording a fabricated hash would mislabel every frame on that channel — a
 /// replay-grade bag with a fabricated hash is worse than no bag — so the
 /// recording ABORTS loudly naming node/output/topic.
+///
+/// `workspace_root` is the workspace directory whose `schemas/` files size
+/// output ports when the producing node does not provide a fixed wire size.
 #[cfg(unix)]
-fn resolve_recorded_topics(
+pub fn resolve_recorded_topics(
     workspace_root: &Path,
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    selected: Option<&std::collections::HashSet<String>>,
 ) -> CliResult<Vec<cerulion_bagd::RecordedTopic>> {
     let wire_sizes = build_workspace_schema_wire_sizes(workspace_root);
     // IndexMap keyed by resolved topic → dedup deterministically (first producer
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
+    // Every graph-produced topic, selected or not: the external-consumer
+    // classification below is about who PRODUCES a topic, not what this
+    // recording selects.
+    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
+            produced.insert(topic.clone());
+            // The selection applies BEFORE the metadata lookup: a names-only
+            // output the recording does not select must not fail startup.
+            if selected.is_some_and(|set| !set.contains(&topic)) {
+                continue;
+            }
             if out.contains_key(&topic) {
                 continue;
             }
             let Some(info) = entry_infos.get(&node_def.id) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: node '{}' (topic '{topic}') has no loaded NodeEntry \
+                    "recording: node '{}' (topic '{topic}') has no loaded NodeEntry \
                      info, so its output's AUTHORITATIVE wire schema hash is unavailable — a \
                      replay-grade bag with a fabricated hash is worse than no bag. Recording \
                      aborted.",
@@ -21230,7 +21427,7 @@ fn resolve_recorded_topics(
             };
             let Some(meta) = info.output_meta().iter().find(|m| m.name == output.name) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: output '{}.{}' (topic '{topic}') carries no \
+                    "recording: output '{}.{}' (topic '{topic}') carries no \
                      OutputMeta — its node reports names-only port info (a raw-FFI cdylib built \
                      without per-port metadata), so the AUTHORITATIVE wire schema hash is \
                      unavailable and the channel would be mislabeled. Recording aborted; rebuild \
@@ -21343,19 +21540,7 @@ fn resolve_recorded_topics(
     // consumed∧¬produced classification `replay_engine::classify_topics`
     // applies at replay time.
     {
-        let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
-        for node_def in &config.nodes {
-            for input in &node_def.inputs {
-                let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
-                if out.contains_key(&topic) {
-                    continue; // graph-produced — recorded, nothing to flag.
-                }
-                let consumers = unrecorded.entry(topic).or_default();
-                if !consumers.contains(&node_def.id) {
-                    consumers.push(node_def.id.clone());
-                }
-            }
-        }
+        let unrecorded = external_consumers(config, &produced);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -21368,6 +21553,31 @@ fn resolve_recorded_topics(
         }
     }
     Ok(out.into_values().collect())
+}
+
+/// The topics a graph consumes but does not produce, each with its consumer
+/// node ids (deduped, config order). A graph-produced topic is never external,
+/// even when a recording's topic selection leaves it out of the bag: replay
+/// re-runs its producer and regenerates it.
+#[cfg(unix)]
+fn external_consumers(
+    config: &GraphConfig,
+    produced: &std::collections::HashSet<String>,
+) -> indexmap::IndexMap<String, Vec<String>> {
+    let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
+    for node_def in &config.nodes {
+        for input in &node_def.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if produced.contains(&topic) {
+                continue; // graph-produced - replay regenerates it.
+            }
+            let consumers = unrecorded.entry(topic).or_default();
+            if !consumers.contains(&node_def.id) {
+                consumers.push(node_def.id.clone());
+            }
+        }
+    }
+    unrecorded
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -21670,6 +21880,21 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paired run rides only a netd that reports paired: an open or an
+    /// unknown posture is refused. An open run accepts every netd. Hand
+    /// oracle over all six (reported, requested) pairs.
+    #[cfg(unix)]
+    #[test]
+    fn netd_posture_acceptable_requires_a_reported_paired_netd_for_a_paired_run() {
+        use cerulion_core::LanAccess::{Open, Paired};
+        assert!(!netd_posture_acceptable(None, Paired));
+        assert!(!netd_posture_acceptable(Some(Open), Paired));
+        assert!(netd_posture_acceptable(Some(Paired), Paired));
+        assert!(netd_posture_acceptable(None, Open));
+        assert!(netd_posture_acceptable(Some(Paired), Open));
+        assert!(netd_posture_acceptable(Some(Open), Open));
+    }
 
     // ======================================================================
     // The scrub fixpoint's NO-PROGRESS fallback, DRIVEN.
@@ -22981,6 +23206,7 @@ nodes:
                 schema_hash: 0x0821_C823_0000_0001,
                 qualified: "pkg/Type".to_string(),
             }],
+            served_topics: vec![],
         };
         let handoff = GatewayHandoff {
             graph_name: "g".to_string(),
@@ -23908,6 +24134,33 @@ nodes:
     /// `pkg13::Type` graph backed by `schemas/pkg13/msg/Type.msg` records
     /// the REAL size (and the normalized provenance spelling). Removing
     /// core's deserializer normalization fails it.
+    /// A recording that selects a subset of outputs must not reclassify an
+    /// unselected graph-produced topic as external: replay re-runs its
+    /// producer. Only a topic no node produces is external.
+    #[cfg(unix)]
+    #[test]
+    fn an_unselected_produced_topic_is_not_an_external_consumer() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let produced: std::collections::HashSet<String> = config
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.outputs.iter().map(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                })
+            })
+            .collect();
+        let external = external_consumers(&config, &produced);
+        assert_eq!(
+            external.into_iter().collect::<Vec<_>>(),
+            vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn r13_a_coloned_graph_spelling_records_the_real_wire_size() {
@@ -23928,7 +24181,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
@@ -24043,7 +24297,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xABCD, None).with_wire_fixed_size(1 << 20)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size,
@@ -24088,7 +24343,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0x5151, None).with_wire_fixed_size(64)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 64,
             "an unregistered schema must not be recorded as a 0-byte layout"
@@ -24141,7 +24397,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xAB, None).with_wire_fixed_size(96)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 96,
             "the node sizes a port the map deliberately refuses to bind"
@@ -24183,7 +24440,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded[0].wire_fixed_size, 0);
         assert_eq!(recorded[0].schema_name, "");
         // The half the name promises: the `is_empty()` gate on the `Unknown`
@@ -24245,7 +24503,8 @@ nodes:
             // `OutputMeta::new` alone: no `with_wire_fixed_size`.
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x7777, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "with no producer claim the workspace file is still the source"
@@ -24313,7 +24572,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xBB, None).with_wire_fixed_size(128)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1, "one topic, one channel");
         assert_eq!(recorded[0].topic, "/tf");
         assert_eq!(
@@ -24371,7 +24631,8 @@ nodes:
         let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
             indexmap::IndexMap::new();
         infos.insert("n".to_string(), info);
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "the workspace file sizes a port whose info block does not"
@@ -24404,8 +24665,8 @@ nodes:
                 ],
             ),
         );
-        let first = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
-        let second = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let first = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
+        let second = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         let render = |v: &[cerulion_bagd::RecordedTopic]| {
             v.iter()
                 .map(|t| {
@@ -24462,7 +24723,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded
                 .iter()
@@ -24548,7 +24810,8 @@ nodes:
                 vec![OutputMeta::new("oa".to_string(), 0xA, None).with_wire_fixed_size(4)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "PREMISE: the two sources agree, so 4 is recorded either way"
@@ -24658,7 +24921,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         // ORACLE: exactly two topics — the derived /rr/cam/img and the
         // override /tf (deduped across cam + cam2); the external consumer-only
@@ -24738,7 +25001,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         let topics: Vec<&str> = recorded.iter().map(|r| r.topic.as_str()).collect();
 
@@ -24775,9 +25038,13 @@ nodes:
             "cam".to_string(),
             NodeInfo::from_names(vec!["ext".to_string()], vec!["img".to_string()]),
         );
-        let err = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let err = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect_err("a names-only NodeInfo must abort the recording");
         let msg = err.to_string();
+        assert!(
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
         assert!(msg.contains("cam.img"), "names node.output: {msg}");
         assert!(msg.contains("/rr/cam/img"), "names the topic: {msg}");
         assert!(
@@ -24795,10 +25062,15 @@ nodes:
         // output-missing message above also contains "cam", so a text-collapse
         // mutation merging the two arms' diagnostics must fail here.
         let empty: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
-        let err = resolve_recorded_topics(tmp.path(), &config, &empty)
+        let err = resolve_recorded_topics(tmp.path(), &config, &empty, None)
             .expect_err("a missing NodeEntry info must abort the recording");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("no loaded NodeEntry info"),
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
+        assert!(
+            msg.contains("no loaded NodeEntry info"),
             "the node-missing arm's DISTINCT diagnostic: {err}"
         );
     }
@@ -27597,7 +27869,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "recorded through the stem binding"
@@ -27668,7 +27941,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x2727, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 — never a guessed document"
@@ -27748,7 +28022,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 with the unknown-size attribution, never the store's 4"
@@ -27900,7 +28175,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 16,

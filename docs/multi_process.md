@@ -384,7 +384,8 @@ GATEWAY, which taps them on the deployment's iceoryx2 namespace.
 One robot = one network peer (Principle #8).
 
 - **Which gateway you get follows the posture.** A run with NO `network:`
-  block is PERMISSIVE (every produced topic is announced + egressable), and on
+  block is PERMISSIVE (every produced topic is egressable; topic announce tokens
+  are declared when LAN access is open), and on
   Unix the supervisor registers the deployment's egress plan with the
   machine's shared `cerulion-netd` daemon, forwarding the supervisor-minted
   worker namespace so netd's gateway taps the right shared memory. An explicit

@@ -4132,6 +4132,39 @@ impl GraphRuntime {
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
     ) -> TransportResult<Self> {
+        // `None` reproduces the pre-recording-seam behaviour exactly; the
+        // recorded-topic raise lives on the `_and_recorded` sibling below.
+        Self::build_live_with_schema_hashes_policy_and_recorded(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            policy,
+            None,
+        )
+    }
+
+    /// [`Self::build_live_with_schema_hashes_and_policy`] plus the
+    /// `recorded_topics` recording-provisioning seam on the LIVE (RealClock)
+    /// build path. `Some(set)` raises `subscriber_max_borrowed_samples` to
+    /// `RECORDING_SUBSCRIBER_MAX_BORROWED` and the
+    /// `subscriber_max_buffer_size` ceiling to
+    /// `recording_tap_buffer_depth(max_slice_len)` on each listed topic (see
+    /// `build_with_scheduler`), giving the in-process `bagd` recorder's
+    /// open-only taps the same deep receive queues the CLI `--record` path
+    /// provisions. `None` reproduces
+    /// [`Self::build_live_with_schema_hashes_and_policy`] exactly.
+    // hot-path-alloc-ok-fn: cold: graph BUILD runs once per process, before the first step
+    pub fn build_live_with_schema_hashes_policy_and_recorded(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<dyn Clock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
+    ) -> TransportResult<Self> {
         Self::build_live_core(
             config,
             node_factories,
@@ -4139,6 +4172,7 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            recorded_topics,
             // Single-process live build — the local graph
             // IS the full graph, so there is no cross-group requirement union
             // and no split `block` edge to bind.
@@ -4196,13 +4230,21 @@ impl GraphRuntime {
             clock,
             schema_hashes,
             policy,
+            // A free-run rank is non-recording on this
+            // path (the record arm is `build_live_deterministic_free_run`).
+            None,
             cross_process,
         )
     }
 
-    /// The shared body of [`Self::build_live_with_schema_hashes_and_policy`]
-    /// (union `None`) and [`Self::build_live_free_run`] (union stamped): ONE
+    /// The shared body of
+    /// [`Self::build_live_with_schema_hashes_policy_and_recorded`] (union
+    /// `None`) and [`Self::build_live_free_run`] (union stamped): ONE
     /// implementation of the RealClock live wiring, so the two cannot drift.
+    // Eight parameters, one past clippy's bar: every parameter is a DISTINCT
+    // type, so positional call sites carry no swap hazard; same suppression,
+    // for the same reason, as the private funnel `build_with_scheduler`.
+    #[allow(clippy::too_many_arguments)]
     // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
     fn build_live_core(
         config: GraphConfig,
@@ -4211,6 +4253,7 @@ impl GraphRuntime {
         clock: Arc<dyn Clock>,
         schema_hashes: Option<&HashMap<String, u64>>,
         policy: crate::monitor_wait::MonitorWaitPolicy,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
         cross_process: CrossProcessWiring<'_>,
     ) -> TransportResult<Self> {
         super::validation::validate_graph_with(&config, cross_process.validation_options())?;
@@ -4230,11 +4273,13 @@ impl GraphRuntime {
             scheduler,
             schema_hashes,
             policy,
-            // This NON-deterministic live path (RealClock gating)
-            // is not the recording path — recording builds via
-            // `build_live_deterministic_with_schema_hashes_and_policy` (or, per
-            // free-run rank, `build_live_deterministic_free_run`).
-            None,
+            // `None` on every caller that is not
+            // recording (`build_live*`, `build_live_free_run`); the embedded
+            // recording caller (`build_live_with_schema_hashes_policy_and_recorded`)
+            // threads the recorded set so its bagd taps get the raised
+            // provisioning. The deterministic recording builds reach the same
+            // raise through their own ctor.
+            recorded_topics,
             cross_process,
             // A live build exists to be driven.
             BuildPurpose::Execution,
@@ -14116,6 +14161,65 @@ impl GraphRuntime {
             .get_or_init(|| matches!(std::env::var("CERULION_MW_SINGLE_PARK").as_deref(), Ok("1")))
     }
 
+    /// Run [`Self::run_live`]'s fallible launch setup without entering the
+    /// loop: collect the external ingress wake sources (refusing a graph with
+    /// an external node that is provably inert at launch,
+    /// [`TransportError::ExternalNodesInertAtLaunch`]) and build the WaitSet
+    /// reactor when the loop needs one ([`TransportError::LiveReactorBuild`]).
+    ///
+    /// An embedding host calls this on the thread that will run the loop and
+    /// reports the graph ready only after it returns `Ok`, so a launch failure
+    /// surfaces as a start failure instead of after start reported success.
+    /// `run_live` runs the same setup first, so calling this is optional.
+    /// Idempotent, with the same sticky refusal: the `run_live` that follows
+    /// reuses the collected bindings and the parked reactor. (A cross-process
+    /// rank's armed gating epoch is placed by `run_live` itself, at its clock
+    /// anchor; its refusals are made earlier, when the epoch is armed.)
+    pub fn prepare_live(&mut self) -> TransportResult<()> {
+        self.collect_external_sources()?;
+        if self.reactor.is_none() && self.live_loop_needs_reactor() {
+            self.reactor = Some(self.build_live_reactor()?);
+        }
+        Ok(())
+    }
+
+    /// Whether the live loop idles on the WaitSet reactor. A parked run idles
+    /// in `monitor_wait_block` instead (the `park_active()` branch in
+    /// `live_step` PRECEDES the WaitSet branch), and so does a barrier
+    /// participant or a run with credit edges, so those need no reactor.
+    fn live_loop_needs_reactor(&self) -> bool {
+        !(self.park_active() || self.barrier_participant.is_some() || self.has_credit_edges())
+    }
+
+    /// Build the live loop's WaitSet reactor, sized for data-trigger + sync +
+    /// external attachments (a `DeviceFd` / `Notified` doorbell each attaches
+    /// one WaitSet source).
+    fn build_live_reactor(&self) -> TransportResult<waitset::WaitSetReactor> {
+        waitset::WaitSetReactor::new(
+            (self.data_trigger_bindings.len()
+                + self.sync_input_bindings.len()
+                + self.external_bindings.len())
+            .max(1),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "run_live: cannot build WaitSet reactor; aborting live loop"
+            );
+            // Propagate the failure. Returning `Ok(())` from `run_live` (a
+            // bare `()` meaning "ran") would let `cerulion graph run` exit 0
+            // for a live run that never executed a single step - a false
+            // success. So the underlying iceoryx2 `WaitSetCreateError` is
+            // surfaced and the CLI exits non-zero.
+            TransportError::LiveReactorBuild {
+                // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
+                // arm, which aborts the live loop
+                graph: self.config.identity().to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+
     /// The production event-driven live loop.
     ///
     /// Drives the graph from real iceoryx2 wakeups instead of fixed-`delta`
@@ -14232,43 +14336,8 @@ impl GraphRuntime {
         // reused regardless (harmless if the park is active — it just sits idle).
         let mut reactor: Option<waitset::WaitSetReactor> = match self.reactor.take() {
             Some(r) => Some(r),
-            // A barrier participant idles in `monitor_wait_block`
-            // even when the park is off (see `live_step`), so it needs no
-            // reactor either.
-            None if self.park_active()
-                || self.barrier_participant.is_some()
-                || self.has_credit_edges() =>
-            {
-                None
-            }
-            // Size for data-trigger + sync + external
-            // attachments (a `DeviceFd` / `Notified` doorbell each attaches one
-            // WaitSet source).
-            None => match waitset::WaitSetReactor::new(
-                (self.data_trigger_bindings.len()
-                    + self.sync_input_bindings.len()
-                    + self.external_bindings.len())
-                .max(1),
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "run_live: cannot build WaitSet reactor; aborting live loop"
-                    );
-                    // Propagate the failure. Returning
-                    // `Ok(())` here (a bare `()` meaning "ran") would let
-                    // `cerulion graph run` exit 0 for a live run that never executed
-                    // a single step — a false success. So the underlying iceoryx2
-                    // `WaitSetCreateError` is surfaced and the CLI exits non-zero.
-                    return Err(TransportError::LiveReactorBuild {
-                        // hot-path-alloc-ok: cold: error-struct fields on the reactor-build FAILURE
-                        // arm, which aborts the live loop
-                        graph: self.config.identity().to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            None if !self.live_loop_needs_reactor() => None,
+            None => Some(self.build_live_reactor()?),
         };
 
         // Worker-visible wait-policy line (once per run_live entry, after
