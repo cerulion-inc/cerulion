@@ -11,6 +11,8 @@ nodes:
         schema: std_msgs/Int32
   - id: printer
     type: printer
+    params:
+      step: ${step}
     inputs:
       - name: count
         source: timer/count
