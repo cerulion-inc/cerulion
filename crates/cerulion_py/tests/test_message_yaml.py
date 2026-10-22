@@ -43,6 +43,7 @@ schemas:
 def schemas():
     s = cerulion.SchemaSet.builtins()
     s.add_yaml(SCHEMAS)
+    s.add_rosmsg("wstring<=1 w\n", "demo/Wide")
     return s
 
 
@@ -390,6 +391,14 @@ def test_yaml_text_may_be_any_bytes_like(schemas):
             'tag: "a\\0"\n',
             "YamlNulInFixedString",
             "tag: a string_fixed value cannot contain a NUL character",
+        ),
+        (
+            # The bound counts UTF-16 code units: one emoji is two.
+            "demo/Wide",
+            {"w": "\U0001F600"},
+            'w: "\U0001F600"\n',
+            "YamlWideStringTooLong",
+            "w: string is 2 UTF-16 code units, over the bound of 1",
         ),
     ],
 )
@@ -794,6 +803,53 @@ def test_numpy_and_bytes_values_are_accepted(schemas):
         },
     )
     assert schemas.message_to_dict(image)["data"] == [0, 1, 255]
+
+
+def test_a_numpy_array_past_the_cap_is_refused_before_it_converts(schemas):
+    # A broadcast view names 268435457 items in 8 bytes of storage. Each
+    # item writes at least one character, so the array is refused by its
+    # size alone: no item becomes a Python value, so this takes no memory.
+    np = pytest.importorskip("numpy")
+    huge = np.broadcast_to(np.float64(0.5), ((1 << 28) + 1,))
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Named", {"name": "n", "samples": huge})
+    assert err.value.kind == "DictTooLarge"
+    assert str(err.value) == "samples: the YAML form passes the 268435456-byte cap"
+    # The same for an inner axis: 2 rows of 2**27 items is past the cap too.
+    rows = np.broadcast_to(np.float64(0.5), (2, (1 << 27) + 1))
+    with pytest.raises(cerulion.EncodeError) as err:
+        schemas.dict_to_message("Named", {"name": "n", "samples": rows})
+    assert err.value.kind == "DictTooLarge"
+    assert str(err.value) == "samples: the YAML form passes the 268435456-byte cap"
+
+
+def test_a_numpy_array_converts_across_its_chunks(schemas):
+    # 10000 items is two full 4096-item slices and a part one; every item
+    # lands at its own index.
+    np = pytest.importorskip("numpy")
+    samples = [float(i) / 4 for i in range(10000)]
+    frame = schemas.dict_to_message(
+        "Named", {"name": "n", "samples": np.array(samples)}
+    )
+    assert frame == named_frame(schemas, "n", samples)
+    # float32 and int items give their plain values, as `tolist()` does.
+    assert schemas.dict_to_message(
+        "Named", {"name": "n", "samples": np.array([0.5, 2.0], dtype=np.float32)}
+    ) == named_frame(schemas, "n", [0.5, 2.0])
+    assert schemas.dict_to_message(
+        "Named", {"name": "n", "samples": np.array([1, -3], dtype=np.int16)}
+    ) == named_frame(schemas, "n", [1.0, -3.0])
+
+
+def test_a_two_dimensional_numpy_array_is_its_nested_lists(schemas):
+    # A 2-D array writes `[[...], [...]]` as its nested lists would, so a
+    # float64[] field refuses both with the same error at the same item.
+    np = pytest.importorskip("numpy")
+    for value in (np.zeros((2, 2)), [[0.0, 0.0], [0.0, 0.0]]):
+        with pytest.raises(cerulion.EncodeError) as err:
+            schemas.dict_to_message("Named", {"name": "n", "samples": value})
+        assert err.value.kind == "YamlWrongType"
+        assert str(err.value) == "samples[0]: expected float64, got sequence"
 
 
 def test_deeply_nested_types_round_trip(schemas):

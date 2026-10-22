@@ -211,6 +211,7 @@ pub(crate) fn map_dynamic_err(py: Python<'_>, error: DynamicError) -> PyErr {
         | DynamicError::YamlWrongLength { .. }
         | DynamicError::YamlTooManyElements { .. }
         | DynamicError::YamlStringTooLong { .. }
+        | DynamicError::YamlWideStringTooLong { .. }
         | DynamicError::YamlNulInFixedString { .. }
         | DynamicError::YamlTruncated { .. }
         | DynamicError::YamlTag { .. }
@@ -243,6 +244,7 @@ fn yaml_kind(error: &DynamicError) -> &'static str {
         DynamicError::YamlWrongLength { .. } => "YamlWrongLength",
         DynamicError::YamlTooManyElements { .. } => "YamlTooManyElements",
         DynamicError::YamlStringTooLong { .. } => "YamlStringTooLong",
+        DynamicError::YamlWideStringTooLong { .. } => "YamlWideStringTooLong",
         DynamicError::YamlNulInFixedString { .. } => "YamlNulInFixedString",
         DynamicError::YamlTruncated { .. } => "YamlTruncated",
         DynamicError::YamlTag { .. } => "YamlTag",

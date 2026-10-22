@@ -20,7 +20,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple,
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PySlice, PyString, PyTuple,
 };
 use pyo3::IntoPyObjectExt;
 use serde_yaml::Value;
@@ -33,7 +33,7 @@ const YAML_READER_DEPTH: usize = 128;
 
 /// How deep a dict may nest before it is refused. The root dict is level 0,
 /// so the reader's collections fill levels 0 to 127 and their scalars sit
-/// at 128; a NumPy value adds one level for its `tolist()`. So every value
+/// at 128; a NumPy value adds one level, as its `tolist()` would. So every value
 /// the codec can take fits, and a dict that contains itself stops here.
 const MAX_DICT_DEPTH: usize = YAML_READER_DEPTH + 1;
 
@@ -245,16 +245,7 @@ fn emit(
     depth: usize,
 ) -> PyResult<()> {
     let py = value.py();
-    if depth > MAX_DICT_DEPTH {
-        return Err(kinded::<EncodeError>(
-            py,
-            "DictTooDeep",
-            format!(
-                "{}: the value nests deeper than {MAX_DICT_DEPTH} levels",
-                abridged(path)
-            ),
-        ));
-    }
+    within_depth(py, path, depth)?;
     if value.is_none() {
         out.push_str("null");
     } else if let Ok(b) = value.cast::<PyBool>() {
@@ -326,8 +317,12 @@ fn emit(
         }
         out.push(']');
     } else if let Some(tolist) = callable_tolist(value)? {
-        // A NumPy array or scalar: its plain Python value.
-        emit(&tolist.call0()?, out, path, depth + 1)?;
+        match array_rank(value)? {
+            // A NumPy array: its items, converted a slice at a time.
+            Some(rank) if rank > 0 => emit_array(value, rank, out, path, depth)?,
+            // A NumPy scalar or 0-d array: its plain Python value.
+            _ => emit(&tolist.call0()?, out, path, depth + 1)?,
+        }
     } else {
         return Err(kinded::<EncodeError>(
             py,
@@ -341,6 +336,113 @@ fn emit(
         ));
     }
     within_budget(py, out, path)
+}
+
+/// How many items of a one-dimensional array one `tolist()` call turns
+/// into Python values, so a large array never becomes one large list.
+const ARRAY_CHUNK: usize = 4096;
+
+/// Emit an array of `rank` dimensions (a NumPy array) as the nested lists
+/// its `tolist()` would give, at the same depths, without building them:
+/// the first axis is walked an item at a time and a one-dimensional array
+/// is converted [`ARRAY_CHUNK`] items at a time. Every item writes at least
+/// one character, so an array with more items than the budget has left is
+/// refused before any item is converted.
+fn emit_array(
+    value: &Bound<'_, PyAny>,
+    rank: usize,
+    out: &mut String,
+    path: &mut String,
+    depth: usize,
+) -> PyResult<()> {
+    let py = value.py();
+    // The array stands where its outer list would be.
+    within_depth(py, path, depth + 1)?;
+    if let Ok(size) = value
+        .getattr("size")
+        .and_then(|size| size.extract::<usize>())
+    {
+        if out.len().saturating_add(size) > MAX_DICT_YAML_BYTES {
+            return Err(too_large(py, path));
+        }
+    }
+    let len = value.len()?;
+    out.push('[');
+    let mut index = 0;
+    while index < len {
+        if rank > 1 {
+            // A sub-array per item of the first axis, one level deeper.
+            let item = value.get_item(index)?;
+            push_item(out, path, index, |out, path| {
+                emit_array(&item, rank - 1, out, path, depth + 1)
+            })?;
+            index += 1;
+            continue;
+        }
+        let end = len.min(index.saturating_add(ARRAY_CHUNK));
+        let chunk = value
+            .get_item(PySlice::new(py, index as isize, end as isize, 1))?
+            .call_method0("tolist")?;
+        for item in chunk.try_iter()? {
+            let item = item?;
+            push_item(out, path, index, |out, path| {
+                emit(&item, out, path, depth + 2)
+            })?;
+            index += 1;
+        }
+        if index < end {
+            return Err(PyValueError::new_err(format!(
+                "{}: the array changed size while it was read",
+                shown(path)
+            )));
+        }
+    }
+    out.push(']');
+    within_budget(py, out, path)
+}
+
+/// Write the separator before item `index`, then the item under its
+/// `[index]` path.
+fn push_item(
+    out: &mut String,
+    path: &mut String,
+    index: usize,
+    write_item: impl FnOnce(&mut String, &mut String) -> PyResult<()>,
+) -> PyResult<()> {
+    if index > 0 {
+        out.push_str(", ");
+    }
+    let mark = path.len();
+    let _ = write!(path, "[{index}]");
+    write_item(out, path)?;
+    path.truncate(mark);
+    Ok(())
+}
+
+/// The `ndim` of a NumPy-like array; `None` for a value with no integer
+/// `ndim`.
+fn array_rank(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    match value.getattr("ndim") {
+        Ok(ndim) => Ok(ndim.extract::<usize>().ok()),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(value.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `Ok(())` while `depth` is within [`MAX_DICT_DEPTH`], else the
+/// `DictTooDeep` error naming `path`.
+fn within_depth(py: Python<'_>, path: &str, depth: usize) -> PyResult<()> {
+    if depth <= MAX_DICT_DEPTH {
+        return Ok(());
+    }
+    Err(kinded::<EncodeError>(
+        py,
+        "DictTooDeep",
+        format!(
+            "{}: the value nests deeper than {MAX_DICT_DEPTH} levels",
+            abridged(path)
+        ),
+    ))
 }
 
 /// `Ok(())` while `out` is within [`MAX_DICT_YAML_BYTES`], else the

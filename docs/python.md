@@ -422,8 +422,14 @@ messages are one level each) raises `SchemaError` `YamlTooDeep` on both paths.
 
 `Message.copy()` is not this conversion: it materializes a view (a
 received message, a loan or a nested view) as owned NumPy values,
-`bytes` and nested copies, the value forms the typed `publish()` takes. Use `to_dict()` for
-the plain values `topic echo` shows.
+`bytes`, nested copies and, for `string[]` and nested-message array
+fields, decoded Python lists. The typed `publish()` takes those fields only
+as pre-framed bytes, so a copy of a message with one of them is refused
+with `EncodeError`. To send a received message on, pass the received
+`Message` itself to `publish()`, which forwards its frame bytes. To send
+plain values, build the frame with `dict_to_message(name, message.to_dict())`
+and hand it to `publish_frame()`. Use `to_dict()` for the plain values
+`topic echo` shows.
 
 ```python
 frame = schemas.yaml_to_message("Point", "x: 1.5\ny: -2.0\n")
