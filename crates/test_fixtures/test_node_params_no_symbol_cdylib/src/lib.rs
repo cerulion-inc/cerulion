@@ -23,7 +23,9 @@
 //! With `CER_INFO_UNKNOWN_KEY=1` every call returns a document with no params
 //! and one key the host does not know (`polciy`): the same test file uses it
 //! to prove the child does not log the unknown-key warning the parent logs
-//! again when it parses the forwarded document.
+//! again when it parses the forwarded document. With `CER_INFO_MALFORMED=1`
+//! every call returns a document that is not JSON, to prove the child still
+//! logs the host's ERROR for it.
 
 // P12 (the AGENTS.md logging convention): library code never prints; it logs
 // through `tracing`. Scoped `not(test)` so unit tests keep printing
@@ -86,6 +88,9 @@ static PLAIN_INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
 /// The document every call returns under `CER_INFO_UNKNOWN_KEY=1`.
 static UNKNOWN_KEY_INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[],\"polciy\":\"x\"}\0";
 
+/// The document every call returns under `CER_INFO_MALFORMED=1`: not JSON.
+static MALFORMED_INFO_BYTES: &[u8] = b"{not json\0";
+
 /// How many times `cerulion_node_info()` has been called in this process.
 static INFO_CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -94,7 +99,10 @@ pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
     let first = INFO_CALLS.fetch_add(1, Ordering::Relaxed) == 0;
     let varies = std::env::var_os("CER_INFO_FIRST_READ_PLAIN").is_some_and(|v| v == "1");
     let unknown_key = std::env::var_os("CER_INFO_UNKNOWN_KEY").is_some_and(|v| v == "1");
-    let bytes = if unknown_key {
+    let malformed = std::env::var_os("CER_INFO_MALFORMED").is_some_and(|v| v == "1");
+    let bytes = if malformed {
+        MALFORMED_INFO_BYTES
+    } else if unknown_key {
         UNKNOWN_KEY_INFO_BYTES
     } else if first && varies {
         PLAIN_INFO_BYTES
