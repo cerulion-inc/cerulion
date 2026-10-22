@@ -160,7 +160,8 @@ pub enum NetworkPostureLabel {
     Inert,
     /// An explicit enabled `network:` block.
     Strict,
-    /// The default: every produced topic announced + egressable.
+    /// The default: every produced topic is egressable and can be announced
+    /// when LAN access is open.
     Permissive,
 }
 

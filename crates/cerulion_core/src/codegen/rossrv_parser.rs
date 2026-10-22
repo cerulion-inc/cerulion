@@ -13,10 +13,13 @@
 //! ```
 //!
 //! Each part parses with [`parse_rosmsg`] into its own message schema. The
-//! request is named `<Name>Request` and the response `<Name>Response`, in
+//! request is named `<Name>_Request` and the response `<Name>_Response`, in
 //! the same package as the service, so `std_srvs/Trigger` gives
-//! `std_srvs/TriggerRequest` and `std_srvs/TriggerResponse`. Either part
-//! can be empty (`std_srvs/Empty` is a lone `---`).
+//! `std_srvs/Trigger_Request` and `std_srvs/Trigger_Response`. These are
+//! the names ROS 2 gives the two parts, and the schema hash covers the
+//! qualified name, so a native peer and a ROS 2 peer on `rmw_cerulion`
+//! hash each part the same. Either part can be empty (`std_srvs/Empty` is
+//! a lone `---`).
 
 use super::rosmsg_parser::{parse_rosmsg, ParseError};
 use super::schema::MessageSchema;
@@ -57,9 +60,9 @@ pub struct ServiceDefinition {
     pub name: String,
     /// Package of the service, for example `std_srvs`.
     pub package: Option<String>,
-    /// The request message, named `<name>Request`.
+    /// The request message, named `<name>_Request`.
     pub request: MessageSchema,
-    /// The response message, named `<name>Response`.
+    /// The response message, named `<name>_Response`.
     pub response: MessageSchema,
 }
 
@@ -75,24 +78,25 @@ impl ServiceDefinition {
 
 /// Name of the request message of service `srv_name`.
 pub fn srv_request_name(srv_name: &str) -> String {
-    format!("{srv_name}Request")
+    format!("{srv_name}_Request")
 }
 
 /// Name of the response message of service `srv_name`.
 pub fn srv_response_name(srv_name: &str) -> String {
-    format!("{srv_name}Response")
+    format!("{srv_name}_Response")
 }
 
 /// What is wrong with a `.srv` file.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SrvErrorKind {
     /// No `---` line in the file.
-    #[error("missing `{SRV_SEPARATOR}` line between the request and the response")]
+    #[error("missing `{sep}` line between the request and the response", sep = SRV_SEPARATOR)]
     MissingSeparator,
     /// A second `---` line; `first_line` is where the first one is.
     #[error(
-        "a second `{SRV_SEPARATOR}` line (the first is on line {first_line}); \
-         a service has exactly one"
+        "a second `{sep}` line (the first is on line {first_line}); \
+         a service has exactly one",
+        sep = SRV_SEPARATOR
     )]
     ExtraSeparator { first_line: usize },
     /// A line in the request or response part is not a valid `.msg` line.
@@ -209,8 +213,8 @@ mod tests {
         let srv = parse_rossrv(text, "SetBool", Some("std_srvs"), "std_srvs/SetBool.srv").unwrap();
 
         assert_eq!(srv.qualified_name(), "std_srvs/SetBool");
-        assert_eq!(srv.request.qualified_name(), "std_srvs/SetBoolRequest");
-        assert_eq!(srv.response.qualified_name(), "std_srvs/SetBoolResponse");
+        assert_eq!(srv.request.qualified_name(), "std_srvs/SetBool_Request");
+        assert_eq!(srv.response.qualified_name(), "std_srvs/SetBool_Response");
         assert_eq!(field_names(&srv.request), ["data"]);
         assert_eq!(srv.request.fields[0].field_type, FieldType::Bool);
         assert_eq!(field_names(&srv.response), ["success", "message"]);
@@ -220,14 +224,38 @@ mod tests {
     #[test]
     fn each_part_hashes_like_the_same_text_parsed_as_a_msg() {
         // A service part is an ordinary message: its schema hash is the hash
-        // of the same text parsed as `<Name>Request.msg` in the package.
+        // of the same text parsed as `<Name>_Request.msg` in the package.
         let text = "string[] names\n---\nuint8[] types\n";
         let srv = parse_rossrv(text, "GetTypes", Some("p"), FILE).unwrap();
-        let req = parse_rosmsg("string[] names\n", "GetTypesRequest", Some("p")).unwrap();
-        let resp = parse_rosmsg("uint8[] types\n", "GetTypesResponse", Some("p")).unwrap();
+        let req = parse_rosmsg("string[] names\n", "GetTypes_Request", Some("p")).unwrap();
+        let resp = parse_rosmsg("uint8[] types\n", "GetTypes_Response", Some("p")).unwrap();
         assert_eq!(srv.request.schema_hash(), req.schema_hash());
         assert_eq!(srv.response.schema_hash(), resp.schema_hash());
         assert_ne!(srv.request.schema_hash(), srv.response.schema_hash());
+    }
+
+    /// The qualified name `rmw_cerulion` gives a message from its rosidl
+    /// introspection: the package is the namespace up to the first `__`
+    /// (`std_srvs__srv` gives `std_srvs`), then `/`, then `message_name_`.
+    /// rosidl names the two parts of service `SetBool` `SetBool_Request`
+    /// and `SetBool_Response`.
+    fn rmw_side_schema(body: &str, namespace: &str, message_name: &str) -> MessageSchema {
+        let package = namespace.split("__").next().unwrap();
+        parse_rosmsg(body, message_name, Some(package)).unwrap()
+    }
+
+    #[test]
+    fn each_part_hashes_like_the_rmw_cerulion_peer_of_the_same_service() {
+        let request = "bool data\n";
+        let response = "bool success\nstring message\n";
+        let text = format!("{request}---\n{response}");
+        let srv = parse_rossrv(&text, "SetBool", Some("std_srvs"), FILE).unwrap();
+
+        let rmw_req = rmw_side_schema(request, "std_srvs__srv", "SetBool_Request");
+        let rmw_resp = rmw_side_schema(response, "std_srvs__srv", "SetBool_Response");
+        assert_eq!(rmw_req.qualified_name(), "std_srvs/SetBool_Request");
+        assert_eq!(srv.request.schema_hash(), rmw_req.schema_hash());
+        assert_eq!(srv.response.schema_hash(), rmw_resp.schema_hash());
     }
 
     #[test]

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The `_cerulion._tcp` mDNS gateway beacon: the advertise half.
+//! The `_cerulion._tcp` mDNS gateway beacon: the advertise half and a bounded
+//! browse.
 //!
 //! mDNS is the primary robot-discovery rung on every network: mDNS finds robots,
-//! zenoh connects and does everything after. A serving gateway always advertises
-//! `_cerulion._tcp`. The SRV record carries the zenoh listen port that was actually
-//! bound, and the TXT record carries `robot=<identity>` (the resolved hostname or
+//! zenoh connects and does everything after. A serving gateway advertises
+//! `_cerulion._tcp` when its first TCP listen endpoint is LAN-dialable. The SRV
+//! record carries the zenoh listen port that was actually bound, and the TXT record carries `robot=<identity>` (the resolved hostname or
 //! the `CERULION_ROBOT_IDENTITY` override, not the graph prefix) plus the
 //! remote-access endpoint facts when the remote-access daemon has published them.
 //! A discovering CLI browses the same service type and hands each resolved instance
@@ -18,13 +19,14 @@
 //! depend on it; two copies of the TXT vocabulary would drift, so it lives here
 //! once.
 //!
-//! # What is not here
+//! # The browse half
 //!
-//! The browse half (`browse_rung`, `resolve_robot_eid`, the record-to-peer mapping)
-//! stays in `cerulion_cli_engine::mdns_discovery`: netd never browses, and those
-//! functions return `cerulion_discovery::DiscoveredPeer`. [`CERULION_SERVICE_TYPE`]
-//! is defined once, here, and imported by the browser, so the one string that must
-//! match on both sides cannot drift.
+//! [`browse_rung`] is the bounded `_cerulion._tcp` browse. The CLI's discovery
+//! ladder and `cerulion-netd`'s boot-time peer fold both call it, so the
+//! record-to-locator mapping exists once. [`CERULION_SERVICE_TYPE`] is defined
+//! here and used by both halves. `resolve_robot_eid` (the `eid=` TXT reader)
+//! stays in `cerulion_cli_engine::mdns_discovery`, because it normalizes ids
+//! through the CLI's `connect_cmd::normalize_eid`.
 //!
 //! # Failure posture
 //!
@@ -55,7 +57,11 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+use std::net::IpAddr;
 use std::path::PathBuf;
+
+mod browse;
+pub use browse::{browse_rung, browse_rung_report, instance_from_fullname, BrowseRungReport};
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Deserialize;
@@ -307,18 +313,39 @@ pub fn sanitize_instance(robot: &str) -> String {
 ///
 /// Returns the port of the FIRST `tcp/` endpoint (the substring after its LAST
 /// `:`, so the IPv6 bracket form `tcp/[::]:7683` and the `tcp/0.0.0.0:7683` /
-/// `tcp/host:7683` forms all parse), or `None` when no endpoint is `tcp/` or the
-/// port is unparseable. PURE — oracle-tested.
+/// `tcp/host:7683` forms all parse), or `None` when no endpoint is `tcp/`, its
+/// host is loopback (including an IPv4-mapped loopback address), its port is
+/// zero, or the port is unparseable. The first TCP
+/// endpoint is the only candidate. PURE; oracle-tested.
 ///
 /// `None` is a REFUSAL TO ADVERTISE, not a default: the beacon's whole payload is
-/// "dial me at this port", so a gateway with no dialable tcp port has nothing to
-/// say and both callers skip the beacon LOUDLY rather than publishing a port
-/// nothing is bound to. On the netd-hosted plane this is also the desk/robot
+/// "dial me at this port", so a gateway with no LAN-dialable nonzero TCP port has
+/// nothing to say and both callers skip the beacon LOUDLY rather than publishing
+/// an unreachable endpoint. On the netd-hosted plane this is also the desk/robot
 /// discriminator — a desk netd sets no `CERULION_NETD_LISTEN`, so it has no
 /// listen endpoint and never advertises itself as a robot.
 pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
     let ep = listen_endpoints.iter().find(|e| e.starts_with("tcp/"))?;
-    ep.rsplit(':').next()?.parse::<u16>().ok()
+    let endpoint = ep.strip_prefix("tcp/")?;
+    let (host, raw_port) = endpoint.rsplit_once(':')?;
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    // A `.localhost` name resolves loopback on every resolver that honors
+    // RFC 6761 (a trailing dot is the root label, so tolerate `foo.localhost.`);
+    // refusing it keeps a loopback-only endpoint out of the LAN beacon.
+    let host_name = host.strip_suffix('.').unwrap_or(host);
+    if host_name
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.to_canonical().is_loopback())
+    {
+        return None;
+    }
+    let port = raw_port.parse::<u16>().ok()?;
+    (port != 0).then_some(port)
 }
 
 /// Build the advertise-side [`ServiceInfo`] for this robot's gateway:
@@ -467,20 +494,52 @@ mod tests {
     /// `run-gateway` fallback derive the advertised port from ONE rule.
     #[test]
     fn srv_port_reads_the_first_tcp_endpoint() {
-        // IPv6 bracket form: the port is the substring after the LAST colon.
+        // IPv6 wildcard and IPv4 wildcard forms are LAN-dialable.
         assert_eq!(
             srv_port_from_listen_endpoints(&["tcp/[::]:7683".to_string()]),
             Some(7683)
         );
-        // IPv4 wildcard + explicit host forms.
         assert_eq!(
             srv_port_from_listen_endpoints(&["tcp/0.0.0.0:7683".to_string()]),
             Some(7683)
         );
         assert_eq!(
-            srv_port_from_listen_endpoints(&["tcp/192.168.1.5:7001".to_string()]),
-            Some(7001)
+            srv_port_from_listen_endpoints(&["tcp/192.0.2.1:7683".to_string()]),
+            Some(7683)
         );
+        // An IPv4-mapped NON-loopback host is LAN-dialable and advertised.
+        assert_eq!(
+            srv_port_from_listen_endpoints(&["tcp/[::ffff:192.0.2.1]:7683".to_string()]),
+            Some(7683)
+        );
+        // Loopback cannot be reached by another machine and must not be advertised.
+        for endpoint in [
+            "tcp/127.0.0.1:7683",
+            "tcp/127.5.0.1:7683",
+            "tcp/[::1]:7683",
+            "tcp/[::ffff:127.0.0.1]:7683",
+            "tcp/localhost:7683",
+            "tcp/LOCALHOST:7683",
+            "tcp/gw.localhost:7683",
+            "tcp/GW.LOCALHOST:7683",
+            "tcp/gw.localhost.:7683",
+            "tcp/a.b.localhost:7683",
+        ] {
+            assert_eq!(
+                srv_port_from_listen_endpoints(&[endpoint.to_string()]),
+                None,
+                "{endpoint}"
+            );
+        }
+        // Only a name ENDING in `.localhost` is refused; a name that merely
+        // contains the label stays LAN-dialable.
+        for endpoint in ["tcp/localhost.example.com:7683", "tcp/localhosted:7683"] {
+            assert_eq!(
+                srv_port_from_listen_endpoints(&[endpoint.to_string()]),
+                Some(7683),
+                "{endpoint}"
+            );
+        }
         // The FIRST tcp/ endpoint wins, even when a non-tcp one precedes it.
         assert_eq!(
             srv_port_from_listen_endpoints(&[
@@ -491,7 +550,7 @@ mod tests {
             Some(7683)
         );
         // NO advertise: empty, no tcp/ endpoint, an unparseable port, a missing
-        // port, and a port past u16 all yield None (the caller skips loudly).
+        // port, a port past u16, and port zero all yield None (the caller skips loudly).
         assert_eq!(srv_port_from_listen_endpoints(&[]), None);
         assert_eq!(
             srv_port_from_listen_endpoints(&["udp/0.0.0.0:7683".to_string()]),
@@ -508,6 +567,26 @@ mod tests {
         assert_eq!(
             srv_port_from_listen_endpoints(&["tcp/0.0.0.0:70000".to_string()]),
             None
+        );
+        assert_eq!(
+            srv_port_from_listen_endpoints(&["tcp/0.0.0.0:0".to_string()]),
+            None
+        );
+        assert_eq!(
+            srv_port_from_listen_endpoints(&[
+                "tcp/0.0.0.0:0".to_string(),
+                "tcp/0.0.0.0:7683".to_string(),
+            ]),
+            None,
+            "a later TCP endpoint does not replace the first TCP endpoint"
+        );
+        assert_eq!(
+            srv_port_from_listen_endpoints(&[
+                "tcp/127.0.0.1:7683".to_string(),
+                "tcp/0.0.0.0:7683".to_string(),
+            ]),
+            None,
+            "a later TCP endpoint does not replace a loopback first endpoint"
         );
     }
 

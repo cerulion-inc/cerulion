@@ -213,20 +213,35 @@ fn desk_label_default() -> String {
     cerulion_core::graph::robot_identity_from_env()
 }
 
-/// Resolve the desk key PATH: the explicit `--key-file`, else the well-known
-/// `~/.cerulion/desk.key`. A missing home directory with no explicit path is a
-/// loud error. `cerulion-connectd pair` CREATES the key at this path if absent.
+/// Resolve the desk key PATH: the explicit `--key-file`, else this machine's
+/// key, created here (0600) when no key exists so `cerulion-connectd pair` and
+/// sign-in share one key. The path returned is its legacy name
+/// `~/.cerulion/desk.key`; `cerulion-connectd pair` recognizes it as this
+/// machine's key and loads it through the identity layout.
+/// A missing home directory with no explicit path is a loud error.
+/// `cerulion-connectd pair` CREATES an explicit `--key-file` path if absent.
 fn resolve_desk_key_path(explicit: Option<PathBuf>) -> CliResult<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p);
     }
-    crate::connect_cmd::desk_key_path().ok_or_else(|| {
+    let layout = crate::auth::identity_layout().ok_or_else(|| {
         CliError::Validation(
-            "no home directory to resolve ~/.cerulion/desk.key — pass `--key-file <path>` \
-             for the desk device key"
+            "no home directory to hold this machine's device key: set CERULION_HOME, or pass \
+             `--key-file <path>` for the desk device key"
                 .to_string(),
         )
-    })
+    })?;
+    let (key, origin) = layout
+        .load_or_create_machine_key()
+        .map_err(|e| CliError::Validation(format!("cerulion pair: {e}")))?;
+    if origin == cerulion_pairing::identity::KeyOrigin::Created {
+        tracing::info!(
+            fingerprint = %key.short_fingerprint(),
+            path = %layout.device_key_path().display(),
+            "cerulion pair: created this machine's device key"
+        );
+    }
+    Ok(layout.legacy_desk_key_path())
 }
 
 // ── argv construction (pure, byte-oracle-tested) ──────────────────────────────
@@ -295,8 +310,27 @@ fn warn_if_code_in_argv(code: Option<&str>) -> bool {
     }
 }
 
+/// The refusal `cerulion pair` prints, before its mDNS lookup and before it
+/// spawns `cerulion-connectd`, when `CERULION_NETWORK` (the run and query parse,
+/// [`crate::graph_cmd::network_env_kill_from`]) keeps the command local. `None`
+/// when the variable is unset. Pure over its input (`None` = not set).
+pub fn network_refusal_from(network: Option<String>) -> Option<String> {
+    crate::graph_cmd::network_env_kill_from(network)
+        .refusal_label()
+        .map(|label| {
+            format!(
+                "cerulion pair reaches the robot over the network, which {label} disables; \
+                 unset CERULION_NETWORK to pair"
+            )
+        })
+}
+
 /// Resolve the full spawn plan: the target (eid + name) + the argv + the binary.
+/// Refused first under the network kill switch ([`network_refusal_from`]).
 pub fn plan(args: &PairArgs) -> CliResult<PairPlan> {
+    if let Some(refusal) = network_refusal_from(std::env::var("CERULION_NETWORK").ok()) {
+        return Err(CliError::Validation(refusal));
+    }
     warn_if_code_in_argv(args.code.as_deref());
     let target = resolve_pair_target(args)?;
     let key_path = resolve_desk_key_path(args.key_file.clone())?;
@@ -523,6 +557,29 @@ fn pinned_line(name: &str, eid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pairing refuses under the network kill switch, naming the setting that
+    /// engaged it; unset or whitespace-only, it proceeds.
+    #[test]
+    fn pair_refuses_under_the_network_kill_switch() {
+        assert_eq!(network_refusal_from(None), None);
+        assert_eq!(network_refusal_from(Some(" ".into())), None);
+        assert_eq!(
+            network_refusal_from(Some(" OFF ".into())).as_deref(),
+            Some(
+                "cerulion pair reaches the robot over the network, which CERULION_NETWORK=off \
+                 disables; unset CERULION_NETWORK to pair"
+            )
+        );
+        assert_eq!(
+            network_refusal_from(Some("on".into())).as_deref(),
+            Some(
+                "cerulion pair reaches the robot over the network, which CERULION_NETWORK=on \
+                 (an unrecognized value, which fails closed to local-only) disables; unset \
+                 CERULION_NETWORK to pair"
+            )
+        );
+    }
 
     // Exactly 64 hex chars.
     const HEX64: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";

@@ -15,8 +15,8 @@
 //! a heap struct, so nothing here asserts on those patterns.
 
 use cerulion_core::codegen::{
-    generate_schema, parse_rosmsg, resolve_fixed_nested, FieldDef, FieldType, MessageSchema,
-    NestedFixedInfo, ScalarLiteral,
+    generate_schema, parse_rosmsg, parse_rossrv, resolve_fixed_nested, FieldDef, FieldType,
+    MessageSchema, NestedFixedInfo, ScalarLiteral,
 };
 
 /// NO generated code may name a bare `::serde` path.
@@ -87,6 +87,110 @@ fn the_bare_serde_guard_rejects_a_bare_path_in_every_derive_position() {
 // =============================================================================
 // Fixed-schema codegen
 // =============================================================================
+
+/// The `pub struct` names in `code` whose attribute block (the `#[...]` and
+/// `///` lines right above the declaration) does not hold
+/// `#[allow(non_camel_case_types)]`.
+fn structs_without_camel_case_allow(code: &str) -> Vec<String> {
+    let lines: Vec<&str> = code.lines().collect();
+    let mut missing = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("pub struct ") else {
+            continue;
+        };
+        let allowed = lines[..i]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+            .any(|l| *l == "#[allow(non_camel_case_types)]");
+        if !allowed {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            missing.push(name);
+        }
+    }
+    missing
+}
+
+/// A service request or response keeps its ROS 2 name (`SetBool_Request`),
+/// which the `non_camel_case_types` lint rejects. Every generated struct of
+/// such a message (marker, `Shm`, `FixedSection`, `Snapshot`) carries the
+/// allow, for a fixed and for a variable message.
+#[test]
+fn service_message_structs_allow_the_ros_2_names() {
+    let srv = parse_rossrv(
+        "bool data\n---\nbool success\nstring message\n",
+        "SetBool",
+        Some("std_srvs"),
+        "std_srvs/SetBool.srv",
+    )
+    .expect("SetBool parses");
+    for schema in [&srv.request, &srv.response] {
+        let code = generate_schema(schema);
+        assert!(code.contains(&format!("pub struct {};", schema.name)));
+        assert_eq!(
+            structs_without_camel_case_allow(&code),
+            Vec::<String>::new(),
+            "{} structs without the allow",
+            schema.name
+        );
+    }
+    // The variable response emits all four kinds of struct.
+    let code = generate_schema(&srv.response);
+    for name in [
+        "SetBool_Response;",
+        "SetBool_ResponseShm<'a> {",
+        "SetBool_ResponseFixedSection {",
+        "SetBool_ResponseSnapshot {",
+    ] {
+        assert!(
+            code.contains(&format!("pub struct {name}")),
+            "missing {name}"
+        );
+    }
+}
+
+/// A plain UpperCamelCase name gets no allow, so its output is unchanged.
+#[test]
+fn a_camel_case_message_gets_no_camel_case_allow() {
+    let mut schema = MessageSchema::new("Vector3");
+    schema.add_field(FieldDef::new("x", FieldType::F64));
+    let code = generate_schema(&schema);
+    assert!(!code.contains("non_camel_case_types"), "{code}");
+}
+
+/// A name that starts lower case is also rejected by the lint, so it gets
+/// the allow on every struct even with no underscore.
+#[test]
+fn a_lower_case_message_name_gets_the_camel_case_allow() {
+    let mut schema = MessageSchema::new("vector3");
+    schema.add_field(FieldDef::new("x", FieldType::F64));
+    let code = generate_schema(&schema);
+    assert_eq!(
+        structs_without_camel_case_allow(&code),
+        Vec::<String>::new()
+    );
+}
+
+/// Generating a service message twice gives the same text, allow lines
+/// included.
+#[test]
+fn service_message_codegen_is_deterministic() {
+    let srv = parse_rossrv(
+        "bool data\n---\nbool success\nstring message\n",
+        "SetBool",
+        Some("std_srvs"),
+        "std_srvs/SetBool.srv",
+    )
+    .expect("SetBool parses");
+    assert_eq!(
+        generate_schema(&srv.response),
+        generate_schema(&srv.response)
+    );
+    assert_eq!(generate_schema(&srv.request), generate_schema(&srv.request));
+}
 
 #[test]
 fn test_fixed_schema_emits_marker_shm_snapshot_shm_message() {
@@ -2307,6 +2411,30 @@ fn a_string_only_default_leaves_the_fixed_overlay_derived() {
     assert!(code.contains(
         "#[derive(Debug, Clone, Copy, PartialEq, Default)]\npub struct OnlyStrFixedSection {"
     ));
+}
+
+/// A large array whose element is variable (`string[33]`, or a nested
+/// type that did not resolve as fixed) lives in the payload region, not in
+/// the fixed overlay. It must not force a manual overlay `Default`, which
+/// clippy `derivable_impls` would reject, and must not drop `Debug`.
+#[test]
+fn a_variable_large_array_leaves_the_fixed_overlay_derived() {
+    for (msg, name) in [
+        ("string[33] names\nint32 plain\n", "BigStr"),
+        ("q/Header[33] stamps\nint32 plain\n", "BigHdr"),
+    ] {
+        let code = generate_from_msg(msg, name);
+        let decl = format!("pub struct {name}FixedSection {{");
+        assert_eq!(
+            derive_above(&code, &decl),
+            "#[derive(Debug, Clone, Copy, PartialEq, Default)]",
+            "{name}"
+        );
+        assert!(
+            !code.contains(&format!("impl Default for {name}FixedSection")),
+            "{name}"
+        );
+    }
 }
 
 /// A `string[]` snapshot field holds the raw wire payload, so its default

@@ -1144,14 +1144,13 @@ pub fn resolve_lib_dir() -> CliResult<PathBuf> {
 ///   deliberate side effect — it runs in the dispatch, never in the pure
 ///   plan builder.
 pub fn stage_ament_prefix(lib_dir: &Path) -> CliResult<PathBuf> {
-    let state_dir = dirs::home_dir()
+    let state_dir = crate::auth::cerulion_config_dir()
         .ok_or_else(|| {
             CliError::Validation(
                 "cannot resolve a home directory for the ament staging prefix — set HOME"
                     .to_string(),
             )
         })?
-        .join(".cerulion")
         .join("ros2");
     stage_ament_prefix_under(&state_dir, lib_dir)
 }
@@ -1188,7 +1187,7 @@ fn ament_prefix_path_under(state_dir: &Path, lib_dir: &Path) -> PathBuf {
 /// shape rather than failing, because a user with an unusable HOME still
 /// deserves the refusal's answer rather than a staging error.
 pub fn ament_prefix_path(lib_dir: &Path) -> Option<PathBuf> {
-    let state_dir = dirs::home_dir()?.join(".cerulion").join("ros2");
+    let state_dir = crate::auth::cerulion_config_dir()?.join("ros2");
     Some(ament_prefix_path_under(&state_dir, lib_dir))
 }
 

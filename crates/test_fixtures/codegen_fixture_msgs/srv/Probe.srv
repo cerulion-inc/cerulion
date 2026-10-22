@@ -1,0 +1,6 @@
+# A service: codegen names its request and response messages
+# Probe_Request and Probe_Response, the ROS 2 names.
+bool data true
+---
+bool success
+string message "ready"

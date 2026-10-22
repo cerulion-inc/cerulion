@@ -45,10 +45,10 @@ pub fn parse_rosmsg(
 
     for (idx, line) in msg_content.lines().enumerate() {
         let line_num = idx + 1;
-        let line = line.trim();
+        let line = strip_comment(line);
 
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
+        // Skip empty lines and comment-only lines
+        if line.is_empty() {
             continue;
         }
 
@@ -113,7 +113,7 @@ impl QuoteScan {
     }
 
     /// Feed one character. Returns true when `c` is outside every quoted
-    /// string, so the caller may treat it as syntax (`#`, `,`).
+    /// string, so the caller may treat it as syntax (the `,` between items).
     fn outside(&mut self, c: char) -> bool {
         if let Some(q) = self.quote {
             if self.escaped {
@@ -139,38 +139,15 @@ impl QuoteScan {
     }
 }
 
-/// Cut a trailing `# comment` that sits outside any quoted string, and
-/// trim the result.
+/// Cut `line` at its first `#` and trim the result.
 ///
-/// For a string value (`string_value`), a `#` in bare text starts a
-/// comment only as the first character or after whitespace or a closing
-/// quote, so `string TAG=a#b` keeps `a#b` while `string LABEL=it's # note`
-/// is `it's` and `string S="x"#note` is `x`. For any other type every `#`
-/// outside a quoted string starts a comment. (rosidl cuts at the first
-/// `#` anywhere, even inside quotes; a quoted `#` is kept here so a
-/// string can hold one.)
-fn strip_comment(text: &str, string_value: bool) -> &str {
-    let mut scan = QuoteScan::new();
-    let mut at_boundary = true;
-    for (i, c) in text.char_indices() {
-        let was_quoted = scan.quote.is_some();
-        if scan.outside(c) && c == '#' && (!string_value || at_boundary) {
-            return text[..i].trim();
-        }
-        at_boundary = c.is_whitespace() || (was_quoted && scan.quote.is_none());
-    }
-    text.trim()
-}
-
-/// True when values of `ft` (or its array elements) are strings.
-fn holds_strings(ft: &FieldType) -> bool {
-    match ft {
-        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
-            holds_strings(element_type)
-        }
-        FieldType::String => true,
-        _ => false,
-    }
+/// rosidl treats the first `#` anywhere on a line as the start of a
+/// comment, inside a quoted string or bare text alike, before it reads
+/// any value. So `string s a#b` has the default `a`, and
+/// `string S="a#b"` is an unterminated string. Reading it the same way
+/// keeps a `.msg` file meaning the same thing here as in a ROS 2 build.
+fn strip_comment(line: &str) -> &str {
+    line.split_once('#').map_or(line, |(code, _)| code).trim()
 }
 
 /// Which kind of value a literal belongs to, for the error text.
@@ -214,7 +191,7 @@ fn parse_constant(type_token: &str, name: &str, value: &str) -> Result<ConstantD
             "constant {name}: type {type_token} is not a primitive type or a string"
         ));
     }
-    let value = strip_comment(value, holds_strings(&field_type));
+    let value = value.trim();
     if value.is_empty() {
         return Err(format!("constant {name} has no value"));
     }
@@ -267,16 +244,43 @@ fn parse_field_line(line: &str, line_num: usize) -> Result<FieldDef, ParseError>
 
     let mut field = FieldDef::new(field_name, field_type);
 
-    // Everything after the name, up to a comment, is the default value
-    // (`float64 w 1`, `string s "a b"`, `int32[] v [1, 2]`).
-    let default_text = strip_comment(default_text, holds_strings(&field.field_type));
+    // Everything after the name is the default value (`float64 w 1`,
+    // `string s "a b"`, `int32[] v [1, 2]`); the comment is already cut.
     if !default_text.is_empty() {
         let default = parse_default(&field.field_type, ros_type, default_text)
+            .and_then(|d| refuse_wide_string_default(ros_type, d))
             .map_err(|message| ParseError::InvalidLine { line_num, message })?;
         field = field.with_default(default);
     }
 
     Ok(field)
+}
+
+/// Refuse a non-empty default on a `wstring` field. A `wstring` is carried as
+/// a [`FieldType::String`], which the codec writes as UTF-8, not the UTF-16 a
+/// ROS 2 peer reads, so a pre-filled value would go on the wire in the wrong
+/// encoding. An empty default (`""`, `[]`, `["", ""]`) is the zero value and
+/// is kept. A `wstring` constant is still accepted: constants never reach the
+/// wire.
+fn refuse_wide_string_default(
+    type_token: &str,
+    default: DefaultLiteral,
+) -> Result<DefaultLiteral, String> {
+    if !type_token.starts_with("wstring") {
+        return Ok(default);
+    }
+    let non_empty = |v: &ScalarLiteral| matches!(v, ScalarLiteral::Str(s) if !s.is_empty());
+    let has_text = match &default {
+        DefaultLiteral::Scalar(v) => non_empty(v),
+        DefaultLiteral::Array(items) => items.iter().any(non_empty),
+    };
+    if has_text {
+        return Err(format!(
+            "a non-empty default on {type_token} is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        ));
+    }
+    Ok(default)
 }
 
 /// Parse + validate a field default against its type. `type_token` is the
@@ -1098,7 +1102,7 @@ mod constant_and_default_tests {
              float64 RATE=2.5\n\
              bool ON=True\n\
              byte RAW=255\n\
-             string MODE = \"AUTO # not a comment\"  # but this is\n\
+             string MODE = \"AUTO\"  # a comment\n\
              string BARE=plain text\n\
              uint64 BIG=18446744073709551615\n\
              string name\n");
@@ -1112,11 +1116,7 @@ mod constant_and_default_tests {
                 constant("RATE", FieldType::F64, ScalarLiteral::Float(2.5)),
                 constant("ON", FieldType::Bool, ScalarLiteral::Bool(true)),
                 constant("RAW", FieldType::U8, ScalarLiteral::Int(255)),
-                constant(
-                    "MODE",
-                    FieldType::String,
-                    ScalarLiteral::Str("AUTO # not a comment".into())
-                ),
+                constant("MODE", FieldType::String, ScalarLiteral::Str("AUTO".into())),
                 constant(
                     "BARE",
                     FieldType::String,
@@ -1189,6 +1189,10 @@ mod constant_and_default_tests {
                 format!("line 2: invalid constant name: {bad}")
             );
         }
+        // rosidl reads any `=` after the name as a constant separator, so a
+        // bare string default that starts with `=` is a constant named `s`,
+        // and that name is refused (rosidl raises the same error).
+        assert_eq!(err("string s =foo\n"), "line 1: invalid constant name: s");
         let ok = one("uint8 A=1\nuint8 A_B2=2\nuint8 X9_Y_Z=3\nuint8 B1=4\n");
         assert_eq!(
             ok.constants
@@ -1431,21 +1435,73 @@ mod constant_and_default_tests {
         );
         assert!(parse_rosmsg("string<=2 a \"\u{e9}\"\n", "Fits", None).is_ok());
         // A `wstring<=N` bound counts UTF-16 units: `é` is one unit, so it
-        // fits a bound of 1; U+1F600 is a surrogate pair, two units.
-        assert!(parse_rosmsg("wstring<=1 a \"\u{e9}\"\n", "Fits", None).is_ok());
-        assert!(parse_rosmsg("wstring<=1[] a [\"\u{e9}\"]\n", "Fits", None).is_ok());
-        assert!(parse_rosmsg("wstring<=2 a \"\u{1f600}\"\n", "Fits", None).is_ok());
+        // fits a bound of 1; U+1F600 is a surrogate pair, two units. Only a
+        // constant can hold wide text (a non-empty wstring default is
+        // refused, see below), so the bound is pinned on constants.
+        assert!(parse_rosmsg("wstring<=1 A=\"\u{e9}\"\n", "Fits", None).is_ok());
+        assert!(parse_rosmsg("wstring<=2 A=\"\u{1f600}\"\n", "Fits", None).is_ok());
         assert_eq!(
-            err("wstring<=1 a \"\u{1f600}\"\n"),
-            "line 1: string default is longer than its bound of 1 UTF-16 units"
+            err("wstring<=1 A=\"\u{1f600}\"\n"),
+            "line 1: string constant is longer than its bound of 1 UTF-16 units"
         );
         assert_eq!(
-            err("wstring<=2 a \"abc\"\n"),
-            "line 1: string default is longer than its bound of 2 UTF-16 units"
+            err("wstring<=2 A=\"abc\"\n"),
+            "line 1: string constant is longer than its bound of 2 UTF-16 units"
         );
+        // The bound is checked before the wstring refusal, so a default that
+        // is both too long and wide names the bound.
         assert_eq!(
             err("wstring<=1[] a [\"ab\"]\n"),
             "line 1: string default is longer than its bound of 1 UTF-16 units"
+        );
+        // A wstring is written as UTF-8, so a non-empty wstring default
+        // would reach a ROS 2 peer in the wrong encoding: it is refused,
+        // scalar or array, bounded or not, naming the declared type.
+        assert_eq!(
+            err("wstring a \"hi\"\n"),
+            "line 1: a non-empty default on wstring is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring<=4 a \"\u{e9}\"\n"),
+            "line 1: a non-empty default on wstring<=4 is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring[] a [\"\", \"x\"]\n"),
+            "line 1: a non-empty default on wstring[] is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        assert_eq!(
+            err("wstring[2] a [\"x\", \"\"]\n"),
+            "line 1: a non-empty default on wstring[2] is not supported: \
+             a wstring is written as UTF-8, not UTF-16"
+        );
+        // An empty wstring default is the zero value and is kept; a plain
+        // `string` default and a wstring constant are untouched.
+        let empty = parse_rosmsg("wstring a \"\"\nwstring[] b [\"\", \"\"]\n", "E", None)
+            .expect("an empty wstring default parses");
+        assert_eq!(
+            empty.fields[0].default_literal,
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Str(String::new())))
+        );
+        assert_eq!(
+            empty.fields[1].default_literal,
+            Some(DefaultLiteral::Array(vec![
+                ScalarLiteral::Str(String::new()),
+                ScalarLiteral::Str(String::new()),
+            ]))
+        );
+        let plain = parse_rosmsg("string a \"hi\"\n", "P", None).expect("a string default parses");
+        assert_eq!(
+            plain.fields[0].default_literal,
+            Some(DefaultLiteral::Scalar(ScalarLiteral::Str("hi".to_string())))
+        );
+        let constant =
+            parse_rosmsg("wstring A=\"hi\"\n", "C", None).expect("a wstring constant parses");
+        assert_eq!(
+            constant.constants[0].value,
+            ScalarLiteral::Str("hi".to_string())
         );
         assert_eq!(
             err("int32[] a 1, 2\n"),
@@ -1597,33 +1653,55 @@ mod literal_syntax_tests {
     }
 
     #[test]
-    fn a_hash_in_bare_string_text_starts_a_comment_only_after_whitespace() {
+    fn the_first_hash_on_a_line_starts_a_comment_as_rosidl_reads_it() {
         use ScalarLiteral::{Int, Str};
+        // rosidl cuts every line at its first `#`, so a bare string value
+        // ends there, with or without a space before it.
         assert_eq!(
-            constant_values("string TAG=a#b\nstring T2=a#b # note\n"),
-            vec![Str("a#b".into()), Str("a#b".into())]
+            constant_values("string TAG=a#b\nstring T2=a #b\n"),
+            vec![Str("a".into()), Str("a".into())]
         );
-        // A `#` as the value's first character is a comment, so nothing
-        // is left.
+        assert_eq!(
+            default_of("string s a#b\n"),
+            Some(DefaultLiteral::Scalar(Str("a".into())))
+        );
+        // A `#` as the value's first character leaves no value.
         assert_eq!(err("string T3=#x\n"), "line 1: constant T3 has no value");
+        assert_eq!(default_of("string s #x\n"), None);
+        // A `#` inside quotes is cut too, so the quote never closes.
         assert_eq!(
-            default_of("string s a#b # note\n"),
-            Some(DefaultLiteral::Scalar(Str("a#b".into())))
+            err("string S=\"a#b\"\n"),
+            "line 1: unterminated string constant: \"a"
         );
-        // The same rule holds for each item of a string array.
         assert_eq!(
-            default_of("string[] v [a#b, c] # note\n"),
-            Some(DefaultLiteral::Array(vec![
-                Str("a#b".into()),
-                Str("c".into())
-            ]))
+            err("string s 'a#b'\n"),
+            "line 1: unterminated string default: 'a"
         );
-        // Right after a closing quote a `#` is a comment too.
+        // Right after a closing quote.
         assert_eq!(
             constant_values("string S=\"x\"#note\n"),
             vec![Str("x".into())]
         );
-        // A non-string value is cut at any `#`.
+        // In a string array the cut can land inside an item, which then
+        // leaves the list unclosed, or right after the closing `]`.
+        assert_eq!(
+            err("string[] v [a#b, c]\n"),
+            "line 1: array default must be written [a, b, ...]: [a"
+        );
+        assert_eq!(
+            default_of("string[] v [\"x\"]# note\n"),
+            Some(DefaultLiteral::Array(vec![Str("x".into())]))
+        );
+        assert_eq!(
+            default_of("string[2] v [a, c]#note\n"),
+            Some(DefaultLiteral::Array(vec![
+                Str("a".into()),
+                Str("c".into())
+            ]))
+        );
+        // A scalar string: `]` is plain text, the `#` after it still cuts.
+        assert_eq!(constant_values("string S=a]#b\n"), vec![Str("a]".into())]);
+        // A non-string value is cut the same way.
         assert_eq!(constant_values("uint8 X=1#c\n"), vec![Int(1)]);
     }
 

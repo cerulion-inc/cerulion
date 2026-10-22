@@ -1120,6 +1120,8 @@ pub unsafe extern "C" fn rmw_publish(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
             Err(_) => 0,
@@ -1910,6 +1912,8 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let key = ros_message as usize;
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
@@ -2175,6 +2179,38 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let Some(ros_topic) = ffi::cstr(topic_name) else {
             return std::ptr::null_mut();
         };
+        // Lyrical and Rolling: `acceptable_buffer_backends`. CPU is always
+        // acceptable and is the only backend this rmw has, so a subscription
+        // naming another backend is created, logs one warning naming the
+        // backends it ignores, and receives CPU data. Malformed input fails
+        // the create (null, the RMW_RET_ERROR of a constructor) with the
+        // reason on rcl's error channel.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        {
+            let requested = (*subscription_options).acceptable_buffer_backends;
+            let requested =
+                (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+            match crate::rosidl_buffer::validate_acceptable_buffer_backends(requested) {
+                Ok(ignored) if !ignored.is_empty() => {
+                    tracing::warn!(
+                        topic = %ros_topic,
+                        ignored_backends = %ignored.join(","),
+                        "acceptable_buffer_backends names backends rmw_cerulion does not have; \
+                         this subscription receives every frame as CPU data"
+                    );
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        topic = %ros_topic,
+                        reason = %reason,
+                        "subscription creation refused: acceptable_buffer_backends is malformed"
+                    );
+                    let _ = ffi::rcutils_set_error_state_best_effort(&reason);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
         let Ok(rt) = runtime::runtime() else {
             return std::ptr::null_mut();
         };

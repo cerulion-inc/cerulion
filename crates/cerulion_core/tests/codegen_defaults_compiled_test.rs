@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Compiled pins for `.msg` constants and string, array and all-zero
-//! defaults.
+//! defaults, and for a `.srv` service whose request and response keep the
+//! ROS 2 names (`Probe_Request`, `Probe_Response`).
 //!
 //! No vendored message carries a string or array default, so these paths
 //! are generated here from the `codegen_fixture_msgs` fixture crate (its
@@ -13,17 +14,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cerulion_core::codegen::{parse_rosmsg, FrameValueKind, FrameWalker};
+use cerulion_core::codegen::{parse_rosmsg, parse_rossrv, FrameValueKind, FrameWalker};
 use cerulion_core::testing::TestTransport;
 use cerulion_core::transport::publisher::CerulionPublisher;
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 
 use codegen_fixture_msgs::codegen_fixture::{
-    DefaultsFixedShm, DefaultsFixedSnapshot, DefaultsVar, DefaultsVarSnapshot, ZeroDefaultsSnapshot,
+    DefaultsFixedShm, DefaultsFixedSnapshot, DefaultsVar, DefaultsVarSnapshot, Probe_RequestShm,
+    Probe_RequestSnapshot, Probe_Response, Probe_ResponseSnapshot, ZeroDefaultsSnapshot,
 };
 
 const DEFAULTS_VAR_MSG: &str =
     include_str!("../../test_fixtures/codegen_fixture_msgs/msg/DefaultsVar.msg");
+const PROBE_SRV: &str = include_str!("../../test_fixtures/codegen_fixture_msgs/srv/Probe.srv");
 
 static TOPIC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +129,42 @@ fn the_default_string_array_payload_decodes_through_the_frame_walker() {
     assert_eq!(fv.field("s"), Some(&FrameValueKind::Str("hi")));
     assert_eq!(fv.field("bounded"), Some(&FrameValueKind::Str("bound")));
     assert_eq!(fv.field("plain"), Some(&FrameValueKind::U16(0)));
+}
+
+/// The `.srv` request and response compile under their ROS 2 names and hold
+/// the defaults `Probe.srv` declares: `bool data true` in the fixed request,
+/// `string message "ready"` in the variable response.
+#[test]
+fn a_service_request_and_response_compile_with_their_defaults() {
+    assert!(Probe_RequestSnapshot::default().data);
+    // The SHM overlay stores `bool` as `u8`.
+    assert_eq!(Probe_RequestShm::default().data, 1u8);
+    let response = Probe_ResponseSnapshot::default();
+    assert!(!response.success);
+    assert_eq!(response.message, "ready");
+}
+
+/// The default response publishes through the generated writer, and the
+/// frame decodes with the `FrameWalker` built from the `.srv` response.
+#[test]
+fn the_default_service_response_decodes_through_the_frame_walker() {
+    let frame = publish_default_frame(|publisher| {
+        let mut proxy = publisher
+            .loan_proxy::<Probe_Response>()
+            .expect("loan_proxy");
+        proxy
+            .write_from_snapshot(&Probe_ResponseSnapshot::default())
+            .expect("write the default snapshot");
+    });
+    let srv = parse_rossrv(PROBE_SRV, "Probe", Some("codegen_fixture"), "Probe.srv")
+        .expect("fixture parses");
+    let (walker, warnings) = FrameWalker::new(vec![srv.response]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let fv = walker
+        .walk("codegen_fixture/Probe_Response", &frame)
+        .expect("walk the Probe_Response frame");
+    assert_eq!(fv.field("success"), Some(&FrameValueKind::Bool(false)));
+    assert_eq!(fv.field("message"), Some(&FrameValueKind::Str("ready")));
 }
 
 /// Publish once through `write` on a fresh topic and return the one

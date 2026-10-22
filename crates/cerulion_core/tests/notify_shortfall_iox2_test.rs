@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![cfg(not(feature = "local-transport"))]
+// This binary spawns child processes that share an iceoryx2 namespace.
 //! A notify that reaches fewer listeners than the topic has must be counted and
 //! reported, and the condition that produces one must be REACHABLE, end to end
 //! over real iceoryx2.

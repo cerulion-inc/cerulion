@@ -260,10 +260,11 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
 The published `cerulion_cli_engine` 1.0.0 package exposes the graph-run partition
 APIs in [`partition_emit`](https://github.com/cerulion-inc/cerulion/blob/36135c33a10a09aa0dc6e7e7317c7f93c4f63ef8/crates/cerulion_cli_engine/src/partition_emit.rs#L1515).
 Removing their public fields, lifetime parameter, function argument and outcome
-variant breaks Rust callers. Publish the changed engine under a new major version,
-with the workspace version and internal dependency pins updated together under the
-lockstep release policy in `Cargo.toml`. Migration guidance alone does not make a
-1.x library update source compatible.
+variant breaks Rust callers. SemVer in 1.x does not cover the `cerulion_cli_engine`
+library API (see `CHANGELOG.md`), and these changes ship in a 1.x minor release with
+the workspace version and internal dependency pins updated together under the
+lockstep release policy in `Cargo.toml`. Rust code that calls the engine directly
+applies the migrations below.
 
 | 1.0.0 API | Migration |
 |---|---|
@@ -986,6 +987,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `tests/mp_auto_partition_e2e_test.rs` | Unix nonrecording and refusal arms; Linux recording and orphan cleanup (macOS runs none of this binary under the iceoryx2 2034 waiver). Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out, refusal never mutates the file | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib`, `test_node_macro_trigger_block_cdylib` |
 | `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Pins the `CERULION_EXECUTION_MODE=lockstep` opt-out on purpose: a free-run deployment has no barrier to plumb, so the property under test only exists there. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
 | `tests/mp_execution_mode_e2e_test.rs` | The execution-mode default over the real binary: a `process_groups:` run FREE-RUNS by default (`run.json` `gating: recorded_wall`, both workers `build_path=FreeRunTraced`, no shared barrier), `CERULION_EXECUTION_MODE=lockstep` opts out (`gating: quantum`, both workers `build_path=Lockstep`, both leave the cohort), and `--single-process` is the untouched negative control (`process_groups: false`, no worker line, no barrier breadcrumb). Positive `run.json` + per-worker witnesses first; breadcrumb absences second. | yes | same two |
+| `tests/mp_live_determinism_box_test.rs` | The live determinism oracle (Linux only, `#[ignore]`, iceoryx2 2034 waiver on macOS): the 3-node chain split into two ranks and into three ranks, each under `CERULION_EXECUTION_MODE=lockstep` and under the shipped free-run default (the variable REMOVED), `CER_DET_RUNS` live runs per arm (default 5) with busy-loop threads loading every CPU. Every run's merged worker trace is compared on `(node_id, step, global_level)` over `[0, k]` against an in-process monolith and a hand oracle, and prints one `DET_ORACLE mode= ranks= run= verdict= first_diff= k=` line, after the run proves its mode (one `build_path=` line per rank of the expected family) and, under lockstep, a per-rank drift of at most 2 steps; the arm prints a `DET_ORACLE_SUMMARY` line and asserts every run equal. Every harness failure panics with a `DET_HARNESS:` prefix, so a red arm made only of `DET_ORACLE` lines is a divergence, not a broken run. The free-run arms are expected to fail on a current build: free-run ranks do not agree on the step a cross-process input lands on. One pure arm pins the verdict function against hand vectors | yes | none (it scaffolds and builds its own node workspace) |
 | `tests/network_gateway_e2e_test.rs` | Permissive gateway lifecycle: notice exactly once, child reaped on SIGINT/SIGTERM, graceful-forward discriminator (the gateway's own shutdown line, not just exit 0 + reap) | yes | same two |
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
@@ -1010,6 +1012,9 @@ or REMOVE the variable). `mp_execution_mode` drives all three directions, and
 `mp_record`, `plain_run_resim` and `credit_death` carry per-arm pins.
 `mp_split_pair` and `mp_supervisor_box_test` pin the `lockstep` OPT-OUT,
 because their whole property is the barrier and a free-run deployment has none.
+`mp_live_determinism_box_test` drives BOTH directions on purpose: each of its
+shapes runs once with `lockstep` pinned and once with the variable REMOVED, because
+its property, run to run agreement with the monolith, is asked of both contracts.
 Every other binary whose spawn can reach the supervisor REMOVES the variable,
 so that it exercises the shipped default: `mp_auto_partition`,
 `mp_default_ns`, `mp_consumer_first_spawn`, `network_gateway_mp`,

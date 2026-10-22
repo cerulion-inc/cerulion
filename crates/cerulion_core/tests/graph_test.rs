@@ -3115,6 +3115,7 @@ nodes:
 /// partition covering only the native nodes is COMPLETE (the orphan check
 /// exempts ros2 entries).
 #[test]
+#[cfg(not(feature = "local-transport"))] // Process groups need cross-process shared memory.
 fn ros2_entries_are_refused_in_process_groups_and_exempt_from_coverage() {
     let base = r#"
 prefix: p

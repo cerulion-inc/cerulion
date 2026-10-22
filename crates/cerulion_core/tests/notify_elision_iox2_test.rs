@@ -60,6 +60,11 @@ use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
+#[cfg(not(feature = "local-transport"))]
+type TestService = iceoryx2::service::ipc_threadsafe::Service;
+#[cfg(feature = "local-transport")]
+type TestService = iceoryx2::service::local_threadsafe::Service;
+
 /// Steps discarded before the measured window (let the data-trigger chain reach
 /// steady state).
 const WARMUP: u32 = 3;
@@ -215,7 +220,7 @@ fn drive(runtime: &mut GraphRuntime, last_read: &Arc<AtomicU64>, n: u32) -> Vec<
 fn attach_foreign_listener(
     runtime: &GraphRuntime,
     topic: &str,
-) -> iceoryx2::port::listener::Listener<iceoryx2::service::ipc_threadsafe::Service> {
+) -> iceoryx2::port::listener::Listener<TestService> {
     let mgr = runtime
         .test_transport()
         .expect("build_for_test parks a test transport");

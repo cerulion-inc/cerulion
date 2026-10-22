@@ -9,6 +9,11 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use iceoryx2::prelude::*;
 use iceoryx2::service::attribute::AttributeSpecifier;
 
+#[cfg(not(feature = "local-transport"))]
+type TestService = iceoryx2::service::ipc_threadsafe::Service;
+#[cfg(feature = "local-transport")]
+type TestService = iceoryx2::service::local_threadsafe::Service;
+
 const SLICE: MaxSliceLen = MaxSliceLen::const_new(256);
 
 #[test]
@@ -92,7 +97,7 @@ fn marker_attribute_collision_refuses_observation_listing_and_publisher_creation
     let config = cerulion_core::testing::iceoryx_test_config();
     let node = NodeBuilder::new()
         .config(&config)
-        .create::<ipc_threadsafe::Service>()
+        .create::<TestService>()
         .unwrap();
     let topic = "/marker/collision";
     let name: ServiceName = marker_service_name(topic).as_str().try_into().unwrap();
@@ -169,7 +174,7 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
     let config = cerulion_core::testing::iceoryx_test_config();
     let node = NodeBuilder::new()
         .config(&config)
-        .create::<ipc_threadsafe::Service>()
+        .create::<TestService>()
         .unwrap();
     let topic = "/marker/missing_attribute";
     let name: ServiceName = marker_service_name(topic).as_str().try_into().unwrap();
@@ -208,7 +213,7 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
     let config = cerulion_core::testing::iceoryx_test_config();
     let node = NodeBuilder::new()
         .config(&config)
-        .create::<ipc_threadsafe::Service>()
+        .create::<TestService>()
         .unwrap();
     let hostile = "\u{1b}[2J\u{07}\r'\\u{1b}";
     let rendered = "\\u{1b}[2J\\u{7}\\r\\'\\\\u{1b}";
@@ -269,7 +274,7 @@ fn fenced_native_role_registration_cannot_admit_both_sources() {
     let config = cerulion_core::testing::iceoryx_test_config();
     let node = NodeBuilder::new()
         .config(&config)
-        .create::<ipc_threadsafe::Service>()
+        .create::<TestService>()
         .unwrap();
     for round in 0..100 {
         let name: ServiceName = format!("/fenced-admission/{round}")
@@ -450,7 +455,7 @@ fn source_constructors_never_admit_local_and_remote_together() {
 /// Separate processes map the same private SHM registry. The child must refuse
 /// a retained local source, then admit and deliver literal bytes after release.
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "local-transport")))] // Child process shares this namespace.
 fn a_child_remote_publisher_respects_the_local_source_lifetime() {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
