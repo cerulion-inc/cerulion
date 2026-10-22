@@ -302,6 +302,10 @@ members = [
     # inverted whole-build tree `cargo tree -e normal -i axum` (empty on a default
     # build).
     "crates/cerulion_accountd",
+    # The Robot Context Protocol daemon: an MCP server over the live robot
+    # graph. Hosts streamable HTTP on hyper (already in the default build),
+    # not axum, so its only new crates are rmcp and its small helpers.
+    "crates/cerulion_rcpd",
 ]
 # default-members: the LEAN build set — every workspace member EXCEPT the
 # heavy-tree crates: the `cerulion_viz/*` crates (the `rerun` SDK, ~39 crates) AND
@@ -345,6 +349,9 @@ default-members = [
     "crates/cerulion_wire",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
+    # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
+    # default build: its HTTP side runs on hyper, already here.
+    "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via
