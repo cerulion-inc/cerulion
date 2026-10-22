@@ -25,11 +25,13 @@ topology and param values only: each node's trigger policy is on its macro, in
 
 ## How this workspace was made
 
-The workspace was scaffolded with these verbs. The node bodies and their
-comments, the `args:` map and the `params:` block on the `timer` entry in
-`graphs/basic_timer.yaml`, the relative dependency paths in `Cargo.toml`, the
-`recordings/` line in `.gitignore` and the pinned `Cargo.lock` were then
-written by hand.
+These verbs scaffold the workspace. No verb writes the rest, so to make it
+yourself you add: the node bodies and their comments; at the top of
+`graphs/basic_timer.yaml`, the `args:` map that declares the `step` launch
+argument with its default (`step: 2`, which `step:=5` on `graph run` replaces
+for one run); the `params:` block on the `timer` entry that reads it
+(`step: ${step}`); the relative dependency paths in `Cargo.toml`; the
+`recordings/` line in `.gitignore`; and the pinned `Cargo.lock`.
 
 ```bash
 cerulion workspace create basic_timer
