@@ -102,6 +102,9 @@ CLI_FAMILIES_DIR = "crates/cerulion_cli/src/families/"
 # The registry: its `mod` lines and its `FAMILIES` list decide which family
 # modules the binary has. A source file in the directory is not a verb by itself.
 CLI_FAMILIES_MOD = CLI_FAMILIES_DIR + "mod.rs"
+# Nested-verb sets: verbs added under an existing verb, one module each.
+CLI_NESTED_DIR = CLI_FAMILIES_DIR + "nested/"
+CLI_NESTED_MOD = CLI_NESTED_DIR + "mod.rs"
 DATA_FILES = (ALLOW_FILE, PHRASES_FILE, LEDGER_FILE, WORKSTATE_FILE, WORKSTATE_LEDGER_FILE, ENTITY_FILE)
 
 # What no allow entry may excuse. The floor is the guard this whole class stands
@@ -237,11 +240,12 @@ def in_docs_set(rel):
 # ---------------------------------------------------------------------------
 
 
-def lex_rust(src):
+def lex_rust(src, keep_strings=False):
     """Return (code_view, literals). `code_view` is `src` with every comment and
     every string body blanked to spaces (same length, newlines kept) so brace
     counting, pattern search and line numbers stay exact; `literals` is a list
-    of (line, body) for every string literal outside comments."""
+    of (line, body) for every string literal outside comments. With
+    `keep_strings`, only the comments are blanked."""
     n = len(src)
     out = list(src)
     literals = []
@@ -290,7 +294,8 @@ def lex_rust(src):
             body = src[start:end]
             literals.append((line, body))
             line += body.count("\n")
-            blank(start, end)
+            if not keep_strings:
+                blank(start, end)
             i = end + 1 + len(hashes)
             continue
         if c == '"' or (c == "b" and i + 1 < n and src[i + 1] == '"'):
@@ -303,7 +308,8 @@ def lex_rust(src):
                     line += 1
                 i += 1
             literals.append((line - src.count("\n", start, i), src[start:i]))
-            blank(start, i)
+            if not keep_strings:
+                blank(start, i)
             i += 1
             continue
         if c == "'":
@@ -311,7 +317,8 @@ def lex_rust(src):
             if i + 2 < n and (src[i + 2] == "'" or src[i + 1] == "\\"):
                 j = src.find("'", i + 2 if src[i + 1] != "\\" else i + 3)
                 if j > 0:
-                    blank(i + 1, j)
+                    if not keep_strings:
+                        blank(i + 1, j)
                     i = j + 1
                     continue
             i += 1
@@ -545,9 +552,48 @@ def kebab(name):
 FAMILY_ENUM_RE = re.compile(r"^#\[derive\([^)\n]*\bSubcommand\b[^)\n]*\)\]\n(?:#\[[^\n]*\n)*(?:pub(?:\([a-z]+\))? )?enum (\w+) \{\n(.*?)\n\}\n", re.S | re.M)
 
 
-def parse_cli_tree(src, family_srcs=()):
+# A nested verb set's parent: `const PARENT: &str = "topic";` at the top level.
+NESTED_PARENT_RE = re.compile(r'^const PARENT: &str = "([a-z][a-z0-9-]*)";$', re.M)
+
+
+def code_matches(pattern, src):
+    """The matches of `pattern` that start in CODE: searched over `src` with
+    every comment removed (string literals kept, each line's trailing blanks
+    trimmed), and a match that starts inside a string literal dropped, so a
+    declaration in a comment or in a string (a doc example in a raw string)
+    is never read as code."""
+    kept, blanked = [], []
+    for k, b in zip(lex_rust(src, keep_strings=True)[0].split("\n"), lex_rust(src)[0].split("\n")):
+        n = len(k.rstrip())
+        kept.append(k[:n])
+        blanked.append(b[:n])
+    view, code = "\n".join(kept), "\n".join(blanked)
+    # A string body is blanked in `code` only, and every pattern here starts
+    # on a non-blank character, so a start that differs is inside a string.
+    return [m for m in pattern.finditer(view) if code[m.start()] == view[m.start()]]
+
+
+def module_verbs(path, fsrc):
+    """The verbs of one family or nested-verb module: the subtree of the one
+    `Subcommand` enum no other enum in the module nests. Only code counts, so
+    an enum inside a comment or a string is never a verb."""
+    fam = parse_enums(code_matches(FAMILY_ENUM_RE, fsrc))
+    nested = {d["sub"] for variants in fam.values() for d in variants.values()}
+    roots = [e for e in fam if e not in nested]
+    if not roots:
+        raise CannotRun("%s: no `#[derive(Subcommand)]` enum found; the verb parser no longer understands this verb family" % path)
+    # Exactly one: two un-nested enums mean the parser missed a nesting, and
+    # guessing would accept an action enum's verbs as top-level verbs.
+    if len(roots) > 1:
+        raise CannotRun("%s: %d `Subcommand` enums nest in no other (%s); a verb family has exactly one top-level verb enum" % (path, len(roots), ", ".join(sorted(roots))))
+    return build_tree(fam, roots[0])
+
+
+def parse_cli_tree(src, family_srcs=(), nested_srcs=()):
     """The clap verb tree from `#[derive(Subcommand)] pub enum ...` definitions,
-    plus every verb family module in `family_srcs` (`(path, source)` pairs)."""
+    plus every verb family module in `family_srcs` and every nested-verb module
+    in `nested_srcs` (`(path, source)` pairs), the latter under the verb its
+    `const PARENT` names."""
     enums = parse_enums(re.finditer(r"#\[derive\(Subcommand\)\]\s*\n(?:[^\n]*\n)*?pub enum (\w+) \{\n(.*?)\n\}\n", src, re.S))
     if "Commands" not in enums:
         raise CannotRun("%s: no `#[derive(Subcommand)] pub enum Commands` found; the verb parser no longer understands the CLI" % CLI_FILE)
@@ -555,19 +601,25 @@ def parse_cli_tree(src, family_srcs=()):
     for path, fsrc in family_srcs:
         # A family module's root is the enum no other enum in it nests: its
         # one-variant top-level verb. Enum names are scoped per module.
-        fam = parse_enums(FAMILY_ENUM_RE.finditer(fsrc))
-        nested = {d["sub"] for variants in fam.values() for d in variants.values()}
-        roots = [e for e in fam if e not in nested]
-        if not roots:
-            raise CannotRun("%s: no `#[derive(Subcommand)]` enum found; the verb parser no longer understands this verb family" % path)
-        # Exactly one: two un-nested enums mean the parser missed a nesting, and
-        # guessing would accept an action enum's verbs as top-level verbs.
-        if len(roots) > 1:
-            raise CannotRun("%s: %d `Subcommand` enums nest in no other (%s); a verb family has exactly one top-level verb enum" % (path, len(roots), ", ".join(sorted(roots))))
-        for verb, node in build_tree(fam, roots[0]).items():
+        for verb, node in module_verbs(path, fsrc).items():
             if verb in tree:
                 raise CannotRun("%s: the verb `%s` is defined twice" % (path, verb))
             tree[verb] = node
+    for path, fsrc in nested_srcs:
+        # A nested verb set's verbs join the subtree of the verb it names.
+        # Exactly one declaration, read from code only: a parent in a comment
+        # or a string is not the one the binary uses.
+        parents = code_matches(NESTED_PARENT_RE, fsrc)
+        if len(parents) != 1:
+            raise CannotRun("%s: a nested verb set declares %d `const PARENT: &str = \"<verb>\";` lines, expected exactly one, so its parent verb cannot be established" % (path, len(parents)))
+        parent = parents[0]
+        if parent.group(1) not in tree:
+            raise CannotRun("%s: nested verbs are added under `%s`, which is not a verb" % (path, parent.group(1)))
+        target = tree[parent.group(1)]
+        for verb, node in module_verbs(path, fsrc).items():
+            if verb in target:
+                raise CannotRun("%s: the verb `%s %s` is defined twice" % (path, parent.group(1), verb))
+            target[verb] = node
     return tree
 
 
@@ -576,34 +628,127 @@ FAMILY_ENTRY_RE = re.compile(r"&\s*(\w+)::\w+")
 FAMILY_MOD_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?mod (\w+);", re.M)
 
 
+NESTED_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static NESTED: &\[&dyn NestedVerbs\] = &\[(.*?)\];", re.S | re.M)
+
+
 def registered_family_paths(mod_src, files):
     """The source files of the verb families the binary registers: each module a
     `FAMILIES` entry names, declared by a `mod` line in the registry, as
     `families/<module>.rs` or `families/<module>/mod.rs`. A family file with no
     `FAMILIES` entry is not compiled into the verb set, so it is never read as
     one. Anything the parser cannot pin down refuses the run."""
-    family_files = [f for f in files if f.startswith(CLI_FAMILIES_DIR) and f.endswith(".rs") and f != CLI_FAMILIES_MOD]
+    return registered_module_paths(mod_src, files, CLI_FAMILIES_MOD, FAMILIES_LIST_RE,
+                                   "static FAMILIES: &[&dyn VerbFamily]", "FAMILIES",
+                                   exclude=(CLI_NESTED_DIR,))
+
+
+def registered_nested_paths(mod_src, files):
+    """The source files of the nested-verb sets the binary registers: each
+    module a `NESTED` entry in `families/nested/mod.rs` names, by the same rules
+    as [`registered_family_paths`]."""
+    return registered_module_paths(mod_src, files, CLI_NESTED_MOD, NESTED_LIST_RE,
+                                   "static NESTED: &[&dyn NestedVerbs]", "NESTED")
+
+
+# The production command factory, which `main` parses with: the nested-verb
+# sets are in the binary only when ITS body attaches them.
+CLI_FACTORY_FN = "cli_command"
+CLI_FACTORY_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?fn " + CLI_FACTORY_FN + r"\(\) -> Command \{", re.M)
+NESTED_ATTACH_RE = re.compile(r"\bnested::attach\([^;]*\bnested::NESTED\b")
+# The factory's tail expression when it returns the attached command: the
+# attach result itself (optionally unwrapped), or a `match` on it whose `Ok`
+# arm returns the command it binds.
+NESTED_TAIL_RE = re.compile(r"(match\s+)?nested::attach\([^;{}]*\bnested::NESTED\s*\)(.*)", re.S)
+NESTED_UNWRAP_RE = re.compile(r"\s*(?:\.unwrap\(\)|\.expect\([^()]*\))?\s*")
+NESTED_OK_ARM_RE = re.compile(r"\{\s*Ok\((\w+)\)\s*=>\s*(\w+)\s*,")
+
+
+def fn_body(code, start):
+    """The text from the `{` that ends at `start` to its matching `}`, in a
+    code view whose comments and string bodies are blanked."""
+    depth, i = 1, start
+    while i < len(code) and depth:
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        i += 1
+    return code[start:i]
+
+
+def tail_expr(body):
+    """The tail expression of a fn body from [`fn_body`]: the text after its
+    last statement-ending `;` at the body's own nesting level, closing `}`
+    dropped, trimmed. Empty when the body ends in a statement."""
+    depth, last = 0, -1
+    inner = body[:-1] if body.endswith("}") else body
+    for i, c in enumerate(inner):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            last = i
+    return inner[last + 1:].strip()
+
+
+def returns_attached(tail):
+    """Whether a factory tail expression returns the command `nested::attach`
+    built, not a value computed beside it."""
+    m = NESTED_TAIL_RE.fullmatch(tail)
+    if not m:
+        return False
+    rest = m.group(2)
+    if not m.group(1):
+        return NESTED_UNWRAP_RE.fullmatch(rest) is not None
+    arm = NESTED_OK_ARM_RE.match(rest.lstrip())
+    return arm is not None and arm.group(1) == arm.group(2)
+
+
+def check_nested_wiring(families_mod_src):
+    """Refuse the run unless `families/mod.rs` declares the `nested` module and
+    its top-level `cli_command` factory attaches the `NESTED` registry: without
+    both, the nested verbs are not in the binary, and accepting them would let
+    docs name commands the CLI does not have. An attach anywhere else (a test,
+    a helper nothing calls) does not count."""
+    code = lex_rust(families_mod_src or "")[0]
+    if "nested" not in FAMILY_MOD_RE.findall(code):
+        raise CannotRun("%s: no `mod nested;` line, but %s registers nested verbs: they cannot be in the binary" % (CLI_FAMILIES_MOD, CLI_NESTED_MOD))
+    factories = list(CLI_FACTORY_RE.finditer(code))
+    if len(factories) != 1:
+        raise CannotRun("%s: %d top-level `fn %s() -> Command` found, expected exactly one; whether the nested verbs are attached cannot be established" % (CLI_FAMILIES_MOD, len(factories), CLI_FACTORY_FN))
+    body = fn_body(code, factories[0].end())
+    if not NESTED_ATTACH_RE.search(body):
+        raise CannotRun("%s: `%s` makes no `nested::attach(..., nested::NESTED)` call, but %s registers nested verbs: they are not attached to the command" % (CLI_FAMILIES_MOD, CLI_FACTORY_FN, CLI_NESTED_MOD))
+    # The attach must BE the returned command: a call whose result is dropped
+    # (or bound and then ignored) leaves the nested verbs out of the binary.
+    if not returns_attached(tail_expr(body)):
+        raise CannotRun("%s: `%s` does not return the command `nested::attach(..., nested::NESTED)` builds, but %s registers nested verbs: they are not attached to the command it returns" % (CLI_FAMILIES_MOD, CLI_FACTORY_FN, CLI_NESTED_MOD))
+
+
+def registered_module_paths(mod_src, files, mod_path, list_re, list_decl, list_name, exclude=()):
+    """The modules the registry at `mod_path` lists in its one `list_re` static."""
+    mod_dir = mod_path[: -len("mod.rs")]
+    family_files = [f for f in files if f.startswith(mod_dir) and f.endswith(".rs") and f != mod_path
+                    and not any(f.startswith(e) for e in exclude)]
     if mod_src is None:
         if family_files:
-            raise CannotRun("%s is not in the tree, but %s holds %s: which verb families are registered cannot be established" % (CLI_FAMILIES_MOD, CLI_FAMILIES_DIR, ", ".join(sorted(family_files))))
+            raise CannotRun("%s is not in the tree, but %s holds %s: which verb families are registered cannot be established" % (mod_path, mod_dir, ", ".join(sorted(family_files))))
         return []
     code = lex_rust(mod_src)[0]
-    lists = FAMILIES_LIST_RE.findall(code)
+    lists = list_re.findall(code)
     if len(lists) != 1:
-        raise CannotRun("%s: %d `static FAMILIES: &[&dyn VerbFamily]` lists found, expected exactly one; which verb families are registered cannot be established" % (CLI_FAMILIES_MOD, len(lists)))
+        raise CannotRun("%s: %d `%s` lists found, expected exactly one; which modules are registered cannot be established" % (mod_path, len(lists), list_decl))
     entries = [e.strip() for e in lists[0].split(",") if e.strip()]
     declared = set(FAMILY_MOD_RE.findall(code))
     paths = []
     for entry in entries:
         m = FAMILY_ENTRY_RE.fullmatch(entry)
         if not m:
-            raise CannotRun("%s: the `FAMILIES` entry `%s` is not `&<module>::<Type>`; its module cannot be established" % (CLI_FAMILIES_MOD, entry))
+            raise CannotRun("%s: the `%s` entry `%s` is not `&<module>::<Type>`; its module cannot be established" % (mod_path, list_name, entry))
         module = m.group(1)
         if module not in declared:
-            raise CannotRun("%s: the `FAMILIES` entry `%s` names the module `%s`, which no `mod %s;` line declares" % (CLI_FAMILIES_MOD, entry, module, module))
-        found = [f for f in (CLI_FAMILIES_DIR + module + ".rs", CLI_FAMILIES_DIR + module + "/mod.rs") if f in files]
+            raise CannotRun("%s: the `%s` entry `%s` names the module `%s`, which no `mod %s;` line declares" % (mod_path, list_name, entry, module, module))
+        found = [f for f in (mod_dir + module + ".rs", mod_dir + module + "/mod.rs") if f in files]
         if len(found) != 1:
-            raise CannotRun("%s: the registered family module `%s` has %d source files (%s.rs or %s/mod.rs), expected exactly one" % (CLI_FAMILIES_MOD, module, len(found), module, module))
+            raise CannotRun("%s: the registered family module `%s` has %d source files (%s.rs or %s/mod.rs), expected exactly one" % (mod_path, module, len(found), module, module))
         paths.append(found[0])
     return paths
 
@@ -682,7 +827,10 @@ def check_docs_refs(root, files):
     if cli_src is None:
         raise CannotRun("%s is not in the tree: the verb check cannot run" % CLI_FILE)
     family_srcs = [(f, read_text(root, f) or "") for f in registered_family_paths(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None, files)]
-    tree = parse_cli_tree(cli_src, family_srcs)
+    nested_srcs = [(f, read_text(root, f) or "") for f in registered_nested_paths(read_text(root, CLI_NESTED_MOD) if CLI_NESTED_MOD in files else None, files)]
+    if nested_srcs:
+        check_nested_wiring(read_text(root, CLI_FAMILIES_MOD) if CLI_FAMILIES_MOD in files else None)
+    tree = parse_cli_tree(cli_src, family_srcs, nested_srcs)
     crate_names = sorted({f.split("/")[1] for f in files if f.startswith("crates/") and f.count("/") >= 2})
     stale_names = crate_names + ["test_fixtures", "scripts"]
     stale_re = re.compile(r"(?<![\w/.-])(" + "|".join(re.escape(n) for n in stale_names) + r")/(?=[\w.])")
@@ -2180,11 +2328,76 @@ def self_test(out=sys.stdout):
         arm("verb-tree-family-two-roots", False, "a family module with two top-level enums was accepted")
     except CannotRun:
         arm("verb-tree-family-two-roots", True)
+    nested_src = 'const PARENT: &str = "graph";\n\n#[derive(Subcommand)]\nenum GraphExtra {\n    Inspect {\n        name: String,\n    },\n}\n'
+    tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", nested_src)])
+    arm("verb-tree-nested", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    # A parent or an enum inside a comment is not code: the real declaration decides.
+    commented = '/*\nconst PARENT: &str = "nope";\n*/\n// const PARENT: &str = "nope";\n/*\n#[derive(Subcommand)]\nenum Ghost {\n    Haunt,\n}\n*/\n' + nested_src
+    tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", commented)])
+    arm("verb-tree-nested-commented-decoys", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    # Nor is one inside a string: a raw-string doc example is text, not a declaration.
+    in_string = 'const DOC: &str = r#"\nconst PARENT: &str = "nope";\n#[derive(Subcommand)]\nenum Ghost {\n    Haunt,\n}\n"#;\n\n' + nested_src
+    tree = parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", in_string)])
+    arm("verb-tree-nested-string-decoys", tree == dict(EXPECTED_TREE, graph=dict(EXPECTED_TREE["graph"], inspect={})), repr(tree))
+    for label, bad in (("verb-tree-nested-duplicate", nested_src.replace("Inspect {", "Run {")),
+                       ("verb-tree-nested-unknown-parent", nested_src.replace('"graph"', '"nope"')),
+                       ("verb-tree-nested-no-parent", nested_src.replace('const PARENT: &str = "graph";', "")),
+                       ("verb-tree-nested-two-parents", 'const PARENT: &str = "schema";\n' + nested_src),
+                       ("verb-tree-nested-only-commented-parent", nested_src.replace('const PARENT: &str = "graph";', '/*\nconst PARENT: &str = "graph";\n*/'))):
+        try:
+            parse_cli_tree(FIXTURE_CLI, (), [("families/nested/graph_extra.rs", bad)])
+            arm(label, False, "accepted")
+        except CannotRun:
+            arm(label, True)
     fams = [CLI_FAMILIES_MOD, CLI_FAMILIES_DIR + "schema.rs", CLI_FAMILIES_DIR + "orphan.rs"]
     arm("families-registered-only", registered_family_paths(FIXTURE_FAMILIES_MOD, fams) == [CLI_FAMILIES_DIR + "schema.rs"],
         repr(registered_family_paths(FIXTURE_FAMILIES_MOD, fams)))
     arm("families-nested-module", registered_family_paths(FIXTURE_FAMILIES_MOD, [CLI_FAMILIES_DIR + "schema/mod.rs"]) == [CLI_FAMILIES_DIR + "schema/mod.rs"])
     arm("families-none-without-registry", registered_family_paths(None, [CLI_FILE]) == [])
+    nested_mod = "mod graph_extra;\n\npub(crate) static NESTED: &[&dyn NestedVerbs] = &[&graph_extra::GraphExtra];\n"
+    nested_files = [CLI_NESTED_MOD, CLI_NESTED_DIR + "graph_extra.rs", CLI_NESTED_DIR + "orphan.rs"]
+    arm("nested-registered-only", registered_nested_paths(nested_mod, nested_files) == [CLI_NESTED_DIR + "graph_extra.rs"],
+        repr(registered_nested_paths(nested_mod, nested_files)))
+    # A nested set is never read as a top-level family.
+    arm("nested-not-a-family", registered_family_paths(FIXTURE_FAMILIES_MOD, fams + nested_files) == [CLI_FAMILIES_DIR + "schema.rs"])
+    for name, mod_src in (("nested-no-registry", None), ("nested-no-list", "mod graph_extra;\n"),
+                          ("nested-undeclared-module", nested_mod.replace("mod graph_extra;", ""))):
+        try:
+            registered_nested_paths(mod_src, nested_files)
+            arm(name, False, "the registry was accepted")
+        except CannotRun:
+            arm(name, True)
+    # The nested verbs count only when the production factory attaches them.
+    wired = ("mod nested;\n\npub(crate) fn cli_command() -> Command {\n"
+             "    let cmd = build(Cli::command());\n"
+             "    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n}\n")
+    unwired = wired.replace("nested::attach(cmd, nested::NESTED)", "Ok::<_, String>(cmd)")
+    for name, mod_src in (("nested-wired", wired),
+                          ("nested-wired-expect", wired.replace("    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n",
+                                                                "    nested::attach(cmd, nested::NESTED).expect(\"nested verbs\")\n"))):
+        try:
+            check_nested_wiring(mod_src)
+            arm(name, True)
+        except CannotRun as e:
+            arm(name, False, str(e))
+    for name, mod_src in (
+            ("nested-wiring-no-module", wired.replace("mod nested;", "")),
+            ("nested-wiring-no-attach", unwired),
+            ("nested-wiring-test-only-attach", unwired + "\n#[cfg(test)]\nmod tests {\n    fn t(c: Command) -> Command {\n"
+             "        nested::attach(c, nested::NESTED).unwrap()\n    }\n}\n"),
+            ("nested-wiring-helper-attach", unwired + "\nfn helper(c: Command) -> Command {\n"
+             "    nested::attach(c, nested::NESTED).unwrap()\n}\n"),
+            ("nested-wiring-comment-attach", unwired.replace("Ok::<_, String>(cmd)", "/* nested::attach(cmd, nested::NESTED) */ Ok::<_, String>(cmd)")),
+            ("nested-wiring-no-factory", wired.replace("fn cli_command()", "fn other()")),
+            ("nested-wiring-result-dropped", wired.replace("    match nested::attach(cmd, nested::NESTED) {\n        Ok(cmd) => cmd,\n        Err(e) => panic!(\"{e}\"),\n    }\n",
+                                                           "    let _ = nested::attach(cmd.clone(), nested::NESTED);\n    cmd\n")),
+            ("nested-wiring-result-ignored-arm", wired.replace("Ok(cmd) => cmd,", "Ok(_attached) => Cli::command(),")),
+            ("nested-wiring-result-statement", wired.replace("        Err(e) => panic!(\"{e}\"),\n    }\n}", "        Err(e) => panic!(\"{e}\"),\n    };\n    Cli::command()\n}"))):
+        try:
+            check_nested_wiring(mod_src)
+            arm(name, False, "the wiring was accepted")
+        except CannotRun:
+            arm(name, True)
     for name, mod_src, tree_files in (
             ("families-no-registry", None, fams[1:]),
             ("families-no-list", "mod schema;\n", fams),
