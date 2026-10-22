@@ -196,15 +196,9 @@ impl SchemaSet {
                 continue;
             }
             let (walker, warnings) = FrameWalker::new(schemas.clone());
-            let over: BTreeSet<String> = schemas
-                .iter()
-                .map(MessageSchema::qualified_name)
-                .filter(|q| {
-                    walker
-                        .layout_for_name(q)
-                        .is_some_and(|layout| layout.frame_prefix_exceeds_wire())
-                })
-                .collect();
+            // Every hash-reachable identity, not only the name owners: a
+            // twin hidden from name lookups still decodes by its hash.
+            let over: Vec<usize> = walker.wire_oversized().iter().map(|&(i, _)| i).collect();
             if over.is_empty() {
                 log_warnings(&file_warnings);
                 log_warnings(&warnings);
@@ -212,13 +206,13 @@ impl SchemaSet {
                 return Ok((Self { schemas, walker }, file_warnings));
             }
             let mut removed = Vec::new();
-            for q in &over {
-                if let Some(i) = schemas.iter().rposition(|s| s.qualified_name() == *q) {
-                    removed.push(schemas.remove(i));
-                }
+            for &i in over.iter().rev() {
+                let schema = schemas.remove(i);
                 file_warnings.push(format!(
-                    "skipped workspace schema '{q}': frame prefix exceeds the u32 wire total_size (the rest still load)"
+                    "skipped workspace schema '{}': frame prefix exceeds the u32 wire total_size (the rest still load)",
+                    schema.qualified_name()
                 ));
+                removed.push(schema);
             }
             let rejected = fully_removed(&schemas, removed);
             drop_dependents(
@@ -401,20 +395,17 @@ impl SchemaSet {
             });
         }
         let (walker, warnings) = FrameWalker::new(schemas.to_vec());
-        for schema in schemas {
-            let qname = schema.qualified_name();
-            if let Some(layout) = walker.layout_for_name(&qname) {
-                if layout.frame_prefix_exceeds_wire() {
-                    return Err(DynamicError::SchemaNotWireRepresentable {
-                        schema: qname,
-                        detail: format!(
-                            "frame prefix (32-byte header + {}-byte fixed section + {}-entry offset table) exceeds the u32 wire total_size",
-                            layout.fixed_size,
-                            layout.variable_fields.len()
-                        ),
-                    });
-                }
-            }
+        // Every hash-reachable identity, not only the name owners: a twin
+        // hidden from name lookups still decodes by its hash.
+        if let Some(&(i, layout)) = walker.wire_oversized().first() {
+            return Err(DynamicError::SchemaNotWireRepresentable {
+                schema: schemas[i].qualified_name(),
+                detail: format!(
+                    "frame prefix (32-byte header + {}-byte fixed section + {}-entry offset table) exceeds the u32 wire total_size",
+                    layout.fixed_size,
+                    layout.variable_fields.len()
+                ),
+            });
         }
         Ok((walker, warnings))
     }

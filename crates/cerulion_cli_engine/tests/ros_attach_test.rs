@@ -4398,11 +4398,11 @@ fn test_closure_completed_by_builtin_dep_resolves_without_duplicating_builtin() 
 
 // ───── Acquisition hardening ──────────────
 
-/// Drift-guard: feed cases through the codec's SHARED nested-ref ladder
-/// (`resolve_nested_qname_ladder` — the exact fn the CDR decoder AND the attach
-/// completeness walk both call) and assert every documented rung. Because the
-/// codec delegates to this fn, this is the anti-drift pin: the walk can never
-/// resolve a nested reference differently from the decoder.
+/// Drift-guard: feed cases through the names-only nested-ref ladder
+/// (`resolve_nested_qname_ladder`, the fn the attach completeness walk calls)
+/// and assert every documented rung. The CDR decoder binds on schema
+/// identity; a `cerulion_core` test pins that it binds the same target as
+/// this ladder on every rung, so the walk predicts the decoder.
 #[test]
 fn ladder_resolves_every_documented_rung() {
     fn ladder(name: &str, pkg: Option<&str>, parent: &str, universe: &[&str]) -> Option<String> {

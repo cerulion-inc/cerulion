@@ -408,7 +408,8 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 ///   the binary and reads the child's exit code. They are NOT dark, and six of
 ///   the nineteen arms here are this class. Counting them as unowned overstates
 ///   the gap.
-/// * `unix-by-hand` — needs several real processes and a real `MAP_SHARED` page.
+/// * `unix-by-hand`: needs several real processes and a real `MAP_SHARED` page,
+///   or is a release measurement that prints a table and gates nothing.
 ///   Runnable on any Unix host.
 /// * `linux-only` — needs a Linux-only kernel interface (`/proc/self/smaps`) or
 ///   CPU pinning. Runnable on a Linux host only.
@@ -490,6 +491,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "probe_latency_big_vs_small_tier",
         "jetson-board",
         "oversizing-is-latency-free on that same board",
+    ),
+    (
+        "colocated_hop_probe_test.rs",
+        "the_queued_hop_through_the_level_loop",
+        "unix-by-hand",
+        "a release measurement of the in-process hop through the level loop; prints a table, gates nothing",
+    ),
+    (
+        "colocated_hop_probe_test.rs",
+        "what_a_hop_is_made_of",
+        "unix-by-hand",
+        "a release measurement of a consumer receive, the library receive and a publish; prints a table, gates nothing",
     ),
     (
         "cross_machine_data_plane_harness.rs",
