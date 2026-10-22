@@ -347,7 +347,9 @@ const ARRAY_CHUNK: usize = 4096;
 /// the first axis is walked an item at a time and a one-dimensional array
 /// is converted [`ARRAY_CHUNK`] items at a time. Every item writes at least
 /// one character, so an array with more items than the budget has left is
-/// refused before any item is converted.
+/// refused before any item is converted. The length is read again once
+/// every item is written, so an array that shrank or grew while it was
+/// read is the `DictChangedSize` error, never a partial list.
 fn emit_array(
     value: &Bound<'_, PyAny>,
     rank: usize,
@@ -399,6 +401,11 @@ fn emit_array(
         if index != end {
             return Err(changed_size(py, path));
         }
+    }
+    // An array that grew while it was read still gave `len` items: only
+    // its length now shows the items it gained.
+    if value.len()? != len {
+        return Err(changed_size(py, path));
     }
     out.push(']');
     within_budget(py, out, path)

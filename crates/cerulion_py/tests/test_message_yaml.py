@@ -842,9 +842,10 @@ def test_a_numpy_array_converts_across_its_chunks(schemas):
 
 
 class ResizedArray:
-    """An array-like whose length moves while it is read: `len()` names
-    `length` items, but a slice of it gives `items` (another thread
-    resizing a NumPy array looks the same to the reader)."""
+    """An array-like whose `len()` names `length` items but which holds
+    `items`: a slice of it is bounded as a NumPy slice is, so it gives at
+    most the items it was asked for (another thread shrinking a NumPy
+    array looks the same to the reader)."""
 
     def __init__(self, ndim, length, items):
         self.ndim = ndim
@@ -856,10 +857,38 @@ class ResizedArray:
 
     def __getitem__(self, key):
         if isinstance(key, slice):
-            return ResizedArray(1, len(self.items), self.items)
+            part = self.items[key]
+            return ResizedArray(1, len(part), part)
         if key >= len(self.items):
             raise IndexError(key)
         return ResizedArray(1, len(self.items[key]), self.items[key])
+
+    def tolist(self):
+        return list(self.items)
+
+
+class GrowingArray:
+    """An array-like that gains `grow_by` items the first time it is read,
+    as a NumPy array another thread appends to looks to the reader: every
+    read is bounded and honest, so only its length shows the change."""
+
+    def __init__(self, ndim, items, grow_by):
+        self.ndim = ndim
+        self.items = list(items)
+        self.grow_by = grow_by
+
+    def __len__(self):
+        return len(self.items)
+
+    def _grow(self):
+        tail = self.items[-1]
+        self.items.extend([tail] * self.grow_by)
+        self.grow_by = 0
+
+    def __getitem__(self, key):
+        part = self.items[key]
+        self._grow()
+        return ResizedArray(1, len(part), part)
 
     def tolist(self):
         return list(self.items)
@@ -869,10 +898,11 @@ class ResizedArray:
     "value",
     [
         ResizedArray(1, 3, [0.5]),
-        ResizedArray(1, 2, [0.5, 1.0, 1.5]),
         ResizedArray(2, 2, [[0.5]]),
+        GrowingArray(1, [0.5, 1.0], 1),
+        GrowingArray(2, [[0.5], [1.0]], 1),
     ],
-    ids=["shrank", "grew", "lost_a_row"],
+    ids=["shrank", "lost_a_row", "grew", "gained_a_row"],
 )
 def test_an_array_that_changes_size_while_read_is_an_encode_error(schemas, value):
     with pytest.raises(cerulion.EncodeError) as err:

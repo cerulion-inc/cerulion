@@ -401,7 +401,7 @@ kinds come from the dict itself, before the codec reads it: `DictUnsupportedValu
 with a lone surrogate), `DictTooDeep` (a dict nested past 129 levels,
 such as one that contains itself), `DictTooLarge` (a dict whose YAML
 passes 256 MiB, such as one list shared many times over) and `DictChangedSize`
-(an array whose length changes while it is read, such as one another thread resizes). An integer past 64 bits in a dict is
+(an array whose length changes while it is read, such as one another thread resizes: the length is read again once every item is written, so growth and shrinkage both raise it). An integer past 64 bits in a dict is
 written as its digits, so it gets the error the same YAML text gets: an integer field refuses it
 with `YamlOutOfRange` up to 128 bits and `YamlWrongType` past that (the YAML parser reads such
 digits as a float), and a float field takes its nearest float value. Past the float range
