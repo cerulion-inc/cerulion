@@ -74,7 +74,7 @@ What happens when the graph starts:
 2. **The first sample is the epoch.** The graph clock is placed at it before
    the nodes are built, so a period node's first deadline is one period after
    the epoch and no deadline window counts a phantom miss.
-3. **One step per sample.** A sample ahead of the last accepted one steps the
+3. **One step per accepted sample.** A sample ahead of the last accepted one steps the
    graph by the difference. A sample equal to it steps the graph by zero, so
    data triggers still drain while a paused simulator republishes the same
    time. A period node fires at most once per accepted sample, however many
