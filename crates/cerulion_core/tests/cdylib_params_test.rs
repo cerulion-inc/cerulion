@@ -215,21 +215,26 @@ fn values_cross_the_optional_symbol_and_instances_hold_their_own() {
     with_values.tick().expect("tick values");
     assert_eq!(read_cmd(&mut sub_values), (2.5, -7.0, -1.0));
 
-    // 3. Two instances of one library.
+    // 3. Two instances of one library. `b` also overrides the string while
+    //    `enabled` keeps its default true, so z is the eight-byte "left_cam"
+    //    that crossed the FFI, not the nine-byte default.
     let mut twin_a = load(PARAM_FIXTURE);
     let mut twin_b = load(PARAM_FIXTURE);
     twin_a
         .set_params(&values(&[("gain", ParamValue::Float(2.5))]))
         .expect("set_params a");
     twin_b
-        .set_params(&values(&[("gain", ParamValue::Float(0.5))]))
+        .set_params(&values(&[
+            ("gain", ParamValue::Float(0.5)),
+            ("frame_id", ParamValue::Str("left_cam".into())),
+        ]))
         .expect("set_params b");
     twin_a.init(ctx_twin_a).expect("init a");
     twin_b.init(ctx_twin_b).expect("init b");
     twin_a.tick().expect("tick a");
     twin_b.tick().expect("tick b");
     assert_eq!(read_cmd(&mut sub_twin_a), (2.5, 0.0, 9.0));
-    assert_eq!(read_cmd(&mut sub_twin_b), (0.5, 0.0, 9.0));
+    assert_eq!(read_cmd(&mut sub_twin_b), (0.5, 0.0, 8.0));
 
     // 4. An unknown name is held by `set_params` and refused at `init`.
     let mut unknown = load(PARAM_FIXTURE);

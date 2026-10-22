@@ -86,16 +86,25 @@ fn validate_reads_each_node_library_once_across_its_checks() {
     // line per node), so a single read is a shared
     // one and not a skipped check.
     let labels: Vec<&str> = report.checks.iter().map(|c| c.label.as_str()).collect();
-    assert!(labels.contains(&"network ingress"), "{labels:?}");
+    let ingress: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|c| c.label == "network ingress")
+        .collect();
+    assert_eq!(ingress.len(), 1, "{labels:?}");
+    // The gate got node infos and judged them (no input consumes the topic,
+    // so it fails), rather than failing to read the libraries at all.
+    assert!(
+        !ingress[0].detail.contains("could not load node libraries"),
+        "the ingress gate must have read the library: {}",
+        ingress[0].detail
+    );
     for node in ["left", "right"] {
         let label = format!("params '{node}'");
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.label == label)
-            .unwrap_or_else(|| panic!("no {label} line: {labels:?}"));
-        assert!(check.passed, "{label}: {}", check.detail);
-        assert_eq!(check.detail, "gain=1.0", "{label}");
+        let lines: Vec<_> = report.checks.iter().filter(|c| c.label == label).collect();
+        assert_eq!(lines.len(), 1, "exactly one {label} line: {labels:?}");
+        assert!(lines[0].passed, "{label}: {}", lines[0].detail);
+        assert_eq!(lines[0].detail, "gain=1.0", "{label}");
     }
     let reads = counting.reads.lock().unwrap().clone();
     assert_eq!(
