@@ -176,7 +176,7 @@
 #                         SCOPE: every tracked text file, `tests/` and
 #                         `crates/test_fixtures/` INCLUDED (a test comment
 #                         ships too), except raw benchmark evidence
-#                         (`docs/benchmarks/results/`), the vendored message
+#                         (`docs/benchmarks/results/`), the vendored message, service
 #                         and binding trees, lockfiles, `docs/legal/`, the CLA
 #                         texts, LICENSE, and this gate's own scripts and data
 #                         files and `leak_scan.py`, which spell the wording in

@@ -696,6 +696,32 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/Detection2DArray"
         | "vision_msgs/Detection3DArray"
         | "vision_msgs/LabelInfo"
+        // rcl_interfaces parameter services, MEDIUM group: everything that
+        // carries a parameter VALUE. One value can be a whole document: the
+        // usual case is a robot description (URDF) string parameter, which
+        // runs from tens of KB to around 1 MB on large robots; x 4 needs
+        // MEDIUM. A value-carrying container is at least its value (the
+        // container rule), so the lists and the services that move values
+        // ride the same tier. `DescribeParameters`' response holds one
+        // descriptor (TINY, below) per requested name; 1,000 parameters
+        // with 300-char descriptions is about 300 KB, past SMALL even
+        // before the x 4. `SetParameters`' response is the same shape: one
+        // result (TINY, below) with a free-text reason per parameter set, so
+        // 1,000 rejections with 300-char reasons is also about 300 KB. All
+        // are request/response traffic, not streams, so there is no ingress
+        // depth to trade. `ListParameters`' result carries no value but two
+        // string lists, names and prefixes: 1,000 entries of 40 chars in
+        // each is about 88 KB; x 4 = about 352 KB, past SMALL, so the result
+        // and the response that holds it ride MEDIUM too.
+        | "rcl_interfaces/DescribeParameters_Response"
+        | "rcl_interfaces/GetParameters_Response"
+        | "rcl_interfaces/ListParameters_Response"
+        | "rcl_interfaces/ListParametersResult"
+        | "rcl_interfaces/Parameter"
+        | "rcl_interfaces/ParameterValue"
+        | "rcl_interfaces/SetParametersAtomically_Request"
+        | "rcl_interfaces/SetParameters_Request"
+        | "rcl_interfaces/SetParameters_Response"
         => Some(TIER_MEDIUM),
 
         // ─────────────── TIER_SMALL — 256 KiB ───────────────
@@ -1017,6 +1043,17 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/Classification"
         | "vision_msgs/Detection2D"
         | "vision_msgs/Detection3D"
+        // rcl_interfaces parameter services, SMALL group: ONE list of
+        // parameter names or prefixes (and one type byte per name). A node
+        // with 1,000 parameters at 40-char names is about 44 KB of names;
+        // x 4 = about 176 KB, inside SMALL, past TINY. `ListParameters`'
+        // response is not here: it carries two such lists (see the MEDIUM
+        // group).
+        | "rcl_interfaces/DescribeParameters_Request"
+        | "rcl_interfaces/GetParameterTypes_Request"
+        | "rcl_interfaces/GetParameterTypes_Response"
+        | "rcl_interfaces/GetParameters_Request"
+        | "rcl_interfaces/ListParameters_Request"
         => Some(TIER_SMALL),
 
         // ─────────────── TIER_TINY — 16 KiB ───────────────
@@ -1171,6 +1208,16 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         | "vision_msgs/ObjectHypothesisWithPose"
         | "vision_msgs/VisionClass"
         | "vision_msgs/VisionInfo"
+        // rcl_interfaces and std_srvs, TINY group: one record of short
+        // strings. A parameter descriptor is a name, a type byte, a
+        // description and a constraints note (a 1 KB description is far past
+        // a normal one; x 4 = 4 KB). A set result and the std_srvs responses
+        // are a bool plus a reason or message string.
+        | "rcl_interfaces/ParameterDescriptor"
+        | "rcl_interfaces/SetParametersAtomically_Response"
+        | "rcl_interfaces/SetParametersResult"
+        | "std_srvs/SetBool_Response"
+        | "std_srvs/Trigger_Response"
         => Some(TIER_TINY),
 
         // ─────────────── Unlisted: `None` — POLICY LIVES IN THE CALLERS ───
@@ -1189,7 +1236,7 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
     }
 }
 
-/// Packages vendored in `crates/native_ros2_messages/msg/`. Schemas from these
+/// Packages vendored in `crates/native_ros2_messages/msg/` and `srv/`. Schemas from these
 /// MUST have explicit tier arms (the catch-all panics for them at codegen
 /// time). Third-party packaged schemas fall through to the catch-all
 /// silently and can override per-topic in graph YAML.
@@ -1225,10 +1272,12 @@ pub const IN_REPO_PACKAGES: &[&str] = &[
     "object_recognition_msgs",
     "octomap_msgs",
     "radar_msgs",
+    "rcl_interfaces",
     "sensor_msgs",
     "shape_msgs",
     "statistics_msgs",
     "std_msgs",
+    "std_srvs",
     "tf2_msgs",
     "trajectory_msgs",
     "unique_identifier_msgs",

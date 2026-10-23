@@ -38,49 +38,22 @@
 use cerulion_core::codegen::{parse_rosmsg, resolve_fixed_nested, MessageSchema};
 use cerulion_core::message::ShmMessage;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
+
+mod common;
 
 /// Parse + resolve the entire vendored `.msg` corpus ONCE, exactly as
 /// `build.rs` does, and return a `(package, name) -> resolved schema` map.
 fn resolved_corpus() -> &'static BTreeMap<(String, String), MessageSchema> {
     static CORPUS: OnceLock<BTreeMap<(String, String), MessageSchema>> = OnceLock::new();
     CORPUS.get_or_init(|| {
-        let msg_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg");
+        // msg/<package>/<Name>.msg plus both parts of srv/<package>/<Name>.srv,
+        // with build.rs's package-name sanitization.
         let mut flat: Vec<MessageSchema> = Vec::new();
-        // msg/<package>/<Name>.msg
-        let mut pkg_dirs: Vec<PathBuf> = std::fs::read_dir(&msg_dir)
-            .unwrap_or_else(|e| panic!("read {}: {e}", msg_dir.display()))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        pkg_dirs.sort();
-        for pkg_dir in pkg_dirs {
-            // Mirror build.rs's `sanitize_package_name` (`-` → `_`) so the
-            // package string we hash over matches the generated constant for
-            // any hyphenated package dir (all dirs use
-            // underscores, so this is a no-op — kept for fidelity).
-            let package = pkg_dir
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replace('-', "_");
-            let mut msg_files: Vec<PathBuf> = std::fs::read_dir(&pkg_dir)
-                .unwrap_or_else(|e| panic!("read {}: {e}", pkg_dir.display()))
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "msg"))
-                .collect();
-            msg_files.sort();
-            for msg_path in msg_files {
-                let msg_name = msg_path.file_stem().unwrap().to_string_lossy().to_string();
-                let content = std::fs::read_to_string(&msg_path)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", msg_path.display()));
-                let schema = parse_rosmsg(&content, &msg_name, Some(&package))
-                    .unwrap_or_else(|e| panic!("parse {package}/{msg_name}.msg: {e}"));
-                flat.push(schema);
-            }
+        for ((package, msg_name), content) in common::vendored_sources() {
+            let schema = parse_rosmsg(&content, &msg_name, Some(&package))
+                .unwrap_or_else(|e| panic!("parse {package}/{msg_name}: {e}"));
+            flat.push(schema);
         }
         // build.rs is the authority (it PANICS on any resolution warning for
         // the vendored set), but assert clean here too: cheap belt-and-

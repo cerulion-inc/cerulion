@@ -41,7 +41,10 @@ pub use element_codec::{
 pub use frame_walker::{
     FrameValue, FrameValueKind, FrameWalker, NamedValue, PrimArray, PrimType, WalkError,
 };
-pub use generator::{generate_schema, variable_schema_max_slice_len, IN_REPO_PACKAGES};
+pub use generator::{
+    generate_schema, generate_service_marker, service_marker_conflict, service_part_replaced,
+    variable_schema_max_slice_len, IN_REPO_PACKAGES,
+};
 #[doc(hidden)]
 pub use header_stamp::{header_stamp_location, HeaderStampSchemaError};
 pub use resolve::{composed_overflow_indices, resolve_fixed_nested};

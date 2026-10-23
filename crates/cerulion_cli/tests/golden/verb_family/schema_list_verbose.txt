@@ -4,7 +4,7 @@ Workspace schemas (schemas/*.yaml): 0
 
 Schemas from the .msg store (schemas/<pkg>/msg): 0 in 0 packages
 
-Built-in ROS 2 messages: 254 in 22 packages
+Built-in ROS 2 messages: 280 in 24 packages
   action_msgs (3):
     GoalInfo, GoalStatus, GoalStatusArray
   autoware_perception_msgs (6):
@@ -64,6 +64,15 @@ Built-in ROS 2 messages: 254 in 22 packages
     Octomap, OctomapWithPose
   radar_msgs (4):
     RadarReturn, RadarScan, RadarTrack, RadarTracks
+  rcl_interfaces (20):
+    DescribeParameters_Request, DescribeParameters_Response
+    FloatingPointRange, GetParameterTypes_Request
+    GetParameterTypes_Response, GetParameters_Request
+    GetParameters_Response, IntegerRange, ListParametersResult
+    ListParameters_Request, ListParameters_Response, Parameter
+    ParameterDescriptor, ParameterType, ParameterValue
+    SetParametersAtomically_Request, SetParametersAtomically_Response
+    SetParametersResult, SetParameters_Request, SetParameters_Response
   sensor_msgs (27):
     BatteryState, CameraInfo, ChannelFloat32, CompressedImage, FluidPressure
     Illuminance, Image, Imu, JointState, Joy, JoyFeedback, JoyFeedbackArray
@@ -82,6 +91,9 @@ Built-in ROS 2 messages: 254 in 22 packages
     Int8MultiArray, MultiArrayDimension, MultiArrayLayout, String, UInt16
     UInt16MultiArray, UInt32, UInt32MultiArray, UInt64, UInt64MultiArray
     UInt8, UInt8MultiArray
+  std_srvs (6):
+    Empty_Request, Empty_Response, SetBool_Request, SetBool_Response
+    Trigger_Request, Trigger_Response
   tf2_msgs (2):
     TF2Error, TFMessage
   trajectory_msgs (4):

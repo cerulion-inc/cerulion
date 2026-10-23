@@ -404,6 +404,34 @@ mod tests {
         assert_eq!(slice_ceiling_for_type("nav_msgs/Odometry").get(), TINY);
     }
 
+    /// The parameter-list services split by how many string lists they
+    /// carry: one list of names (1,000 x 40 chars x 4 = about 176 KB) fits
+    /// SMALL, but `ListParameters`' result carries names AND prefixes
+    /// (about 352 KB after the x 4), so it and its response need MEDIUM.
+    #[test]
+    fn list_parameters_result_is_sized_for_both_of_its_string_lists() {
+        assert_eq!(
+            slice_ceiling_for_type("rcl_interfaces/GetParameters_Request").get(),
+            SMALL
+        );
+        assert_eq!(
+            slice_ceiling_for_type("rcl_interfaces/ListParameters_Request").get(),
+            SMALL
+        );
+        assert_eq!(
+            slice_ceiling_for_type("rcl_interfaces/ListParametersResult").get(),
+            MEDIUM
+        );
+        assert_eq!(
+            slice_ceiling_for_type("rcl_interfaces/ListParameters_Response").get(),
+            MEDIUM
+        );
+        // The x 4 envelope of two full 1,000-entry lists is past SMALL.
+        let two_lists = 2 * 1_000 * (4 + 40);
+        assert!(two_lists * 4 > SMALL);
+        assert!(two_lists * 4 <= MEDIUM);
+    }
+
     /// Unknown types — a packaged user type AND the package-less workspace
     /// shape — take the catch-all SILENTLY (that is their documented tier,
     /// not a failure).

@@ -3699,7 +3699,7 @@ pub unsafe extern "C" fn rmw_take_sequence(
 ///
 /// - a PLAIN (recursively-fixed) type — `bridge.can_loan()`, the same gate as
 ///   the publish-side loan: the C struct IS the wire fixed section,
-///   byte-for-byte (pinned by `layout_equivalence_test` over all 254 vendored
+///   byte-for-byte (pinned by `layout_equivalence_test` over all 280 vendored
 ///   types), so the SHM payload pointer itself is handed out;
 /// - a type carrying at least one FORGEABLE primitive
 ///   sequence (`Image.data`, `LaserScan.ranges`, …): an rmw-owned SHADOW

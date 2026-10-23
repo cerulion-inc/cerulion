@@ -18,14 +18,18 @@
 //! - `types` — FieldType → Rust type string mapping and primitive introspection
 //! - `structs` — `<Name>Shm[<'a>]` and `<Name>Snapshot` emission
 //! - `wire_impl` — `impl ShmMessage for <Name>` emission (the marker type)
+//! - `service_marker`: the `impl ServiceType` marker for a `.srv` file
 //!
 //! The legacy heap `<Name>` struct, `<Name>View<'a>`, `<Name>Build`/Measurer/
 //! Writer codegen, and `impl Message for <Name>` were deleted in an earlier
 //! change alongside the `Message` trait itself.
 
+mod service_marker;
 mod structs;
 mod types;
 mod wire_impl;
+
+pub use service_marker::{generate_service_marker, service_marker_conflict, service_part_replaced};
 
 // The per-schema variable budget is no longer codegen-private. A
 // `ros2 attach` bridge route is created at RUN time from a schema NAME (no
@@ -106,7 +110,7 @@ pub(super) fn field_has_large_array(ft: &FieldType) -> bool {
 /// manual `Default` impl, so the parent can still `#[derive(Default)]` —
 /// deriving is preferred (clippy `derivable_impls` rejects a manual impl
 /// that derive could produce).
-fn has_direct_large_array(schema: &MessageSchema) -> bool {
+pub(super) fn has_direct_large_array(schema: &MessageSchema) -> bool {
     schema
         .fields
         .iter()

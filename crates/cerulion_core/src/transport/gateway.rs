@@ -312,7 +312,7 @@ pub struct SchemaServing {
     /// hash-reverse resolution of runtime-registered topics. `#[serde(default)]`
     /// so an older handoff (no field) boots naming only `topic_schemas` topics.
     ///
-    /// Carries the BUILT-IN corpus's bindings (~254 entries) as well
+    /// Carries the BUILT-IN corpus's bindings as well
     /// as the custom types' — a runtime-registered topic of a built-in type (an
     /// rmw `std_msgs/String` publisher) otherwise catalogs `schema_name: None`,
     /// which every desk consumer refuses. The gateway itself cannot compute them

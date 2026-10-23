@@ -175,18 +175,27 @@ fn python_name(name: &str) -> bool {
         && !PYTHON_KEYWORDS.contains(&name)
 }
 
+/// What a scaffolded `node.py` binds at module scope: the name it reaches the
+/// `cerulion` package through, its message import lines, and the class
+/// expression each schema is spelled as.
+struct PythonRefs {
+    cerulion: String,
+    imports: Vec<String>,
+    refs: std::collections::BTreeMap<String, String>,
+}
+
 /// The import lines and the per-schema class expression a scaffolded
 /// `node.py` uses: `pkg/Name` is `Name` from `cerulion.msgs.pkg` (a package's
 /// `-` is `_`, the module spelling), a package-less `Name` is `Name` from
 /// `cerulion.msgs`. A leaf that two packages share, that the scaffold itself
 /// binds (`cerulion`, `Node`), or that a port of the node is named (a class-body
 /// assignment rebinds the name for every later port), is reached through its
-/// module (`pkg.Name`). A schema no import can name (a keyword, a name with several
-/// `/`) keeps the quoted-name form, the escape hatch `cerulion.input` takes.
-fn python_message_refs(
-    schemas: &[&str],
-    ports: &std::collections::BTreeSet<&str>,
-) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+/// module (`pkg.Name`). The same rebinding rule covers every module name the
+/// class body reads (`cerulion` and each `pkg`): one a port is named is imported
+/// under that name with `_` appended until no port and no other binding spells
+/// it. A schema no import can name (a keyword, a name with several `/`) keeps
+/// the quoted-name form, the escape hatch `cerulion.input` takes.
+fn python_message_refs(schemas: &[&str], ports: &std::collections::BTreeSet<&str>) -> PythonRefs {
     use std::collections::{BTreeMap, BTreeSet};
     let mut parts: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
     let mut quoted: BTreeMap<String, String> = BTreeMap::new();
@@ -210,6 +219,7 @@ fn python_message_refs(
         owners.entry(leaf.as_str()).or_default().insert(package);
     }
     let mut by_module: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+    let mut qualified: Vec<(&str, &str, &str)> = Vec::new();
     let mut modules: BTreeSet<&str> = BTreeSet::new();
     let mut refs = quoted;
     for (schema, (package, leaf)) in &parts {
@@ -220,7 +230,7 @@ fn python_message_refs(
         if shared {
             let module = package.as_deref().unwrap_or("msgs");
             modules.insert(module);
-            refs.insert(schema.clone(), format!("{module}.{leaf}"));
+            qualified.push((schema.as_str(), module, leaf.as_str()));
         } else {
             by_module
                 .entry(package.as_deref())
@@ -228,6 +238,31 @@ fn python_message_refs(
                 .insert(leaf);
             refs.insert(schema.clone(), leaf.clone());
         }
+    }
+    // Every module-scope binding, so an alias never lands on one of them.
+    let mut taken: BTreeSet<String> = ports.iter().map(|port| port.to_string()).collect();
+    taken.extend(["cerulion".to_string(), "Node".to_string()]);
+    taken.extend(modules.iter().map(|module| module.to_string()));
+    taken.extend(by_module.values().flatten().map(|leaf| leaf.to_string()));
+    let mut bind = |name: &str| -> String {
+        if !ports.contains(name) {
+            return name.to_string();
+        }
+        let mut alias = format!("{name}_");
+        while taken.contains(&alias) {
+            alias.push('_');
+        }
+        taken.insert(alias.clone());
+        alias
+    };
+    let cerulion = bind("cerulion");
+    let aliases: BTreeMap<&str, String> = modules.iter().map(|&m| (m, bind(m))).collect();
+    let spell = |module: &str| match aliases[module].as_str() {
+        alias if alias == module => module.to_string(),
+        alias => format!("{module} as {alias}"),
+    };
+    for (schema, module, leaf) in qualified {
+        refs.insert(schema.to_string(), format!("{}.{leaf}", aliases[module]));
     }
     let mut imports = Vec::new();
     for (module, leaves) in &by_module {
@@ -237,20 +272,29 @@ fn python_message_refs(
             None => imports.push(format!("from cerulion.msgs import {names}")),
         }
     }
-    let packaged: Vec<&str> = modules.iter().copied().filter(|m| *m != "msgs").collect();
+    let packaged: Vec<String> = modules
+        .iter()
+        .copied()
+        .filter(|m| *m != "msgs")
+        .map(spell)
+        .collect();
     if !packaged.is_empty() {
         imports.push(format!("from cerulion.msgs import {}", packaged.join(", ")));
     }
     if modules.contains("msgs") {
-        imports.push("from cerulion import msgs".to_string());
+        imports.push(format!("from cerulion import {}", spell("msgs")));
     }
     imports.sort();
-    (imports, refs)
+    PythonRefs {
+        cerulion,
+        imports,
+        refs,
+    }
 }
 
-/// Generate the starter Python implementation for a node: bare
-/// `import cerulion`, one import per message class, and ports typed by the
-/// class.
+/// Generate the starter Python implementation for a node: `import cerulion`
+/// (under an alias when a port is named `cerulion`), one import per message
+/// class, and ports typed by the class.
 pub fn generate_python_node_py(
     inputs: &[(String, String)],
     outputs: &[(String, String)],
@@ -267,13 +311,21 @@ pub fn generate_python_node_py(
         .chain(outputs)
         .map(|(name, _)| name.as_str())
         .collect();
-    let (imports, refs) = python_message_refs(&schemas, &ports);
-    let mut result = String::from("import cerulion\n");
+    let PythonRefs {
+        cerulion,
+        imports,
+        refs,
+    } = python_message_refs(&schemas, &ports);
+    let mut result = if cerulion == "cerulion" {
+        String::from("import cerulion\n")
+    } else {
+        format!("import cerulion as {cerulion}\n")
+    };
     for line in &imports {
         result.push_str(line);
         result.push('\n');
     }
-    result.push_str(&format!("\n\n@cerulion.node({policy})\nclass Node:\n"));
+    result.push_str(&format!("\n\n@{cerulion}.node({policy})\nclass Node:\n"));
     for (name, schema) in inputs {
         let trigger_suffix = if triggers.contains(name) {
             ", trigger=True"
@@ -281,12 +333,15 @@ pub fn generate_python_node_py(
             ""
         };
         result.push_str(&format!(
-            "    {name} = cerulion.input({}{trigger_suffix})\n",
+            "    {name} = {cerulion}.input({}{trigger_suffix})\n",
             refs[schema]
         ));
     }
     for (name, schema) in outputs {
-        result.push_str(&format!("    {name} = cerulion.output({})\n", refs[schema]));
+        result.push_str(&format!(
+            "    {name} = {cerulion}.output({})\n",
+            refs[schema]
+        ));
     }
     result.push_str("\n    def tick(self):\n");
     match (inputs.first(), outputs.first()) {

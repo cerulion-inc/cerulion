@@ -2284,7 +2284,7 @@ A schema is "fixed" iff every field is fixed: a primitive, a `string_fixed[N]`, 
 
 ## ROS2 `.msg` re-use
 
-Standard ROS2 message types live in the `native_ros2_messages` crate (22 packages, 254 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
+Standard ROS2 message types live in the `native_ros2_messages` crate (24 packages, 280 schemas; `cerulion schema list` prints the current set). Reference them by qualified name in graph YAML and node Rust code:
 
 ```yaml
 schema: sensor_msgs/Image
@@ -2334,12 +2334,39 @@ types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
 `SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
 code generated from a `.srv` passes `clippy -D warnings`.
 
+`std_srvs/Trigger.srv` generates `std_srvs::Trigger_Request` and
+`std_srvs::Trigger_Response`. With the opt-in `unstable-services` cargo feature (off
+by default, on `native_ros2_messages` or `cerulion_core`) it also generates the
+service marker `std_srvs::Trigger`, which implements
+`cerulion_core::message::ServiceType`, names the two parts
+(`type Request = Trigger_Request`) and carries `SERVICE_HASH`: FNV-1a 64 over the
+length-prefixed service name and the request and response schema hashes, so it
+changes when the name or either part's schema changes. Either part can be empty (`std_srvs/Empty` is a
+lone `---`). A missing `---`, a second `---` or a bad field in either part is an error
+that names the file and the line. The part name is what you write as `schema:` in
+graph YAML and what `cerulion schema list` prints.
+
+The built-in corpus carries these service types:
+
+| Package | Services |
+|---|---|
+| `std_srvs` | `Empty`, `SetBool`, `Trigger` |
+| `rcl_interfaces` | `DescribeParameters`, `GetParameterTypes`, `GetParameters`, `ListParameters`, `SetParameters`, `SetParametersAtomically` |
+
+`rcl_interfaces` also carries the messages those services use (`Parameter`,
+`ParameterValue`, `ParameterType`, `ParameterDescriptor`, `FloatingPointRange`,
+`IntegerRange`, `ListParametersResult`, `SetParametersResult`). Service types are
+message definitions only: a node does not yet serve or call a service through them,
+and the `ServiceType` trait is experimental, which is why it sits behind
+`unstable-services`: its shape can change when nodes can serve and call services.
+
 A message type your own robot needs goes in your workspace's `schemas/` directory
 (see [Schema YAML](#schema-yaml)), not in this crate. Adding a type to the BUILT-IN
 corpus is a change to the Cerulion repository itself, made in a source checkout, and
 it takes three steps, not one:
 
-1. Drop the `.msg` file under `crates/native_ros2_messages/msg/<package>/<Name>.msg`.
+1. Drop the `.msg` file under `crates/native_ros2_messages/msg/<package>/<Name>.msg`
+   (a service goes under `crates/native_ros2_messages/srv/<package>/<Name>.srv`).
 2. If the schema is **variable**, add a tier arm to
    `crates/cerulion_core/src/codegen/generator/wire_impl.rs::variable_schema_max_slice_len`.
    This is mandatory, not conditional: the silent 128 MiB catch-all is reserved

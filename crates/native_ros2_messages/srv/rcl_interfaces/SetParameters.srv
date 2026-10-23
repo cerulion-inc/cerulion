@@ -1,0 +1,6 @@
+# A list of parameters to set.
+rcl_interfaces/Parameter[] parameters
+
+---
+# Indicates whether setting each parameter succeeded or not and why.
+rcl_interfaces/SetParametersResult[] results

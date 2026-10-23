@@ -52,22 +52,34 @@ use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Every package directory under `native_ros2_messages/msg/`, with `build.rs`'s
-/// own name sanitisation applied so the two sides are comparable.
+/// Every package directory under `native_ros2_messages/msg/` and `srv/`,
+/// with `build.rs`'s own name sanitisation applied so the two sides are
+/// comparable.
 fn vendored_package_dirs() -> BTreeSet<String> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg");
-    std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .map(|p| {
-            p.file_name()
-                .expect("package dir name")
-                .to_string_lossy()
-                .replace('-', "_")
-        })
-        .collect()
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut out = BTreeSet::new();
+    for root in [crate_root.join("msg"), crate_root.join("srv")] {
+        out.extend(
+            std::fs::read_dir(&root)
+                .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
+                .map(|e| {
+                    e.unwrap_or_else(|e| panic!("read an entry of {}: {e}", root.display()))
+                        .path()
+                })
+                .filter(|p| {
+                    std::fs::metadata(p)
+                        .unwrap_or_else(|e| panic!("read the metadata of {}: {e}", p.display()))
+                        .is_dir()
+                })
+                .map(|p| {
+                    p.file_name()
+                        .expect("package dir name")
+                        .to_string_lossy()
+                        .replace('-', "_")
+                }),
+        );
+    }
+    out
 }
 
 #[test]
@@ -80,7 +92,7 @@ fn every_vendored_package_is_registered_so_none_takes_the_catch_all_silently() {
     // count so it pins "the tree was read", not a census.
     assert!(
         vendored.len() >= 20,
-        "only {} package directories found under msg/ — the walk is not reaching the \
+        "only {} package directories found under msg/ and srv/: the walk is not reaching the \
          vendored tree, so the comparisons below are vacuous",
         vendored.len()
     );
@@ -104,7 +116,7 @@ fn every_vendored_package_is_registered_so_none_takes_the_catch_all_silently() {
     let phantom: Vec<_> = registered.difference(&vendored).collect();
     assert!(
         phantom.is_empty(),
-        "TIER FOLLOW-ON: {} package(s) in `IN_REPO_PACKAGES` are not vendored under msg/: \
+        "TIER FOLLOW-ON: {} package(s) in `IN_REPO_PACKAGES` are not vendored under msg/ or srv/: \
          {phantom:?}\n\n\
          Checked in this direction too so the list stays a description of the tree rather than a \
          wish-list. A name here that no longer exists reads as coverage the table does not have; \

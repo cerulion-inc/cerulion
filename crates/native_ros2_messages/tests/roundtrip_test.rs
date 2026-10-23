@@ -8,7 +8,7 @@
 //! side and `try_view::<T, _>(|view| view.snapshot())` on the subscriber
 //! side, with the recovered snapshot equal to the original.
 //!
-//! All 254 schemas are covered (61 fixed + 193 variable), including the
+//! All 280 schemas are covered (68 fixed + 212 variable), including the
 //! vendored MoveIt packages (moveit_msgs, control_msgs,
 //! octomap_msgs, object_recognition_msgs), the vendored
 //! perception packages (vision_msgs, radar_msgs, grid_map_msgs,
@@ -18,7 +18,7 @@
 //! shared body lives in [`assert_round_trip_fixed`] and
 //! [`assert_round_trip_var`]. Each test builds a private
 //! [`cerulion_core::testing::TestTransport`] with its own isolated
-//! iceoryx2 SHM root, so the parallel-test runner can dispatch all 254 without
+//! iceoryx2 SHM root, so the parallel-test runner can dispatch all 280 without
 //! contention or `--test-threads=1` gating — even though every test reuses the
 //! same topic shape, the per-call SHM isolation keeps them independent.
 //!
@@ -28,7 +28,7 @@
 //! a small handful of field overrides aimed at catching basic field-routing
 //! bugs (a wrong getter returning a sibling field's value, an off-by-one in
 //! the offset table, etc.). Hand-crafting deeply-populated nested structures
-//! across 254 schemas is explicitly out of scope — the round-trip property
+//! across 280 schemas is explicitly out of scope: the round-trip property
 //! holds for default-valued snapshots too, and dedicated tests already cover the
 //! "non-default values flow through correctly" property for representative
 //! schemas.
@@ -65,8 +65,9 @@ use cerulion_core::wire::MaxSliceLen;
 use native_ros2_messages::{
     action_msgs, autoware_perception_msgs, autoware_planning_msgs, builtin_interfaces,
     control_msgs, diagnostic_msgs, geometry_msgs, grid_map_msgs, moveit_msgs, nav_msgs,
-    object_recognition_msgs, octomap_msgs, radar_msgs, sensor_msgs, shape_msgs, statistics_msgs,
-    std_msgs, tf2_msgs, trajectory_msgs, unique_identifier_msgs, vision_msgs, visualization_msgs,
+    object_recognition_msgs, octomap_msgs, radar_msgs, rcl_interfaces, sensor_msgs, shape_msgs,
+    statistics_msgs, std_msgs, std_srvs, tf2_msgs, trajectory_msgs, unique_identifier_msgs,
+    vision_msgs, visualization_msgs,
 };
 
 // =============================================================
@@ -78,7 +79,7 @@ use native_ros2_messages::{
 /// The largest schemas (`Image`, `PointCloud2`, `Marker`) only carry empty
 /// `Vec`s in their default snapshots, so the overhead is just header +
 /// fixed-section + offset table for the variable-field count of the schema.
-/// 16 KiB comfortably covers all 254 schemas including future growth.
+/// 16 KiB comfortably covers all 280 schemas including future growth.
 const MAX_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(16 * 1024);
 
 /// Subscriber channel capacity. Each test publishes exactly one frame,
@@ -126,7 +127,7 @@ where
     // Note: codegen omits `Debug` from the three large-array snapshots
     // (`PoseWithCovariance`, `TwistWithCovariance`, `AccelWithCovariance`)
     // because their fixed arrays exceed the 32-element `Debug`-blanket cap.
-    // Keep the bound minimal so the same helper covers all 254 schemas.
+    // Keep the bound minimal so the same helper covers all 280 schemas.
     Snap: Default + Clone + PartialEq,
     // The Writer<'a> for fixed schemas is `&'a mut <Name>Shm`, which carries
     // an inherent `write_from_snapshot(&mut self, &Snap) -> ()` method. We
@@ -171,7 +172,7 @@ where
     // Note: codegen omits `Debug` from the three large-array snapshots
     // (`PoseWithCovariance`, `TwistWithCovariance`, `AccelWithCovariance`)
     // because their fixed arrays exceed the 32-element `Debug`-blanket cap.
-    // Keep the bound minimal so the same helper covers all 254 schemas.
+    // Keep the bound minimal so the same helper covers all 280 schemas.
     Snap: Default + Clone + PartialEq,
     F: FnOnce(&mut Snap),
     for<'a> T::Writer<'a>: TryWriteFromSnapshot<Snap>,
@@ -1120,4 +1121,102 @@ roundtrip_var!(autoware_planning_msgs, LaneletRoute, |s| {
     // `uuid` (UUID), `allow_modification` (bool) are fixed.
     s.header = vec![0x08];
     s.segments = vec![0x09, 0x0A];
+});
+
+// -------------------------------------------------------------
+// rcl_interfaces (8 messages: 3 fixed + 5 variable; 6 services:
+// 12 parts, all variable)
+// -------------------------------------------------------------
+roundtrip_fixed!(rcl_interfaces, FloatingPointRange, |s| {
+    s.from_value = -1.5;
+    s.to_value = 2.5;
+    s.step = 0.5;
+});
+roundtrip_fixed!(rcl_interfaces, IntegerRange, |s| {
+    s.from_value = -10;
+    s.to_value = 10;
+    s.step = 2;
+});
+roundtrip_fixed!(rcl_interfaces, ParameterType);
+roundtrip_var!(rcl_interfaces, ListParametersResult, |s| {
+    // `string[]` fields ride as raw payload bytes.
+    s.names = vec![0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, b'a'];
+    s.prefixes = vec![0x00, 0x00, 0x00, 0x00];
+});
+roundtrip_var!(rcl_interfaces, Parameter, |s| {
+    s.name = "max_speed".into();
+    s.value = vec![0x03, 0x00];
+});
+roundtrip_var!(rcl_interfaces, ParameterDescriptor, |s| {
+    s.name = "max_speed".into();
+    s.r#type = 3;
+    s.description = "top speed in m/s".into();
+    s.read_only = true;
+    s.floating_point_range = vec![0xAA; 24];
+});
+roundtrip_var!(rcl_interfaces, ParameterValue, |s| {
+    s.r#type = 3;
+    s.double_value = 1.25;
+    s.string_value = "fast".into();
+    s.bool_array_value = vec![true, false];
+    s.integer_array_value = vec![1, -2, 3];
+});
+roundtrip_var!(rcl_interfaces, SetParametersResult, |s| {
+    s.successful = true;
+    s.reason = "ok".into();
+});
+roundtrip_var!(rcl_interfaces, DescribeParameters_Request, |s| {
+    s.names = vec![0x00, 0x00, 0x00, 0x00];
+});
+roundtrip_var!(rcl_interfaces, DescribeParameters_Response, |s| {
+    s.descriptors = vec![0x01, 0x02];
+});
+roundtrip_var!(rcl_interfaces, GetParameterTypes_Request, |s| {
+    s.names = vec![0x00, 0x00, 0x00, 0x00];
+});
+roundtrip_var!(rcl_interfaces, GetParameterTypes_Response, |s| {
+    s.types = vec![1, 4, 9];
+});
+roundtrip_var!(rcl_interfaces, GetParameters_Request, |s| {
+    s.names = vec![0x00, 0x00, 0x00, 0x00];
+});
+roundtrip_var!(rcl_interfaces, GetParameters_Response, |s| {
+    s.values = vec![0x05, 0x06];
+});
+roundtrip_var!(rcl_interfaces, ListParameters_Request, |s| {
+    s.prefixes = vec![0x00, 0x00, 0x00, 0x00];
+    s.depth = 3;
+});
+roundtrip_var!(rcl_interfaces, ListParameters_Response, |s| {
+    s.result = vec![0x07];
+});
+roundtrip_var!(rcl_interfaces, SetParameters_Request, |s| {
+    s.parameters = vec![0x08, 0x09];
+});
+roundtrip_var!(rcl_interfaces, SetParameters_Response, |s| {
+    s.results = vec![0x0A];
+});
+roundtrip_var!(rcl_interfaces, SetParametersAtomically_Request, |s| {
+    s.parameters = vec![0x0B];
+});
+roundtrip_var!(rcl_interfaces, SetParametersAtomically_Response, |s| {
+    s.result = vec![0x0C];
+});
+
+// -------------------------------------------------------------
+// std_srvs (3 services: 6 parts, 4 fixed + 2 variable)
+// -------------------------------------------------------------
+roundtrip_fixed!(std_srvs, Empty_Request);
+roundtrip_fixed!(std_srvs, Empty_Response);
+roundtrip_fixed!(std_srvs, SetBool_Request, |s| {
+    s.data = true;
+});
+roundtrip_var!(std_srvs, SetBool_Response, |s| {
+    s.success = true;
+    s.message = "enabled".into();
+});
+roundtrip_fixed!(std_srvs, Trigger_Request);
+roundtrip_var!(std_srvs, Trigger_Response, |s| {
+    s.success = false;
+    s.message = "not ready".into();
 });

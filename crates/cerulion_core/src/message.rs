@@ -291,3 +291,84 @@ pub trait ShmMessage: Sized {
         Ok(())
     }
 }
+
+/// A service type: the pair of a request message and a response message.
+///
+/// Codegen emits a unit marker `pub struct <Name>;` per `.srv` file and
+/// implements `ServiceType` on it, next to the two message markers the
+/// `.srv` parts generate (`<Name>_Request`, `<Name>_Response`). For example
+/// `std_srvs::Trigger` names `std_srvs::Trigger_Request` and
+/// `std_srvs::Trigger_Response`. Each part is an ordinary [`ShmMessage`],
+/// with its own schema hash, so it is published, recorded and replayed like
+/// any other message.
+///
+/// Experimental, behind the opt-in `unstable-services` cargo feature (off
+/// by default): nodes cannot serve or call a service yet, and this trait's
+/// shape can change when they can. The two part messages do not need the
+/// feature; only this trait and the service markers do.
+#[cfg(feature = "unstable-services")]
+pub trait ServiceType {
+    /// Qualified service name, for example `"std_srvs/Trigger"`.
+    const NAME: &'static str;
+
+    /// The request message marker.
+    type Request: ShmMessage;
+
+    /// The response message marker.
+    type Response: ShmMessage;
+
+    /// The service's identity hash: FNV-1a 64 over the length-prefixed
+    /// [`Self::NAME`] followed by the request and the response
+    /// [`ShmMessage::SCHEMA_HASH`]. A change to the name or to either part's
+    /// schema changes it. Do not override it: two peers agree on a service
+    /// only when both derive it the same way.
+    const SERVICE_HASH: u64 = service_hash(
+        Self::NAME,
+        <Self::Request as ShmMessage>::SCHEMA_HASH,
+        <Self::Response as ShmMessage>::SCHEMA_HASH,
+    );
+}
+
+/// The [`ServiceType::SERVICE_HASH`] recipe: FNV-1a 64 over the name length
+/// (`u64`, little-endian), the name bytes, then the request and the response
+/// schema hashes (each `u64`, little-endian). The length prefix keeps the
+/// name and the hashes that follow it from running into each other.
+#[cfg(feature = "unstable-services")]
+const fn service_hash(name: &str, request: u64, response: u64) -> u64 {
+    use crate::wire::{fnv1a_fold, FNV_OFFSET};
+    let hash = fnv1a_fold(FNV_OFFSET, &(name.len() as u64).to_le_bytes());
+    let hash = fnv1a_fold(hash, name.as_bytes());
+    let hash = fnv1a_fold(hash, &request.to_le_bytes());
+    fnv1a_fold(hash, &response.to_le_bytes())
+}
+
+/// Declares a generated service marker: `pub struct <Name>;` with
+/// `impl ServiceType`. Codegen emits one call per `.srv` file. With the
+/// `unstable-services` feature of THIS crate off, the call expands to
+/// nothing, so a crate of generated code carries the marker only when a
+/// build opts in, and it does not need a feature of its own to decide.
+#[cfg(feature = "unstable-services")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __service_marker {
+    ($(#[$meta:meta])* $name:ident, $qualified:literal, $request:ty, $response:ty) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $name;
+
+        impl $crate::message::ServiceType for $name {
+            const NAME: &'static str = $qualified;
+            type Request = $request;
+            type Response = $response;
+        }
+    };
+}
+
+/// The `unstable-services` feature is off: a service marker is not
+/// declared. See the feature-on definition.
+#[cfg(not(feature = "unstable-services"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __service_marker {
+    ($($tokens:tt)*) => {};
+}

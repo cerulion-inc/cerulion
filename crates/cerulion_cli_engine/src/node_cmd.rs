@@ -2851,6 +2851,63 @@ mod tests {
     }
 
     #[test]
+    fn python_template_aliases_a_module_a_port_rebinds() {
+        // A port named `cerulion` rebinds the package name in the class body,
+        // so every later port line would read the port, not the package.
+        let inputs = vec![("cerulion".to_string(), "geometry_msgs/Vector3".to_string())];
+        let outputs = vec![("out".to_string(), "geometry_msgs/Vector3".to_string())];
+        let source = templates::generate_python_node_py(&inputs, &outputs, "period_ms=1", &[]);
+        assert_eq!(
+            source,
+            "import cerulion as cerulion_\n\
+             from cerulion.msgs.geometry_msgs import Vector3\n\
+             \n\
+             \n\
+             @cerulion_.node(period_ms=1)\n\
+             class Node:\n\
+             \x20   cerulion = cerulion_.input(Vector3)\n\
+             \x20   out = cerulion_.output(Vector3)\n\
+             \n\
+             \x20   def tick(self):\n\
+             \x20       msg = self.cerulion\n\
+             \x20       if msg is None:  # no frame received yet\n\
+             \x20           return\n\
+             \x20       out = self.out  # first touch loans the output; it is committed at tick end\n\
+             \x20       # copy fields here, e.g. out.x = msg.x\n"
+        );
+
+        // The same holds for a message module a port is named: the alias skips
+        // every name a port or another binding already spells.
+        let inputs = vec![
+            ("cerulion".to_string(), "geometry_msgs/Vector3".to_string()),
+            ("Vector3".to_string(), "geometry_msgs/Vector3".to_string()),
+            ("geometry_msgs".to_string(), "Reading".to_string()),
+            ("Reading".to_string(), "Reading".to_string()),
+            ("msgs".to_string(), "std_msgs/Int32".to_string()),
+            ("cerulion_".to_string(), "std_msgs/Int32".to_string()),
+        ];
+        let source = templates::generate_python_node_py(&inputs, &[], "period_ms=1", &[]);
+        assert_eq!(
+            source.split("\n\n\n").next().unwrap(),
+            "import cerulion as cerulion__\n\
+             from cerulion import msgs as msgs_\n\
+             from cerulion.msgs import geometry_msgs as geometry_msgs_\n\
+             from cerulion.msgs.std_msgs import Int32"
+        );
+        for line in [
+            "@cerulion__.node(period_ms=1)\n",
+            "    cerulion = cerulion__.input(geometry_msgs_.Vector3)\n",
+            "    Vector3 = cerulion__.input(geometry_msgs_.Vector3)\n",
+            "    geometry_msgs = cerulion__.input(msgs_.Reading)\n",
+            "    Reading = cerulion__.input(msgs_.Reading)\n",
+            "    msgs = cerulion__.input(Int32)\n",
+            "    cerulion_ = cerulion__.input(Int32)\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?} in:\n{source}");
+        }
+    }
+
+    #[test]
     fn python_template_reaches_a_shared_leaf_through_its_module() {
         let inputs = vec![
             ("a".to_string(), "geometry_msgs/Pose2D".to_string()),

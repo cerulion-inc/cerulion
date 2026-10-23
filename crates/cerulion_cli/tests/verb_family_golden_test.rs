@@ -10,6 +10,8 @@
 //! golden file under `tests/golden/verb_family/` was captured from the binary
 //! BEFORE the family moved and is never regenerated from the code under test.
 //! A diff here is a user-visible change: fix the code, do not re-capture.
+//! A change that means to alter that output (a corpus that grows the built-in
+//! list) edits the golden by hand in the same PR, never by a re-capture.
 //!
 //! Each case is one subprocess under an isolated `HOME`, an empty cwd with no
 //! workspace, the network kill switch and telemetry off, so there is no
