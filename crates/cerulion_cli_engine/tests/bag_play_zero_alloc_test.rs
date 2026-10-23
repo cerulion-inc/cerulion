@@ -161,6 +161,26 @@ fn min_over_reps(mut f: impl FnMut() -> usize) -> usize {
     (0..REPS).map(|_| f()).min().expect("REPS > 0")
 }
 
+/// The ONE iceoryx2 namespace every manager in this binary uses.
+///
+/// iceoryx2 0.10.0 numbers a namespace's nodes from a counter in its global
+/// management segment, which it creates without initializing (`init_impl`
+/// writes `MaybeUninit::uninit()` over it). A node id carries that counter in
+/// its top 32 bits and is printed in decimal into every node-scoped path, and
+/// iceoryx2 escapes each path with one heap allocation per byte
+/// (`as_escaped_string`). With a fresh namespace per manager, a node whose
+/// counter came from leftover bytes printed 37 digits where a zeroed one printed
+/// 26 (MEASURED on Linux), moving that play's setup by about 460 one-byte
+/// allocations whatever its frame count. In one namespace the counter only
+/// increments, so successive node ids differ by at most a digit (a few dozen
+/// allocations, inside the band).
+fn shared_iceoryx_config() -> iceoryx2::config::Config {
+    static CONFIG: std::sync::OnceLock<iceoryx2::config::Config> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(cerulion_core::testing::iceoryx_test_config)
+        .clone()
+}
+
 /// Play one bag on the CURRENT thread with the counter armed, returning the
 /// allocation count for the whole call.
 fn measured_play_once(bag: &Path) -> usize {
@@ -169,7 +189,7 @@ fn measured_play_once(bag: &Path) -> usize {
             node_name: format!("play_alloc_{}", unique()),
             ..Default::default()
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        shared_iceoryx_config(),
     )
     .expect("init_for_test");
 
@@ -192,7 +212,7 @@ fn measured_play_once(bag: &Path) -> usize {
             node_name: format!("play_alloc_{}", unique()),
             ..Default::default()
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        shared_iceoryx_config(),
     )
     .expect("init_for_test");
     let mut sink2 = Vec::with_capacity(4096);
