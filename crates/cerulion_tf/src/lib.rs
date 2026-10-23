@@ -1,11 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Deterministic SE(3) math for Cerulion frames.
+//! Deterministic SE(3) math for Cerulion frames, and the tf buffer.
 //!
 //! A [`Transform`] is a rigid motion: a translation plus a unit-quaternion
 //! rotation ([`UnitQuaternion`]). This crate composes, inverts and applies
-//! transforms. It allocates nothing and does no I/O, and the same inputs give
-//! bit-identical `f64` results on every machine, so frame lookups built on it
-//! replay byte-exact.
+//! transforms. A [`TfBuffer`] collects stamped transforms into a frame tree
+//! and answers [`TfBuffer::lookup`] for any two frames at a time. Nothing
+//! allocates after a buffer is built and nothing does I/O, and the same
+//! inputs give bit-identical `f64` results on every machine, so frame
+//! lookups replay byte-exact.
+//!
+//! # The buffer
+//!
+//! A node holds one [`TfBuffer`], feeds it every transform it receives
+//! ([`TfBuffer::insert`] for `/tf`, [`TfBuffer::insert_static`] for
+//! `/tf_static`), each with the [`WriterId`] of the node that published it,
+//! and reads it with [`TfBuffer::lookup`] or [`TfBuffer::lookup_latest`].
+//! The buffer keeps one parent and one writer per frame, interns frame ids
+//! into [`FrameId`] handles, keeps a fixed window of history per edge
+//! ([`TfBufferConfig::retention`], 10 s by default), refuses a malformed
+//! transform before writing anything, and returns a [`TfError`] that names
+//! the frames involved when a lookup cannot be answered. Past an edge's
+//! newest sample it answers only what the edge's [`EdgePolicy`] allows, and
+//! it never blocks. The type docs state every rule.
 //!
 //! # Conventions
 //!
@@ -57,12 +73,24 @@
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+mod buffer;
+mod edge_policy;
 mod error;
 mod exact;
+mod frame_id;
 mod kernels;
+mod names;
 mod quaternion;
 mod transform;
 
+pub use buffer::{
+    EdgeInfo, StaticEdge, TfBuffer, TfBufferConfig, DEFAULT_FRAME_CAPACITY, DEFAULT_JUMP_LIMIT,
+    DEFAULT_MAX_RATE_HZ, DEFAULT_NAME_BYTES, DEFAULT_RETENTION, NAME_BYTES_PER_FRAME,
+};
+pub use edge_policy::EdgePolicy;
+#[allow(deprecated)]
 pub use error::TfMathError;
+pub use error::{Describe, TfError};
+pub use frame_id::{FrameId, FrameLabel, WriterId, FRAME_LABEL_BYTES};
 pub use quaternion::UnitQuaternion;
 pub use transform::Transform;

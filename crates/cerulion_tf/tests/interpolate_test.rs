@@ -7,7 +7,7 @@
 //! written out by hand (a turn of `a` about +z is `(0, 0, sin a/2, cos a/2)`),
 //! never computed by the code under test.
 
-use cerulion_tf::{TfMathError, Transform, UnitQuaternion};
+use cerulion_tf::{TfError, Transform, UnitQuaternion};
 use std::f64::consts::FRAC_1_SQRT_2;
 
 const TOL: f64 = 1e-15;
@@ -511,11 +511,11 @@ fn a_nan_fraction_is_refused() {
     let a = Transform::IDENTITY;
     assert_eq!(
         a.interpolate(&a, f64::NAN),
-        Err(TfMathError::FractionNotANumber)
+        Err(TfError::FractionNotANumber)
     );
     assert_eq!(
         UnitQuaternion::IDENTITY.slerp(&UnitQuaternion::IDENTITY, f64::NAN),
-        Err(TfMathError::FractionNotANumber)
+        Err(TfError::FractionNotANumber)
     );
 }
 
@@ -525,12 +525,12 @@ fn a_fraction_below_zero_is_refused_never_extrapolated() {
     for t in [-1e-300, -0.5, -1.0, f64::NEG_INFINITY] {
         assert_eq!(
             a.interpolate(&a, t),
-            Err(TfMathError::FractionOutOfRange { t }),
+            Err(TfError::FractionOutOfRange { t }),
             "t = {t}"
         );
         assert_eq!(
             UnitQuaternion::IDENTITY.slerp(&UnitQuaternion::IDENTITY, t),
-            Err(TfMathError::FractionOutOfRange { t }),
+            Err(TfError::FractionOutOfRange { t }),
             "t = {t}"
         );
     }
@@ -543,12 +543,12 @@ fn a_fraction_above_one_is_refused_never_extrapolated() {
     for t in [1.000_000_000_000_000_2, 1.5, 2.0, f64::INFINITY] {
         assert_eq!(
             a.interpolate(&a, t),
-            Err(TfMathError::FractionOutOfRange { t }),
+            Err(TfError::FractionOutOfRange { t }),
             "t = {t}"
         );
         assert_eq!(
             UnitQuaternion::IDENTITY.slerp(&UnitQuaternion::IDENTITY, t),
-            Err(TfMathError::FractionOutOfRange { t }),
+            Err(TfError::FractionOutOfRange { t }),
             "t = {t}"
         );
     }

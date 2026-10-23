@@ -6,7 +6,7 @@
 //! 90 degree turn about z sends +x to +y, and so on) or from an exact
 //! arithmetic identity, never computed by the code under test.
 
-use cerulion_tf::{TfMathError, Transform, UnitQuaternion};
+use cerulion_tf::{TfError, Transform, UnitQuaternion};
 use std::f64::consts::FRAC_1_SQRT_2;
 
 /// Absolute tolerance for unit-magnitude results: a few ulps of 1.0.
@@ -101,7 +101,7 @@ fn construction_accepts_a_small_but_not_degenerate_norm() {
 fn construction_rejects_the_zero_quaternion() {
     assert_eq!(
         UnitQuaternion::new(0.0, 0.0, 0.0, 0.0),
-        Err(TfMathError::DegenerateQuaternion { norm: 0.0 })
+        Err(TfError::DegenerateQuaternion { norm: 0.0 })
     );
 }
 
@@ -109,7 +109,7 @@ fn construction_rejects_the_zero_quaternion() {
 fn construction_rejects_a_norm_below_the_floor() {
     // (0, 0, 3e-13, 4e-13) has norm 5e-13, below UnitQuaternion::MIN_NORM (1e-12).
     match UnitQuaternion::new(0.0, 0.0, 3e-13, 4e-13) {
-        Err(TfMathError::DegenerateQuaternion { norm }) => {
+        Err(TfError::DegenerateQuaternion { norm }) => {
             assert!((norm - 5e-13).abs() <= 1e-27, "norm {norm:e}");
         }
         other => panic!("expected DegenerateQuaternion, got {other:?}"),
@@ -123,7 +123,7 @@ fn degenerate_quaternion_message_names_the_min_norm() {
     // to either one fails here.
     assert_eq!(UnitQuaternion::MIN_NORM, 1e-12);
     assert_eq!(
-        TfMathError::DegenerateQuaternion { norm: 0.0 }.to_string(),
+        TfError::DegenerateQuaternion { norm: 0.0 }.to_string(),
         "quaternion norm 0e0 is below the minimum of 1e-12, so it names no rotation"
     );
 }
@@ -142,7 +142,7 @@ fn construction_rejects_nan_in_every_component() {
         c[i] = f64::NAN;
         assert_eq!(
             UnitQuaternion::new(c[0], c[1], c[2], c[3]),
-            Err(TfMathError::NonFiniteQuaternion),
+            Err(TfError::NonFiniteQuaternion),
             "NaN in component {i}"
         );
     }
@@ -156,7 +156,7 @@ fn construction_rejects_infinity_in_every_component() {
             c[i] = inf;
             assert_eq!(
                 UnitQuaternion::new(c[0], c[1], c[2], c[3]),
-                Err(TfMathError::NonFiniteQuaternion),
+                Err(TfError::NonFiniteQuaternion),
                 "{inf} in component {i}"
             );
         }
@@ -251,7 +251,7 @@ fn transform_rejects_a_non_finite_translation_in_every_component() {
             t[i] = bad;
             assert_eq!(
                 Transform::new(t, UnitQuaternion::IDENTITY),
-                Err(TfMathError::NonFiniteTranslation),
+                Err(TfError::NonFiniteTranslation),
                 "{bad} in component {i}"
             );
         }
@@ -364,7 +364,7 @@ fn rotation_by_180_composed_twice_is_the_identity_motion() {
 #[test]
 fn compose_rejects_a_translation_that_overflows() {
     let far = tf([1e308, 0.0, 0.0], UnitQuaternion::IDENTITY);
-    assert_eq!(far.compose(&far), Err(TfMathError::NonFiniteTranslation));
+    assert_eq!(far.compose(&far), Err(TfError::NonFiniteTranslation));
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn inverse_rejects_a_translation_that_overflows() {
     let s = 0.382_683_432_365_089_8; // sin 22.5
     let c = 0.923_879_532_511_286_7; // cos 22.5
     let t = tf([1.7e308, 1.7e308, 0.0], q(0.0, 0.0, s, c));
-    assert_eq!(t.inverse(), Err(TfMathError::NonFiniteTranslation));
+    assert_eq!(t.inverse(), Err(TfError::NonFiniteTranslation));
 }
 
 #[test]
@@ -455,4 +455,19 @@ fn rotation_at_the_scaling_threshold_is_exact_for_the_identity() {
     let v = [UnitQuaternion::ROTATE_SCALE_ABOVE, tiny, 0.0];
     let got = UnitQuaternion::IDENTITY.rotate(v);
     assert_eq!(got.map(f64::to_bits), v.map(f64::to_bits));
+}
+
+/// Code written against the former error name still compiles: it names the
+/// type, builds a variant through it, and receives a math refusal as it.
+#[test]
+#[allow(deprecated)]
+fn the_former_error_name_still_names_the_math_refusals() {
+    use cerulion_tf::TfMathError;
+    let refused: Result<UnitQuaternion, TfMathError> = UnitQuaternion::new(0.0, 0.0, 0.0, 0.0);
+    assert_eq!(
+        refused,
+        Err(TfMathError::DegenerateQuaternion { norm: 0.0 })
+    );
+    let nan: TfMathError = UnitQuaternion::new(f64::NAN, 0.0, 0.0, 1.0).unwrap_err();
+    assert_eq!(nan, TfError::NonFiniteQuaternion);
 }

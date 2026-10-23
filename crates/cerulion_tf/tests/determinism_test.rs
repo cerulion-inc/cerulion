@@ -8,11 +8,21 @@
 //! platform math library fails here.
 //!
 //! The committed bits are a regression pin, not the correctness oracle: the
-//! hand-written vectors in `se3_test.rs` and `interpolate_test.rs` are. The
-//! last two tests tie the two together by checking that the pinned SLERP
-//! values decode to the hand-written half-angle sines.
+//! hand-written vectors in `se3_test.rs`, `interpolate_test.rs` and
+//! `lookup_test.rs` are. The tying tests check that the pinned SLERP values
+//! decode to the hand-written half-angle sines, and that the buffer's
+//! interpolated lookup lands on the same bits as the direct interpolation
+//! it is built from.
+//!
+//! The second program feeds a tf buffer and reads it back through
+//! `lookup` and `lookup_latest`, so the walk order over the tree, the
+//! fraction formed from the stamps and the composition along the chain are
+//! all under the same bit pin.
 
-use cerulion_tf::{Transform, UnitQuaternion};
+use cerulion_tf::{EdgePolicy, TfBuffer, Transform, UnitQuaternion, WriterId};
+
+/// The one writer of every edge in this file.
+const W: WriterId = WriterId::new(1);
 use std::f64::consts::FRAC_1_SQRT_2;
 
 const N: usize = 47;
@@ -119,9 +129,234 @@ const EXPECTED: [u64; N] = [
     0x3fed906bcf328d46,
 ];
 
+/// Five lookups of seven values each.
+const M: usize = 35;
+
+/// The buffer program: a four-frame chain with two dynamic edges and two
+/// static mounts, read at a midpoint, at the fraction 0.37, along the whole
+/// chain, between two siblings, and at the latest common time in the
+/// inverse direction.
+fn buffer_program() -> [f64; M] {
+    let q = |x, y, z, w| UnitQuaternion::new(x, y, z, w).unwrap();
+    let a = Transform::new([1.5, -2.25, 3.0], q(0.1, 0.2, 0.3, 0.9)).unwrap();
+    let b = Transform::new([-3.0, 0.25, 1.0], q(-0.4, 0.1, 0.0, 0.8)).unwrap();
+    let z90 = q(0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2);
+
+    let mut buf = TfBuffer::new();
+    buf.insert(W, "map", "odom", 0, a).unwrap();
+    buf.insert(W, "map", "odom", 1_000, b).unwrap();
+    buf.insert(W, "odom", "base", 0, Transform::IDENTITY)
+        .unwrap();
+    buf.insert(
+        W,
+        "odom",
+        "base",
+        1_000,
+        Transform::new([2.0, 0.0, 0.0], z90).unwrap(),
+    )
+    .unwrap();
+    buf.insert_static(
+        W,
+        "base",
+        "lidar",
+        Transform::new([0.17, 0.0, 0.11], z90).unwrap(),
+    )
+    .unwrap();
+    buf.insert_static(
+        W,
+        "base",
+        "camera",
+        Transform::new([0.27, 0.0, 0.05], UnitQuaternion::IDENTITY).unwrap(),
+    )
+    .unwrap();
+
+    let reads = [
+        buf.lookup("odom", "base", 500).unwrap(),
+        buf.lookup("map", "odom", 370).unwrap(),
+        buf.lookup("map", "lidar", 370).unwrap(),
+        buf.lookup("camera", "lidar", 123).unwrap(),
+        buf.lookup_latest("lidar", "map").unwrap(),
+    ];
+    let mut out = [0.0; M];
+    let mut k = 0;
+    for t in &reads {
+        for x in t.translation().into_iter().chain(t.rotation().to_array()) {
+            out[k] = x;
+            k += 1;
+        }
+    }
+    out
+}
+
+fn buffer_bits(xs: [f64; M]) -> [u64; M] {
+    xs.map(f64::to_bits)
+}
+
 #[test]
 fn two_runs_give_identical_bits() {
     assert_eq!(bits(program()), bits(program()));
+}
+
+#[test]
+fn two_buffer_runs_give_identical_bits() {
+    assert_eq!(buffer_bits(buffer_program()), buffer_bits(buffer_program()));
+}
+
+/// The edge policies past the newest sample, after an epoch: a turning
+/// edge extrapolated by a fraction and by whole steps, and a held slow
+/// edge read through the chain at the fast edge's newest stamp.
+fn policy_program() -> [u64; 21] {
+    let q = |x, y, z, w| UnitQuaternion::new(x, y, z, w).unwrap();
+    let mut buf = TfBuffer::new();
+    buf.set_edge_policy("map", "odom", EdgePolicy::HoldLast { max_age_ns: 900 })
+        .unwrap();
+    buf.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 10_000 })
+        .unwrap();
+    // A first timeline, then a reset to a second one.
+    buf.insert(W, "odom", "base", 50_000, Transform::IDENTITY)
+        .unwrap();
+    buf.begin_epoch();
+    buf.insert(
+        W,
+        "map",
+        "odom",
+        0,
+        Transform::new([0.5, 0.25, 0.0], q(0.0, 0.0, 0.1, 0.99)).unwrap(),
+    )
+    .unwrap();
+    buf.insert(
+        W,
+        "odom",
+        "base",
+        0,
+        Transform::new([0.0, 0.0, 0.0], q(0.0, 0.1, 0.0, 0.99)).unwrap(),
+    )
+    .unwrap();
+    buf.insert(
+        W,
+        "odom",
+        "base",
+        300,
+        Transform::new([1.25, -0.5, 0.1], q(0.2, 0.1, 0.3, 0.9)).unwrap(),
+    )
+    .unwrap();
+    let reads = [
+        buf.lookup("odom", "base", 437).unwrap(),
+        buf.lookup("odom", "base", 2_000).unwrap(),
+        buf.lookup_latest("map", "base").unwrap(),
+    ];
+    let mut out = [0u64; 21];
+    let mut k = 0;
+    for t in &reads {
+        for x in t.translation().into_iter().chain(t.rotation().to_array()) {
+            out[k] = x.to_bits();
+            k += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn two_policy_runs_give_identical_bits() {
+    assert_eq!(policy_program(), policy_program());
+}
+
+/// The bits `buffer_program` produced, committed as the regression pin.
+const EXPECTED_BUFFER: [u64; M] = [
+    0x3ff0000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3fd87de2a6aea963,
+    0x3fed906bcf328d46,
+    0xbfc51eb851eb8518,
+    0xbff5333333333333,
+    0x4002147ae147ae15,
+    0xbfbb7b225b1cd9af,
+    0x3fc6ddd3523f2fc8,
+    0x3fc9e8940924c617,
+    0x3fee9ea59f28ec02,
+    0x3fe29c7882690f4f,
+    0xbfece5dcbb7d0661,
+    0x400010a1c148e2bd,
+    0x3fbb32cba47724a7,
+    0x3fc6f3687ba3d528,
+    0x3fee05e2d3874fd0,
+    0x3fd1adeb39378cde,
+    0xbfb999999999999a,
+    0x0000000000000000,
+    0x3faeb851eb851eb8,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3fe6a09e667f3bcc,
+    0x3fe6a09e667f3bcc,
+    0xbff25ed097b425ee,
+    0xbfc617839a5bc7e0,
+    0xbfd2e450672894ab,
+    0xbfbc71c71c71c71c,
+    0xbfdc71c71c71c71c,
+    0xbfec71c71c71c71c,
+    0x0000000000000000,
+];
+
+#[test]
+fn the_buffer_output_matches_the_committed_bits() {
+    let got = buffer_bits(buffer_program());
+    for (k, (g, w)) in got.iter().zip(EXPECTED_BUFFER.iter()).enumerate() {
+        assert_eq!(
+            g,
+            w,
+            "buffer output {k}: got {g:#018x} ({}), committed {w:#018x} ({})",
+            f64::from_bits(*g),
+            f64::from_bits(*w)
+        );
+    }
+}
+
+#[test]
+fn the_pinned_midpoint_lookup_is_the_hand_value() {
+    // Outputs 0..7: halfway from the identity to (2 m, 90 about z) is
+    // (1 m, 45 about z): translation (1, 0, 0), rotation
+    // (0, 0, sin 22.5, cos 22.5).
+    let want = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.382_683_432_365_089_8,
+        0.923_879_532_511_286_7,
+    ];
+    for (k, w) in want.iter().enumerate() {
+        let got = f64::from_bits(EXPECTED_BUFFER[k]);
+        assert!((got - w).abs() <= 1e-15, "buffer output {k}: {got} vs {w}");
+    }
+}
+
+#[test]
+fn the_pinned_fraction_lookup_is_the_direct_interpolation_bit_for_bit() {
+    // Outputs 7..14: `map -> odom` at 370 of 1000 ns is `a.interpolate(&b,
+    // 0.37)`, the value the SE(3) program pins at outputs 14..21. The
+    // fraction 370 / 1000 rounds to the same double as the literal 0.37, so
+    // the buffer's walk adds nothing to the math.
+    assert_eq!(&EXPECTED_BUFFER[7..14], &EXPECTED[14..21]);
+}
+
+#[test]
+fn the_pinned_sibling_lookup_is_the_hand_value() {
+    // Outputs 21..28: the lidar seen from the camera. Both are mounts on
+    // `base`, so the offset is the difference of the mounts, (0.17 - 0.27,
+    // 0, 0.11 - 0.05), and the rotation is the lidar's 90 about z.
+    let want = [-0.1, 0.0, 0.06, 0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2];
+    for (k, w) in want.iter().enumerate() {
+        let got = f64::from_bits(EXPECTED_BUFFER[21 + k]);
+        assert!(
+            (got - w).abs() <= 1e-15,
+            "buffer output {}: {got} vs {w}",
+            21 + k
+        );
+    }
 }
 
 #[test]

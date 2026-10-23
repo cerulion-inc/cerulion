@@ -515,6 +515,13 @@ fn workspace_manifest(base: Option<&Path>, version: &str) -> String {
             .display()
             .to_string()
             .replace('\\', "/");
+        // `cerulion_tf` is not on crates.io, so only a checkout can offer
+        // it; a node opts in with `cerulion_tf = { workspace = true }`.
+        let tf_path = base
+            .join("crates/cerulion_tf")
+            .display()
+            .to_string()
+            .replace('\\', "/");
         format!(
             r#"[workspace]
 members = ["nodes/*"]
@@ -523,6 +530,7 @@ resolver = "2"
 [workspace.dependencies]
 cerulion_core = {{ path = "{core_path}" }}
 native_ros2_messages = {{ path = "{msgs_path}" }}
+cerulion_tf = {{ path = "{tf_path}" }}
 "#
         )
     } else {
@@ -1063,6 +1071,9 @@ mod tests {
         assert!(manifest.contains(
             r#"native_ros2_messages = { path = "/tmp/cerulion-src/crates/native_ros2_messages" }"#
         ));
+        assert!(
+            manifest.contains(r#"cerulion_tf = { path = "/tmp/cerulion-src/crates/cerulion_tf" }"#)
+        );
     }
 
     #[test]
@@ -1072,6 +1083,8 @@ mod tests {
         assert!(manifest.contains(r#"cerulion_core = "=0.0.1-alpha""#));
         assert!(manifest.contains(r#"native_ros2_messages = "=0.0.1-alpha""#));
         assert!(!manifest.contains("path ="));
+        // `cerulion_tf` is not published, so a registry pin could never resolve.
+        assert!(!manifest.contains("cerulion_tf"));
     }
 
     #[test]

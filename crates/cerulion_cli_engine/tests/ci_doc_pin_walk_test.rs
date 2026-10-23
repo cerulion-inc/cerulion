@@ -3397,6 +3397,8 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_cli_engine", "cerulion_wsd", "crate-path"),
     // workspace resolves `base.join("crates/native_ros2_messages")`.
     ("cerulion_cli_engine", "native_ros2_messages", "crate-path"),
+    // workspace resolves `base.join("crates/cerulion_tf")`.
+    ("cerulion_cli_engine", "cerulion_tf", "crate-path"),
     // ros2_cmd holds `RMW_LIB_FILENAME`, `librmw_cerulion.so`, the artifact
     // rmw_cerulion builds.
     ("cerulion_cli_engine", "rmw_cerulion", "dlopen"),
