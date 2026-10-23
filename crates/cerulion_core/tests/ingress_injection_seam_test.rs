@@ -58,7 +58,7 @@ fn setup(base: &str) -> (Arc<TransportManager>, String) {
     (transport, format!("/inj/{base}/{id}"))
 }
 
-/// Hand-build a raw wire frame (32-byte little-endian header + payload) with a
+/// Hand-build a raw wire frame (40-byte little-endian header + payload) with a
 /// CORRECT `total_size`.
 fn make_wire_frame(schema_hash: u64, seq: u32, timestamp_ns: u64, payload: &[u8]) -> Vec<u8> {
     make_wire_frame_with_total_size(
@@ -86,6 +86,7 @@ fn make_wire_frame_with_total_size(
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -269,7 +270,7 @@ fn seam_refuses_and_counts_total_size_lie() {
     assert_eq!(stats.schema_mismatch_drops, 0);
     assert_eq!(stats.reinject_failure_drops, 0);
 
-    // A frame SHORTER than the 32-byte header is the `TooSmall` decode class.
+    // A frame SHORTER than the 40-byte header is the `TooSmall` decode class.
     let too_small = vec![0u8; WireHeader::SIZE - 1];
     let outcome = injector.reinject_raw(&too_small);
     assert_eq!(

@@ -60,7 +60,7 @@ fn make_in_process_context() -> (
     cerulion_core::transport::subscriber::CerulionSubscriber,
 ) {
     // One isolated transport owns both topics (velocity_in + cmd_out). The
-    // 24-byte Vector3 fixed payload + 32-byte WireHeader fits in 256.
+    // 24-byte Vector3 fixed payload + 40-byte WireHeader fits in 256.
     let tt = TestTransport::with_buffer_size(8);
 
     // velocity_in: upstream publisher (host owns), node holds subscriber.

@@ -1708,6 +1708,7 @@ mod tests {
             offset_table_count: 0,
             sequence: seq,
             timestamp_ns: ts,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut f = vec![0u8; WireHeader::SIZE];
         header.write_to_buf(&mut f);

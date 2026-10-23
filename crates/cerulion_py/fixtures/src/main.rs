@@ -327,6 +327,7 @@ fn bag_oracle_frame(hash: u64, sequence: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence,
         timestamp_ns: 2_000_000_000 + u64::from(sequence) * 10_000_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);

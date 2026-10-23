@@ -100,10 +100,11 @@ variable field is its offset-table row.
 ## Frame - header, offset table, payload
 
 ```text
-[WireHeader 32 B][fixed section fixed_size B][offset table 8 B × n][variable payloads]
-header (LE): schema_hash u64 | total_size u32 | offset_table_offset u32 (= 32 + fixed_size)
+[WireHeader 40 B][fixed section fixed_size B][offset table 8 B × n][variable payloads]
+header (LE): schema_hash u64 | total_size u32 | offset_table_offset u32 (= 40 + fixed_size)
              | offset_table_count u32 (= n) | sequence u32 | timestamp_ns u64
-offset entry (LE): offset u32 (payload-relative, i.e. from byte 32) | length u32
+             | step_tag u64 (bytes 32..40)
+offset entry (LE): offset u32 (payload-relative, i.e. from byte 40) | length u32
 ```
 
 Placement rule (shared by generated writers, `rmw_cerulion` and `FrameEncoder`):
@@ -111,7 +112,7 @@ cursor starts at `data_floor()`; for each variable field in declaration order,
 align the cursor up to `variable_payload_align(field_type)` - 2/4/8 for
 `i16/u16`, `i32/u32/f32`, `i64/u64/f64` dynamic arrays, 1 for everything else -
 record `(cursor, len)`, advance by `len`. Every byte not written by a field
-(fixed-section padding, alignment padding) is **zero**. `total_size = 32 + cursor`.
+(fixed-section padding, alignment padding) is **zero**. `total_size = 40 + cursor`.
 
 `sequence`: the transport stamps it at commit (`OutputProxy::Drop`), so `begin`
 writes 0 and `FrameCursor::set_sequence` exists for replay and for parity pins (the
@@ -126,21 +127,22 @@ Schema `Probe { uint32 id; uint8 flag; string name; float64[] samples }`, values
 ```text
 off  bytes                                     meaning
  0   H (8 B LE)                                schema_hash
- 8   50 00 00 00                               total_size = 80
-12   28 00 00 00                               offset_table_offset = 32 + 8
+ 8   58 00 00 00                               total_size = 88
+12   30 00 00 00                               offset_table_offset = 40 + 8
 16   02 00 00 00                               offset_table_count = 2
 20   00 00 00 00                               sequence (transport stamps)
 24   88 77 66 55 44 33 22 11                   timestamp_ns
-32   04 03 02 01                               id
-36   07                                        flag
-37   00 00 00                                  fixed tail padding (align 4)
-40   18 00 00 00  02 00 00 00                  name   @24 len 2   (24 = data_floor)
-48   20 00 00 00  10 00 00 00                  samples @32 len 16 (26 aligned up to 8)
-56   61 62                                     "ab"
-58   00 00 00 00 00 00                         alignment padding
-64   00 00 00 00 00 00 F0 3F                   1.0f64
-72   00 00 00 00 00 00 00 40                   2.0f64
-80                                             total_size
+32   00 00 00 00 00 00 00 00                   step_tag (UNTAGGED)
+40   04 03 02 01                               id
+44   07                                        flag
+45   00 00 00                                  fixed tail padding (align 4)
+48   18 00 00 00  02 00 00 00                  name   @24 len 2   (24 = data_floor)
+56   20 00 00 00  10 00 00 00                  samples @32 len 16 (26 aligned up to 8)
+64   61 62                                     "ab"
+66   00 00 00 00 00 00                         alignment padding
+72   00 00 00 00 00 00 F0 3F                   1.0f64
+80   00 00 00 00 00 00 00 40                   2.0f64
+88                                             total_size
 ```
 
 This is `tests.rs::probe_oracle_frame`, asserted against `FrameEncoder` output and
@@ -195,7 +197,7 @@ reason. Both `with_layout` and `FrameEncoder::new` validate a supplied layout on
 
 | Class | `DynamicError` variant |
 |---|---|
-| frame shorter than 32 B | `FrameTooShort { have, need }` |
+| frame shorter than 40 B | `FrameTooShort { have, need }` |
 | hash unknown to the walker / hash ≠ supplied layout | `UnknownSchemaHash(u64)` / `SchemaHashMismatch { expected, found }` |
 | `total_size` > supplied buffer | `TotalSizeExceedsBuffer { total_size, have }` |
 | `total_size` < header + fixed + table | `TotalSizeBelowPrefix { schema, total_size, need }` |
@@ -230,7 +232,7 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   full count comes from the schema or the array's raw bytes). A zero-size message (no
   wire bytes: an empty message, or one made only of fixed arrays of them) is printed
   from the schema, and the keeping walk holds none of a fixed array of them, so a
-  32-byte frame that declares 2^40 empty elements costs only the output cap. It then
+  40-byte frame that declares 2^40 empty elements costs only the output cap. It then
   prints fields in DECLARATION order from the resolved schema of the frame's own hash
   (`FrameWalker::schema_for_hash`; a twin that owns the same qualified name never stands in)
   and of each nested target (`FrameWalker::nested_target`): a `WireLayout` splits fields

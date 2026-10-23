@@ -295,7 +295,7 @@ fn the_two_topic_determinism_fixture_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0xE637_D33C, 2301),
+        (0xD1D6_E1D1, 2325),
         "the two-topic determinism fixture's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );
@@ -361,7 +361,7 @@ fn the_six_message_roundtrip_fixture_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0x6631_0572, 2947),
+        (0x7766_2528, 2975),
         "the six-message roundtrip fixture's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );
@@ -386,7 +386,7 @@ fn the_empty_topic_list_bag_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0x68EE_6CC6, 1236),
+        (0x7F85_D2FA, 1252),
         "the empty-topic-list bag's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );

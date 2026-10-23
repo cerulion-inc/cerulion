@@ -215,7 +215,7 @@ fn oracle_payload(seq: u32) -> Vec<u8> {
     p
 }
 
-/// Build a raw wire frame (32-byte LE header + payload). `publish_raw` publishes
+/// Build a raw wire frame (40-byte LE header + payload). `publish_raw` publishes
 /// these bytes VERBATIM, so the published bytes ARE the oracle bytes.
 fn make_wire_frame(schema_hash: u64, seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
     let header = WireHeader {
@@ -225,6 +225,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, ts: u64, payload: &[u8]) -> Vec<u
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -1067,6 +1068,7 @@ async fn multi_topic_interleaved_reinject_byte_identical_per_topic() {
 /// A single-topic catalog (the misbehaving robot lists the topic it will ACK).
 fn single_topic_catalog(robot: &str, topic: &str) -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
@@ -1271,6 +1273,7 @@ async fn catalog_then_stop_reading_robot(daemon: Endpoint, robot: &str) {
     // Answer exactly ONE request (the catalog), then never read again.
     let _ = read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await;
     let reply = WireResponse::Catalog(CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![],

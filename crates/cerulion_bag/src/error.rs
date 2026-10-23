@@ -291,6 +291,28 @@ pub enum BagError {
         /// The id of the reader that refused it.
         this: u64,
     },
+
+    /// A user channel states a wire header version this build cannot read
+    /// (it reads version 1, the 32-byte header, and its own
+    /// [`WIRE_HEADER_VERSION`](cerulion_core::wire::WIRE_HEADER_VERSION)).
+    #[error("channel {topic:?} was recorded with wire header version {version}, which this build cannot read (it reads versions 1 and {current}); open the bag with the Cerulion release that recorded it", current = cerulion_core::wire::WIRE_HEADER_VERSION)]
+    UnsupportedWireHeader {
+        /// The channel's topic.
+        topic: String,
+        /// The version its descriptor states.
+        version: u16,
+    },
+
+    /// A bag recorded with the version 1 wire header could not be upgraded
+    /// for reading (its frames are too large to hold upgraded in memory, a
+    /// frame cannot grow to the current header, or a frame walk found a frame
+    /// its upgraded copy does not hold). Distinct from a torn or malformed bag:
+    /// the bag itself is intact.
+    #[error("version 1 wire header upgrade: {reason}")]
+    LegacyUpgrade {
+        /// What stopped the upgrade, and the remedy.
+        reason: String,
+    },
 }
 
 impl From<mcap::McapError> for BagError {

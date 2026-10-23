@@ -252,7 +252,7 @@ nodes:
 fn test_tier2_undersized_meta_value_rejected_at_newtype_construction() {
     // Adversarial: the macro-emitted MAX_SLICE_LEN const is buggy or
     // missing the wire-header offset (e.g. 8 — smaller than
-    // WireHeader::SIZE = 32). The resolver needs no runtime
+    // WireHeader::SIZE = 40). The resolver needs no runtime
     // floor check: the rejection happens at
     // `MaxSliceLen::try_new` construction (compile-time-aware
     // fallible constructor) — `try_new(8)` returns `None` before the
@@ -260,21 +260,21 @@ fn test_tier2_undersized_meta_value_rejected_at_newtype_construction() {
     // `meta.max_slice_len_default == None` and falls through to
     // tier-3 normally.
     //
-    // This test pins the TYPE-SYSTEM property (try_new rejects < 32)
+    // This test pins the TYPE-SYSTEM property (try_new rejects < 40)
     // separately from the resolver behavior. If `try_new`'s lower
     // bound is ever loosened, this test will fail loud — independent
     // of whether the resolver's downstream behavior also changes.
     assert!(
         MaxSliceLen::try_new(8).is_none(),
-        "MaxSliceLen::try_new must reject values < WireHeader::SIZE (32)"
+        "MaxSliceLen::try_new must reject values < WireHeader::SIZE (40)"
     );
     assert!(
-        MaxSliceLen::try_new(31).is_none(),
-        "MaxSliceLen::try_new must reject 31 (just below floor)"
+        MaxSliceLen::try_new(39).is_none(),
+        "MaxSliceLen::try_new must reject 39 (just below floor)"
     );
     assert!(
-        MaxSliceLen::try_new(32).is_some(),
-        "MaxSliceLen::try_new must accept WireHeader::SIZE (32) — header-only payload is valid"
+        MaxSliceLen::try_new(40).is_some(),
+        "MaxSliceLen::try_new must accept WireHeader::SIZE (40): header-only payload is valid"
     );
 
     // Belt-and-suspenders: also verify the resolver-level fallthrough

@@ -284,6 +284,9 @@ serde_json = "1"
 # `graph_cmd.rs` can build an in-process `GraphRuntime` without
 # pulling in iceoryx2.
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# `test-helpers` exposes `cerulion_bag::legacy_fixture`, which rewrites a bag in the
+# 32-byte wire header layout for the legacy play, resim and migrate tests.
+cerulion_bag = { workspace = true, features = ["test-helpers"] }
 # `no-env-filter` is required so the test subscriber doesn't filter
 # out cross-crate events. Without it, `#[traced_test]` builds an
 # EnvFilter scoped to the test crate's `module_path!()` and silently

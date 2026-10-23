@@ -1021,7 +1021,7 @@ rejected frame puts nothing on the wire and burns no sequence.
 There are exactly TWO reject gates, and it is worth being precise about what the second
 one does NOT cover: the header must PARSE (`WireHeader::read_from_buf`), and its
 `schema_hash` must match the publisher's. `read_from_buf` checks only that the buffer
-holds the 32-byte header; it does not validate `total_size` against the buffer length.
+holds the 40-byte header; it does not validate `total_size` against the buffer length.
 So a buffer shorter than the header is rejected under the malformed-header arm, but a
 frame carrying a VALID header and a payload truncated relative to `total_size` is
 **published**. Truncation is not an independently detected reject condition; do not

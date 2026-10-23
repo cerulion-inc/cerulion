@@ -380,7 +380,7 @@ impl Drop for RecordOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cerulion_bag::{BagReader, SchemaDescriptor, DESCRIPTOR_VERSION, SCHEMA_ENCODING};
+    use cerulion_bag::{BagReader, SchemaDescriptor, SCHEMA_ENCODING};
     use cerulion_core::{SchemaDoc, SchemaEncoding, SchemaHashName};
 
     const HASH: u64 = 0x11;
@@ -392,12 +392,7 @@ mod tests {
             schema_name: "go/State".to_string(),
             schema_encoding: SCHEMA_ENCODING.to_string(),
             message_encoding: SCHEMA_ENCODING.to_string(),
-            descriptor: Some(SchemaDescriptor {
-                descriptor_version: DESCRIPTOR_VERSION,
-                hash_recipe: cerulion_core::trace::bag::HASH_RECIPE,
-                schema_hash: HASH,
-                wire_fixed_size: 8,
-            }),
+            descriptor: Some(SchemaDescriptor::new(HASH, 8)),
             provisioning: ChannelProvisioning::default(),
         }
     }
@@ -557,12 +552,9 @@ mod tests {
     fn a_legacy_recipe_channel_takes_its_hash_from_the_first_frame() {
         let dir = tempfile::tempdir().unwrap();
         let mut legacy = channel("/state");
-        legacy.descriptor = Some(SchemaDescriptor {
-            descriptor_version: DESCRIPTOR_VERSION,
-            hash_recipe: cerulion_core::trace::bag::HASH_RECIPE.wrapping_sub(1),
-            schema_hash: HASH,
-            wire_fixed_size: 8,
-        });
+        let mut d = SchemaDescriptor::new(HASH, 8);
+        d.hash_recipe = cerulion_core::trace::bag::HASH_RECIPE.wrapping_sub(1);
+        legacy.descriptor = Some(d);
         legacy.schema_encoding = SCHEMA_ENCODING.to_string();
         let (plan, path) = plan(dir.path(), vec![legacy]);
         let out = RecordOut::open(plan, &["/state".to_string()]).expect("opens");
@@ -640,12 +632,7 @@ mod tests {
         let mut placeholder = channel("/state");
         // Hash 0 is the unknown placeholder: nothing comparable, so the
         // channel waits for its first frame.
-        placeholder.descriptor = Some(SchemaDescriptor {
-            descriptor_version: DESCRIPTOR_VERSION,
-            hash_recipe: cerulion_core::trace::bag::HASH_RECIPE,
-            schema_hash: 0,
-            wire_fixed_size: 8,
-        });
+        placeholder.descriptor = Some(SchemaDescriptor::new(0, 8));
         let (mut plan, path) = plan(dir.path(), vec![placeholder]);
         plan.catalog = Some(catalog());
         let out = RecordOut::open(plan, &["/state".to_string()]).expect("opens");

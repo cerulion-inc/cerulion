@@ -171,7 +171,7 @@ pub(crate) fn warn_offthread_release(py: Python<'_>, class: &str, returns: &str)
     let _ = PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &msg, 1);
 }
 
-/// One received wire frame (32-byte header + body).
+/// One received wire frame (40-byte header + body).
 ///
 /// A memoryview released on a foreign thread still uncounts its export;
 /// if that was the last view of a released frame, the slot returns at the
@@ -342,6 +342,14 @@ impl Frame {
     fn timestamp_ns(&self) -> PyResult<u64> {
         self.check_live()?;
         Ok(self.header.timestamp_ns)
+    }
+
+    /// Wire `step_tag` field, as its raw `u64` (0 = untagged: producer rank
+    /// in bits 48 to 63, step plus one in bits 0 to 47).
+    #[getter]
+    fn step_tag(&self) -> PyResult<u64> {
+        self.check_live()?;
+        Ok(self.header.step_tag.raw())
     }
 
     /// Wire `total_size` field (header + body bytes).

@@ -355,14 +355,14 @@ fn undersized_max_slice_len_fails_validation() {
     // Pin the actionable numerics so a future error-message reword
     // can't silently drop the diagnostic that tells the user what to
     // fix. Validator format (see validation.rs:81-87): "node 'lidar_sensor'
-    // output 'scan' max_slice_len (8) must be > WireHeader::SIZE (32)".
+    // output 'scan' max_slice_len (8) must be > WireHeader::SIZE (40)".
     assert!(
         reason.contains("(8)"),
         "error must report the bad value `(8)` for actionable diagnostics; got: {reason}"
     );
     assert!(
-        reason.contains("(32)"),
-        "error must report the WireHeader::SIZE threshold `(32)` so users see the rule; got: {reason}"
+        reason.contains("(40)"),
+        "error must report the WireHeader::SIZE threshold `(40)` so users see the rule; got: {reason}"
     );
     assert!(
         reason.contains("lidar_sensor"),

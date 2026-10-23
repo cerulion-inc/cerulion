@@ -223,6 +223,7 @@ fn make_frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000_000 + seq as u64 * 10_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

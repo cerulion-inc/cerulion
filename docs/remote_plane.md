@@ -9,7 +9,7 @@ never bricks offline.
 It is distinct from `docs/networking.md`, which covers the LAN **zenoh gateway**
 (`network:` block, `topic list`, mDNS). The remote plane is the internet path:
 one iroh endpoint per robot, dial-by-key, the `cerulion/ops/1` (cerud) and
-`cerulion/wire/1` planes, reachable 24/7 from boot by design, auth-gated
+`cerulion/wire/2` planes, reachable 24/7 from boot by design, auth-gated
 by the offline pairing access list.
 
 ## The control-lease deadman

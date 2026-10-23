@@ -196,6 +196,7 @@ fn build_frame(sequence: u32, video_height: u32, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 1,
         sequence,
         timestamp_ns: 1_000 + sequence as u64,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&body);

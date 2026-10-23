@@ -338,6 +338,7 @@ fn frame_with_header(
         offset_table_count: table_count,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1429,6 +1430,7 @@ fn build_path_frame(frame_id: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1915,6 +1917,7 @@ fn build_imu_frame(frame_id: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1940,6 +1943,7 @@ fn build_pose_stamped_frame(frame_id: &str, pos: [f64; 3], timestamp_ns: u64) ->
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

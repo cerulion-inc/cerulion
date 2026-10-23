@@ -53,6 +53,8 @@
 //! - Token is automatically dropped when the publisher is dropped or the session closes
 //! - Remote nodes detect the drop via liveliness subscription (failure detection for free)
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use zenoh::Wait;
@@ -587,6 +589,43 @@ fn attribute_schema_to_queried(mut reply: SchemaReply, robot: &str) -> SchemaRep
     reply
 }
 
+/// The most distinct `(robot, version)` pairs [`warn_catalog_wire_header_mismatch`]
+/// remembers; past it, a new pair logs at `debug!`, so a hostile or huge LAN
+/// cannot grow the set without bound.
+const CATALOG_WIRE_HEADER_WARNED_CAP: usize = 256;
+
+/// The `(robot, wire header version)` pairs already warned about.
+static CATALOG_WIRE_HEADER_WARNED: Mutex<BTreeSet<(String, u16)>> = Mutex::new(BTreeSet::new());
+
+/// Loud ONCE per `(robot, version)`: the robot's catalog says it reads and
+/// writes another wire header version, so none of its topics can be received
+/// here. Catalogs are gathered repeatedly, so a repeat logs at `debug!`.
+// hot-path-alloc-ok-fn: cold, one catalog reply per discovery gather, never per frame.
+fn warn_catalog_wire_header_mismatch(robot: &str, theirs: u16) {
+    let first = {
+        let mut warned = CATALOG_WIRE_HEADER_WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warned.len() < CATALOG_WIRE_HEADER_WARNED_CAP && warned.insert((robot.to_string(), theirs))
+    };
+    if first {
+        tracing::warn!(
+            robot = %robot,
+            peer_wire_header = theirs,
+            local_wire_header = crate::wire::WIRE_HEADER_VERSION,
+            "this robot runs a Cerulion build with a different wire header version, so its \
+             topics are listed but cannot be received here. Install the same Cerulion release \
+             on both machines"
+        );
+    } else {
+        tracing::debug!(
+            robot = %robot,
+            peer_wire_header = theirs,
+            "robot catalog wire header version differs (repeat)"
+        );
+    }
+}
+
 pub fn query_robot_catalog(
     session: &zenoh::Session,
     robot: &str,
@@ -617,6 +656,9 @@ pub fn query_robot_catalog(
     }
     match cerulion_q::gather_catalog_outcome(payloads.iter().map(|p| p.as_slice())) {
         CatalogGatherOutcome::Decoded(catalog) => {
+            if !catalog.wire_header_matches() {
+                warn_catalog_wire_header_mismatch(robot, catalog.wire_header_version);
+            }
             Some(attribute_catalog_to_queried(catalog, robot))
         }
         CatalogGatherOutcome::Ignored(reason) => {
@@ -1570,6 +1612,7 @@ mod tests {
 
         // CATALOG reply: same override, entries/version preserved.
         let served_cat = CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: cerulion_q::CATALOG_WIRE_VERSION,
             robot: "ubuntu".to_string(),
             entries: Vec::new(),
