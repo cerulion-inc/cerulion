@@ -992,7 +992,10 @@ pub struct TopicServiceConfig {
     /// creates it with `publishers + 2 x subscribers` notifier and listener
     /// slots, read from the live data service and never below iceoryx2's
     /// event defaults: one per data port, plus the standalone listener a
-    /// graph's unified data-trigger input adds beside its subscriber.
+    /// graph's unified data-trigger input adds beside its subscriber. A
+    /// floored create also sets the data and event services' `max_nodes`
+    /// (attached processes) to `publishers + subscribers`, never below the
+    /// node config's defaults; see `Self::create_node_cap` (pub(crate)).
     ///
     /// The create value is `max(floor, max_publishers or the node's
     /// create default)`, so a floor can only raise. A floor at or below that
@@ -1202,6 +1205,7 @@ struct DataLeg {
     borrowed_samples: Option<usize>,
     max_publishers: Option<usize>,
     max_subscribers: Option<usize>,
+    max_nodes: Option<usize>,
 }
 
 /// An RAII handle that keeps a pre-created topic's
@@ -1591,6 +1595,39 @@ impl TopicServiceConfig {
         )
     }
 
+    /// Whether this opener carries a create-leg port floor
+    /// ([`Self::create_publisher_floor`] or [`Self::create_subscriber_floor`]).
+    /// A floored opener sizes the services it creates from the data caps:
+    /// the event ports, and the node cap from [`Self::create_node_cap`].
+    pub(crate) fn has_create_port_floor(&self) -> bool {
+        self.create_publisher_floor.is_some() || self.create_subscriber_floor.is_some()
+    }
+
+    /// The `max_nodes` for the CREATE leg of a data-service acquisition:
+    /// `None` (the node config's default applies) unless this opener carries
+    /// a port floor; then one node per data port the created service has,
+    /// `publishers + subscribers` from [`Self::create_port_caps`] (the
+    /// node's `default_caps` where that is `None`), clamped to
+    /// [`MAX_REASONABLE_PORTS`] and never below `default_nodes`. iceoryx2
+    /// counts each process that opens the service once against this cap, so
+    /// the value admits one process per port slot. It is set on the create
+    /// leg only; it never arms an open requirement.
+    pub(crate) fn create_node_cap(
+        &self,
+        default_caps: (usize, usize),
+        default_nodes: usize,
+    ) -> Option<usize> {
+        if !self.has_create_port_floor() {
+            return None;
+        }
+        let (publishers, subscribers) = self.create_port_caps(default_caps);
+        let ports = publishers
+            .unwrap_or(default_caps.0)
+            .saturating_add(subscribers.unwrap_or(default_caps.1))
+            .min(MAX_REASONABLE_PORTS);
+        Some(ports.max(default_nodes))
+    }
+
     /// Service REQUEST topic provisioning (explicit and
     /// role-derived, never sniffed from the topic
     /// name). A request topic fans N client
@@ -1816,6 +1853,14 @@ fn publish_subscribe_open_env_hint(
             "; a peer crashed while creating this service — remove \
              the stale iceoryx2 shared-memory artifacts (or reboot) \
              before reopening"
+        }
+        PublishSubscribeOpenError::ExceedsMaxNumberOfNodes => {
+            "; the service already has as many attached processes as its \
+             creator allowed (iceoryx2 `max_nodes`, counted once per process). \
+             A service an rmw endpoint creates allows one process per publisher \
+             and subscriber slot; a service created elsewhere keeps the node \
+             config's `max-nodes` (default 20), which `[defaults.publish-subscribe]` \
+             in iceoryx2.toml raises"
         }
         PublishSubscribeOpenError::VersionMismatch => {
             "; the existing service was created by a process linking a \
@@ -6360,6 +6405,7 @@ impl TransportManager {
                 borrowed_samples,
                 max_publishers,
                 max_subscribers,
+                max_nodes,
             } = legs;
             let mut data_builder = self
                 .node
@@ -6385,6 +6431,11 @@ impl TransportManager {
             if let Some(max_publishers) = max_publishers {
                 // Same per-setter verification semantics.
                 data_builder = data_builder.max_publishers(max_publishers);
+            }
+            if let Some(max_nodes) = max_nodes {
+                // Set on the create leg only, so no opener carries a node
+                // requirement.
+                data_builder = data_builder.max_nodes(max_nodes);
             }
             if topic_config.history_size > 0 {
                 // Arm iceoryx2 NATIVE publisher history at the
@@ -6435,18 +6486,24 @@ impl TransportManager {
         // `create_subscriber_floor`, see `TopicServiceConfig::create_port_caps`):
         // the OPEN leg arms only `max_publishers` / `max_subscribers`, the
         // CREATE leg the floored values.
+        //
+        // The node cap rides the create leg too: an opener with a port floor
+        // creates the data service with `max_nodes` from
+        // `TopicServiceConfig::create_node_cap`, one node per data port.
         let node_defaults = &self.node.config().defaults.publish_subscribe;
-        let (create_publishers, create_subscribers) = topic_config
-            .create_port_caps((node_defaults.max_publishers, node_defaults.max_subscribers));
+        let default_caps = (node_defaults.max_publishers, node_defaults.max_subscribers);
+        let (create_publishers, create_subscribers) = topic_config.create_port_caps(default_caps);
         let open_leg = DataLeg {
             borrowed_samples: topic_config.subscriber_max_borrowed_samples,
             max_publishers: topic_config.max_publishers,
             max_subscribers: topic_config.max_subscribers,
+            max_nodes: None,
         };
         let create_leg = DataLeg {
             borrowed_samples: topic_config.create_borrowed_samples(),
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
+            max_nodes: topic_config.create_node_cap(default_caps, node_defaults.max_nodes),
         };
         let data_result = if open_leg == create_leg {
             // No asymmetry (External passthrough, a genuine borrow requirement
@@ -6819,13 +6876,16 @@ impl TransportManager {
         // listener belongs to a unified data-trigger input whose body
         // subscriber is one of the subscribers, so that requirement never
         // exceeds what is created here. Never below iceoryx2's event create
-        // defaults, so a floor only raises.
+        // defaults, so a floor only raises. Keyed on a floor being SET, not on
+        // it raising the data caps: when the node config already sets the data
+        // caps at or above the floors, the data service carries them while the
+        // event defaults can be smaller, and the sizing reads the live caps
+        // either way.
+        let event_defaults = &self.node.config().defaults.event;
+        let floored = topic_config.has_create_port_floor();
         let create_event_ports = match armed_event_ports {
             Some(ports) => Some(ports),
-            None if (create_publishers, create_subscribers)
-                != (topic_config.max_publishers, topic_config.max_subscribers) =>
-            {
-                let event_defaults = &self.node.config().defaults.event;
+            None if floored => {
                 let ports = live_data
                     .max_publishers()
                     .saturating_add(live_data.max_subscribers().saturating_mul(2))
@@ -6838,9 +6898,14 @@ impl TransportManager {
             }
             None => None,
         };
+        // Every process attached to the data service also attaches the event
+        // service, so a floored create gives the event service at least the
+        // live data service's node cap (never below the event default).
+        let create_event_nodes =
+            floored.then(|| live_data.max_nodes().max(event_defaults.max_nodes));
         // Same event-id ceiling as the sibling open above; see
         // `CERULION_MAX_EVENT_ID`.
-        let make_event_builder = |event_ports: Option<usize>| {
+        let make_event_builder = |event_ports: Option<usize>, max_nodes: Option<usize>| {
             let mut event_builder = self
                 .node
                 .service_builder(&event_service_name)
@@ -6851,37 +6916,41 @@ impl TransportManager {
                     .max_listeners(event_ports)
                     .max_notifiers(event_ports);
             }
+            if let Some(max_nodes) = max_nodes {
+                event_builder = event_builder.max_nodes(max_nodes);
+            }
             event_builder
         };
-        let event_result = if armed_event_ports == create_event_ports {
-            make_event_builder(armed_event_ports).open_or_create()
-        } else {
-            use iceoryx2::service::builder::event::{
-                EventCreateError, EventOpenError, EventOpenOrCreateError,
+        let event_result =
+            if armed_event_ports == create_event_ports && create_event_nodes.is_none() {
+                make_event_builder(armed_event_ports, None).open_or_create()
+            } else {
+                use iceoryx2::service::builder::event::{
+                    EventCreateError, EventOpenError, EventOpenOrCreateError,
+                };
+                // The data half's split, on the event builder: open with the
+                // armed requirement, create with `create_event_ports` and
+                // `create_event_nodes`.
+                open_then_create(
+                    self.node.config().global.creation_timeout,
+                    EventOpenOrCreateError::SystemInFlux,
+                    || make_event_builder(armed_event_ports, None).open(),
+                    |e| match e {
+                        EventOpenError::DoesNotExist => OpenStep::Create,
+                        EventOpenError::HangsInCreation
+                        | EventOpenError::IsMarkedForDestruction => OpenStep::Wait,
+                        _ => OpenStep::Fail,
+                    },
+                    || make_event_builder(create_event_ports, create_event_nodes).create(),
+                    |e| {
+                        matches!(
+                            e,
+                            EventCreateError::AlreadyExists
+                                | EventCreateError::IsBeingCreatedByAnotherInstance
+                        )
+                    },
+                )
             };
-            // The data half's split, on the event builder: open with the
-            // armed requirement (none), create with `create_event_ports`.
-            open_then_create(
-                self.node.config().global.creation_timeout,
-                EventOpenOrCreateError::SystemInFlux,
-                || make_event_builder(armed_event_ports).open(),
-                |e| match e {
-                    EventOpenError::DoesNotExist => OpenStep::Create,
-                    EventOpenError::HangsInCreation | EventOpenError::IsMarkedForDestruction => {
-                        OpenStep::Wait
-                    }
-                    _ => OpenStep::Fail,
-                },
-                || make_event_builder(create_event_ports).create(),
-                |e| {
-                    matches!(
-                        e,
-                        EventCreateError::AlreadyExists
-                            | EventCreateError::IsBeingCreatedByAnotherInstance
-                    )
-                },
-            )
-        };
         let event_service = event_result.map_err(|e| {
             use iceoryx2::service::builder::event::{EventOpenError, EventOpenOrCreateError};
             // The event-service twin of the data
@@ -8657,6 +8726,46 @@ mod tests {
         cfg.max_subscribers = Some(40);
         cfg.create_subscriber_floor = Some(32);
         assert_eq!(cfg.create_port_caps(defaults), (Some(32), Some(40)));
+    }
+
+    /// `create_node_cap`: `None` without a floor; with one, the created data
+    /// caps summed (the node defaults filling an unraised axis), never below
+    /// the node default and clamped to `MAX_REASONABLE_PORTS`. Hand oracle
+    /// per arm.
+    #[test]
+    fn create_node_cap_counts_one_node_per_created_port() {
+        let defaults = (2, 8);
+        let mut cfg = default_seed_cfg();
+        cfg.publisher_provisioning = PublisherProvisioning::External;
+        assert_eq!(
+            cfg.create_node_cap(defaults, 20),
+            None,
+            "no floor: no change"
+        );
+
+        cfg.create_publisher_floor = Some(32);
+        cfg.create_subscriber_floor = Some(32);
+        assert_eq!(cfg.create_node_cap(defaults, 20), Some(64));
+
+        // A subscriber floor at the node default leaves that axis at 8.
+        cfg.create_subscriber_floor = Some(8);
+        assert_eq!(cfg.create_node_cap(defaults, 20), Some(40));
+
+        // Floors that raise nothing still set a cap, from the defaults, and
+        // a larger node default wins.
+        cfg.create_publisher_floor = Some(1);
+        cfg.create_subscriber_floor = None;
+        assert_eq!(cfg.create_node_cap(defaults, 20), Some(20));
+        assert_eq!(cfg.create_node_cap((32, 32), 20), Some(64));
+        assert_eq!(cfg.create_node_cap(defaults, 100), Some(100));
+
+        // The sum is clamped.
+        cfg.create_publisher_floor = Some(MAX_REASONABLE_PORTS);
+        cfg.create_subscriber_floor = Some(MAX_REASONABLE_PORTS);
+        assert_eq!(
+            cfg.create_node_cap(defaults, 20),
+            Some(MAX_REASONABLE_PORTS)
+        );
     }
 
     // ===================================================================
