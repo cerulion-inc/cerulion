@@ -1308,8 +1308,8 @@ export AWS_FAIL_METADATA_INVALIDATION=1
 export AWS_FAIL_METADATA_INVALIDATION_MARKER="$workdir/metadata-invalidation-failure"
 rm -f "$AWS_SIGNAL_MARKER" "$AWS_FAIL_METADATA_INVALIDATION_MARKER"
 : > "$AWS_LOG"
-if metadata_invalidation_output=$("$workdir/run-signal-narrowing" INT \
-    >"$workdir/metadata-invalidation-output" 2>&1); then
+if "$workdir/run-signal-narrowing" INT \
+    >"$workdir/metadata-invalidation-output" 2>&1; then
     printf '%s\n' 'error: metadata invalidation failure unexpectedly succeeded' >&2
     exit 1
 fi
