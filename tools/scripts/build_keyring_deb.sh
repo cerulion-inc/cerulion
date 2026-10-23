@@ -1,11 +1,21 @@
 #!/bin/sh
 #
-# Build the Debian package that installs the Cerulion APT archive keyring.
+# Build the Debian package that bootstraps the Cerulion APT repository on a
+# client: it installs the archive signing keyring AND the sources.list entry
+# that points at the repository, so a new machine runs `dpkg -i` on this one
+# package and then `apt-get update` works. Rotating a signing key, or moving
+# the repository, then reaches every client as an ordinary package upgrade
+# rather than as a documentation change nobody re-reads.
+#
+# The sources.list entry names the repository URL, which the package cannot
+# know on its own, so APT_REPO_URL is required: a package built without one
+# would install a keyring that verifies a repository the client is never told
+# about, which fails later and further away than refusing here.
 #
 set -eu
 
 usage() {
-    printf 'usage: %s KEYRING VERSION REVISION OUTDIR\n' "$0" >&2
+    printf 'usage: APT_REPO_URL=URL %s KEYRING VERSION REVISION OUTDIR\n' "$0" >&2
 }
 
 die() {
@@ -111,6 +121,30 @@ case "$revision" in
     ''|*[!0-9]*|0[0-9]*) die "keyring revision must be a canonical non-negative integer: $revision" ;;
     *) ;;
 esac
+repo_url=${APT_REPO_URL:-}
+[ -n "$repo_url" ] ||
+    die "APT_REPO_URL is required: the package carries the sources.list entry naming the repository"
+case "$repo_url" in
+    *"
+"*) die "invalid APT_REPO_URL: $repo_url" ;;
+esac
+case "$repo_url" in
+    http://*|https://*) ;;
+    *) die "APT_REPO_URL must be an http or https URL: $repo_url" ;;
+esac
+# A space or a bracket would end the URL field, or the option field before it,
+# in the one-line sources.list entry below and silently change what apt fetches.
+case "$repo_url" in
+    *' '*|*'	'*|*'['*|*']'*) die "invalid APT_REPO_URL: $repo_url" ;;
+esac
+# apt joins the URL and the suite with a single slash of its own.
+while :; do
+    case "$repo_url" in
+        */) repo_url=${repo_url%/} ;;
+        *) break ;;
+    esac
+done
+[ -n "$repo_url" ] || die "invalid APT_REPO_URL: ${APT_REPO_URL:-}"
 command -v dpkg-deb >/dev/null 2>&1 ||
     die "dpkg-deb is required to build a Debian package"
 command -v ar >/dev/null 2>&1 ||
@@ -130,11 +164,27 @@ cleanup() {
 trap cleanup EXIT
 
 stage="$workdir/root"
-mkdir -p "$stage/DEBIAN" "$stage/usr/share/keyrings"
+mkdir -p "$stage/DEBIAN" "$stage/usr/share/keyrings" \
+    "$stage/etc/apt/sources.list.d"
 chmod 0755 "$stage" "$stage/DEBIAN" "$stage/usr" "$stage/usr/share" \
-    "$stage/usr/share/keyrings"
+    "$stage/usr/share/keyrings" "$stage/etc" "$stage/etc/apt" \
+    "$stage/etc/apt/sources.list.d"
 cp "$keyring" "$stage/usr/share/keyrings/cerulion-archive-keyring.gpg"
 chmod 0644 "$stage/usr/share/keyrings/cerulion-archive-keyring.gpg"
+
+# The architectures are the ones the repository actually indexes. Leaving the
+# field out would make apt ask for every architecture the client has enabled,
+# so a machine carrying a foreign architecture would fail `apt-get update` on
+# an index this repository never publishes.
+printf '%s\n' \
+    "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/cerulion-archive-keyring.gpg] $repo_url stable main" \
+    > "$stage/etc/apt/sources.list.d/cerulion.list"
+chmod 0644 "$stage/etc/apt/sources.list.d/cerulion.list"
+
+# Under /etc, so dpkg must treat it as configuration: without this an upgrade
+# overwrites an operator's edits (a mirror, a pinned suite) without asking.
+printf '%s\n' /etc/apt/sources.list.d/cerulion.list > "$stage/DEBIAN/conffiles"
+chmod 0644 "$stage/DEBIAN/conffiles"
 
 cat > "$stage/DEBIAN/control" <<EOF
 Package: cerulion-archive-keyring
@@ -144,8 +194,11 @@ Section: admin
 Priority: optional
 Maintainer: Cerulion <packaging@cerulion.com>
 Homepage: https://cerulion.com
-Description: Cerulion APT archive signing keys
- The public keys used to verify Cerulion APT repository metadata.
+Description: Cerulion APT repository keyring and source entry
+ The public keys used to verify Cerulion APT repository metadata, and the
+ sources.list entry that points apt at the repository they verify. Installing
+ this package is what makes \`apt-get install cerulion\` work; upgrading it is
+ how a rotated signing key reaches a machine.
 EOF
 chmod 0644 "$stage/DEBIAN/control"
 

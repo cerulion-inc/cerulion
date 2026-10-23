@@ -63,7 +63,8 @@ jobs:
         run: |
           # APT_GPG_KEY_ID is optional; it overrides the recorded fingerprint
           # fallback used by the import step below.
-          # APT_CLOUDFRONT_PATH_PREFIX and APT_KEYRING_REVISION are optional.
+          # APT_CLOUDFRONT_PATH_PREFIX, APT_KEYRING_REVISION and
+          # APT_PUBLIC_URL are optional.
           if [ -z "$TAG" ]; then
             echo "::error::TAG is empty; this workflow runs on a tag push or a workflow_dispatch naming an existing tag"
             exit 1
@@ -131,10 +132,10 @@ jobs:
           [ -n "$APT_CLOUDFRONT_DISTRIBUTION_ID" ] || missing="$missing vars.APT_CLOUDFRONT_DISTRIBUTION_ID"
           if [ -n "$missing" ]; then
             if [ "$dispatch" = true ]; then
-              echo "::error::APT repository publish cannot run; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, and vars.APT_KEYRING_REVISION customize the publish)"
+              echo "::error::APT repository publish cannot run; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, vars.APT_KEYRING_REVISION, and vars.APT_PUBLIC_URL customize the publish)"
               exit 1
             fi
-            echo "APT repository publish skipped; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, and vars.APT_KEYRING_REVISION customize the publish)"
+            echo "APT repository publish skipped; configure:$missing (optional: vars.APT_GPG_KEY_ID, vars.APT_CLOUDFRONT_PATH_PREFIX, vars.APT_KEYRING_REVISION, and vars.APT_PUBLIC_URL customize the publish)"
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "stable=$stable" >> "$GITHUB_OUTPUT"
             exit 0
@@ -376,6 +377,10 @@ jobs:
           APT_CLOUDFRONT_PATH_PREFIX: ${{ vars.APT_CLOUDFRONT_PATH_PREFIX }}
           APT_KEYRING_REVISION: ${{ vars.APT_KEYRING_REVISION }}
           APT_KEYRING_KEYS: ${{ vars.APT_KEYRING_KEYS }}
+          # The address clients fetch from, written into the sources.list entry
+          # the keyring package carries. Empty falls back to the repository the
+          # project publishes; set it when publishing somewhere else.
+          APT_REPO_URL: ${{ vars.APT_PUBLIC_URL }}
           FINGERPRINT: ${{ steps.key.outputs.fingerprint }}
         run: |
           if [ -z "$TAG" ]; then
@@ -419,4 +424,26 @@ jobs:
           tools/scripts/publish_apt_repo.sh "$repo" "$remote" \
             "$APT_CLOUDFRONT_DISTRIBUTION_ID" "$cloudfront_path_prefix" \
             "$published_keyring" "$primary_fingerprint"
+          # The bootstrap package, at an address a person can type. The pool
+          # copy is version-stamped and moves every release, so it can never be
+          # the URL a README gives out. This copy is made only after the
+          # publish above succeeded, so it can lag the live keyring but never
+          # lead it: whoever installs it gets a keyring the repository metadata
+          # is already signed against, in both directions of a key rotation.
+          keyring_revision=${APT_KEYRING_REVISION:-1}
+          bootstrap_deb="$repo/pool/main/c/cerulion-archive-keyring/cerulion-archive-keyring_${debian_version}-${keyring_revision}_all.deb"
+          if [ ! -f "$bootstrap_deb" ]; then
+            echo "::error::keyring package is missing from the pool: $bootstrap_deb"
+            exit 1
+          fi
+          aws s3 cp "$bootstrap_deb" "$remote/cerulion-archive-keyring.deb"
+          cloudfront_prefix=${cloudfront_path_prefix#/}
+          cloudfront_prefix=${cloudfront_prefix%/}
+          if [ -n "$cloudfront_prefix" ]; then
+            cloudfront_prefix="/$cloudfront_prefix"
+          fi
+          aws cloudfront create-invalidation \
+            --distribution-id "$APT_CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "${cloudfront_prefix}/cerulion-archive-keyring.deb" \
+            --query Invalidation.Id --output text
         shell: bash
