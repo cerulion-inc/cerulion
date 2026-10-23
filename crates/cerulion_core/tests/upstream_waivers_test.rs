@@ -260,6 +260,11 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
     ),
     (
+        "crates/cerulion_cli/tests/log_throttle_e2e_test.rs",
+        "spawns `graph run --single-process` (virtual and `--record`) then `bag play \
+         --resim`; its 2 macOS arms passed at 32ab62f6",
+    ),
+    (
         "crates/cerulion_cli/tests/graph_launch_args_e2e_test.rs",
         "spawns `graph run --single-process` (and one multi-process run its `--yes` guard \
          refuses before any node plugin loads); its 4 macOS arms passed on Darwin 27 \
@@ -407,8 +412,8 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
-/// with the number of SUBTRACTION SITES each carries: eleven sites across
-/// ten arms in five binaries, because the wide level arm subtracts once per width.
+/// with the number of SUBTRACTION SITES each carries: twelve sites across
+/// eleven arms in six binaries, because the wide level arm subtracts once per width.
 ///
 /// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
 /// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
@@ -419,6 +424,7 @@ const WAIVED_2035: &[(&str, usize)] = &[
         "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
         1,
     ),
+    ("crates/cerulion_core/tests/log_sites_zero_alloc_test.rs", 1),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
@@ -1674,8 +1680,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 11,
-        "the 2035 waiver covers eleven subtraction sites across ten arms (the wide level arm \
+        total, 12,
+        "the 2035 waiver covers twelve subtraction sites across eleven arms (the wide level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit."
     );

@@ -28,6 +28,8 @@ pub mod chain;
 pub mod config;
 pub mod drain_latch;
 pub mod launch_args;
+// The throttle and once log macros' per-call-site state.
+pub mod log_sites;
 pub mod node;
 pub mod param_resume;
 pub mod params;

@@ -86,6 +86,9 @@ members = [
     # A period cdylib with an `#[input(accumulate)]` input, for the
     # in-process vs cdylib parity pin of the keep-every-message read.
     "crates/test_fixtures/test_node_macro_accumulate_cdylib",
+    # A fast period cdylib that logs through the throttle and once macros
+    # on every tick, for the `graph run` stderr and resim pins.
+    "crates/test_fixtures/test_node_macro_log_throttle_cdylib",
     # ABI v8: #[input(depth = 32)] across the cdylib FFI; consumed
     # by cdylib_depth_ffi_test (parse pin + parity + e2e ceiling oracle).
     "crates/test_fixtures/test_node_macro_depth_cdylib",
