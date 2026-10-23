@@ -17,10 +17,13 @@ struct Host {
     runtime: Mutex<EmbeddedRuntime>,
     status: Arc<Mutex<Status>>,
     lifecycle: Mutex<Lifecycle>,
+    #[cfg(test)]
+    worker_hold: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// Async-operation lifecycle. The lock is held only to make
-/// and record a transition decision, never across runtime work.
+/// Async-operation lifecycle. The lock is held only to make and record a
+/// transition decision or to read it with the status, never across runtime
+/// work.
 enum Lifecycle {
     /// No start or stop worker is in flight.
     Idle,
@@ -68,6 +71,43 @@ impl Host {
             runtime: Mutex::new(runtime),
             status,
             lifecycle: Mutex::new(Lifecycle::Idle),
+            #[cfg(test)]
+            worker_hold: Mutex::new(None),
+        }
+    }
+
+    /// The status an app reads. While the lifecycle is Starting or Stopping
+    /// the state reads as that transition, whatever the runtime recorded;
+    /// the other fields read as recorded. A worker records Running, Stopped
+    /// or Failed while it still holds the runtime lock, and sets the
+    /// lifecycle to Idle only after releasing it.
+    /// The lifecycle and the status are read under both locks, in the order
+    /// `start` and `stop` take them, so a reported Running, Stopped or Failed
+    /// means the worker has released the runtime lock and the lifecycle is
+    /// Idle: a publish or a restart issued next is not answered BUSY by it.
+    fn observed_status(&self) -> Status {
+        let lifecycle = lock_lifecycle(&self.lifecycle);
+        let mut status = lock_status(&self.status).clone();
+        match *lifecycle {
+            Lifecycle::Idle => {}
+            Lifecycle::Starting { .. } => status.state = RuntimeState::Starting,
+            Lifecycle::Stopping => status.state = RuntimeState::Stopping,
+        }
+        status
+    }
+
+    /// TEST SEAM: run the hook a test installed, once, in the next start or
+    /// stop worker after its runtime call returns and before the worker
+    /// releases the runtime lock.
+    fn hold_worker_for_test(&self) {
+        #[cfg(test)]
+        if let Some(hold) = self
+            .worker_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hold();
         }
     }
 
@@ -102,7 +142,9 @@ impl Host {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut runtime = lock_runtime(&self.runtime);
-                    runtime.start_accepted(&config_json)
+                    let result = runtime.start_accepted(&config_json);
+                    self.hold_worker_for_test();
+                    result
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -233,7 +275,9 @@ impl Host {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut runtime = lock_runtime(&self.runtime);
-                    runtime.stop().map(|_| ())
+                    let result = runtime.stop().map(|_| ());
+                    self.hold_worker_for_test();
+                    result
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -253,17 +297,15 @@ impl Host {
 
     /// Take the runtime lock for an app publish. The lifecycle check and the
     /// runtime try_lock run under the lifecycle guard so a stop cannot be
-    /// accepted in between; then the guard drops before the publish itself,
-    /// so a Java stop() is never made to wait out a publish. Once the caller
+    /// accepted in between; then the guard drops before the publish itself.
+    /// The lifecycle lock is taken with a wait (its holders only decide a
+    /// transition or read the status); the runtime lock with try_lock, so a
+    /// Java stop() is never made to wait out a publish. Once the caller
     /// holds the returned runtime lock, a stop accepted afterwards just waits
     /// on that lock in its worker: the publish is ordered before the stop and
     /// teardown cannot interleave.
     fn publish_runtime(&self) -> Result<MutexGuard<'_, EmbeddedRuntime>, i32> {
-        let lifecycle = match self.lifecycle.try_lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(TryLockError::WouldBlock) => return Err(codes::BUSY),
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        };
+        let lifecycle = lock_lifecycle(&self.lifecycle);
         if !matches!(*lifecycle, Lifecycle::Idle) {
             return Err(codes::BUSY);
         }
@@ -441,8 +483,7 @@ fn status_inner() -> String {
     let Some(host) = HOST.get() else {
         return "{\"state\":\"uninitialized\"}".to_string();
     };
-    let status = lock_status(&host.status);
-    serde_json::to_string(&*status)
+    serde_json::to_string(&host.observed_status())
         .unwrap_or_else(|_| failed_status_json("status serialization failed"))
 }
 
@@ -777,17 +818,7 @@ mod tests {
             );
         }
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if lock_status(&host.status).state == RuntimeState::Running {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "runtime did not reach running within 10 seconds"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_observed(host, RuntimeState::Running);
 
         // The JNI publish path: the limit check and the publish must see the
         // same run, so no stop or restart may take the runtime while the
@@ -816,25 +847,129 @@ mod tests {
             Some(&1)
         );
         assert_eq!(host.stop(), codes::OK);
+        wait_for_observed(host, RuntimeState::Stopped);
+    }
+
+    /// Poll the app-observed status until it reads `want`; panic on any
+    /// other settled state (Failed, or Stopped while waiting for Running).
+    fn wait_for_observed(host: &Host, want: RuntimeState) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let (state, last_error) = {
-                let status = lock_status(&host.status);
-                (status.state, status.last_error.clone())
-            };
-            let idle = matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle);
-            if state == RuntimeState::Stopped && idle {
-                break;
-            }
-            if state == RuntimeState::Failed {
-                panic!("runtime failed during stop: {last_error:?}");
+            let status = host.observed_status();
+            if status.state == want {
+                return;
             }
             assert!(
+                matches!(
+                    status.state,
+                    RuntimeState::Starting | RuntimeState::Running | RuntimeState::Stopping
+                ),
+                "waiting for {want:?}, the runtime settled in {:?}: {:?}",
+                status.state,
+                status.last_error
+            );
+            assert!(
                 std::time::Instant::now() < deadline,
-                "runtime did not reach stopped within 10 seconds"
+                "runtime did not reach {want:?} within 10 seconds"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Hold the next start or stop worker after its runtime call, with the
+    /// runtime lock still held. The first receiver fires once the worker is
+    /// held; the worker proceeds when the returned sender is dropped or sent.
+    fn hold_next_worker(
+        host: &Host,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *host.worker_hold.lock().expect("worker hold") = Some(Box::new(move || {
+            held_tx.send(()).expect("test waits for the hold");
+            let _ = release_rx.recv();
+        }));
+        (held_rx, release_tx)
+    }
+
+    #[test]
+    fn running_is_reported_only_after_the_start_path_releases_the_runtime() {
+        let host = static_test_host();
+        let config = r#"{"publish":[{"topic":"/host_test/window","schema":"std_msgs/String"}]}"#;
+        let (held, release) = hold_next_worker(host);
+        assert_eq!(host.start(config), codes::OK);
+        held.recv().expect("start worker reaches the hold");
+
+        // The runtime has recorded Running and the start worker still holds
+        // the runtime lock: a publish here is BUSY, so the app must not be
+        // told Running yet.
+        assert_eq!(lock_status(&host.status).state, RuntimeState::Running);
+        assert_eq!(
+            publish_on(host, "/host_test/window", r#"{"data":"x"}"#),
+            codes::BUSY
+        );
+        assert_eq!(host.observed_status().state, RuntimeState::Starting);
+        let reported: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&host.observed_status()).expect("json"))
+                .expect("status json");
+        assert_eq!(reported["state"], "starting");
+
+        drop(release);
+        wait_for_observed(host, RuntimeState::Running);
+        // No retry: the first publish after the app reads Running succeeds.
+        assert_eq!(
+            publish_on(host, "/host_test/window", r#"{"data":"x"}"#),
+            codes::OK
+        );
+        assert_eq!(host.stop(), codes::OK);
+        wait_for_observed(host, RuntimeState::Stopped);
+    }
+
+    #[test]
+    fn stopped_is_reported_only_after_the_stop_path_releases_the_runtime() {
+        let host = static_test_host();
+        let config =
+            r#"{"publish":[{"topic":"/host_test/stop_window","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+        wait_for_observed(host, RuntimeState::Running);
+
+        let (held, release) = hold_next_worker(host);
+        assert_eq!(host.stop(), codes::OK);
+        held.recv().expect("stop worker reaches the hold");
+        assert_eq!(lock_status(&host.status).state, RuntimeState::Stopped);
+        assert_eq!(host.start(config), codes::BUSY);
+        assert_eq!(host.observed_status().state, RuntimeState::Stopping);
+
+        drop(release);
+        wait_for_observed(host, RuntimeState::Stopped);
+        // The first restart after the app reads Stopped is accepted.
+        assert_eq!(host.start(config), codes::OK);
+        wait_for_observed(host, RuntimeState::Running);
+        assert_eq!(host.stop(), codes::OK);
+        wait_for_observed(host, RuntimeState::Stopped);
+    }
+
+    #[test]
+    fn failed_is_reported_only_after_the_start_path_releases_the_runtime() {
+        let host = static_test_host();
+        let (held, release) = hold_next_worker(host);
+        assert_eq!(host.start("{not json"), codes::OK);
+        held.recv().expect("start worker reaches the hold");
+        assert_eq!(lock_status(&host.status).state, RuntimeState::Failed);
+        assert_eq!(host.observed_status().state, RuntimeState::Starting);
+
+        drop(release);
+        wait_for_observed(host, RuntimeState::Failed);
+        assert_eq!(
+            host.observed_status().last_error.map(|error| error.code),
+            Some(codes::INVALID_ARGUMENT)
+        );
+        // The first restart after the app reads Failed is accepted.
+        let config =
+            r#"{"publish":[{"topic":"/host_test/fail_window","schema":"std_msgs/String"}]}"#;
+        assert_eq!(host.start(config), codes::OK);
+        wait_for_observed(host, RuntimeState::Running);
+        assert_eq!(host.stop(), codes::OK);
+        wait_for_observed(host, RuntimeState::Stopped);
     }
 
     #[test]
@@ -843,27 +978,7 @@ mod tests {
         let config = r#"{"publish":[{"topic":"/host_test/heartbeat","schema":"std_msgs/String"}]}"#;
         assert_eq!(host.start(config), codes::OK);
         assert_eq!(host.stop(), codes::OK);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let status = lock_status(&host.status);
-            let idle = matches!(*lock_lifecycle(&host.lifecycle), Lifecycle::Idle);
-            if status.state == RuntimeState::Stopped && idle {
-                break;
-            }
-            if matches!(status.state, RuntimeState::Failed) {
-                panic!(
-                    "runtime failed during deferred stop: {:?}",
-                    status.last_error
-                );
-            }
-            drop(status);
-            assert!(
-                std::time::Instant::now() < deadline,
-                "runtime did not reach stopped within 10 seconds"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_observed(host, RuntimeState::Stopped);
     }
 
     #[test]

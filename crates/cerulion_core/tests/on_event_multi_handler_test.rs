@@ -131,6 +131,7 @@ fn dual_handler_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
                 node_type: "fast_producer".to_string(),
@@ -145,6 +146,7 @@ fn dual_handler_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "dual_handler_consumer".to_string(),
@@ -323,6 +325,7 @@ fn order_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_zeta".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -337,6 +340,7 @@ fn order_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_alpha".to_string(),
                 node_type: "flood_producer".to_string(),
@@ -351,6 +355,7 @@ fn order_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
                 node_type: "order_consumer".to_string(),

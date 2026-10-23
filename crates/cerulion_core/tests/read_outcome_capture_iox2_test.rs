@@ -564,6 +564,7 @@ fn two_node_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ro_src".to_string(),
@@ -578,6 +579,7 @@ fn two_node_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_sink".to_string(),
@@ -767,6 +769,7 @@ fn role_view(records: &[TraceRingRecord]) -> Vec<(u64, u32, u16, u16, ReadSiteRo
 fn src_def(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "ro_src".to_string(),
@@ -785,6 +788,7 @@ fn src_def(id: &str) -> NodeDef {
 fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "ro_sink".to_string(),
@@ -2193,6 +2197,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
             src_def("producer"),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_relay".to_string(),
@@ -3996,6 +4001,7 @@ fn the_wide_shared_topic_interleave_is_bit_identical_across_runs() {
 fn relay_def(id: &str, input: &str, source: &str, topic: Option<&str>) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "ro_relay".to_string(),
@@ -6263,6 +6269,7 @@ fn wave_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ro_src".to_string(),
@@ -6277,6 +6284,7 @@ fn wave_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "ro_sink".to_string(),

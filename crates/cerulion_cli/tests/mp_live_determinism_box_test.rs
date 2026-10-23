@@ -246,6 +246,7 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
             NodeDef {
                 fuse: None,
                 ros2: None,
+                params: Default::default(),
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
                 inputs: vec![],
@@ -254,6 +255,7 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
             NodeDef {
                 fuse: None,
                 ros2: None,
+                params: Default::default(),
                 id: "relay".to_string(),
                 node_type: "relay".to_string(),
                 inputs: vec![input("ticker/out")],
@@ -262,6 +264,7 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
             NodeDef {
                 fuse: None,
                 ros2: None,
+                params: Default::default(),
                 id: "sink".to_string(),
                 node_type: "sink".to_string(),
                 inputs: vec![input("relay/out")],

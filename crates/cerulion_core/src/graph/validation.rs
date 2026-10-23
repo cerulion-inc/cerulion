@@ -721,6 +721,11 @@ pub fn validate_graph_with(
 /// 4. Every `params:` value is a scalar (string / number / bool).
 /// 5. A graph of ONLY ros2 entries is refused — the runtime has nothing to
 ///    schedule; `cerulion ros2 run <launch-file>` is the tool for that.
+/// 6. A ros2 entry carries no native `params:` (the `#[param]` values of a
+///    native node): its ROS 2 parameters go under `ros2.params`. Refused HERE,
+///    in the check every run makes, because the run lifts ros2 entries out of
+///    the graph before it resolves native params, so a key that slipped past
+///    this check (`graph run --no-validate`) would be silently dead.
 ///
 /// `process_groups:` membership is refused in `validate_process_groups` and
 /// `level_assignments:` membership in `validate_graph_with` (each beside the
@@ -743,6 +748,21 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
             return reject(format!(
                 "node '{}': declares BOTH `type:` and `ros2:` — an entry is either a native \
                  node (`type:`) or a ROS 2 process (`ros2:`); remove one",
+                node.id
+            ));
+        }
+        if !node.params.is_empty() {
+            // The remedy follows the entry's shape: a `launch:` entry refuses
+            // `ros2.params` too (its launch file declares its parameters), so
+            // pointing it there would trade one refusal for another.
+            let remedy = if ros2.launch.is_some() {
+                "a launch file declares its own parameters; pass launch arguments \
+                 (`name:=value`) through `ros2.args` instead"
+            } else {
+                "put ROS 2 parameters under `ros2.params` on that entry"
+            };
+            return reject(format!(
+                "node '{}': `params:` is not accepted on a `ros2:` entry; {remedy}",
                 node.id
             ));
         }

@@ -160,6 +160,7 @@ fn recovery_graph(probe: &Probe) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "stamp_producer".to_string(),
@@ -174,6 +175,7 @@ fn recovery_graph(probe: &Probe) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "aging_consumer".to_string(),

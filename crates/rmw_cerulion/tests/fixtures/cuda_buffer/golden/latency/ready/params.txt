@@ -1,0 +1,5 @@
+count=1000 warmup=100 rate_hz=50 stamp=ready
+sizes=4096 65536 1048576 4194304 16777216 67108864
+modes=inter intra proc1_rmw
+rmws=rmw_fastrtps_cpp rmw_zenoh_cpp
+2026-10-21T08:13:03Z

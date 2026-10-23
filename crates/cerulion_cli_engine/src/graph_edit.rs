@@ -30,8 +30,8 @@
 
 use cerulion_core::graph::config::{GraphConfig, InputDef};
 use cerulion_core::graph::{
-    default_prefix, parse_graph_raw, resolve_output_topic, resolve_source, validate_graph_with,
-    ValidationOptions,
+    default_prefix, parse_graph_as_written, parse_graph_raw, resolve_output_topic, resolve_source,
+    validate_graph_with, ValidationOptions,
 };
 
 use crate::error::CliError;
@@ -124,28 +124,39 @@ fn refuse(message: impl Into<String>) -> GraphEditError {
     GraphEditError::Cli(CliError::Validation(message.into()))
 }
 
-/// The in-memory state every edit starts from: the lock, the file bytes and
-/// a config parsed from exactly those bytes.
+/// The in-memory state every edit starts from: the lock, the file bytes, a
+/// config parsed from exactly those bytes with its launch arguments resolved
+/// to their defaults (what every edit judges and the total guard compares),
+/// and the same document as written, `${name}` references kept (what a wire
+/// copies into the file).
 struct Loaded {
     _lock: WorkspaceLock,
     raw: String,
     config: GraphConfig,
+    as_written: GraphConfig,
 }
 
 fn load(workspace: &CerulionWorkspace, graph: &str) -> Result<Loaded, GraphEditError> {
     let lock = WorkspaceLock::acquire_and_track_gitignore(&workspace.root)?;
     let (_, raw) = graph_read_raw(&workspace.graphs_dir, graph)?;
     let config = parse_graph_raw(&raw).map_err(CliError::from)?;
+    let as_written = parse_graph_as_written(&raw).map_err(CliError::from)?;
     Ok(Loaded {
         _lock: lock,
         raw,
         config,
+        as_written,
     })
 }
 
 /// The `source:` text a wire from `node`'s output `port` carries: the
 /// absolute `topic:` override when the output has one (a relative
 /// `<node>/<port>` would not resolve to it), else `<node>/<port>`.
+///
+/// On the resolved config this is the topic the run resolves (for matching
+/// and for the in-memory edit); on the as-written config it is the topic
+/// text the author wrote, a `${name}` reference included, so the written
+/// `source:` follows the launch argument instead of freezing one value.
 fn wire_source(config: &GraphConfig, node: &str, port: &str) -> Result<String, GraphEditError> {
     let node_def = config
         .nodes
@@ -181,9 +192,13 @@ pub fn graph_wire(
     to: &PortRef,
 ) -> Result<EditOutcome, GraphEditError> {
     let Loaded {
-        raw, mut config, ..
+        raw,
+        mut config,
+        as_written,
+        ..
     } = load(workspace, graph)?;
     let source = wire_source(&config, &from.node, &from.port)?;
+    let source_as_written = wire_source(&as_written, &from.node, &from.port)?;
     let to_index = config
         .nodes
         .iter()
@@ -204,13 +219,20 @@ pub fn graph_wire(
     }
     check_schemas(workspace, &config, from, to, to_index)?;
 
-    let input = InputDef {
+    // The in-memory edit holds the RESOLVED source (the total guard compares
+    // it with a re-parse of the written file, which resolves too); the file
+    // gets the source AS WRITTEN, so a `topic: /${ns}/cmd` is copied with
+    // its reference and the wire follows `ns` on every later run.
+    config.nodes[to_index].inputs.push(InputDef {
         name: to.port.clone(),
         source,
-    };
-    config.nodes[to_index].inputs.push(input.clone());
+    });
     validate_after_edit(&config)?;
-    let out = splice_add_input(&raw, to_index, &input)?;
+    let written = InputDef {
+        name: to.port.clone(),
+        source: source_as_written,
+    };
+    let out = splice_add_input(&raw, to_index, &written)?;
     commit(workspace, graph, &raw, out, &config, Vec::new())
 }
 

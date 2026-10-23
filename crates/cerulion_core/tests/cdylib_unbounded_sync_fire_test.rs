@@ -151,6 +151,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "unbounded_sync_node".to_string(),
@@ -174,6 +175,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "unbounded_sync_sink".to_string(),

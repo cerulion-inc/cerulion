@@ -1435,23 +1435,14 @@ pub fn graph_read(graphs_dir: &Path, name: &str) -> CliResult<GraphConfig> {
 /// the file and the splice would land on another — which is the whole class
 /// the precondition exists to close.
 pub fn graph_read_raw(graphs_dir: &Path, name: &str) -> CliResult<(GraphConfig, String)> {
-    let graph_path = graphs_dir.join(format!("{}.yaml", name));
-    if !graph_path.exists() {
-        return Err(CliError::GraphNotFound {
-            name: name.to_string(),
-        });
-    }
-    let yaml = std::fs::read_to_string(&graph_path)?;
-    // Use the raw parser so an absent `prefix:` line stays absent when
-    // CLI commands like `node stage` round-trip the YAML back to disk.
-    let mut config = parse_graph_raw(&yaml)?;
-    // This is the seam where a graph acquires its identity. Every
-    // CLI verb resolves a graph by joining `graphs/{name}.yaml`, so `name` IS
-    // the file stem, and every identity surface downstream reads it back
-    // through `GraphConfig::identity()`. A legacy `name:` that disagrees warns
-    // here, once, at the one place both values are in scope.
-    cerulion_core::graph::adopt_file_stem_identity(&mut config, name);
-    Ok((config, yaml))
+    // The raw parser keeps an absent `prefix:` line absent when CLI commands
+    // like `node stage` round-trip the YAML back to disk, and it is where a
+    // graph acquires its identity: every CLI verb resolves a graph by joining
+    // `graphs/{name}.yaml`, so `name` IS the file stem. Launch arguments
+    // resolve to their declared defaults on this path; `graph run` reads
+    // through the same function with the operator's overrides.
+    crate::graph_launch_args::graph_read_raw_with_launch_args(graphs_dir, name, &[])
+        .map(|(config, yaml, _)| (config, yaml))
 }
 
 // There is deliberately NO whole-file graph writer (`serde_yaml::to_string` + a truncating
@@ -1862,6 +1853,21 @@ fn render_node_entry(node: &NodeDef, indent: &str, nested_step: usize) -> String
             }
         }
     }
+    if !node.params.is_empty() {
+        // Declaration order, one scalar per line. A string goes through
+        // `render_scalar` so `"2.0"` stays a string; a number or bool is its
+        // `Display`, which keeps a float's decimal point (`2.0`, `-0.0`), so
+        // each value re-parses as the same `ParamValue`.
+        use cerulion_core::graph::params::ParamValue;
+        out.push_str(&format!("{key}params:\n"));
+        for (name, value) in &node.params {
+            let rendered = match value {
+                ParamValue::Str(s) => render_scalar(s),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("{key}  {}: {rendered}\n", render_scalar(name)));
+        }
+    }
     out
 }
 
@@ -2108,6 +2114,7 @@ pub fn build_node_def(
 
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id,
         node_type: node_type.to_string(),
@@ -2293,7 +2300,10 @@ pub fn graph_validate_with_inspector(
     inspector: &dyn crate::node_inspector::NodeInspector,
 ) -> CliResult<ValidationReport> {
     let graphs_dir = workspace_root.join("graphs");
-    let mut config = graph_read(&graphs_dir, graph_name)?;
+    // The declared defaults, with the record of which launch argument fed
+    // which `params:` value, so the params check can name the argument.
+    let (mut config, _, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(&graphs_dir, graph_name, &[])?;
     // Fill the DEFAULT PREFIX before anything judges this config.
     //
     // `graph_read` deliberately uses the RAW parser so an absent `prefix:` line
@@ -2321,13 +2331,18 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
+    // Both checks that read a node library (the ingress gate and the params
+    // check) go through ONE memo, so each library's static initialization
+    // and teardown run once per validation, not once per check and node.
+    let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
         graph_name,
         &config,
         &cdylib_cache,
         true,
-        inspector,
+        &inspector,
+        &launch_arg_sources,
     ))
 }
 
@@ -2393,6 +2408,10 @@ fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache)
         // into the same sentence from `GraphRuntime::build`.
         || label.starts_with(DATA_TRIGGER_CHECK_PREFIX)
         || label.starts_with(SYNC_TRIGGER_CHECK_PREFIX)
+        // The graph BUILD resolves every node's `params:` again before any
+        // transport resource exists, so a failing params line blocks the run
+        // under the flag with the same sentence.
+        || label.starts_with(crate::graph_params_check::PARAMS_CHECK_PREFIX)
     {
         return true;
     }
@@ -2833,6 +2852,7 @@ fn graph_validate_with_cache(
     cdylib_cache: &ResolvedCdylibCache,
     check_network_ingress: bool,
     inspector: &dyn crate::node_inspector::NodeInspector,
+    launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
     let nodes_dir = workspace_root.join("nodes");
     let mut checks = Vec::new();
@@ -3493,6 +3513,17 @@ fn graph_validate_with_cache(
             )),
         }
     }
+
+    // Every node's `params:` against the specs its library declares, read
+    // through the caller's inspector once per resolved type. The graph build
+    // re-runs the same resolution, so a failing line here is a blocking one
+    // (`failing_check_blocks_the_run`).
+    checks.extend(crate::graph_params_check::params_checks(
+        config,
+        &resolved_library_paths(cdylib_cache),
+        inspector,
+        launch_arg_sources,
+    ));
 
     tracing::info!(graph = %graph_name, "graph validation complete");
 
@@ -5258,6 +5289,7 @@ mod open_file_limit_verdict_tests {
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id,
             node_type: "n".to_string(),
@@ -5508,6 +5540,11 @@ pub fn graph_run(
     // external clocks, non-Unix — each of which says so at launch rather than
     // swallowing the flag.
     no_rings: bool,
+    // `graph run <NAME> [NAME:=VALUE]...`: the launch-argument overrides,
+    // already parsed. They apply to the graph READ below and nowhere else;
+    // the run executes, validates and records the resolved graph. Internal
+    // callers (`node run`, `ros2 attach`) pass none.
+    launch_args: &[cerulion_core::graph::LaunchOverride],
 ) -> CliResult<()> {
     // CPU C-state cap. Acquired AFTER the runtime is built —
     // not here — so the cap can be DERIVED from the graph's own tightest
@@ -5580,7 +5617,19 @@ pub fn graph_run(
     // ONE read: `config` and the bytes the auto-partition preflight splices
     // must describe the SAME revision (see
     // `run_auto_partition_preflight`).
-    let (mut config, raw_graph_yaml) = graph_read_raw(graphs_dir, graph_name)?;
+    let (mut config, raw_graph_yaml, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(
+            graphs_dir,
+            graph_name,
+            launch_args,
+        )?;
+    // `--yes` saves a partition derived from the graph as DECLARED (what
+    // `graph partition` derives). Whether this run's overrides moved its
+    // wiring is judged on the bytes just read, BEFORE the prefix fill below
+    // (the fill would differ from the declared defaults on a prefix-less
+    // file); the auto-partition pre-flight refuses the save when they did.
+    let wiring_overridden = !launch_args.is_empty()
+        && crate::graph_launch_args::overrides_change_wiring(&raw_graph_yaml, &config)?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -5660,6 +5709,14 @@ pub fn graph_run(
         crate::partition_emit::PartitionIntent::Derive
     );
 
+    // The params passes below (the validation report's check, the pre-write
+    // refusal and the effective-graph fill) read node libraries through one
+    // memo over a loader that keeps each library loaded for the whole run, so
+    // the run's own node load reuses it: a library's static initialization
+    // runs once per run, however many passes read its info.
+    let params_libraries = crate::graph_params_check::KeepLoaded::default();
+    let params_inspector = crate::graph_params_check::OncePerLibrary::new(&params_libraries);
+
     if !skip_validate {
         // A run that is about to DERIVE a partition validates REPLACE-SCOPED:
         // the block on disk is what it is here to replace, so it must not be
@@ -5683,7 +5740,8 @@ pub fn graph_run(
             report_config,
             &cdylib_cache,
             false,
-            &crate::node_inspector::InProcessInspector,
+            &params_inspector,
+            &launch_arg_sources,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5765,6 +5823,15 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+    // Params the build would refuse, refused NOW, before the auto-partition
+    // pre-flight can write the graph file: `--no-validate` skips the report,
+    // not this, so a run refused over its params never mutates the file.
+    crate::graph_params_check::refuse_unresolvable_params(
+        &config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+        &launch_arg_sources,
+    )?;
 
     // This process holds every topic of the graph while it starts, a set of
     // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
@@ -5825,32 +5892,46 @@ pub fn graph_run(
     // a written file would produce (the in-memory == written equality pin).
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
-    let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
-            let consent = partition_consent
-                .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
-            let pre = crate::partition_emit::run_auto_partition_preflight(
-                workspace_root,
-                graph_name,
-                config,
-                &raw_graph_yaml,
-                &crate::partition_emit::PreflightOptions {
-                    // Lenient only on the zero-flag default —
-                    // an explicit --auto-partition asked for cost-aware
-                    // behavior, so a broken default artifact stays a hard Err.
-                    lenient_costs: !consent.auto_partition,
-                    assume_yes: consent.assume_yes,
-                },
-            )?;
-            // The OUTCOME is the run's partition PROVENANCE — kept
-            // rather than discarded, because the file cannot tell you: on the
-            // no-TTY floor the run executes derived groups the file does not
-            // carry.
-            let provenance = run_dir_partition_provenance(pre.outcome);
-            (pre.config, provenance)
-        } else {
-            (config, crate::run_dir::PartitionProvenance::Declared)
-        };
+    let (mut config, partition_provenance) = if let crate::partition_emit::PartitionIntent::Derive =
+        partition_intent
+    {
+        let consent = partition_consent
+            .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
+        // A partition the file keeps must hold for the graph as declared,
+        // not for one run's overrides. Under such overrides the pre-flight
+        // runs with saving OFF, so it can never write; only an outcome that
+        // WOULD have written (`InMemory`) refuses the run's `--yes`. A file
+        // that already carries exactly the derived partition needs no
+        // write, so that run proceeds.
+        let refuse_save = consent.assume_yes && wiring_overridden;
+        let pre = crate::partition_emit::run_auto_partition_preflight(
+            workspace_root,
+            graph_name,
+            config,
+            &raw_graph_yaml,
+            &crate::partition_emit::PreflightOptions {
+                // Lenient only on the zero-flag default:
+                // an explicit --auto-partition asked for cost-aware
+                // behavior, so a broken default artifact stays a hard Err.
+                lenient_costs: !consent.auto_partition,
+                assume_yes: consent.assume_yes && !refuse_save,
+            },
+        )?;
+        if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
+        {
+            return Err(
+                crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
+            );
+        }
+        // The OUTCOME is the run's partition PROVENANCE, kept
+        // rather than discarded, because the file cannot tell you: on the
+        // no-TTY floor the run executes derived groups the file does not
+        // carry.
+        let provenance = run_dir_partition_provenance(pre.outcome);
+        (pre.config, provenance)
+    } else {
+        (config, crate::run_dir::PartitionProvenance::Declared)
+    };
 
     // The deployment is RESOLVED here rather than inside the `match`
     // below, for two reasons that are both load-bearing.
@@ -5934,6 +6015,18 @@ pub fn graph_run(
     // lifted out, so deployment planning, the recording's topic derivation
     // and the runtime build below see a plain native graph; the entries are
     // spawned beside it once the run's side effects begin.
+    //
+    // First, each node's `params:` is completed to the RESOLVED map (the
+    // graph's values over the declared defaults, in declaration order), so the
+    // document both embeds render carries the values in force and a resim
+    // applies them even after a node's `#[param]` default changed. Best
+    // effort: a node whose library will not read, or whose values the build
+    // refuses, keeps its map as written and the build below says why.
+    crate::graph_params_check::fill_resolved_params(
+        &mut config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+    );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
 
@@ -14769,14 +14862,14 @@ pub fn write_profile_artifact_atomically(
 /// callers need so none of it has to be re-derived from the path
 /// (and so the staleness walk runs exactly once per resolution).
 #[derive(Clone, Debug)]
-struct ResolvedCdylib {
-    path: std::path::PathBuf,
+pub(crate) struct ResolvedCdylib {
+    pub(crate) path: std::path::PathBuf,
     /// True when the artifact came from `target/release/`.
     release: bool,
     /// Best-effort staleness verdict: true when a build
     /// input under `nodes/<type>/` is strictly newer than the
     /// artifact.
-    stale: bool,
+    pub(crate) stale: bool,
 }
 
 impl ResolvedCdylib {
@@ -14844,6 +14937,23 @@ fn warn_if_stale(node_type: &str, lib: &ResolvedCdylib) {
 /// `graph_validate` and `graph_run` so a validated run
 /// walks each `src/` tree exactly once total rather than twice.
 type ResolvedCdylibCache = indexmap::IndexMap<String, Result<ResolvedCdylib, String>>;
+
+/// The cdylib path of every node TYPE in `cache` that resolved, for the
+/// passes that read a library's node info through a `NodeInspector` (the
+/// params check and the params fill). A type that did not resolve is absent;
+/// its own cdylib check already says why.
+fn resolved_library_paths(
+    cache: &ResolvedCdylibCache,
+) -> indexmap::IndexMap<String, std::path::PathBuf> {
+    cache
+        .iter()
+        .filter_map(|(node_type, lib)| {
+            lib.as_ref()
+                .ok()
+                .map(|lib| (node_type.clone(), lib.path.clone()))
+        })
+        .collect()
+}
 
 /// Resolve every distinct node type in `config` to its cdylib once,
 /// returning a per-type memo. The staleness walk runs exactly once
@@ -15307,7 +15417,7 @@ fn arch_filter<'a>(
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
 /// [`warn_if_stale`]).
-fn find_cdylib(
+pub(crate) fn find_cdylib(
     workspace_root: &Path,
     node_type: &str,
     prefer_release: bool,
@@ -24845,6 +24955,7 @@ nodes:
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
                     node_type: "cam".to_string(),
@@ -24875,6 +24986,7 @@ nodes:
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
                     node_type: "cam2".to_string(),
@@ -25197,6 +25309,7 @@ nodes:
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25274,6 +25387,7 @@ nodes:
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25356,6 +25470,7 @@ nodes:
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -28438,6 +28553,7 @@ nodes:
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
                 node_type: "driver".to_string(),
@@ -28506,6 +28622,7 @@ nodes:
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -30417,6 +30534,62 @@ nodes:
         );
     }
 
+    /// A `graph run --yes` saves a partition for the graph as DECLARED. Whether this run's
+    /// launch-argument overrides moved the wiring is judged on the bytes of
+    /// the one read, before the prefix fill (which would differ from the
+    /// declared defaults on a prefix-less file). Under such overrides the
+    /// pre-flight runs with saving OFF, so it cannot write the graph file, and
+    /// only an outcome that would have written refuses the run: a file that
+    /// already carries the derived partition (`AlreadyCurrent`) proceeds.
+    #[test]
+    fn graph_run_refuses_a_yes_save_under_wiring_overrides_before_the_preflight_writes() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let read = body
+            .find("graph_read_raw_with_launch_args(")
+            .expect("the graph read must still be there");
+        let judged = body
+            .find("overrides_change_wiring(")
+            .expect("the wiring judgement must still be there");
+        let fill = read
+            + body[read..]
+                .find("default_prefix(")
+                .expect("the prefix fill must follow the read");
+        assert!(
+            read < judged && judged < fill,
+            "the wiring is judged on the bytes just read, BEFORE the prefix fill"
+        );
+
+        let gate = body
+            .find("let refuse_save = consent.assume_yes && wiring_overridden;")
+            .expect("the save gate must be computed from --yes and the wiring judgement");
+        let preflight = body
+            .find("run_auto_partition_preflight(")
+            .expect("the pre-flight must still be there");
+        assert!(
+            gate < preflight,
+            "the save gate is decided before the pre-flight runs"
+        );
+        let save_off = preflight
+            + body[preflight..]
+                .find("assume_yes: consent.assume_yes && !refuse_save,")
+                .expect("the pre-flight must run with saving OFF under wiring overrides");
+        let refused = body
+            .find("refuse_persist_under_wiring_overrides(")
+            .expect("the save refusal must still be there");
+        assert!(
+            save_off < refused,
+            "the refusal reads the outcome of a pre-flight that could not write"
+        );
+        let exempt = &body[preflight..refused];
+        assert!(
+            exempt.contains("if refuse_save && pre.outcome != ")
+                && exempt.contains("RunPartitionOutcome::AlreadyCurrent"),
+            "a file that already carries the derived partition needs no write, so the \
+             refusal must exempt `AlreadyCurrent`"
+        );
+    }
+
     /// `graph run` arms the graceful-exit
     /// hygiene pass, and arms it as a TEARDOWN rather than as startup work.
     ///
@@ -30463,7 +30636,7 @@ nodes:
         // the first preflight step and the deployment REJECTION is the last, so
         // both must precede the arming.
         let read = body
-            .find("graph_read_raw(graphs_dir, graph_name)?")
+            .find("graph_read_raw_with_launch_args(")
             .expect("the graph read must still be there");
         assert!(
             read < armed,
@@ -30542,6 +30715,7 @@ nodes:
             RecordCpu::Auto,
             /* partition_consent */ None,
             /* no_rings */ true,
+            /* launch_args */ &[],
         );
         assert!(err.is_err(), "a graph that does not exist must be refused");
         assert_eq!(
@@ -32823,6 +32997,7 @@ network:
             nodes: (0..n)
                 .map(|i| NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
                     node_type: node_type.to_string(),
@@ -34842,6 +35017,7 @@ struct Sink {
                 RecordCpu::Auto,
                 /* partition_consent */ None,
                 /* no_rings */ true,
+                /* launch_args */ &[],
             )
         };
         let msg = run()
@@ -37003,6 +37179,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -37061,6 +37238,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
                     node_type: "fast".to_string(),
@@ -37075,6 +37253,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
                     node_type: "slow".to_string(),
@@ -40121,6 +40300,7 @@ mod worker_tests {
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
                 node_type: id.to_string(),
@@ -41851,6 +42031,7 @@ mod supervisor_tests {
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "t".to_string(),

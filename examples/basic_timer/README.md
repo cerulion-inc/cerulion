@@ -6,22 +6,32 @@ The smallest Cerulion graph: two nodes, one topic.
 timer  --(std_msgs/Int32)-->  printer
 ```
 
-- **`timer`** is a periodic source (`period_ms = 100`) that publishes an
-  incrementing counter on `count`.
+- **`timer`** is a periodic source (`period_ms = 100`) that publishes a counter
+  on `count`, going up by its `step` param each tick. `step` is declared on the
+  node struct (`#[param(default = 1, min = 1, max = 1000)] step: i32`) and set
+  in the graph file under the node's `params:` from the launch argument of the
+  same name (`args: {step: 2}` at the top of the file, `step: ${step}` on the
+  node). `cerulion graph run basic_timer step:=5` runs the same file with a
+  different increment; delete both lines and the counter goes up by the
+  default `1`.
 - **`printer`** is a data-triggered sink (`#[input(trigger)] count`, no
   `period_ms`) that fires once per published count and logs the value with
   `tracing`.
 
 Each node type is its own crate under `nodes/<type>/`, written in the macro
 form. All wiring lives in `graphs/basic_timer.yaml`. The graph file carries
-topology only: each node's trigger policy is on its macro, in
+topology and param values only: each node's trigger policy is on its macro, in
 `nodes/<type>/src/lib.rs`.
 
 ## How this workspace was made
 
-The workspace was scaffolded with these verbs. The node bodies and their
-comments, the relative dependency paths in `Cargo.toml`, the `recordings/`
-line in `.gitignore` and the pinned `Cargo.lock` were then written by hand.
+These verbs scaffold the workspace. No verb writes the rest, so to make it
+yourself you add: the node bodies and their comments; at the top of
+`graphs/basic_timer.yaml`, the `args:` map that declares the `step` launch
+argument with its default (`step: 2`, which `step:=5` on `graph run` replaces
+for one run); the `params:` block on the `timer` entry that reads it
+(`step: ${step}`); the relative dependency paths in `Cargo.toml`; the
+`recordings/` line in `.gitignore`; and the pinned `Cargo.lock`.
 
 ```bash
 cerulion workspace create basic_timer
@@ -54,6 +64,9 @@ cerulion graph validate basic_timer
 
 # Run live with recording on (Ctrl+C to stop)
 cerulion graph run basic_timer --release --record
+
+# The same graph with a different increment: a launch-argument override
+cerulion graph run basic_timer --release step:=5
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
@@ -61,11 +74,12 @@ minutes; later builds take seconds. On the first run, Cerulion proposes one
 process per node and asks `Apply this partition to the graph file? [y/N]`.
 Press **Enter** to use that layout for this run only.
 
-The run terminal shows the printer firing ten times a second:
+The run terminal shows the printer firing ten times a second, the count going
+up by the `step` of `2` the graph file sets:
 
 ```
-INFO printer: count received value=1 received=1
-INFO printer: count received value=2 received=2
+INFO printer: count received value=2 received=1
+INFO printer: count received value=4 received=2
 ```
 
 In a second terminal, watch the topic itself:
@@ -107,7 +121,7 @@ verdict turns into a divergence with a nonzero exit code.
 basic_timer/
   Cargo.toml                 # [workspace] members = ["nodes/*"]
   .cargo/config.toml         # IOX2_LOG_LEVEL / RUST_LOG defaults
-  graphs/basic_timer.yaml    # topology only: ids, types, inputs, outputs
+  graphs/basic_timer.yaml    # topology and values: ids, types, inputs, outputs, params, args
   nodes/
     timer/src/lib.rs         # one node type, macro form
     printer/src/lib.rs       # one node type, macro form

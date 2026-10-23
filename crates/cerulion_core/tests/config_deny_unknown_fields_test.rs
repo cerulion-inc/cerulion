@@ -448,6 +448,23 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
          the gate refuses this classification for a field-bearing type in a \
          warn-reporting module",
     ),
+    (
+        "cerulion_core/src/graph/params.rs",
+        "ParamType",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: a unit-variant enum (`bool`, `i32`, `f64`, \
+         `String`, ...), so an unknown type NAME is refused by serde's variant \
+         matcher; the struct that carries it (`ParamSpec`) denies unknown fields",
+    ),
+    (
+        "cerulion_core/src/graph/params.rs",
+        "ParamValue",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: an untagged scalar (`bool`, integer, float or \
+         string) read from a `params:` map value. A map or list in that position \
+         matches no variant and is refused; the map KEYS are checked against the \
+         node's declared params at graph build, with a nearest-name suggestion",
+    ),
 
     (
         "cerulion_core/src/graph/sibling_topics.rs",
@@ -1206,6 +1223,18 @@ fn every_user_authored_config_type_denies_unknown_fields() {
         .iter()
         .map(|(f, t, c, _)| ((*f, *t), *c))
         .collect();
+    // The exemptions whose whole REASON is that the type has no named field
+    // to deny. That claim is checked against the type below: a type in a
+    // module with no unknown-key warn would otherwise keep its exemption
+    // after it gains a named field, and drop a misspelled key in silence.
+    const NO_NAMED_FIELDS: &str = "NO NAMED FIELDS";
+    let fieldless_claims: BTreeSet<(&str, &str)> = UNDENIED_TYPES
+        .iter()
+        .filter(|(_, _, c, why)| {
+            matches!(c, Classification::ExemptWithReason) && why.starts_with(NO_NAMED_FIELDS)
+        })
+        .map(|(f, t, _, _)| (*f, *t))
+        .collect();
 
     // The fourth tuple element is the REASON, and every message this gate
     // prints tells the reader an exemption needs one. Nothing checked it: the
@@ -1274,6 +1303,17 @@ fn every_user_authored_config_type_denies_unknown_fields() {
                 ));
                 continue;
             };
+            if item.has_named_fields
+                && fieldless_claims.contains(&(module.path, item.name.as_str()))
+            {
+                offenders.push(format!(
+                    "  {}:{} `{}` is classified `ExemptWithReason` because it has \
+                     \"{NO_NAMED_FIELDS}\" to deny, but it now declares a named field. Add \
+                     `#[serde(deny_unknown_fields)]` to it, or reclassify it with a reason that \
+                     is still true",
+                    item.file, item.line, item.name
+                ));
+            }
             match class {
                 Classification::WarnInsteadOfDeny { .. }
                     if module.unknown_key_warn_field.is_none() =>
@@ -1662,4 +1702,77 @@ fn every_graph_yaml_in_the_repo_still_parses() {
          schema agree.",
         failures.join("\n")
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Launch arguments: the `args:` section is lifted out of the document before
+// the graph types read it, so `deny_unknown_fields` on `GraphConfig` stays
+// in force and the section carries its own unknown-key refusal.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An `args:` graph parses through the ordinary raw parser with its
+/// defaults applied, and a graph with no `args:` is untouched by the pass.
+#[test]
+fn a_graph_declaring_args_parses_with_its_defaults_applied() {
+    let yaml = r#"
+args:
+  ns: lab
+  use_sim:
+    default: false
+    description: drive the simulator
+prefix: ${ns}
+nodes:
+  - id: cam
+    type: camera
+    params:
+      enabled: ${use_sim}
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+        topic: /${ns}/image
+"#;
+    let config = cerulion_core::graph::parse_graph_raw(yaml)
+        .expect("a graph declaring args parses with its defaults applied");
+    assert_eq!(config.prefix, "lab");
+    assert_eq!(
+        config.nodes[0].outputs[0].topic.as_deref(),
+        Some("/lab/image")
+    );
+    assert_eq!(
+        config.nodes[0].params["enabled"],
+        cerulion_core::graph::ParamValue::Bool(false)
+    );
+    // The resolved graph re-serializes with no `args:` and no reference: a
+    // bag's `graph.yaml` is a plain graph.
+    let rendered = serde_yaml::to_string(&config).expect("renders");
+    assert!(!rendered.contains("args:"), "{rendered}");
+    assert!(!rendered.contains("${"), "{rendered}");
+}
+
+/// A misspelled key INSIDE the long form of a declaration is refused naming
+/// the key and the accepted ones, exactly like a misspelled graph key.
+#[test]
+fn a_misspelled_key_inside_an_args_declaration_is_refused_naming_the_key() {
+    let yaml = r#"
+args:
+  use_sim:
+    defualt: false
+prefix: lab
+nodes:
+  - id: cam
+    type: camera
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+"#;
+    let err = cerulion_core::graph::parse_graph_raw(yaml)
+        .expect_err("a misspelled key inside `args:` must be refused");
+    let reason = err.to_string();
+    assert!(reason.contains("use_sim"), "{reason}");
+    assert!(reason.contains("`defualt`"), "{reason}");
+    for accepted in ["default", "description"] {
+        assert!(reason.contains(&format!("`{accepted}`")), "{reason}");
+    }
+    let fixed = yaml.replace("defualt", "default");
+    cerulion_core::graph::parse_graph_raw(&fixed).expect("the corrected document parses");
 }
