@@ -126,8 +126,8 @@ cerulion_core = { workspace = true, features = ["test-helpers"] }
 # Independent read oracle: bags on disk ARE standard MCAP, so the round-trip
 # test cross-checks message count + payloads with the upstream `mcap` crate.
 # Same version/features as cerulion_bag (uncompressed bags only).
-mcap = { version = "0.25", default-features = false }
-serial_test = "3"
+mcap = { version = "0.26", default-features = false }
+serial_test = "4"
 tempfile = "3"
 # SIGTERM delivery (libc::kill) in the subprocess finalize test.
 libc = "0.2"
