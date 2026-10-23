@@ -7433,8 +7433,8 @@ mod tests {
         .unwrap();
         let walker = local_walker_from_workspace(Some(tmp.path()));
         let mut header = WireHeader::with_schema(walker.schema_hash_for("Wrap").unwrap());
-        header.total_size = 40;
-        header.offset_table_offset = 32;
+        header.total_size = (WireHeader::SIZE + 8) as u32;
+        header.offset_table_offset = WireHeader::SIZE as u32;
         header.offset_table_count = 1;
         let mut buf = Vec::new();
         write_custom_decode(

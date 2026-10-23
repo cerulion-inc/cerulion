@@ -230,7 +230,7 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   full count comes from the schema or the array's raw bytes). A zero-size message (no
   wire bytes: an empty message, or one made only of fixed arrays of them) is printed
   from the schema, and the keeping walk holds none of a fixed array of them, so a
-  32-byte frame that declares 2^40 empty elements costs only the output cap. It then
+  40-byte frame that declares 2^40 empty elements costs only the output cap. It then
   prints fields in DECLARATION order from the resolved schema of the frame's own hash
   (`FrameWalker::schema_for_hash`; a twin that owns the same qualified name never stands in)
   and of each nested target (`FrameWalker::nested_target`): a `WireLayout` splits fields
