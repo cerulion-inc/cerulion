@@ -45,7 +45,10 @@ fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SchemaError", m.py().get_type::<SchemaError>())?;
     m.add("BagError", m.py().get_type::<BagError>())?;
     m.add("WIRE_HEADER_SIZE", WireHeader::SIZE)?;
-    m.add("WIRE_HEADER_VERSION", cerulion_core::wire::WIRE_HEADER_VERSION)?;
+    m.add(
+        "WIRE_HEADER_VERSION",
+        cerulion_core::wire::WIRE_HEADER_VERSION,
+    )?;
     m.add_function(wrap_pyfunction!(session::connect, m)?)?;
     m.add_function(wrap_pyfunction!(session::real_ns, m)?)?;
     m.add_class::<publisher::Publisher>()?;
