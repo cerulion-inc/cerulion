@@ -72,9 +72,11 @@ pub enum TimeSource {
     /// Live, event-driven loop under `RealClock` on the iceoryx2 WaitSet.
     /// The default — wakes within microseconds of a publish.
     Real,
-    /// Externally-mastered time (`ExternalClock`). INERT today: no external
-    /// time feeder is wired yet, so the clock stays at 0
-    /// and time-based triggers never fire. Loudly warns at run start.
+    /// Sim time: the graph clock is a controlled `VirtualClock` that follows
+    /// `rosgraph_msgs/Clock` samples on `/clock`, one step per sample
+    /// (`crate::sim_time_run`). Selected by `sim_time: true` in the graph YAML
+    /// or by `--time-source external`; the two name the same path
+    /// (`sim_time_run::resolve_time_source`). Single process; not recordable.
     External,
     /// Deterministic `VirtualClock` + 1 ms poll loop. Select for replay,
     /// deterministic runs, and benchmarking.
@@ -1386,6 +1388,7 @@ pub fn graph_create(graphs_dir: &Path, name: &str, prefix: Option<&str>) -> CliR
 /// [`is_pristine_scaffold`].
 fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -3918,7 +3921,7 @@ impl RunNetwork {
 /// | condition | result |
 /// |---|---|
 /// | `--network off` / `CERULION_NETWORK=off` (any clock/block) | [`RunNetwork::Off`] + a TRUE-in-its-arm notice: enabled block ⇒ the declared-topics warn; blockless real clock ⇒ [`NETWORK_OFF_LOCAL_ONLY_NOTICE`] (warn — the kill-switch ACTED, suppressing the permissive default); virtual/external clock ⇒ [`NETWORK_OFF_REDUNDANT_NOTICE`] (info — the run is network-inert either way) |
-/// | `--time-source virtual\|external` | [`RunNetwork::Inert`] (silent — replay-class) |
+/// | `--time-source virtual\|external` | [`RunNetwork::Inert`] (replay-class; silent under `virtual`, and under sim time an enabled block gets the declared-topics warn [`crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE`], because the graph's own `sim_time: true` can select it) |
 /// | enabled block, real clock, `is_record` + declared `ingress:` | `Err` (the record-plus-ingress refusal, naming the topics + both workarounds) |
 /// | enabled block, real clock (egress-only under `--record`, or any non-record) | [`RunNetwork::Strict`] with the block's `NetworkConfig` |
 /// | no / disabled block, real clock (incl. `--record`) | [`RunNetwork::Permissive`] with the synth config |
@@ -3995,7 +3998,22 @@ pub fn resolve_run_network(
     // 2. Replay-class clocks: the network plane is INERT (Principle #7). A
     //    zenoh session is a live side effect that would break replay
     //    byte-identity, so virtual/external runs never build a gateway.
+    //    Under `--time-source virtual` the operator typed the flag that turns
+    //    the network off and the arm stays silent; under sim time the graph's
+    //    own `sim_time: true` can turn it off, so an enabled block is told
+    //    which declared topics stay local for this run.
     if time_source != TimeSource::Real {
+        if time_source == TimeSource::External {
+            if let Some(net) = config.network.as_ref().filter(|n| n.is_enabled()) {
+                use crate::sim_time_run::SIM_TIME_NETWORK_INERT_NOTICE;
+                tracing::warn!(
+                    graph = %config.identity(),
+                    egress = ?net.egress,
+                    ingress = ?net.ingress,
+                    "{SIM_TIME_NETWORK_INERT_NOTICE}"
+                );
+            }
+        }
         return Ok(RunNetwork::Inert);
     }
 
@@ -5319,6 +5337,7 @@ mod open_file_limit_verdict_tests {
             ));
         }
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -5447,12 +5466,11 @@ fn refuse_ambiguous_output_schemas(workspace_root: &Path, config: &GraphConfig) 
 ///   1 ms poll loop that pumps events at full speed (byte-identical to the
 ///   pre-25b default). Select it for replay, deterministic runs, and
 ///   benchmarking.
-/// - [`TimeSource::External`]: builds on an `ExternalClock` via the same
-///   live path as `Real`, but is INERT today — no external time master is
-///   wired yet, so the clock stays at 0 and time-based
-///   triggers (period/deadline) never fire. A loud `tracing::warn!` is
-///   emitted at run start; use `real` or `virtual` until external feeding
-///   lands.
+/// - [`TimeSource::External`]: sim time, a `VirtualClock` the
+///   `crate::sim_time_run` loop steps once per `rosgraph_msgs/Clock` sample on
+///   `/clock`. Nothing is built until the first sample places the epoch. The
+///   graph's `sim_time: true` resolves to this source too, before the run
+///   shape is judged (`sim_time_run::resolve_time_source`).
 ///
 /// When `skip_validate` is false, runs the pre-flight validation report
 /// before starting the graph. A FAILING check REFUSES the run
@@ -5650,6 +5668,31 @@ pub fn graph_run(
     // the fail-closed gate exists to remove, re-created in the opposite direction.
     if config.prefix.is_empty() {
         config.prefix = cerulion_core::graph::default_prefix(config.identity());
+    }
+
+    // The graph's `sim_time:` switch and the `--time-source` flag name ONE
+    // clock, resolved here before anything judges the run shape: the partition
+    // intent, the network decision and the multi-process and record guards all
+    // read the resolved source. `sim_time: true` + `--time-source virtual` is
+    // two clock sources and is refused.
+    let time_source_flag = time_source;
+    let time_source = crate::sim_time_run::resolve_time_source(
+        time_source_flag,
+        config.sim_time,
+        config.identity(),
+    )?;
+    // The load-time sim-time rules (one clock source, and it runs outside
+    // the graph) are judged on the EFFECTIVE switch: `--time-source external`
+    // turns sim time on for a graph whose YAML says `sim_time: false`, and
+    // `validate_graph` judges only the YAML, so the flag's spelling is held
+    // to the same rules here. A `sim_time: true` graph is judged twice (here
+    // and at load); the first refusal wins. The refusal's remedy names every
+    // switch that is on, the flag included.
+    if time_source == TimeSource::External {
+        cerulion_core::graph::sim_time::validate_sim_time_for(
+            &config,
+            time_source_flag == TimeSource::External,
+        )?;
     }
 
     // Resolve every node type's cdylib once, up front. The same cache
@@ -6046,6 +6089,7 @@ pub fn graph_run(
         config.identity(),
         running.clone(),
         resolve_peer_loss(peer_loss),
+        time_source,
     )?;
 
     // Write THIS RUN's directory and announce it on
@@ -6148,7 +6192,7 @@ pub fn graph_run(
                     // twice and drift.
                     gating: crate::run_dir::GatingClock::classify(
                         executes_process_groups,
-                        time_source == TimeSource::Virtual,
+                        run_is_polled(time_source),
                         record.is_some(),
                         // The run's ring INTENT: a supervisor run ASKS FOR
                         // trace rings unless `--no-rings`. Intent is all this
@@ -6568,52 +6612,111 @@ pub fn graph_run(
             fatal_nodes = runtime.node_fatal_errors();
             runtime.shutdown();
         }
-        TimeSource::Real | TimeSource::External => {
-            // LIVE path: RealClock (default) or ExternalClock (inert today)
-            // on the iceoryx2 WaitSet — `run_live` blocks until a publish wakes
-            // a data-trigger input (or the next Period deadline), waking within
-            // microseconds instead of the 1 ms poll floor. `run_live` honors
-            // both `running` (SIGINT) and node-requested shutdown internally.
+        TimeSource::External => {
+            // SIM TIME: the graph clock is a controlled `VirtualClock` that
+            // follows `rosgraph_msgs/Clock` samples on `/clock`, one step per
+            // sample (`crate::sim_time_run`). Nothing is built until the first
+            // sample places the epoch, so nothing time-triggered fires before
+            // time is valid. A replay-class run: no gateway, no pause page (a
+            // simulator owns this clock; pause the simulator).
             //
-            // `External` builds the SAME live path but on an
-            // `ExternalClock`. No external time master is wired yet — the clock
-            // starts at 0 and never advances without a `/clock` feeder, so
-            // time-based triggers (period/deadline) will not fire. Warn loudly.
+            // The same rule as the virtual poll loop: nothing sweeps an
+            // external-policy node's fd or doorbell between clock samples, so
+            // such a graph is refused rather than run blind. Judged on the
+            // loaded entries' metadata BEFORE the transport exists and BEFORE
+            // the wait for a clock, so a graph that can never run says so at
+            // launch, not after the simulator starts; and with sim time's own
+            // text, because the virtual loop's fix (`--time-source real`)
+            // resolves back to sim time on a `sim_time: true` graph.
+            crate::sim_time_run::refuse_external_nodes_under_sim_time(
+                graph_name, &config, &factories,
+            )?;
+            let clock = Arc::new(cerulion_core::VirtualClock::new());
+            let transport =
+                cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
+                    node_name: format!("cerulion_{}", graph_name),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                })?;
+            // The sim poll loop never parks on the WaitSet, so Auto takes NO
+            // cap; an explicit `CERULION_CPU_DMA_LOCK=1` / `_US=N` still pins it.
+            let _dma_lock = acquire_cstate_cap(resolve_cpu_dma_lock_cap(CapInputs {
+                mode: cpu_dma_lock,
+                env_lock: env_lock.as_deref(),
+                env_us: env_us.as_deref(),
+                tightest_ns: None,
+                auto_cap_us: auto_cap,
+                monitor_wait_active: false,
+            }));
+            tracing::info!(
+                graph = %graph_name,
+                time_source = ?time_source,
+                topic = cerulion_core::graph::sim_time::SIM_CLOCK_TOPIC,
+                "graph waiting for sim time: the first clock sample starts the run; press Ctrl+C to stop"
+            );
+            let source = crate::sim_time_run::ClockTopicSource::new(Arc::clone(&transport));
+            let build_clock = Arc::clone(&clock);
+            let built = crate::sim_time_run::run_sim_time(crate::sim_time_run::SimTimeRun {
+                graph_name,
+                running: &running,
+                clock: &clock,
+                build: move || {
+                    let mut runtime = cerulion_core::GraphRuntime::build_with_schema_hashes(
+                        config,
+                        factories,
+                        &transport,
+                        build_clock,
+                        Some(&schema_hashes),
+                    )?;
+                    runtime.set_trace_limit(trace_limit);
+                    Ok(runtime)
+                },
+                source,
+                no_clock_grace: crate::sim_time_run::NO_CLOCK_GRACE,
+                idle: Duration::from_millis(1),
+            })?;
+            tracing::info!(graph = %graph_name, "shutting down");
+            fatal_nodes = match built {
+                Some(runtime) => {
+                    let fatal = runtime.node_fatal_errors();
+                    runtime.shutdown();
+                    fatal
+                }
+                None => Vec::new(),
+            };
+        }
+        TimeSource::Real => {
+            // LIVE path: RealClock on the iceoryx2 WaitSet. `run_live` blocks
+            // until a publish wakes a data-trigger input (or the next Period
+            // deadline), waking within microseconds instead of the 1 ms poll
+            // floor. `run_live` honors both `running` (SIGINT) and
+            // node-requested shutdown internally.
+            //
             // This run's pause page, when the clock below is the pausable one.
             // Declared before the clock so it outlives the runtime that reads it.
             #[cfg(unix)]
             let mut pause_page: Option<
                 Arc<cerulion_core::pause_page::MappedPausePage>,
             > = None;
-            let clock: Arc<dyn cerulion_core::clock::Clock> = match time_source {
-                TimeSource::External => {
-                    tracing::warn!(
-                        graph = %graph_name,
-                        "--time-source external: no external time master is wired yet; the ExternalClock starts at 0 and will NOT advance without a /clock feeder, so time-based triggers (period/deadline) will not fire. Use real or virtual until external feeding lands."
-                    );
-                    Arc::new(cerulion_core::ExternalClock::new())
+            // The real clock: the hardware clock, except that a run `graph pause`
+            // can reach reads the run clock, which stands still while paused.
+            #[cfg(unix)]
+            let clock: Arc<dyn cerulion_core::clock::Clock> = match create_run_pause_page(
+                run_id,
+                graph_name,
+                !ros2_entries.is_empty(),
+                _run_descriptor.is_some(),
+            ) {
+                Some(page) => {
+                    let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
+                    pause_page = Some(page);
+                    clock
                 }
-                // The real clock: the hardware clock, except that a run `graph pause`
-                // can reach reads the run clock, which stands still while paused.
-                // An external time master is not this process's to stop, so only the
-                // real clock is pausable.
-                #[cfg(unix)]
-                _ => match create_run_pause_page(
-                    run_id,
-                    graph_name,
-                    !ros2_entries.is_empty(),
-                    _run_descriptor.is_some(),
-                ) {
-                    Some(page) => {
-                        let clock = Arc::new(cerulion_core::PausableClock::new(Arc::clone(&page)));
-                        pause_page = Some(page);
-                        clock
-                    }
-                    None => Arc::new(cerulion_core::RealClock),
-                },
-                #[cfg(not(unix))]
-                _ => Arc::new(cerulion_core::RealClock),
+                None => Arc::new(cerulion_core::RealClock),
             };
+            #[cfg(not(unix))]
+            let clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(cerulion_core::RealClock);
             let transport =
                 cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
                     node_name: format!("cerulion_{}", graph_name),
@@ -8935,12 +9038,12 @@ const NON_UNIX_MONOLITH_FALLBACK: &str =
 /// The `--time-source external` × multi-process rejection text (the dispatch
 /// site prefixes the graph name).
 const EXTERNAL_CLOCK_MULTIPROCESS_REJECTION: &str =
-    "a multi-process (`process_groups:`) deployment cannot run under `--time-source external`: \
-     every worker runs on the real clock, free-run by default (each rank on its own \
-     wall-following clock) or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, \
-     and an external time master driving N separate processes is unspecified either way. \
-     Fix: drop `--time-source external`, or \
-     force one process with `--single-process`.";
+    "a multi-process (`process_groups:`) deployment cannot run under `--time-source external` \
+     (sim time, also selected by `sim_time: true` in the graph YAML): every worker runs on the \
+     real clock, free-run by default (each rank on its own wall-following clock) or \
+     barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`, and one `/clock` stream \
+     driving N separate processes is not supported yet. Fix: drop `--time-source external` \
+     (and set `sim_time: false`), or force one process with `--single-process`.";
 
 /// See [`Deployment`]. `Err` = the `--time-source external` rejection (only on
 /// the arm that WOULD have dispatched to the supervisor — a `--single-process`
@@ -12617,6 +12720,17 @@ fn graph_run_supervisor(
     }
 }
 
+/// True for the monolith shapes that step the graph through the polled
+/// `GraphRuntime::step()` seam and never enter the live loop: the
+/// deterministic `--time-source virtual` loop, and sim time
+/// (`--time-source external`, or `sim_time: true` in the graph YAML), whose
+/// loop steps a controlled `VirtualClock` once per `/clock` sample. The real
+/// clock is the live loop. Feeds [`crate::run_dir::GatingClock::classify`], so
+/// `run.json` labels a sim-time run `polled`, never `wall`.
+pub fn run_is_polled(time_source: TimeSource) -> bool {
+    matches!(time_source, TimeSource::Virtual | TimeSource::External)
+}
+
 /// Formerly `virtual_external_inert_warning`: build the STARTUP
 /// REFUSAL for external-policy nodes under the deterministic `--time-source
 /// virtual` poll loop, or `None` when the graph declares no external nodes (the
@@ -14172,6 +14286,17 @@ pub fn graph_profile(
         config.prefix = cerulion_core::graph::default_prefix(config.identity());
     }
     validate_graph(&config)?;
+    // A profile is a real-clock measurement: the graph's `sim_time:` switch
+    // does not apply to this verb, and a graph that says `true` is told so
+    // rather than profiled on a clock it did not ask for in silence.
+    if config.sim_time {
+        use crate::sim_time_run::SIM_TIME_PROFILE_IGNORED_NOTICE;
+        tracing::warn!(
+            graph = %config.identity(),
+            key = cerulion_core::graph::sim_time::SIM_TIME_KEY,
+            "{SIM_TIME_PROFILE_IGNORED_NOTICE}"
+        );
+    }
     // A profile EXECUTES the graph without the report: the same resolution
     // `graph run` performs, so an ambiguous `schema:` cannot be profiled on
     // a last-wins pick either (the class sibling of --no-validate).
@@ -15784,8 +15909,9 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
             "`graph run --record` requires the live clock (`--time-source real`, the default), but \
              `--time-source {}` was requested. Recording captures a live run on the wall-following gating \
              clock (fire_time_ns is real cumulative timing, re-advanceable in replay); the \
-             deterministic virtual poll loop and the inert external clock are not recordable in \
-             Tier-0. Drop the `--time-source` flag (or set it to `real`) to record.",
+             deterministic virtual poll loop and sim time (`--time-source external`, or \
+             `sim_time: true` in the graph YAML) are not recordable yet. Drop the \
+             `--time-source` flag (or set it to `real`) and set `sim_time: false` to record.",
             match time_source {
                 TimeSource::Virtual => "virtual",
                 TimeSource::External => "external",
@@ -24944,6 +25070,7 @@ nodes:
     #[cfg(unix)]
     fn recorded_topics_config() -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -25299,6 +25426,7 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -25377,6 +25505,7 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -25460,6 +25589,7 @@ nodes:
         use indexmap::IndexMap;
 
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -27041,6 +27171,26 @@ nodes:
             GatingClock::classify(false, true, false, false, monolith),
             GatingClock::Polled
         );
+        // The polled fact comes off the resolved source through ONE predicate:
+        // the virtual loop and sim time both step a controlled clock through
+        // `step()` and never enter the live loop, so both label `polled`; the
+        // real clock is the live loop.
+        assert!(!run_is_polled(TimeSource::Real));
+        assert!(run_is_polled(TimeSource::Virtual));
+        assert!(
+            run_is_polled(TimeSource::External),
+            "a sim-time run is polled, so its run.json must not read `wall`"
+        );
+        assert_eq!(
+            GatingClock::classify(
+                false,
+                run_is_polled(TimeSource::External),
+                false,
+                false,
+                monolith
+            ),
+            GatingClock::Polled
+        );
         assert_eq!(
             GatingClock::classify(false, false, true, false, monolith),
             GatingClock::RecordedWall
@@ -28543,6 +28693,7 @@ nodes:
 
         // --- External node → refused before stepping. ---
         let ext_config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -28612,6 +28763,7 @@ nodes:
 
         // --- Non-external (Period) node → NO refusal (Ok, run proceeds). ---
         let ok_config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -32987,6 +33139,7 @@ network:
     /// `node_type` (ids `<type>_0..n`), no ports.
     fn config_with_n_instances(node_type: &str, n: usize) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -37169,6 +37322,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         use indexmap::IndexMap;
 
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -37227,6 +37381,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         use indexmap::IndexMap;
 
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -40029,6 +40184,7 @@ mod worker_tests {
             go_path: "unused.go".to_string(),
             go_deadline_ms: 120_000,
             subgraph: GraphConfig {
+                sim_time: false,
                 level_assignments: None,
                 network: None,
                 name: None,
@@ -40286,6 +40442,7 @@ mod worker_tests {
         }
         fn cfg(nodes: Vec<NodeDef>) -> GraphConfig {
             GraphConfig {
+                sim_time: false,
                 level_assignments: None,
                 network: None,
                 name: None,
@@ -41168,6 +41325,7 @@ mod supervisor_tests {
     /// A minimal empty-subgraph config for plan literals.
     fn empty_subgraph(name: &str) -> GraphConfig {
         GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             name: None,

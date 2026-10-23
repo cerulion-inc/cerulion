@@ -149,6 +149,7 @@ fn snap_graph(
     last_read: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -332,6 +333,7 @@ impl ExtSnapConsumer {
 fn fire_gating_skips_snapshot_on_non_fire_steps() {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -533,6 +535,7 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
     let plain_read = Arc::new(AtomicU64::new(MISSING));
     let block_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -775,6 +778,7 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
     let trig_read = Arc::new(AtomicU64::new(MISSING));
     let plain_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -998,6 +1002,7 @@ impl SampleConsumer {
 fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
     let last_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1149,6 +1154,7 @@ fn flat_and_level_executors_produce_byte_identical_traces() {
             })
             .collect();
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -1279,6 +1285,7 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
     let trig_read = Arc::new(AtomicU64::new(MISSING));
     let plain_read = Arc::new(AtomicU64::new(MISSING));
     let config = GraphConfig {
+        sim_time: false,
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),

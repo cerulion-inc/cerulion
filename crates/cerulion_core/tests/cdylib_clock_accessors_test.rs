@@ -127,6 +127,7 @@ fn clockprobe_graph(
     captured: Arc<Mutex<Vec<ClockRow>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

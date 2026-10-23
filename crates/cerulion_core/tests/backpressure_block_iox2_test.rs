@@ -72,6 +72,7 @@ impl StalledBlockConsumer {
 /// Build the producer→consumer graph: `producer.out` feeds `consumer.inp`.
 fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -230,6 +231,7 @@ fn draining_block_graph(
     seen: Arc<Mutex<Vec<u32>>>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -424,6 +426,7 @@ impl DropOldestConsumer {
 #[test]
 fn mixed_block_dropoldest_producer_not_deferred() {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -552,6 +555,7 @@ impl DeepBlockConsumer {
 #[test]
 fn block_declared_depth_honored_beyond_global_default() {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -697,6 +701,7 @@ impl DegradedBlockConsumer {
 fn mixed_topic_degraded_block_counts_drop_oldest() {
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1355,6 +1360,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
     let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

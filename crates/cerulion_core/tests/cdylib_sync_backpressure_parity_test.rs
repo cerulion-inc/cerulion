@@ -338,6 +338,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
 
 fn graph(prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

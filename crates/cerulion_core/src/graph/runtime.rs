@@ -9848,6 +9848,21 @@ impl GraphRuntime {
         ));
     }
 
+    /// Bound every `Period` node of this runtime to at most `ceiling` fires
+    /// per step, the latest deadlines the step passes; `None` removes the
+    /// bound. A sim-time run sets one, so a `/clock` sample that jumps across
+    /// several periods fires each period node once. See
+    /// [`crate::scheduler::period_ceiling`].
+    pub fn set_period_fire_ceiling(&mut self, ceiling: Option<u32>) {
+        self.scheduler.set_period_fire_ceiling(ceiling);
+    }
+
+    /// The `Period` fire ceiling this runtime runs under, `None` when
+    /// unbounded.
+    pub fn period_fire_ceiling(&self) -> Option<u32> {
+        self.scheduler.period_fire_ceiling()
+    }
+
     /// Install this rank's WEDGE PAGE and bind each node to its slot.
     ///
     /// A thin delegation to [`crate::scheduler::Scheduler::set_wedge_page`] — the
@@ -19393,6 +19408,7 @@ mod tests {
     fn ingress_resolver_config(nodes: Vec<(&str, Vec<(&str, &str)>)>) -> GraphConfig {
         use crate::graph::config::{InputDef, NodeDef};
         GraphConfig {
+            sim_time: false,
             name: None,
             identity: "ingress_hash_test".to_string(),
             prefix: "nw".to_string(),

@@ -4,7 +4,7 @@
 # Refresh crates/native_ros2_messages/upstream_msg_manifest.txt: the
 # checked-in snapshot of every vendored message's UPSTREAM ROS 2 signature,
 # which `upstream_drift_test.rs` gates the corpus against. Each package is
-# pinned to the distro it is vendored from: of 22 packages, 19 Jazzy,
+# pinned to the distro it is vendored from: of 23 packages, 20 Jazzy,
 # control_msgs LYRICAL, and the two autoware_* packages have NO distro pin
 # at all (see PINNED REFS below).
 #
@@ -37,10 +37,10 @@
 #                                       named by distribution.yaml (the
 #                                       authoritative released source)
 #
-# Of the 22 packages, 20 carry a distro pin (19 Jazzy + control_msgs on
+# Of the 23 packages, 21 carry a distro pin (20 Jazzy + control_msgs on
 # Lyrical) and 2 (the autoware_* pair) carry none at all. "Jazzy" is the
 # majority, NOT the whole corpus. Only the 5 ros2-gbp `release/...` pins are
-# immutable tags; the other 17 name a MOVING branch, so two refreshes months
+# immutable tags; the other 18 name a MOVING branch, so two refreshes months
 # apart can produce different signatures under identical `!source` lines.
 #
 # These refs are cross-checked against the manifest's `!source` lines by
@@ -110,6 +110,7 @@ place common_interfaces        trajectory_msgs/msg          trajectory_msgs
 place common_interfaces        visualization_msgs/msg       visualization_msgs
 place rcl_interfaces           action_msgs/msg              action_msgs
 place rcl_interfaces           builtin_interfaces/msg       builtin_interfaces
+place rcl_interfaces           rosgraph_msgs/msg            rosgraph_msgs
 place rcl_interfaces           statistics_msgs/msg          statistics_msgs
 place unique_identifier_msgs   msg                          unique_identifier_msgs
 place geometry2                tf2_msgs/msg                 tf2_msgs

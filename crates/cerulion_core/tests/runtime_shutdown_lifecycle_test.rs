@@ -57,6 +57,7 @@ fn build_runtime_with_counters(counters: Arc<LifecycleCounters>, period_ms: u64)
     });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -205,6 +206,7 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
         });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

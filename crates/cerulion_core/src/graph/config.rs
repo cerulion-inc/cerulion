@@ -65,6 +65,16 @@ pub struct GraphConfig {
     pub identity: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+    /// `sim_time: true` runs the graph on sim time: the graph clock follows
+    /// `rosgraph_msgs/Clock` samples on `/clock` instead of the real clock,
+    /// so a simulator or sim bridge drives every period trigger, deadline and
+    /// output stamp. Off by default (the real clock). Sim time is single
+    /// process only: a graph with `process_groups:` is refused under it and
+    /// runs with `--single-process`. The rules the clock follows, and the
+    /// load-time refusals (a second clock source, a clock publisher inside
+    /// the graph), live in [`sim_time`](super::sim_time).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sim_time: bool,
     pub nodes: Vec<NodeDef>,
     /// ABSOLUTE topic names opted into multiple
     /// publishers (e.g. `multi_publisher_topics: [/tf]`). A listed topic

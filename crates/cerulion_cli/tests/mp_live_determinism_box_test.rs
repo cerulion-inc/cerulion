@@ -242,6 +242,7 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
         name: None,
         identity: shape.graph.to_string(),
         prefix: GRAPH_PREFIX.to_string(),
+        sim_time: false,
         nodes: vec![
             NodeDef {
                 fuse: None,

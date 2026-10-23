@@ -411,6 +411,7 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 | `clock_model_e2e_iox2_test.rs` | End-to-end clock-model contracts over real iceoryx2. | `#[serial]` tt1 | none |
 | `d2_sim_ns_warn_test.rs` / `ext_ns_warn_test.rs` | `RealClock::virt_ns()` / `ext_ns()` return `None` + one-time warn. | parallel | none |
 | `macro_shim_clock_sources_test.rs` | Macro shim clock reads reach the runtime's ACTIVE clock. | `#[serial]` tt1 | none |
+| `sim_time_test.rs` | The `sim_time:` graph YAML switch (`parse_graph` / `validate_graph`) and the pure `/clock` sample policy of `cerulion_core::graph::sim_time`, with hand-written YAML, error text and nanosecond verdicts. | parallel | none |
 
 ### Macro runtime (in-process)
 

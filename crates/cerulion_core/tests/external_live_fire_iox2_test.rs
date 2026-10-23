@@ -238,6 +238,7 @@ fn producer_consumer_parts(
     consumer_fires: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -569,6 +570,7 @@ fn blocking_panic_is_contained_and_loud() {
     let p_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -632,6 +634,7 @@ fn host_driven_and_none_refused_on_live_but_fire_when_polled() {
             producer.src = None; // external_source() → None (no override)
         }
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -702,6 +705,7 @@ fn host_driven_and_none_refused_on_live_but_fire_when_polled() {
             producer2.src = None;
         }
         let config2 = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),
@@ -784,6 +788,7 @@ fn duplicate_fd_rejected_loudly() {
     let p2_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -901,6 +906,7 @@ fn poisoned_entry_refuses_the_run() {
     let producer = ExtProducer::new(ExternalSource::HostDriven, Arc::clone(&fires), None);
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -984,6 +990,7 @@ fn pollnval_unbinds_loudly() {
     let b_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1062,6 +1069,7 @@ fn zero_external_bindings_zero_cost() {
     let c_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1497,6 +1505,7 @@ fn invalid_fd_at_collect_refuses_naming_both_offenders() {
     let good_fires = Arc::new(AtomicU64::new(0));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1760,6 +1769,7 @@ fn fd_written_mid_block_wakes_live_seam_and_fires() {
 fn blocking_doorbell_without_transport_manager_refused_at_launch() {
     let p_fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1850,6 +1860,7 @@ fn blocking_doorbell_without_transport_manager_refused_at_launch() {
 #[serial]
 fn live_transport_arm_is_load_bearing_for_doorbell_resolution() {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1929,6 +1940,7 @@ fn set_live_transport_after_collect_warns() {
     let pipe = Pipe::new();
     let p_fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2012,6 +2024,7 @@ fn collect_twice_is_idempotent_and_reports_resume() {
     let closure = move || matches!(rx.recv_timeout(Duration::from_millis(50)), Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -2810,6 +2823,7 @@ mod eventfd_arm {
         consumer_fires: Arc<AtomicU64>,
     ) -> GraphRuntime {
         let config = GraphConfig {
+            sim_time: false,
             level_assignments: None,
             network: None,
             process_groups: Default::default(),

@@ -24,8 +24,8 @@ pub enum TimeSource {
     /// Live, event-driven loop on the real clock (the default). Wakes within
     /// microseconds of a publish.
     Real,
-    /// An external time master. Not wired yet: the clock starts at 0 and never
-    /// advances, so time-based triggers never fire.
+    /// Sim time: the graph clock follows `rosgraph_msgs/Clock` samples on
+    /// `/clock`, the path `sim_time: true` in the graph YAML selects.
     External,
     /// Deterministic virtual clock driven by a 1 ms poll loop, for
     /// deterministic runs and benchmarking.
@@ -1573,9 +1573,10 @@ pub enum GraphAction {
         /// is not a recording.
         ///
         /// On the shapes that mint no ring anyway it is NOT a no-op: a
-        /// `--single-process` or `--time-source external` run still has its
-        /// window recorder stopped by it, so the run takes no captures. Each
-        /// says at launch which it was.
+        /// `--single-process` run still has its window recorder stopped by it,
+        /// so the run takes no captures, and says so at launch. A sim-time run
+        /// (`--time-source external`) starts no recorder, so there the flag
+        /// changes nothing.
         #[arg(long = "no-rings", conflicts_with = "record")]
         no_rings: bool,
         /// Re-derive the multi-process partition even when the graph already

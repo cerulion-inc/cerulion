@@ -461,6 +461,11 @@ this section is the opt-out's machinery.)
   Determinism is unaffected: `real_ns` is the non-deterministic escape hatch; replay
   uses `VirtualClock`. `RealClock::virt_ns()` / `ext_ns()` return `None` with a one-time
   warn.
+- Sim time (`sim_time: true`) moves the graph clock ONLY through a `VirtualClock` and
+  `step(delta)`, one step per accepted `/clock` sample. `graph/sim_time.rs` holds the pure
+  verdicts; the CLI engine feeds it (`docs/internals/cli.md` §15). A backward sample is
+  refused, never stored. The clock is placed at the first sample BEFORE the build, so
+  period anchors are epoch-relative.
 
 ## cdylib runtime contracts (host side)
 

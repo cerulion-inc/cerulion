@@ -55,6 +55,7 @@ impl NodeEntry for PumpSpy {
 fn build_spy_graph() -> (GraphRuntime, Arc<AtomicU64>) {
     let pumped = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -154,6 +155,7 @@ fn pump_history_recovers_after_a_tick_panic_poisons_the_entry_mutex() {
     let pumped = Arc::new(AtomicU64::new(0));
     let ticked = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

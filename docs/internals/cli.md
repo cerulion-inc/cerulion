@@ -1305,3 +1305,19 @@ earlier set's verb). `the_registered_nested_verbs_attach` runs the production re
 through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
 files them under the verb their `PARENT` names. A flag on a built-in verb (such as
 `topic list -t`) is still a field of that verb.
+
+## 15. Sim time: `sim_time:` and `/clock`
+
+`sim_time_run.rs` owns the sim-time run loop. Its contract:
+
+- `resolve_time_source` folds the graph's `sim_time:` into `TimeSource` BEFORE
+  partition intent, network and record guards read it. `--time-source external`
+  IS sim time, and is held to `validate_sim_time_for`'s load rules.
+- External-policy nodes are refused from the loaded entries' metadata BEFORE the
+  transport exists.
+- The loop builds the runtime only after the first `/clock` sample and steps once
+  per accepted sample, through a data-only `/clock` tap (no listener).
+- A period fires at most once per sample: a jump fires the latest passed deadline,
+  never a catch-up burst.
+- A frame is decoded only after its wire framing is checked.
+- Every warning and refusal text is a pinned constant.

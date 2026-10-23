@@ -302,7 +302,7 @@ fn every_publishable_crate_ships_the_text_of_its_license() {
     );
 }
 
-/// `native_ros2_messages` redistributes 254 ROS 2 interface definitions that
+/// `native_ros2_messages` redistributes 255 ROS 2 interface definitions that
 /// are not ours. Apache-2.0 section 4 and the BSD-3-Clause first condition
 /// each require a recipient of those files to get the license text and the
 /// attribution notice, so those three files are as load-bearing as the crate's

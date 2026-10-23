@@ -78,6 +78,7 @@ fn macro_sync_with_two_yaml_wired_inputs_builds_successfully() {
     let producer = ClosureNodeEntry::new(producer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -168,6 +169,7 @@ fn macro_sync_with_zero_yaml_wired_inputs_fails_to_build_with_diagnostic() {
     let entry = DylibNodeEntry::load(&path).expect("load");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

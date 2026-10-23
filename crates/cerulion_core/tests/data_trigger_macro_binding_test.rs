@@ -62,6 +62,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -144,6 +145,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
     });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -224,6 +226,7 @@ fn build_fails_when_macro_data_trigger_input_name_not_in_yaml_inputs() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -285,6 +288,7 @@ fn build_fails_when_macro_data_trigger_input_loops_to_self() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -358,6 +362,7 @@ fn build_fails_when_macro_data_trigger_loops_to_own_overridden_output() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -434,6 +439,7 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
     let consumer_entry = ClosureNodeEntry::new(consumer_info, |_ctx: &mut NodeContext| Ok(()));
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

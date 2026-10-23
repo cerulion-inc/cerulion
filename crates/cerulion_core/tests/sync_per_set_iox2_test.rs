@@ -162,6 +162,7 @@ fn pair_graph(
     entry: Box<dyn NodeEntry>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -196,6 +197,7 @@ fn pair_graph(
 
 fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -919,6 +921,7 @@ impl PairFuseCtx {
 fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
     let sets: Triples = Arc::new(Mutex::new(Vec::new()));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1306,6 +1309,7 @@ fn closure_sync_graph(
     let entry = ClosureNodeEntry::new(info, body).with_label("pss_closure_fuse");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -1543,6 +1547,7 @@ fn degraded_sync_graph(
         .with_label("pss_degraded_fuse");
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
