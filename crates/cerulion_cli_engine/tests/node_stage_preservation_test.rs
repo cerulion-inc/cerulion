@@ -986,3 +986,64 @@ fn code_only_strips_comments_and_keeps_code() {
         "nested block comments must strip: {block:?}"
     );
 }
+
+/// A staged node's `params:` reach the file: the renderer writes every value
+/// in declaration order and each re-parses as the value it was staged with,
+/// a string that looks like a number included.
+#[test]
+fn a_staged_nodes_params_round_trip_through_the_file() {
+    use cerulion_core::graph::params::ParamValue;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    write_graph(dir, "prm", "prefix: robot\nnodes: []\n");
+    let mut def = build_node_def(
+        "camera",
+        Some("left"),
+        &[("image".to_string(), Some("sensor_msgs/Image".to_string()))],
+        &[],
+    );
+    let staged = [
+        ("gain", ParamValue::Float(2.0)),
+        ("bias", ParamValue::Float(-0.0)),
+        ("offset", ParamValue::Int(-3)),
+        ("count", ParamValue::Int(7)),
+        ("enabled", ParamValue::Bool(false)),
+        ("frame_id", ParamValue::Str("left_cam".into())),
+        ("version", ParamValue::Str("2.0".into())),
+    ];
+    def.params = staged
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    node_stage(dir, "prm", def).expect("stage a node with params");
+
+    let after = read_graph(dir, "prm");
+    // HAND ORACLE: the exact text, in declaration order.
+    assert!(
+        after.contains(
+            "    params:\n      gain: 2.0\n      bias: -0.0\n      offset: -3\n      \
+             count: 7\n      enabled: false\n      frame_id: left_cam\n      version: \"2.0\"\n"
+        ),
+        "{after}"
+    );
+    let config = graph_read(dir, "prm").expect("the staged file reads back");
+    let node = config
+        .nodes
+        .iter()
+        .find(|n| n.id == "left")
+        .unwrap_or_else(|| panic!("no staged node\n{after}"));
+    let read: Vec<(String, ParamValue)> = node
+        .params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let want: Vec<(String, ParamValue)> = staged
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    assert_eq!(read, want, "{after}");
+    let ParamValue::Float(bias) = &node.params["bias"] else {
+        panic!("bias must read back as a float\n{after}");
+    };
+    assert_eq!(bias.to_bits(), (-0.0_f64).to_bits(), "the sign survives");
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! # cerulion_wireclient
 //!
-//! Desk-side client pieces for the `cerulion/wire/1` protocol: what a computer needs
+//! Desk-side client pieces for the `cerulion/wire/2` protocol: what a computer needs
 //! to read a remote robot's topics over an iroh connection. It is the desk
 //! counterpart of the robot-side server in `cerulion_remoted`.
 //!
@@ -19,7 +19,7 @@
 //!   parsers (endpoint id, addresses, desk key, account), including the resolver
 //!   from a device certificate to its account ([`resolve_desk_account`]) that the
 //!   netd dial config uses to present an account-bound identity.
-//! - [`protocol`]: the desk-side mirror of the robot's `cerulion/wire/1` control
+//! - [`protocol`]: the desk-side mirror of the robot's `cerulion/wire/2` control
 //!   protocol ([`WireRequest`], [`WireResponse`], [`StreamPreamble`]). A parity test
 //!   in `cerulion_connectd` pins it against the types the robot serves.
 //! - [`reader`]: [`run_topic_reader`], the validated per-topic re-inject loop. One

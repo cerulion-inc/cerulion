@@ -60,6 +60,7 @@ pub(crate) mod shm_guard;
 mod shm_sample;
 pub mod subscriber;
 pub mod uds_write;
+pub mod wire_header_attribute;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
 #[doc(hidden)]
@@ -3084,12 +3085,15 @@ impl TransportManager {
             .as_str()
             .try_into()
             .expect("valid service name");
-        let svc = self
-            .node
-            .service_builder(&name)
-            .publish_subscribe::<[u8]>()
-            .open_or_create()
-            .expect("create default service");
+        let builder = || self.node.service_builder(&name).publish_subscribe::<[u8]>();
+        let svc = match builder().open() {
+            Ok(svc) => svc,
+            Err(_) => builder()
+                .create_with_attributes(
+                    &wire_header_attribute::data_service_specifier().expect("attribute"),
+                )
+                .expect("create default service"),
+        };
         svc.static_config().subscriber_max_borrowed_samples()
     }
 
@@ -5153,6 +5157,7 @@ impl TransportManager {
                 };
                 map_err(format!("{e}{hint}"))
             })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(&map_err)?;
 
         // Subscriber port only (`TapDepth::Ceiling` → the service ceiling, the
         // deepest view the recording tap provisioned; the liveness sampling
@@ -5357,6 +5362,7 @@ impl TransportManager {
                 };
                 map_err(format!("{e}{hint}"))
             })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(map_err)?;
 
         // Size the event-id space to the ids this transport mints; see
         // `CERULION_MAX_EVENT_ID`.
@@ -5823,6 +5829,7 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
             .map_err(|e| map_err(format!("{e}{}", publish_subscribe_open_env_hint(&e))))?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(&map_err)?;
         Ok(ExternalPublisherProbe { data_service })
     }
 
@@ -5930,6 +5937,14 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
         {
+            // A service at another wire header version is not this build's
+            // topic: it counts as absent (the open is refused, and logged, by
+            // the same rule every opener applies).
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                0
+            }
             Ok(service) => {
                 let cfg = service.dynamic_config();
                 if publishers {
@@ -5973,6 +5988,11 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
         {
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                ProducerProbe::Failed
+            }
             Ok(service) => {
                 ProducerProbe::Count(service.dynamic_config().number_of_publishers() as u32)
             }
@@ -6435,6 +6455,11 @@ impl TransportManager {
         // `create_subscriber_floor`, see `TopicServiceConfig::create_port_caps`):
         // the OPEN leg arms only `max_publishers` / `max_subscribers`, the
         // CREATE leg the floored values.
+        // Every data service this build creates states the wire header version
+        // its frames carry; an opened one is checked after the open (see
+        // `wire_header_attribute`), so the open leg requires nothing and the
+        // create leg defines the attribute.
+        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let (create_publishers, create_subscribers) = topic_config
             .create_port_caps((node_defaults.max_publishers, node_defaults.max_subscribers));
@@ -6448,13 +6473,11 @@ impl TransportManager {
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
         };
-        let data_result = if open_leg == create_leg {
-            // No asymmetry (External passthrough, a genuine borrow requirement
-            // at or above the floor, port floors at or below the requirement
-            // or the node default): iceoryx2's native loop is exactly
-            // equivalent — keep the single call.
-            make_data_builder(open_leg).open_or_create()
-        } else {
+        // The two legs always run apart: iceoryx2's single `open_or_create`
+        // cannot define an attribute on create without also REQUIRING it on
+        // open, and an opened service without the attribute must still attach
+        // (it is checked, and warned about, after the open).
+        let data_result = {
             use iceoryx2::service::builder::publish_subscribe::{
                 PublishSubscribeCreateError, PublishSubscribeOpenError,
                 PublishSubscribeOpenOrCreateError,
@@ -6469,7 +6492,7 @@ impl TransportManager {
                     | PublishSubscribeOpenError::IsMarkedForDestruction => OpenStep::Wait,
                     _ => OpenStep::Fail,
                 },
-                || make_data_builder(create_leg).create(),
+                || make_data_builder(create_leg).create_with_attributes(&wire_header_specifier),
                 |e| {
                     matches!(
                         e,
@@ -6630,6 +6653,8 @@ impl TransportManager {
                 buffer_ceiling_refused,
             }
         })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes())
+            .map_err(|reason| OpenServicesFailure::from(map_err(reason)))?;
 
         // Loud-over-silent (with a
         // subscriber twin + a once-per-topic dedup): iceoryx2 enforces

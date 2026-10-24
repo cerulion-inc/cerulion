@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod introspect;
+
 use crate::discovery_ladder::{DiscoveredPeer, DiscoveryRung};
 use crate::error::{CliError, CliResult};
 
@@ -246,15 +248,31 @@ pub const INTERNAL_TOPIC_MARKER: &str = "internal";
 /// non-topic line stays free of a leading `/` so a row parser cannot mistake it
 /// for a topic. Oracle-tested below.
 pub fn render_local_topics_section(local: &[TopicInfo], show_all: bool) -> String {
+    render_local_topic_rows(local.iter().map(|t| (t.name.as_str(), None)), show_all)
+}
+
+/// The one LOCAL-section renderer behind [`render_local_topics_section`] and
+/// the typed `topic list -t` listing: each row is a topic name and an optional
+/// column printed two spaces after it (the type of `-t`), before the
+/// `internal` marker. The hide, count and empty rules are the ones
+/// [`render_local_topics_section`] documents.
+pub(crate) fn render_local_topic_rows<'a>(
+    local: impl IntoIterator<Item = (&'a str, Option<String>)>,
+    show_all: bool,
+) -> String {
     let mut rows = String::new();
     let mut hidden = 0usize;
-    for topic in local {
-        let internal = is_internal_topic(&topic.name);
+    for (name, column) in local {
+        let internal = is_internal_topic(name);
         if internal && !show_all {
             hidden += 1;
             continue;
         }
-        rows.push_str(&topic.name);
+        rows.push_str(name);
+        if let Some(column) = column {
+            rows.push_str("  ");
+            rows.push_str(&column);
+        }
         if internal {
             rows.push_str("  ");
             rows.push_str(INTERNAL_TOPIC_MARKER);
@@ -405,7 +423,7 @@ fn ensure_topic_available(
     // rule: one data source = one topic, obtained over the network once).
     let killed = scope.local_only();
     // Read once, so every refusal below names the kill-switch state this call saw.
-    let env_kill = crate::graph_cmd::network_env_kill();
+    let env_kill = crate::graph_cmd::query_network_kill();
     let transport = cerulion_core::TransportManager::get_or_init()?;
 
     // Classify: a topic LISTED locally that is NOT a netd mirror is a
@@ -702,6 +720,23 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
         // The user stopped us. Say that and nothing else — the
         // observation was cut short, so it supports no claim about `topic` at all.
         RemoteResolve::Cancelled => CliError::Validation(cancelled_message(topic)),
+        RemoteResolve::CatalogRefused { robot, reason } => CliError::Validation(format!(
+            "robot '{}' refused to serve its topic catalog to LAN peers (not authorized), so \
+             '{topic}' was not searched there{}; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key",
+            sanitize_refusal_reason(&robot),
+            reason
+                .as_deref()
+                .map(|reason| {
+                    format!(
+                        ": the robot's authorizer reported '{}'",
+                        sanitize_refusal_reason(reason)
+                    )
+                })
+                .unwrap_or_default(),
+        )),
         RemoteResolve::SchemaUnavailable { robot, cause } => CliError::Validation(format!(
             "topic '{topic}' is announced by robot '{}' but could not be demanded: {} \
              — add the type's `.msg` under `schemas/` (or update the robot to serve its \
@@ -947,7 +982,7 @@ pub fn schema_discovery_not_converged_message(requested: &str) -> String {
 fn local_lease_refusal_message(
     error: &cerulion_core::TransportError,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (_, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -963,30 +998,31 @@ fn local_lease_refusal_message(
 /// Pure over its inputs: the caller reads the kill-switch state once.
 fn scope_selection_and_remedy(
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
-) -> (String, &'static str) {
+    env: &crate::graph_cmd::QueryNetworkKill,
+) -> (String, String) {
     match scope {
         TopicScope::Local => (
             "--local".to_string(),
-            "remove --local and unset CERULION_NETWORK",
+            format!("remove --local and {}", env.unset_remedy()),
         ),
-        TopicScope::Automatic => (environment_selection_label(env), "unset CERULION_NETWORK"),
+        TopicScope::Automatic => (
+            environment_selection_label(env),
+            env.unset_remedy().to_string(),
+        ),
     }
 }
 
 /// The label for a local-only refusal the environment kill-switch caused: the
 /// accepted `off`, or the unrecognized value that failed closed, named as such so
-/// the refusal states what actually engaged the switch. `Unset` cannot reach a
-/// local-only refusal (nothing engaged the switch); it names the accepted value.
-fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String {
-    match env {
-        crate::graph_cmd::NetworkEnvKill::Off | crate::graph_cmd::NetworkEnvKill::Unset => {
-            "CERULION_NETWORK=off".to_string()
-        }
-        crate::graph_cmd::NetworkEnvKill::Unrecognized(value) => format!(
-            "CERULION_NETWORK={} (an unrecognized value, which fails closed to local-only)",
-            sanitize_display(value.trim())
-        ),
+/// the refusal states what actually engaged the switch, joined with
+/// `CERULION_NETD_NETWORK=off` when that switch is engaged too. Nothing engaged
+/// cannot reach a local-only refusal; it names `CERULION_NETWORK=off`.
+fn environment_selection_label(env: &crate::graph_cmd::QueryNetworkKill) -> String {
+    match (env.network.refusal_label(), env.netd_off) {
+        (Some(network), true) => format!("{network} and CERULION_NETD_NETWORK=off"),
+        (Some(network), false) => network,
+        (None, true) => "CERULION_NETD_NETWORK=off".to_string(),
+        (None, false) => "CERULION_NETWORK=off".to_string(),
     }
 }
 
@@ -995,7 +1031,7 @@ fn environment_selection_label(env: &crate::graph_cmd::NetworkEnvKill) -> String
 fn unknown_origin_mirror_message(
     topic: &str,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     format!(
@@ -1010,12 +1046,13 @@ fn scope_unavailable_message(
     mirror_robot: Option<&str>,
     has_slashed_twin: bool,
     scope: TopicScope,
-    env: &crate::graph_cmd::NetworkEnvKill,
+    env: &crate::graph_cmd::QueryNetworkKill,
 ) -> String {
     let (selection, remedy) = scope_selection_and_remedy(scope, env);
     let short_remedy = match scope {
-        TopicScope::Local => remedy,
-        TopicScope::Automatic => "unset it",
+        TopicScope::Local => remedy.clone(),
+        TopicScope::Automatic if env.both_engaged() => "unset both".to_string(),
+        TopicScope::Automatic => "unset it".to_string(),
     };
     match mirror_robot {
         Some(robot) => {
@@ -1064,19 +1101,23 @@ pub const CATALOG_GATHER_WINDOW: Duration = Duration::from_millis(250);
 /// map 1:1 onto zenoh locator strings and onto
 /// `NetworkConfig::{connect,listen}_endpoints`.
 ///
-/// `scouting` maps onto BOTH `multicast_scouting` and `gossip_scouting`. The
-/// struct DEFAULT (via `Default`/field init) keeps scouting OFF so engine
-/// unit + live tests stay hermetic (an isolated session discovers only what
-/// its explicit locators reach); the CLI dispatch (`topic list`) flips it ON
-/// — that's where the automagic default lives, NOT in this struct.
+/// `scouting` selects the AUTOMAGIC path: the discovery ladder (mDNS, cache,
+/// hostname) runs, the session has gossip scouting on, and zenoh multicast
+/// scouting follows
+/// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off).
+/// `false` keeps engine unit + live tests hermetic (an isolated session
+/// discovers only what its explicit locators reach); the CLI dispatch
+/// (`topic list`) sets it, that's where the automagic default lives, NOT in
+/// this struct.
 pub struct RemoteTopicsOptions {
     /// Remote locators to connect to (e.g. `tcp/192.168.123.99:7683` — a
     /// permissive robot's gateway listens on the well-known 7683).
     pub connect: Vec<String>,
     /// Local locators to listen on (e.g. `tcp/0.0.0.0:7447`).
     pub listen: Vec<String>,
-    /// Enable multicast + gossip scouting (LAN auto-discovery). The CLI-path
-    /// default is `true` (automagic); tests keep it `false` for hermeticity.
+    /// The automagic path: ladder + gossip, multicast per
+    /// `CERULION_MULTICAST_SCOUTING`. The CLI-path default is `true`; tests keep
+    /// it `false` for hermeticity.
     pub scouting: bool,
 }
 
@@ -1091,17 +1132,18 @@ impl RemoteTopicsOptions {
 }
 
 /// Build the automagic `topic list` discovery
-/// options — THE one place the CLI-path scouting-ON default lives. The binary
+/// options, THE one place the CLI-path automagic default lives. The binary
 /// dispatch (`cerulion topic list`) is a thin passthrough to this fn, so the
 /// default is unit-pinnable here (`cerulion_cli` has no lib target): a
-/// regression flipping scouting off would silently disable zero-flag discovery.
+/// regression flipping `scouting` off would silently disable zero-flag
+/// discovery (no ladder, no netd query plane).
 ///
 /// - `no_network == true` (`--local` or `--no-network`), or the environment
 ///   kill-switch, yields `None`: skip the remote query entirely.
-/// - otherwise ⇒ `Some` with multicast + gossip SCOUTING ON (unpaired robots
-///   on the LAN are discoverable with zero flags) and any `--connect` /
-///   `--listen` locators carried ADDITIVELY (they extend the scouting
-///   session; they never replace it).
+/// - otherwise ⇒ `Some` with `scouting` set (the ladder finds unpaired robots
+///   on the LAN with zero flags) and any `--connect` / `--listen` locators
+///   carried ADDITIVELY (they extend the discovered set; they never replace
+///   it).
 pub fn remote_discovery_options(
     no_network: bool,
     connect: Vec<String>,
@@ -1353,14 +1395,35 @@ pub fn query_remote_topics_with_scan(
     opts: &RemoteTopicsOptions,
     scan: bool,
 ) -> CliResult<RemoteDiscovery> {
+    query_remote_topics_and_catalogs(opts, scan).map(|(disc, _catalogs)| disc)
+}
+
+/// The per-robot catalog gather: the replies (each entry's schema name and
+/// hash) and the robots whose worker panicked, so a caller that claims an
+/// absence can tell a partial gather from a complete one.
+pub type CatalogGather =
+    cerulion_core::transport::discovery::GatherReplies<cerulion_core::CatalogReply>;
+
+/// [`query_remote_topics_with_scan`] that also returns the per-robot catalog
+/// gather, for the typed `topic list -t` and `topic find`. Its replies are
+/// empty when no robot answered its catalog GET.
+pub fn query_remote_topics_and_catalogs(
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // The ladder produces candidate LOCATORS; scouting off (hermetic tests)
     // skips it entirely. The pre-filter + fold + open live in the delegate.
+    // This machine's own netd and gateway processes answer the browse under its
+    // identity on its own addresses; they are not remote robots.
     let ladder_peers = if opts.scouting {
-        crate::discovery_ladder::discover_peers(scan)
+        cerulion_discovery::ladder::drop_this_hosts_gateways(
+            crate::discovery_ladder::discover_peers(scan),
+            &cerulion_core::graph::robot_identity_from_env(),
+        )
     } else {
         Vec::new()
     };
-    query_remote_topics_with_candidates(opts, ladder_peers)
+    query_remote_topics_and_catalogs_with_candidates(opts, ladder_peers)
 }
 
 /// Remote discovery over an EXPLICITLY-supplied set
@@ -1398,6 +1461,15 @@ pub fn query_remote_topics_with_candidates(
     opts: &RemoteTopicsOptions,
     ladder_peers: Vec<DiscoveredPeer>,
 ) -> CliResult<RemoteDiscovery> {
+    query_remote_topics_and_catalogs_with_candidates(opts, ladder_peers).map(|(disc, _)| disc)
+}
+
+/// [`query_remote_topics_with_candidates`] that also returns the catalog
+/// gather (see [`query_remote_topics_and_catalogs`]).
+pub fn query_remote_topics_and_catalogs_with_candidates(
+    opts: &RemoteTopicsOptions,
+    ladder_peers: Vec<DiscoveredPeer>,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
     // ── Syntax gate (BEFORE any probing): explicit `--connect` locators are
     //    USER INPUT, so a SYNTACTICALLY malformed one (a typo with no
     //    proto/host:port shape) is a HARD, actionable error — never a silent
@@ -1538,7 +1610,7 @@ pub fn query_remote_topics_with_candidates(
     // an unknown wire version falls back to its announce-derived listing (already
     // folded into `all` below). Runs while the session is OPEN, so it MUST precede
     // `mgr.close()` and the result unwraps below.
-    let catalog_topics: Vec<String> = match &announce {
+    let catalogs: CatalogGather = match &announce {
         Ok(entries) => {
             // Distinct robot identities from the announce gather (the proven
             // direction) → EXPLICIT-robot catalog GETs (never a mid-key wildcard).
@@ -1549,24 +1621,22 @@ pub fn query_remote_topics_with_candidates(
                 .into_iter()
                 .map(|robot| robot.to_string())
                 .collect();
-            // `.replies` alone. This is the ENRICHMENT path — the result
-            // is folded into a topic listing and no absence is claimed from it, so a
-            // robot lost to a panicked worker costs its rows and nothing else. The
-            // gather has already named it at ERROR. The two sites below DO claim an
-            // absence and read `is_complete()` accordingly.
-            cerulion_core::transport::discovery::query_robot_catalogs(
+            // The whole gather, `panicked` included. Folded into the topic
+            // listing below, a robot lost to a panicked worker costs its rows
+            // and nothing else (the gather has already named it at ERROR); but
+            // `topic find` claims an absence from these replies, so it reads
+            // `panicked` and says which robots it could not search.
+            let gather = cerulion_core::transport::discovery::query_robot_catalogs(
                 session,
                 &robots,
                 CATALOG_GATHER_WINDOW,
-            )
-            .replies
-            .into_iter()
-            .flat_map(|catalog| catalog.entries.into_iter().map(|entry| entry.topic))
-            .collect()
+            );
+            warn_on_catalog_refusals(&gather.replies);
+            gather
         }
         // A failed announce gather yields no robot identities — the demand-space
         // topics still carry the run; the announce error is surfaced on unwrap.
-        Err(_) => Vec::new(),
+        Err(_) => CatalogGather::default(),
     };
     // The gathers are done and joined, so this ephemeral
     // discovery session is finished — close it in order (deterministic resource
@@ -1616,14 +1686,22 @@ pub fn query_remote_topics_with_candidates(
     // `normalize_remote_topics` dedups a catalog topic against its announce twin,
     // so a robot that answered contributes any catalog-only topics while a robot
     // that did NOT answer is unaffected (its announce topics above stand).
-    all.extend(catalog_topics);
+    all.extend(
+        catalogs
+            .replies
+            .iter()
+            .flat_map(|catalog| catalog.entries.iter().map(|entry| entry.topic.clone())),
+    );
 
-    Ok(RemoteDiscovery {
-        topics: normalize_remote_topics(all),
-        robots,
-        peers: ladder_peers,
-        announce_entries,
-    })
+    Ok((
+        RemoteDiscovery {
+            topics: normalize_remote_topics(all),
+            robots,
+            peers: ladder_peers,
+            announce_entries,
+        },
+        catalogs,
+    ))
 }
 
 /// Seed a [`FrameWalker`](cerulion_core::codegen::FrameWalker)
@@ -2139,8 +2217,8 @@ pub fn fetch_remote_schema(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             requested = %requested,
-            "remote schema fetch suppressed by the CERULION_NETWORK kill-switch \
-             — LOCAL-ONLY (no remote attempt)"
+            "remote schema fetch suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         // NOT a cold start: the user asked for local-only, so the local "not found"
         // IS the correct answer.
@@ -2166,7 +2244,7 @@ pub fn fetch_remote_schema(
     // "no robot serves this type" is a claim with no evidence behind it (and it is
     // reached exactly when netd is broken, which is when the desk is most likely to
     // get it wrong).
-    let mgr = match open_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
+    let mgr = match open_fallback_discovery_session(&opts.connect, &opts.listen, opts.scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(requested = %requested, error = %e,
@@ -2278,11 +2356,11 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         None,
         // This seam makes NO absence claim (every failure
         // collapses to `None` below and the caller degrades to hex), and
-        // `topic_echo` calls it UNCONDITIONALLY for every LOCAL topic — so
-        // inheriting the first-contact wait stalled `cerulion topic echo
-        // /my/local/topic` for the full ceiling, printed a counter, and closed
-        // with "nothing on the network answered", all before the first frame of a
-        // topic that was streaming in local SHM the whole time.
+        // `topic_echo` calls it for a LOCAL topic's first undecodable frame, so
+        // inheriting the first-contact wait would stall `cerulion topic echo
+        // /my/local/topic` for the full ceiling, print a counter, and close
+        // with "nothing on the network answered", on a topic that is streaming
+        // in local SHM the whole time.
         ResolveWait::no_wait(),
     ) {
         SchemaResolve::Found { robot, walker, .. } => Some((robot, walker)),
@@ -2294,6 +2372,7 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         // A cancelled resolve degrades to hex exactly like the others —
         // this seam renders no claim, so it has nothing to say about the wait.
         | SchemaResolve::Cancelled
+        | SchemaResolve::CatalogRefused { .. }
         | SchemaResolve::SchemaUnavailable { .. } => None,
     }
 }
@@ -2347,6 +2426,11 @@ pub enum RemoteResolve {
     /// A robot catalogs the topic, but its schema could not be resolved (not
     /// served / an empty reply / no wire layout). `cause` states why.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched.
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
 }
 
 /// Production remote resolve of `topic`'s ingress target —
@@ -2413,6 +2497,9 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
         // would re-create the exact false-absence claim this issue removed.
         SchemaResolve::DiscoveryNotConverged => RemoteResolve::DiscoveryNotConverged,
         SchemaResolve::Cancelled => RemoteResolve::Cancelled,
+        SchemaResolve::CatalogRefused { robot, reason } => {
+            RemoteResolve::CatalogRefused { robot, reason }
+        }
         SchemaResolve::SchemaUnavailable { robot, cause } => {
             RemoteResolve::SchemaUnavailable { robot, cause }
         }
@@ -2473,6 +2560,56 @@ enum SchemaResolve {
     Cancelled,
     /// A robot catalogs the topic but did not serve its schema.
     SchemaUnavailable { robot: String, cause: String },
+    /// A robot refused its catalog, so its topics were not searched. The
+    /// authorizer's own reason travels with it so the refusal text can say
+    /// WHY instead of prescribing the wrong remedy.
+    CatalogRefused {
+        robot: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogTarget {
+    Found {
+        robot: String,
+        qualified: String,
+    },
+    Refused {
+        robot: String,
+        reason: Option<String>,
+    },
+    Missing,
+}
+
+fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> CatalogTarget {
+    if let Some((robot, qualified)) = catalogs.iter().find_map(|catalog| {
+        catalog.entries.iter().find_map(|entry| {
+            if entry.topic == topic {
+                entry
+                    .schema_name
+                    .as_ref()
+                    .map(|name| (catalog.robot.clone(), name.clone()))
+            } else {
+                None
+            }
+        })
+    }) {
+        return CatalogTarget::Found { robot, qualified };
+    }
+    match refused_catalog_robot(catalogs) {
+        Some((robot, reason)) => CatalogTarget::Refused { robot, reason },
+        None => CatalogTarget::Missing,
+    }
+}
+
+fn refused_catalog_robot(
+    catalogs: &[cerulion_core::CatalogReply],
+) -> Option<(String, Option<String>)> {
+    catalogs
+        .iter()
+        .find(|catalog| catalog.error.is_some())
+        .map(|catalog| (catalog.robot.clone(), catalog.error.clone()))
 }
 
 /// Whether to route this catalog/schema query through the shared
@@ -2494,9 +2631,8 @@ fn warn_on_catalog_refusals(catalogs: &[cerulion_core::CatalogReply]) {
         if let Some(reason) = &cat.error {
             tracing::warn!(
                 robot = %sanitize_display(&cat.robot),
-                reason = %reason,
-                "cerulion-netd: robot refused to serve its topic catalog (not authorized) — its \
-                 topics will not resolve"
+                reason = %sanitize_refusal_reason(reason),
+                "robot refused to serve its topic catalog (not authorized); its topics will not resolve"
             );
         }
     }
@@ -2581,22 +2717,14 @@ fn netd_resolve_topic_schema(
     let catalogs = gather.catalogs;
     warn_on_catalog_refusals(&catalogs);
     // Find the catalog entry for THIS topic that carries a qualified schema name.
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot, reason } => {
+            return Some(SchemaResolve::CatalogRefused { robot, reason });
+        }
         // Nothing matched. WHICH kind of nothing depends on whether netd had
         // completed a discovery pass — see `classify_unmatched_catalog`.
-        None => return Some(classify_unmatched_catalog(topic, gather.discovery)),
+        CatalogTarget::Missing => return Some(classify_unmatched_catalog(topic, gather.discovery)),
     };
     // LOCAL-FIRST: a catalog-named built-in / workspace type resolves from the
     // desk's own corpus with NO schema fetch (the wire fetch stays the fallback for a
@@ -2771,8 +2899,8 @@ fn resolve_remote_topic_schema_with_opts(
     if crate::graph_cmd::remote_network_suppressed() {
         tracing::info!(
             topic = %topic,
-            "remote schema resolve for `topic echo` suppressed by the CERULION_NETWORK \
-             kill-switch — LOCAL-ONLY (no remote attempt)"
+            "remote schema resolve for `topic echo` suppressed by the network kill switch \
+             (CERULION_NETWORK or CERULION_NETD_NETWORK): LOCAL-ONLY, no remote attempt"
         );
         return SchemaResolve::NoProducer;
     }
@@ -2796,7 +2924,7 @@ fn resolve_remote_topic_schema_with_opts(
     // user as PROOF the topic does not exist. Nothing was searched in any of them, so
     // they report non-convergence (and say why, loudly). This needs no grace and adds
     // no wait — it is pure classification.
-    let mgr = match open_discovery_session(connect, listen, scouting) {
+    let mgr = match open_fallback_discovery_session(connect, listen, scouting) {
         Ok(mgr) => mgr,
         Err(e) => {
             tracing::warn!(topic = %topic, error = %e,
@@ -2837,20 +2965,13 @@ fn resolve_remote_topic_schema_with_opts(
     // draw — the same demotion the netd plane applies at its own seam.
     let read_nothing_conclusive = gathered.replies.is_empty() || !gathered.is_complete();
     let catalogs = gathered.replies;
-    let target = catalogs.iter().find_map(|cat| {
-        cat.entries.iter().find_map(|e| {
-            if e.topic == topic {
-                e.schema_name
-                    .as_ref()
-                    .map(|n| (cat.robot.clone(), n.clone()))
-            } else {
-                None
-            }
-        })
-    });
-    let (robot, qualified) = match target {
-        Some(t) => t,
-        None => {
+    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Found { robot, qualified } => (robot, qualified),
+        CatalogTarget::Refused { robot, reason } => {
+            mgr.close();
+            return SchemaResolve::CatalogRefused { robot, reason };
+        }
+        CatalogTarget::Missing => {
             mgr.close();
             // Nothing matched — but WHICH nothing? `catalogs` is what we
             // actually READ, so an empty one means we read nobody's catalog and have
@@ -2910,6 +3031,67 @@ fn resolve_remote_topic_schema_with_opts(
     }
 }
 
+/// The `NetworkConfig` of a CLI discovery session. Pure. `scouting` (the
+/// automagic path) turns gossip on; `multicast` (the caller's read of
+/// `CERULION_MULTICAST_SCOUTING`) turns multicast scouting on only together
+/// with `scouting`. The connect phase is always bounded.
+fn discovery_session_config(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+    multicast: bool,
+) -> cerulion_core::transport::network::NetworkConfig {
+    cerulion_core::transport::network::NetworkConfig {
+        connect_endpoints: connect.to_vec(),
+        listen_endpoints: listen.to_vec(),
+        multicast_scouting: scouting && multicast,
+        gossip_scouting: scouting,
+        bounded_connect: true,
+        ..cerulion_core::transport::network::NetworkConfig::default()
+    }
+}
+
+/// Open the transient session a schema fallback (netd not applicable or
+/// unreachable) searches. With `scouting` set, the discovery ladder runs first
+/// and its candidates that accept a TCP connect within
+/// [`crate::discovery_ladder::LADDER_PROBE_TIMEOUT`] are appended to `connect`,
+/// because a session with multicast scouting off reaches only its connect
+/// endpoints. `connect` itself is kept verbatim. If the open fails with ladder
+/// candidates folded in, it is retried once with `connect` alone.
+fn open_fallback_discovery_session(
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+) -> CliResult<cerulion_core::transport::network::NetworkManager> {
+    if !scouting {
+        return open_discovery_session(connect, listen, false);
+    }
+    let ladder_peers = cerulion_discovery::ladder::drop_this_hosts_gateways(
+        crate::discovery_ladder::discover_peers(false),
+        &cerulion_core::graph::robot_identity_from_env(),
+    );
+    let ladder_locators: Vec<String> = ladder_peers.iter().map(|p| p.locator.clone()).collect();
+    let mut reachable = crate::discovery_ladder::probe_reachable_locators(
+        &ladder_locators,
+        crate::discovery_ladder::LADDER_PROBE_TIMEOUT,
+    );
+    reachable.extend(connect.iter().cloned());
+    let plan = crate::discovery_ladder::plan_connect_set(connect, &ladder_peers, &reachable);
+    match open_discovery_session(&plan.connect, listen, true) {
+        Ok(mgr) => Ok(mgr),
+        Err(first_err) if !plan.folded_ladder.is_empty() => {
+            tracing::warn!(
+                error = %first_err,
+                dropped = ?plan.folded_ladder,
+                "a discovered candidate poisoned the fallback discovery session open; retrying \
+                 with the given locators only"
+            );
+            open_discovery_session(connect, listen, true)
+        }
+        Err(first_err) => Err(first_err),
+    }
+}
+
 /// Open ONE bounded-connect discovery session over `connect`/`listen`
 /// (the EPHEMERAL `topic list` session — the one place `bounded_connect` opts
 /// in, so a black-hole locator can't stall the open past the 1 s bound). A
@@ -2922,18 +3104,11 @@ fn open_discovery_session(
     listen: &[String],
     scouting: bool,
 ) -> CliResult<cerulion_core::transport::network::NetworkManager> {
-    use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-    let config = NetworkConfig {
-        connect_endpoints: connect.to_vec(),
-        listen_endpoints: listen.to_vec(),
-        // Scouting is caller-controlled — ON for the automagic CLI
-        // path, OFF for hermetic tests (reaches exactly the named locators).
-        multicast_scouting: scouting,
-        gossip_scouting: scouting,
-        bounded_connect: true,
-        ..NetworkConfig::default()
-    };
-    let mgr = NetworkManager::new(config);
+    use cerulion_core::transport::network::NetworkManager;
+    let multicast = scouting && cerulion_core::transport::network::multicast_scouting_from_env();
+    let mgr = NetworkManager::new(discovery_session_config(
+        connect, listen, scouting, multicast,
+    ));
     mgr.session().map_err(|e| {
         CliError::Validation(format!(
             "failed to open the zenoh discovery session: {e} — check the \
@@ -3001,6 +3176,43 @@ pub(crate) fn sanitize_display(s: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// A remote authorizer's refusal reason is untrusted remote text: control
+/// characters (ESC, CR, LF, ...) and the Unicode line and paragraph
+/// separators become `?` so the error cannot inject terminal sequences or
+/// extra lines, and the text truncates at 200 chars
+/// with a `…` marker.
+pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut out = String::with_capacity(s.len().min(LIMIT));
+    let mut chars = s.chars();
+    for _ in 0..LIMIT {
+        match chars.next() {
+            // C0/C1 controls, the Unicode line and paragraph separators,
+            // and the bidi/format controls that reorder or hide text in a
+            // terminal all become `?`: a hostile LAN peer cannot smuggle
+            // terminal sequences, line breaks, or right-to-left overrides
+            // into a logged or printed refusal.
+            Some(
+                '\u{0000}'..='\u{001F}'
+                | '\u{007F}'..='\u{009F}'
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}',
+            ) => out.push('?'),
+            Some(other) => out.push(other),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Render the `ROBOTS` section of `topic list` — the presence-derived
@@ -3089,6 +3301,24 @@ fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> Strin
 /// FAILURE never reaches this renderer; it stays a distinct loud error at the
 /// dispatch site.
 pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool) -> String {
+    render_remote_topic_rows(disc, had_endpoints, &[], &|_| None)
+}
+
+/// The one REMOTE-section renderer behind [`render_remote_topics_section`],
+/// [`render_remote_topics_section_with_mirrors`] and the typed `topic list -t`
+/// listing. `column` gives a row an optional column printed two spaces after
+/// the topic name (the type of `-t`), before any streaming marker; it is
+/// printed as given, so the caller sanitizes it. Every other rule is the one
+/// those two renderers document.
+pub(crate) fn render_remote_topic_rows(
+    disc: &RemoteDiscovery,
+    had_endpoints: bool,
+    streaming: &[MirrorStreamRow],
+    column: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    if !streaming.is_empty() {
+        return render_remote_rows_with_mirrors(disc, streaming, column);
+    }
     let mut out = render_robots_section(&disc.robots, &disc.peers);
     let topics = &disc.topics;
     if topics.is_empty() {
@@ -3115,9 +3345,18 @@ pub fn render_remote_topics_section(disc: &RemoteDiscovery, had_endpoints: bool)
     out.push_str("\nREMOTE TOPICS\n");
     for t in topics {
         out.push_str(&sanitize_display(t));
+        push_column(&mut out, column(t));
         out.push('\n');
     }
     out
+}
+
+/// Append a row's optional column, two spaces after what precedes it.
+fn push_column(out: &mut String, column: Option<String>) {
+    if let Some(column) = column {
+        out.push_str("  ");
+        out.push_str(&column);
+    }
 }
 
 /// The ONE line `topic list` prints in place of the `REMOTE TOPICS` section
@@ -3216,11 +3455,18 @@ pub fn render_remote_topics_section_with_mirrors(
     had_endpoints: bool,
     streaming: &[MirrorStreamRow],
 ) -> String {
-    if streaming.is_empty() {
-        // No mirrors ⇒ identical to the mirror-less renderer (incl. its
-        // one-line none-discovered arms).
-        return render_remote_topics_section(disc, had_endpoints);
-    }
+    // No mirrors ⇒ identical to the mirror-less renderer (incl. its
+    // one-line none-discovered arms).
+    render_remote_topic_rows(disc, had_endpoints, streaming, &|_| None)
+}
+
+/// The merged-rows half of [`render_remote_topic_rows`] (at least one
+/// streaming row).
+fn render_remote_rows_with_mirrors(
+    disc: &RemoteDiscovery,
+    streaming: &[MirrorStreamRow],
+    column: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let mut out = render_robots_section(&disc.robots, &disc.peers);
     out.push_str("\nREMOTE TOPICS\n");
     // Union rows keyed by canonical topic: streaming (Some robot) wins over an
@@ -3237,6 +3483,7 @@ pub fn render_remote_topics_section_with_mirrors(
     }
     for (topic, robot) in rows {
         out.push_str(&sanitize_display(topic));
+        push_column(&mut out, column(topic));
         if let Some(robot) = robot {
             out.push_str("  ● streaming  ");
             out.push_str(&sanitize_display(robot));
@@ -3565,269 +3812,49 @@ fn remote_fallback_breadcrumb(topic: &str, robot: &str) -> String {
     )
 }
 
-/// Default max array ELEMENTS `topic echo` renders inline before
-/// truncating with a trailing `...` inside the brackets plus a `(N elements)`
-/// total annotation — matching `ros2 topic echo`'s default `--truncate-length`.
-/// Overridable per-run via the `--truncate-length` flag; named in ONE place (the
-/// CLI's flag default references this constant). Keeps a 57600-point
-/// PointCloud2 `data` field or a long joint-state array readable instead of
-/// flooding the terminal.
+/// Default max array ELEMENTS `topic echo` prints per array before it
+/// closes the array with a `!truncated <n>` element (the count left out),
+/// matching `ros2 topic echo`'s default `--truncate-length`. Overridable per
+/// run with the `--truncate-length` flag; named in ONE place (the CLI's flag
+/// default references this constant). Keeps a 57600-point PointCloud2 `data`
+/// field or a long joint-state array readable instead of flooding the
+/// terminal. A message with no array longer than this prints in full, which
+/// is exactly the YAML `cerulion_core::dynamic::yaml_to_message` reads back.
 pub const DEFAULT_ECHO_TRUNCATE_LENGTH: usize = 128;
 
-/// Total lines one frame's field render may emit.
+/// Total lines one frame's YAML may print.
 ///
 /// `truncate_length` bounds each array INDEPENDENTLY, and it is re-applied at
 /// every nesting level, so a frame whose element arrays nest costs
 /// `truncate_length ^ depth` lines: a `visualization_msgs/MarkerArray`
 /// (`Marker[] markers`, each with `Point[] points` + `ColorRGBA[] colors`)
-/// renders ~1.5×10^5 lines PER FRAME at the default 128 — an echo no operator
-/// can read, on a topic real robots publish at 10 Hz. Before the walker was
-/// taught the canonical element framing those fields were one opaque line
-/// each, so this ceiling is what keeps the new element rendering from
-/// regressing `topic echo`. Mirrors `cerulion_viz::archetype`'s
+/// renders ~1.5×10^5 lines PER FRAME at the default 128, on a topic real
+/// robots publish at 10 Hz. Mirrors `cerulion_viz::archetype`'s
 /// `DUMP_MAX_LINES`, which carries a global budget for the same reason.
 ///
-/// A frame that hits it renders its first `ECHO_MAX_LINES` lines plus a loud
-/// truncation notice — never a silent cut, and never an unbounded dump. This
-/// is deliberately a CONSTANT, not a multiple of `truncate_length`: raising
-/// `--truncate-length` widens each array, and the whole point of the ceiling
-/// is that the total does not follow that exponentially.
+/// A frame that hits it prints its first `ECHO_MAX_LINES` lines, then a
+/// column-0 `!truncated` line (which no YAML reader accepts, so cut output
+/// can never be published back as a shorter message) and a comment saying
+/// what happened. The codec stops writing at the budget
+/// ([`cerulion_core::dynamic::YamlEncodeOptions::max_lines`]), so a small
+/// frame that names a huge YAML form costs `ECHO_MAX_LINES` lines of work
+/// per frame, not the whole form. This is deliberately a CONSTANT, not a
+/// multiple of `truncate_length`.
 const ECHO_MAX_LINES: usize = 2000;
 
-/// Append `", ...] (N elements)"` when an array of `count` elements was
-/// truncated at `shown`, or close the bracket plain otherwise. ONE seam so every
-/// inline leaf array (`uint8[]`, `float64[]`, …) shares the exact truncation
-/// shape: a trailing `...` INSIDE the brackets + a `(N elements)` total
-/// annotation for truncated renders only (an untruncated array gets NO
-/// annotation — ros2-parity).
-fn close_array(parts: &[String], count: usize, shown: usize) -> String {
-    if count > shown {
-        format!("[{}, ...] ({} elements)", parts.join(", "), count)
-    } else {
-        format!("[{}]", parts.join(", "))
-    }
-}
-
-/// Format ONE decoded LEAF value (scalar / string / byte-blob /
-/// numeric-array) as a compact inline string. `Nested` + `Array` are multi-line
-/// composites rendered by [`write_named_value`] and never reach here.
-///
-/// Every STRING value is terminal-escape-sanitized ([`sanitize_display`]) THEN
-/// quoted: a wire string is LAN/robot-supplied data,
-/// so an embedded ANSI/CSI escape must never reach the operator's terminal.
-/// A `uint8[]`/`int8[]` byte array now renders its ELEMENTS (decimal
-/// u8) like every other array — truncated at `truncate_length` — instead of the
-/// old opaque `<N bytes>` placeholder (a PointCloud2 `data` field or a LowState
-/// `head: [255, 0]` are now readable).
-fn format_leaf_value(
-    kind: &cerulion_core::codegen::FrameValueKind,
-    truncate_length: usize,
-) -> String {
-    use cerulion_core::codegen::FrameValueKind as K;
-    match kind {
-        K::Bool(v) => v.to_string(),
-        K::I8(v) => v.to_string(),
-        K::U8(v) => v.to_string(),
-        K::I16(v) => v.to_string(),
-        K::U16(v) => v.to_string(),
-        K::I32(v) => v.to_string(),
-        K::U32(v) => v.to_string(),
-        K::I64(v) => v.to_string(),
-        K::U64(v) => v.to_string(),
-        // `{:?}` keeps the float-ness visible (`1.0`, not `1`) — the familiar
-        // `ros2 topic echo` presentation.
-        K::F32(v) => format!("{v:?}"),
-        K::F64(v) => format!("{v:?}"),
-        // Sanitize THEN quote: `{:?}` escapes embedded quotes/backslashes and
-        // sanitize has already neutralized every control char.
-        K::Str(s) => format!("{:?}", sanitize_display(s)),
-        K::Bytes(b) => format_byte_array(b, truncate_length),
-        K::PrimArray(a) => format_prim_array(a, truncate_length),
-        // The walker maps a DynamicArray of Nested / String / bool / array
-        // element to this opaque-bytes arm (frame_walker.rs) when the bytes are
-        // NOT canonically framed, so the label must NOT claim
-        // "nested-message" — a `bool[]` lands here too. Neutral + accurate:
-        // opaque producer bytes with no framing we can enumerate.
-        K::NestedArrayOpaque(b) => format!("<{} bytes, opaque array>", b.len()),
-        // Composites are rendered multi-line by write_named_value; the arm is
-        // unreachable in practice but keeps the match total.
-        K::Nested(_) | K::Array(_) | K::NestedArray { .. } => String::from("<nested>"),
-    }
-}
-
-/// Render a `uint8[]` / `int8[]` byte array as its ELEMENTS (decimal
-/// u8), truncated to `truncate_length` with a trailing `...` + `(N elements)`
-/// tail. Bytes are raw wire numbers, NOT a string, so no sanitize/quote applies
-/// (a `u8` renders as a decimal digit sequence — never a control char).
-fn format_byte_array(bytes: &[u8], truncate_length: usize) -> String {
-    let shown = bytes.len().min(truncate_length);
-    let parts: Vec<String> = bytes[..shown].iter().map(|b| b.to_string()).collect();
-    close_array(&parts, bytes.len(), shown)
-}
-
-/// Render a numeric primitive array (`float64[]`, `uint32[9]`,
-/// …) as `[e0, e1, …, ...] (N elements)`, truncated to `truncate_length`. Each
-/// element is formatted in its NATIVE type (integers stay integer, floats keep
-/// the decimal point) — no lossy widen. Bounds-guarded: a malformed
-/// short-`bytes` array stops rather than panicking on untrusted wire input.
-fn format_prim_array(a: &cerulion_core::codegen::PrimArray, truncate_length: usize) -> String {
-    use cerulion_core::codegen::PrimType as P;
-    let shown = a.count.min(truncate_length);
-    let sz = a.elem.size();
-    let mut parts: Vec<String> = Vec::with_capacity(shown);
-    for i in 0..shown {
-        let start = i * sz;
-        let Some(b) = a.bytes.get(start..start + sz) else {
-            break;
-        };
-        let elem = match a.elem {
-            P::I16 => i16::from_le_bytes([b[0], b[1]]).to_string(),
-            P::U16 => u16::from_le_bytes([b[0], b[1]]).to_string(),
-            P::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
-            P::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
-            P::I64 => {
-                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
-            }
-            P::U64 => {
-                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).to_string()
-            }
-            P::F32 => format!("{:?}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            P::F64 => format!(
-                "{:?}",
-                f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-            ),
-        };
-        parts.push(elem);
-    }
-    close_array(&parts, a.count, shown)
-}
-
-/// Write ONE `name: value` line — or a multi-line block for a nested
-/// message / message array — indented `indent` levels under the schema header.
-/// `truncate_length` bounds EVERY array — inline leaf arrays (threaded
-/// through [`format_leaf_value`]) AND this multi-line nested-message array arm.
-fn write_named_value(
-    writer: &mut dyn Write,
-    name: &str,
-    kind: &cerulion_core::codegen::FrameValueKind,
-    indent: usize,
-    truncate_length: usize,
-    lines: &mut usize,
-) {
-    if *lines >= ECHO_MAX_LINES {
-        return;
-    }
-    *lines += 1;
-    use cerulion_core::codegen::FrameValueKind as K;
-    let pad = "  ".repeat(indent + 1);
-    // Security: a field NAME is wire-derived (for a remote type it comes from
-    // a robot's LAN-fetched `.msg`, which the parser does not
-    // identifier-validate), so it is sanitized before display in
-    // EVERY arm (a hostile `x\x1b[2J…` field name would otherwise clear the
-    // operator's terminal each frame). Nested field names are sanitized on their
-    // own recursion through this fn; the `[i]` index labels are numeric.
-    let name = sanitize_display(name);
-    match kind {
-        K::Nested(inner) => {
-            writeln!(writer, "{pad}{name}:").ok();
-            render_frame_fields_budgeted(writer, inner, indent + 1, truncate_length, lines);
-        }
-        // A canonically-framed `Nested[]` / `string[]` renders exactly
-        // like a fixed-length nested array — element-by-element, bounded by
-        // `truncate_length` per level AND by `ECHO_MAX_LINES` overall.
-        K::Array(elems)
-        | K::NestedArray {
-            elements: elems, ..
-        } => {
-            writeln!(writer, "{pad}{name}: [{} element(s)]", elems.len()).ok();
-            let mut shown = 0usize;
-            for (i, elem) in elems.iter().take(truncate_length).enumerate() {
-                if *lines >= ECHO_MAX_LINES {
-                    break;
-                }
-                *lines += 1;
-                shown += 1;
-                match elem {
-                    K::Nested(inner) => {
-                        writeln!(writer, "{pad}  [{i}]:").ok();
-                        render_frame_fields_budgeted(
-                            writer,
-                            inner,
-                            indent + 2,
-                            truncate_length,
-                            lines,
-                        );
-                    }
-                    other => {
-                        writeln!(
-                            writer,
-                            "{pad}  [{i}]: {}",
-                            format_leaf_value(other, truncate_length)
-                        )
-                        .ok();
-                    }
-                }
-            }
-            if elems.len() > shown {
-                writeln!(writer, "{pad}  … ({} total)", elems.len()).ok();
-            }
-        }
-        leaf => {
-            writeln!(
-                writer,
-                "{pad}{name}: {}",
-                format_leaf_value(leaf, truncate_length)
-            )
-            .ok();
-        }
-    }
-}
-
-/// Render every field of a decoded
-/// [`FrameValue`](cerulion_core::codegen::FrameValue) as readable
-/// `name: value` lines — the output shows the data a frame carries, not a field
-/// count. Reused by the LOCAL-walker and REMOTE-walker echo paths so there is
-/// ONE rendering seam. `truncate_length` is threaded down to bound
-/// every rendered array.
-fn render_frame_fields(
-    writer: &mut dyn Write,
-    value: &cerulion_core::codegen::FrameValue,
-    indent: usize,
-    truncate_length: usize,
-) {
-    let mut lines = 0usize;
-    render_frame_fields_budgeted(writer, value, indent, truncate_length, &mut lines);
-    if lines >= ECHO_MAX_LINES {
+/// Write one decoded frame's YAML (already cut at [`ECHO_MAX_LINES`] by
+/// the codec), plus a comment when it was cut.
+fn write_yaml_body(writer: &mut dyn Write, yaml: &str) {
+    writer.write_all(yaml.as_bytes()).ok();
+    // A cut ends in a column-0 marker line; no message line can be one
+    // (column-0 lines are `key:` lines, and keys are never tags).
+    if yaml.lines().next_back() == Some(cerulion_core::dynamic::YAML_TRUNCATED_TAG) {
         writeln!(
             writer,
-            "  … (output truncated at {ECHO_MAX_LINES} lines — this frame nests more \
-             element arrays than one echo can render)"
+            "# output cut at {ECHO_MAX_LINES} lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays",
         )
         .ok();
-    }
-}
-
-/// [`render_frame_fields`]'s recursive half, carrying the shared
-/// [`ECHO_MAX_LINES`] budget.
-fn render_frame_fields_budgeted(
-    writer: &mut dyn Write,
-    value: &cerulion_core::codegen::FrameValue,
-    indent: usize,
-    truncate_length: usize,
-    lines: &mut usize,
-) {
-    for field in &value.fields {
-        if *lines >= ECHO_MAX_LINES {
-            return;
-        }
-        write_named_value(
-            writer,
-            &field.name,
-            &field.value,
-            indent,
-            truncate_length,
-            lines,
-        );
     }
 }
 
@@ -3855,9 +3882,10 @@ fn resolve_schema_line(
     )
 }
 
-/// Render the decode line(s) for one `topic echo` frame whose
-/// `schema_hash` is not a pinned built-in (`std_msgs/String` /
-/// `sensor_msgs/Image` are handled inline by the caller).
+/// Write the body of one `topic echo` frame: a `# <type>` comment line and
+/// the message as YAML (the [`cerulion_core::dynamic::message_to_yaml_with`]
+/// codec, arrays cut at `truncate_length`), or comment lines that explain a
+/// frame no walker can decode, with a hex preview.
 ///
 /// Tries the LOCAL walker first (built-ins + the workspace `.msg` store +
 /// `schemas/*.yaml`): a locally-known type decodes with NO
@@ -3868,10 +3896,11 @@ fn resolve_schema_line(
 /// once-only discipline; keeping the breadcrumb here (not pre-loop) is what
 /// makes it factual rather than a prediction a local-heavy topic breaks.
 ///
-/// `truncate_length` bounds EVERY array rendered on this walker path —
-/// byte, numeric, and nested-message arrays. It does NOT affect the caller's
-/// pinned `sensor_msgs/Image` fast-path (a deliberate curated summary) nor the
-/// undecodable-frame hex preview below (a fixed 64-byte raw-wire diagnostic).
+/// Every line that is not the message itself starts with `#`, so a frame's
+/// block is valid YAML and a copied message is valid message YAML input. The
+/// codec quotes every string and escapes control characters, and quotes any
+/// key that is not a plain identifier, so a wire string or a remote field
+/// name cannot reach the terminal as an escape sequence.
 #[allow(clippy::too_many_arguments)]
 fn write_custom_decode(
     writer: &mut dyn Write,
@@ -3884,141 +3913,116 @@ fn write_custom_decode(
     explained_hashes: &mut std::collections::BTreeSet<u64>,
     truncate_length: usize,
 ) {
-    // Reconstruct the full wire frame (32-byte header + payload) once; `walk`
-    // slices the header off.
+    use cerulion_core::dynamic::{message_to_yaml_with, YamlEncodeOptions};
+    // Reconstruct the full wire frame (40-byte header + payload) once.
     let mut frame = vec![0u8; cerulion_core::wire::WireHeader::SIZE];
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(payload);
+    let options = YamlEncodeOptions {
+        truncate_arrays: Some(truncate_length),
+        max_lines: Some(ECHO_MAX_LINES),
+    };
 
-    // A schema whose hash the walker RESOLVES but whose
-    // frame fails to `walk()` (a truncated / corrupt frame) must be distinguished
-    // from a genuinely-unknown type — otherwise both render as bare hex. Remember
-    // the first such `(name, WalkError)` and surface it before the hex dump.
-    let mut decode_failure: Option<(String, cerulion_core::codegen::WalkError)> = None;
+    // A schema whose hash a walker RESOLVES but whose frame does not decode
+    // (a truncated / corrupt frame, or a value with no YAML form) must be
+    // distinguished from a genuinely-unknown type. Remember the first such
+    // `(name, error text)` and surface it before the hex dump.
+    let mut decode_failure: Option<(String, String)> = None;
 
     // LOCAL walker first: a frame whose type the workspace already knows decodes
     // LOCALLY — no network, no remote fallback, no breadcrumb.
-    // render the full decoded field TREE, not a bare field count.
+    // Decode by HASH, not by the returned name: two identities can share
+    // a qualified name, and only the hash picks the frame's own layout.
     if let Some(name) = local_walker.schema_name_for_hash(header.schema_hash) {
-        match local_walker.walk(name, &frame) {
-            Ok(value) => {
+        match message_to_yaml_with(local_walker, &frame, options) {
+            Ok(yaml) => {
                 // The schema NAME is a local, trusted identifier — no sanitize
-                // needed (it never crossed the network). Field VALUES are
-                // sanitized inside the renderer.
-                writeln!(writer, "  {name}:").ok();
-                render_frame_fields(writer, &value, 1, truncate_length);
+                // needed (it never crossed the network).
+                writeln!(writer, "# {name}").ok();
+                write_yaml_body(writer, &yaml);
                 return;
             }
-            Err(e) => decode_failure = Some((name.to_string(), e)),
+            Err(e) => decode_failure = Some((name.to_string(), e.to_string())),
         }
     }
 
-    // Fall back to the remote-seeded walker — a frame whose custom-type hash the
-    // walker knows is decoded + RENDERED (structurally validated) instead of
-    // dumped as opaque hex.
-    let mut remote_decoded = None;
+    // Fall back to the remote-seeded walker.
     if let Some((robot, walker)) = remote_walker {
         if let Some(name) = walker.schema_name_for_hash(header.schema_hash) {
-            match walker.walk(name, &frame) {
-                Ok(value) => remote_decoded = Some((robot.as_str(), name, value)),
-                // Known-to-the-remote-walker but undecodable: remember it (only
-                // if the local walker did not already record a failure).
+            match message_to_yaml_with(walker, &frame, options) {
+                Ok(yaml) => {
+                    // The FACTUAL breadcrumb, emitted ONCE on the FIRST frame
+                    // that actually decodes remotely. `robot` is LAN-sourced, so it is
+                    // sanitized inside `remote_fallback_breadcrumb`.
+                    if !*breadcrumb_shown {
+                        writeln!(writer, "# {}", remote_fallback_breadcrumb(topic, robot)).ok();
+                        *breadcrumb_shown = true;
+                    }
+                    // BOTH `name` (the remote-served schema name) and `robot`
+                    // are LAN-supplied: sanitize before display.
+                    writeln!(
+                        writer,
+                        "# {} (via robot '{}')",
+                        sanitize_display(name),
+                        sanitize_display(robot),
+                    )
+                    .ok();
+                    write_yaml_body(writer, &yaml);
+                    return;
+                }
                 Err(e) => {
-                    decode_failure.get_or_insert((name.to_string(), e));
+                    decode_failure.get_or_insert((name.to_string(), e.to_string()));
                 }
             }
         }
     }
-    match remote_decoded {
-        Some((robot, name, value)) => {
-            // The FACTUAL breadcrumb, emitted ONCE on the FIRST frame that
-            // actually decodes remotely (never pre-loop, never for a
-            // locally-decoded frame). `robot` is LAN-sourced — sanitized inside
-            // `remote_fallback_breadcrumb`.
-            if !*breadcrumb_shown {
-                writeln!(writer, "{}", remote_fallback_breadcrumb(topic, robot)).ok();
-                *breadcrumb_shown = true;
-            }
-            // BOTH `name` (the remote-served schema
-            // name) and `robot` (announce-space) are LAN-supplied — sanitize
-            // terminal-escape chars before display. Field VALUES are sanitized
-            // inside the renderer.
+
+    match &decode_failure {
+        // Name the known-but-undecodable schema before the hex. The name AND
+        // the error text can carry wire-derived field/schema names (remote),
+        // so BOTH are sanitized.
+        Some((name, err)) => {
             writeln!(
                 writer,
-                "  {} (via robot '{}'):",
+                "# ({}: decode failed: {})",
                 sanitize_display(name),
-                sanitize_display(robot),
+                sanitize_display(err),
             )
             .ok();
-            render_frame_fields(writer, &value, 1, truncate_length);
         }
         None => {
-            // Name the known-but-undecodable schema before the
-            // hex. The name AND the WalkError Display can carry wire-derived
-            // field/schema names (remote), so BOTH are sanitized.
-            if let Some((name, err)) = &decode_failure {
-                writeln!(
-                    writer,
-                    "  ({}: decode failed: {})",
-                    sanitize_display(name),
-                    sanitize_display(&err.to_string()),
-                )
-                .ok();
-            } else {
-                // NEITHER walker names this hash. Printing
-                // bare hex and nothing else would make the one surface an operator
-                // reaches for first say only "here are some bytes",
-                // on the command whose whole job is to
-                // say what is on a topic. (`topic info` names this
-                // condition too; the two surfaces agree.)
-                //
-                // No candidate name is threaded here: echo's remote walker is
-                // keyed by hash, and had a name been known the branch above would
-                // have run. `schema_unidentified` is the correct verdict for this
-                // vantage.
-                //
-                // Once per distinct hash, never per frame.
-                // Echo always passes `candidate: None`, so only the
-                // `Unidentified` arm is reachable and its text is byte-invariant
-                // for a given hash — printing it on every frame of a 500 Hz
-                // undecodable topic is ~135 KB/s of identical prose carrying zero
-                // per-frame information, which is the very flood class the rest of
-                // this path latches. The per-frame hex preview is untouched: the
-                // paragraph explains the dump, so it needs saying once.
-                //
-                // A SEPARATE set from `breadcrumb_shown` deliberately — that
-                // latches the remote-fallback breadcrumb, a different condition,
-                // and sharing it would let whichever fired first suppress the
-                // other. Bounded by the topic's schema cardinality (in practice 1).
-                if explained_hashes.insert(header.schema_hash) {
-                    let diagnosis =
-                        cerulion_core::codegen::diagnose_unknown_hash(header.schema_hash, None);
-                    writeln!(writer, "  (undecodable: {})", diagnosis.detail()).ok();
-                }
+            // NEITHER walker names this hash: say so, once per distinct hash
+            // (never per frame: the text is byte-invariant for a hash, and a
+            // 500 Hz undecodable topic would flood ~135 KB/s of identical
+            // prose). A SEPARATE latch from `breadcrumb_shown`, which marks a
+            // different condition.
+            if explained_hashes.insert(header.schema_hash) {
+                let diagnosis =
+                    cerulion_core::codegen::diagnose_unknown_hash(header.schema_hash, None);
+                writeln!(writer, "# (undecodable: {})", diagnosis.detail()).ok();
             }
-            // This hex preview shows the raw wire bytes of a FAILED
-            // decode (not array ELEMENTS of a decoded field), so its 64-byte
-            // bound is DELIBERATELY independent of `--truncate-length` — it is a
-            // fixed diagnostic dump, not a rendered array.
-            let hex: String = payload
-                .iter()
-                .take(64)
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let suffix = if payload.len() > 64 { "..." } else { "" };
-            writeln!(writer, "  payload: {}{}", hex, suffix).ok();
         }
     }
+    // The raw wire bytes of a FAILED decode: a fixed 64-byte diagnostic,
+    // deliberately independent of `--truncate-length`.
+    let hex: String = payload
+        .iter()
+        .take(64)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if payload.len() > 64 { "..." } else { "" };
+    writeln!(writer, "# payload: {}{}", hex, suffix).ok();
 }
 
 /// Echo messages from a topic.
 ///
-/// Pretty-prints payloads for well-known schemas (`std_msgs/String`,
-/// `sensor_msgs/Image`) and falls back to a hex preview otherwise. Schema
-/// recognition is by `WireHeader::schema_hash` — the
-/// layout-sensitive hash baked in by the message codegen, so it survives
-/// recompiles and round-trips through the wire format unchanged.
+/// Each frame prints as one YAML document: a `# seq=.. ts=..ns schema=0x..
+/// size=..` comment, a `# <type>` comment, the message as YAML (the
+/// `cerulion_core::dynamic` codec), then `---`. The message lines are valid
+/// message YAML input as long as no array was cut at `truncate_length`.
+/// A frame no walker decodes prints comment lines with a hex preview.
+/// Schema recognition is by `WireHeader::schema_hash`.
 pub fn topic_echo(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
@@ -4045,14 +4049,10 @@ pub fn topic_echo_with_scope(
     schemas_dir: Option<&std::path::Path>,
     running: Arc<AtomicBool>,
     writer: &mut dyn Write,
-    // Max array ELEMENTS to render inline before truncating with a
-    // trailing `...` + `(N elements)` tail (the `--truncate-length` flag; the CLI
-    // passes [`DEFAULT_ECHO_TRUNCATE_LENGTH`] when the flag is omitted). Bounds
-    // every array in the CUSTOM-DECODE walker path (`write_custom_decode`) —
-    // u8/byte arrays (never an opaque `<N bytes>` placeholder) AND
-    // numeric/nested-message arrays. The pinned `sensor_msgs/Image` fast-path
-    // deliberately keeps its one-line `data=N bytes` summary (it never dumps
-    // pixel bytes), so the bound does NOT reach it.
+    // Max array ELEMENTS to print per array before closing it with a
+    // `!truncated <n>` element (the `--truncate-length` flag; the CLI passes
+    // [`DEFAULT_ECHO_TRUNCATE_LENGTH`] when the flag is omitted). Bounds every
+    // array: byte, numeric, string and message arrays alike.
     truncate_length: usize,
     scope: TopicScope,
 ) -> CliResult<()> {
@@ -4084,14 +4084,6 @@ pub fn topic_echo_with_scope(
     // below stays the FALLBACK for types the desk genuinely lacks.
     let local_walker = local_walker_from_workspace(schemas_dir);
 
-    // Recipe-3 layout-sensitive schema hashes — a `const fn` over the name
-    // alone CANNOT reproduce them (the recipe folds in wire_fixed_size +
-    // per-field canonical_str + nested layout). The pinned literals live in
-    // the named consts above and are kept in sync with the generated
-    // `<T>::SCHEMA_HASH` by `pinned_hashes_match_generated_constants`.
-    const STD_MSGS_STRING: u64 = STD_MSGS_STRING_SCHEMA_HASH;
-    const SENSOR_MSGS_IMAGE: u64 = SENSOR_MSGS_IMAGE_SCHEMA_HASH;
-
     // Delivery accounting: the wire sequence of the last frame this
     // run displayed. The non-notifying degrade window (~1 heartbeat between
     // timeout drains) can silently overflow the bounded `drop_oldest`
@@ -4113,11 +4105,16 @@ pub fn topic_echo_with_scope(
     let mut consecutive_wait_errors: u32 = 0;
 
     // A REMOTE topic already carries the walker seeded during the
-    // ingress resolve — reuse it (no second discovery). A LOCAL topic keeps the
-    // earlier behavior: a ONE-TIME best-effort remote resolve as the FALLBACK for
-    // a frame carrying a type the desk never compiled (learn the type from a
-    // robot's catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk
-    // writes). A failed resolve is a `None` walker — the local path is unchanged.
+    // ingress resolve, reuse it (no second discovery). A LOCAL topic in automatic
+    // scope gets a ONE-TIME best-effort remote resolve as the FALLBACK for a frame
+    // carrying a type the desk never compiled (learn the type from a robot's
+    // catalog + fetch its closure + seed a FrameWalker IN MEMORY, no disk writes).
+    // That resolve runs on the FIRST frame whose schema hash the local walker
+    // cannot name, the same lazy rung `topic info` uses, never before the loop:
+    // the resolve can take seconds (a netd round trip, or the discovery ladder
+    // when netd is unreachable), and frames the desk can decode are displayed
+    // without waiting for it. A failed resolve is a `None` walker, the local
+    // path is unchanged.
     //
     // WHERE this observer's frames are supposed to come from, captured
     // before `source` is consumed below — it is the whole point of the silence
@@ -4126,10 +4123,11 @@ pub fn topic_echo_with_scope(
     // nothing").
     let source_desc = observer_source_description(&source);
 
-    let remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
+    let mut remote_walker_pending =
+        matches!(source, TopicSource::Local) && scope != TopicScope::Local;
+    let mut remote_walker: Option<(String, cerulion_core::codegen::FrameWalker)> = match source {
         TopicSource::Remote { robot, walker } => Some((robot, walker)),
-        TopicSource::Local if scope == TopicScope::Local => None,
-        TopicSource::Local => resolve_remote_walker_for_topic(topic),
+        TopicSource::Local => None,
     };
     // The remote-fallback breadcrumb is emitted
     // LAZILY — only on the FIRST frame that ACTUALLY decodes via the remote
@@ -4180,7 +4178,7 @@ pub fn topic_echo_with_scope(
                     if missed > 0 {
                         writeln!(
                             writer,
-                            "[gap: {missed} frame(s) missed — subscriber queue overflow \
+                            "# [gap: {missed} frame(s) missed: subscriber queue overflow \
                              (drop_oldest) between drains; wire seq jumped {last} -> {}]",
                             header.sequence,
                         )
@@ -4191,58 +4189,36 @@ pub fn topic_echo_with_scope(
             last_seq = Some(header.sequence);
             writeln!(
                 writer,
-                "seq={} ts={}ns schema=0x{:016x} size={}",
+                "# seq={} ts={}ns schema=0x{:016x} size={}",
                 header.sequence, header.timestamp_ns, header.schema_hash, header.total_size,
             )
             .ok();
 
-            match header.schema_hash {
-                STD_MSGS_STRING => match decode_string_payload(payload) {
-                    Some(s) => {
-                        writeln!(writer, "  std_msgs/String: {:?}", s).ok();
-                    }
-                    None => {
-                        writeln!(writer, "  std_msgs/String: <undecodable>").ok();
-                    }
-                },
-                SENSOR_MSGS_IMAGE => match decode_image_meta(payload) {
-                    Some(meta) => {
-                        // EXCEPTION: this pinned fast-path is a
-                        // curated one-line summary for the one type where dumping
-                        // the `data` pixel bytes is exactly the flood we avoid —
-                        // so `--truncate-length` does NOT apply here (it bounds the
-                        // custom-decode walker path). `data=N bytes` stays a
-                        // summary, never element-rendered.
-                        writeln!(
-                            writer,
-                            "  sensor_msgs/Image: {}x{} encoding={:?} step={} data={} bytes",
-                            meta.width, meta.height, meta.encoding, meta.step, meta.data_len,
-                        )
-                        .ok();
-                    }
-                    None => {
-                        writeln!(writer, "  sensor_msgs/Image: <undecodable>").ok();
-                    }
-                },
-                _ if !payload.is_empty() => {
-                    // LOCAL walker first, remote-seeded walker as the
-                    // fallback, hash-only hex otherwise. The one-time remote
-                    // breadcrumb is emitted LAZILY inside — only when a frame
-                    // ACTUALLY decodes remotely (factual, not predictive).
-                    write_custom_decode(
-                        writer,
-                        topic,
-                        header,
-                        payload,
-                        &local_walker,
-                        remote_walker.as_ref(),
-                        &mut breadcrumb_shown,
-                        &mut explained_hashes,
-                        truncate_length,
-                    );
-                }
-                _ => {}
+            // LOCAL walker first, remote-seeded walker as the fallback,
+            // hash-only hex otherwise. The one-time remote breadcrumb is
+            // emitted LAZILY inside, only when a frame ACTUALLY decodes
+            // remotely (factual, not predictive). The remote walker itself is
+            // resolved on the first frame the local walker cannot name.
+            if remote_walker_pending
+                && local_walker
+                    .schema_name_for_hash(header.schema_hash)
+                    .is_none()
+            {
+                remote_walker_pending = false;
+                remote_walker = resolve_remote_walker_for_topic(topic);
             }
+            write_custom_decode(
+                writer,
+                topic,
+                header,
+                payload,
+                &local_walker,
+                remote_walker.as_ref(),
+                &mut breadcrumb_shown,
+                &mut explained_hashes,
+                truncate_length,
+            );
+            writeln!(writer, "---").ok();
         });
 
         match received {
@@ -4320,81 +4296,6 @@ pub fn topic_echo_with_scope(
     }
 
     Ok(())
-}
-
-/// Pull the UTF-8 bytes from a `std_msgs/String` SHM payload.
-///
-/// The wire layout for a single-variable-field message: 8-byte offset table
-/// at byte 0 (one 4-byte offset + 4-byte length), then the payload bytes
-/// at that offset. Returns `None` if the offset table is missing or the
-/// referenced range is out of bounds.
-fn decode_string_payload(payload: &[u8]) -> Option<String> {
-    if payload.len() < 8 {
-        return None;
-    }
-    let offset = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
-    let len = u32::from_le_bytes(payload[4..8].try_into().ok()?) as usize;
-    let end = offset.checked_add(len)?;
-    if end > payload.len() {
-        return None;
-    }
-    std::str::from_utf8(&payload[offset..end])
-        .ok()
-        .map(|s| s.to_string())
-}
-
-struct ImageMeta {
-    width: u32,
-    height: u32,
-    encoding: String,
-    step: u32,
-    data_len: usize,
-}
-
-/// Pull width/height/encoding/data-size out of a `sensor_msgs/Image` SHM
-/// payload. The fixed section layout (matching `ImageFixedSection` in the
-/// generated bindings) is `height: u32, width: u32, is_bigendian: u8,
-/// step: u32` (with C alignment padding to 16 bytes), followed by a
-/// 24-byte offset table covering the three variable fields
-/// (header_bytes, encoding, data).
-fn decode_image_meta(payload: &[u8]) -> Option<ImageMeta> {
-    // FIXED_SIZE = size_of::<ImageFixedSection>() with C alignment = 16 bytes.
-    const FIXED_SIZE: usize = 16;
-    const TABLE_BYTES: usize = 8 * 3;
-    if payload.len() < FIXED_SIZE + TABLE_BYTES {
-        return None;
-    }
-    let height = u32::from_le_bytes(payload[0..4].try_into().ok()?);
-    let width = u32::from_le_bytes(payload[4..8].try_into().ok()?);
-    // is_bigendian at offset 8 (1 byte) — skipped here.
-    let step = u32::from_le_bytes(payload[12..16].try_into().ok()?);
-
-    // Offset-table entry layout: `[u32 offset, u32 len]` per variable field.
-    // Field index 1 = encoding, field index 2 = data.
-    let read_entry = |idx: usize| -> Option<(usize, usize)> {
-        let base = FIXED_SIZE + idx * 8;
-        let off = u32::from_le_bytes(payload[base..base + 4].try_into().ok()?) as usize;
-        let len = u32::from_le_bytes(payload[base + 4..base + 8].try_into().ok()?) as usize;
-        Some((off, len))
-    };
-    let (enc_off, enc_len) = read_entry(1)?;
-    let (_, data_len) = read_entry(2)?;
-    let enc_end = enc_off.checked_add(enc_len)?;
-    if enc_end > payload.len() {
-        return None;
-    }
-    let encoding = std::str::from_utf8(&payload[enc_off..enc_end])
-        .ok()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    Some(ImageMeta {
-        width,
-        height,
-        encoding,
-        step,
-        data_len,
-    })
 }
 
 /// Measure publish rate on a topic.
@@ -4674,7 +4575,10 @@ mod tests {
             mirror_robot,
             has_slashed_twin,
             TopicScope::Automatic,
-            &crate::graph_cmd::NetworkEnvKill::Off,
+            &crate::graph_cmd::QueryNetworkKill {
+                network: crate::graph_cmd::NetworkEnvKill::Off,
+                netd_off: false,
+            },
         )
     }
 
@@ -4700,7 +4604,10 @@ mod tests {
             topic: "/cam".to_string(),
             reason: "a live network mirror owns this topic".to_string(),
         };
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = local_lease_refusal_message(&error, TopicScope::Local, &off);
         assert!(flagged.starts_with("Local observation of topic '/cam' could not hold its source: a live network mirror owns this topic; "), "{flagged}");
         assert!(
@@ -4725,24 +4632,91 @@ mod tests {
     /// never `off` for a value the user did not set.
     #[test]
     fn environment_selection_label_preserves_an_unrecognized_value() {
-        use crate::graph_cmd::NetworkEnvKill;
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let network = |network| QueryNetworkKill {
+            network,
+            netd_off: false,
+        };
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Off),
+            environment_selection_label(&network(NetworkEnvKill::Off)),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unset),
+            environment_selection_label(&QueryNetworkKill::UNSET),
             "CERULION_NETWORK=off"
         );
         assert_eq!(
-            environment_selection_label(&NetworkEnvKill::Unrecognized(" typo ".to_string())),
+            environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+                " typo ".to_string()
+            ))),
             "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)"
         );
-        let hostile =
-            environment_selection_label(&NetworkEnvKill::Unrecognized("on\u{1b}[2J".to_string()));
+        let hostile = environment_selection_label(&network(NetworkEnvKill::Unrecognized(
+            "on\u{1b}[2J".to_string(),
+        )));
         assert!(
             hostile.starts_with("CERULION_NETWORK=on\u{fffd}[2J ("),
             "{hostile}"
+        );
+    }
+
+    /// The netd daemon's switch is named on its own when it alone engaged the
+    /// local scope, and beside `CERULION_NETWORK` when both did; each remedy
+    /// unsets exactly the engaged variables.
+    #[test]
+    fn netd_network_switch_is_named_in_the_label_and_the_remedy() {
+        use crate::graph_cmd::{NetworkEnvKill, QueryNetworkKill};
+        let netd = QueryNetworkKill {
+            network: NetworkEnvKill::Unset,
+            netd_off: true,
+        };
+        assert_eq!(
+            environment_selection_label(&netd),
+            "CERULION_NETD_NETWORK=off"
+        );
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &netd);
+        assert_eq!(
+            missing,
+            "topic '/cam' not found locally, and remote discovery is disabled by \
+             CERULION_NETD_NETWORK=off; unset it to search robots on the LAN (a matching \
+             remote topic is then demanded automatically via cerulion-netd)"
+        );
+        let mirror = unknown_origin_mirror_message("/cam", TopicScope::Automatic, &netd);
+        assert!(
+            mirror.contains(
+                "; CERULION_NETD_NETWORK=off forbids demanding it from cerulion-netd; \
+                 unset CERULION_NETD_NETWORK to resolve"
+            ),
+            "{mirror}"
+        );
+        let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &netd);
+        assert!(
+            flagged.contains("; remove --local and unset CERULION_NETD_NETWORK to resolve"),
+            "{flagged}"
+        );
+        let both = QueryNetworkKill {
+            network: NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: true,
+        };
+        let missing = scope_unavailable_message("/cam", None, false, TopicScope::Automatic, &both);
+        assert!(
+            missing.contains(
+                "disabled by CERULION_NETWORK=on (an unrecognized value, which fails closed to \
+                 local-only) and CERULION_NETD_NETWORK=off; unset both to search"
+            ),
+            "{missing}"
+        );
+        let lease = local_lease_refusal_message(
+            &cerulion_core::TransportError::LocalObservationLease {
+                topic: "/cam".to_string(),
+                reason: "a live network mirror owns this topic".to_string(),
+            },
+            TopicScope::Automatic,
+            &both,
+        );
+        assert!(
+            lease.contains("; unset CERULION_NETWORK and CERULION_NETD_NETWORK to demand"),
+            "{lease}"
         );
     }
 
@@ -4750,7 +4724,10 @@ mod tests {
     /// remedy: `--local` only when the flag was passed, the environment switch otherwise.
     #[test]
     fn unknown_origin_mirror_refusal_names_the_active_selection() {
-        let off = crate::graph_cmd::NetworkEnvKill::Off;
+        let off = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Off,
+            netd_off: false,
+        };
         let flagged = unknown_origin_mirror_message("/cam", TopicScope::Local, &off);
         assert!(
             flagged.starts_with("topic '/cam' exists locally as a network mirror with origin unavailable; --local forbids demanding it from cerulion-netd; remove --local and unset CERULION_NETWORK to resolve"),
@@ -4762,7 +4739,10 @@ mod tests {
             "{environment}"
         );
         assert!(!environment.contains("--local"), "{environment}");
-        let unrecognized = crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string());
+        let unrecognized = crate::graph_cmd::QueryNetworkKill {
+            network: crate::graph_cmd::NetworkEnvKill::Unrecognized("on".to_string()),
+            netd_off: false,
+        };
         let failed_closed =
             unknown_origin_mirror_message("/cam", TopicScope::Automatic, &unrecognized);
         assert!(
@@ -5802,6 +5782,50 @@ mod tests {
         assert_eq!(sanitize_display(""), "");
     }
 
+    /// `sanitize_refusal_reason` neutralizes a remote authorizer's text for
+    /// terminal display: control characters become `?` and the text truncates
+    /// at 200 chars with `…`.
+    #[test]
+    fn sanitize_refusal_reason_replaces_controls_and_truncates() {
+        // An ANSI escape plus a newline can neither inject a CSI sequence
+        // nor forge a second error line.
+        assert_eq!(sanitize_refusal_reason("\u{1b}[2J\nnope"), "?[2J?nope");
+        assert_eq!(sanitize_refusal_reason("a\rb"), "a?b");
+        // Bidi/format controls and C1 controls are neutralized the same way:
+        // a remote reason cannot reorder or hide the text around it.
+        assert_eq!(sanitize_refusal_reason("a\u{202E}b"), "a?b");
+        // U+061C (Arabic Letter Mark) reorders surrounding text the same way.
+        assert_eq!(sanitize_refusal_reason("a\u{061C}b"), "a?b");
+        assert_eq!(sanitize_refusal_reason("\u{2066}hid"), "?hid");
+        assert_eq!(sanitize_refusal_reason("\u{200F}x"), "?x");
+        assert_eq!(sanitize_refusal_reason("a\u{0085}b"), "a?b");
+        assert_eq!(sanitize_refusal_reason("ok"), "ok");
+        // Exactly 200 chars is not truncated; 201 is, with the marker.
+        let exact: String = std::iter::repeat_n('x', 200).collect();
+        assert_eq!(sanitize_refusal_reason(&exact), exact);
+        let long: String = std::iter::repeat_n('x', 201).collect();
+        assert_eq!(sanitize_refusal_reason(&long), format!("{exact}\u{2026}"));
+    }
+
+    /// U+2028 LINE SEPARATOR cannot forge a second line in a displayed or
+    /// logged refusal.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_line_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2028}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
+    /// U+2029 PARAGRAPH SEPARATOR cannot forge a second line either.
+    #[test]
+    fn sanitize_refusal_reason_neutralizes_the_paragraph_separator() {
+        assert_eq!(
+            sanitize_refusal_reason("denied\u{2029}error: forged"),
+            "denied?error: forged"
+        );
+    }
+
     /// A hostile LAN-supplied robot name — from
     /// EITHER the announce-key robot chunk OR the mDNS TXT record — cannot
     /// inject terminal escapes into the rendered ROBOTS section, and the mDNS
@@ -6510,6 +6534,22 @@ mod tests {
         assert!(!opts.has_endpoints());
     }
 
+    /// A CLI discovery session runs gossip on the automagic path and adds
+    /// multicast scouting only when the switch is also on.
+    #[test]
+    fn discovery_session_config_is_multicast_off_unless_both_flags() {
+        let c = vec!["tcp/10.0.0.1:7683".to_string()];
+        let auto = discovery_session_config(&c, &[], true, false);
+        assert!(auto.gossip_scouting && !auto.multicast_scouting);
+        assert!(auto.bounded_connect);
+        assert_eq!(auto.connect_endpoints, c);
+        let opted_in = discovery_session_config(&c, &[], true, true);
+        assert!(opted_in.gossip_scouting && opted_in.multicast_scouting);
+        // Hermetic sessions never scout, whatever the switch says.
+        let hermetic = discovery_session_config(&c, &[], false, true);
+        assert!(!hermetic.gossip_scouting && !hermetic.multicast_scouting);
+    }
+
     /// `--no-network` skips the remote query
     /// entirely — no options, no session.
     #[test]
@@ -6668,7 +6708,7 @@ mod tests {
             cerulion_core::SchemaDoc {
                 qualified: "hostile/Inner".to_string(),
                 encoding: cerulion_core::SchemaEncoding::Msg,
-                text: "float64[536870907] v\n".to_string(),
+                text: "float64[536870906] v\n".to_string(),
                 deps: vec![],
             },
             cerulion_core::SchemaDoc {
@@ -6713,7 +6753,7 @@ mod tests {
         let msg_dir = tmp.path().join("nav14").join("msg");
         std::fs::create_dir_all(&msg_dir).unwrap();
         std::fs::write(msg_dir.join("Huge.msg"), "float64[2305843009213693951] v\n").unwrap();
-        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870907] v\n").unwrap();
+        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870906] v\n").unwrap();
         std::fs::write(msg_dir.join("Outer.msg"), "Inner[8589934592] arr\n").unwrap();
         std::fs::write(msg_dir.join("Wrapper.msg"), "Outer o\nfloat64 w\n").unwrap();
         let goal_text = "float64 x\nfloat64 y\n";
@@ -6885,8 +6925,8 @@ mod tests {
         );
         let a = String::from_utf8(std::mem::take(&mut buf)).unwrap();
         assert!(
-            a.contains("demo_msgs/Widget:"),
-            "Widget must decode locally under its schema-name header: {a}"
+            a == "# demo_msgs/Widget\nx: 1.0\ny: 2.0\n",
+            "Widget must decode locally as YAML under its schema-name comment: {a}"
         );
         // The ACTUAL field VALUES are rendered (not a count).
         assert!(
@@ -7038,12 +7078,69 @@ mod tests {
         );
         let good = String::from_utf8(std::mem::take(&mut buf)).unwrap();
         assert!(
-            good.contains("demo_msgs/Widget:"),
+            good.contains("# demo_msgs/Widget\nx: 1.0\ny: 2.0\n"),
             "the control really does decode: {good}"
         );
         assert!(
             !good.contains("undecodable"),
             "a decodable frame must not be labelled undecodable: {good}"
+        );
+    }
+
+    /// Two identities share the qualified name `pkg/Type`: the store's
+    /// packaged `{ float64 x }` and a later package-less YAML entry NAMED
+    /// `pkg/Type` (`{ uint32 a }`) that owns the name. A frame stamped with
+    /// the packaged hash must decode as `x = 1.5` on BOTH the local and the
+    /// remote path, never re-read through the name as the `a` twin.
+    #[test]
+    fn write_custom_decode_decodes_a_name_twin_by_its_own_hash() {
+        use cerulion_core::codegen::{FieldDef, FieldType, FrameWalker, MessageSchema};
+        use cerulion_core::wire::WireHeader;
+
+        let mut packaged = MessageSchema::new_in_package("Type", "pkg");
+        packaged.add_field(FieldDef::new("x", FieldType::F64));
+        let mut loose = MessageSchema::new("pkg/Type");
+        loose.add_field(FieldDef::new("a", FieldType::U32));
+        let packaged_hash = packaged.schema_hash();
+        assert_ne!(packaged_hash, loose.schema_hash());
+        let twins = || FrameWalker::new(vec![packaged.clone(), loose.clone()]).0;
+        let payload = 1.5f64.to_le_bytes();
+
+        let decode = |local: &FrameWalker, remote: Option<&(String, FrameWalker)>| {
+            let mut shown = false;
+            let mut explained = std::collections::BTreeSet::new();
+            let mut buf: Vec<u8> = Vec::new();
+            write_custom_decode(
+                &mut buf,
+                "/twin",
+                &WireHeader::with_schema(packaged_hash),
+                &payload,
+                local,
+                remote,
+                &mut shown,
+                &mut explained,
+                DEFAULT_ECHO_TRUNCATE_LENGTH,
+            );
+            String::from_utf8(buf).unwrap()
+        };
+
+        let local_out = decode(&twins(), None);
+        assert!(local_out.starts_with("# pkg/Type\nx: 1.5\n"), "{local_out}");
+        assert!(
+            !local_out.lines().any(|l| l.trim_start().starts_with("a:")),
+            "{local_out}"
+        );
+
+        let empty = FrameWalker::new(Vec::new()).0;
+        let remote = ("bot".to_string(), twins());
+        let remote_out = decode(&empty, Some(&remote));
+        assert!(
+            remote_out.contains("# pkg/Type (via robot 'bot')\nx: 1.5\n"),
+            "{remote_out}"
+        );
+        assert!(
+            !remote_out.lines().any(|l| l.trim_start().starts_with("a:")),
+            "{remote_out}"
         );
     }
 
@@ -7135,353 +7232,6 @@ mod tests {
         );
     }
 
-    /// `format_leaf_value` renders each decoded LEAF
-    /// kind in a human-readable form — scalars verbatim, floats with the decimal
-    /// point, strings quoted, and byte arrays as their ELEMENTS. Hand
-    /// oracles (never self-compare).
-    #[test]
-    fn format_leaf_value_renders_scalars_strings_and_blobs() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        let n = DEFAULT_ECHO_TRUNCATE_LENGTH;
-        assert_eq!(format_leaf_value(&K::Bool(true), n), "true");
-        assert_eq!(format_leaf_value(&K::U8(7), n), "7");
-        assert_eq!(format_leaf_value(&K::I32(-42), n), "-42");
-        assert_eq!(
-            format_leaf_value(&K::U64(18446744073709551615), n),
-            "18446744073709551615"
-        );
-        // `{:?}` keeps the float-ness visible (`1.0`, not `1`).
-        assert_eq!(format_leaf_value(&K::F64(1.0), n), "1.0");
-        assert_eq!(format_leaf_value(&K::F32(0.5), n), "0.5");
-        assert_eq!(format_leaf_value(&K::Str("hello"), n), "\"hello\"");
-        // A short byte array renders its ELEMENTS (no more `<N bytes>`).
-        let short_bytes = vec![12u8, 0, 255];
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&short_bytes), n),
-            "[12, 0, 255]"
-        );
-        // A numeric array renders in its NATIVE type.
-        let f64_bytes: Vec<u8> = [1.0f64, 2.0, 3.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let arr = PrimArray {
-            elem: PrimType::F64,
-            bytes: &f64_bytes,
-            count: 3,
-        };
-        assert_eq!(format_leaf_value(&K::PrimArray(arr), n), "[1.0, 2.0, 3.0]");
-        let opaque = vec![0u8; 12];
-        assert_eq!(
-            format_leaf_value(&K::NestedArrayOpaque(&opaque), n),
-            // NEUTRAL label — the walker routes bool[] here
-            // too, so it must not claim "nested-message". This opaque-array
-            // arm stays a summary (no element framing to enumerate).
-            "<12 bytes, opaque array>"
-        );
-    }
-
-    /// A numeric array longer than `truncate_length` is truncated with a
-    /// trailing `...` inside the brackets + a `(N elements)` total annotation; an
-    /// exactly-bound-length array is shown in full with NO annotation; integer
-    /// elements stay integer.
-    #[test]
-    fn format_prim_array_truncates_beyond_bound() {
-        use cerulion_core::codegen::{PrimArray, PrimType};
-        let vals: Vec<u32> = (0..10).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 10,
-        };
-        // Bound 8 < 10 → truncated: 8 elements + `...` + `(10 elements)`.
-        assert_eq!(
-            format_prim_array(&arr, 8),
-            "[0, 1, 2, 3, 4, 5, 6, 7, ...] (10 elements)"
-        );
-        // Bound == count (10) → full, NO annotation (ros2-parity).
-        assert_eq!(
-            format_prim_array(&arr, 10),
-            "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]"
-        );
-    }
-
-    /// A `uint8[]` shorter than or equal to the bound renders EVERY
-    /// element with NO annotation (the LowState `head` / short-array case).
-    #[test]
-    fn byte_array_within_bound_renders_all_elements_no_annotation() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // Empty byte array → empty brackets.
-        assert_eq!(format_leaf_value(&K::Bytes(&[]), 128), "[]");
-        // A 2-byte LowState `head`.
-        assert_eq!(format_leaf_value(&K::Bytes(&[255u8, 0]), 128), "[255, 0]");
-        // Exactly-at-bound (128) renders full, no `...`, no `(N elements)`.
-        let at_bound: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
-        let rendered = format_leaf_value(&K::Bytes(&at_bound), 128);
-        assert!(
-            !rendered.contains("..."),
-            "at-bound must not truncate: no `...`"
-        );
-        assert!(
-            !rendered.contains("elements)"),
-            "at-bound must not carry the count annotation"
-        );
-        let expected: Vec<String> = at_bound.iter().map(|b| b.to_string()).collect();
-        assert_eq!(rendered, format!("[{}]", expected.join(", ")));
-    }
-
-    /// A `uint8[]` LONGER than the bound truncates at EXACTLY the bound
-    /// with a trailing `...` inside the brackets + a `(N elements)` total
-    /// annotation — the PointCloud2 `data` case (the headline ros2-parity shape).
-    #[test]
-    fn byte_array_beyond_bound_truncates_at_128_with_count() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // 57600 bytes (a small PointCloud2 `data`), first three are 12/0/255.
-        let mut data: Vec<u8> = vec![0u8; 57600];
-        data[0] = 12;
-        data[1] = 0;
-        data[2] = 255;
-        let rendered = format_leaf_value(&K::Bytes(&data), 128);
-        // EXACTLY 128 elements shown before the marker.
-        let shown: Vec<String> = data[..128].iter().map(|b| b.to_string()).collect();
-        assert_eq!(
-            rendered,
-            format!("[{}, ...] (57600 elements)", shown.join(", "))
-        );
-        // Head/tail spot-checks so the assertion is not vacuous.
-        assert!(rendered.starts_with("[12, 0, 255, "), "{rendered}");
-        assert!(rendered.ends_with(", ...] (57600 elements)"), "{rendered}");
-    }
-
-    /// Truncation boundary: exactly-128 is full (no annotation); 129 truncates.
-    #[test]
-    fn byte_array_boundary_128_full_129_truncated() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let n128: Vec<u8> = (0..128u32).map(|i| (i % 256) as u8).collect();
-        let n129: Vec<u8> = (0..129u32).map(|i| (i % 256) as u8).collect();
-        // 128 → full, no `...`.
-        assert!(!format_leaf_value(&K::Bytes(&n128), 128).contains("..."));
-        // 129 → truncated to 128 + `...` + `(129 elements)`.
-        let r129 = format_leaf_value(&K::Bytes(&n129), 128);
-        let shown: Vec<String> = n129[..128].iter().map(|b| b.to_string()).collect();
-        assert_eq!(r129, format!("[{}, ...] (129 elements)", shown.join(", ")));
-    }
-
-    /// A non-u8 (numeric) array LONGER than the bound truncates in the
-    /// EXACT same shape as a byte array — one seam, one shape.
-    #[test]
-    fn non_u8_array_beyond_bound_truncates_identically() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        let vals: Vec<u32> = (0..200).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 200,
-        };
-        let rendered = format_leaf_value(&K::PrimArray(arr), 128);
-        let shown: Vec<String> = (0..128u32).map(|v| v.to_string()).collect();
-        assert_eq!(
-            rendered,
-            format!("[{}, ...] (200 elements)", shown.join(", "))
-        );
-    }
-
-    /// The `truncate_length` bound is THREADED — a bound of 4 renders 4
-    /// elements + `...` + the count, on BOTH byte and numeric arrays.
-    #[test]
-    fn truncate_length_bound_is_honored_end_to_end() {
-        use cerulion_core::codegen::{FrameValueKind as K, PrimArray, PrimType};
-        // Byte array, bound 4.
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&[10u8, 20, 30, 40, 50, 60]), 4),
-            "[10, 20, 30, 40, ...] (6 elements)"
-        );
-        // Numeric array, bound 4.
-        let vals: Vec<u32> = (0..6).collect();
-        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let arr = PrimArray {
-            elem: PrimType::U32,
-            bytes: &bytes,
-            count: 6,
-        };
-        assert_eq!(
-            format_leaf_value(&K::PrimArray(arr), 4),
-            "[0, 1, 2, 3, ...] (6 elements)"
-        );
-    }
-
-    /// Truncation boundary: a bound of 1 is the tightest legal bound — N>1 shows one
-    /// element + `...` + `(N elements)`, exactly-one-element renders `[e0]` with
-    /// NO annotation, and an empty array renders `[]`.
-    #[test]
-    fn bound_of_one_shows_single_element_and_truncates_the_rest() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        // N>1 → one element then the truncation marker + count.
-        assert_eq!(
-            format_leaf_value(&K::Bytes(&[7u8, 8, 9]), 1),
-            "[7, ...] (3 elements)"
-        );
-        // Exactly one element at bound 1 → full, NO annotation.
-        assert_eq!(format_leaf_value(&K::Bytes(&[42u8]), 1), "[42]");
-        // Empty at bound 1 → empty brackets, NO annotation.
-        assert_eq!(format_leaf_value(&K::Bytes(&[]), 1), "[]");
-    }
-
-    /// The MULTI-LINE nested-message array arm (`FrameValueKind::Array`,
-    /// which the walker emits for a fixed array of fixed-nested messages like
-    /// `geometry_msgs/Point[N]`) also honors `truncate_length` — it renders up to
-    /// `bound` element blocks, elides the rest, and closes with the multi-line
-    /// `… (N total)` tail. Pins BOTH the truncation bound behavior AND the exact
-    /// tail wording. Hand-built oracle (never a self-compare).
-    #[test]
-    fn nested_message_array_truncates_at_bound_with_total_tail() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        // A `geometry_msgs/Point[5]`-shaped fixed array of fixed-nested messages
-        // — exactly the shape the walker decodes into `FrameValueKind::Array`.
-        let point = |x: f64| {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "geometry_msgs/Point".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "x".into(),
-                        value: K::F64(x),
-                    },
-                    NamedValue {
-                        name: "y".into(),
-                        value: K::F64(0.0),
-                    },
-                ],
-            }))
-        };
-        let arr = K::Array(vec![
-            point(0.0),
-            point(1.0),
-            point(2.0),
-            point(3.0),
-            point(4.0),
-        ]);
-
-        // Bound 2 < 5 → header count line, blocks [0] and [1] rendered, [2..]
-        // elided, and the multi-line `… (5 total)` tail.
-        let mut buf: Vec<u8> = Vec::new();
-        write_named_value(&mut buf, "points", &arr, 0, 2, &mut 0);
-        let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("points: [5 element(s)]"), "{out}");
-        assert!(out.contains("[0]:") && out.contains("x: 0.0"), "{out}");
-        assert!(out.contains("[1]:") && out.contains("x: 1.0"), "{out}");
-        assert!(
-            !out.contains("[2]:"),
-            "beyond-bound blocks must be elided: {out}"
-        );
-        assert!(
-            !out.contains("x: 2.0"),
-            "the 3rd element's fields must be elided: {out}"
-        );
-        // The EXACT multi-line truncation tail wording (unicode ellipsis).
-        assert!(out.contains("… (5 total)"), "{out}");
-
-        // Control: bound 5 == len → every block rendered, NO `… (N total)` tail.
-        let mut buf2: Vec<u8> = Vec::new();
-        write_named_value(&mut buf2, "points", &arr, 0, 5, &mut 0);
-        let out2 = String::from_utf8(buf2).unwrap();
-        assert!(out2.contains("[4]:") && out2.contains("x: 4.0"), "{out2}");
-        assert!(
-            !out2.contains("total)"),
-            "an at-or-above-bound array must not carry the total tail: {out2}"
-        );
-    }
-
-    /// STRINGS are NOT affected by the array-truncation change — a long
-    /// string still renders whole + quoted, never element-split or `...`-tailed.
-    #[test]
-    fn strings_are_not_truncated_by_the_array_bound() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let long = "a".repeat(300);
-        let rendered = format_leaf_value(&K::Str(&long), 4);
-        assert_eq!(rendered, format!("{long:?}"));
-        assert!(
-            !rendered.contains("elements)") && !rendered.contains(", ..."),
-            "a string must never carry the array truncation tail: {rendered}"
-        );
-    }
-
-    /// `render_frame_fields` renders a nested message
-    /// indented under its parent, quotes string values, and renders byte arrays
-    /// as their ELEMENTS. Hand oracle over a HAND-BUILT `FrameValue` (never a
-    /// self-compare).
-    #[test]
-    fn render_frame_fields_renders_nested_and_byte_arrays() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        let inner = FrameValue {
-            schema_name: "demo/Inner".into(),
-            fields: vec![NamedValue {
-                name: "x".into(),
-                value: K::F64(1.5),
-            }],
-        };
-        // A LowState-style `head` byte field renders its elements.
-        let blob = vec![255u8, 0];
-        let msg = FrameValue {
-            schema_name: "demo/Outer".into(),
-            fields: vec![
-                NamedValue {
-                    name: "count".into(),
-                    value: K::U32(5),
-                },
-                NamedValue {
-                    name: "label".into(),
-                    value: K::Str("ok"),
-                },
-                NamedValue {
-                    name: "inner".into(),
-                    value: K::Nested(Box::new(inner)),
-                },
-                NamedValue {
-                    name: "head".into(),
-                    value: K::Bytes(&blob),
-                },
-            ],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &msg, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        // Top-level fields at 4-space indent (indent 1 → pad = 2 levels).
-        assert!(
-            out.contains("\n    count: 5\n") || out.starts_with("    count: 5\n"),
-            "{out}"
-        );
-        assert!(out.contains("    label: \"ok\""), "{out}");
-        assert!(out.contains("    inner:\n"), "{out}");
-        // Nested field at 6-space indent (indent 2).
-        assert!(out.contains("      x: 1.5"), "{out}");
-        // The byte field renders its elements, not `<2 bytes>`.
-        assert!(out.contains("    head: [255, 0]"), "{out}");
-    }
-
-    /// SECURITY: a wire STRING value is terminal-escape-sanitized before
-    /// display: an injected ANSI/CSI escape
-    /// is neutralized to U+FFFD, the printable tail survives.
-    #[test]
-    fn format_leaf_value_sanitizes_terminal_escapes_in_strings() {
-        use cerulion_core::codegen::FrameValueKind as K;
-        let hostile = "\u{1b}[2Jowned";
-        let rendered = format_leaf_value(&K::Str(hostile), DEFAULT_ECHO_TRUNCATE_LENGTH);
-        assert!(
-            !rendered.contains('\u{1b}'),
-            "raw ESC must be neutralized: {rendered:?}"
-        );
-        assert!(
-            rendered.contains('\u{fffd}'),
-            "control chars map to U+FFFD: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("owned"),
-            "the printable tail survives: {rendered:?}"
-        );
-    }
-
     /// `resolve_schema_line` names a built-in and a workspace
     /// type via the LOCAL walker, falls back to the REMOTE walker for a type the
     /// desk lacks, and degrades to a hash-only line + hint for an unknown hash.
@@ -7547,156 +7297,197 @@ mod tests {
         );
     }
 
-    /// Security: a wire-derived field NAME is
-    /// terminal-escape-sanitized before display — a hostile robot's `.msg` field
-    /// named `x\x1b[2J…` must not clear the operator's terminal. Both the
-    /// top-level and the NESTED (recursed) name paths are covered.
-    /// `topic echo`'s field render is bounded globally, not
-    /// just per array. The pathological shape is real —
-    /// `visualization_msgs/MarkerArray` is `Marker[] markers` where each
-    /// `Marker` carries `Point[] points` + `ColorRGBA[] colors`, and with
-    /// `truncate_length` re-applied at every level that renders ~1.5×10^5 lines
-    /// per frame. Without the canonical element framing those
-    /// fields would be ONE opaque line each, so an unbounded render is a straight
-    /// regression of the verb.
+    /// Echo one frame of `qualified` (a `.msg` written to a temp workspace)
+    /// through `write_custom_decode`, as the echo loop does.
+    fn echo_one(
+        msg: &str,
+        qualified: &str,
+        payload: &[u8],
+        truncate_length: usize,
+    ) -> (String, Vec<u8>, cerulion_core::codegen::FrameWalker) {
+        use cerulion_core::codegen::parse_rosmsg;
+        use cerulion_core::wire::WireHeader;
+        let (pkg, name) = qualified.split_once('/').unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let msg_dir = tmp.path().join(pkg).join("msg");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(msg_dir.join(format!("{name}.msg")), msg).unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let hash = walker
+            .schema_hash_for(qualified)
+            .unwrap_or_else(|| parse_rosmsg(msg, name, Some(pkg)).unwrap().schema_hash());
+        let layout = walker
+            .layout_for_name(qualified)
+            .expect("workspace type loads");
+        let mut header = WireHeader::with_schema(hash);
+        header.total_size = (WireHeader::SIZE + payload.len()) as u32;
+        header.offset_table_offset = (WireHeader::SIZE + layout.fixed_size) as u32;
+        header.offset_table_count = layout.variable_fields.len() as u32;
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        header.write_to_buf(&mut frame);
+        frame.extend_from_slice(payload);
+        let mut buf = Vec::new();
+        write_custom_decode(
+            &mut buf,
+            "/t",
+            &header,
+            payload,
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
+            truncate_length,
+        );
+        (String::from_utf8(buf).unwrap(), frame, walker)
+    }
+
+    /// The body after the `# <type>` line is the codec's YAML: arrays past
+    /// `--truncate-length` end in `!truncated <n>`, strings are quoted with
+    /// control characters escaped, and an uncut body decodes back to the
+    /// same frame. Hand-built frame, hand-written YAML.
     #[test]
-    fn render_frame_fields_bounds_total_lines_for_nested_element_arrays() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-
-        // A `Marker`-shaped element: two nested element arrays of 128 leaves.
-        let leaf = || {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "geometry_msgs/Point".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "x".into(),
-                        value: K::F64(1.0),
-                    },
-                    NamedValue {
-                        name: "y".into(),
-                        value: K::F64(2.0),
-                    },
-                ],
-            }))
-        };
-        let leaves = || K::NestedArray {
-            elements: (0..DEFAULT_ECHO_TRUNCATE_LENGTH).map(|_| leaf()).collect(),
-            raw: &[],
-        };
-        let marker = || {
-            K::Nested(Box::new(FrameValue {
-                schema_name: "visualization_msgs/Marker".into(),
-                fields: vec![
-                    NamedValue {
-                        name: "points".into(),
-                        value: leaves(),
-                    },
-                    NamedValue {
-                        name: "colors".into(),
-                        value: leaves(),
-                    },
-                ],
-            }))
-        };
-        let frame = FrameValue {
-            schema_name: "visualization_msgs/MarkerArray".into(),
-            fields: vec![NamedValue {
-                name: "markers".into(),
-                value: K::NestedArray {
-                    elements: (0..DEFAULT_ECHO_TRUNCATE_LENGTH)
-                        .map(|_| marker())
-                        .collect(),
-                    raw: &[],
-                },
-            }],
-        };
-
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &frame, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        let rendered = out.lines().count();
-        // Bounded, and the bound is what did the bounding: an unbounded render
-        // of this frame is 128 × (1 + 2 × (1 + 128 × 3)) ≈ 9.9×10^4 lines.
-        assert!(
-            rendered <= ECHO_MAX_LINES + 8,
-            "render must be globally bounded, got {rendered} lines"
-        );
-        assert!(
-            out.contains("output truncated at"),
-            "the cut must be LOUD, never silent: {}",
-            &out[out.len().saturating_sub(400)..]
-        );
-
-        // CONTROL (anti-tautology): an ordinary frame is untouched — every
-        // field renders and there is NO truncation notice.
-        let small = FrameValue {
-            schema_name: "geometry_msgs/PoseArray".into(),
-            fields: vec![NamedValue {
-                name: "poses".into(),
-                value: K::NestedArray {
-                    elements: vec![leaf(), leaf()],
-                    raw: &[],
-                },
-            }],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        render_frame_fields(&mut buf, &small, 1, DEFAULT_ECHO_TRUNCATE_LENGTH);
-        let out = String::from_utf8(buf).unwrap();
-        assert!(!out.contains("output truncated at"), "{out}");
-        assert!(out.contains("poses: [2 element(s)]"), "{out}");
+    fn echo_prints_codec_yaml_that_decodes_back_when_uncut() {
+        // table: v @16 len 24 (8-aligned), name @40 len 2.
+        let mut payload = vec![16, 0, 0, 0, 24, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0];
+        for v in [1.0f64, 2.0, 3.0] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(b"a\x1b");
+        let msg = "float64[] v\nstring name\n";
+        let (cut, _, _) = echo_one(msg, "demo_msgs/Arr", &payload, 2);
         assert_eq!(
-            out.matches("x: 1.0").count(),
-            2,
-            "both elements render: {out}"
+            cut,
+            "# demo_msgs/Arr\nv: [1.0, 2.0, !truncated 1]\nname: \"a\\x1B\"\n"
+        );
+        assert!(
+            !cut.contains('\u{1b}'),
+            "no raw ESC reaches the terminal: {cut:?}"
+        );
+
+        let (whole, frame, walker) =
+            echo_one(msg, "demo_msgs/Arr", &payload, DEFAULT_ECHO_TRUNCATE_LENGTH);
+        assert_eq!(
+            whole,
+            "# demo_msgs/Arr\nv: [1.0, 2.0, 3.0]\nname: \"a\\x1B\"\n"
+        );
+        let mut back =
+            cerulion_core::dynamic::yaml_to_message(&walker, "demo_msgs/Arr", whole.as_bytes(), 0)
+                .expect("an uncut echo is message YAML input");
+        // The echo header carries the publisher's sequence/timestamp; the
+        // decoded frame carries 0 for both.
+        back[20..32].copy_from_slice(&frame[20..32]);
+        assert_eq!(back, frame);
+    }
+
+    /// A frame whose YAML passes `ECHO_MAX_LINES` prints that many lines, a
+    /// `!truncated` line and a comment; the cut output never
+    /// decodes. A short frame of the same type is not cut.
+    #[test]
+    fn echo_cuts_a_frame_at_the_line_budget_and_the_cut_never_decodes() {
+        let points = |n: usize| {
+            let mut p = vec![8, 0, 0, 0];
+            p.extend_from_slice(&((n * 24) as u32).to_le_bytes());
+            for i in 0..n {
+                for v in [i as f64, 0.5, -1.0] {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            p
+        };
+        let msg = "geometry_msgs/Point[] p\n";
+        let (out, _, walker) = echo_one(msg, "demo_msgs/Pts", &points(1000), 2000);
+        let lines: Vec<&str> = out.lines().collect();
+        // `# type` + 2000 body lines + the marker + the comment.
+        assert_eq!(lines.len(), 2003, "{}", &out[out.len() - 300..]);
+        assert_eq!(lines[2001], "!truncated");
+        assert!(
+            lines[2002].starts_with("# output cut at 2000 lines"),
+            "{}",
+            lines[2002]
+        );
+        match cerulion_core::dynamic::yaml_to_message(&walker, "demo_msgs/Pts", out.as_bytes(), 0) {
+            Err(cerulion_core::dynamic::DynamicError::YamlSyntax(_)) => {}
+            other => panic!("cut echo output must not decode, got {other:?}"),
+        }
+
+        let (small, _, _) = echo_one(msg, "demo_msgs/Pts", &points(2), 2000);
+        assert_eq!(
+            small,
+            "# demo_msgs/Pts\np:\n  - x: 0.0\n    y: 0.5\n    z: -1.0\n  - x: 1.0\n    y: 0.5\n    z: -1.0\n"
         );
     }
 
+    /// An 8-byte payload whose unset nested field names 2^31 zero lines
+    /// (2^15 rows of 2^16 leaves) prints the first 2000 and stops: the
+    /// codec stops at the line budget, so echo never builds the rest.
     #[test]
-    fn write_named_value_sanitizes_hostile_field_names() {
-        use cerulion_core::codegen::{FrameValue, FrameValueKind as K, NamedValue};
-        let hostile = "x\u{1b}[2J";
-        let mut buf: Vec<u8> = Vec::new();
-        write_named_value(
+    fn echo_of_a_huge_zero_default_frame_stops_at_the_line_budget() {
+        use cerulion_core::wire::WireHeader;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.yaml"),
+            "schemas:\n  Leaf:\n    fields:\n      uint8 v: {}\n  Row:\n    fields:\n      \
+             Leaf[65536] leaves: {}\n  Inner:\n    fields:\n      string s: {}\n      \
+             Row[32768] rows: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n",
+        )
+        .unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let mut header = WireHeader::with_schema(walker.schema_hash_for("Wrap").unwrap());
+        header.total_size = (WireHeader::SIZE + 8) as u32;
+        header.offset_table_offset = WireHeader::SIZE as u32;
+        header.offset_table_count = 1;
+        let mut buf = Vec::new();
+        write_custom_decode(
             &mut buf,
-            hostile,
-            &K::U32(5),
-            0,
-            DEFAULT_ECHO_TRUNCATE_LENGTH,
-            &mut 0,
+            "/t",
+            &header,
+            &[8, 0, 0, 0, 0, 0, 0, 0],
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
+            usize::MAX,
         );
         let out = String::from_utf8(buf).unwrap();
-        assert!(
-            !out.contains('\u{1b}'),
-            "raw ESC in the field NAME must be neutralized: {out:?}"
+        let mut expected = String::from("# Wrap\ninner:\n  s: \"\"\n  rows:\n    - leaves:\n");
+        expected.push_str(&"        - v: 0\n".repeat(ECHO_MAX_LINES - 4));
+        expected.push_str(
+            "!truncated\n# output cut at 2000 lines: this frame's YAML is longer than one \
+             echo prints; a smaller --truncate-length shortens its arrays\n",
         );
-        assert!(
-            out.contains('\u{fffd}'),
-            "control chars in the name map to U+FFFD: {out:?}"
-        );
-        assert!(out.contains(": 5"), "the value still renders: {out:?}");
+        assert_eq!(out, expected);
+    }
 
-        // Nested field names are sanitized on their own recursion.
-        let inner = FrameValue {
-            schema_name: "demo/Inner".into(),
-            fields: vec![NamedValue {
-                name: hostile.into(),
-                value: K::U8(1),
-            }],
-        };
-        let mut buf2: Vec<u8> = Vec::new();
-        write_named_value(
-            &mut buf2,
-            "outer",
-            &K::Nested(Box::new(inner)),
-            0,
+    /// A field NAME is wire-derived for a remote type; one that is not a
+    /// plain identifier is printed as a quoted, escaped key.
+    #[test]
+    fn echo_quotes_and_escapes_a_hostile_field_name() {
+        use cerulion_core::wire::WireHeader;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("odd.yaml"),
+            "schemas:\n  Odd:\n    fields:\n      \"uint32 x\\e[2J\": {}\n",
+        )
+        .unwrap();
+        let walker = local_walker_from_workspace(Some(tmp.path()));
+        let hash = walker
+            .schema_hash_for("Odd")
+            .expect("workspace schema loads");
+        let header = WireHeader::with_schema(hash);
+        let mut buf = Vec::new();
+        write_custom_decode(
+            &mut buf,
+            "/t",
+            &header,
+            &5u32.to_le_bytes(),
+            &walker,
+            None,
+            &mut false,
+            &mut std::collections::BTreeSet::new(),
             DEFAULT_ECHO_TRUNCATE_LENGTH,
-            &mut 0,
         );
-        let out2 = String::from_utf8(buf2).unwrap();
-        assert!(
-            !out2.contains('\u{1b}'),
-            "a nested hostile field name is also sanitized: {out2:?}"
-        );
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "# Odd\n\"x\\x1B[2J\": 5\n");
     }
 
     /// A KNOWN schema whose frame fails to `walk()` (a
@@ -8139,6 +7930,92 @@ mod tests {
             !m.contains("not found locally or on any discovered robot") && !m.contains("UNKNOWN"),
             "an internal routing bug must not masquerade as a discovery verdict: {m}"
         );
+    }
+
+    #[test]
+    fn refused_catalog_robot_returns_none_or_the_first_refusal() {
+        let unrefused = [cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "available",
+            [],
+        )];
+        assert_eq!(refused_catalog_robot(&unrefused), None);
+
+        let mixed = [
+            cerulion_core::transport::cerulion_q::build_catalog_reply("available", []),
+            cerulion_core::CatalogReply::refused("first", "not authorized"),
+            cerulion_core::CatalogReply::refused("second", "not authorized"),
+        ];
+        assert_eq!(
+            refused_catalog_robot(&mixed),
+            Some(("first".to_string(), Some("not authorized".to_string()))),
+            "catalog order chooses the first refusal"
+        );
+    }
+
+    #[test]
+    fn a_catalog_match_wins_over_refusals_and_an_unmatched_refusal_is_preserved() {
+        let refused = [cerulion_core::CatalogReply::refused(
+            "restricted",
+            "not authorized",
+        )];
+        assert_eq!(
+            catalog_target(&refused, "/camera"),
+            CatalogTarget::Refused {
+                robot: "restricted".to_string(),
+                reason: Some("not authorized".to_string()),
+            }
+        );
+
+        let found = cerulion_core::transport::cerulion_q::build_catalog_reply(
+            "producer",
+            [cerulion_core::transport::cerulion_q::CatalogEntry {
+                topic: "/camera".to_string(),
+                schema_hash: None,
+                schema_name: Some("camera_msgs/Frame".to_string()),
+                provenance: cerulion_core::transport::cerulion_q::CatalogProvenance::Boot,
+                producer_count: None,
+                liveness: None,
+            }],
+        );
+        assert_eq!(
+            catalog_target(&[refused[0].clone(), found], "/camera"),
+            CatalogTarget::Found {
+                robot: "producer".to_string(),
+                qualified: "camera_msgs/Frame".to_string(),
+            },
+            "a target in any catalog wins over another robot's refusal"
+        );
+    }
+
+    #[test]
+    fn catalog_refusal_error_explains_lan_identity_and_sanitizes_robot() {
+        let message = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "robot".to_string(),
+                reason: Some("policy: paired peers only".to_string()),
+            },
+        )
+        .to_string();
+        assert_eq!(
+            message,
+            "robot 'robot' refused to serve its topic catalog to LAN peers (not authorized), \
+             so '/camera' was not searched there: the robot's authorizer reported 'policy: paired \
+             peers only'; a LAN lookup carries no paired identity, so \
+             pairing does not open it: check the robot's demand authorization policy, or on a \
+             trusted development network start the robot with CERULION_LAN_ACCESS=open, or an \
+             Android app with its \"lan_access\": \"open\" config key"
+        );
+
+        let sanitized = unresolved_remote_error(
+            "/camera",
+            RemoteResolve::CatalogRefused {
+                robot: "ro\x1b[31mbot".to_string(),
+                reason: None,
+            },
+        )
+        .to_string();
+        assert!(!sanitized.contains('\x1b'), "{sanitized:?}");
     }
 
     /// The TRANSIENT path's classifier. Same rule as the netd

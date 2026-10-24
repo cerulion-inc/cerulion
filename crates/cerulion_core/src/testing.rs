@@ -1023,7 +1023,7 @@ pub fn find_fixture_cdylib_same_profile(crate_name: &str) -> std::path::PathBuf 
 /// accessors, bagd byte-fidelity, gateway forward, replay diff) from this ONE
 /// stated layout.
 ///
-/// Layout (PAYLOAD-relative; the wire frame prepends the 32-byte header):
+/// Layout (PAYLOAD-relative; the wire frame prepends the 40-byte header):
 ///
 /// ```text
 /// [0,   16)  fixed section: height u32 | width u32 | is_bigendian u8 (pad 3) | step u32
@@ -1120,7 +1120,7 @@ pub mod gap_frame {
         sub
     }
 
-    /// Build the full gap frame (32-byte wire header + the payload above).
+    /// Build the full gap frame (40-byte wire header + the payload above).
     /// `sequence`/`timestamp_ns` are the caller's hand values so multi-frame
     /// suites (bagd, gateway, replay) mint distinct, deterministic frames.
     pub fn image_gap_frame(schema_hash: u64, sequence: u32, timestamp_ns: u64) -> Vec<u8> {

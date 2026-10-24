@@ -28,13 +28,13 @@ schemas:
 """
 
 
-def _wire_frame(schema_hash, body, count=2, offset=36):
-    total = 32 + len(body)
-    header = struct.pack("<QIIIIQ", schema_hash, total, offset, count, 0, 0)
+def _wire_frame(schema_hash, body, count=2, offset=44):
+    total = 40 + len(body)
+    header = struct.pack("<QIIIIQQ", schema_hash, total, offset, count, 0, 0, 0)
     return header + body
 
 
-def _decode_probe(session, schemas, body, *, count=2, offset=36):
+def _decode_probe(session, schemas, body, *, count=2, offset=44):
     topic = unique_topic("typed-decode")
     publisher = session.publisher(
         topic, schema_hash=schemas.schema_hash("DecodeProbe")
@@ -144,12 +144,12 @@ def test_readonly_view_and_unknown_attribute_errors(session):
 @pytest.mark.parametrize(
     ("body", "count", "offset", "kind"),
     [
-            (b"\0" * 20, 2, 35, "OffsetTableMismatch"),
-            (b"\0" * 20, 1, 36, "OffsetTableMismatch"),
+            (b"\0" * 20, 2, 43, "OffsetTableMismatch"),
+            (b"\0" * 20, 1, 44, "OffsetTableMismatch"),
             (
             b"\0" * 4 + struct.pack("<II", 4, 1) + b"\0" * 8,
             2,
-                36,
+                44,
             "OffsetBelowDataFloor",
         ),
         (
@@ -158,7 +158,7 @@ def test_readonly_view_and_unknown_attribute_errors(session):
                 + struct.pack("<II", 20, 0)
                 + b"\0" * 100,
             2,
-                36,
+                44,
             "VariableFieldOutOfBounds",
         ),
         (
@@ -167,7 +167,7 @@ def test_readonly_view_and_unknown_attribute_errors(session):
             + struct.pack("<II", 22, 2)
             + b"\0" * 4,
             2,
-            36,
+            44,
             "OverlappingEntries",
         ),
         (
@@ -176,7 +176,7 @@ def test_readonly_view_and_unknown_attribute_errors(session):
             + struct.pack("<II", 32, 0)
             + b"\0" * 4,
             2,
-            36,
+            44,
             "MisalignedElements",
         ),
         (
@@ -185,7 +185,7 @@ def test_readonly_view_and_unknown_attribute_errors(session):
                 + struct.pack("<II", 20, 1)
                 + b"\xff",
             2,
-            36,
+            44,
             "InvalidUtf8",
         ),
     ],

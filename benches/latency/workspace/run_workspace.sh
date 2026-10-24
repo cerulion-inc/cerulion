@@ -39,6 +39,12 @@
 #            flagless default returns as the headline. Network posture
 #            UNCHANGED: no env overrides; the gateway spawns
 #            exactly as on every real-clock live run.
+#   split3   `cerulion graph run rtt_bench_split3 --release`: the declared
+#            3-group shape, one node per group (g1={ping} / g2={pong} /
+#            g3={latency}), so BOTH edges are real cross-process iceoryx2
+#            hops; the split3-vs-split delta is the second hop. Same flags
+#            (none), same network posture, and the same structural skip
+#            under backtoback as split.
 #   mono     `cerulion graph run rtt_bench --single-process --release`
 #            — the single-process opt-in (one flag, nothing else; the
 #            gateway still spawns — it is the product's default network
@@ -98,7 +104,7 @@
 #               fires every step at maximum step rate — a genuinely
 #               saturating producer). Counts come from
 #               CER_BENCH_TARGET_SAMPLES / CER_BENCH_WARMUP (10000/1000
-#               default). split × backtoback is a STRUCTURAL SKIP (rc=77):
+#               default). split (and split3) × backtoback is a STRUCTURAL SKIP (rc=77):
 #               `--time-source virtual` on a `process_groups:` graph
 #               dispatches to the supervisor with the time-source IGNORED
 #               (real-clock mp has no uncapped mode; the period floor is
@@ -147,6 +153,22 @@
 #                             array length, and their init verifies
 #                             baked-vs-runtime size — loud Err on a
 #                             stale artifact, never a mislabel)
+#   CER_BENCH_EXECUTION_MODE  free_run (default) | lockstep: the
+#                             EXECUTION-MODE axis of the multi-process
+#                             legs. free_run UNSETS CERULION_EXECUTION_MODE
+#                             for the graph (`env -u`, an inherited value
+#                             included), so the run takes the shipped
+#                             default; lockstep exports
+#                             CERULION_EXECUTION_MODE=lockstep, the
+#                             shared-barrier opt-out. The mono leg has no
+#                             ranks, so lockstep there is REFUSED (exit 2),
+#                             as is any other value, and an exported
+#                             CERULION_EXECUTION_MODE that names the other
+#                             mode (a contradictory declaration). A lockstep
+#                             run's raw prefix carries a `_lockstep` token
+#                             (cerulion_workspace_<leg>_lockstep[_pod]_chrt<N>)
+#                             and a free-run prefix must not, refused both
+#                             ways like the `_pod` class token.
 #   CER_BENCH_PACING          quiescent (default) | backtoback
 #   CER_BENCH_SMOKE_N         override (total, warmup) = (N, max(N/10,1))
 #                             keeping the pacing — the smoke-gate knob
@@ -212,7 +234,7 @@
 #
 # Exit codes: 0 ok · 1 hard failure (loud) · 2 env-contract violation
 #             (incl. the retired `default` leg refusal) ·
-#             77 structural skip (split × backtoback — see below).
+#             77 structural skip (split or split3 × backtoback, see below).
 #
 # Deliberately NO `set -e` — every rc is checked bare so a failed step
 # reports loudly instead of aborting mid-cleanup (mp_latency convention).
@@ -222,7 +244,7 @@ set -uo pipefail
 # ── leg selection ───────────────────────────────────────────────────────────
 LEG="${1:-}"
 case "$LEG" in
-    split|mono) ;;
+    split|split3|mono) ;;
     default)
         echo "run_workspace.sh: the 'default' leg is RETIRED from the matrix" >&2
         echo "The flagless \`graph run\` shape" >&2
@@ -237,8 +259,9 @@ case "$LEG" in
         exit 2
         ;;
     *)
-        echo "usage: run_workspace.sh <split|mono>" >&2
+        echo "usage: run_workspace.sh <split|split3|mono>" >&2
         echo "  split = graph run rtt_bench_split (declared 2-group process_groups mp; THE headline row)" >&2
+        echo "  split3 = graph run rtt_bench_split3 (declared 3-group process_groups mp; both edges cross processes)" >&2
         echo "  mono  = graph run rtt_bench --single-process (one flag, nothing else)" >&2
         exit 2
         ;;
@@ -258,16 +281,16 @@ esac
 # ── type-class axis (CER_BENCH_MSG — METHODOLOGY § "The type-class axis") ───
 # variable (default) = the INCUMBENT legs, byte-identical to the
 #   pre-axis runner: sensor_msgs/Image with the unbounded `data` field
-#   loaned per tick (graphs rtt_bench / rtt_bench_split; the pinned
-#   cerulion_workspace_{split,mono}_chrt{N} prefixes carry NO class
+#   loaned per tick (graphs rtt_bench / rtt_bench_split / rtt_bench_split3;
+#   the pinned cerulion_workspace_{split,split3,mono}_chrt{N} prefixes carry NO class
 #   token — they predate the axis).
 # pod = the FIXED-POD twin: the PodPayload workspace schema whose wire
 #   fixed size is exactly the sweep payload (pod_schema/pod_codegen.rs
 #   bakes the array length per size via CER_BENCH_POD_BYTES; the pod
 #   nodes' init verifies baked-vs-runtime size, so a stale build fails
 #   the size loudly instead of mislabeling). Graphs rtt_bench_pod /
-#   rtt_bench_pod_split; raw prefixes carry a `_pod` token
-#   (cerulion_workspace_{split,mono}_pod_chrt{N} — bench.py mints them).
+#   rtt_bench_pod_split / rtt_bench_pod_split3; raw prefixes carry a `_pod`
+#   token (cerulion_workspace_{split,split3,mono}_pod_chrt{N}, bench.py mints them).
 # Between the two classes the ONLY moving part is the message class, so
 # their delta isolates what a variable field costs the loaned-slot
 # write path.
@@ -281,9 +304,59 @@ case "$MSG_CLASS" in
         ;;
 esac
 
-# ── structural skips (LOUD, rc=77 — the suite's skip convention) ────────────
-if [ "$LEG" = "split" ] && [ "$PACING" = "backtoback" ]; then
-    echo "SKIP (rc=77): split × backtoback is structurally unmeasurable —" >&2
+# ── execution-mode axis (CER_BENCH_EXECUTION_MODE) ──────────────────────────
+# free_run (default) = the shipped multi-process default: the graph runs with
+#   CERULION_EXECUTION_MODE UNSET (`env -u` in RUN_CMD below, so an inherited
+#   value cannot pick the contract). lockstep = the shared-barrier opt-out,
+#   CERULION_EXECUTION_MODE=lockstep. Resolved ONCE here, before any build, so
+#   a bad value dies in milliseconds and the per-size loop cannot flip mode
+#   mid-sweep.
+EXEC_MODE="${CER_BENCH_EXECUTION_MODE:-free_run}"
+case "$EXEC_MODE" in
+    free_run|lockstep) ;;
+    *)
+        echo "run_workspace.sh: CER_BENCH_EXECUTION_MODE='$EXEC_MODE' is not an execution mode" >&2
+        echo "  (free_run | lockstep)" >&2
+        exit 2
+        ;;
+esac
+# The mono leg runs --single-process: no ranks, so it IS the one-rank lockstep
+# timeline in either mode and a lockstep row of it would be a second label on
+# the same measurement. Refused rather than minted.
+if [ "$LEG" = "mono" ] && [ "$EXEC_MODE" = "lockstep" ]; then
+    echo "run_workspace.sh: CER_BENCH_EXECUTION_MODE=lockstep on the mono leg is refused:" >&2
+    echo "  a --single-process run has no ranks to lock together, so the row would be the" >&2
+    echo "  free_run mono row under a second label. Use split or split3 for the lockstep arm." >&2
+    exit 2
+fi
+# A CERULION_EXECUTION_MODE exported in this shell that names the OTHER mode is
+# a contradictory declaration (the same rule as CER_BENCH_DMA_LOCK=0 beside an
+# exported CERULION_CPU_DMA_LOCK): refuse it rather than guess which half was
+# meant. A value that agrees (or an empty one under free_run, which the CLI
+# reads as the default) is harmless, since RUN_CMD sets or unsets the variable
+# itself either way.
+if [ "${CERULION_EXECUTION_MODE+set}" = "set" ]; then
+    case "$EXEC_MODE:$CERULION_EXECUTION_MODE" in
+        free_run:|free_run:free_run|lockstep:lockstep) ;;
+        *)
+            echo "run_workspace.sh: CER_BENCH_EXECUTION_MODE=$EXEC_MODE but CERULION_EXECUTION_MODE" >&2
+            echo "  is also exported (='$CERULION_EXECUTION_MODE'): contradictory execution mode; unset" >&2
+            echo "  CERULION_EXECUTION_MODE and choose the mode with CER_BENCH_EXECUTION_MODE." >&2
+            exit 2
+            ;;
+    esac
+fi
+if [ "$EXEC_MODE" = "lockstep" ]; then
+    MODE_UNSET=()
+    MODE_SET=(CERULION_EXECUTION_MODE=lockstep)
+else
+    MODE_UNSET=(-u CERULION_EXECUTION_MODE)
+    MODE_SET=()
+fi
+
+# ── structural skips (LOUD, rc=77: the suite's skip convention) ─────────────
+if { [ "$LEG" = "split" ] || [ "$LEG" = "split3" ]; } && [ "$PACING" = "backtoback" ]; then
+    echo "SKIP (rc=77): $LEG × backtoback is structurally unmeasurable:" >&2
     echo "--time-source virtual on a process_groups graph dispatches to the" >&2
     echo "supervisor with the time-source IGNORED (real-clock mp has no uncapped" >&2
     echo "mode; the period floor is 1 ms). A 1 kHz-capped line labeled" >&2
@@ -339,13 +412,53 @@ case "$MSG_CLASS:$CER_BENCH_RAW_NAME" in
         echo "run_workspace.sh: CER_BENCH_MSG=pod but CER_BENCH_RAW_NAME='$CER_BENCH_RAW_NAME' is not the pinned pod grammar" >&2
         echo "  — the raw prefix is what the CSV and the plots classify on (plot.py reads the LEG token's" >&2
         echo "  '_pod' suffix), so this run would publish pod numbers under a sensor_msgs/Image label." >&2
-        echo "  Use: cerulion_workspace_<leg>_pod_chrt<0|1>." >&2
+        echo "  Use: cerulion_workspace_<leg>[_lockstep]_pod_chrt<0|1>." >&2
         exit 2
         ;;
     variable:*_pod_*)
         echo "run_workspace.sh: CER_BENCH_MSG=variable but CER_BENCH_RAW_NAME='$CER_BENCH_RAW_NAME' carries the pod class token" >&2
         echo "  — the raw prefix is what the CSV and the plots classify on, so this run would publish" >&2
         echo "  variable-class numbers under a pod label. Drop '_pod' from the name, or set CER_BENCH_MSG=pod." >&2
+        exit 2
+        ;;
+esac
+# The execution mode rides the raw prefix the same way: `_lockstep` sits
+# between the leg token and the optional `_pod` class token
+# (cerulion_workspace_<leg>_lockstep[_pod]_chrt<N>), so plot.py's `_pod`
+# SUFFIX rule on the leg group still reads the class, and a lockstep run can
+# never publish under the free-run row's name (or the reverse). Pinned
+# grammar only, as above: an ad-hoc name that does not open with the pinned
+# prefix claims no mode, but under free_run any name carrying the token is
+# refused.
+case "$EXEC_MODE:$CER_BENCH_RAW_NAME" in
+    lockstep:cerulion_workspace_*_lockstep_chrt[01]) ;;
+    lockstep:cerulion_workspace_*_lockstep_pod_chrt[01]) ;;
+    lockstep:cerulion_workspace_*)
+        echo "run_workspace.sh: CER_BENCH_EXECUTION_MODE=lockstep but CER_BENCH_RAW_NAME='$CER_BENCH_RAW_NAME' is not the pinned lockstep grammar" >&2
+        echo "  (the raw prefix is what the CSV and the plots classify on, so this run would publish" >&2
+        echo "  lockstep numbers under a free-run label). Use: cerulion_workspace_<leg>_lockstep[_pod]_chrt<0|1>." >&2
+        exit 2
+        ;;
+    free_run:*_lockstep_*)
+        echo "run_workspace.sh: CER_BENCH_EXECUTION_MODE=free_run but CER_BENCH_RAW_NAME='$CER_BENCH_RAW_NAME' carries the lockstep token" >&2
+        echo "  (the raw prefix is what the CSV and the plots classify on, so this run would publish" >&2
+        echo "  free-run numbers under a lockstep label). Drop '_lockstep', or set CER_BENCH_EXECUTION_MODE=lockstep." >&2
+        exit 2
+        ;;
+esac
+# And the LEG token: a pinned name must name THIS leg, exactly. The arms are
+# spelled out whole (not `${LEG}_*`) because `split` is a prefix of `split3`:
+# `cerulion_workspace_split3_chrt0` under the split leg would satisfy a
+# prefix test and publish split numbers under the split3 label.
+case "$CER_BENCH_RAW_NAME" in
+    "cerulion_workspace_${LEG}_chrt"[01]) ;;
+    "cerulion_workspace_${LEG}_pod_chrt"[01]) ;;
+    "cerulion_workspace_${LEG}_lockstep_chrt"[01]) ;;
+    "cerulion_workspace_${LEG}_lockstep_pod_chrt"[01]) ;;
+    cerulion_workspace_*)
+        echo "run_workspace.sh: CER_BENCH_RAW_NAME='$CER_BENCH_RAW_NAME' does not name the '$LEG' leg" >&2
+        echo "  (the raw prefix is what the CSV and the plots classify on, so this run would publish" >&2
+        echo "  $LEG numbers under another leg's label). Use: cerulion_workspace_${LEG}[_lockstep][_pod]_chrt<0|1>." >&2
         exit 2
         ;;
 esac
@@ -907,7 +1020,8 @@ fi
 # ── leg -> graph + flags ────────────────────────────────────────────────────
 # The row label IS the invocation. split = the declared `process_groups:`
 # graph, zero flags (real-clock mp; the run spawns the gateway — no env
-# overrides). mono = the same node chain in one process via exactly
+# overrides). split3 = the same chain declared as three groups, one node
+# each, zero flags. mono = the same node chain in one process via exactly
 # `--single-process`. The type-class axis picks the graph pair: the pod
 # graphs are faithful wiring mirrors of the variable pair with only the
 # node types + schema swapped (see the graphs' provenance headers).
@@ -916,6 +1030,9 @@ GRAPH="rtt_bench"
 LEG_FLAGS=(--single-process)
 if [ "$LEG" = "split" ]; then
     GRAPH="${GRAPH}_split"
+    LEG_FLAGS=()
+elif [ "$LEG" = "split3" ]; then
+    GRAPH="${GRAPH}_split3"
     LEG_FLAGS=()
 fi
 PACING_FLAGS=()
@@ -964,6 +1081,64 @@ trap 'stop_usage_sampler;
 
 # Portable file size (stat -c is GNU, stat -f is BSD — wc -c is both).
 file_size() { wc -c <"$1" 2>/dev/null | tr -d '[:space:]'; }
+
+# ── execution-mode witness (multi-process legs) ─────────────────────────────
+# A POSITIVE witness that the mode this row is labeled with is the mode the
+# run EXECUTED: every worker logs one INFO line, "worker build path resolved
+# from the stamped execution mode", carrying `execution_mode=<Lockstep|FreeRun>`
+# (graph_cmd.rs). It passes the CLI's default `cerulion=info` filter for
+# workers; an exported RUST_LOG that drops cerulion INFO removes the line, and
+# the witness then fails the leg loudly rather than passing it. The log
+# carries ANSI escapes between a field's name and its `=`, so they are
+# stripped first. Exactly RANKS lines, every one naming WANT_MODE; anything
+# else (a missing worker line, a stale binary that logs no such line, the
+# other mode) is a hard failure, never a label.
+case "$LEG" in
+    split) RANKS=2 ;;
+    split3) RANKS=3 ;;
+    *) RANKS=0 ;;
+esac
+if [ "$EXEC_MODE" = "lockstep" ]; then WANT_MODE="Lockstep"; else WANT_MODE="FreeRun"; fi
+verify_mode_witness() {
+    local log="$1" lines rc n bad
+    [ "$RANKS" -gt 0 ] || return 0
+    local stripped
+    # Read (and strip) FIRST, on its own: under pipefail a failed read piped
+    # into grep would surface as grep's status and could not be told apart
+    # from "no matching line".
+    if ! stripped=$(sed $'s/\x1b\\[[0-9;]*m//g' "$log"); then
+        echo "!!! payload=$SIZE: could not read $log for the execution-mode witness" >&2
+        return 1
+    fi
+    lines=$(printf '%s\n' "$stripped" | grep "worker build path resolved from the stamped execution mode")
+    rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "!!! payload=$SIZE: grep failed (rc=$rc) on $log for the execution-mode witness" >&2
+        return 1
+    fi
+    n=0
+    [ -n "$lines" ] && n=$(printf '%s\n' "$lines" | wc -l | tr -d '[:space:]')
+    bad=$(printf '%s\n' "$lines" | awk -v want="$WANT_MODE" '
+        NF == 0 { next }
+        {
+            got = ""
+            for (i = 1; i <= NF; i++) {
+                k = index($i, "=")
+                if (k > 0 && substr($i, 1, k - 1) == "execution_mode") got = substr($i, k + 1)
+            }
+            if (got != want) c++
+        }
+        END { print c + 0 }')
+    if [ "$n" -ne "$RANKS" ] || [ "$bad" != "0" ]; then
+        echo "" >&2
+        echo "!!! EXECUTION-MODE WITNESS: payload=$SIZE leg=$LEG wants $RANKS worker line(s) with" >&2
+        echo "!!! execution_mode=$WANT_MODE; found $n line(s), $bad naming another mode. The row would" >&2
+        echo "!!! carry a mode label the run did not execute. Log: $log" >&2
+        return 1
+    fi
+    echo "   execution-mode witness: $n/$RANKS workers execution_mode=$WANT_MODE"
+    return 0
+}
 
 # ── one (size, rate) run + gates ────────────────────────────────────────────
 # The whole "announce → rewrite period → rebuild ping → run under the
@@ -1059,8 +1234,16 @@ run_size_once() {
     # measured samples — the equality gate below depends on this.
     RUN_CMD=(env
         # FIRST: `env` parses options only before the first name=value
-        # operand, so the `-u` form above must precede every assignment.
+        # operand, so every `-u` form must precede every assignment.
+        # MODE_UNSET is `-u CERULION_EXECUTION_MODE` under free_run and
+        # empty under lockstep; DMA_ENV is either a `-u` or an assignment,
+        # so it comes after MODE_UNSET and before the assignments.
+        ${MODE_UNSET[@]+"${MODE_UNSET[@]}"}
         ${DMA_ENV[@]+"${DMA_ENV[@]}"}
+        # The execution mode (CER_BENCH_EXECUTION_MODE, resolved once
+        # above): CERULION_EXECUTION_MODE=lockstep under lockstep, nothing
+        # under free_run (the variable was removed by MODE_UNSET).
+        ${MODE_SET[@]+"${MODE_SET[@]}"}
         CER_BENCH_PAYLOAD_SIZE="$SIZE"
         CER_BENCH_TARGET_SAMPLES="$MEASURED"
         CER_BENCH_WARMUP="$WARMUP"
@@ -1091,7 +1274,7 @@ run_size_once() {
     rm -f "$USAGE_PATH"
     if [ "$USAGE_ON" = "1" ]; then
         python3 "$USAGE_SAMPLER" --out "$USAGE_PATH" --parent-pid $$ --descend \
-            --label "leg=$LEG msg=$MSG_CLASS size=$SIZE pacing=$PACING rate_hz=${RATE_HZ:-}" \
+            --label "leg=$LEG msg=$MSG_CLASS execution_mode=$EXEC_MODE size=$SIZE pacing=$PACING rate_hz=${RATE_HZ:-}" \
             2>"$LOG_DIR/${CER_BENCH_RAW_NAME}_${SIZE}${RUN_LOG_SUFFIX}.sampler.log" &
         SAMPLER_PID=$!
     fi
@@ -1185,6 +1368,13 @@ run_size_once() {
         echo "!!! payload=$SIZE: 'cerulion graph run $GRAPH' exited $RUN_STATUS" >&2
         echo "!!! (not a watchdog kill) — a hard failure. Log tail:" >&2
         tail -30 "$RUN_LOG" >&2
+        exit 1
+    fi
+
+    # The execution-mode witness: hard failure in EVERY pacing mode (a wrong
+    # mode is a mislabel, not a cannot-sustain rung).
+    if ! verify_mode_witness "$RUN_LOG"; then
+        rm -f "$BIN_PATH"
         exit 1
     fi
 
@@ -1481,7 +1671,7 @@ run_size_once() {
     # Full delivery == received ≈ forwarded ≈ published AND drop_oldest=0
     # (deficits explained by data-trigger latest-wins coalescing, never
     # silent loss).
-    echo "-- delivery accounting (leg=$LEG payload=$SIZE) --"
+    echo "-- delivery accounting (leg=$LEG execution_mode=$EXEC_MODE payload=$SIZE) --"
     if [ "$PACING" != "backtoback" ]; then
         # Schedule vs EFFECTIVE rate side by side (integer period_ms
         # quantization — see the PERIOD_MS comment in the sweep loop): at
@@ -1570,7 +1760,7 @@ run_size_once() {
 }
 
 echo ""
-echo "leg=$LEG graph=$GRAPH msg=$MSG_CLASS pacing=$PACING raw_name=$CER_BENCH_RAW_NAME"
+echo "leg=$LEG graph=$GRAPH msg=$MSG_CLASS execution_mode=$EXEC_MODE pacing=$PACING raw_name=$CER_BENCH_RAW_NAME"
 echo "sizes: ${SIZES[*]}"
 
 for SIZE in "${SIZES[@]}"; do

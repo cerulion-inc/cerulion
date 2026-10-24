@@ -24,24 +24,24 @@ fn try_new_rejects_one() {
 
 #[test]
 fn try_new_rejects_just_below_wire_header_size() {
-    // 31 = WireHeader::SIZE - 1 = floor of the rejection band.
-    assert_eq!(WireHeader::SIZE, 32);
-    assert!(MaxSliceLen::try_new(31).is_none());
+    // 39 = WireHeader::SIZE - 1 = top of the rejection band.
+    assert_eq!(WireHeader::SIZE, 40);
+    assert!(MaxSliceLen::try_new(39).is_none());
 }
 
 #[test]
 fn try_new_accepts_exactly_wire_header_size() {
-    // 32 = WireHeader::SIZE = smallest legal MaxSliceLen.
-    // Header-only payloads (e.g. std_msgs::Empty, total = 32) are
-    // valid; rejecting 32 would break empty-message schemas.
-    let v = MaxSliceLen::try_new(32).expect("32 must be accepted");
-    assert_eq!(v.get(), 32);
+    // 40 = WireHeader::SIZE = smallest legal MaxSliceLen.
+    // Header-only payloads (e.g. std_msgs::Empty, total = 40) are
+    // valid; rejecting 40 would break empty-message schemas.
+    let v = MaxSliceLen::try_new(40).expect("40 must be accepted");
+    assert_eq!(v.get(), 40);
 }
 
 #[test]
 fn try_new_accepts_one_above_wire_header_size() {
-    let v = MaxSliceLen::try_new(33).expect("33 must be accepted");
-    assert_eq!(v.get(), 33);
+    let v = MaxSliceLen::try_new(41).expect("41 must be accepted");
+    assert_eq!(v.get(), 41);
 }
 
 #[test]
@@ -61,9 +61,9 @@ fn try_new_accepts_u32_max_at_ceiling() {
 #[test]
 fn const_new_accepts_at_floor() {
     // `const_new` is the const-eval-aware constructor used by codegen.
-    // The const itself proves the floor (32) is accepted at const-eval.
-    const FLOOR: MaxSliceLen = MaxSliceLen::const_new(32);
-    assert_eq!(FLOOR.get(), 32);
+    // The const itself proves the floor (40) is accepted at const-eval.
+    const FLOOR: MaxSliceLen = MaxSliceLen::const_new(40);
+    assert_eq!(FLOOR.get(), 40);
 }
 
 #[test]
@@ -85,12 +85,12 @@ fn const_new_panics_on_zero_at_runtime() {
 #[test]
 #[should_panic(expected = "MaxSliceLen::const_new requires n >= WireHeader::SIZE")]
 fn const_new_panics_on_just_below_floor() {
-    let _ = MaxSliceLen::const_new(31);
+    let _ = MaxSliceLen::const_new(39);
 }
 
 #[test]
 fn get_round_trips_construction() {
-    for n in [32u32, 33, 64, 256, 4096, 65536, 1 << 24, u32::MAX] {
+    for n in [40u32, 41, 64, 256, 4096, 65536, 1 << 24, u32::MAX] {
         let v = MaxSliceLen::try_new(n).unwrap_or_else(|| panic!("{} must be accepted", n));
         assert_eq!(v.get(), n, "round-trip failed for {}", n);
     }

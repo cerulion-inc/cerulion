@@ -203,6 +203,7 @@ impl WideProducer {
 fn wide_producer_def(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "wide_producer".to_string(),
@@ -458,6 +459,7 @@ fn run_freeze(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, [u64; 4])> 
     // the snapshot freezes it to the prior step.
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "consumer".to_string(),
         node_type: "freeze_consumer".to_string(),
@@ -703,6 +705,7 @@ fn run_panic_iso(
     // PARALLEL (no-port-from-the-snapshot-set Period closure → not serial-gated).
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "panic".to_string(),
         node_type: "panic_node".to_string(),
@@ -718,6 +721,7 @@ fn run_panic_iso(
     for i in 0..SURVIVORS {
         nodes.push(NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: format!("s{i:02}"),
             node_type: "survivor_node".to_string(),
@@ -905,6 +909,7 @@ fn run_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntry> {
     // decision order; routed to the serial path by serial_fire_node_ids.
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "gated".to_string(),
         node_type: "gated_closure".to_string(),
@@ -1093,6 +1098,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
     // The fast block producer (level 0).
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "bprod".to_string(),
         node_type: "block_fast_producer".to_string(),
@@ -1117,6 +1123,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
     // as bprod + the macros (not level 1).
     nodes.push(NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "bcons".to_string(),
         node_type: "block_slow_consumer".to_string(),
@@ -1245,6 +1252,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
 
     let mk_producer = |id: &str| NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "block_fast_producer".to_string(),
@@ -1259,6 +1267,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
     };
     let mk_consumer = |id: &str, src: &str| NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "block_slow_consumer".to_string(),
@@ -1415,6 +1424,7 @@ fn interleaved_gated_node_merges_in_decision_order() {
             // closure to a later level (it stays at level 0, decision position 2).
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "gated".to_string(),
                 node_type: "gated_closure".to_string(),
@@ -1615,6 +1625,7 @@ fn wide_rayon_level_stamps_nonzero_global_level() {
     for id in &consumer_ids {
         nodes.push(NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: id.clone(),
             node_type: "wide_consumer".to_string(),

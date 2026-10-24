@@ -130,7 +130,7 @@
 //! (`test_node_macro_period_cdylib`, `period_ms = 50`) feeding `relay`
 //! (`test_node_macro_data_trigger_cdylib`), both publishing `geometry_msgs/Vector3`.
 //! Read off those two fixtures' SOURCE, every frame either node publishes is a
-//! 32-byte wire header carrying `Vector3::SCHEMA_HASH` followed by 24 bytes of
+//! 40-byte wire header carrying `Vector3::SCHEMA_HASH` followed by 24 bytes of
 //! zero: the ticker writes `cmd.x = 0.0` and touches nothing else, and the relay
 //! forwards that same `x`. So the oracle is written from the fixtures, not read
 //! off the run, and it is checked BEFORE the resim — a bag whose frames are not
@@ -743,7 +743,7 @@ fn gating_stamp_violation(stamps: &[u64], gating: Gating) -> Option<String> {
 /// `ticker` (`period_ms = 50`) writes `cmd.x = 0.0` and touches no other field;
 /// `relay` forwards `cmd.x = trigger_in.x`. `geometry_msgs/Vector3` is three
 /// `f64`s and carries no variable field, so a frame on either topic is exactly a
-/// 32-byte wire header plus 24 zero bytes.
+/// 40-byte wire header plus 24 zero bytes.
 ///
 /// Also asserts the per-topic wire SEQUENCE is STRICTLY ASCENDING, which is the
 /// half a constant payload cannot state: a bag carrying a frame twice, or one
@@ -785,7 +785,7 @@ fn assert_frames_match_the_fixture_oracle(
     );
 
     const VECTOR3_WIRE_BYTES: usize = 24;
-    const HEADER_BYTES: usize = 32;
+    const HEADER_BYTES: usize = WireHeader::SIZE;
     let hash =
         <native_ros2_messages::geometry_msgs::Vector3 as cerulion_core::ShmMessage>::SCHEMA_HASH;
 
@@ -1847,7 +1847,7 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
     //
     // What is asserted instead, and what it is worth: the recorded frames are
     // byte-exact against a hand oracle written from the fixtures' source (their
-    // full 32-byte header AND their payload), and this same bag re-executes.
+    // full 40-byte header AND their payload), and this same bag re-executes.
     // The golden is independently checked; nothing here is a self-compare.
 }
 
@@ -1868,7 +1868,7 @@ impl CoTenant {
     ///
     /// A hand-built wire frame, not a typed publish: what matters is that the
     /// recorder's discovery finds a LIVE producer and taps it, and a valid
-    /// 32-byte header is all a tap needs to record one (a headerless frame is
+    /// 40-byte header is all a tap needs to record one (a headerless frame is
     /// recorded too, but with a FABRICATED sequence, which would make the
     /// capture's own health report describe this test rather than the feature).
     fn spawn(topic: &str) -> Self {

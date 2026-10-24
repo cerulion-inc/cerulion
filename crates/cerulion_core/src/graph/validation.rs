@@ -557,8 +557,8 @@ pub fn validate_graph_with(
     // Validate max_slice_len is within the wire-format-representable range.
     //
     // Lower bound: `>= WireHeader::SIZE` (the wire frame requires at least the
-    // 32-byte header — a header-only payload like `std_msgs::Empty` whose
-    // `WIRE_FIXED_SIZE = 0` is valid at exactly 32 bytes). Upper bound:
+    // 40-byte header; a header-only payload like `std_msgs::Empty` whose
+    // `WIRE_FIXED_SIZE = 0` is valid at exactly 40 bytes). Upper bound:
     // `<= u32::MAX` (the wire format's `WireHeader::total_size`
     // field is `u32`, so slot sizes above 4 GiB cannot be represented).
     // Failing graph-load surfaces the misconfig with an actionable error
@@ -721,6 +721,11 @@ pub fn validate_graph_with(
 /// 4. Every `params:` value is a scalar (string / number / bool).
 /// 5. A graph of ONLY ros2 entries is refused — the runtime has nothing to
 ///    schedule; `cerulion ros2 run <launch-file>` is the tool for that.
+/// 6. A ros2 entry carries no native `params:` (the `#[param]` values of a
+///    native node): its ROS 2 parameters go under `ros2.params`. Refused HERE,
+///    in the check every run makes, because the run lifts ros2 entries out of
+///    the graph before it resolves native params, so a key that slipped past
+///    this check (`graph run --no-validate`) would be silently dead.
 ///
 /// `process_groups:` membership is refused in `validate_process_groups` and
 /// `level_assignments:` membership in `validate_graph_with` (each beside the
@@ -743,6 +748,21 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
             return reject(format!(
                 "node '{}': declares BOTH `type:` and `ros2:` — an entry is either a native \
                  node (`type:`) or a ROS 2 process (`ros2:`); remove one",
+                node.id
+            ));
+        }
+        if !node.params.is_empty() {
+            // The remedy follows the entry's shape: a `launch:` entry refuses
+            // `ros2.params` too (its launch file declares its parameters), so
+            // pointing it there would trade one refusal for another.
+            let remedy = if ros2.launch.is_some() {
+                "a launch file declares its own parameters; pass launch arguments \
+                 (`name:=value`) through `ros2.args` instead"
+            } else {
+                "put ROS 2 parameters under `ros2.params` on that entry"
+            };
+            return reject(format!(
+                "node '{}': `params:` is not accepted on a `ros2:` entry; {remedy}",
                 node.id
             ));
         }
@@ -1395,13 +1415,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 31
+        max_slice_len: 39
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_err(),
-            "max_slice_len: 31 (< WireHeader::SIZE) must fail graph-load"
+            "max_slice_len: 39 (< WireHeader::SIZE) must fail graph-load"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1411,7 +1431,7 @@ nodes:
     }
 
     /// Pin the exact
-    /// floor — `max_slice_len: 32` (exactly `WireHeader::SIZE`) is
+    /// floor: `max_slice_len: 40` (exactly `WireHeader::SIZE`) is
     /// accepted. Mirror of `try_new_accepts_exactly_wire_header_size`
     /// in `max_slice_len_newtype_test.rs`. This is the boundary
     /// (`<`, not `<=`); a future
@@ -1428,13 +1448,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 32
+        max_slice_len: 40
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_ok(),
-            "max_slice_len: 32 (== WireHeader::SIZE) must be accepted (header-only payload). \
+            "max_slice_len: 40 (== WireHeader::SIZE) must be accepted (header-only payload). \
              Error was: {:?}",
             result.err()
         );

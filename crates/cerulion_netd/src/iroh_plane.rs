@@ -8,7 +8,7 @@
 //! Where the zenoh [`GatewayMirrorPlane`](crate::mirror::GatewayMirrorPlane) ensures a
 //! mirror via `register_ingress_topic` (a zenoh subscriber + the SHM mirror
 //! publisher), this plane ensures the SAME kind of mirror over iroh: it dials the
-//! robot's `cerulion/wire/1` ALPN, demands the topic over the shared `cerulion_q`
+//! robot's `cerulion/wire/2` ALPN, demands the topic over the shared `cerulion_q`
 //! control vocabulary, and re-injects each per-topic uni-stream frame into desk SHM
 //! through the SHARED validated re-inject primitive
 //! [`IngressInjector::reinject_raw`](cerulion_core::transport::network::IngressInjector::reinject_raw)
@@ -171,7 +171,7 @@ pub struct IrohMirrorPlane {
     /// The WAN half of the ONE demand-authorization seam — consulted
     /// BEFORE dialing so an unauthorized WAN demand never opens a connection. This
     /// COMPOSES WITH (never replaces) the robot's own `PairingAuthorizer` accept at the
-    /// `cerulion/wire/1` ALPN (which still refuses an unpaired desk key on the wire); it
+    /// `cerulion/wire/2` ALPN (which still refuses an unpaired desk key on the wire); it
     /// is netd's desk-side pre-flight gate. It STAYS the deny-nothing
     /// [`AllowAllAuthorizer`] (byte-identical): the robot is the authoritative
     /// per-demand enforcement point — the `is_allowed`-backed

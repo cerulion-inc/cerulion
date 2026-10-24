@@ -15,8 +15,8 @@
 //! a heap struct, so nothing here asserts on those patterns.
 
 use cerulion_core::codegen::{
-    generate_schema, parse_rosmsg, resolve_fixed_nested, DefaultLiteral, FieldDef, FieldType,
-    MessageSchema, NestedFixedInfo,
+    generate_schema, parse_rosmsg, parse_rossrv, resolve_fixed_nested, FieldDef, FieldType,
+    MessageSchema, NestedFixedInfo, ScalarLiteral,
 };
 
 /// NO generated code may name a bare `::serde` path.
@@ -87,6 +87,110 @@ fn the_bare_serde_guard_rejects_a_bare_path_in_every_derive_position() {
 // =============================================================================
 // Fixed-schema codegen
 // =============================================================================
+
+/// The `pub struct` names in `code` whose attribute block (the `#[...]` and
+/// `///` lines right above the declaration) does not hold
+/// `#[allow(non_camel_case_types)]`.
+fn structs_without_camel_case_allow(code: &str) -> Vec<String> {
+    let lines: Vec<&str> = code.lines().collect();
+    let mut missing = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("pub struct ") else {
+            continue;
+        };
+        let allowed = lines[..i]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+            .any(|l| *l == "#[allow(non_camel_case_types)]");
+        if !allowed {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            missing.push(name);
+        }
+    }
+    missing
+}
+
+/// A service request or response keeps its ROS 2 name (`SetBool_Request`),
+/// which the `non_camel_case_types` lint rejects. Every generated struct of
+/// such a message (marker, `Shm`, `FixedSection`, `Snapshot`) carries the
+/// allow, for a fixed and for a variable message.
+#[test]
+fn service_message_structs_allow_the_ros_2_names() {
+    let srv = parse_rossrv(
+        "bool data\n---\nbool success\nstring message\n",
+        "SetBool",
+        Some("std_srvs"),
+        "std_srvs/SetBool.srv",
+    )
+    .expect("SetBool parses");
+    for schema in [&srv.request, &srv.response] {
+        let code = generate_schema(schema);
+        assert!(code.contains(&format!("pub struct {};", schema.name)));
+        assert_eq!(
+            structs_without_camel_case_allow(&code),
+            Vec::<String>::new(),
+            "{} structs without the allow",
+            schema.name
+        );
+    }
+    // The variable response emits all four kinds of struct.
+    let code = generate_schema(&srv.response);
+    for name in [
+        "SetBool_Response;",
+        "SetBool_ResponseShm<'a> {",
+        "SetBool_ResponseFixedSection {",
+        "SetBool_ResponseSnapshot {",
+    ] {
+        assert!(
+            code.contains(&format!("pub struct {name}")),
+            "missing {name}"
+        );
+    }
+}
+
+/// A plain UpperCamelCase name gets no allow, so its output is unchanged.
+#[test]
+fn a_camel_case_message_gets_no_camel_case_allow() {
+    let mut schema = MessageSchema::new("Vector3");
+    schema.add_field(FieldDef::new("x", FieldType::F64));
+    let code = generate_schema(&schema);
+    assert!(!code.contains("non_camel_case_types"), "{code}");
+}
+
+/// A name that starts lower case is also rejected by the lint, so it gets
+/// the allow on every struct even with no underscore.
+#[test]
+fn a_lower_case_message_name_gets_the_camel_case_allow() {
+    let mut schema = MessageSchema::new("vector3");
+    schema.add_field(FieldDef::new("x", FieldType::F64));
+    let code = generate_schema(&schema);
+    assert_eq!(
+        structs_without_camel_case_allow(&code),
+        Vec::<String>::new()
+    );
+}
+
+/// Generating a service message twice gives the same text, allow lines
+/// included.
+#[test]
+fn service_message_codegen_is_deterministic() {
+    let srv = parse_rossrv(
+        "bool data\n---\nbool success\nstring message\n",
+        "SetBool",
+        Some("std_srvs"),
+        "std_srvs/SetBool.srv",
+    )
+    .expect("SetBool parses");
+    assert_eq!(
+        generate_schema(&srv.response),
+        generate_schema(&srv.response)
+    );
+    assert_eq!(generate_schema(&srv.request), generate_schema(&srv.request));
+}
 
 #[test]
 fn test_fixed_schema_emits_marker_shm_snapshot_shm_message() {
@@ -2008,9 +2112,9 @@ fn variable_fields_named_after_private_fields_compile() {
 fn nonzero_scalar_defaults_emit_manual_default() {
     let mut quat = MessageSchema::new("Quat");
     for f in ["x", "y", "z"] {
-        quat.add_field(FieldDef::new(f, FieldType::F64).with_default(DefaultLiteral::Float(0.0)));
+        quat.add_field(FieldDef::new(f, FieldType::F64).with_default(ScalarLiteral::Float(0.0)));
     }
-    quat.add_field(FieldDef::new("w", FieldType::F64).with_default(DefaultLiteral::Float(1.0)));
+    quat.add_field(FieldDef::new("w", FieldType::F64).with_default(ScalarLiteral::Float(1.0)));
 
     let code = generate_schema(&quat);
     // Manual Default impls with the literal, on both Shm and Snapshot.
@@ -2023,7 +2127,7 @@ fn nonzero_scalar_defaults_emit_manual_default() {
 
     // All-zero defaults keep the plain derive (clippy derivable_impls).
     let mut zeroed = MessageSchema::new("Zeroed");
-    zeroed.add_field(FieldDef::new("x", FieldType::F64).with_default(DefaultLiteral::Float(0.0)));
+    zeroed.add_field(FieldDef::new("x", FieldType::F64).with_default(ScalarLiteral::Float(0.0)));
     let code = generate_schema(&zeroed);
     assert!(
         code.contains("#[derive(Debug, Clone, Copy, PartialEq, Default)]\npub struct ZeroedShm {")
@@ -2175,5 +2279,272 @@ fn test_i8_push_round_trip_via_int8_multi_array() {
         writer.data(),
         &[-1, 5, i8::MIN],
         "i8 push round-trip must preserve negative values bit-exactly"
+    );
+}
+
+/// Parse a `.msg` text in package `p` and generate its code.
+fn generate_from_msg(text: &str, name: &str) -> String {
+    generate_schema(&parse_rosmsg(text, name, Some("p")).expect("test .msg parses"))
+}
+
+/// Message constants become associated constants on the marker, with the
+/// field type's Rust type and the declared value.
+#[test]
+fn constants_are_emitted_as_associated_constants_on_the_marker() {
+    let code = generate_from_msg(
+        "uint8 PARAMETER_NOT_SET=0\nint64 NEG=-3\nfloat32 HALF=0.5\nbool ON=true\n\
+         string MODE=\"AUTO \\\"x\\\"\"\nint32 v\n",
+        "Consts",
+    );
+    let expected = "impl Consts {\n\
+        \x20   /// Constant `PARAMETER_NOT_SET` declared in the message.\n\
+        \x20   pub const PARAMETER_NOT_SET: u8 = 0;\n\
+        \x20   /// Constant `NEG` declared in the message.\n\
+        \x20   pub const NEG: i64 = -3;\n\
+        \x20   /// Constant `HALF` declared in the message.\n\
+        \x20   pub const HALF: f32 = 0.5;\n\
+        \x20   /// Constant `ON` declared in the message.\n\
+        \x20   pub const ON: bool = true;\n\
+        \x20   /// Constant `MODE` declared in the message.\n\
+        \x20   pub const MODE: &'static str = \"AUTO \\\"x\\\"\";\n\
+        }\n";
+    assert!(code.contains(expected), "constants block missing:\n{code}");
+}
+
+/// A message without constants gets no inherent impl on its marker.
+#[test]
+fn a_message_without_constants_has_no_inherent_marker_impl() {
+    let code = generate_from_msg("int32 v\n", "Plain");
+    assert!(!code.contains("impl Plain {"));
+}
+
+/// A constant that would shadow a `ShmMessage` trait item is refused at
+/// compile time, naming the constant.
+#[test]
+fn a_constant_named_like_a_trait_item_is_a_compile_error() {
+    let code = generate_from_msg("uint64 SCHEMA_HASH=1\nint32 v\n", "Clash");
+    assert!(code
+        .contains("compile_error!(\"schema `Clash`: constant name(s) `SCHEMA_HASH` are reserved"));
+    assert!(!code.contains("impl Clash {"));
+}
+
+/// String and primitive-array defaults land in the snapshot's manual
+/// `Default`; the fixed overlay of a variable schema keeps its derive when
+/// none of ITS fields has a non-zero default.
+#[test]
+fn string_and_array_defaults_reach_the_variable_snapshot_default() {
+    let code = generate_from_msg(
+        "string name \"robot \\\"one\\\"\"\nint32[] ids [1, -2]\nbool[] flags [true]\n\
+         float64[2] gains [1, 0.5]\nint32 plain\n",
+        "Defaults",
+    );
+    let snapshot_default = "impl Default for DefaultsSnapshot {\n\
+        \x20   fn default() -> Self {\n\
+        \x20       Self {\n\
+        \x20           name: ::std::string::String::from(\"robot \\\"one\\\"\"),\n\
+        \x20           ids: ::std::vec![1, -2],\n\
+        \x20           flags: ::std::vec![true],\n\
+        \x20           gains: [1.0, 0.5],\n\
+        \x20           plain: 0,\n\
+        \x20       }\n";
+    assert!(
+        code.contains(snapshot_default),
+        "snapshot default missing:\n{code}"
+    );
+    // `gains` is a fixed-section field with a non-zero default, so the
+    // overlay gets a manual impl too, with the SHM literal. Read the body
+    // of THAT impl: the same lines also occur in the snapshot block.
+    assert_eq!(
+        impl_body(&code, "impl Default for DefaultsFixedSection {"),
+        "    fn default() -> Self {\n\
+        \x20       Self {\n\
+        \x20           gains: [1.0, 0.5],\n\
+        \x20           plain: 0,\n\
+        \x20       }\n\
+        \x20   }\n"
+    );
+}
+
+/// The body of the impl block that opens with `header`, up to its closing
+/// `}` at column 0.
+fn impl_body<'a>(code: &'a str, header: &str) -> &'a str {
+    let start = code
+        .find(header)
+        .unwrap_or_else(|| panic!("`{header}` missing:\n{code}"))
+        + header.len()
+        + 1;
+    let len = code[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("`{header}` never closes:\n{code}"))
+        + 1;
+    &code[start..start + len]
+}
+
+/// The `#[derive(...)]` attribute directly above the declaration `decl`
+/// (panics when the nearest derive belongs to another item).
+fn derive_above<'a>(code: &'a str, decl: &str) -> &'a str {
+    let at = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` missing:\n{code}"));
+    let open = code[..at]
+        .rfind("#[derive(")
+        .unwrap_or_else(|| panic!("no derive above `{decl}`"));
+    let close = open + code[open..].find(")]").expect("derive closes") + 2;
+    // Bind the derive to `decl`: only attribute lines may sit between them,
+    // so a derive on an EARLIER type never answers for this one.
+    let between = &code[close..at];
+    assert!(
+        between
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("#[")),
+        "the derive above `{decl}` belongs to another item:\n{}",
+        &code[open..at]
+    );
+    &code[open..close]
+}
+
+#[test]
+fn a_string_only_default_leaves_the_fixed_overlay_derived() {
+    let code = generate_from_msg("string name \"x\"\nint32 plain\n", "OnlyStr");
+    assert!(code.contains("impl Default for OnlyStrSnapshot {"));
+    assert!(!code.contains("impl Default for OnlyStrFixedSection"));
+    assert!(code.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Default)]\npub struct OnlyStrFixedSection {"
+    ));
+}
+
+/// A large array whose element is variable (`string[33]`, or a nested
+/// type that did not resolve as fixed) lives in the payload region, not in
+/// the fixed overlay. It must not force a manual overlay `Default`, which
+/// clippy `derivable_impls` would reject, and must not drop `Debug`.
+#[test]
+fn a_variable_large_array_leaves_the_fixed_overlay_derived() {
+    for (msg, name) in [
+        ("string[33] names\nint32 plain\n", "BigStr"),
+        ("q/Header[33] stamps\nint32 plain\n", "BigHdr"),
+    ] {
+        let code = generate_from_msg(msg, name);
+        let decl = format!("pub struct {name}FixedSection {{");
+        assert_eq!(
+            derive_above(&code, &decl),
+            "#[derive(Debug, Clone, Copy, PartialEq, Default)]",
+            "{name}"
+        );
+        assert!(
+            !code.contains(&format!("impl Default for {name}FixedSection")),
+            "{name}"
+        );
+    }
+}
+
+/// A `string[]` snapshot field holds the raw wire payload, so its default
+/// is the canonical encoding: u32 count, then per string a u32 length and
+/// its bytes, little-endian. Hand-assembled oracle for `["ab", ""]`.
+#[test]
+fn a_string_array_default_is_the_canonical_payload_bytes() {
+    let code = generate_from_msg("string[] names [\"ab\", \"\"]\n", "Names");
+    assert!(
+        code.contains("names: ::std::vec![2, 0, 0, 0, 2, 0, 0, 0, 97, 98, 0, 0, 0, 0],"),
+        "string[] default bytes missing:\n{code}"
+    );
+}
+
+/// A bool fixed-array default in a FIXED schema is stored as `u8` in the
+/// SHM overlay and as `bool` in the snapshot.
+#[test]
+fn a_fixed_bool_array_default_uses_u8_in_shm_and_bool_in_the_snapshot() {
+    let code = generate_from_msg("bool[2] mask [true, false]\n", "Mask");
+    assert!(code.contains("impl Default for MaskShm {"));
+    assert!(code.contains("            mask: [1u8, 0u8],\n"));
+    assert!(code.contains("impl Default for MaskSnapshot {"));
+    assert!(code.contains("            mask: [true, false],\n"));
+}
+
+/// Empty defaults equal the derive, so they keep the derived `Default`.
+#[test]
+fn empty_string_and_array_defaults_keep_the_derive() {
+    let code = generate_from_msg("string name \"\"\nint32[] ids []\n", "Empty");
+    assert!(!code.contains("impl Default for EmptySnapshot"));
+    assert!(
+        derive_above(&code, "pub struct EmptySnapshot {").contains("Default"),
+        "{code}"
+    );
+}
+
+/// A fixed array default of all zeros equals the derive too (the derive
+/// gives a zeroed array), so it keeps the derived `Default`; one non-zero
+/// element makes the impl manual.
+#[test]
+fn an_all_zero_fixed_array_default_keeps_the_derive() {
+    let code = generate_from_msg(
+        "int32[3] a [0, 0, 0]\nfloat64[2] g [0, 0]\nbool[2] m [false, false]\n",
+        "Zero",
+    );
+    assert!(!code.contains("impl Default for ZeroSnapshot"), "{code}");
+    assert!(!code.contains("impl Default for ZeroShm"), "{code}");
+    for decl in ["pub struct ZeroSnapshot {", "pub struct ZeroShm {"] {
+        assert!(
+            derive_above(&code, decl).contains("Default"),
+            "{decl}:\n{code}"
+        );
+    }
+    let code = generate_from_msg("int32[3] a [0, 0, 1]\n", "One");
+    assert!(code.contains("impl Default for OneSnapshot"), "{code}");
+}
+
+/// `-0.0` is not the derived `+0.0`: a negative-zero default, scalar or
+/// in a fixed array, gets a manual impl that writes `-0.0`.
+#[test]
+fn a_negative_zero_default_is_not_the_derived_zero() {
+    let code = generate_from_msg("float64[2] g [-0.0, -0.0]\nfloat32 h -0.0\n", "NegZero");
+    for decl in [
+        "impl Default for NegZeroShm {",
+        "impl Default for NegZeroSnapshot {",
+    ] {
+        assert!(
+            impl_body(&code, decl).contains("g: [-0.0, -0.0],\n"),
+            "{decl}:\n{code}"
+        );
+        assert!(
+            impl_body(&code, decl).contains("h: -0.0,\n"),
+            "{decl}:\n{code}"
+        );
+    }
+}
+
+/// An explicit empty `string[]` default is the same value as no default:
+/// the derived empty snapshot blob, which the codec and the frame walker
+/// both read as zero elements. So it keeps the derive, exactly as an
+/// omitted default does.
+#[test]
+fn an_empty_string_array_default_keeps_the_derive() {
+    let code = generate_from_msg("string[] names []\nstring<=4[<=3] tags []\n", "Names");
+    assert!(!code.contains("impl Default for NamesSnapshot"), "{code}");
+    assert!(
+        derive_above(&code, "pub struct NamesSnapshot {").contains("Default"),
+        "{code}"
+    );
+}
+
+/// Generating twice from the same text is byte-identical.
+#[test]
+fn constants_and_defaults_generate_deterministically() {
+    let text = "uint8 A=1\nstring S=\"s\"\nstring name \"x\"\nint32[] v [1, 2]\n";
+    assert_eq!(
+        generate_from_msg(text, "Det"),
+        generate_from_msg(text, "Det")
+    );
+}
+
+/// A fixed string array snapshot is `[String; N]`, so each element default
+/// is an owned `String`.
+#[test]
+fn a_fixed_string_array_default_builds_owned_strings() {
+    let code = generate_from_msg("string[2] tags [\"a\", 'b c']\n", "Tags");
+    assert!(
+        code.contains(
+            "tags: [::std::string::String::from(\"a\"), ::std::string::String::from(\"b c\")],"
+        ),
+        "fixed string array default missing:\n{code}"
     );
 }

@@ -205,7 +205,15 @@ node declaration order elsewhere in the graph file.
 4. **GO gate**: no worker enters its live loop until EVERY worker is
    built + READY. This kills the startup first-sample race: all
    subscribers are connected before the first publish, so no step's inputs
-   depend on which worker started first. What that buys depends on the
+   depend on which worker started first. The GO sentinel carries the
+   deployment's shared start epoch, 20 ms after the supervisor writes it;
+   every worker waits for that instant before its first step, so the ranks
+   that reach their live loop in time start together to within one wake
+   rather than one GO poll apart. A rank with a gating quantum (a free-run
+   `--record` rank, whose quantum is the graph's tightest declared timing
+   and at least 1 ms) that is more than one quantum late warns and starts
+   its own timeline instead; a plain free-run or lockstep rank starts
+   whenever it gets there. What that buys depends on the
    execution mode below. Under the `CERULION_EXECUTION_MODE=lockstep`
    opt-out the run is deterministic **from step 0**. Under the DEFAULT
    free run each rank advances on its own wall clock, so two live runs of
@@ -376,7 +384,8 @@ GATEWAY, which taps them on the deployment's iceoryx2 namespace.
 One robot = one network peer (Principle #8).
 
 - **Which gateway you get follows the posture.** A run with NO `network:`
-  block is PERMISSIVE (every produced topic is announced + egressable), and on
+  block is PERMISSIVE (every produced topic is egressable; topic announce tokens
+  are declared when LAN access is open), and on
   Unix the supervisor registers the deployment's egress plan with the
   machine's shared `cerulion-netd` daemon, forwarding the supervisor-minted
   worker namespace so netd's gateway taps the right shared memory. An explicit
@@ -678,9 +687,12 @@ EQUAL across ranks. Want the wall-faithful recording? Run
 
 **By default (free-run)** the paragraph above does not apply: there is no
 barrier and no handed gating quantum, and each rank records its OWN
-wall-faithful timeline, a controlled clock placed at a shared `real_ns()` epoch
-(read by every rank at its live loop's clock anchor, after GO) that then
-follows the wall, so per-step boundary times DIFFER across ranks and carry each
+wall-faithful timeline, a controlled clock placed at the deployment's shared
+start epoch (the `real_ns()` instant the GO sentinel carries; a rank that
+reaches its live loop within one gating quantum of it places exactly that value
+and counts the overshoot into its first step, and a later rank warns and places
+its own `real_ns()` at its live loop instead) that then follows the wall, so
+per-step boundary times DIFFER across ranks and carry each
 rank's real jitter. The quantum-timed lockstep recording above is what you get
 under the `CERULION_EXECUTION_MODE=lockstep` opt-out. The bag's `coordination`
 stamp (`lockstep` / `free_run`) and the run directory's `gating` label

@@ -78,7 +78,8 @@ ENVIRONMENT:
                                  HARD-exits (nonzero) to avoid a zombie, in ms
                                  (default 5000).
     CERULION_NETD_CONNECT        Zenoh locators to CONNECT to for remote robots
-                                 scouting can't reach (comma/space separated).
+                                 the boot-time mDNS browse and the peer cache
+                                 can't reach (comma/space separated).
     CERULION_NETD_LISTEN         Zenoh locators to LISTEN on (comma/space separated).
                                  This ALSO decides whether this machine advertises
                                  itself as a robot on mDNS (`_cerulion._tcp`), the
@@ -96,6 +97,12 @@ ENVIRONMENT:
                                  daemon runs until SIGINT/SIGTERM).
                                  CERULION_NETD_NETWORK=off wins.
     CERULION_NETD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no network ever).
+    CERULION_MULTICAST_SCOUTING=on
+                                 Turn zenoh multicast scouting (periodic scout
+                                 packets to UDP 224.0.0.224:7446) back on, for a
+                                 network where mDNS does not cross. Default off: peers come from
+                                 one `_cerulion._tcp` browse at boot plus the peer
+                                 cache.
 ";
 
 /// The iroh WAN-plane env docs — appended to [`USAGE`] ONLY in a `--features wan`
@@ -195,26 +202,26 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> ArgAction {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ONE iceoryx2 node + ONE zenoh session for the whole machine (Principle #8).
-    // Network-CONFIGURED by default (scouting ON) so demand-driven ingress works,
-    // but the session stays LAZY — a netd spawned but never demanded opens no zenoh
+    // Network-CONFIGURED by default (gossip on, multicast scouting off unless
+    // CERULION_MULTICAST_SCOUTING=on) so demand-driven ingress works, but the
+    // session stays LAZY, a netd spawned but never demanded opens no zenoh
     // session and then self-exits on idle. `init` (not `get_or_init`) so the
     // network config is honored: netd is the sole initializer of its transport.
     //
     // FIRST-CONTACT AUTOMAGIC: before init (the config is immutable
-    // afterwards), fold the verified `~/.cerulion/peers.json` cache into the
-    // connect endpoints, so a desk that has seen this robot before dials it with
-    // NO `CERULION_NETD_CONNECT`. Explicit env locators stay first and verbatim;
-    // cached rows are TCP-probed so a stale one cannot buy a background retry
-    // connector for the life of the daemon. An empty cache costs nothing and
-    // leaves the config byte-identical. See `discovery_fold` for the once-at-boot
-    // cadence and its residual.
+    // afterwards), browse `_cerulion._tcp` once and fold the answers plus the
+    // verified `~/.cerulion/peers.json` cache into the connect endpoints, so a
+    // desk dials a LAN robot with NO `CERULION_NETD_CONNECT`. Explicit env
+    // locators stay first and verbatim; discovered rows are TCP-probed so a dead
+    // address cannot buy a background retry connector for the life of the
+    // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
     let (network, peer_fold) = match net::network_config_from_env() {
         Some(cfg) => {
-            let (cfg, fold) = discovery_fold::fold_cached_peers(cfg);
+            let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
             (Some(cfg), fold)
         }
         // LOCAL-ONLY (`CERULION_NETD_NETWORK=off`): no session is ever opened, so
-        // there is nothing to dial — do not read the cache at all.
+        // there is nothing to dial, no browse, no cache read.
         None => (None, discovery_fold::PeerFold::default()),
     };
     // Decide the STANDING-gateway posture BEFORE `network` moves
@@ -228,15 +235,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         network,
         ..TransportConfig::default()
     })?;
-    // THE demand-authorization seam — install ONE authorizer on BOTH
-    // demand planes. The zenoh LAN plane consults it via the shared manager's
-    // NetworkManager (the egress plane's embedded gateway reads it); the iroh WAN plane
-    // gets it via `build_mirror_plane` below. On the desk this is the deny-nothing
-    // AllowAllAuthorizer (see `build_demand_authorizer`: the account grant is
-    // enforced at the ROBOT); ONE body decides the gate and BOTH planes
-    // consult it.
+    // Install the same inner demand authorizer on both planes. NetworkManager
+    // applies the LAN posture in front of it; the iroh WAN plane gets the inner
+    // authorizer via `build_mirror_plane` below.
     let demand_authorizer = build_demand_authorizer();
     if let Some(net) = manager.network() {
+        tracing::info!(lan_access = net.lan_access().as_str(), "LAN access posture");
         net.set_demand_authorizer(Arc::clone(&demand_authorizer));
     }
     // The mirror plane (ingress), the egress plane, AND the query
@@ -537,15 +541,14 @@ fn lean_build_env_warn_message(var: &str) -> String {
     }
 }
 
-/// Build netd's desk-side demand-authorization gate BOTH of netd's demand
-/// planes consult. It STAYS the deny-nothing [`AllowAllAuthorizer`] and always will:
-/// netd is the DESK (the demander) and holds no robot access list, so it cannot resolve
-/// `is_allowed` — the ROBOT is the authoritative per-demand enforcement point. The
-/// pairing crate ships the `is_allowed`-backed `PairingAuthorizer`, and the robot daemon INSTALLS it on the
-/// ROBOT serving plane (`cerulion_remoted::wire`), keyed by the demanding desk's
-/// authenticated key + a mid-session revocation sweep — NOT here. This gate is a
-/// pre-dial hook that denies nothing; the account grant is enforced at
-/// the robot, over BOTH planes.
+/// Build the inner authorizer both of netd's demand planes consult. On a desk
+/// netd is the demander and holds no robot access list, so it denies nothing:
+/// the ROBOT is the authoritative per-demand enforcement point. The LAN posture
+/// is applied separately by `NetworkManager` from `CERULION_LAN_ACCESS`. The
+/// pairing crate's `is_allowed`-backed `PairingAuthorizer` is installed by the
+/// robot daemon on the robot serving plane (`cerulion_remoted::wire`), keyed by
+/// the demanding desk's authenticated key plus a mid-session revocation sweep,
+/// NOT here.
 fn build_demand_authorizer() -> Arc<dyn DemandAuthorizer> {
     Arc::new(AllowAllAuthorizer)
 }
@@ -704,6 +707,7 @@ mod tests {
         assert!(USAGE.contains(net::CONNECT_ENV));
         assert!(USAGE.contains(net::LISTEN_ENV));
         assert!(USAGE.contains(net::NETWORK_ENV));
+        assert!(USAGE.contains(cerulion_core::transport::network::MULTICAST_SCOUTING_ENV));
         assert!(USAGE.contains(daemon::IDLE_GRACE_ENV));
         // The hard-exit deadline knob is discoverable from --help.
         assert!(USAGE.contains(HARD_EXIT_ENV));

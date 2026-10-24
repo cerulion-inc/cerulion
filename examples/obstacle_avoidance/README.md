@@ -74,8 +74,21 @@ cerulion topic list
 cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 ```
 
+Each message prints as one YAML document (the `seq` and `ts` numbers in
+the first comment change with every frame):
+
+```
+# seq=<n> ts=<ns>ns schema=0xd43ee5592039b9df size=56
+# geometry_msgs/Vector3
+x: 0.3
+y: 0.0
+z: 0.0
+---
+```
+
 The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses
-the distance threshold.
+the distance threshold. The lines between the comments and `---` are the
+message in full, as YAML.
 
 ## Verify the recording
 

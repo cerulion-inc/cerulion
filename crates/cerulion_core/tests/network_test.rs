@@ -75,6 +75,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, timestamp_ns: u64, payload: &[u8]
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -276,7 +277,7 @@ fn test_network_put_delivers_header_fields_and_payload() {
     assert_eq!(&received[WireHeader::SIZE..], payload.as_slice());
 }
 
-/// The empty-payload pin: a header-only (32-byte) frame
+/// The empty-payload pin: a header-only (40-byte) frame
 /// survives the network hop byte-identical with an empty payload region.
 #[test]
 fn test_network_put_delivers_empty_payload_frame() {
@@ -310,15 +311,15 @@ fn test_data_key_format_simple() {
     // Canonical names join the namespace directly (the
     // leading slash IS the separator); raw no-slash names canonicalize
     // first and ALIAS their slashed twin on the wire.
-    assert_eq!(NetworkManager::data_key("/foo"), "cerulion/foo");
-    assert_eq!(NetworkManager::data_key("foo"), "cerulion/foo");
+    assert_eq!(NetworkManager::data_key("/foo"), "cerulion_w2/foo");
+    assert_eq!(NetworkManager::data_key("foo"), "cerulion_w2/foo");
 }
 
 #[test]
 fn test_data_key_format_nested_topic() {
     assert_eq!(
         NetworkManager::data_key("/perception/camera/image"),
-        "cerulion/perception/camera/image"
+        "cerulion_w2/perception/camera/image"
     );
     // Raw + canonical alias to the same key (documented network-layer
     // contract — locally they are distinct iceoryx2 services).

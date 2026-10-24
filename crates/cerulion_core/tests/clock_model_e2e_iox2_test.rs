@@ -81,6 +81,7 @@ fn ext_time_config() -> GraphConfig {
         prefix: "ext_time".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "ext_time_sink".to_string(),
@@ -202,6 +203,7 @@ fn publish_stamp_follows_active_virtual_clock_not_wall() {
         prefix: "stamp".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "prod".to_string(),
             node_type: "stamp_producer".to_string(),
@@ -269,6 +271,6 @@ fn publish_stamp_follows_active_virtual_clock_not_wall() {
         "the virtual stamp ({stamped}) must NOT be wall time (>= {wall_at_publish})"
     );
 
-    // Sanity: WireHeader::SIZE is the 32-byte header these bytes carry.
-    assert_eq!(WireHeader::SIZE, 32, "WireHeader is 32 bytes");
+    // Sanity: WireHeader::SIZE is the 40-byte header these bytes carry.
+    assert_eq!(WireHeader::SIZE, 40, "WireHeader is 40 bytes");
 }

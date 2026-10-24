@@ -115,6 +115,47 @@ fn wiring_into_a_hand_authored_graph_preserves_every_byte_it_did_not_add() {
     );
 }
 
+/// An output whose `topic:` names a launch argument is wired by the TEXT the
+/// author wrote, reference included, so the new input follows the argument
+/// on every later run instead of freezing the default's value into the file.
+#[test]
+fn wiring_from_a_topic_that_names_a_launch_argument_copies_the_reference_not_the_default() {
+    let tmp = TempDir::new().unwrap();
+    let ws = workspace(tmp.path());
+    let graph = HAND_AUTHORED
+        .replace("prefix: percep\n", "args:\n  ns: percep\nprefix: ${ns}\n")
+        .replace(
+            "        schema: sensor_msgs/Image\n",
+            "        schema: sensor_msgs/Image\n        topic: /${ns}/image\n",
+        );
+    write_graph(&ws, &graph);
+
+    let out = graph_wire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    let expected = graph.replace(
+        "  - id: det # the detector\n    type: detector\n",
+        "  - id: det # the detector\n    type: detector\n    inputs:\n      - name: image\n        source: \"/${ns}/image\"\n",
+    );
+    assert_eq!(out.raw, expected);
+    assert_eq!(read_graph(&ws), expected);
+
+    // The written wire resolves with the argument on every later read.
+    let override_ = cerulion_core::graph::parse_override("ns:=robot2").unwrap();
+    let (resolved, _) =
+        cerulion_core::graph::parse_graph_raw_with_launch_args(&read_graph(&ws), &[override_])
+            .unwrap();
+    assert_eq!(
+        resolved.nodes[0].outputs[0].topic.as_deref(),
+        Some("/robot2/image")
+    );
+    assert_eq!(resolved.nodes[1].inputs[0].source, "/robot2/image");
+
+    // Unwiring matches the wire through the same resolution and restores the
+    // bytes.
+    let out = graph_unwire(&ws, "percep", &port("cam", "image"), &port("det", "image")).unwrap();
+    assert_eq!(out.raw, graph);
+    assert_eq!(read_graph(&ws), graph);
+}
+
 #[test]
 fn unwiring_restores_the_document_byte_for_byte() {
     let tmp = TempDir::new().unwrap();

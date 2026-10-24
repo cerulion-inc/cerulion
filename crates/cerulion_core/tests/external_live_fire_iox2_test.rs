@@ -249,6 +249,7 @@ fn producer_consumer_parts(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "ext_producer".to_string(),
@@ -263,6 +264,7 @@ fn producer_consumer_parts(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "recv_consumer".to_string(),
@@ -318,6 +320,7 @@ fn producer_consumer_graph_with_policy(
 fn producer_only_node(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "ext_producer".to_string(),
@@ -1069,6 +1072,7 @@ fn zero_external_bindings_zero_cost() {
         prefix: "extz".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "recv_consumer".to_string(),
@@ -2818,6 +2822,7 @@ mod eventfd_arm {
                 producer_only_node("producer"),
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "consumer".to_string(),
                     node_type: "recv_consumer".to_string(),

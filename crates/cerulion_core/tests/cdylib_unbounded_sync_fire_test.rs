@@ -151,6 +151,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "fuse".to_string(),
                 node_type: "unbounded_sync_node".to_string(),
@@ -174,6 +175,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
                 node_type: "unbounded_sync_sink".to_string(),
@@ -195,7 +197,7 @@ fn build_graph(prefix: &str, sink_read: Arc<AtomicU64>) -> GraphRuntime {
 }
 
 /// Mint the two raw external publishers on the absolute source topics. Vector3
-/// is 24 bytes fixed (< 64 with the 32-byte wire header), matching the
+/// is 24 bytes fixed (< 64 with the 40-byte wire header), matching the
 /// `sync_fire_iox2_test` sizing.
 fn external_publishers(runtime: &GraphRuntime) -> (CerulionPublisher, CerulionPublisher) {
     let mgr = runtime.test_transport().expect("test transport parked");
