@@ -94,7 +94,7 @@ impl<'a> SampleHandle<'a> {
     /// Borrow the sample bytes immutably.
     ///
     /// Returns the entire loaned/received payload slice, including the
-    /// 32-byte WireHeader at the front.
+    /// 40-byte WireHeader at the front.
     #[inline]
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {

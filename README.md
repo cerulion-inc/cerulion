@@ -84,7 +84,7 @@ Homebrew and the Debian package do not provision Rust. To build your own nodes, 
 cargo install --locked cerulion_cli cerulion_netd
 ```
 
-The release installer places `cerulion-connectd` beside the CLI for remote connections. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
+The release installer places `cerulion-connectd` (the desk side of a remote connection) and `cerulion-remoted` (the robot side) beside the CLI. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
 
 </details>
 

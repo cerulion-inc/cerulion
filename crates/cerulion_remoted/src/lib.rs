@@ -9,7 +9,7 @@
 //!   BOTH its iroh [`EndpointId`](cerulion_link::EndpointId) AND its
 //!   `cerulion_pairing` `DeviceIdentity` seed, and iroh multiplexes both protocols
 //!   on ONE endpoint. So exactly one process owns that endpoint, dispatching
-//!   `cerulion/wire/1` and `cerulion/ops/1` at accept.
+//!   `cerulion/wire/2` and `cerulion/ops/1` at accept.
 //! - **Always on from boot.** Operations and pairing must be reachable when NO graph
 //!   is running (deploy, restart, inventory and pair at rest), and topic data exists
 //!   only while a graph runs, so the endpoint host is a robot-level service, NOT the
@@ -44,7 +44,7 @@
 //!
 //! ## The wire plane
 //!
-//! - [`wire`]: the `cerulion/wire/1` control protocol ([`WireRequest`] and
+//! - [`wire`]: the `cerulion/wire/2` control protocol ([`WireRequest`] and
 //!   [`WireResponse`]), the connection handler, and the [`WirePlane`] context (robot
 //!   identity, `remoted`'s own `network:None` `TransportManager`, and catalog and
 //!   schema assembly), reusing the `cerulion_q` vocabulary.

@@ -211,8 +211,8 @@ pub fn hostname_rung(budget: Duration) -> Vec<DiscoveredPeer> {
     }
 
     // (b) ~/.cerulion/config.toml `peers = [...]`; a missing file is silent.
-    if let Some(home) = dirs::home_dir() {
-        let cfg = home.join(".cerulion").join("config.toml");
+    if let Some(config_dir) = crate::auth::cerulion_config_dir() {
+        let cfg = config_dir.join("config.toml");
         match std::fs::read_to_string(&cfg) {
             Ok(text) => {
                 for entry in parse_config_peers(&text) {

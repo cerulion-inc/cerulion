@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The WIRE PLANE (`cerulion/wire/1`): a demand-driven SHM tap
+//! The WIRE PLANE (`cerulion/wire/2`): a demand-driven SHM tap
 //! gateway arm speaking the `cerulion_q` catalog/demand vocabulary over
 //! iroh, with per-topic uni data streams.
 //!
-//! A `cerulion/wire/1` connection (admitted ONLY for a paired `CAP_OBSERVE`
+//! A `cerulion/wire/2` connection (admitted ONLY for a paired `CAP_OBSERVE`
 //! account — the accept gate runs FIRST, in [`crate::daemon`], per the
 //! `cerulion_q` marker) carries:
 //!
@@ -14,7 +14,7 @@
 //!   — imported, NOT mirrored): [`CatalogReply`] + [`SchemaReply`].
 //! - **ONE uni data stream per demanded topic** (robot → desk): a JSON
 //!   [`StreamPreamble`] naming the topic, then raw Cerulion wire frames VERBATIM
-//!   (32-byte [`WireHeader`] + payload). Per-topic streams give QUIC per-stream
+//!   (40-byte [`WireHeader`] + payload). Per-topic streams give QUIC per-stream
 //!   flow control (a slow topic never stalls a fast one) and make the demand
 //!   lifecycle = the stream lifecycle.
 //!
@@ -82,7 +82,7 @@ pub enum WireError {
 
 /// The first frame of every per-topic uni data stream: names the topic the
 /// stream carries, so the desk correlates stream ↔ topic. All subsequent frames
-/// on the stream are raw Cerulion wire frames (32-byte [`WireHeader`] + payload).
+/// on the stream are raw Cerulion wire frames (40-byte [`WireHeader`] + payload).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamPreamble {
     /// The canonical absolute topic name the following frames belong to.
@@ -481,7 +481,7 @@ impl WirePlane {
     }
 }
 
-/// Serve ONE admitted `cerulion/wire/1` connection to completion. Accepts the
+/// Serve ONE admitted `cerulion/wire/2` connection to completion. Accepts the
 /// bidi control stream and loops read-request → dispatch → write-response until
 /// the desk closes it (or the revocation sweep evicts it), then tears down
 /// every demanded topic (releasing SHM slots). A long-lived session — the caller
@@ -1041,6 +1041,7 @@ mod tests {
             offset_table_count: 0,
             sequence: 7,
             timestamp_ns: 123_456,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let frame = rebuild_frame(&header, &[1, 2, 3]);
         assert_eq!(frame.len(), WireHeader::SIZE + 3);

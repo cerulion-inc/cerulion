@@ -94,6 +94,7 @@ pub unsafe extern "C" fn rmw_serialize(
                 return RMW_RET_ERROR;
             }
         };
+        let _downgrades = crate::rosidl_buffer::PublishScope::open("<rmw_serialize>");
         let frame = match bridge.flatten(ros_message, 0, 0) {
             Ok(f) => f,
             Err(e) => {

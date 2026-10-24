@@ -44,6 +44,13 @@ pub const VIZD_SOCKET_ENV: &str = cerulion_hygiene::VIZD.socket_env();
 /// pulls the SDK.
 pub const VIZD_BINARY: &str = "cerulion-vizd";
 
+/// Return the platform refusal for `cerulion viz`, when it is unavailable.
+pub fn unsupported_viz_message(is_android: bool) -> Option<&'static str> {
+    is_android.then_some(
+        "cerulion viz needs a desktop and is not available on Android; run it on a desktop host and reach the device's topics over the network",
+    )
+}
+
 /// The env var the daemon reads for CONNECT locators. MIRRORS
 /// `cerulion_vizd::net::CONNECT_ENV` (that crate pulls `rerun`, so it is not a
 /// dependency here — the same decoupling `VIZD_SOCKET_ENV` uses). The verb sets it
@@ -214,6 +221,26 @@ pub fn status_line(id: u64) -> String {
         id,
         method: "status",
     })
+}
+
+#[cfg(test)]
+mod platform_availability_tests {
+    use super::unsupported_viz_message;
+
+    #[test]
+    fn android_viz_refusal_points_to_a_desktop_host() {
+        assert_eq!(
+            unsupported_viz_message(true),
+            Some(
+                "cerulion viz needs a desktop and is not available on Android; run it on a desktop host and reach the device's topics over the network"
+            )
+        );
+    }
+
+    #[test]
+    fn other_platforms_have_no_viz_refusal() {
+        assert_eq!(unsupported_viz_message(false), None);
+    }
 }
 
 /// What a `schemas` side-load actually achieved at the daemon.
@@ -543,7 +570,7 @@ mod unix_client {
         /// out with an `Err` instead of hanging the (un-interruptible) blocking
         /// banner read forever.
         pub fn connect(socket: &Path) -> io::Result<Self> {
-            let stream = UnixStream::connect(socket)?;
+            let stream = cerulion_hygiene::connect_control_socket(socket)?;
             arm_io_timeouts(&stream)?;
             let writer = stream.try_clone()?;
             let mut reader = BufReader::new(stream);

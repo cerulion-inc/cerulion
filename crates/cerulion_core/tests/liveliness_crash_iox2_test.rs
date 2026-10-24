@@ -296,6 +296,7 @@ fn build_watcher(obs: Arc<CrashObs>) -> GraphRuntime {
         prefix: "lcr".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "cons".to_string(),
             node_type: "crash_consumer".to_string(),

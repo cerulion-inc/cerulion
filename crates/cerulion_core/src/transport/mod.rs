@@ -43,6 +43,7 @@ pub mod frame_drop_latch;
 pub mod gateway;
 pub mod ingress_build;
 pub mod input_view;
+pub mod kind;
 pub mod liveness;
 pub mod mirror_origin;
 pub mod mirror_registry;
@@ -59,6 +60,11 @@ pub(crate) mod shm_guard;
 mod shm_sample;
 pub mod subscriber;
 pub mod uds_write;
+pub mod wire_header_attribute;
+
+pub use kind::{TransportKind, TRANSPORT_KIND};
+#[doc(hidden)]
+pub use shm_guard::{shm_pool_advice_scans_run, shm_safety_checks_run};
 
 use std::sync::{Arc, OnceLock};
 // Only the test-only `LivelinessCleaner` invocation
@@ -70,11 +76,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use iceoryx2::node::Node;
 use iceoryx2::prelude::*;
 
-// THE transport Service type. ipc_threadsafe::Service = Send+Sync
-// ports (MutexProtected), so NodeContext/DylibNodeEntry/rmw port-structs are
-// Send-by-construction (none of them needs a manual
-// `unsafe impl Send/Sync`).
+// THE transport Service type. The default uses cross-process shared memory;
+// `local-transport` selects process-local storage with thread-safe ports.
+// Under `local-transport` nothing maps shared memory, so every shm-safety
+// check and pool advice (`check_and_warn_shm_safety`,
+// `advise_shm_pools_no_hugepage`) no-ops instead of warning about pools that
+// cannot exist.
+#[cfg(not(feature = "local-transport"))]
 pub(crate) use iceoryx2::service::ipc_threadsafe::Service as CerService;
+#[cfg(feature = "local-transport")]
+pub(crate) use iceoryx2::service::local_threadsafe::Service as CerService;
 
 /// The `event_id_max_value` EVERY Cerulion event service is created with.
 ///
@@ -103,6 +114,59 @@ use subscriber::{CerulionSubscriber, DataOnlySubscriber};
 
 /// Maximum topic name length (255 - "/event" suffix = 249).
 const MAX_TOPIC_LEN: usize = 249;
+
+/// Refuse node/transport startup when this process's iceoryx2 build lacks
+/// Android shared-memory support (stock iceoryx2 has no `shm_open` on
+/// bionic). No-op off Android. `pub` because a hand-written `--raw-ffi`
+/// cdylib links its own `cerulion_core` copy: its own PAL is the one that
+/// must be probed, and this is the call the generated template makes.
+/// Android-facing, stability-exempt.
+#[inline]
+pub fn refuse_unsupported_android_shm(node_name: &str) -> TransportResult<()> {
+    #[cfg(feature = "local-transport")]
+    let _ = node_name;
+
+    #[cfg(not(feature = "local-transport"))]
+    {
+        #[cfg(target_os = "android")]
+        {
+            static SHM_SUPPORTED: OnceLock<bool> = OnceLock::new();
+            let supported = *SHM_SUPPORTED.get_or_init(|| {
+                // SAFETY: the probe name is NUL-terminated and static; `close` receives
+                // only a nonnegative descriptor returned by `shm_open`.
+                unsafe {
+                    let fd = iceoryx2_pal_posix::posix::shm_open(
+                        b"/cerulion_shm_probe\0".as_ptr().cast(),
+                        iceoryx2_pal_posix::posix::O_RDONLY,
+                        0,
+                    );
+                    if fd >= 0 {
+                        let _ = iceoryx2_pal_posix::posix::close(fd);
+                        true
+                    } else {
+                        iceoryx2_pal_posix::posix::Errno::get()
+                            != iceoryx2_pal_posix::posix::Errno::ENOSYS
+                    }
+                }
+            });
+            if !supported {
+                return Err(TransportError::NodeCreation {
+                    node_name: node_name.to_owned(),
+                    reason:
+                        "the binary links an iceoryx2 build without Android shared-memory support; \
+                         build the workspace with the iceoryx2 fork [patch.crates-io] block \
+                         (see docs/android.md)"
+                            .to_owned(),
+                });
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let _ = node_name;
+    }
+
+    Ok(())
+}
 
 /// Maximum concurrent clients (publishers) on a service REQUEST topic.
 ///
@@ -2655,6 +2719,18 @@ impl TransportManager {
         // Nothing has been created at this point, so a refusal leaves no
         // transport state behind: `INSTANCE` stays unset.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
+        refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if ix_config.is_some() {
+            if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+                "joining another process's transport namespace \
+                     (TransportManager::init_with_config)",
+            ) {
+                return Err(TransportError::NodeCreation {
+                    node_name: config.node_name.clone(),
+                    reason,
+                });
+            }
+        }
         // Defensive: a supervisor-minted shared config is honored ONLY on
         // the singleton's FIRST init. If the process already initialized the
         // transport (e.g. a stray default-config `init()`), `get_or_init` below
@@ -2896,7 +2972,8 @@ impl TransportManager {
     ///   a duplicate node NAME is NOT among them (identity is the
     ///   counter-derived `UniqueNodeId`). Every constructor returns a loud `Err`
     ///   here — a supervisor must be able to fail the deployment cleanly instead
-    ///   of aborting the process.
+    ///   of aborting the process. It is also returned with `local-transport`
+    ///   because process-local services cannot be opened by other processes.
     #[must_use = "transport initialization result must be checked"]
     pub fn detached_with_config(
         config: TransportConfig,
@@ -2924,6 +3001,16 @@ impl TransportManager {
         // numbers on the length arm) instead of one of them serving a bare
         // `{e:?}` behind a generic config error.
         let node_name = node_name_or_refusal(config.node_name.as_str())?;
+        refuse_unsupported_android_shm(config.node_name.as_str())?;
+        if let Err(reason) = crate::transport::kind::refuse_cross_process_peer(
+            "pre-creating services for other processes \
+                 (TransportManager::detached_with_config)",
+        ) {
+            return Err(TransportError::NodeCreation {
+                node_name: config.node_name.clone(),
+                reason,
+            });
+        }
         // Disable iceoryx2 auto dead-node cleanup on this detached
         // production node too — never trust the caller's config. No startup sweep:
         // the process singleton (the supervisor's planning manager) owns
@@ -2998,12 +3085,15 @@ impl TransportManager {
             .as_str()
             .try_into()
             .expect("valid service name");
-        let svc = self
-            .node
-            .service_builder(&name)
-            .publish_subscribe::<[u8]>()
-            .open_or_create()
-            .expect("create default service");
+        let builder = || self.node.service_builder(&name).publish_subscribe::<[u8]>();
+        let svc = match builder().open() {
+            Ok(svc) => svc,
+            Err(_) => builder()
+                .create_with_attributes(
+                    &wire_header_attribute::data_service_specifier().expect("attribute"),
+                )
+                .expect("create default service"),
+        };
         svc.static_config().subscriber_max_borrowed_samples()
     }
 
@@ -5067,6 +5157,7 @@ impl TransportManager {
                 };
                 map_err(format!("{e}{hint}"))
             })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(&map_err)?;
 
         // Subscriber port only (`TapDepth::Ceiling` → the service ceiling, the
         // deepest view the recording tap provisioned; the liveness sampling
@@ -5271,6 +5362,7 @@ impl TransportManager {
                 };
                 map_err(format!("{e}{hint}"))
             })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(map_err)?;
 
         // Size the event-id space to the ids this transport mints; see
         // `CERULION_MAX_EVENT_ID`.
@@ -5737,6 +5829,7 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
             .map_err(|e| map_err(format!("{e}{}", publish_subscribe_open_env_hint(&e))))?;
+        wire_header_attribute::check_opened(topic, data_service.attributes()).map_err(&map_err)?;
         Ok(ExternalPublisherProbe { data_service })
     }
 
@@ -5844,6 +5937,14 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
         {
+            // A service at another wire header version is not this build's
+            // topic: it counts as absent (the open is refused, and logged, by
+            // the same rule every opener applies).
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                0
+            }
             Ok(service) => {
                 let cfg = service.dynamic_config();
                 if publishers {
@@ -5887,6 +5988,11 @@ impl TransportManager {
             .publish_subscribe::<[u8]>()
             .open()
         {
+            Ok(service)
+                if wire_header_attribute::check_opened(topic, service.attributes()).is_err() =>
+            {
+                ProducerProbe::Failed
+            }
             Ok(service) => {
                 ProducerProbe::Count(service.dynamic_config().number_of_publishers() as u32)
             }
@@ -6349,6 +6455,11 @@ impl TransportManager {
         // `create_subscriber_floor`, see `TopicServiceConfig::create_port_caps`):
         // the OPEN leg arms only `max_publishers` / `max_subscribers`, the
         // CREATE leg the floored values.
+        // Every data service this build creates states the wire header version
+        // its frames carry; an opened one is checked after the open (see
+        // `wire_header_attribute`), so the open leg requires nothing and the
+        // create leg defines the attribute.
+        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let (create_publishers, create_subscribers) = topic_config
             .create_port_caps((node_defaults.max_publishers, node_defaults.max_subscribers));
@@ -6362,13 +6473,11 @@ impl TransportManager {
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
         };
-        let data_result = if open_leg == create_leg {
-            // No asymmetry (External passthrough, a genuine borrow requirement
-            // at or above the floor, port floors at or below the requirement
-            // or the node default): iceoryx2's native loop is exactly
-            // equivalent — keep the single call.
-            make_data_builder(open_leg).open_or_create()
-        } else {
+        // The two legs always run apart: iceoryx2's single `open_or_create`
+        // cannot define an attribute on create without also REQUIRING it on
+        // open, and an opened service without the attribute must still attach
+        // (it is checked, and warned about, after the open).
+        let data_result = {
             use iceoryx2::service::builder::publish_subscribe::{
                 PublishSubscribeCreateError, PublishSubscribeOpenError,
                 PublishSubscribeOpenOrCreateError,
@@ -6383,7 +6492,7 @@ impl TransportManager {
                     | PublishSubscribeOpenError::IsMarkedForDestruction => OpenStep::Wait,
                     _ => OpenStep::Fail,
                 },
-                || make_data_builder(create_leg).create(),
+                || make_data_builder(create_leg).create_with_attributes(&wire_header_specifier),
                 |e| {
                     matches!(
                         e,
@@ -6544,6 +6653,8 @@ impl TransportManager {
                 buffer_ceiling_refused,
             }
         })?;
+        wire_header_attribute::check_opened(topic, data_service.attributes())
+            .map_err(|reason| OpenServicesFailure::from(map_err(reason)))?;
 
         // Loud-over-silent (with a
         // subscriber twin + a once-per-topic dedup): iceoryx2 enforces

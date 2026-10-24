@@ -49,11 +49,10 @@
 //!
 //! **Why this is an oracle and not a self-compare.** The values asserted are
 //! the ones hand-written INTO the CDR body, not a re-encode of the walker's
-//! own output. The two sides in between are independent implementations that
-//! never call each other: the codec resolves element layouts through
-//! `resolve_nested_qname` and writes the framing in `decode_cdr_seq`, while
-//! the walker resolves through `lookup_nested` and reads the framing in its
-//! own bounded cursor. Their agreement is exactly what needs asserting.
+//! own output. The two sides in between never call each other: both bind
+//! element references through the one shared identity registry, but the
+//! codec writes the framing in `decode_cdr_seq` while the walker reads it in
+//! its own bounded cursor. Their agreement is exactly what needs asserting.
 //! Where the framing arithmetic is fully determined by the schema (no
 //! interior alignment padding — `variable_payload_align` is 1 for nested and
 //! string payloads) the arms ALSO assert the blob's byte length against a
@@ -101,7 +100,7 @@ fn builtin_walker() -> FrameWalker {
 }
 
 /// Drain the subscriber and return the LAST delivered frame re-assembled as
-/// full wire bytes (32-byte header + payload). `write_to_buf` is
+/// full wire bytes (40-byte header + payload). `write_to_buf` is
 /// `read_from_buf`'s exact inverse, so the reassembled bytes equal the bytes
 /// the publisher committed.
 fn capture_last_frame(sub: &CerulionSubscriber) -> Vec<u8> {

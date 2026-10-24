@@ -1,0 +1,5 @@
+# Per-machine build trees, minted certificates and run output.
+.ros_ws/
+.certs/
+results/
+__pycache__/

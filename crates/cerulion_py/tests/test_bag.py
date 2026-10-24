@@ -27,13 +27,14 @@ def oracle_frame(schema_hash, sequence):
     payload = bytes((sequence * 7 + i) & 0xFF for i in range(8 + sequence % 5))
     total_size = cerulion.WIRE_HEADER_SIZE + len(payload)
     header = struct.pack(
-        "<QIIIIQ",
+        "<QIIIIQQ",
         schema_hash,
         total_size,
         0,
         0,
         sequence,
         2_000_000_000 + sequence * 10_000_000,
+        0,
     )
     return header + payload
 
@@ -46,16 +47,17 @@ def vector3_schemas():
 
 def test_record_validates_wire_header():
     with pytest.raises(cerulion.BagError):
-        cerulion.Record(b"\x00" * 31)
+        cerulion.Record(b"\x00" * 39)
 
-    invalid = struct.pack("<QIIIIQ", 1, 96, 0, 0, 0, 0) + bytes(8)
+    invalid = struct.pack("<QIIIIQQ", 1, 96, 0, 0, 0, 0, 0) + bytes(8)
     with pytest.raises(cerulion.BagError, match="total_size=96"):
         cerulion.Record(invalid)
 
     payload = bytes(range(8))
-    valid = struct.pack("<QIIIIQ", 1, 40, 0, 0, 0, 0) + payload
+    valid = struct.pack("<QIIIIQQ", 1, 48, 0, 0, 0, 0, 0x0001_0000_0000_0003) + payload
     record = cerulion.Record(valid)
     assert bytes(record.payload) == payload
+    assert record.step_tag == 0x0001_0000_0000_0003
 
 
 def test_bag_topics_and_records(fixture_bin, tmp_path):

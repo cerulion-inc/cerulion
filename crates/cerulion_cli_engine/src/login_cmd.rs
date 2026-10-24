@@ -1189,86 +1189,40 @@ fn fetch_account_id(
         .map_err(|e| CliError::Login(format!("could not parse /v1/me: {e}")))
 }
 
-/// Load the 32-byte ed25519 device seed from `~/.cerulion/desk.key`, creating it
-/// (0600) if absent. Shared with the `cerulion connect`/`pair` desk identity —
-/// one device key per machine (Studio ⊃ CLI). `pub(crate)` so the robot-claim
-/// flow ([`crate::robot_cmd`]) presents the SAME machine key as its transport
-/// identity (never a second device key).
+/// Load this machine's 32-byte ed25519 device seed, creating it (0600) if no
+/// key exists. The one machine key of [`auth::identity_layout`]: shared with the
+/// `cerulion connect`/`pair` desk identity (Studio and CLI alike). `pub(crate)`
+/// so the robot-claim flow ([`crate::robot_cmd`]) presents the SAME machine key
+/// as its transport identity (never a second device key).
 pub(crate) fn ensure_device_key_seed() -> CliResult<[u8; 32]> {
-    let path = auth::device_key_path().ok_or_else(|| {
+    let layout = auth::identity_layout().ok_or_else(|| {
         CliError::Login("no home directory (set CERULION_HOME) to store the device key".into())
     })?;
-    ensure_device_key_seed_at(&path)
+    ensure_device_key_seed_in(&layout)
 }
 
-/// The path-explicit body of [`ensure_device_key_seed`] (testable without env).
-fn ensure_device_key_seed_at(path: &Path) -> CliResult<[u8; 32]> {
-    if path.exists() {
-        let bytes = std::fs::read(path).map_err(|e| {
-            CliError::Login(format!("reading the device key {}: {e}", path.display()))
-        })?;
-        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            CliError::Login(format!(
-                "the device key {} is not 32 bytes (delete it to regenerate)",
-                path.display()
-            ))
-        })?;
-        return Ok(seed);
+/// The layout-explicit body of [`ensure_device_key_seed`] (testable without env).
+fn ensure_device_key_seed_in(
+    layout: &cerulion_pairing::identity::IdentityLayout,
+) -> CliResult<[u8; 32]> {
+    use cerulion_pairing::identity::KeyOrigin;
+    let (key, origin) = layout
+        .load_or_create_machine_key()
+        .map_err(|e| CliError::Login(e.to_string()))?;
+    match origin {
+        KeyOrigin::Created => tracing::info!(
+            fingerprint = %key.short_fingerprint(),
+            path = %layout.device_key_path().display(),
+            "created this machine's device key"
+        ),
+        KeyOrigin::AdoptedLegacy => tracing::info!(
+            fingerprint = %key.short_fingerprint(),
+            path = %layout.device_key_path().display(),
+            "this machine's existing desk.key is now also its identity/device.key"
+        ),
+        KeyOrigin::Existing => {}
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            // 0700 (not the umask default 0755): ~/.cerulion also holds the
-            // 0600 secrets (auth.json / desk.key / device.cert). Creating it
-            // here — the device-key path can run FIRST, before any
-            // `atomic_write_secret` — with umask perms would leave the config
-            // dir world-listable.
-            auth::create_secret_dir(parent)
-                .map_err(|e| CliError::Login(format!("creating {}: {e}", parent.display())))?;
-        }
-    }
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)
-        .map_err(|e| CliError::Login(format!("generating the device key failed: {e}")))?;
-    write_new_device_key(path, &seed)?;
-    Ok(seed)
-}
-
-/// Create `path` (0600 on Unix, `create_new` so a racing writer never
-/// overwrites) and write the 32-byte seed.
-#[cfg(unix)]
-fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CliError::Login(format!("creating the device key {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| CliError::Login(format!("writing the device key {}: {e}", path.display())))?;
-    // fsync so a crash between the buffer and the flush cannot leave a
-    // 0/partial-byte key that later fails `try_into::<[u8; 32]>()` (a
-    // manual-deletion recovery). Mirrors `auth::write_new_secret_file`.
-    f.sync_all()
-        .map_err(|e| CliError::Login(format!("syncing the device key {}: {e}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn write_new_device_key(path: &Path, seed: &[u8; 32]) -> CliResult<()> {
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| CliError::Login(format!("creating the device key {}: {e}", path.display())))?;
-    f.write_all(seed)
-        .map_err(|e| CliError::Login(format!("writing the device key {}: {e}", path.display())))?;
-    // fsync so a crash between the buffer and the flush cannot leave a
-    // 0/partial-byte key that later fails `try_into::<[u8; 32]>()` (a
-    // manual-deletion recovery). Mirrors `auth::write_new_secret_file`.
-    f.sync_all()
-        .map_err(|e| CliError::Login(format!("syncing the device key {}: {e}", path.display())))
+    Ok(*key.seed())
 }
 
 // ===========================================================================
@@ -1576,9 +1530,11 @@ mod tests {
     #[test]
     fn device_key_seed_is_created_0600_then_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("desk.key");
-        let s1 = ensure_device_key_seed_at(&path).unwrap();
-        assert!(path.exists());
+        let layout = cerulion_pairing::identity::IdentityLayout::at(dir.path());
+        let s1 = ensure_device_key_seed_in(&layout).unwrap();
+        let path = layout.device_key_path();
+        assert_eq!(std::fs::read(&path).unwrap(), s1);
+        assert_eq!(std::fs::read(layout.legacy_desk_key_path()).unwrap(), s1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1586,7 +1542,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         // Second call REUSES the existing key (never regenerates).
-        let s2 = ensure_device_key_seed_at(&path).unwrap();
+        let s2 = ensure_device_key_seed_in(&layout).unwrap();
         assert_eq!(
             s1, s2,
             "an existing device key is reused, never regenerated"
@@ -1598,29 +1554,33 @@ mod tests {
     fn device_key_path_creates_fresh_config_dir_0700() {
         // The device-key seed can be the FIRST thing to create ~/.cerulion (before
         // any auth.json / device.cert write), so it MUST create the parent at 0700
-        // — not the umask default 0755 — since that dir also holds the 0600 secrets
-        // whose filenames would otherwise be world-listable. Regression guard:
-        // a plain create_dir_all here leaves it 0755.
+        // (not the umask default 0755), since that dir also holds the 0600 secrets
+        // whose filenames would otherwise be world-listable.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
-        // A NESTED, not-yet-existing parent so the dir-creation branch actually
-        // runs (the sibling 0600 test writes into the pre-existing tempdir root).
         let cfg_dir = base.path().join("nested").join(".cerulion");
-        let path = cfg_dir.join("desk.key");
         assert!(!cfg_dir.exists(), "precondition: parent must not pre-exist");
-        ensure_device_key_seed_at(&path).unwrap();
-        let mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "~/.cerulion must be owner-only (0700)");
+        let layout = cerulion_pairing::identity::IdentityLayout::at(&cfg_dir);
+        ensure_device_key_seed_in(&layout).unwrap();
+        for dir in [cfg_dir.clone(), layout.identity_dir()] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only (0700)", dir.display());
+        }
     }
 
     #[test]
     fn wrong_size_device_key_is_a_loud_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("desk.key");
-        std::fs::write(&path, b"too short").unwrap();
-        let err = ensure_device_key_seed_at(&path).unwrap_err();
+        let layout = cerulion_pairing::identity::IdentityLayout::at(dir.path());
+        std::fs::write(layout.legacy_desk_key_path(), b"too short").unwrap();
+        let err = ensure_device_key_seed_in(&layout).unwrap_err();
         assert!(matches!(err, CliError::Login(_)));
-        assert!(err.to_string().contains("32 bytes"));
+        assert!(err.to_string().contains("not 32"), "{err}");
+        assert_eq!(
+            std::fs::read(layout.legacy_desk_key_path()).unwrap(),
+            b"too short",
+            "a wrong-size key is never regenerated in place"
+        );
     }
 
     #[test]

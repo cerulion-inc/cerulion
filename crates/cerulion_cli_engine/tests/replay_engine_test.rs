@@ -1867,6 +1867,7 @@ fn replay_inner(
         record_health,
         tolerance_yaml,
         strict_state,
+        false,
     )
 }
 
@@ -1886,6 +1887,8 @@ fn replay_inner_with_transport(
     record_health: RecordHealthReport,
     tolerance_yaml: Option<String>,
     strict_state: bool,
+    // `--allow-param-change`.
+    allow_param_change: bool,
 ) -> Result<ReplayOutcome, ReplayError> {
     let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(path);
     // Compile + validate the tolerance against the
@@ -1933,6 +1936,7 @@ fn replay_inner_with_transport(
         fire_tap,
         tolerance,
         strict_state,
+        allow_param_change,
         record_out: None,
     };
     let factories = make_factories(&transport);
@@ -2241,6 +2245,63 @@ fn frame_y(frame: &[u8]) -> f64 {
 // 1. Happy path
 // ===========================================================================
 
+/// A recording made by the release with the 32-byte wire header resims:
+/// its frames are upgraded as they are read, the re-executed graph's
+/// untagged 40-byte frames match them byte for byte, and the run passes. A
+/// payload byte flipped in the legacy file still fails it, so the verdict
+/// compares the upgraded bytes rather than skipping them.
+#[test]
+#[serial]
+fn a_recording_from_the_32_byte_release_resims_byte_exact() {
+    let steps = 4;
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.mcap");
+    write_bag(&rec, &current, None);
+    let legacy_bytes =
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap());
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(&legacy, &legacy_bytes).unwrap();
+    let topics = cerulion_bag::BagReader::open(&legacy)
+        .unwrap()
+        .legacy_wire_header_topics()
+        .unwrap();
+    assert_eq!(
+        topics,
+        vec!["/sr/relay/out".to_string(), "/sr/source/out".to_string()]
+    );
+
+    let outcome = replay(&legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        outcome.passed,
+        "a legacy recording must resim byte-exact: {:?}",
+        outcome.violations
+    );
+    assert_eq!(outcome.ticks_replayed, steps);
+
+    // Flip the first payload byte of the last relay frame in the legacy
+    // recording (payload starts at byte 32 in the old layout).
+    let mut flipped = rec.clone();
+    let rel = flipped.messages.get_mut("/sr/relay/out").unwrap();
+    let last = rel.len() - 1;
+    rel[last][cerulion_core::wire::WireHeader::SIZE] ^= 0x01;
+    let flipped_current = dir.path().join("flipped_current.mcap");
+    write_bag(&flipped, &flipped_current, None);
+    let flipped_legacy = dir.path().join("flipped_legacy.mcap");
+    std::fs::write(
+        &flipped_legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(
+            &std::fs::read(&flipped_current).unwrap(),
+        ),
+    )
+    .unwrap();
+    let outcome = replay(&flipped_legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        !outcome.passed,
+        "a flipped payload byte in a legacy recording must fail"
+    );
+}
+
 #[test]
 #[serial]
 fn happy_path_replays_byte_exact_and_passes() {
@@ -2353,8 +2414,8 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
         outcome.violations
     );
     // EXACT diff coordinates: the flipped byte is the FIRST payload byte, so
-    // the first divergence is at exactly WireHeader::SIZE (32); a Vector3 frame
-    // is 32-byte header + 24-byte payload = 56 bytes on both sides.
+    // the first divergence is at exactly WireHeader::SIZE (40); a Vector3 frame
+    // is 40-byte header + 24-byte payload = 64 bytes on both sides.
     match relay_violations[0].class {
         ViolationClass::ByteMismatch {
             index,
@@ -2368,7 +2429,7 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
                 WireHeader::SIZE,
                 "the flip was at the first payload byte"
             );
-            assert_eq!((recorded_len, replayed_len), (56, 56));
+            assert_eq!((recorded_len, replayed_len), (64, 64));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
@@ -2405,7 +2466,7 @@ fn nondet_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 /// The assertions prove the divergence is DATA, not schedule:
 ///   * ≥1 `ByteMismatch` violation on the node's topic (the diff caught it);
 ///   * the first differing byte is in the PAYLOAD region (≥ `WireHeader::SIZE`)
-///     — the 32-byte header (sequence + timestamp) reproduced byte-identically
+///     the 40-byte header (sequence + timestamp) reproduced byte-identically
 ///     via the recorded-clock re-advance, so the schedule/clock was retraced;
 ///   * `trace_divergence` is `None` (NOT an exit-6 structural divergence —
 ///     the node fired identically, only the data differs);
@@ -2530,7 +2591,7 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
         } => {
             assert_eq!(index, 1, "the flipped common-prefix frame is named");
             assert_eq!(first_diff_byte_offset, WireHeader::SIZE);
-            assert_eq!((recorded_len, replayed_len), (56, 56));
+            assert_eq!((recorded_len, replayed_len), (64, 64));
         }
         ref other => panic!("expected ByteMismatch second, got {other:?}"),
     }
@@ -4266,7 +4327,7 @@ fn fire_bearing_trace_without_boundaries_is_bag_no_step_boundaries_exit_2() {
 // 18. Defensive branches
 // ===========================================================================
 
-/// An external frame too short for a wire header (< 32 bytes) injects
+/// An external frame too short for a wire header (< 40 bytes) injects
 /// UNCONDITIONALLY (it cannot be time-windowed) and must not strand later
 /// frames behind it. Placed FIRST in file order: it is injected alongside the
 /// first real frame; the data-trigger consumer reads the LATEST queued frame
@@ -4308,8 +4369,8 @@ fn tiny_unparseable_external_frame_injects_without_stranding() {
 #[serial]
 fn extended_recorded_frame_reports_diff_at_common_length() {
     let mut rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
-    // Append 4 trailing bytes to the LAST source frame (56 → 60 bytes). The
-    // wire header (total_size 56, timestamp) is untouched, so the cross-checks
+    // Append 4 trailing bytes to the LAST source frame (64 → 68 bytes). The
+    // wire header (total_size 64, timestamp) is untouched, so the cross-checks
     // pass; only the byte diff sees the tail.
     let frames = rec.messages.get_mut("/sr/source/out").unwrap();
     let last = frames.len() - 1;
@@ -4336,10 +4397,10 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
         } => {
             assert_eq!(index, 3, "the extended frame is the last of 4");
             assert_eq!(
-                first_diff_byte_offset, 56,
+                first_diff_byte_offset, 64,
                 "matching prefix → first diff at the common length"
             );
-            assert_eq!((recorded_len, replayed_len), (60, 56));
+            assert_eq!((recorded_len, replayed_len), (68, 64));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
@@ -4718,7 +4779,7 @@ fn swapped_frames_violate_monotonicity_recording_inconsistent_exit_2() {
 
 /// A PRODUCED-topic frame too short for a wire header hits the
 /// "no parseable wire header" cross-check arm (graph publishers always stamp a
-/// 32-byte header, so this is corruption — unlike the EXTERNAL tiny-frame
+/// 40-byte header, so this is corruption, unlike the EXTERNAL tiny-frame
 /// exemption pinned by `tiny_unparseable_external_frame_injects_without_stranding`).
 #[test]
 #[serial]
@@ -9584,6 +9645,7 @@ fn replay_probing_reader(
         fire_tap: None,
         tolerance: None,
         strict_state: false,
+        allow_param_change: false,
         record_out: None,
     };
     let nodes = ReplayNodes::Injected {
@@ -13886,6 +13948,221 @@ fn strict_state_refuses_a_node_with_no_state_that_the_default_runs_and_reports()
     assert!(ok.passed, "{:?}", ok.violations);
 }
 
+/// A [`CounterEntry`] whose BUILD declares one param, `gain: f64` with
+/// default 3.0, and files the value it held at its first tick. It publishes
+/// exactly what the counter does, so a resumed replay still byte-matches the
+/// recording: the only new fact is which `gain` the node ran on.
+struct GainCounterEntry {
+    inner: CounterEntry,
+    gain: f64,
+    first_tick_gain: Arc<std::sync::Mutex<Option<f64>>>,
+}
+
+impl GainCounterEntry {
+    fn new(first_tick_gain: Arc<std::sync::Mutex<Option<f64>>>) -> Self {
+        Self {
+            inner: CounterEntry::new(),
+            gain: 3.0,
+            first_tick_gain,
+        }
+    }
+}
+
+impl NodeEntry for GainCounterEntry {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::NodeInfo> {
+        use cerulion_core::graph::params::{ParamSpec, ParamType, ParamValue};
+        Ok(self.inner.info()?.with_params(vec![ParamSpec {
+            name: "gain".into(),
+            ty: ParamType::F64,
+            default: ParamValue::Float(3.0),
+            min: None,
+            max: None,
+            description: None,
+        }]))
+    }
+
+    fn set_params(
+        &mut self,
+        params: &cerulion_core::graph::params::ParamValues,
+    ) -> cerulion_core::TransportResult<()> {
+        for (name, value) in params {
+            match (name.as_str(), value) {
+                ("gain", cerulion_core::graph::params::ParamValue::Float(x)) => self.gain = *x,
+                _ => {
+                    return Err(cerulion_core::TransportError::GraphError {
+                        reason: format!("gain counter: unexpected param '{name}'"),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn init(&mut self, context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
+        self.inner.init(context)
+    }
+
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        self.first_tick_gain
+            .lock()
+            .expect("probe lock")
+            .get_or_insert(self.gain);
+        self.inner.tick()
+    }
+
+    fn state_shape(&self) -> Option<u64> {
+        self.inner.state_shape()
+    }
+
+    fn restore_state(&mut self, payload: &[u8]) -> cerulion_core::TransportResult<()> {
+        self.inner.restore_state(payload)
+    }
+}
+
+/// [`write_healthy_checkpoint_bag`] whose embedded graph gives the counter
+/// `params:` `yaml_params` (indented under the node entry).
+fn write_checkpoint_bag_with_params(
+    dir: &tempfile::TempDir,
+    name: &str,
+    yaml_params: &str,
+) -> std::path::PathBuf {
+    let mut mid = make_mid_run(&checkpoint_reference(), CP_FIRST_STEP);
+    mid.graph_yaml = mid.graph_yaml.replacen(
+        "    type: counter\n",
+        &format!("    type: counter\n    params:\n{yaml_params}"),
+        1,
+    );
+    assert!(
+        mid.graph_yaml.contains("params:"),
+        "the fixture graph must carry the params: {}",
+        mid.graph_yaml
+    );
+    let bag = dir.path().join(name);
+    write_checkpoint_bag(
+        &mid,
+        &bag,
+        &state_records(
+            CHECKPOINT_RUN,
+            CP_FIRST_STEP - 1,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, CP_FIRST_STEP),
+        ),
+        Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
+        None,
+    );
+    bag
+}
+
+/// Replay `bag` with the counter built as a [`GainCounterEntry`], with or
+/// without `--allow-param-change`: the outcome, and the `gain` the node held
+/// at its first tick (`None` when it never ticked).
+fn run_gain_resume(
+    bag: &std::path::Path,
+    allow_param_change: bool,
+) -> (Result<ReplayOutcome, ReplayError>, Option<f64>) {
+    let probe = Arc::new(std::sync::Mutex::new(None));
+    let entry_probe = Arc::clone(&probe);
+    let outcome = replay_inner_with_transport(
+        bag,
+        move |_| {
+            factories(vec![(
+                CP_NODE,
+                Box::new(GainCounterEntry::new(entry_probe)) as Box<dyn NodeEntry>,
+            )])
+        },
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        None,
+        false,
+        allow_param_change,
+    );
+    let first_tick_gain = *probe.lock().expect("probe lock");
+    (outcome, first_tick_gain)
+}
+
+#[test]
+#[serial]
+fn a_resume_judges_a_recorded_param_the_node_no_longer_declares() {
+    // The recording names `gain: 2.0` and `legacy: true`; this build's node
+    // declares only `gain`. The build alone would refuse `legacy` as an
+    // unknown name, so the resume rule must judge it first.
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_checkpoint_bag_with_params(
+        &dir,
+        "removed.mcap",
+        "      gain: 2.0\n      legacy: true\n",
+    );
+
+    // DEFAULT: the resume refusal (exit 2), naming the dropped param, not a
+    // build failure; nothing ticks.
+    let (outcome, first_tick_gain) = run_gain_resume(&bag, false);
+    let err = outcome.expect_err("a dropped param refuses the resume");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("node 'counter' param 'legacy': recorded true, current no value"),
+        "{text}"
+    );
+    assert!(
+        text.contains("--allow-param-change"),
+        "names the opt-in: {text}"
+    );
+    assert_eq!(first_tick_gain, None, "a refused resume ticks nothing");
+
+    // `--allow-param-change`: the resume runs, the dropped name never reaches
+    // the node (its `set_params` refuses any name but `gain`), and the kept
+    // recorded value is the one in force.
+    let (outcome, first_tick_gain) = run_gain_resume(&bag, true);
+    let outcome = outcome.expect("the opt-in resumes without the dropped param");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert!(outcome.resume.is_some(), "still a resume");
+    assert_eq!(first_tick_gain, Some(2.0));
+}
+
+#[test]
+#[serial]
+fn a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed() {
+    // The recording's graph names no `gain` (its build declared none); this
+    // build declares `gain` with default 3.0, so the resumed node would run on
+    // a value the recording never ran with.
+    let dir = tempfile::tempdir().unwrap();
+    let unnamed = write_healthy_checkpoint_bag(&dir, CP_FIRST_STEP);
+    let run = run_gain_resume;
+
+    // DEFAULT: refused before any state lands or any node ticks, one line
+    // naming the node, the param and both values.
+    let (outcome, first_tick_gain) = run(&unnamed, false);
+    let err = outcome.expect_err("a param the recording does not hold refuses the resume");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("node 'counter' param 'gain': recorded no value, current 3.0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("--allow-param-change"),
+        "names the opt-in: {text}"
+    );
+    assert_eq!(first_tick_gain, None, "a refused resume ticks nothing");
+
+    // `--allow-param-change`: the same bag resumes on the value in force.
+    let (outcome, first_tick_gain) = run(&unnamed, true);
+    let outcome = outcome.expect("the opt-in resumes on the current values");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert!(outcome.resume.is_some(), "still a resume");
+    assert_eq!(first_tick_gain, Some(3.0));
+
+    // ANTI-TAUTOLOGY: a recording that names the value resumes WITHOUT the
+    // opt-in, and the node runs on the recorded 2.0, not this build's 3.0.
+    let named = write_checkpoint_bag_with_params(&dir, "named.mcap", "      gain: 2.0\n");
+    let (outcome, first_tick_gain) = run(&named, false);
+    let outcome = outcome.expect("a recorded value in force resumes");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert_eq!(first_tick_gain, Some(2.0));
+}
+
 #[test]
 #[serial]
 fn two_resumed_replays_of_one_bag_are_byte_identical() {
@@ -17688,6 +17965,10 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
     (
         "a_zero_length_section_is_refused_at_the_anchor_not_blamed_on_the_node",
         "`cp3`'s two Period counters",
+    ),
+    (
+        "write_checkpoint_bag_with_params",
+        "`GainCounterEntry`, which delegates its shape to `CounterEntry`",
     ),
     // --- not a stamp at all ----------------------------------------------
     (
@@ -26214,7 +26495,7 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
 
     // (2) FRAME CONTENT — one flipped payload byte, schedule untouched.
     let mut flipped = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     let bag_flip = dir.path().join("dc_flip.mcap");
     write_bag(&flipped, &bag_flip, None);
 
@@ -26245,7 +26526,7 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
 
     // (5) BOTH structural and content — the ordering pin on a real outcome.
     let mut both = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    both.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    both.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     both.trace.remove(fire_index_at(&both, "relay", 1));
     let bag_both = dir.path().join("dc_both.mcap");
     write_bag(&both, &bag_both, None);
@@ -26490,7 +26771,7 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
 
     // (2) a BYTE-MISMATCH bag (exit-1 shape) — one flipped payload byte.
     let mut flipped = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     let bag_flip = dir.path().join("corpus_flip.mcap");
     write_bag(&flipped, &bag_flip, None);
 
@@ -29881,7 +30162,7 @@ fn a_duration_bounded_steered_pass_reports_no_injection_residue() {
 /// produces the topic:
 ///
 /// * a topic the graph PRODUCES cannot legally carry one — a graph publisher
-///   always stamps a 32-byte header — so it is a corrupt recording and the
+///   always stamps a 40-byte header, so it is a corrupt recording and the
 ///   pre-flight refuses the whole replay with `RecordingInconsistent` (exit 2).
 ///   That gate had no test at all; this is it.
 /// * a topic the graph only CONSUMES (an absolute external `source:`) may carry
@@ -36636,6 +36917,7 @@ fn c6_a_finished_pass_holds_no_capture_port_into_the_next_ranks_pass() {
         None,
         RecordHealthReport::Absent,
         None,
+        false,
         false,
     )
     .expect("a two-rank free-run bag replays");

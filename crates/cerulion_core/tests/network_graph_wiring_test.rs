@@ -109,6 +109,7 @@ fn peer_block(egress: Vec<String>, ingress: Vec<String>) -> NetworkBlock {
         egress: egress.into_iter().map(Into::into).collect(),
         ingress,
         tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 
@@ -120,6 +121,7 @@ fn disabled_block(egress: Vec<String>, ingress: Vec<String>) -> NetworkBlock {
         egress: egress.into_iter().map(Into::into).collect(),
         ingress,
         tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
     }
 }
 
@@ -137,6 +139,7 @@ fn mixed_graph(
     if !egress_topic.is_empty() {
         nodes.push(NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "src".to_string(),
             node_type: "nw_producer".to_string(),
@@ -154,6 +157,7 @@ fn mixed_graph(
     if !ingress_topic.is_empty() {
         nodes.push(NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
             node_type: "nw_sink".to_string(),

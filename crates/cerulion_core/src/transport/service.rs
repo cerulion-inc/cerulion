@@ -32,7 +32,7 @@
 //! `publish_raw`:
 //!
 //! ```text
-//! [WireHeader (32 B)][ServiceEnvelope (24 B)][opaque payload …]
+//! [WireHeader (40 B)][ServiceEnvelope (24 B)][opaque payload …]
 //! ```
 //!
 //! The envelope carries the rmw correlation contract verbatim
@@ -281,6 +281,7 @@ fn build_frame(
         offset_table_count: 0,
         sequence: sequence_low,
         timestamp_ns,
+        step_tag: crate::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; total_size];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

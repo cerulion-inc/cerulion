@@ -1236,7 +1236,7 @@ fn windowed_gate_requires_the_ceiling_to_hold_the_slot_geometry() {
     // The MaxSliceLen legal minimum (a bare WireHeader) must refuse.
     assert!(
         rmw_cerulion::windowed_borrow_geometry(&bridge, WireHeader::SIZE, true).is_none(),
-        "a 32-byte ceiling cannot hold the struct"
+        "a 40-byte ceiling cannot hold the struct"
     );
     // Boundary, both sides.
     assert!(
@@ -1470,8 +1470,10 @@ extern "C" {
 }
 
 /// Lyrical and Rolling: the borrow seal refuses a Buffer-backed top-level
-/// primitive sequence instance before touching the payload (neither
-/// adopted nor copied), and the same slot with the flag clear seals.
+/// primitive sequence instance whose elements are not bytes (rosidl backs
+/// only `uint8[]` with a `rosidl::Buffer<uint8_t>`) before touching the
+/// payload (neither adopted nor copied), and the same slot with the flag
+/// clear seals.
 #[cfg(cerulion_has_is_rosidl_buffer)]
 #[test]
 #[serial]
@@ -1504,5 +1506,320 @@ fn c_buffer_backed_instance_is_refused_by_the_seal_before_any_mutation() {
             .seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch())
             .expect("seal");
         assert_eq!((seal.adopted, seal.escaped, seal.copied), (0, 1, 1));
+    }
+}
+
+// =====================================================================
+// Lyrical and Rolling: a `rosidl::Buffer<uint8_t>` member through the seal
+// =====================================================================
+
+#[cfg(cerulion_has_is_rosidl_buffer)]
+mod rosidl_buffer_seal {
+    use super::*;
+    use std::ffi::CStr;
+    use std::os::raw::c_int;
+
+    const DEVICE: &CStr = c"fixture_device";
+
+    extern "C" {
+        fn rmw_cerulion_fixture_buffer_u8_new(
+            data: *const u8,
+            len: usize,
+            backend: *const c_char,
+            throw_on_copy: c_int,
+        ) -> *mut c_void;
+        fn rmw_cerulion_fixture_buffer_u8_delete(b: *mut c_void);
+        fn rmw_cerulion_fixture_buffer_u8_construct(
+            at: *mut c_void,
+            data: *const u8,
+            len: usize,
+            backend: *const c_char,
+            throw_on_copy: c_int,
+        );
+        fn rmw_cerulion_fixture_buffer_u8_destruct(b: *mut c_void);
+        fn rmw_cerulion_fixture_buffer_u8_size_function(m: *const c_void) -> usize;
+        fn rmw_cerulion_fixture_buffer_u8_get_const_function(
+            m: *const c_void,
+            i: usize,
+        ) -> *const c_void;
+        fn rmw_cerulion_fixture_buffer_u8_get_function(m: *mut c_void, i: usize) -> *mut c_void;
+        fn rmw_cerulion_fixture_buffer_u8_resize_function(m: *mut c_void, size: usize);
+    }
+
+    #[repr(C)]
+    struct CU8Seq {
+        data: *mut u8,
+        size: usize,
+        capacity: usize,
+        is_rosidl_buffer: bool,
+        owns_rosidl_buffer: bool,
+    }
+
+    /// Scanish plus a `uint8[] data` member the typesupport marks as a
+    /// Buffer: the forgeable `ranges` keeps the type windowed-borrow
+    /// eligible, so the seal is the publish path it really takes.
+    #[repr(C)]
+    struct CScanBuf {
+        angle_min: f32,
+        ranges: CF32Seq,
+        data: CU8Seq,
+    }
+
+    /// rosidl-shaped `fini`: a Buffer-backed instance it owns is destroyed
+    /// (`rosidl_buffer_uint8_destroy` is `delete`), everything else freed.
+    unsafe extern "C" fn scanbuf_fini(msg: *mut c_void) {
+        let m = &mut *(msg as *mut CScanBuf);
+        if !m.ranges.data.is_null() {
+            free(m.ranges.data as *mut c_void);
+            m.ranges.data = std::ptr::null_mut();
+        }
+        if m.data.is_rosidl_buffer {
+            if m.data.owns_rosidl_buffer {
+                rmw_cerulion_fixture_buffer_u8_delete(m.data.data as *mut c_void);
+            }
+        } else if !m.data.data.is_null() {
+            free(m.data.data as *mut c_void);
+        }
+        m.data.data = std::ptr::null_mut();
+        m.data.is_rosidl_buffer = false;
+        m.data.owns_rosidl_buffer = false;
+    }
+
+    unsafe extern "C" fn scanbuf_init(
+        msg: *mut c_void,
+        _init: rosidl_runtime_c__message_initialization,
+    ) {
+        std::ptr::write_bytes(msg as *mut u8, 0, std::mem::size_of::<CScanBuf>());
+    }
+
+    fn scanbuf_bridge() -> BridgedMessage {
+        let mut data = c_sequence(
+            "data",
+            ROS_TYPE_UINT8,
+            std::mem::offset_of!(CScanBuf, data) as u32,
+        );
+        data.is_rosidl_buffer_ = true;
+        let members = vec![
+            c_member("angle_min", ROS_TYPE_FLOAT, 0),
+            c_sequence(
+                "ranges",
+                ROS_TYPE_FLOAT,
+                std::mem::offset_of!(CScanBuf, ranges) as u32,
+            ),
+            data,
+        ];
+        let members = Box::leak(members.into_boxed_slice());
+        let members = Box::leak(Box::new(
+            rosidl_typesupport_introspection_c__MessageMembers {
+                message_namespace_: cstr("seal_test__msg"),
+                message_name_: cstr("ScanBuf"),
+                member_count_: members.len() as u32,
+                size_of_: std::mem::size_of::<CScanBuf>(),
+                members_: members.as_ptr(),
+                init_function: Some(scanbuf_init),
+                fini_function: Some(scanbuf_fini),
+                ..Default::default()
+            },
+        ));
+        unsafe { BridgedMessage::new(members) }.expect("bridge")
+    }
+
+    /// Lay a CScanBuf in a fresh slot whose `data` is an owned Buffer on
+    /// `backend` (`None` = CPU), seal it windowless, and return the sealed
+    /// payload bytes (or the refusal).
+    unsafe fn seal_scanbuf(
+        bridge: &BridgedMessage,
+        bytes: &[u8],
+        backend: Option<&CStr>,
+        throws: bool,
+    ) -> Result<(Vec<u8>, usize), Vec<u8>> {
+        let mut slot = Slot::new();
+        let payload = slot.payload();
+        let ranges = [0.25f32, 0.5];
+        let heap = calloc(ranges.len(), 4) as *mut f32;
+        std::ptr::copy_nonoverlapping(ranges.as_ptr(), heap, ranges.len());
+        let m = &mut *(payload as *mut CScanBuf);
+        m.angle_min = 3.0;
+        m.ranges = CF32Seq {
+            data: heap,
+            size: ranges.len(),
+            capacity: ranges.len(),
+            is_rosidl_buffer: false,
+            owns_rosidl_buffer: false,
+        };
+        m.data = CU8Seq {
+            data: rmw_cerulion_fixture_buffer_u8_new(
+                bytes.as_ptr(),
+                bytes.len(),
+                backend.map_or(std::ptr::null(), |b| b.as_ptr()),
+                throws as c_int,
+            ) as *mut u8,
+            size: bytes.len(),
+            capacity: 0,
+            is_rosidl_buffer: true,
+            owns_rosidl_buffer: true,
+        };
+        let before: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+        let geo = bridge.borrow_geometry().expect("geometry");
+        match bridge.seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch()) {
+            Ok(seal) => Ok((
+                std::slice::from_raw_parts(payload, seal.total_payload).to_vec(),
+                seal.copied,
+            )),
+            Err(_) => {
+                let after: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+                assert_eq!(before, after, "a refused seal must not touch the payload");
+                scanbuf_fini(payload as *mut c_void);
+                Err(after)
+            }
+        }
+    }
+
+    /// A device Buffer seals to the bytes a CPU Buffer seals to, counted
+    /// as a structural copy and as one downgrade; an empty one seals; a
+    /// backend that throws on the host copy refuses before any mutation.
+    #[test]
+    #[serial]
+    fn c_seal_copies_a_device_buffer_into_the_frame_and_never_adopts_it() {
+        let bridge = scanbuf_bridge();
+        let bytes: Vec<u8> = (0..200u32).map(|i| (i * 7) as u8).collect();
+        unsafe {
+            let (cpu, cpu_copied) = seal_scanbuf(&bridge, &bytes, None, false).expect("cpu");
+            let before = rmw_cerulion::rosidl_buffer::downgrade_count();
+            let (device, copied) = seal_scanbuf(&bridge, &bytes, Some(DEVICE), false).expect("dev");
+            assert_eq!(rmw_cerulion::rosidl_buffer::downgrade_count(), before + 1);
+            assert_eq!(device, cpu, "the host copy seals byte-identically");
+            assert_eq!(copied, cpu_copied);
+            seal_scanbuf(&bridge, &[], Some(DEVICE), false).expect("an empty Buffer seals");
+            assert!(seal_scanbuf(&bridge, &bytes, Some(DEVICE), true).is_err());
+            assert_eq!(rmw_cerulion::rosidl_buffer::downgrade_count(), before + 1);
+        }
+    }
+
+    /// Pointer-aligned storage for one `rosidl::Buffer<uint8_t>`.
+    #[repr(C, align(8))]
+    struct BufferSlot([u8; 16]);
+
+    /// Imageish with its `uint8[] data` a Buffer, plus a forgeable
+    /// `uint8[] extra` vector so the type is windowed-borrow eligible.
+    #[repr(C)]
+    struct CppImageBuf {
+        height: u32,
+        width: u32,
+        data: BufferSlot,
+        extra: VecU8Slot,
+    }
+
+    unsafe extern "C" fn imagebuf_init(msg: *mut c_void, _init: u32) {
+        let m = &mut *(msg as *mut CppImageBuf);
+        m.height = 0;
+        m.width = 0;
+        rmw_cerulion_fixture_buffer_u8_construct(
+            m.data.0.as_mut_ptr() as *mut c_void,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+        );
+        rmw_cerulion_vector_u8_construct(m.extra.0.as_mut_ptr() as *mut c_void);
+    }
+
+    unsafe extern "C" fn imagebuf_fini(msg: *mut c_void) {
+        let m = &mut *(msg as *mut CppImageBuf);
+        rmw_cerulion_fixture_buffer_u8_destruct(m.data.0.as_mut_ptr() as *mut c_void);
+        rmw_cerulion_vector_u8_destruct(m.extra.0.as_mut_ptr() as *mut c_void);
+    }
+
+    fn imagebuf_bridge() -> CppBridgedMessage {
+        let mut data = cpp_member(
+            "data",
+            ROS_TYPE_UINT8,
+            std::mem::offset_of!(CppImageBuf, data) as u32,
+        );
+        data.is_array_ = true;
+        data.is_rosidl_buffer_ = true;
+        data.size_function = Some(rmw_cerulion_fixture_buffer_u8_size_function);
+        data.get_const_function = Some(rmw_cerulion_fixture_buffer_u8_get_const_function);
+        data.get_function = Some(rmw_cerulion_fixture_buffer_u8_get_function);
+        data.resize_function = Some(rmw_cerulion_fixture_buffer_u8_resize_function);
+        let mut extra = cpp_member(
+            "extra",
+            ROS_TYPE_UINT8,
+            std::mem::offset_of!(CppImageBuf, extra) as u32,
+        );
+        extra.is_array_ = true;
+        extra.size_function = Some(vecu8_size);
+        extra.get_const_function = Some(vecu8_get_const);
+        extra.get_function = Some(vecu8_get);
+        let members = vec![
+            cpp_member("height", ROS_TYPE_UINT32, 0),
+            cpp_member("width", ROS_TYPE_UINT32, 4),
+            data,
+            extra,
+        ];
+        let members = Box::leak(members.into_boxed_slice());
+        let members = Box::leak(Box::new(CppMessageMembers {
+            message_namespace_: cstr("seal_test::msg"),
+            message_name_: cstr("ImageBuf"),
+            member_count_: members.len() as u32,
+            size_of_: std::mem::size_of::<CppImageBuf>(),
+            has_any_key_member_: false,
+            members_: members.as_ptr(),
+            init_function: Some(imagebuf_init),
+            fini_function: Some(imagebuf_fini),
+        }));
+        unsafe { CppBridgedMessage::new(members) }.expect("bridge")
+    }
+
+    unsafe fn seal_imagebuf(
+        bridge: &CppBridgedMessage,
+        bytes: &[u8],
+        backend: Option<&CStr>,
+        throws: bool,
+    ) -> Option<Vec<u8>> {
+        let mut slot = Slot::new();
+        let payload = slot.payload();
+        imagebuf_init(payload as *mut c_void, 0);
+        let m = &mut *(payload as *mut CppImageBuf);
+        m.height = 2;
+        m.width = 3;
+        let at = m.data.0.as_mut_ptr() as *mut c_void;
+        rmw_cerulion_fixture_buffer_u8_destruct(at);
+        rmw_cerulion_fixture_buffer_u8_construct(
+            at,
+            bytes.as_ptr(),
+            bytes.len(),
+            backend.map_or(std::ptr::null(), |b| b.as_ptr()),
+            throws as c_int,
+        );
+        let geo = bridge.borrow_geometry().expect("geometry");
+        let before: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+        match bridge.seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch()) {
+            Ok(seal) => Some(std::slice::from_raw_parts(payload, seal.total_payload).to_vec()),
+            Err(_) => {
+                let after: Vec<u8> = std::slice::from_raw_parts(payload, PAYLOAD_LEN).to_vec();
+                assert_eq!(before, after, "a refused seal must not touch the payload");
+                imagebuf_fini(payload as *mut c_void);
+                None
+            }
+        }
+    }
+
+    /// The C++ twin: a device Buffer member seals to the CPU Buffer's
+    /// bytes and counts one downgrade; a throwing backend refuses first.
+    #[test]
+    #[serial]
+    fn cpp_seal_copies_a_device_buffer_member_and_never_forges_it() {
+        let bridge = imagebuf_bridge();
+        let bytes: Vec<u8> = (0..96u32).map(|i| (i * 5 + 1) as u8).collect();
+        unsafe {
+            let cpu = seal_imagebuf(&bridge, &bytes, None, false).expect("cpu");
+            let before = rmw_cerulion::rosidl_buffer::downgrade_count();
+            let device = seal_imagebuf(&bridge, &bytes, Some(DEVICE), false).expect("device");
+            assert_eq!(rmw_cerulion::rosidl_buffer::downgrade_count(), before + 1);
+            assert_eq!(device, cpu);
+            assert!(seal_imagebuf(&bridge, &bytes, Some(DEVICE), true).is_none());
+            assert_eq!(rmw_cerulion::rosidl_buffer::downgrade_count(), before + 1);
+        }
     }
 }

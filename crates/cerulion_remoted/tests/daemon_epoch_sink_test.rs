@@ -6,7 +6,7 @@
 //! Without this, reverting that one line keeps every other epoch-push test green
 //! (`epoch_push_e2e_test.rs` builds the `WirePlane` directly and installs the sink
 //! itself). Here the sink is wired by `serve_endpoint`; a real desk pushes a real
-//! CA-signed epoch over the real `cerulion/wire/1` plane and the robot must both REPORT
+//! CA-signed epoch over the real `cerulion/wire/2` plane and the robot must both REPORT
 //! it applied AND actually refuse the revoked party afterwards. Reverting the wiring
 //! turns the reply into the sink-less refusal and this test fails.
 //!

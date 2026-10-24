@@ -11,10 +11,10 @@ use std::time::Duration;
 use cerulion_cli_engine::node_cmd;
 use cerulion_cli_engine::workspace;
 use cerulion_wsd::daemon::{self, RunningWsd, WsdConfig};
+use cerulion_wsd::hygiene::connect_control_socket;
 use cerulion_wsd::protocol::PROTOCOL_VERSION;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -99,7 +99,7 @@ async fn fixture() -> Fixture {
 }
 
 async fn connect(socket: &Path) -> (Reader, Writer) {
-    let stream = UnixStream::connect(socket).await.expect("connect");
+    let stream = connect_control_socket(socket).expect("connect");
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut hello = String::new();

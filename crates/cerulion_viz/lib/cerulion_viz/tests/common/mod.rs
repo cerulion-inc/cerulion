@@ -71,6 +71,7 @@ fn build_fixed_frame_at(
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);

@@ -34,7 +34,7 @@ def test_publish_empty_payload(session):
     pub.publish(b"", timestamp_ns=5)
     frame = sub.receive(2000)
     assert frame is not None
-    assert frame.total_size == 32
+    assert frame.total_size == 40
     assert len(frame.payload) == 0
     assert frame.to_bytes() == b""
     frame.release()
@@ -48,7 +48,7 @@ def test_loan_zero_length(session):
     loan.commit()
     frame = sub.receive(2000)
     assert frame is not None
-    assert frame.total_size == 32
+    assert frame.total_size == 40
     assert len(frame.payload) == 0
     frame.release()
 
