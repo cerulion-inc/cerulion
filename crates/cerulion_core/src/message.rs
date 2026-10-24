@@ -19,7 +19,7 @@
 //! Every `ShmMessage` impl agrees on the unified offset-table layout:
 //!
 //! ```text
-//! [WireHeader (32 bytes)][fixed_section][offset_table][variable_payload]
+//! [WireHeader (40 bytes)][fixed_section][offset_table][variable_payload]
 //! ```
 //!
 //! For fixed schemas, `WIRE_FIXED_SIZE == size of fixed_section` and the
@@ -113,7 +113,7 @@ pub trait ShmMessage: Sized {
     /// unrepresentable — the
     /// `MaxSliceLen` newtype encodes BOTH the upper bound
     /// (`u32::MAX`, the wire format's `WireHeader::total_size`
-    /// ceiling) AND the lower bound (`>= WireHeader::SIZE = 32`,
+    /// ceiling) AND the lower bound (`>= WireHeader::SIZE = 40`,
     /// so the slot can hold at least the header). Codegen emits
     /// `MaxSliceLen::const_new(<expr>)` which panics at const-eval
     /// if the bound is violated — pathological schemas fail to
@@ -166,7 +166,7 @@ pub trait ShmMessage: Sized {
         Self: 'a;
 
     /// Construct a `Reader<'a>` over an immutable byte slice (the SHM payload
-    /// region after the 32-byte `WireHeader`).
+    /// region after the 40-byte `WireHeader`).
     ///
     /// Used by `CerulionSubscriber::try_view`
     /// to wrap the inbound iceoryx2 sample's payload in the schema-specific
@@ -180,7 +180,7 @@ pub trait ShmMessage: Sized {
     fn build_reader(bytes: &[u8]) -> Self::Reader<'_>;
 
     /// Construct a `Writer<'a>` over a mutable byte slice (the SHM payload
-    /// region after the 32-byte `WireHeader`).
+    /// region after the 40-byte `WireHeader`).
     ///
     /// Used by `CerulionPublisher::loan_proxy`
     /// to wrap the outbound iceoryx2 sample's payload. For fixed schemas this
@@ -191,7 +191,7 @@ pub trait ShmMessage: Sized {
     /// # `max_capacity` and `topic`
     ///
     /// `max_capacity` is the configured `max_slice_len` ceiling MINUS the
-    /// 32-byte `WireHeader` (i.e., the absolute upper bound on the
+    /// 40-byte `WireHeader` (i.e., the absolute upper bound on the
     /// post-header payload). Variable schemas store it so a setter that
     /// detects `cursor + bytes_needed > self.len` (current loan) can decide
     /// between two paths: (a) `cursor + bytes_needed >
@@ -224,7 +224,7 @@ pub trait ShmMessage: Sized {
         topic: Arc<str>,
     ) -> Self::Writer<'a>;
 
-    /// Wire size of the payload region (excludes the 32-byte `WireHeader`).
+    /// Wire size of the payload region (excludes the 40-byte `WireHeader`).
     ///
     /// Used by `OutputProxy::Drop` to finalise `WireHeader::total_size` from
     /// the writer's runtime state. For fixed schemas this is always

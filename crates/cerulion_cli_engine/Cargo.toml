@@ -103,10 +103,6 @@ mdns-sd = "0.20"
 # `cerulion_cli_engine` depends on `cerulion_netd`, so the beacon could not live
 # here without a cyclic edge. The BROWSE half stays in `mdns_discovery`.
 cerulion_mdns = { workspace = true }
-# Resolve the home dir for the peer cache (`~/.cerulion/peers.json`,
-# `peer_cache`) and the peers config (`~/.cerulion/config.toml`,
-# `hostname_peers`). Already in the workspace lockfile transitively.
-dirs = "6"
 # Parse the `~/.cerulion/config.toml` `peers = [...]` list
 # (`hostname_peers`). Already in the workspace lockfile transitively.
 toml = "0.9"
@@ -288,6 +284,9 @@ serde_json = "1"
 # `graph_cmd.rs` can build an in-process `GraphRuntime` without
 # pulling in iceoryx2.
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
+# `test-helpers` exposes `cerulion_bag::legacy_fixture`, which rewrites a bag in the
+# 32-byte wire header layout for the legacy play, resim and migrate tests.
+cerulion_bag = { workspace = true, features = ["test-helpers"] }
 # `no-env-filter` is required so the test subscriber doesn't filter
 # out cross-crate events. Without it, `#[traced_test]` builds an
 # EnvFilter scoped to the test crate's `module_path!()` and silently

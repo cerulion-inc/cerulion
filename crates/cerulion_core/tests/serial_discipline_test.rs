@@ -267,6 +267,10 @@ the arms are additionally #[serial] within the binary because the drain tally is
 process-global static two concurrent arms would both bump",
     ),
     (
+        "local_transport_test",
+        "touches the process singleton in refusal and device-role arms",
+    ),
+    (
         "latest_value_input_has_no_listener_test",
         "default-namespace manager: the refusal pair stands up its own ports on the shared \
 root, and the window arms read a topic's live listener count, which a sibling attaching \
@@ -368,6 +372,10 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
         "toolchain",
         "nobody (on demand) — asserts rustc's UNSTABLE diagnostic rendering, so CI must never gate on it; re-blessed after toolchain bumps",
     ),
+    (
+        "android-device",
+        "nobody (on demand): requires an Android device for the local transport serving role",
+    ),
 ];
 
 /// Every `#[ignore]`d test arm in `cerulion_core/tests`, with the CLASS that
@@ -390,7 +398,8 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 ///   the binary and reads the child's exit code. They are NOT dark, and six of
 ///   the nineteen arms here are this class. Counting them as unowned overstates
 ///   the gap.
-/// * `unix-by-hand` — needs several real processes and a real `MAP_SHARED` page.
+/// * `unix-by-hand`: needs several real processes and a real `MAP_SHARED` page,
+///   or is a release measurement that prints a table and gates nothing.
 ///   Runnable on any Unix host.
 /// * `linux-only` — needs a Linux-only kernel interface (`/proc/self/smaps`) or
 ///   CPU pinning. Runnable on a Linux host only.
@@ -400,6 +409,8 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 /// * `toolchain` — asserts rustc's own unstable diagnostic rendering, so it is
 ///   deliberately on-demand and re-blessed after toolchain bumps. CI must not
 ///   gate on it.
+/// * `android-device`: the local-transport serving role needs an Android
+///   device and is run on demand.
 ///
 /// Compared BOTH directions by the test below, like the two inventories above:
 /// an arm added without an entry fails, and an entry naming an arm that no
@@ -472,10 +483,34 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "oversizing-is-latency-free on that same board",
     ),
     (
+        "colocated_hop_probe_test.rs",
+        "the_queued_hop_through_the_level_loop",
+        "unix-by-hand",
+        "a release measurement of the in-process hop through the level loop; prints a table, gates nothing",
+    ),
+    (
+        "colocated_hop_probe_test.rs",
+        "what_a_hop_is_made_of",
+        "unix-by-hand",
+        "a release measurement of a consumer receive, the library receive and a publish; prints a table, gates nothing",
+    ),
+    (
         "cross_machine_data_plane_harness.rs",
         "cross_machine_data_plane",
         "two-machine",
         "a standing cross-machine data-plane diagnostic, driven by env; never a gate",
+    ),
+    (
+        "local_transport_test.rs",
+        "loader_refuses_a_matching_local_transport_cdylib",
+        "unix-by-hand",
+        "needs a fixture built WITH cerulion_core/local-transport; the Local transport CI lane builds it and runs this arm with --ignored --exact",
+    ),
+    (
+        "local_transport_test.rs",
+        "serve_role",
+        "android-device",
+        "manual Android device E2E: exercises local pub/sub and gateway schema serving under the app sandbox",
     ),
     (
         "macro_compile_fail_test.rs",
@@ -512,6 +547,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_raw_ffi_level_probe",
         "child",
         "self-re-exec entry point for the raw-FFI half of the same contract",
+    ),
+    (
+        "cdylib_shm_fd_handoff_iox2_test.rs",
+        "subprocess_child_shm_fd_handoff",
+        "child",
+        "self-re-exec entry point; the parent runs it with `--exact … --ignored` in a fresh process, since its descriptor table is the subject",
     ),
     (
         "cdylib_tracing_stopgap_test.rs",
@@ -560,6 +601,18 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subscriber_role",
         "child",
         "self-re-exec subscriber role that reports readiness before the publisher starts",
+    ),
+    (
+        "gateway_iox2_test.rs",
+        "lan_announce_observer_role",
+        "child",
+        "self-re-exec LAN observer role; one zenoh session per process, so the parent drives it in a child and reads the announce set it prints",
+    ),
+    (
+        "gateway_iox2_test.rs",
+        "lan_demand_client_role",
+        "child",
+        "self-re-exec LAN demand-client role; one zenoh session per process, so the parent drives it in a child and reads the PRE/POST tokens it prints",
     ),
 ];
 

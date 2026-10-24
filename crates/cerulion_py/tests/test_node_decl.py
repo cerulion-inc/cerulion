@@ -79,7 +79,7 @@ def test_two_input_one_output_metadata_matches_handwritten_oracle():
                 "name": "result",
                 "schema": "Probe",
                 "schema_hash": 5093796653891464803,
-                "max_slice_len_default": 36,
+                "max_slice_len_default": 44,
                 "promise_within_ms": None,
                 "wire_fixed_size": 4,
             }
@@ -500,7 +500,7 @@ def test_rust_period_node_metadata_matches_python_declaration():
     @cerulion.node(period_ms=50)
     class PeriodNode:
         cmd = cerulion.output(
-            "geometry_msgs/Vector3", max_slice_len_default=56
+            "geometry_msgs/Vector3", max_slice_len_default=64
         )
 
         def tick(self):
@@ -571,7 +571,7 @@ def test_output_limit_smaller_than_the_fixed_frame_is_rejected():
 
     @cerulion.node(period_ms=50)
     class TooSmall:
-        cmd = cerulion.output("geometry_msgs/Vector3", max_slice_len_default=55)
+        cmd = cerulion.output("geometry_msgs/Vector3", max_slice_len_default=63)
 
         def tick(self):
             pass
@@ -579,14 +579,14 @@ def test_output_limit_smaller_than_the_fixed_frame_is_rejected():
     with pytest.raises(ValueError) as error:
         TooSmall.__cerulion_info__(schemas)
     assert str(error.value) == (
-        "output 'cmd': max_slice_len_default 55 is smaller than the 56-byte "
+        "output 'cmd': max_slice_len_default 63 is smaller than the 64-byte "
         "geometry_msgs/Vector3 frame"
     )
 
 
 def test_output_limit_counts_alignment_padding_before_variable_fields():
-    """uint32 id + uint64[] v: 32 header + 4 fixed + 8 offset entry = 44,
-    padded to the 8-byte element boundary = 48 bytes even with `v` empty."""
+    """uint32 id + uint64[] v: 40 header + 4 fixed + 8 offset entry = 52,
+    padded to the 8-byte element boundary = 56 bytes even with `v` empty."""
     schemas = cerulion.SchemaSet()
     assert schemas.add_rosmsg("uint32 id\nuint64[] v\n", "pkg/Padded") == []
 
@@ -601,10 +601,10 @@ def test_output_limit_counts_alignment_padding_before_variable_fields():
         return Padded
 
     with pytest.raises(ValueError) as error:
-        declare(47).__cerulion_info__(schemas)
+        declare(55).__cerulion_info__(schemas)
     assert str(error.value) == (
-        "output 'out': max_slice_len_default 47 is smaller than the 48-byte "
+        "output 'out': max_slice_len_default 55 is smaller than the 56-byte "
         "pkg/Padded frame"
     )
-    info = json.loads(declare(48).__cerulion_info__(schemas))
-    assert info["outputs"][0]["max_slice_len_default"] == 48
+    info = json.loads(declare(56).__cerulion_info__(schemas))
+    assert info["outputs"][0]["max_slice_len_default"] == 56

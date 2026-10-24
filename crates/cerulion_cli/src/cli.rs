@@ -172,9 +172,9 @@ const COMPLETIONS_LONG_ABOUT: &str = "\
 Print the shell code that enables `cerulion` tab-completion.
 
 Completes everything: subcommands, flags, and enum values from the command
-tree, plus LIVE names: topic names for `topic echo/info/hz`, node types
-for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
-workspace + built-in ROS 2 schemas for `schema info`, and robot names for
+tree, plus LIVE names: topic names for `topic echo/info/hz/type/bw`, node
+types for `node build/run/info/...`, graph names for `graph run/levels/partition/...`,
+workspace + built-in ROS 2 schemas for `schema info` and `topic find`, and robot names for
 `viz --robot`.
 
 Install it once, per shell:
@@ -309,7 +309,7 @@ pub enum Commands {
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
         /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found by scouting with no configuration, and
+        /// typical LAN the robot is found over mDNS with no configuration, and
         /// no schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
@@ -317,11 +317,11 @@ pub enum Commands {
         /// A topic the robot does not serve is an error, not a silent skip.
         #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// Additional zenoh gateway locator to CONNECT to, for a robot scouting
-        /// cannot reach, for example `tcp/192.0.2.10:7683`. Repeatable. Requires
-        /// `--robot`. Used when this command STARTS the daemon; a daemon that is
-        /// already running keeps the locators it started with (scouting covers
-        /// the LAN regardless, and the verb says so).
+        /// Additional zenoh gateway locator to CONNECT to, for a robot mDNS
+        /// discovery cannot reach, for example `tcp/192.0.2.10:7683`.
+        /// Repeatable. Requires `--robot`. Used when this command STARTS the
+        /// daemon; a daemon that is already running keeps the locators it
+        /// started with, and the verb says so.
         #[arg(long, value_name = "LOCATOR", requires = "robot")]
         connect: Vec<String>,
         /// Local zenoh locator to LISTEN on for remote discovery and ingress, for
@@ -373,8 +373,9 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
-        /// omitted, the paired desk key `~/.cerulion/desk.key` is used if it
-        /// exists (written by `cerulion pair`), else an EPHEMERAL key, which an
+        /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
+        /// named `~/.cerulion/desk.key`) is used if it exists (written by
+        /// `cerulion pair` or `cerulion login`), else an EPHEMERAL key, which an
         /// unpaired robot REFUSES, so pair the desk first with `cerulion pair`.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
@@ -407,9 +408,10 @@ pub enum Commands {
     ///
     /// The robot owner starts code pairing on the robot and shares a short code;
     /// you supply it here (`--code`, else typed at the prompt or piped on stdin).
-    /// The desk device key is created at `~/.cerulion/desk.key` on the first pair
-    /// (0600 permissions) and reused afterwards. An existing key is never
-    /// overwritten.
+    /// The desk device key is this machine's key,
+    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
+    /// created on the first pair or sign-in (0600 permissions) and reused
+    /// afterwards. An existing key is never overwritten.
     ///
     /// STDOUT carries deterministic, machine-parseable state lines:
     /// `pairing: robot=<name> eid=<hex>`, then on success
@@ -454,7 +456,8 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         label: Option<String>,
         /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
-        /// `~/.cerulion/desk.key` (created 0600 on the first pair, reused after).
+        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
+        /// the first pair or sign-in, reused after).
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
         key_file: Option<PathBuf>,
         /// Self-hosted relay URL. Default: n0 public relays.
@@ -1353,6 +1356,19 @@ pub enum GraphAction {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]
         name: String,
+        /// Launch-argument overrides, `name:=value`, for the arguments the
+        /// graph declares under its top-level `args:` map (each with a
+        /// default). An override replaces the default for this run only:
+        /// `cerulion graph run robot use_sim:=true robot_name:=go2`. The
+        /// value is read as a YAML scalar (`true` is a bool, `50` an
+        /// integer, `go2` text; quote digits to keep them text). An
+        /// override for an argument the graph does not declare is refused
+        /// before any node loads, with the nearest declared name.
+        #[arg(
+            value_name = "NAME:=VALUE",
+            value_parser = cerulion_cli_engine::graph_launch_args::check_override_word
+        )]
+        launch_args: Vec<String>,
         /// Clock that drives the run
         #[arg(long = "time-source", value_enum, default_value_t = TimeSource::Real)]
         time_source: TimeSource,
@@ -1518,9 +1534,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// announces every produced topic on the LAN, viewable by any peer
-        /// without pairing. Restrict exposure with a `network:` block, or pass
-        /// `off` for local-only.
+        /// can announce every produced topic when LAN access is open. Android
+        /// defaults to paired-only access, which withholds topic announcements.
+        /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
         /// Cap, in entries, on the in-memory fire trace. The trace is a BOUNDED
@@ -1789,8 +1805,9 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (multicast and gossip scouting
-    /// on), so robots on the LAN show up with no flags and no pairing; when it
+    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
+    /// cache and the hostname rung), so robots on the LAN show up with no
+    /// flags and no pairing; when it
     /// finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
@@ -1799,7 +1816,7 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators to reach
-    /// peers scouting cannot find; pass `--local` to skip the remote
+    /// peers discovery cannot find; pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1819,11 +1836,11 @@ pub enum TopicAction {
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
         /// for example `tcp/192.0.2.10:7683` (7683 is the default gateway
-        /// port). Adds to the default scouting session.
+        /// port). Adds to the discovered peers.
         #[arg(long, value_name = "LOCATOR")]
         connect: Vec<String>,
         /// Additional zenoh locator to listen on for discovery (repeatable),
-        /// for example `tcp/0.0.0.0:7447`. Adds to the default scouting session.
+        /// for example `tcp/0.0.0.0:7447`. Adds to the default discovery session.
         #[arg(long, value_name = "LOCATOR")]
         listen: Vec<String>,
         /// OPT-IN: also sweep the local /24 subnets, one address at a time, on
@@ -1837,6 +1854,13 @@ pub enum TopicAction {
         /// appears as a robot.
         #[arg(long)]
         scan: bool,
+        /// Show each topic's message type after its name, as
+        /// `/topic  [package/Type]` (`ros2 topic list -t`). A LOCAL topic is
+        /// typed from one message (the listing waits up to one second in
+        /// all); a REMOTE topic from its robot's catalog. A type that is not
+        /// known shows `[unknown]`.
+        #[arg(short = 't', long = "show-types")]
+        show_types: bool,
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
@@ -1854,7 +1878,7 @@ pub enum TopicAction {
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
     },
-    /// Echo messages from a topic (decoded fields)
+    /// Echo messages from a topic as YAML
     ///
     /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
     /// robot's topic discovered on the LAN: the topic is demanded
@@ -1869,10 +1893,10 @@ pub enum TopicAction {
         /// Topic name
         #[arg(add = ArgValueCandidates::new(completion::topics))]
         topic: String,
-        /// Max array elements to render before truncating with `...` + a
-        /// `(N elements)` tail (default 128; matches `ros2 topic echo
-        /// --truncate-length`). Must be a positive integer: 0 and negative
-        /// values are rejected at parse.
+        /// Max array elements to print; a cut array ends in a
+        /// `!truncated <n>` element (n = elements left out). Default 128;
+        /// matches `ros2 topic echo --truncate-length`. Must be a positive
+        /// integer: 0 and negative values are rejected at parse.
         #[arg(
             long = "truncate-length",
             value_name = "N",
@@ -2043,6 +2067,15 @@ pub enum BagAction {
         /// claim about the recording, so a plain `--resim all` honours it too.
         #[arg(long)]
         strict_state: bool,
+        /// With `--resim`: on a recording that begins MID-RUN, resume on the
+        /// param values in force even where they differ from the ones the
+        /// recording names. A param is not node state, so a restore never
+        /// writes one; without this flag such a difference refuses the run
+        /// with exit 2, one line per param (node, param, recorded value,
+        /// current value). Inert on a from-start bag. Valid in BOTH resim
+        /// modes.
+        #[arg(long)]
+        allow_param_change: bool,
         /// With `--resim`: write the re-executed frames to a new bag at this
         /// path. One channel per graph-produced topic, labelled with the schema
         /// the re-executed graph publishes, holding every frame it published on
@@ -2364,7 +2397,7 @@ mod pair_dispatch_tests {
                 assert!(label.is_none(), "the label defaults to the desk hostname");
                 assert!(
                     key_file.is_none(),
-                    "the key file defaults to ~/.cerulion/desk.key"
+                    "the key file defaults to this machine's key"
                 );
                 assert!(relay_url.is_none());
                 assert!(!relay_disabled);
@@ -2662,6 +2695,72 @@ mod graph_partition_dispatch_tests {
             Cli::try_parse_from(["cerulion", "graph", "partition", "g", "--force"]).is_err(),
             "an unknown --force flag must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_run_launch_args_tests {
+    use super::*;
+
+    fn launch_args_of(argv: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        match cli.command {
+            Commands::Graph {
+                action: GraphAction::Run { launch_args, .. },
+            } => launch_args,
+            _ => panic!("expected Graph::Run"),
+        }
+    }
+
+    /// `name:=value` words after the graph name are collected in order, and
+    /// flags may follow or precede them.
+    #[test]
+    fn graph_run_collects_name_value_overrides_after_the_graph_name() {
+        assert_eq!(
+            launch_args_of(&[
+                "cerulion",
+                "graph",
+                "run",
+                "robot",
+                "use_sim:=true",
+                "robot_name:=go2",
+                "--single-process",
+            ]),
+            ["use_sim:=true", "robot_name:=go2"]
+        );
+        assert_eq!(
+            launch_args_of(&["cerulion", "graph", "run", "--release", "robot", "n:=1"]),
+            ["n:=1"]
+        );
+    }
+
+    /// A bare `graph run <name>` carries no override: the graph's declared
+    /// defaults apply.
+    #[test]
+    fn graph_run_without_overrides_carries_none() {
+        assert!(launch_args_of(&["cerulion", "graph", "run", "robot"]).is_empty());
+    }
+
+    /// A word after the graph name that is not `name:=value` is a usage
+    /// error at parse, naming the word, the shape and the `--flag=value`
+    /// spelling (the word a user most often means is a flag's value).
+    #[test]
+    fn graph_run_refuses_a_word_that_is_not_an_override_at_parse() {
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "bags"])
+            .err()
+            .expect("a bare word is not an override")
+            .to_string();
+        assert!(
+            err.contains("launch argument override 'bags' is malformed")
+                && err.contains("found no `:=`")
+                && err.contains("`--record=DIR`"),
+            "{err}"
+        );
+        let err = Cli::try_parse_from(["cerulion", "graph", "run", "robot", "my-arg:=1"])
+            .err()
+            .expect("an invalid name is refused")
+            .to_string();
+        assert!(err.contains("'my-arg' is not an argument name"), "{err}");
     }
 }
 
@@ -3704,8 +3803,10 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        show_types,
                     },
             } => {
+                assert!(!show_types, "a bare list prints no types");
                 assert!(!no_network, "bare list must default to remote-discovery ON");
                 assert!(connect.is_empty());
                 assert!(listen.is_empty());
@@ -3713,6 +3814,21 @@ mod topic_list_network_flag_tests {
                 assert!(!all, "internal topics must be HIDDEN on a bare list");
             }
             _ => panic!("expected Topic::List"),
+        }
+    }
+
+    #[test]
+    fn topic_list_t_and_show_types_ask_for_types() {
+        for flag in ["-t", "--show-types"] {
+            match Cli::try_parse_from(["cerulion", "topic", "list", flag])
+                .expect("`topic list -t` must parse")
+                .command
+            {
+                Commands::Topic {
+                    action: TopicAction::List { show_types, .. },
+                } => assert!(show_types, "{flag}"),
+                _ => panic!("expected Topic::List"),
+            }
         }
     }
 
@@ -3794,6 +3910,7 @@ mod topic_list_network_flag_tests {
                         connect,
                         listen,
                         scan,
+                        ..
                     },
             } => {
                 assert!(!no_network);
@@ -4582,6 +4699,31 @@ mod verb_log_class_tests {
             assert!(strict_state, "{argv:?} must carry --strict-state");
             assert_eq!(verify, want_verify, "{argv:?}");
             assert_eq!(resim.as_deref(), Some("all"), "{argv:?}");
+        }
+    }
+
+    /// `--allow-param-change` parses onto `bag play` in both resim modes, and
+    /// an invocation without it carries `false`.
+    #[test]
+    fn bag_play_parses_allow_param_change_in_both_resim_modes() {
+        for (extra, want) in [
+            (vec!["--allow-param-change"], true),
+            (vec!["--verify", "--allow-param-change"], true),
+            (vec![], false),
+        ] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action:
+                    BagAction::Play {
+                        allow_param_change, ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(allow_param_change, want, "{argv:?}");
         }
     }
 

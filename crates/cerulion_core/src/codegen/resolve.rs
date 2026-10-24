@@ -46,12 +46,8 @@
 //! fixedness DFS memoizes per target. Same input → same rewrites → same
 //! generated code (Principle #7).
 
+use super::nested_index::{Bound, Miss, NestedIndex};
 use super::schema::{FieldType, MessageSchema, NestedFixedInfo};
-use std::collections::BTreeMap;
-
-/// Key for schema lookup: `(package, name)`. Package-less schemas key on
-/// `(None, name)`.
-type SchemaKey = (Option<String>, String);
 
 /// Computed fixedness for one schema.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,10 +138,8 @@ struct Resolver {
     /// Pre-rewrite copy of the schemas, so fixedness computation does not
     /// depend on rewrite order.
     snapshot: Vec<MessageSchema>,
-    /// Qualified `(package, name)` → snapshot index.
-    by_key: BTreeMap<SchemaKey, usize>,
-    /// Bare name → all snapshot indices carrying it (collision-aware).
-    by_bare: BTreeMap<String, Vec<usize>>,
+    /// Identity registry the references bind through.
+    index: NestedIndex,
     /// Memoized fixedness per snapshot index.
     memo: Vec<Option<Fixedness>>,
     /// Memoized fully-resolved layout per snapshot index (recipe 3). Only
@@ -160,38 +154,24 @@ struct Resolver {
 impl Resolver {
     fn new(schemas: &[MessageSchema]) -> Self {
         let mut warnings = Vec::new();
-        let mut by_key: BTreeMap<SchemaKey, usize> = BTreeMap::new();
-        let mut by_bare: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut index = NestedIndex::default();
         for (idx, schema) in schemas.iter().enumerate() {
-            let key = (schema.package.clone(), schema.name.clone());
-            if let Some(prev) = by_key.insert(key, idx) {
+            // "Later wins" on every ladder step, the bare namespace included:
+            // a double-registered bare name would make an unqualified
+            // reference report the wrong ambiguity, and keeping the earlier
+            // index would bind bare lookups to a different definition than
+            // qualified ones.
+            if index.insert(schema, idx).is_some() {
                 warnings.push(format!(
                     "duplicate schema definition for '{}' — later definition wins in resolution",
                     schema.qualified_name()
                 ));
-                // Keep `by_bare` CONSISTENT with `by_key` ("later wins" on
-                // BOTH paths): replace the earlier index instead of
-                // double-registering. Double-counting would make an
-                // unqualified reference report "ambiguous (defined in 2
-                // packages)" — wrong count, wrong diagnosis; keeping the
-                // earlier index would make bare lookups bind a different
-                // definition than qualified ones.
-                if let Some(v) = by_bare.get_mut(&schema.name) {
-                    for slot in v.iter_mut() {
-                        if *slot == prev {
-                            *slot = idx;
-                        }
-                    }
-                }
-                continue;
             }
-            by_bare.entry(schema.name.clone()).or_default().push(idx);
         }
         let len = schemas.len();
         Self {
             snapshot: schemas.to_vec(),
-            by_key,
-            by_bare,
+            index,
             memo: vec![None; len],
             resolved_info: vec![None; len],
             visiting: vec![false; len],
@@ -199,65 +179,25 @@ impl Resolver {
         }
     }
 
-    /// Resolve a Nested reference to a snapshot index. `parent_package` is
-    /// the package of the schema CONTAINING the reference (ROS2 semantics:
-    /// an unqualified reference means "same package").
+    /// Resolve a Nested reference to a snapshot index through the shared
+    /// identity ladder ([`NestedIndex::bind`]). `parent_package` is the
+    /// package of the schema CONTAINING the reference (ROS2 semantics: an
+    /// unqualified reference means "same package").
     fn lookup(
         &self,
         reference_pkg: &Option<String>,
         name: &str,
         parent_package: &Option<String>,
-    ) -> Result<Found, String> {
-        if let Some(pkg) = reference_pkg {
-            // Qualified reference: exact lookup only.
-            return self
-                .by_key
-                .get(&(Some(pkg.clone()), name.to_string()))
-                .map(|&idx| Found {
-                    idx,
-                    cross_package_bare: false,
-                })
-                .ok_or_else(|| format!("unknown schema '{pkg}/{name}'"));
-        }
-        // Unqualified: same package first (ROS2 semantics) …
-        if let Some(&idx) = self.by_key.get(&(parent_package.clone(), name.to_string())) {
-            return Ok(Found {
-                idx,
-                cross_package_bare: false,
-            });
-        }
-        // … then rosidl's single legacy special case: bare `Header` means
-        // `std_msgs/Header` (used unqualified by moveit_msgs and friends).
-        // This is the only cross-package bare resolution rosidl accepts,
-        // so it resolves silently.
-        if name == "Header" {
-            if let Some(&idx) = self
-                .by_key
-                .get(&(Some("std_msgs".to_string()), "Header".to_string()))
-            {
-                return Ok(Found {
-                    idx,
-                    cross_package_bare: false,
-                });
-            }
-        }
-        // … then the global bare-name namespace, iff unambiguous. rosidl
-        // would REJECT this (unqualified means same-package, Header
-        // excepted) — we resolve it for pragmatism but flag it so the
-        // rewrite phase emits a loud warning: silent cross-package binding
-        // can flip when a second package later defines the same bare
-        // name.
-        match self.by_bare.get(name).map(|v| v.as_slice()) {
-            Some([idx]) => Ok(Found {
-                idx: *idx,
-                cross_package_bare: true,
-            }),
-            Some(multi) if multi.len() > 1 => Err(format!(
-                "ambiguous unqualified reference '{name}' (defined in {} packages) — qualify as pkg/{name}",
-                multi.len()
-            )),
-            _ => Err(format!("unknown schema '{name}'")),
-        }
+    ) -> Result<Bound, String> {
+        self.index
+            .bind(reference_pkg.as_deref(), name, parent_package.as_deref())
+            .map_err(|miss| match (miss, reference_pkg) {
+                (Miss::Ambiguous { candidates }, _) => format!(
+                    "ambiguous unqualified reference '{name}' (defined in {candidates} packages); qualify as pkg/{name}"
+                ),
+                (Miss::Unknown, Some(pkg)) => format!("unknown schema '{pkg}/{name}'"),
+                (Miss::Unknown, None) => format!("unknown schema '{name}'"),
+            })
     }
 
     /// Memoized recursive fixedness of the schema at `idx` (DFS with
@@ -535,14 +475,6 @@ impl Resolver {
     }
 }
 
-/// Successful lookup result: the snapshot index plus whether the binding
-/// crossed package boundaries through the bare-name fallback (which rosidl
-/// semantics would reject — the rewrite phase warns loudly on it).
-struct Found {
-    idx: usize,
-    cross_package_bare: bool,
-}
-
 /// Accumulator for one schema's fixedness walk.
 struct FixednessAcc {
     fixed: bool,
@@ -578,35 +510,21 @@ struct FixednessAcc {
 /// rule alone would drop an unreachable loser harmlessly — but skipping
 /// it keeps the preflight from ever mutating what resolution cannot see.
 pub fn composed_overflow_indices(schemas: &[MessageSchema]) -> Vec<usize> {
-    // Mirror the resolver's registries: qualified `(package, name)` key
-    // with later-wins duplicate handling, the bare index kept consistent
-    // (a double-registered bare name would misreport ambiguity).
-    let mut by_key: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
-    let mut by_bare: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (idx, schema) in schemas.iter().enumerate() {
-        let key = (schema.package.clone(), schema.name.clone());
-        if let Some(prev) = by_key.insert(key, idx) {
-            if let Some(slots) = by_bare.get_mut(&schema.name) {
-                for slot in slots.iter_mut() {
-                    if *slot == prev {
-                        *slot = idx;
-                    }
-                }
-            }
-            continue;
-        }
-        by_bare.entry(schema.name.clone()).or_default().push(idx);
-    }
-    let active: std::collections::HashSet<usize> = by_key.values().copied().collect();
+    // The resolver's own registry, so the probe binds exactly what it binds.
+    let index = NestedIndex::from_schemas(schemas);
+    let active: Vec<bool> = schemas
+        .iter()
+        .enumerate()
+        .map(|(idx, schema)| index.is_active(schema, idx))
+        .collect();
     let mut probe = ComposedSizeProbe {
         schemas,
-        by_key,
-        by_bare,
+        index,
         memo: vec![None; schemas.len()],
         visiting: vec![false; schemas.len()],
     };
     (0..schemas.len())
-        .filter(|idx| active.contains(idx))
+        .filter(|&idx| active[idx])
         .filter(|&idx| matches!(probe.classify(idx), ComposedClass::Overflow))
         .collect()
 }
@@ -635,44 +553,25 @@ enum ComposedClass {
 /// substituted for the panicking size call.
 struct ComposedSizeProbe<'a> {
     schemas: &'a [MessageSchema],
-    by_key: BTreeMap<(Option<String>, String), usize>,
-    by_bare: BTreeMap<String, Vec<usize>>,
+    index: NestedIndex,
     memo: Vec<Option<ComposedClass>>,
     visiting: Vec<bool>,
 }
 
 impl ComposedSizeProbe<'_> {
-    /// Mirror of the resolver's nested-reference lookup: qualified exact →
-    /// same package → bare `Header` → `std_msgs/Header` → unambiguous
-    /// global bare; `None` for unknown AND ambiguous (both classify the
-    /// referencing field variable, exactly as the resolver's `Err` arm).
+    /// The resolver's nested-reference binding ([`NestedIndex::bind`]);
+    /// `None` for unknown AND ambiguous (both classify the referencing field
+    /// variable, exactly as the resolver's `Err` arm).
     fn lookup(
         &self,
         reference_pkg: &Option<String>,
         name: &str,
         parent_package: &Option<String>,
     ) -> Option<usize> {
-        if let Some(pkg) = reference_pkg {
-            return self
-                .by_key
-                .get(&(Some(pkg.clone()), name.to_string()))
-                .copied();
-        }
-        if let Some(&idx) = self.by_key.get(&(parent_package.clone(), name.to_string())) {
-            return Some(idx);
-        }
-        if name == "Header" {
-            if let Some(&idx) = self
-                .by_key
-                .get(&(Some("std_msgs".to_string()), "Header".to_string()))
-            {
-                return Some(idx);
-            }
-        }
-        match self.by_bare.get(name).map(|v| v.as_slice()) {
-            Some([idx]) => Some(*idx),
-            _ => None,
-        }
+        self.index
+            .bind(reference_pkg.as_deref(), name, parent_package.as_deref())
+            .ok()
+            .map(|bound| bound.idx)
     }
 
     /// Memoized recursive classification of the schema at `idx` (DFS with

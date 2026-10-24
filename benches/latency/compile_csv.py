@@ -27,6 +27,8 @@ line-inventory names, e.g.:
     cerulion_workspace_split_chrt0                     (workspace headline leg)
     cerulion_workspace_mono_chrt0                      (workspace leg)
     cerulion_workspace_split_pod_chrt0                 (type-class pod twin)
+    cerulion_workspace_split3_chrt0                    (workspace 3-group leg)
+    cerulion_workspace_split_lockstep_chrt0            (execution-mode lockstep row)
     jazzy_cyclonedds_shm_rclcpp_be1_chrt0              (ROS 2 cell)
     jazzy_cyclonedds_shm_image_rclcpp_be1_chrt0        (type-class image cell)
     jazzy_fastdds_zc_loan_be1_chrt0                    (FastDDS DataSharing lane)

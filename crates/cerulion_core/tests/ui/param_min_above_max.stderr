@@ -1,0 +1,11 @@
+error: `min` 5.0 is greater than `max` 0.0 on param `gain`
+  --> tests/ui/param_min_above_max.rs:10:45
+   |
+10 |     #[param(default = 1.0, min = 5.0, max = 0.0)]
+   |                                             ^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_min_above_max.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^

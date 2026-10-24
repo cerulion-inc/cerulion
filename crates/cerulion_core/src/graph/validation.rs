@@ -557,8 +557,8 @@ pub fn validate_graph_with(
     // Validate max_slice_len is within the wire-format-representable range.
     //
     // Lower bound: `>= WireHeader::SIZE` (the wire frame requires at least the
-    // 32-byte header — a header-only payload like `std_msgs::Empty` whose
-    // `WIRE_FIXED_SIZE = 0` is valid at exactly 32 bytes). Upper bound:
+    // 40-byte header; a header-only payload like `std_msgs::Empty` whose
+    // `WIRE_FIXED_SIZE = 0` is valid at exactly 40 bytes). Upper bound:
     // `<= u32::MAX` (the wire format's `WireHeader::total_size`
     // field is `u32`, so slot sizes above 4 GiB cannot be represented).
     // Failing graph-load surfaces the misconfig with an actionable error
@@ -721,6 +721,11 @@ pub fn validate_graph_with(
 /// 4. Every `params:` value is a scalar (string / number / bool).
 /// 5. A graph of ONLY ros2 entries is refused — the runtime has nothing to
 ///    schedule; `cerulion ros2 run <launch-file>` is the tool for that.
+/// 6. A ros2 entry carries no native `params:` (the `#[param]` values of a
+///    native node): its ROS 2 parameters go under `ros2.params`. Refused HERE,
+///    in the check every run makes, because the run lifts ros2 entries out of
+///    the graph before it resolves native params, so a key that slipped past
+///    this check (`graph run --no-validate`) would be silently dead.
 ///
 /// `process_groups:` membership is refused in `validate_process_groups` and
 /// `level_assignments:` membership in `validate_graph_with` (each beside the
@@ -743,6 +748,21 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
             return reject(format!(
                 "node '{}': declares BOTH `type:` and `ros2:` — an entry is either a native \
                  node (`type:`) or a ROS 2 process (`ros2:`); remove one",
+                node.id
+            ));
+        }
+        if !node.params.is_empty() {
+            // The remedy follows the entry's shape: a `launch:` entry refuses
+            // `ros2.params` too (its launch file declares its parameters), so
+            // pointing it there would trade one refusal for another.
+            let remedy = if ros2.launch.is_some() {
+                "a launch file declares its own parameters; pass launch arguments \
+                 (`name:=value`) through `ros2.args` instead"
+            } else {
+                "put ROS 2 parameters under `ros2.params` on that entry"
+            };
+            return reject(format!(
+                "node '{}': `params:` is not accepted on a `ros2:` entry; {remedy}",
                 node.id
             ));
         }
@@ -936,12 +956,14 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 ///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
 ///    a connecting peer for no certificate), so each is refused without the
 ///    locator that reads it.
-/// 10. **Best effort needs a datagram link**: a `reliability: best_effort`
-///     egress topic needs at least one `listen` or `connect` locator with
-///     `mixed_rel=1` (`quic/...?mixed_rel=1` or `udp/...?rel=1;mixed_rel=1`);
+/// 10. **Best effort needs a datagram link**: `default_reliability:
+///     best_effort`, and a `reliability: best_effort` egress topic, each need
+///     at least one `listen` or `connect` locator with `mixed_rel=1`
+///     (`quic/...?mixed_rel=1` or `udp/...?rel=1;mixed_rel=1`);
 ///     `mixed_rel=auto` does not count, because it falls back to streams only.
-///     Without one the topic would ride the reliable link with nothing saying
-///     so.
+///     Without one the topics would ride the reliable link with nothing saying
+///     so. The default is refused even when every egress entry sets its own
+///     `reliability`.
 fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> TransportResult<()> {
     use crate::transport::carrier::{classify_locator, Carrier, EgressReliability};
     let err = |reason: String| TransportError::GraphError { reason };
@@ -1022,10 +1044,21 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
         ));
     }
 
+    if net.default_reliability == EgressReliability::BestEffort && !datagram_link {
+        return Err(err(
+            "network default_reliability is best_effort, but no listen or connect locator is \
+             certain to have a datagram link (mixed_rel=auto falls back to streams when the peer \
+             does not offer it), so every egress topic without its own reliability would ride \
+             the reliable link; add mixed_rel=1 to a quic/ locator \
+             ('quic/<host>:<port>?mixed_rel=1'), use 'udp/<host>:<port>?rel=1;mixed_rel=1', or \
+             remove default_reliability"
+                .to_string(),
+        ));
+    }
     if let Some(be) = net
         .egress
         .iter()
-        .find(|e| e.reliability == EgressReliability::BestEffort)
+        .find(|e| e.reliability == Some(EgressReliability::BestEffort))
     {
         if !datagram_link {
             return Err(err(format!(
@@ -1362,13 +1395,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 31
+        max_slice_len: 39
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_err(),
-            "max_slice_len: 31 (< WireHeader::SIZE) must fail graph-load"
+            "max_slice_len: 39 (< WireHeader::SIZE) must fail graph-load"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1378,7 +1411,7 @@ nodes:
     }
 
     /// Pin the exact
-    /// floor — `max_slice_len: 32` (exactly `WireHeader::SIZE`) is
+    /// floor: `max_slice_len: 40` (exactly `WireHeader::SIZE`) is
     /// accepted. Mirror of `try_new_accepts_exactly_wire_header_size`
     /// in `max_slice_len_newtype_test.rs`. This is the boundary
     /// (`<`, not `<=`); a future
@@ -1395,13 +1428,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 32
+        max_slice_len: 40
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_ok(),
-            "max_slice_len: 32 (== WireHeader::SIZE) must be accepted (header-only payload). \
+            "max_slice_len: 40 (== WireHeader::SIZE) must be accepted (header-only payload). \
              Error was: {:?}",
             result.err()
         );
@@ -1668,7 +1701,10 @@ nodes:
     /// Rules 7-10, accepted shapes: a `quic/` listener with its certificate
     /// and key and a best-effort topic on a mixed-reliability locator; the
     /// unsecure `udp/...?rel=1;mixed_rel=1` spelling needs no tls block; a
-    /// best-effort entry on a mixed-rel CONNECT locator counts too.
+    /// best-effort entry on a mixed-rel CONNECT locator counts too; a
+    /// `best_effort` default on a mixed-rel locator, with or without a topic
+    /// that opts back to `reliable`; a `reliable` default and topic need no
+    /// datagram link.
     #[test]
     fn test_network_carriers_accepted_shapes() {
         for block in [
@@ -1702,6 +1738,32 @@ nodes:
       reliability: best_effort
   tls:
     root_ca: /etc/cerulion/peers.pem
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - udp/0.0.0.0:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - /robo/cam/cloud
+"#,
+            r#"network:
+  mode: peer
+  connect:
+    - udp/10.0.0.2:7684?rel=1;mixed_rel=1
+  default_reliability: best_effort
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
+"#,
+            r#"network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  default_reliability: reliable
+  egress:
+    - topic: /robo/cam/cloud
+      reliability: reliable
 "#,
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();
@@ -1764,6 +1826,18 @@ nodes:
             (
                 "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
                 &["mixed_rel=auto falls back"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - /robo/cam/cloud\n",
+                &["network default_reliability is best_effort", "mixed_rel=1", "remove default_reliability"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  default_reliability: best_effort\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: reliable\n",
+                &["network default_reliability is best_effort"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  default_reliability: best_effort\n",
+                &["network default_reliability is best_effort", "mixed_rel=auto falls back"][..],
             ),
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();

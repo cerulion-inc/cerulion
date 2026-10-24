@@ -7,8 +7,8 @@
 //! 1. listener.timed_wait_one(timeout)   → block until event or timeout
 //! 2. subscriber.receive() in loop       → drain ALL available samples
 //! 3. For each sample:
-//!    a. read_from_buf() → owned WireHeader (32 bytes, alignment-safe)
-//!    b. &raw[32..] → zero-copy payload slice into shared memory
+//!    a. read_from_buf() → owned WireHeader (40 bytes, alignment-safe)
+//!    b. &raw[WireHeader::SIZE..] → zero-copy payload slice into shared memory
 //!    c. invoke callback with ReceivedMessage
 //! ```
 //!
@@ -455,6 +455,10 @@ impl RawInputView<'_> {
     /// `Owned` views pin their SHM sample and consume borrow budget for as long
     /// as the returned value lives; a `Held` view borrows the subscriber's
     /// held sample and is returned unchanged in the error arm.
+    // The error arm IS the unchanged view (a header copy plus a borrow), returned
+    // by value so the caller keeps reading it; boxing it would allocate on a
+    // receive path to satisfy a size lint.
+    #[allow(clippy::result_large_err)]
     pub fn into_owned(self) -> Result<RawInputView<'static>, Self> {
         let header = self.header;
         match self.inner {
@@ -554,7 +558,8 @@ impl OwnedInboundSample {
         debug_assert!(
             (WireHeader::SIZE..=sample.payload().len()).contains(&frame_len),
             "with_header's caller must bounds-check total_size against the loaned slot: \
-             {frame_len} is outside 32..={}",
+             {frame_len} is outside {}..={}",
+            WireHeader::SIZE,
             sample.payload().len()
         );
         Self {
@@ -594,7 +599,7 @@ impl OwnedInboundSample {
         }
     }
 
-    /// The full published wire frame (32-byte [`WireHeader`] + body), exactly
+    /// The full published wire frame (40-byte [`WireHeader`] + body), exactly
     /// the bytes the publisher wrote — zero-copy, borrowing the SHM slot.
     ///
     /// Trailing loan capacity past `WireHeader::total_size` is excluded (the
@@ -609,7 +614,7 @@ impl OwnedInboundSample {
     /// The parsed [`WireHeader`] at the front of the frame, or `None` when the
     /// frame is shorter than a header / unparseable.
     ///
-    /// Returned by value (32 bytes on the stack), and the value is the one the read
+    /// Returned by value (40 bytes on the stack), and the value is the one the read
     /// path parsed with the alignment-safe [`WireHeader::read_from_buf`]: iceoryx2
     /// SHM slots are not guaranteed 8-byte aligned, so a borrowed
     /// [`WireHeader::from_bytes`] view would spuriously return `None` on an
@@ -1121,7 +1126,7 @@ impl DrainOutcome {
 
 /// A received message with zero-copy payload access.
 ///
-/// The `header` is an owned copy (32 bytes on stack, from alignment-safe deserialization).
+/// The `header` is an owned copy (40 bytes on stack, from alignment-safe deserialization).
 /// The `payload` is a reference directly into iceoryx2 shared memory — true zero-copy.
 ///
 /// # Lifetime
@@ -1131,12 +1136,36 @@ impl DrainOutcome {
 pub struct ReceivedMessage<'a> {
     header: WireHeader,
     payload: &'a [u8],
+    origin: u128,
 }
 
 impl<'a> ReceivedMessage<'a> {
-    /// Create a new received message from header and payload.
+    /// Create a new received message from header and payload. Its
+    /// [`Self::origin`] is `0`, the "no publisher identity" value, because a
+    /// message built by hand came from no publisher port.
     pub fn new(header: WireHeader, payload: &'a [u8]) -> Self {
-        Self { header, payload }
+        Self::from_publisher(header, payload, 0)
+    }
+
+    /// The message a receive path delivers: header, payload and the
+    /// publisher identity of the sample it was read from.
+    pub(crate) fn from_publisher(header: WireHeader, payload: &'a [u8], origin: u128) -> Self {
+        Self {
+            header,
+            payload,
+            origin,
+        }
+    }
+
+    /// The PUBLISHER IDENTITY of the frame: iceoryx2's `UniquePublisherId` of
+    /// the port that committed it, raw, as [`OwnedInboundSample::origin`]
+    /// returns it. Two frames with the same value came from one publisher,
+    /// so an observer can keep the streams of a `multi_publisher_topics`
+    /// topic apart. Sample metadata: reading it parses and allocates nothing.
+    /// The id is run random, so it is compared only within one run; `0` for
+    /// a message built with [`Self::new`].
+    pub fn origin(&self) -> u128 {
+        self.origin
     }
 
     /// Returns the wire header.
@@ -2917,7 +2946,11 @@ impl CerulionSubscriber {
                 continue;
             }
             let payload = &raw[WireHeader::SIZE..total_size];
-            callback(ReceivedMessage::new(header, payload));
+            callback(ReceivedMessage::from_publisher(
+                header,
+                payload,
+                sample.origin().value(),
+            ));
             // Same serve point as `drain_samples` — one frame, really
             // delivered.
             self.record_service_cursor_from(&header);
@@ -3139,7 +3172,9 @@ impl CerulionSubscriber {
                 // read again here: the served sequence and the cursor below both
                 // want the same thirty-two bytes.
                 removals.set(removals.get() + 1);
-                if let Some(header) = deliver_raw_frame(topic, sample.payload(), callback) {
+                if let Some(header) =
+                    deliver_raw_frame(topic, sample.payload(), sample.origin().value(), callback)
+                {
                     count.set(count.get() + 1);
                     // The served-sequence parse follows the CAPTURE bit or the
                     // GRANT, either of which consumes it: the record below
@@ -5585,10 +5620,16 @@ fn build_inbound_view<T: ShmMessage, R>(
 }
 
 /// Validate a raw wire frame and deliver it to `callback` as a
-/// `ReceivedMessage`. Returns the frame's parsed `WireHeader` if delivered,
-/// `None` if skipped (a `warn` was emitted). Used by the `drain_samples` receive
-/// path.
-fn deliver_raw_frame<F>(topic: &str, raw: &[u8], callback: &mut F) -> Option<WireHeader>
+/// `ReceivedMessage` that carries `origin`, the publisher identity of the
+/// sample `raw` was read from. Returns the frame's parsed `WireHeader` if
+/// delivered, `None` if skipped (a `warn` was emitted). Used by the
+/// `drain_samples` receive path.
+fn deliver_raw_frame<F>(
+    topic: &str,
+    raw: &[u8],
+    origin: u128,
+    callback: &mut F,
+) -> Option<WireHeader>
 where
     F: FnMut(ReceivedMessage<'_>),
 {
@@ -5628,7 +5669,7 @@ where
         return None;
     }
     let payload = &raw[WireHeader::SIZE..total_size];
-    callback(ReceivedMessage::new(header, payload));
+    callback(ReceivedMessage::from_publisher(header, payload, origin));
     Some(header)
 }
 
@@ -6204,7 +6245,7 @@ mod tests {
         )
         .expect("per-test SHM transport");
 
-        // A hand-built wire frame: 32-byte header + 8 payload bytes, the
+        // A hand-built wire frame: 40-byte header + 8 payload bytes, the
         // caller-stamped `sequence` the capture parses back.
         let frame = |seq: u32| -> Vec<u8> {
             let mut header = crate::wire::WireHeader::new(0xC1289, seq, 1_000 + u64::from(seq));
@@ -6733,11 +6774,12 @@ mod tests {
     fn raw_view_frame(sequence: u32) -> Vec<u8> {
         let mut frame = vec![
             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema hash
-            0x22, 0x00, 0x00, 0x00, // total size
-            0x20, 0x00, 0x00, 0x00, // offset table offset
+            0x2A, 0x00, 0x00, 0x00, // total size
+            0x28, 0x00, 0x00, 0x00, // offset table offset
             0x00, 0x00, 0x00, 0x00, // offset table count
             0x00, 0x00, 0x00, 0x00, // sequence
             0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step tag: untagged
             0xAA, 0xBB,
         ];
         frame[20..24].copy_from_slice(&sequence.to_le_bytes());

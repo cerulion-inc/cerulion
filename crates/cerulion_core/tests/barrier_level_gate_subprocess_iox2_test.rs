@@ -256,6 +256,7 @@ fn in_def(name: &str, source: &str) -> InputDef {
 fn relay_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "chain_relay".to_string(),
@@ -268,6 +269,7 @@ fn relay_node(id: &str, source: &str) -> NodeDef {
 fn sink_node(id: &str, source: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "chain_sink".to_string(),

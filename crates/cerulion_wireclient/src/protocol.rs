@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The desk-side MIRROR of the robot's `cerulion/wire/1` control protocol.
+//! The desk-side MIRROR of the robot's `cerulion/wire/2` control protocol.
 //!
 //! # Why mirror instead of importing `cerulion_remoted::wire`
 //!
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// The first frame of every per-topic uni data stream: names the topic the
 /// stream carries, so the desk correlates stream ↔ topic. All subsequent frames
-/// on the stream are raw Cerulion wire frames (32-byte `WireHeader` + payload).
+/// on the stream are raw Cerulion wire frames (40-byte `WireHeader` + payload).
 ///
 /// Mirror of `cerulion_remoted::StreamPreamble`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +211,7 @@ fn decode_refusal(bytes: &[u8]) -> Option<String> {
         )),
         AcceptDecision::OpsAdmit | AcceptDecision::OpsBootstrapOnly => Some(
             "robot routed the wire dial onto the OPS plane (a protocol mismatch) — \
-             the desk dialed cerulion/wire/1 but got an ops decision"
+             the desk dialed cerulion/wire/2 but got an ops decision"
                 .to_string(),
         ),
         // WireAdmit is not a refusal — the caller keeps trying to decode a real

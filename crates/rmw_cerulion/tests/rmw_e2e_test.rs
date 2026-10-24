@@ -482,7 +482,7 @@ fn untouched_loan_publishes_rosidl_defaults_not_zeros() {
         // The pointer the typesupport's init just wrote through, and that
         // rclcpp will overlay the message struct on, is 8-aligned (the
         // borrow path's fail-closed alignment gate let it through; the
-        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +32
+        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +40
         // WireHeader — see `rmw_borrow_loaned_message`).
         assert_eq!(
             (loaned as usize) % std::mem::align_of::<CQuat>(),
@@ -2237,7 +2237,7 @@ fn c_abi_loaned_take_round_trip_and_return() {
             }
         );
         // message_info: source_timestamp is EXACTLY the wire timestamp —
-        // cross-checked against the WireHeader sitting 32 bytes before the
+        // cross-checked against the WireHeader sitting 40 bytes before the
         // loaned pointer in the SAME held frame.
         let header_bytes = std::slice::from_raw_parts(
             (out as *const u8).sub(cerulion_core::wire::WireHeader::SIZE),

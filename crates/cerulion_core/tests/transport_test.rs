@@ -38,7 +38,7 @@
 //! - `test_schema_validation_accepts_match` — duplicates the round-trip
 //!   tests below.
 
-use cerulion_core::wire::MaxSliceLen;
+use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use iceoryx2::service::port_factory::PortFactory as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -62,7 +62,7 @@ fn unique_topic(base: &str) -> String {
 }
 
 /// Create a publisher + subscriber pair on a unique topic with a 256-byte
-/// buffer (room for the 32-byte WireHeader plus a fixed 24-byte payload).
+/// buffer (room for the 40-byte WireHeader plus a fixed 24-byte payload).
 fn setup_pubsub(base: &str) -> (CerulionPublisher, CerulionSubscriber) {
     let mgr = TransportManager::get_or_init().expect("init");
     let topic = unique_topic(base);
@@ -346,7 +346,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
     }
     std::thread::sleep(Duration::from_millis(50));
 
-    // First owned take: frame 1, held. Full-frame shape: 32-byte header +
+    // First owned take: frame 1, held. Full-frame shape: 40-byte header +
     // 24-byte Vector3 fixed section, seq 0.
     let held = subscriber
         .try_receive_one_owned()
@@ -355,7 +355,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
     let header = held.wire_header().expect("held frame header");
     assert_eq!(header.sequence, 0, "FIFO: first published frame first");
     assert_eq!(held.payload().len(), WireHeader::SIZE + 24);
-    let x = f64::from_le_bytes(held.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        held.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 1.0);
 
     // HOLD across further publishes: the held bytes must be UNCHANGED —
@@ -382,7 +386,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, f64::from(expect_x), "FIFO order");
         more.push(s);
     }
@@ -407,7 +415,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 5 must still be queued");
-    let x = f64::from_le_bytes(next.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        next.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 5.0, "no frame was lost to the refused receive");
 
     // Drain the rest + empty.
@@ -419,7 +431,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, f64::from(expect_x));
     }
     assert!(
@@ -492,7 +508,11 @@ fn test_create_port_floors_size_the_created_service() {
             .try_receive_one_owned()
             .expect("owned receive")
             .unwrap_or_else(|| panic!("subscriber {i} must receive the frame"));
-        let x = f64::from_le_bytes(sample.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            sample.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, 7.0, "subscriber {i} payload");
     }
 }
@@ -800,7 +820,11 @@ fn test_borrow_floor_open_leg_tolerates_smaller_service() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 3");
-    let x = f64::from_le_bytes(c.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        c.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 3.0);
     drop(b);
     drop(c);

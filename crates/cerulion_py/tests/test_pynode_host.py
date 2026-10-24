@@ -97,7 +97,7 @@ def test_host_pynode_loans_builtin_output_without_workspace_schemas():
         env=_node_env("builtin"),
     )
     assert result.stdout.splitlines() == [
-        "node_info={\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":15293913555552287199,\"max_slice_len_default\":56,\"promise_within_ms\":null,\"wire_fixed_size\":24}],\"policy\":{\"period_ms\":1}}",
+        "node_info={\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":15293913555552287199,\"max_slice_len_default\":64,\"promise_within_ms\":null,\"wire_fixed_size\":24}],\"policy\":{\"period_ms\":1}}",
         "tick=0 code=0 out=000000000000f83f00000000000000c0000000000000d03f",
         "shutdown code=0",
     ]

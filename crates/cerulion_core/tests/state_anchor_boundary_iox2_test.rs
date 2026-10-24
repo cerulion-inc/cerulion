@@ -188,6 +188,7 @@ fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
             .iter()
             .map(|id| NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: (*id).to_string(),
@@ -720,6 +721,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
         prefix: unique("svc"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),
@@ -860,6 +862,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
         prefix: unique("svp"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),
@@ -887,13 +890,14 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
 
     // The POISON: a well-FRAMED Vector3-sized frame whose schema_hash is
     // wrong, sequence 99. `publish_raw` writes the caller's header verbatim.
-    let mut frame = vec![0u8; 56];
+    const HDR: usize = cerulion_core::wire::WireHeader::SIZE;
+    let mut frame = vec![0u8; HDR + 24];
     let mut header =
         cerulion_core::wire::WireHeader::new(<Vector3 as ShmMessage>::SCHEMA_HASH ^ 1, 99, 0);
-    header.total_size = 56;
-    header.offset_table_offset = 56;
-    header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
-    frame[32..40].copy_from_slice(&777.0f64.to_le_bytes()); // x, must never be summed
+    header.total_size = (HDR + 24) as u32;
+    header.offset_table_offset = (HDR + 24) as u32;
+    header.write_to_buf(&mut frame[..HDR]);
+    frame[HDR..HDR + 8].copy_from_slice(&777.0f64.to_le_bytes()); // x, must never be summed
     ext.publish_raw(&frame).expect("raw publish");
     step_n(&mut h.runtime, 1);
 
@@ -982,6 +986,7 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
         prefix: unique("sy2"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
             node_type: "fusion".to_string(),
@@ -1132,6 +1137,7 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
         prefix: unique("sy3"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
             node_type: "fusion".to_string(),
@@ -1441,6 +1447,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
         prefix: unique("svq"),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
             node_type: "tally".to_string(),

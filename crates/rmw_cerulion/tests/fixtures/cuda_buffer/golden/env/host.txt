@@ -1,0 +1,9 @@
+l4t: # R36 (release), REVISION: 4.3, GCID: 38968081, BOARD: generic, EABI: aarch64, DATE: Wed Jan  8 01:49:37 UTC 2025
+kernel: 5.15.148-tegra
+docker: 29.7.2
+image: sha256:2a6bfc75d733c06d529d2f5ce2e5d1b1f1f54b961d9d4e3e82649e20cb20a6c6
+cuda_toolkit: Build cuda_12.6.r12.6/compiler.34714021_0
+nvpmodel: NV Power Mode: 40W 4 
+cpu_governor:  8 schedutil;
+gpu_devfreq: 17000000.gpu cur=306000000 min=306000000 max=1173000000 gov=nvhost_podgov
+load: 0.20 0.20 0.71

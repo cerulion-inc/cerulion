@@ -276,8 +276,8 @@ fn adaptive_window_shrinks_back_after_large_payload_overwritten() {
         recovered_loan < large_loan,
         "after WINDOW_SIZE small publishes the loan must shrink: large={large_loan} recovered={recovered_loan}"
     );
-    // Quantitative: small payload frame = header + offset_table + 1 = 41
-    // bytes; recent_max = 41; loan = 41 × 1.5 = 61. Floor at min_required.
+    // Quantitative: small payload frame = header + offset_table + 1 = 49
+    // bytes; recent_max = 49; loan = 49 × 1.5 = 73. Floor at min_required.
     assert!(
         recovered_loan < 200,
         "recovered loan should drop to ~60-100 bytes; got {recovered_loan}"
@@ -487,7 +487,7 @@ fn adaptive_payload_round_trips_byte_for_byte() {
         .expect("recv");
     assert_eq!(received.len(), 1);
     let payload_bytes = &received[0].1;
-    // payload_bytes is everything after the 32-byte WireHeader:
+    // payload_bytes is everything after the 40-byte WireHeader:
     // WIRE_FIXED_SIZE (0 for std_msgs/String) + offset table (8) +
     // user payload. The string bytes live at offset 8.
     let user_offset = 8;

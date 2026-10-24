@@ -1,11 +1,12 @@
 # Cerulion Debian and APT distribution
 
-The Debian package is named `cerulion` and installs the CLI, the two daemon
+The Debian package is named `cerulion` and installs the CLI, the three daemon
 binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
 
 * `cerulion`
 * `cerulion-netd`
 * `cerulion-connectd`
+* `cerulion-remoted`
 * `librmw_cerulion.so`
 * `libcerulion_heaphook.so`
 
@@ -20,7 +21,7 @@ unbounded message field straight into a loan slot, and it is transparent to
 a node that never arms a borrow window. The package is assembled from the
 release archive, so the bytes in the package are the release bytes. The rmw
 library is built inside the `ros:jazzy` image against the real Jazzy headers
-(`tools/scripts/build_rmw_jazzy.sh`); the hook is plain Rust over libc and is
+(`tools/scripts/build_rmw.sh jazzy`); the hook is plain Rust over libc and is
 built on the release runner like the binaries. The release workflow installs
 each package in a clean Jazzy container and runs a talker and a listener
 through it, checks that stock rclpy loads the shipped rmw, then checks that
@@ -55,7 +56,7 @@ is under. `NOTICE` is the hand-written attribution for the components a reader
 is most likely to care about, including the vendored ROS 2 message packages.
 `LICENSE-BSD-3-CLAUSE` is the BSD text that seven of those message packages
 require. `THIRD-PARTY-LICENSES.md` is the exhaustive machine-generated
-inventory: every crate linked into the three binaries, grouped by license,
+inventory: every crate linked into the four binaries, grouped by license,
 with each license text reproduced once. It is produced by `cargo about` from
 the locked dependency graph under the policy in `tools/release/about.toml`, whose accepted license list mirrors the `[licenses]` allow list in
 `deny.toml` so the release cannot ship a license CI would refuse. In the

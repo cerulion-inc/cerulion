@@ -1145,6 +1145,8 @@ pub unsafe extern "C" fn rmw_publish(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
             Err(_) => 0,
@@ -1406,7 +1408,7 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         // `static_cast` only; only the heap fallback constructs) and its
         // dtor never runs `~MessageT`, so the slot state IS the message's
         // initial state — and zeros are NOT rosidl defaults (a Quaternion
-        // declares `float64 w 1`). Zero ONLY the 32-byte header region
+        // declares `float64 w 1`). Zero ONLY the 40-byte header region
         // (rewritten at publish; deterministic meanwhile), then run the
         // typesupport's `init_function` on the payload — the loaned
         // message's REAL construction. repr(C) padding stays unwritten
@@ -1736,6 +1738,7 @@ unsafe fn publish_windowed_loan(
                 offset_table_count: data.bridge.layout().variable_fields.len() as u32,
                 sequence: seq,
                 timestamp_ns: now,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             };
             {
                 let bytes = loan.bytes_uninit_mut();
@@ -1935,6 +1938,8 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
         let data = &*((*publisher).data as *const PublisherData);
+        // Reports a rosidl::Buffer this publish copied to host memory.
+        let _downgrades = crate::rosidl_buffer::PublishScope::open(&data.topic);
         let key = ros_message as usize;
         let now = match runtime::runtime() {
             Ok(rt) => rt.transport.clock().now_ns(),
@@ -1995,6 +2000,7 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             offset_table_count: 0,
             sequence: seq,
             timestamp_ns: now,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         header.write_to_buf(&mut loan.bytes_mut()[..WireHeader::SIZE]);
 
@@ -2200,6 +2206,38 @@ pub unsafe extern "C" fn rmw_create_subscription(
         let Some(ros_topic) = ffi::cstr(topic_name) else {
             return std::ptr::null_mut();
         };
+        // Lyrical and Rolling: `acceptable_buffer_backends`. CPU is always
+        // acceptable and is the only backend this rmw has, so a subscription
+        // naming another backend is created, logs one warning naming the
+        // backends it ignores, and receives CPU data. Malformed input fails
+        // the create (null, the RMW_RET_ERROR of a constructor) with the
+        // reason on rcl's error channel.
+        #[cfg(cerulion_has_is_rosidl_buffer)]
+        {
+            let requested = (*subscription_options).acceptable_buffer_backends;
+            let requested =
+                (!requested.is_null()).then(|| std::ffi::CStr::from_ptr(requested).to_bytes());
+            match crate::rosidl_buffer::validate_acceptable_buffer_backends(requested) {
+                Ok(ignored) if !ignored.is_empty() => {
+                    tracing::warn!(
+                        topic = %ros_topic,
+                        ignored_backends = %ignored.join(","),
+                        "acceptable_buffer_backends names backends rmw_cerulion does not have; \
+                         this subscription receives every frame as CPU data"
+                    );
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        topic = %ros_topic,
+                        reason = %reason,
+                        "subscription creation refused: acceptable_buffer_backends is malformed"
+                    );
+                    let _ = ffi::rcutils_set_error_state_best_effort(&reason);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
         let Ok(rt) = runtime::runtime() else {
             return std::ptr::null_mut();
         };
@@ -3677,7 +3715,7 @@ pub unsafe extern "C" fn rmw_take_sequence(
 /// one-read-path decision: no bypass read plane), validates it BEFORE any
 /// pointer escapes, then holds the sample in the subscription's
 /// `pending_takes` table and hands rclcpp a pointer DIRECTLY into the SHM
-/// payload (past the 32-byte `WireHeader`). Zero copies, zero payload allocs.
+/// payload (past the 40-byte `WireHeader`). Zero copies, zero payload allocs.
 ///
 /// The held sample is what makes the pointer sound: iceoryx2's borrow
 /// accounting pins the publisher-pool slot until the `Sample` drops (the pool
@@ -4568,7 +4606,7 @@ mod slice_ceiling_tests {
     /// section` bound, and an env entry naming it is IGNORED — loudly (one
     /// WARN per creation naming the type), never silently inert and never
     /// applied (an applied narrow override would refuse every publish of a
-    /// frame that is ALWAYS exactly 56 bytes here).
+    /// frame that is ALWAYS exactly 64 bytes here).
     #[traced_test]
     #[test]
     fn a_fixed_type_keeps_its_exact_bound_and_an_override_naming_it_warns_ignored() {
@@ -4580,7 +4618,7 @@ mod slice_ceiling_tests {
             exact,
             "no override: exact bound, byte-identical to the pre-override bound"
         );
-        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:32");
+        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:48");
         assert_eq!(
             slice_len_with_overrides(&bridge, &named).get(),
             exact,
@@ -4609,7 +4647,7 @@ mod slice_ceiling_tests {
     #[test]
     fn the_ignored_override_warn_is_once_per_type_not_per_creation() {
         let exact = (WireHeader::SIZE + 24) as u32;
-        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:32,rmw_slcflood/B:32");
+        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:48,rmw_slcflood/B:48");
         let a = fixed_bridge("rmw_slcflood__msg", "A");
         for _ in 0..5 {
             assert_eq!(

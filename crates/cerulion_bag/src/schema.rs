@@ -7,17 +7,25 @@
 //!
 //! ```text
 //! offset  size  field                type   value
-//! 0       2     descriptor_version   u16    = 1  (DESCRIPTOR_VERSION)
+//! 0       2     descriptor_version   u16    = 2  (DESCRIPTOR_VERSION)
 //! 2       4     hash_recipe          u32    = cerulion_core::trace::bag::HASH_RECIPE (3)
 //! 6       8     schema_hash          u64    the layout-sensitive schema hash
 //! 14      4     wire_fixed_size      u32    the schema's fixed wire size in bytes
+//! 18      2     wire_header_version  u16    = cerulion_core::wire::WIRE_HEADER_VERSION
 //! ```
 //!
-//! Total: [`DESCRIPTOR_LEN`] (18) bytes. The descriptor carries only what a
-//! replayer needs to gate wire compatibility (recipe + hash + fixed size); the
-//! qualified schema NAME lives in the Schema record's `name` field, not here.
+//! Total: [`DESCRIPTOR_LEN`] (20) bytes. The descriptor carries only what a
+//! replayer needs to gate wire compatibility (recipe + hash + fixed size + the
+//! header layout its frames were recorded with); the qualified schema NAME
+//! lives in the Schema record's `name` field, not here.
+//!
+//! A version 1 descriptor is the same blob without the last field
+//! ([`DESCRIPTOR_V1_LEN`], 18 bytes). It is still read: its frames carry the
+//! version 1 wire header, and [`SchemaDescriptor::wire_header_version`] says so,
+//! so a consumer knows to upgrade them before use.
 
 use cerulion_core::trace::bag::HASH_RECIPE;
+use cerulion_core::wire::WIRE_HEADER_VERSION;
 
 use crate::error::{BagError, BagResult};
 
@@ -25,10 +33,18 @@ use crate::error::{BagError, BagResult};
 pub const SCHEMA_ENCODING: &str = "cerulion";
 
 /// The current [`SchemaDescriptor`] wire version.
-pub const DESCRIPTOR_VERSION: u16 = 1;
+pub const DESCRIPTOR_VERSION: u16 = 2;
 
 /// The exact byte length of an encoded [`SchemaDescriptor`].
-pub const DESCRIPTOR_LEN: usize = 18;
+pub const DESCRIPTOR_LEN: usize = 20;
+
+/// The byte length of a version 1 descriptor, which has no
+/// `wire_header_version` field. Read, never written.
+pub const DESCRIPTOR_V1_LEN: usize = 18;
+
+/// The wire header version every version 1 descriptor implies: those bags
+/// were recorded before the descriptor carried one.
+pub const V1_DESCRIPTOR_WIRE_HEADER_VERSION: u16 = 1;
 
 /// The reserved topic-name prefix owned by the auto-registered channels. A user
 /// topic starting with this is rejected (see [`BagError::ReservedTopicPrefix`]).
@@ -81,8 +97,11 @@ pub const FRAME_PRODUCERS_SCHEMA: &str = "cerulion.FrameProducers";
 /// A decoded `cerulion` schema descriptor (the Schema record's `data` blob).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaDescriptor {
-    /// The descriptor wire version. Written as [`DESCRIPTOR_VERSION`].
-    pub descriptor_version: u16,
+    /// The descriptor wire version it was DECODED from (1 or 2); a new one is
+    /// [`DESCRIPTOR_VERSION`]. Private: [`Self::encode`] always writes the
+    /// current layout, so a settable version would claim a layout the bytes do
+    /// not have. Read it with [`Self::descriptor_version`].
+    descriptor_version: u16,
     /// The schema-hash recipe id (see `cerulion_core::trace::bag::HASH_RECIPE`).
     /// Written as the current [`HASH_RECIPE`].
     pub hash_recipe: u32,
@@ -100,57 +119,97 @@ pub struct SchemaDescriptor {
     /// `graph_cmd::resolve_recorded_wire_size`) precisely
     /// because it cannot survive this field.
     pub wire_fixed_size: u32,
+    /// The [`WIRE_HEADER_VERSION`] of every frame on this channel. A version 1
+    /// descriptor decodes with
+    /// [`V1_DESCRIPTOR_WIRE_HEADER_VERSION`]. A consumer that hands frames to
+    /// the current build compares it with [`WIRE_HEADER_VERSION`] and
+    /// upgrades the frames when they differ.
+    pub wire_header_version: u16,
 }
 
 impl SchemaDescriptor {
     /// Build a descriptor for a user schema, stamping the current
-    /// [`DESCRIPTOR_VERSION`] and [`HASH_RECIPE`].
+    /// [`DESCRIPTOR_VERSION`], [`HASH_RECIPE`] and [`WIRE_HEADER_VERSION`].
     pub fn new(schema_hash: u64, wire_fixed_size: u32) -> Self {
         Self {
             descriptor_version: DESCRIPTOR_VERSION,
             hash_recipe: HASH_RECIPE,
             schema_hash,
             wire_fixed_size,
+            wire_header_version: WIRE_HEADER_VERSION,
         }
     }
 
-    /// Encode to the fixed [`DESCRIPTOR_LEN`]-byte little-endian blob.
+    /// The descriptor version this value was decoded from (1 or 2), or
+    /// [`DESCRIPTOR_VERSION`] for one built with [`Self::new`].
+    pub fn descriptor_version(&self) -> u16 {
+        self.descriptor_version
+    }
+
+    /// Encode to the fixed [`DESCRIPTOR_LEN`]-byte little-endian blob. Always
+    /// writes the current layout (version 2): a version 1 value re-encodes as
+    /// version 2 with the wire header version it decoded (1).
     pub fn encode(&self) -> [u8; DESCRIPTOR_LEN] {
         let mut b = [0u8; DESCRIPTOR_LEN];
-        b[0..2].copy_from_slice(&self.descriptor_version.to_le_bytes());
+        b[0..2].copy_from_slice(&DESCRIPTOR_VERSION.to_le_bytes());
         b[2..6].copy_from_slice(&self.hash_recipe.to_le_bytes());
         b[6..14].copy_from_slice(&self.schema_hash.to_le_bytes());
         b[14..18].copy_from_slice(&self.wire_fixed_size.to_le_bytes());
+        b[18..20].copy_from_slice(&self.wire_header_version.to_le_bytes());
         b
     }
 
-    /// Decode from a Schema record `data` blob. Rejects a wrong length or an
-    /// unknown [`descriptor_version`](Self::descriptor_version).
+    /// Decode from a Schema record `data` blob: a version 2 blob of
+    /// [`DESCRIPTOR_LEN`] bytes, or a version 1 blob of [`DESCRIPTOR_V1_LEN`]
+    /// bytes (which decodes with [`V1_DESCRIPTOR_WIRE_HEADER_VERSION`]).
+    /// Rejects any other length, a length that does not match its version,
+    /// and an unknown [`descriptor_version`](Self::descriptor_version).
     pub fn decode(data: &[u8]) -> BagResult<Self> {
-        if data.len() != DESCRIPTOR_LEN {
+        if data.len() < 2 {
             return Err(BagError::SchemaDescriptor {
                 reason: format!(
-                    "descriptor is {} bytes, expected exactly {DESCRIPTOR_LEN}",
+                    "descriptor is {} bytes, expected exactly {DESCRIPTOR_LEN} \
+                     (or {DESCRIPTOR_V1_LEN} for version 1)",
                     data.len()
                 ),
             });
         }
         let descriptor_version = u16::from_le_bytes([data[0], data[1]]);
-        if descriptor_version != DESCRIPTOR_VERSION {
+        let expected_len = match descriptor_version {
+            1 => DESCRIPTOR_V1_LEN,
+            DESCRIPTOR_VERSION => DESCRIPTOR_LEN,
+            other => {
+                return Err(BagError::SchemaDescriptor {
+                    reason: format!(
+                    "unknown descriptor_version {other} (this build writes v{DESCRIPTOR_VERSION} \
+                         and reads v1 and v{DESCRIPTOR_VERSION})"
+                ),
+                })
+            }
+        };
+        if data.len() != expected_len {
             return Err(BagError::SchemaDescriptor {
                 reason: format!(
-                    "unknown descriptor_version {descriptor_version} (this build writes/reads v{DESCRIPTOR_VERSION})"
+                    "descriptor_version {descriptor_version} is {expected_len} bytes, this \
+                     descriptor is {}",
+                    data.len()
                 ),
             });
         }
         let hash_recipe = u32::from_le_bytes(data[2..6].try_into().unwrap());
         let schema_hash = u64::from_le_bytes(data[6..14].try_into().unwrap());
         let wire_fixed_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
+        let wire_header_version = if descriptor_version == 1 {
+            V1_DESCRIPTOR_WIRE_HEADER_VERSION
+        } else {
+            u16::from_le_bytes([data[18], data[19]])
+        };
         Ok(Self {
             descriptor_version,
             hash_recipe,
             schema_hash,
             wire_fixed_size,
+            wire_header_version,
         })
     }
 }
@@ -164,18 +223,73 @@ mod tests {
     fn descriptor_byte_oracle() {
         // Distinct, byte-recognisable field values.
         let d = SchemaDescriptor {
-            descriptor_version: 1,
+            descriptor_version: 2,
             hash_recipe: 3,
             schema_hash: 0x0102_0304_0506_0708,
             wire_fixed_size: 0x1112_1314,
+            wire_header_version: 0x2122,
         };
         let expected: [u8; DESCRIPTOR_LEN] = [
-            0x01, 0x00, // descriptor_version = 1
+            0x02, 0x00, // descriptor_version = 2
             0x03, 0x00, 0x00, 0x00, // hash_recipe = 3
             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema_hash LE
             0x14, 0x13, 0x12, 0x11, // wire_fixed_size LE
+            0x22, 0x21, // wire_header_version LE
         ];
         assert_eq!(d.encode(), expected, "descriptor byte layout is a contract");
+        assert_eq!(SchemaDescriptor::decode(&expected).unwrap(), d);
+    }
+
+    /// A version 1 blob (18 bytes, no header version) still decodes, and says
+    /// its frames carry the version 1 wire header.
+    #[test]
+    fn a_version_1_descriptor_decodes_with_wire_header_version_1() {
+        let v1: [u8; DESCRIPTOR_V1_LEN] = [
+            0x01, 0x00, // descriptor_version = 1
+            0x03, 0x00, 0x00, 0x00, // hash_recipe = 3
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // schema_hash LE
+            0x18, 0x00, 0x00, 0x00, // wire_fixed_size = 24
+        ];
+        let d = SchemaDescriptor::decode(&v1).unwrap();
+        assert_eq!(
+            d,
+            SchemaDescriptor {
+                descriptor_version: 1,
+                hash_recipe: 3,
+                schema_hash: 0x0102_0304_0506_0708,
+                wire_fixed_size: 24,
+                wire_header_version: 1,
+            }
+        );
+        // Re-encoding writes the current layout, keeping the header version
+        // the frames were recorded with.
+        let mut want = [0u8; DESCRIPTOR_LEN];
+        want[..DESCRIPTOR_V1_LEN].copy_from_slice(&v1);
+        want[0] = 0x02;
+        want[18] = 0x01;
+        assert_eq!(d.encode(), want);
+    }
+
+    /// A length that does not match the version byte is refused both ways: a
+    /// version 1 tag on 20 bytes and a version 2 tag on 18.
+    #[test]
+    fn a_descriptor_whose_length_disagrees_with_its_version_is_refused() {
+        let mut v2_tag_on_18 = [0u8; DESCRIPTOR_V1_LEN];
+        v2_tag_on_18[0] = 0x02;
+        assert!(matches!(
+            SchemaDescriptor::decode(&v2_tag_on_18),
+            Err(BagError::SchemaDescriptor { .. })
+        ));
+        let mut v1_tag_on_20 = [0u8; DESCRIPTOR_LEN];
+        v1_tag_on_20[0] = 0x01;
+        assert!(matches!(
+            SchemaDescriptor::decode(&v1_tag_on_20),
+            Err(BagError::SchemaDescriptor { .. })
+        ));
+        assert!(matches!(
+            SchemaDescriptor::decode(&[0x02]),
+            Err(BagError::SchemaDescriptor { .. })
+        ));
     }
 
     #[test]
@@ -184,6 +298,7 @@ mod tests {
         assert_eq!(SchemaDescriptor::decode(&d.encode()).unwrap(), d);
         assert_eq!(d.hash_recipe, HASH_RECIPE);
         assert_eq!(d.descriptor_version, DESCRIPTOR_VERSION);
+        assert_eq!(d.wire_header_version, WIRE_HEADER_VERSION);
     }
 
     #[test]
@@ -198,11 +313,11 @@ mod tests {
     #[test]
     fn decode_rejects_bad_length_and_version() {
         assert!(matches!(
-            SchemaDescriptor::decode(&[0u8; 17]),
+            SchemaDescriptor::decode(&[0u8; 19]),
             Err(BagError::SchemaDescriptor { .. })
         ));
         assert!(matches!(
-            SchemaDescriptor::decode(&[0u8; 19]),
+            SchemaDescriptor::decode(&[0u8; 21]),
             Err(BagError::SchemaDescriptor { .. })
         ));
         // Right length, wrong version (99).

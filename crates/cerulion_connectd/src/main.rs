@@ -4,7 +4,7 @@
 //! Two subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
-//! - `cerulion-connectd connect …` — dial a robot's `cerulion/wire/1` ALPN, demand
+//! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
 //!   topics, and re-inject each into desk-local SHM ("remote = local"). The catalog
 //!   prints to STDOUT; structured logs go to STDERR.
 //! - `cerulion-connectd pair …` — run the CPace **code-pairing** ceremony over the
@@ -509,7 +509,7 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     let Some(key_file) = cli.key_file.as_deref() else {
         tracing::error!(
             "cerulion pair: --key-file is required (a persistent desk device key). Run \
-             `cerulion pair <robot>`, which creates + passes ~/.cerulion/desk.key."
+             `cerulion pair <robot>`, which creates + passes this machine's key."
         );
         return ExitCode::from(EXIT_USAGE);
     };
@@ -727,6 +727,7 @@ mod tests {
             liveness: None,
         };
         let catalog = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             // A hostile robot NAME: CSI screen-clear + CR + newline.
             robot: "go\u{1b}[2J2\rx\ny".to_string(),

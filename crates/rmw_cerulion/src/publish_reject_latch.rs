@@ -14,7 +14,7 @@
 //! `rmw_publish_serialized_message` REJECTS a caller-supplied frame on two
 //! adjacent arms, each of which was a BARE per-call `error!`:
 //!
-//! * **malformed wire header** — the buffer is too short to hold the 32-byte
+//! * **malformed wire header**, the buffer is too short to hold the 40-byte
 //!   [`WireHeader`](cerulion_core::wire::WireHeader), so it is not a Cerulion
 //!   frame at all;
 //! * **schema-hash mismatch** — it IS a Cerulion frame, of the WRONG type for

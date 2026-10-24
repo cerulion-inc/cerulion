@@ -2349,7 +2349,7 @@ impl Ctx {
     fn robot_network(&self) -> Result<&NetworkManager, String> {
         self.manager.network().ok_or_else(|| {
             "cerulion-vizd is not network-configured, so it cannot reach a remote robot — run \
-             the daemon with its network default (scouting ON), i.e. WITHOUT \
+             the daemon with its network default, i.e. WITHOUT \
              CERULION_VIZD_NETWORK=off"
                 .to_string()
         })
@@ -4045,7 +4045,7 @@ impl Ctx {
                 format!(
                     "remote viz for '{topic}' from robot '{robot}' needs a network-configured \
                      daemon, but this cerulion-vizd is LOCAL-ONLY (CERULION_VIZD_NETWORK=off) — \
-                     restart it with its network default (scouting ON) to enable the remote arm"
+                     restart it with its network default to enable the remote arm"
                 ),
                 Some(topic),
             );
@@ -6403,7 +6403,7 @@ fn catalog_no_answer_error(robot: &str, topic: &str) -> String {
     format!(
         "robot '{robot}' did not answer a schema catalog (is it reachable, and is its gateway \
          serving schemas? try naming the type explicitly as '{topic}=pkg/Type', or add --connect \
-         <locator> if scouting can't reach it)"
+         <locator> (CERULION_VIZD_CONNECT) if discovery can't reach it)"
     )
 }
 
@@ -6665,8 +6665,10 @@ fn resolve_from_frame(
             ))
         }
     };
+    // Decode by HASH, not by `qname`: two identities can share a qualified
+    // name, and only the hash picks the frame's own layout.
     let fv = walker
-        .walk(&qname, frame)
+        .walk_by_hash(frame)
         .map_err(|_| ResolveFailure::Decode(qname.clone()))?;
     // Deliberately the UNMEMOIZED ladder, not `SinkState::archetype_for`
     // here: this is a ONE-SHOT attach/discover peek over a single drained
@@ -9571,6 +9573,7 @@ mod tests {
             offset_table_count: 3,
             sequence: 0,
             timestamp_ns: 42_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame);
         frame.extend_from_slice(&payload);
@@ -9716,6 +9719,43 @@ mod tests {
         assert!(!fresh.archetype_from_name);
     }
 
+    /// Two identities share the qualified name `pkg/Type`: a packaged
+    /// `{ float64 x }` and a later package-less schema NAMED `pkg/Type`
+    /// (`{ string s }`) that owns the name. A frame stamped with the
+    /// packaged hash must resolve through ITS layout. Re-reading it through
+    /// the name would take the twin's offset table out of the `1.5` bytes
+    /// and fail to decode.
+    #[test]
+    fn resolve_from_frame_decodes_a_name_twin_by_its_own_hash() {
+        use cerulion_core::codegen::{FieldDef, FieldType, MessageSchema};
+        use cerulion_core::wire::WireHeader;
+
+        let mut packaged = MessageSchema::new_in_package("Type", "pkg");
+        packaged.add_field(FieldDef::new("x", FieldType::F64));
+        let mut loose = MessageSchema::new("pkg/Type");
+        loose.add_field(FieldDef::new("s", FieldType::String));
+        let hash = packaged.schema_hash();
+        assert_ne!(hash, loose.schema_hash());
+        let (walker, _) = FrameWalker::new(vec![packaged, loose]);
+
+        let mut frame = vec![0u8; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: hash,
+            total_size: (WireHeader::SIZE + 8) as u32,
+            offset_table_offset: (WireHeader::SIZE + 8) as u32,
+            offset_table_count: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut frame);
+        frame.extend_from_slice(&1.5f64.to_le_bytes());
+
+        let resolved = resolve_from_frame(&walker, &frame, None).expect("resolves");
+        assert_eq!(resolved.schema, "pkg/Type");
+        assert_eq!(resolved.archetype, ArchetypeKind::Scalars);
+    }
+
     /// What the daemon REPORTS for a frame must equal what the sink
     /// RENDERS for it.
     ///
@@ -9793,6 +9833,7 @@ mod tests {
                 offset_table_count: 3,
                 sequence: 0,
                 timestamp_ns: 42_000,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut frame);
             frame.extend_from_slice(&payload);
@@ -10382,6 +10423,7 @@ mod tests {
     fn catalog(robot: &str, topic: &str, schema_name: Option<&str>) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -10427,6 +10469,7 @@ mod tests {
     fn multi_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> CatalogReply {
         use cerulion_core::CatalogProvenance;
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: entries
@@ -10537,6 +10580,7 @@ mod tests {
         use cerulion_core::CatalogProvenance;
         use std::collections::BTreeSet;
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -10617,6 +10661,7 @@ mod tests {
             liveness,
         };
         let cat = CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![
@@ -11163,6 +11208,7 @@ mod tests {
         // (c) A REFUSED catalog serves nothing by definition, so its emptiness says
         //     nothing about any topic.
         let refused = cerulion_core::CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: Vec::new(),
@@ -11754,6 +11800,7 @@ mod tests {
         // `Settled` case that must still make the terminal claim.
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         let served = |topic: &str| CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
@@ -11946,6 +11993,7 @@ mod tests {
     fn catalog_reply_for_test(robot: &str, topic: &str) -> CatalogReply {
         use cerulion_core::{CatalogEntry, CatalogProvenance};
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
@@ -13769,6 +13817,7 @@ mod unknown_hash {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
         header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -14402,6 +14451,7 @@ mod monitor_snapshot_tests {
     /// A catalog reply carrying `entries`, each with the liveness handed in.
     fn catalog(robot: &str, entries: &[(&str, Option<TopicLiveness>)]) -> CatalogReply {
         CatalogReply {
+            wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             version: cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
             robot: robot.to_string(),
             entries: entries

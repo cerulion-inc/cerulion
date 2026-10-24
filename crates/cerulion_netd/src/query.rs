@@ -84,7 +84,7 @@ const COLD_START_HARVEST_ATTEMPTS: u64 = 5;
 /// # Derivation
 ///
 /// netd's zenoh session is LAZY — the FIRST query OPENS it — and a just-opened
-/// scouting session has not yet completed the multicast scout → TCP connect →
+/// session has not yet completed the TCP connect to its folded peers →
 /// session establishment → liveliness/queryable exchange that makes a robot's
 /// announce tokens and its `catalog` queryable visible. ONE harvest is only
 /// `QUERY_HARVEST_WINDOW` (500 ms) and `query_announce_entries` breaks EARLY when

@@ -1946,11 +1946,11 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
         for frame in frames {
             assert_eq!(
                 frame.data.len(),
-                56,
-                "32-byte wire header and fixed Vector3"
+                cerulion_core::wire::WireHeader::SIZE + 24,
+                "wire header and fixed Vector3"
             );
             assert_eq!(
-                &frame.data[32..],
+                &frame.data[cerulion_core::wire::WireHeader::SIZE..],
                 &[0u8; 24],
                 "ticker writes zero x and relay forwards it; untouched y/z remain zero"
             );

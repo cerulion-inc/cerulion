@@ -52,9 +52,11 @@ ENVIRONMENT:
     CERULION_RERUN_URL           Connect the daemon to an external Rerun endpoint
                                  as a CLIENT instead of hosting the proxy.
     CERULION_VIZD_CONNECT        Zenoh locators to CONNECT to for remote robots
-                                 scouting can't reach (comma/space separated).
+                                 (comma/space separated).
     CERULION_VIZD_LISTEN         Zenoh locators to LISTEN on (comma/space separated).
     CERULION_VIZD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no zenoh ever).
+    CERULION_MULTICAST_SCOUTING=on
+                                 Turn zenoh multicast scouting back on (default off).
 ";
 
 fn main() -> ExitCode {
@@ -124,7 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket = ControlSocket::acquire(cerulion_vizd::default_socket_path())?;
 
     // ONE iceoryx2 node + ONE zenoh session for the whole process (Principle #8).
-    // Network-CONFIGURED by default (scouting ON) so the remote arm's
+    // Network-CONFIGURED by default (gossip on, multicast scouting off) so the remote arm's
     // `register_ingress_topic` works, but the session stays LAZY — a purely-local
     // daemon (never a `--robot` attach) opens no zenoh session. `init` (not
     // `get_or_init`) so the network config is honored: the daemon is the sole

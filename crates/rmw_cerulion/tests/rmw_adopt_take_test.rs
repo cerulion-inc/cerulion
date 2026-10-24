@@ -4726,7 +4726,7 @@ fn an_over_retention_take_does_not_close_the_below_floor_regime() {
 /// would be sampling two different implementations.
 ///
 /// The ranges are compared as offsets RELATIVE TO THE FRAME BODY — the
-/// sample's payload base plus the 32-byte `WireHeader`, i.e. the base the
+/// sample's payload base plus the 40-byte `WireHeader`, i.e. the base the
 /// offset table itself is written against (`take_adopted` decodes
 /// `&owned.payload()[WireHeader::SIZE..]`). The absolute SHM address
 /// legitimately differs between runs (a different pool slot); the
