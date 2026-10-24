@@ -1,6 +1,6 @@
 # cerulion_wireclient
 
-Desk-side client pieces for the `cerulion/wire/1` remote protocol of
+Desk-side client pieces for the `cerulion/wire/2` remote protocol of
 [Cerulion](https://github.com/cerulion-inc/cerulion): what a computer needs to
 read a remote robot's topics over an iroh connection.
 

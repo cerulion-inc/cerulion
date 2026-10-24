@@ -154,7 +154,7 @@ def test_held_frames_stay_in_publisher_shm(fixture_bin, session):
                    for address in addresses)
         assert len(set(addresses)) == n
         assert min(abs(left - right) for left in addresses for right in addresses
-                   if left != right) >= size + 32
+                   if left != right) >= size + 40
         after = _metric_snapshot()
         private_growth = (
             after["Private_Clean"] + after["Private_Dirty"]

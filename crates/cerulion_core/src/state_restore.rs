@@ -67,8 +67,8 @@ use crate::state::{CerulionState, SkipCause, StateError, StateSink};
 ///
 /// It exists because the shape check has no other wire slot. `STATE_SHAPE` is
 /// a compile-time constant on the node's type and nothing else
-/// writes it anywhere — not into the record header (which is a fixed 32 bytes
-/// of transport bookkeeping), not into `state_coverage.json` (which the
+/// writes it anywhere: not into the record header (fixed-size transport
+/// bookkeeping, `STATE_RECORD_HEADER_SIZE` bytes), not into `state_coverage.json` (which the
 /// recorder builds from headers it never decodes), and not into the ring
 /// manifest (which never reaches the bag). Without it a retyped field restores
 /// SILENTLY, which is the failure the shape gate exists to make terminal.

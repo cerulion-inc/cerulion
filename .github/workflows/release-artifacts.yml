@@ -70,12 +70,47 @@ jobs:
         env:
           # The same toolchain the `build` job pins for the binaries.
           CERULION_RMW_TOOLCHAIN: 1.95.0
-        run: tools/scripts/build_rmw_jazzy.sh . "$RUNNER_TEMP/rmw"
+        run: tools/scripts/build_rmw.sh jazzy . "$RUNNER_TEMP/rmw"
 
       - name: Upload rmw library and evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rmw-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/rmw/librmw_cerulion.so
+            ${{ runner.temp }}/rmw/librmw_cerulion.so.evidence.txt
+            ${{ runner.temp }}/rmw/build-env.txt
+          if-no-files-found: error
+
+  # The ROS 2 Lyrical rmw, built the same way inside `ros:lyrical` for every
+  # release (build_rmw.sh refuses a library whose bindings were not
+  # generated). It is uploaded as build evidence beside the Jazzy one; the
+  # archives and the deb carry the Jazzy library only.
+  rmw-lyrical:
+    name: Build rmw_cerulion for Lyrical ${{ matrix.target }}
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build librmw_cerulion.so inside ros:lyrical
+        env:
+          CERULION_RMW_TOOLCHAIN: 1.95.0
+        run: tools/scripts/build_rmw.sh lyrical . "$RUNNER_TEMP/rmw"
+
+      - name: Upload rmw library and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmw-lyrical-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/rmw/librmw_cerulion.so
             ${{ runner.temp }}/rmw/librmw_cerulion.so.evidence.txt
@@ -138,9 +173,15 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
+      # The hosted image ships a packages.microsoft.com apt source; apt-get
+      # update exits 100 when that source refuses or fails its signature check,
+      # even though the package comes from the Ubuntu archives. Deleting its
+      # list first keeps that source out of the update; rm -f exits 0 when the
+      # file is absent.
       - name: Install aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
@@ -157,7 +198,7 @@ jobs:
             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           fi
           cargo build --release --locked \
-            -p cerulion_cli -p cerulion_netd -p cerulion_connectd \
+            -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
             --target "$TARGET"
           case "$TARGET" in
             *-unknown-linux-gnu)
@@ -220,7 +261,8 @@ jobs:
           python3 tools/scripts/check_release_glibc.py \
             "target/$TARGET/release/cerulion" \
             "target/$TARGET/release/cerulion-netd" \
-            "target/$TARGET/release/cerulion-connectd"
+            "target/$TARGET/release/cerulion-connectd" \
+            "target/$TARGET/release/cerulion-remoted"
 
       - name: Package archive
         env:
@@ -234,12 +276,13 @@ jobs:
           cp "target/$TARGET/release/cerulion" "$stage/cerulion"
           cp "target/$TARGET/release/cerulion-netd" "$stage/cerulion-netd"
           cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
+          cp "target/$TARGET/release/cerulion-remoted" "$stage/cerulion-remoted"
           cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
           rustc -vV > "$stage/rustc-version.txt"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
-          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd
+          chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           case "$TARGET" in
             *-unknown-linux-gnu)
               rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
@@ -377,14 +420,15 @@ jobs:
   release:
     name: Publish GitHub Release assets
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: [build, verify-rmw]
+    needs: [build, verify-rmw, rmw-lyrical]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      # Only the `cerulion-*` artifacts are release assets. The `rmw-*`
-      # library artifacts and the `rmw-verify-*` logs are build evidence, not
-      # downloads: the library ships inside the Linux archives.
+      # Only the `cerulion-*` artifacts are release assets. The `rmw-*` and
+      # `rmw-lyrical-*` library artifacts and the `rmw-verify-*` logs are
+      # build evidence, not downloads: the Jazzy library ships inside the Linux
+      # archives.
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -553,6 +597,20 @@ jobs:
           actual=$( "$RUNNER_TEMP/cerulion-bin/cerulion" --version )
           printf '%s\n' "$actual" | grep -F "$expected" >/dev/null ||
             { echo "::error::cerulion --version did not contain $expected"; exit 1; }
+          # The installer places every program beside the CLI. v1.0.0
+          # predates cerulion-remoted; every later release carries it.
+          programs="cerulion-netd cerulion-connectd"
+          if [ "$TAG" != v1.0.0 ]; then
+            programs="$programs cerulion-remoted"
+          fi
+          for program in $programs; do
+            [ -x "$RUNNER_TEMP/cerulion-bin/$program" ] ||
+              { echo "::error::the installer did not place $program beside the CLI"; exit 1; }
+          done
+          if [ "$TAG" != v1.0.0 ]; then
+            "$RUNNER_TEMP/cerulion-bin/cerulion-remoted" --version | grep -F "$expected" >/dev/null ||
+              { echo "::error::cerulion-remoted --version did not contain $expected"; exit 1; }
+          fi
           # The Linux archive carries the ROS 2 Jazzy rmw and the heap hook,
           # and the installer places both beside the CLI; macOS archives
           # carry neither by design.

@@ -22,7 +22,10 @@
 //! parallel-safe, no `#[serial]`.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::net::TcpListener;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -32,7 +35,7 @@ use cerulion_core::message::ShmMessage;
 use cerulion_core::testing::{count_at_exclusively, debug_lines_expected, line_level, logged_at};
 use cerulion_core::transport::bridge::TopicBridgeManager;
 use cerulion_core::transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, GATEWAY_ZERO_DEMAND_IDLE,
@@ -50,6 +53,7 @@ use cerulion_core::transport::{PublisherProvisioning, TransportConfig, Transport
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use native_ros2_messages::geometry_msgs::Vector3;
 use tracing_test::traced_test;
+use zenoh::Wait;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -88,6 +92,7 @@ fn oracle_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -879,6 +884,7 @@ fn make_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -1930,6 +1936,706 @@ fn runtime_registration_announce_failure_warns_retains_flag_and_heals() {
     );
 }
 
+#[test]
+fn paired_lan_access_withholds_egress_announces_and_withdraws_existing_tokens() {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (_, _, gateway, _) = make_producer_and_gateway("paired_announce", plan, &[]);
+    let network = gateway.manager().network().expect("network");
+    let topic = format!("/paired/{}", unique_id());
+    let bridges = gateway.manager().bridge_manager();
+
+    network.set_lan_access(LanAccess::Open);
+    bridges.register_topic(&topic).expect("register bridge");
+    assert!(bridges.enable_bridge(&topic).expect("enable bridge"));
+    network.set_lan_access(LanAccess::Paired);
+    assert!(!bridges.is_enabled(&topic).expect("closed bridge"));
+    assert!(
+        !gateway.liveliness_demand_grants_for_test(&topic),
+        "paired posture refuses a live demand"
+    );
+    network
+        .announce_egress_topic(&topic)
+        .expect("paired posture withholds the announce");
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+
+    network.set_lan_access(LanAccess::Open);
+    assert_eq!(
+        network.announced_topic_count(),
+        0,
+        "opening does not replay"
+    );
+    assert!(
+        gateway.liveliness_demand_grants_for_test(&topic),
+        "open posture permits a live demand"
+    );
+    network
+        .announce_egress_topic(&topic)
+        .expect("open posture announces the topic");
+    assert_eq!(network.announced_topic_count(), 1);
+    assert!(network.is_announced(&topic));
+
+    network.set_lan_access(LanAccess::Paired);
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+    assert!(
+        network.has_identity_token(),
+        "robot identity stays announced"
+    );
+}
+
+const LANOBS_ENDPOINT_ENV: &str = "CERULION_GW_LANOBS_ENDPOINT";
+const LANOBS_ROBOT_ENV: &str = "CERULION_GW_LANOBS_ROBOT";
+const LANOBS_TOPIC_ENV: &str = "CERULION_GW_LANOBS_TOPIC";
+
+/// OBSERVER ROLE for `a_paired_switch_waits_out_an_in_flight_announce`:
+/// runs in a re-executed child process (one zenoh session per process).
+/// Opens a plain session against the gateway's listen endpoint and asserts
+/// the robot's surviving identity token is visible, proving the link
+/// carries this robot's announce space, while the revoked egress-topic
+/// token never appears.
+#[test]
+#[ignore = "observer role; spawned by the parent test"]
+fn lan_announce_observer_role() {
+    let endpoint = std::env::var(LANOBS_ENDPOINT_ENV).expect(LANOBS_ENDPOINT_ENV);
+    let robot = std::env::var(LANOBS_ROBOT_ENV).expect(LANOBS_ROBOT_ENV);
+    let topic = std::env::var(LANOBS_TOPIC_ENV).expect(LANOBS_TOPIC_ENV);
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["{endpoint}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let session = zenoh::open(config).wait().expect("observer session opens");
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    // PHASE 1: confirm the token is visible BEFORE the close - a withdrawal
+    // test on a token the LAN never saw proves nothing. Count only CLEAN
+    // snapshots (channel closed inside the window).
+    let saw_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(entries) =
+            cerulion_core::transport::discovery::query_announce_entries_clean_window(
+                &session,
+                Duration::from_millis(300),
+            )
+            .expect("announce-space liveliness query")
+        {
+            if entries
+                .iter()
+                .any(|(_, t)| t.as_deref() == Some(topic.as_str()))
+            {
+                println!("SAW_TOKEN");
+                use std::io::Write;
+                std::io::stdout().flush().expect("flush SAW_TOKEN");
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < saw_deadline,
+            "the observer never saw the topic token before the close; \
+             withdrawing it proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Absence is only proven over COMPLETE snapshots: a snapshot counts only
+    // when the Zenoh get itself finished (the reply channel closed) before
+    // the gather window elapsed AND the robot's own identity reply is in it;
+    // the revoked topic token must be absent in THREE consecutive complete
+    // snapshots, not just one possibly-partial query. The close only runs
+    // once `announce_egress_topic` returns, so the token legitimately stays
+    // visible for the first snapshots after SAW_TOKEN: withdrawal starts
+    // counting once it disappears.
+    let mut complete_clean = 0u32;
+    let mut token_absent = false;
+    loop {
+        let entries =
+            match cerulion_core::transport::discovery::query_announce_entries_clean_window(
+                &session,
+                Duration::from_millis(300),
+            )
+            .expect("announce-space liveliness query")
+            {
+                Some(entries) => entries,
+                // The gather window cut the query short: a partial view, not a
+                // snapshot; it neither proves absence nor breaks the streak.
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the observer never completed a full announce snapshot; \
+                     absence proves nothing on partial gathers"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+        let token_visible = entries
+            .iter()
+            .any(|(_, t)| t.as_deref() == Some(topic.as_str()));
+        if !token_absent {
+            if token_visible {
+                assert!(
+                    Instant::now() < deadline,
+                    "the announce token was never withdrawn after the close: {entries:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            token_absent = true;
+        }
+        assert!(
+            !token_visible,
+            "the revoked announce token reappeared to a LAN observer: {entries:?}"
+        );
+        if entries.iter().any(|(r, _)| r == &robot) {
+            complete_clean += 1;
+        } else {
+            complete_clean = 0;
+        }
+        if complete_clean == 3 {
+            println!("READY");
+            use std::io::Write;
+            std::io::stdout().flush().expect("flush READY");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the observer never saw three complete snapshots of the robot's \
+             announce space; the topic's absence proves nothing without them"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const DEMAND_ENDPOINT_ENV: &str = "CERULION_GW_DEMAND_ENDPOINT";
+const DEMAND_SELECTOR_ENV: &str = "CERULION_GW_DEMAND_SELECTOR";
+const DEMAND_GO_ENV: &str = "CERULION_GW_DEMAND_GO";
+
+/// DEMAND-CLIENT ROLE for `a_paired_switch_waits_out_an_in_flight_demand_query`:
+/// runs in a re-executed child process (one zenoh session per process).
+/// Issues a demand GET against the gateway's queryable, prints the reply
+/// payload as `PRE:<payload>`, waits for the parent's go file, then issues a
+/// second GET and prints `POST:<payload>`.
+#[test]
+#[ignore = "demand client role; spawned by the parent test"]
+fn lan_demand_client_role() {
+    let endpoint = std::env::var(DEMAND_ENDPOINT_ENV).expect(DEMAND_ENDPOINT_ENV);
+    let selector = std::env::var(DEMAND_SELECTOR_ENV).expect(DEMAND_SELECTOR_ENV);
+    let go_path = std::env::var(DEMAND_GO_ENV).expect(DEMAND_GO_ENV);
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["{endpoint}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let session = zenoh::open(config).wait().expect("demand session opens");
+
+    // A demand GET states the demander's wire header version (two bytes,
+    // little-endian), as the production demander sends it; a GET stating
+    // none is refused as another release's.
+    let get_once = |session: &zenoh::Session| -> String {
+        let replies = session
+            .get(&selector)
+            .payload(
+                cerulion_core::wire::WIRE_HEADER_VERSION
+                    .to_le_bytes()
+                    .to_vec(),
+            )
+            .wait()
+            .expect("demand get");
+        let mut payload = Vec::new();
+        while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
+            if let Ok(sample) = reply.into_result() {
+                payload = sample.payload().to_bytes().to_vec();
+            }
+        }
+        String::from_utf8(payload).expect("reply payload is utf8")
+    };
+
+    println!("PRE:{}", get_once(&session));
+    {
+        use std::io::Write;
+        std::io::stdout().flush().expect("flush PRE");
+    }
+
+    // The parent releases the second query only after the paired close has
+    // fully returned, so this reply must be the refusal.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::path::Path::new(&go_path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent never released the second demand query"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    println!("POST:{}", get_once(&session));
+    {
+        use std::io::Write;
+        std::io::stdout().flush().expect("flush POST");
+    }
+}
+
+fn lan_demand_command(endpoint: &str, selector: &str, go_path: &Path, log_path: &Path) -> Command {
+    let stdout = File::create(log_path).expect("create demand log");
+    let stderr = stdout.try_clone().expect("clone demand log");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args([
+            "--exact",
+            "lan_demand_client_role",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEMAND_ENDPOINT_ENV, endpoint)
+        .env(DEMAND_SELECTOR_ENV, selector)
+        .env(DEMAND_GO_ENV, go_path)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command
+}
+
+/// Waits until a running child's log contains `token` as a word (the harness
+/// test-name prefix shares the line with the child's println), with a 30 s
+/// deadline; a premature child exit fails with the log contents.
+fn wait_for_log_token(child: &mut Child, log_path: &Path, token: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = std::fs::read_to_string(log_path).unwrap_or_default();
+        let seen = output
+            .lines()
+            .any(|line| line.split_whitespace().any(|word| word == token));
+        if seen {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("child try_wait") {
+            panic!("child exited with {status} before printing {token}:\n{output}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never printed {token}:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn lan_observer_command(endpoint: &str, robot: &str, topic: &str, log_path: &Path) -> Command {
+    let stdout = File::create(log_path).expect("create observer log");
+    let stderr = stdout.try_clone().expect("clone observer log");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args([
+            "--exact",
+            "lan_announce_observer_role",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LANOBS_ENDPOINT_ENV, endpoint)
+        .env(LANOBS_ROBOT_ENV, robot)
+        .env(LANOBS_TOPIC_ENV, topic)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command
+}
+
+/// Stops and reaps a spawned observer that is still running when the
+/// parent returns or panics.
+struct LanObserver(Child);
+
+impl Drop for LanObserver {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn wait_for_lan_observer(child: &mut Child, log_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = std::fs::read_to_string(log_path).unwrap_or_default();
+        let ready = output
+            .lines()
+            .any(|line| line.split_whitespace().any(|word| word == "READY"));
+        if let Some(status) = child.try_wait().expect("observer try_wait") {
+            assert!(
+                ready && status.success(),
+                "observer failed with {status}:\n{output}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "observer did not finish in time:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_paired_switch_waits_out_an_in_flight_announce() {
+    // A listening gateway is needed so the observer child can attach; the
+    // plan announces no topic of its own.
+    let id = unique_id();
+    let robot = format!("gateguard{id}");
+    let topic = format!("/gate/announce/{id}");
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let clock_dyn: Arc<dyn Clock> = Arc::new(VirtualClock::new());
+    let p = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("gw_p_gate_{id}"),
+            clock: clock_dyn,
+            ..Default::default()
+        },
+        root.clone(),
+    )
+    .expect("init producer P");
+    let mut bound = None;
+    for _ in 0..3 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("probe port")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let g = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("gw_g_gate_{id}"),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    robot_identity: Some(robot.clone()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            root.clone(),
+        )
+        .expect("init gateway G");
+        let manager = Arc::clone(&g);
+        match GatewayRuntime::new(g, plan.clone()) {
+            Ok(gateway) => {
+                bound = Some((gateway, manager, port));
+                break;
+            }
+            Err(error) => eprintln!("G session failed on port {port}: {error}"),
+        }
+    }
+    let Some((_gateway, manager, port)) = bound else {
+        panic!("could not bind a listening gateway in 3 attempts");
+    };
+    let _p = p;
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    // The hook spawns the closer and returns WITHOUT joining it: joining
+    // under the announce gate's read guard would deadlock the close's
+    // write side, which waits for this announce to finish. Before returning,
+    // the hook proves the serialization actually holds: the closer reports
+    // that its write lock on the announce gate is contended, which happens
+    // only while this announce holds the read guard. With the gate removed
+    // the closer never contends and the hook never returns.
+    let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slot_for_hook = Arc::clone(&closer_slot);
+    let manager_for_hook = Arc::clone(&manager);
+    // Fired inside `set_lan_access` when its write lock on the announce
+    // gate is contended, just before it blocks there.
+    {
+        let at_gate = Arc::clone(&closer_at_gate);
+        network.set_on_announce_gate_contended_for_test(Some(Arc::new(move || {
+            at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
+    network.set_after_announce_posture_check_for_test(Some(Arc::new(move || {
+        let manager = Arc::clone(&manager_for_hook);
+        *slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::thread::spawn(move || {
+                manager
+                    .network()
+                    .expect("network")
+                    .set_lan_access(LanAccess::Paired);
+            }));
+        // The closer contended on the gate this announce holds: it is
+        // parked on the write side until the announce releases its read
+        // guard. (The announce has not inserted its token yet at this hook
+        // point; the retained-token check lives in the after-insert hook
+        // below.)
+        while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(
+            !slot_for_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("closer handle")
+                .is_finished(),
+            "the closer finished while an announce was in flight: the \
+             paired switch did not wait on the announce gate"
+        );
+    })));
+    // The token must have been retained first - otherwise the blocked-close
+    // checks and the post-close observer prove nothing about a withdrawal
+    // that never had anything to withdraw. Check it right after the insert,
+    // while the announce still holds its gate read guard: once
+    // `announce_egress_topic` returns, the released guard lets the closer
+    // clear the token before a check could run.
+    // The observer starts BEFORE the close: it must witness the topic token
+    // on the wire first, or a withdrawal it never saw happen proves nothing.
+    // The insert hook below holds the announce gate's read guard until the
+    // observer reports SAW_TOKEN, so the token cannot be revoked early.
+    let dir = tempfile::tempdir().expect("observer dir");
+    let log_path = dir.path().join("observer.log");
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+    let mut observer = LanObserver(
+        lan_observer_command(&endpoint, &robot, &topic, &log_path)
+            .spawn()
+            .expect("spawn observer process"),
+    );
+    let token_retained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let retained = Arc::clone(&token_retained);
+        let manager_for_insert = Arc::clone(&manager);
+        let log_for_insert = log_path.clone();
+        let topic_for_insert = topic.clone();
+        network.set_after_announce_insert_for_test(Some(Arc::new(move || {
+            let announced = manager_for_insert
+                .network()
+                .expect("network")
+                .is_announced(&topic_for_insert);
+            retained.store(announced, std::sync::atomic::Ordering::SeqCst);
+            // Hold the read guard until the LAN observer reports the token:
+            // the closer stays parked on the write side while the observer
+            // gathers, so the token it saw really is the one being revoked.
+            // The observer budget covers its process spawn and zenoh open,
+            // which can take most of a short window on a loaded runner.
+            let saw_deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let saw = std::fs::read_to_string(&log_for_insert)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| {
+                        // The harness "test ... " prefix shares the line with
+                        // the child's println, so match the word, not the
+                        // whole trimmed line.
+                        line.split_whitespace().any(|word| word == "SAW_TOKEN")
+                    });
+                if saw {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < saw_deadline,
+                    "the LAN observer never saw the token before the close"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })));
+    }
+    network
+        .announce_egress_topic(&topic)
+        .expect("an announce that beats the close returns Ok");
+    network.set_after_announce_posture_check_for_test(None);
+    network.set_on_announce_gate_contended_for_test(None);
+    network.set_after_announce_insert_for_test(None);
+    assert!(
+        token_retained.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight announce must retain its topic token before the close"
+    );
+    closer_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the posture hook ran")
+        .join()
+        .expect("closer thread");
+
+    // The close waited out the announce's read guard, then cleared its
+    // token: retained state is empty and only the identity token survives.
+    assert_eq!(network.announced_topic_count(), 0);
+    assert!(!network.is_announced(&topic));
+    assert!(network.has_identity_token());
+
+    // The real proof is on the wire: the observer already SAW the token and
+    // now must watch it withdraw across clean snapshots.
+    wait_for_lan_observer(&mut observer.0, &log_path);
+}
+
+#[test]
+fn a_paired_switch_waits_out_an_in_flight_demand_query() {
+    // The demand queryable holds the announce gate's READ guard from its
+    // authorizer read through its reply send, so a callback that started
+    // before the close still replies under the pre-close posture and the
+    // close waits it out; a query issued after the close is refused.
+    let id = unique_id();
+    let robot = format!("gatequery{id}");
+    let topic = format!("/gate/query/{id}");
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![topic.clone()],
+        ingress: vec![],
+    };
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let mut bound = None;
+    for _ in 0..3 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("probe port")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let g = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("gw_g_query_{id}"),
+                network: Some(NetworkConfig {
+                    listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                    robot_identity: Some(robot.clone()),
+                    ..NetworkConfig::default()
+                }),
+                ..Default::default()
+            },
+            root.clone(),
+        )
+        .expect("init gateway G");
+        let manager = Arc::clone(&g);
+        match GatewayRuntime::new(g, plan.clone()) {
+            Ok(gateway) => {
+                bound = Some((gateway, manager, port));
+                break;
+            }
+            Err(error) => eprintln!("G session failed on port {port}: {error}"),
+        }
+    }
+    let Some((_gateway, manager, port)) = bound else {
+        panic!("could not bind a listening gateway in 3 attempts");
+    };
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    // The demander runs in a re-executed child process: one zenoh session
+    // per process, so it cannot share this process's manager session.
+    let selector = format!("cerulion_q/{robot}/demand{topic}");
+    let dir = tempfile::tempdir().expect("demand dir");
+    let log_path = dir.path().join("demand.log");
+    let go_path = dir.path().join("go");
+    let endpoint = format!("tcp/127.0.0.1:{port}");
+
+    // Same serialization proof as the announce arm: the closer reports that
+    // its write lock on the gate is contended while the callback holds READ.
+    // With the callback's guard removed the closer never contends and the
+    // hook never returns.
+    let closer_slot: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let closer_at_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slot_for_hook = Arc::clone(&closer_slot);
+    let manager_for_hook = Arc::clone(&manager);
+    // Fired inside `set_lan_access` when its write lock on the announce
+    // gate is contended, just before it blocks there.
+    {
+        let at_gate = Arc::clone(&closer_at_gate);
+        network.set_on_announce_gate_contended_for_test(Some(Arc::new(move || {
+            at_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
+    network.set_after_demand_authorizer_read_for_test(Some(Arc::new(move || {
+        let manager = Arc::clone(&manager_for_hook);
+        *slot_for_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::thread::spawn(move || {
+                manager
+                    .network()
+                    .expect("network")
+                    .set_lan_access(LanAccess::Paired);
+            }));
+        while !closer_at_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(
+            !slot_for_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("closer handle")
+                .is_finished(),
+            "the closer finished while a demand query was in flight: the \
+             paired switch did not wait on the announce gate"
+        );
+    })));
+
+    // Spawn the demander only now: both hooks are installed, so its first
+    // query cannot finish (and print PRE) before the authorizer hook exists.
+    let mut demand = LanObserver(
+        lan_demand_command(&endpoint, &selector, &go_path, &log_path)
+            .spawn()
+            .expect("spawn demand client process"),
+    );
+
+    // The child's in-flight query replies under the pre-close posture.
+    wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled/w2");
+
+    network.set_after_demand_authorizer_read_for_test(None);
+    network.set_on_announce_gate_contended_for_test(None);
+    closer_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the authorizer hook ran")
+        .join()
+        .expect("closer thread");
+
+    // The close has now returned: release the child's second query, which
+    // sees the swapped authorizer and is refused.
+    std::fs::write(&go_path, b"go").expect("release second demand query");
+    wait_for_log_token(&mut demand.0, &log_path, "POST:refused");
+    let status = demand.0.wait().expect("reap demand client");
+    assert!(
+        status.success(),
+        "demand client failed with {status}:\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+}
+
+#[test]
+fn an_announce_after_a_paired_then_open_switch_is_retained() {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (_, _, gateway, _) = make_producer_and_gateway("announce_posture_reopen", plan, &[]);
+    let manager = gateway.manager();
+    let network = manager.network().expect("network");
+    network.set_lan_access(LanAccess::Open);
+
+    // The announce gate serializes announces against posture switches, so
+    // the close-and-reopen completes before this announce's posture check.
+    network.set_lan_access(LanAccess::Paired);
+    network.set_lan_access(LanAccess::Open);
+    network
+        .announce_egress_topic(&format!("/race/{}", unique_id()))
+        .expect("announce after reopening is retained");
+
+    assert_eq!(
+        network.announced_topic_count(),
+        1,
+        "an announce after reopening must retain its token"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The AllowAll-only permissive SHM probe + the empty-boot-plan
 // demand surface. When a remote DEMAND names a topic the gateway has NOT
@@ -2326,7 +3032,7 @@ fn permissive_probe_refuses_an_ingress_topic_naming_the_loop() {
     // is fresh and only a HIT re-arms it), so the WARN token is required — the
     // debug repeat carries the same phrase and must not satisfy this.
     logs_assert(|lines: &[&str]| {
-        logged_at(lines, "WARN", "network INGRESS topic — echo-loop")
+        logged_at(lines, "WARN", "network INGRESS topic (echo-loop)")
             .map_err(|e| format!("the loop refusal names the ingress/echo-loop hazard — {e}"))
     });
 }
@@ -2477,7 +3183,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
             let loud = lines
                 .iter()
                 .filter(|l| {
-                    line_level(l) == Some(level) && (l.contains("(repeat — see the first warning)"))
+                    line_level(l) == Some(level) && (l.contains("(repeat; see the first warning)"))
                 })
                 .count();
             if loud != 0 {
@@ -2494,7 +3200,7 @@ fn permissive_probe_miss_flood_counts_all_warns_once_and_stays_live() {
         // Counted AT DEBUG, not by text: a repeat re-emitted at `trace!` is
         // still one line, and the loud sweep above permits TRACE.
         let suppressed =
-            count_at_exclusively(lines, "DEBUG", &["(repeat — see the first warning)"])?;
+            count_at_exclusively(lines, "DEBUG", &["(repeat; see the first warning)"])?;
         if warns != 1 {
             return Err(format!("expected exactly 1 MISS warn, got {warns}"));
         }
@@ -3563,6 +4269,7 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
             schema_hash: widget_hash,
             qualified: widget_q.to_string(),
         }],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3896,13 +4603,7 @@ fn c5c_demand_authorizer_refuses_denied_topic_on_both_lan_paths() {
 
     // The refusal is LOUD (Principle #3 / the loud-over-silent rule) — a WARN,
     // level token included.
-    logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "demand REFUSED by the demand-authorization gate",
-        )
-    });
+    logs_assert(|lines: &[&str]| logged_at(lines, "WARN", "request=\"demand\""));
 
     // ANTI-TAUTOLOGY: re-install the deny-nothing default → a fresh live topic admits,
     // proving the deny was the authorizer's doing (not a MISS).
@@ -4047,6 +4748,7 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
             deps: vec![],
         }],
         schema_hashes: vec![],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -4111,16 +4813,8 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
     // The refusals are LOUD (Principle #3 / the loud-over-silent rule) — WARNs,
     // level token included.
     logs_assert(|lines: &[&str]| {
-        logged_at(
-            lines,
-            "WARN",
-            "catalog GET REFUSED by the demand-authorization gate",
-        )?;
-        logged_at(
-            lines,
-            "WARN",
-            "schema GET REFUSED by the demand-authorization gate",
-        )
+        logged_at(lines, "WARN", "request=\"catalog GET\"")?;
+        logged_at(lines, "WARN", "request=\"schema GET\"")
     });
 
     // --- ANTI-TAUTOLOGY: restore AllowAll → both serve again (the deny was the
@@ -5739,6 +6433,7 @@ fn a_runtime_topic_of_a_builtin_type_is_catalog_named_through_the_corpus_binding
         topic_schemas: vec![], // NO topic→name binding: the catalog MUST use the hash map
         schema_docs: vec![],   // built-ins are never served — the desk has them
         schema_hashes: bindings,
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -5855,6 +6550,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
             schema_hash: BOOT_HASH,
             qualified: "boot_msgs/Alpha".to_string(),
         }],
+        served_topics: vec![],
     };
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
@@ -5920,6 +6616,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
                 qualified: "later_msgs/WrongAlpha".to_string(),
             },
         ],
+        served_topics: vec![],
     };
     let handles = gateway.schema_serving_handles();
     handles.merge(&later_serving);
@@ -5972,6 +6669,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
         topic_schemas: vec![topic("/a", "pkg/A")],
         schema_docs: vec![doc("pkg/A", "int32 a\n")],
         schema_hashes: vec![binding(1, "pkg/A")],
+        served_topics: vec![],
     };
     // A later serving: a NEW type B, plus CONFLICTS on every existing key — a
     // rebind of /a (canonicalized: the bare "a" spelling must still collide), a
@@ -5980,6 +6678,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
         topic_schemas: vec![topic("a", "pkg/WrongA"), topic("/b", "pkg/B")],
         schema_docs: vec![doc("pkg/A", "int64 wrong\n"), doc("pkg/B", "int32 b\n")],
         schema_hashes: vec![binding(1, "pkg/WrongA"), binding(2, "pkg/B")],
+        served_topics: vec![],
     };
     acc.merge_from(&later);
     acc.merge_from(&later); // idempotent — the second fold changes nothing

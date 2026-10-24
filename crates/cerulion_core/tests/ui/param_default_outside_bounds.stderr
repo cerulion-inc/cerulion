@@ -1,0 +1,11 @@
+error: `default` 9.0 is outside [0.0, 5.0] on param `gain`
+  --> tests/ui/param_default_outside_bounds.rs:10:23
+   |
+10 |     #[param(default = 9.0, min = 0.0, max = 5.0)]
+   |                       ^^^
+
+error: cannot find attribute `output` in this scope
+ --> tests/ui/param_default_outside_bounds.rs:8:7
+  |
+8 |     #[output]
+  |       ^^^^^^

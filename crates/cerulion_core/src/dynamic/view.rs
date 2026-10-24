@@ -12,8 +12,8 @@ use crate::wire::WireHeader;
 ///
 /// Construction ([`FrameView::new`]) validates the whole structure ONCE:
 ///
-/// 1. `frame.len() >= 32` and the hash resolves to a layout;
-/// 2. `total_size <= frame.len()` and `total_size >= 32 + data_floor`;
+/// 1. `frame.len() >= 40` (the header) and the hash resolves to a layout;
+/// 2. `total_size <= frame.len()` and `total_size >= 40 + data_floor`;
 /// 3. the header's offset-table position/count match the layout;
 /// 4. every NON-EMPTY offset-table entry lies in `[data_floor, payload_len]`,
 ///    no two non-empty entries overlap, and a primitive-array entry is
@@ -28,7 +28,7 @@ use crate::wire::WireHeader;
 ///
 /// Every accessor afterwards is a slice of the frame - no allocation, no
 /// copy. Only the bytes inside `total_size` are ever read; the payload is
-/// `frame[32..total_size]`.
+/// `frame[40..total_size]`.
 ///
 /// Validation covers the header and the top-level offset table only: the
 /// bytes inside a variable entry (a nested message's own offsets, the
@@ -54,7 +54,7 @@ impl<'l, 'a> FrameView<'l, 'a> {
     /// `schema_hash` to. `frame` is the FULL wire frame, header first, as
     /// `OwnedInboundSample::payload()` returns it (in
     /// `crate::transport::subscriber`). A `try_receive` callback's
-    /// `ReceivedMessage::payload()` is the body WITHOUT the 32-byte header:
+    /// `ReceivedMessage::payload()` is the body WITHOUT the 40-byte header:
     /// write `msg.header()` with `WireHeader::write_to_buf` in front of it
     /// first, or the first body bytes are read as the `schema_hash`. Trailing
     /// bytes past `total_size` are ignored.

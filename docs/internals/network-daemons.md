@@ -95,6 +95,14 @@ remove them before committing.
 - **Singleton**: an exclusive non-blocking `flock` on the pidfile. Only the lock
   holder may unlink or overwrite; the kernel drops the lock on process death, so
   the guarantee survives crashes with no stale-pidfile heuristics.
+- **Android control sockets** (netd and wsd, via `cerulion_hygiene`): the daemon
+  binds and clients connect in the abstract namespace, since SELinux blocks socket
+  files for the shell. The pidfile and flock stay filesystem-backed. Dropping the
+  socket guard shuts the listener down for reads first, so a connect is refused at
+  the same instant a pathname unlink would make it fail; a replacement that wins the
+  flock while the old listener is still open retries the bind on `AddrInUse`. Each
+  accept loop drops a peer whose `SO_PEERCRED` UID differs from its effective UID,
+  or whose credentials cannot be verified (flood-latched via `FailureRegimeLatch`).
 
 ## 4. Egress plane (gateway convergence) and the mDNS beacon
 
@@ -107,8 +115,10 @@ remove them before committing.
   LISTEN-configured machine (`CERULION_NETD_LISTEN` set, a robot serving the
   network) the SAME gateway additionally boots AT DAEMON START with an empty
   announce set (`boot_standing_gateway`), so runtime-registered topics (rmw
-  publishers, raw routes) are announced, catalogued and demandable with no graph
-  run, and the beacon rises at boot; such a daemon never idle-self-exits (§3).
+  publishers, raw routes) are catalogued and demandable with no graph run. When
+  LAN access is open, their announce tokens also make topic names discoverable;
+  paired-only access withholds those tokens while preserving robot identity
+  presence. The beacon rises at boot; such a daemon never idle-self-exits (§3).
   `CERULION_NETD_NETWORK=off` wins over LISTEN: a local-only daemon boots nothing.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
@@ -119,22 +129,37 @@ remove them before committing.
   catalogued `schema_name: None` with zero served docs, forever.
 - The embedded gateway announces under the MACHINE's identity (the hostname,
   resolved into the shared session's `NetworkConfig.robot_identity` at init).
+- A successful `register_egress` response reports the shared manager's LAN
+  posture. `graph run` uses this value for its permissive-egress breadcrumb, so
+  a netd process with a different environment is reported accurately. Older
+  responses omit the optional value and are reported as UNKNOWN, not open: `graph run` warns about the older daemon rather than emitting the permissive-egress breadcrumb.
+  A run that requires `paired` first reads netd's posture from the `status`
+  response (an optional `lan_access` field, UNKNOWN when absent) and registers
+  egress only when netd reports `paired`; an `open` or UNKNOWN posture sends the
+  run to its own gateway child, which enforces `paired`. The probe comes first
+  because a released registration lingers on the shared gateway. The
+  `register_egress` response's posture is checked again.
 - The standalone `graph run-gateway` child hosts the plane for an explicit
   `network:` block (the Strict posture, whose verbatim locators and egress
   allow-list the shared permissive session cannot represent), on non-Unix hosts,
   and when netd registration fails. On the permissive default path netd hosts the
   plane and no child is spawned.
-- **Peer fold at boot**: before `TransportManager::init`, `fold_cached_peers` adds
-  connect endpoints from the same sources the CLI's discovery ladder trusts (the
-  cached peer file, env/config/hostname convention), pre-filtered by the bounded
-  TCP reachability probe, so a desk reaches a robot it has seen before with no
-  environment variable, even where multicast scouting is degraded. Dialling a
-  cached locator is load-bearing, not just faster: a scouting-only session's query
-  plane can converge while its data plane carries nothing.
+- **Peer fold at boot**: before `TransportManager::init`, `fold_discovered_peers`
+  adds connect endpoints from the explicit `CERULION_NETD_CONNECT` locators, one
+  800 ms `_cerulion._tcp` browse (`cerulion_mdns::browse_rung`) and the cached peer
+  file, the discovered rows pre-filtered by the bounded TCP reachability probe,
+  so a desk reaches a listening LAN robot with no environment variable. The
+  session runs with zenoh multicast scouting OFF (`CERULION_MULTICAST_SCOUTING=on`
+  re-enables it), so these connect endpoints are how it finds peers. Dialling a
+  discovered locator is load-bearing, not just faster: a scouting-only session's
+  query plane can converge while its data plane carries nothing.
 - **Beacon**: the `_cerulion._tcp` beacon is raised when the embedded egress
   gateway boots: the instant the machine becomes a producer and the session's
   listener is bound, so the advertised SRV port is a port something really listens
-  on. It is held for the PLANE's lifetime (a drive-thread restart must not flap
+  on. The first TCP listen endpoint must have a LAN-dialable nonzero fixed port;
+  port zero and loopback hosts are not advertised, and later TCP endpoints do
+  not replace an unusable first one.
+  It is held for the PLANE's lifetime (a drive-thread restart must not flap
   it) and leaves the network when netd exits. The advertise gate is the LISTEN
   endpoint (`cerulion_mdns::srv_port_from_listen_endpoints` over the session's own
   config), never robot identity; identity is stamped on every machine, so it
@@ -293,7 +318,7 @@ wrong.
   dependency graph rather than a comment (it also keeps every write on the one
   atomic-secret-write path). Dependency policy: std + serde + dirs + tracing
   ONLY (no transport crates), so it is safe in `default-members`.
-- **`cerulion_wireclient`**: the desk-side `cerulion/wire/1` client substrate
+- **`cerulion_wireclient`**: the desk-side `cerulion/wire/2` client substrate
   (control vocabulary, dial-config parsers, the per-topic re-inject reader). It is
   a crate of its own so that `cerulion_netd` reuses the vocabulary and parsers
   with no netd→connectd cyclic edge: both daemons depend on the substrate rather
@@ -304,12 +329,12 @@ wrong.
   genuinely shared across planes is `cerulion_core`'s
   `IngressInjector::reinject_raw` primitive. Links `cerulion_link` (→ iroh)
   unconditionally, so it is EXCLUDED from `default-members`.
-- **`cerulion_mdns`**: the leaf crate owning the ADVERTISE half of the
-  `_cerulion._tcp` beacon: the service type, the TXT vocabulary,
-  `srv_port_from_listen_endpoints`, `MdnsAdvertiseGuard`. `CERULION_SERVICE_TYPE`
-  is defined once here and imported by the browser, so the one string that must
-  match on both sides cannot drift. The BROWSE half stays in
-  `cerulion_cli_engine::mdns_discovery` (netd never browses). It is a crate
+- **`cerulion_mdns`**: the leaf crate owning the `_cerulion._tcp` beacon: the
+  service type, the TXT vocabulary, `srv_port_from_listen_endpoints`,
+  `MdnsAdvertiseGuard`, and the bounded browse `browse_rung` that netd's boot
+  fold and the CLI ladder both call. `CERULION_SERVICE_TYPE` is defined once
+  here. The `eid=` reader (`resolve_robot_eid`) stays in
+  `cerulion_cli_engine::mdns_discovery`. It is a crate
   because BOTH netd and the fallback `graph run-gateway` child advertise, and the
   engine already depends on netd; importing the beacon from the engine would be
   cyclic, and `cerulion_discovery` is pinned mdns-sd-free.

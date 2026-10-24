@@ -22,7 +22,7 @@
 //! (C3's migrated vizd / `topic echo` / connectd) can lift it verbatim.
 
 use cerulion_core::transport::cerulion_q::UnusableRunsAnswer;
-use cerulion_core::{CatalogReply, GatewayPlan, RunsReply, SchemaReply, SchemaServing};
+use cerulion_core::{CatalogReply, GatewayPlan, LanAccess, RunsReply, SchemaReply, SchemaServing};
 use serde::{Deserialize, Serialize};
 
 /// The `cerulion-netd` control-protocol version. Bumped on any
@@ -115,7 +115,17 @@ use serde::{Deserialize, Serialize};
 /// wire (see [`RunsQueryResponse::discovery`]), so there is no absent-field default to
 /// distrust; its one optional field, `plane_unsettled_ms`, means UNKNOWN when absent
 /// and suppresses nothing.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// `8`: the [`Hello`] banner states the daemon's
+/// [`WIRE_HEADER_VERSION`](cerulion_core::wire::WIRE_HEADER_VERSION) in a new
+/// `wire_header` field. netd re-injects remote frames into this machine's shared
+/// memory, so a client and a daemon built at different wire header versions
+/// would read each other's frames at the wrong offsets; the client refuses such a
+/// daemon at the handshake, naming the remedy. A daemon older than the field omits
+/// it, and its absence decodes as version 1, the header every such daemon carries:
+/// a true statement, not a positive claim the old daemon cannot make, so no trust
+/// floor is needed. Every verb's request and response shape is unchanged.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The minimum daemon [`PROTOCOL_VERSION`] that serves the `query_runs`
 /// verb — the version that INTRODUCED it, frozen here rather than spelled inline so
@@ -162,14 +172,25 @@ pub struct Hello {
     pub hello: String,
     /// The [`PROTOCOL_VERSION`] this daemon speaks.
     pub protocol: u32,
+    /// The [`WIRE_HEADER_VERSION`](cerulion_core::wire::WIRE_HEADER_VERSION)
+    /// of the frames this daemon re-injects. Absent (a daemon older than
+    /// protocol 8) decodes as 1.
+    #[serde(default = "hello_wire_header_absent")]
+    pub wire_header: u16,
+}
+
+/// The wire header version a banner without the field states: 1.
+fn hello_wire_header_absent() -> u16 {
+    1
 }
 
 impl Hello {
-    /// The banner for THIS daemon's protocol version.
+    /// The banner for THIS daemon's protocol and wire header versions.
     pub fn new() -> Self {
         Self {
             hello: HELLO_MARKER.to_string(),
             protocol: PROTOCOL_VERSION,
+            wire_header: cerulion_core::wire::WIRE_HEADER_VERSION,
         }
     }
 
@@ -545,6 +566,13 @@ pub struct StatusResponse {
     /// same reason, as the `DiscoveryState` marker.
     #[serde(default)]
     pub connect_endpoints: Option<Vec<String>>,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent (`None`, UNKNOWN, never open) on older daemons and on egress
+    /// planes without a network manager. A run that requires paired access
+    /// reads it BEFORE it registers egress, because a registration's topics
+    /// and schemas stay served on the shared gateway after release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::RegisterEgress`].
@@ -558,6 +586,10 @@ pub struct EgressResponse {
     /// Whether THIS registration BOOTED the shared embedded egress gateway (the
     /// first egress plan on this daemon); `false` when it joined a running one.
     pub gateway_started: bool,
+    /// The shared gateway's LAN access posture, when the daemon can report it.
+    /// Absent on older daemons and on egress planes without a network manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_access: Option<LanAccess>,
 }
 
 /// The response to [`Request::ReleaseEgress`].
@@ -580,8 +612,8 @@ pub struct EgressReleaseResponse {
 /// # Why the protocol has to carry this
 ///
 /// netd's session is LAZY: the FIRST query on a freshly-spawned daemon opens it,
-/// and a just-opened scouting session has not yet completed the multicast scout →
-/// TCP connect → session establishment → liveliness/queryable exchange that makes a
+/// and a just-opened session has not yet completed the TCP connect to its
+/// folded peers → session establishment → liveliness/queryable exchange that makes a
 /// robot's announce tokens (and its `catalog` queryable) visible. Before the discovery marker the
 /// resulting empty gather was indistinguishable on the wire from "the LAN was
 /// reached and nobody has this topic", so the desk rendered a TERMINAL "not found"
@@ -1085,6 +1117,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["hello"], "cerulion-netd");
         assert_eq!(v["protocol"], PROTOCOL_VERSION);
+        assert_eq!(v["wire_header"], cerulion_core::wire::WIRE_HEADER_VERSION);
+    }
+
+    /// Protocol 8 added the banner's `wire_header`; a banner from an older
+    /// daemon (literal JSON, no such key) decodes as wire header version 1.
+    #[test]
+    fn a_banner_without_wire_header_decodes_as_version_1() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        let old: Hello =
+            serde_json::from_str(r#"{"hello":"cerulion-netd","protocol":7}"#).expect("decodes");
+        assert_eq!(old.wire_header, 1);
+        assert_eq!(old.protocol, 7);
+        let new: Hello =
+            serde_json::from_str(r#"{"hello":"cerulion-netd","protocol":8,"wire_header":2}"#)
+                .expect("decodes");
+        assert_eq!(new.wire_header, 2);
     }
 
     #[test]
@@ -1276,6 +1324,7 @@ mod tests {
         let cat = Response::CatalogQuery(CatalogQueryResponse {
             id: 5,
             catalogs: vec![CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: 1,
                 robot: "ubuntu".to_string(),
                 entries: vec![CatalogEntry {
@@ -1385,6 +1434,7 @@ mod tests {
         let resp = Response::CatalogQuery(CatalogQueryResponse {
             id: 11,
             catalogs: vec![CatalogReply {
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 version: 1,
                 robot: "go2".to_string(),
                 entries: vec![
@@ -1585,11 +1635,13 @@ mod tests {
             id: 1,
             registered_topics: 3,
             gateway_started: true,
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&e.to_json_line()).unwrap();
         assert_eq!(v["id"], 1);
         assert_eq!(v["registered_topics"], 3);
         assert_eq!(v["gateway_started"], true);
+        assert_eq!(v["lan_access"], "paired");
         assert!(v.get("Egress").is_none(), "flat untagged, no wrapper key");
         // The concrete struct round-trips (the consumer half).
         assert_eq!(
@@ -1598,8 +1650,29 @@ mod tests {
                 id: 1,
                 registered_topics: 3,
                 gateway_started: true,
+                lan_access: Some(LanAccess::Paired),
             }
         );
+        let legacy: EgressResponse =
+            serde_json::from_str(r#"{"id":1,"registered_topics":3,"gateway_started":true}"#)
+                .expect("legacy egress response");
+        assert_eq!(
+            legacy,
+            EgressResponse {
+                id: 1,
+                registered_topics: 3,
+                gateway_started: true,
+                lan_access: None,
+            }
+        );
+        let without_posture = EgressResponse {
+            id: 2,
+            registered_topics: 0,
+            gateway_started: false,
+            lan_access: None,
+        };
+        let v = serde_json::to_value(without_posture).expect("serialize absent posture");
+        assert!(v.get("lan_access").is_none());
 
         let r = Response::EgressRelease(EgressReleaseResponse {
             id: 2,
@@ -1714,8 +1787,10 @@ mod tests {
             active_connections: 3,
             idle: false,
             connect_endpoints: Some(vec!["tcp/10.0.0.5:7683".to_string()]),
+            lan_access: Some(LanAccess::Paired),
         });
         let v: serde_json::Value = serde_json::from_str(&st.to_json_line()).unwrap();
+        assert_eq!(v["lan_access"], "paired");
         assert_eq!(v["active_connections"], 3);
         assert_eq!(v["idle"], false);
         assert_eq!(v["demands"][0]["refcount"], 2);
@@ -1737,6 +1812,10 @@ mod tests {
         assert_eq!(
             decoded.connect_endpoints, None,
             "an absent field is UNKNOWN, never an empty (and therefore positive) claim"
+        );
+        assert_eq!(
+            decoded.lan_access, None,
+            "an absent LAN posture is UNKNOWN, never open"
         );
         // The anti-tautology half: a daemon that DOES report an empty set is
         // distinguishable from the one above.
@@ -1811,10 +1890,8 @@ mod tests {
             "the runs verb gates on the version that introduced it"
         );
         assert_eq!(RUNS_MIN_DAEMON_VERSION, 7);
-        assert_eq!(
-            PROTOCOL_VERSION, 7,
-            "the banner bump is what makes the per-verb gate reachable"
-        );
+        // The banner bump is what makes the per-verb gate reachable.
+        const { assert!(PROTOCOL_VERSION >= RUNS_MIN_DAEMON_VERSION) };
 
         // The SCOPED half: a bump that raised every verb's floor would lock a v6
         // consumer out of the vocabulary it has always been able to use.

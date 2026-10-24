@@ -128,6 +128,7 @@ fn fusion_parts(
         identity: format!("capture_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
+            params: Default::default(),
             fuse: None,
             ros2: None,
             id: "fuse".to_string(),
@@ -191,10 +192,10 @@ impl Feed {
         let mgr = runtime.test_transport().expect("test transport parked");
         Self {
             cam: mgr
-                .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(128), 0)
+                .create_publisher(TOPIC_CAM, MaxSliceLen::const_new(256), 0)
                 .expect("publisher on /cap/cam"),
             lidar: mgr
-                .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(128), 0)
+                .create_publisher(TOPIC_LIDAR, MaxSliceLen::const_new(256), 0)
                 .expect("publisher on /cap/lidar"),
         }
     }

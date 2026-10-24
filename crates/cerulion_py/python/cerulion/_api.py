@@ -441,6 +441,11 @@ class Frame:
         return self._native.timestamp_ns
 
     @property
+    def step_tag(self):
+        """The wire header's step tag as an int (0 means untagged)."""
+        return self._native.step_tag
+
+    @property
     def total_size(self):
         return self._native.total_size
 

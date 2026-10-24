@@ -31,9 +31,39 @@
 //! Pure function of the schema set — same input, same layout, every
 //! run, both sides of the FFI boundary (Principle #7).
 
+use super::nested_index::NestedIndex;
 use super::resolve::resolve_fixed_nested;
 use super::schema::{FieldType, MessageSchema};
 use std::collections::BTreeMap;
+
+/// Why a schema's wire layout could not be computed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    /// No schema in the set has this qualified name.
+    #[error("unknown schema '{0}'")]
+    UnknownSchema(String),
+    /// A field marked as an inlined fixed nested message names a target that
+    /// does not bind in the set (a schema set whose stamps do not match
+    /// its definitions).
+    #[error("schema '{schema}': field '{field}' references '{target}', which does not resolve to one schema in the set")]
+    UnresolvedNested {
+        /// Qualified name of the schema holding the reference.
+        schema: String,
+        /// The referencing field.
+        field: String,
+        /// The reference as written (`pkg/Name` or a bare name).
+        target: String,
+    },
+    /// The schema's fixed section (fixed nested targets inlined) does not
+    /// fit in `usize`, so it has no layout.
+    #[error("schema '{schema}': fixed section (after fixed-nested inlining) overflows usize at field '{field}'")]
+    FixedSectionOverflow {
+        /// Qualified name of the schema whose fixed section overflows.
+        schema: String,
+        /// The field at which the arithmetic overflowed.
+        field: String,
+    },
+}
 
 /// Layout of one fixed-section field.
 ///
@@ -56,7 +86,7 @@ pub struct FieldLayout {
 /// Complete wire layout for one schema:
 ///
 /// ```text
-/// [WireHeader (32 B)]
+/// [WireHeader (40 B)]
 /// [fixed section  (fixed_size bytes, fields at fixed_fields[i].offset)]
 /// [offset table   (8 × variable_fields.len() bytes)]
 /// [variable payload …]
@@ -127,7 +157,7 @@ impl WireLayout {
     }
 
     /// True when no frame of this layout fits the wire: its prefix — the
-    /// 32-byte header, the fixed section and the offset table, i.e.
+    /// 40-byte header, the fixed section and the offset table, i.e.
     /// `WireHeader::SIZE + data_floor()` — exceeds the `u32` `total_size`
     /// ([`crate::wire::frame_prefix_exceeds_wire`], read off this layout's
     /// own fixed size and offset-table length so the two cannot be paired
@@ -166,8 +196,12 @@ impl WireLayout {
 /// Computes [`WireLayout`]s for a resolved schema set.
 pub struct LayoutResolver {
     schemas: Vec<MessageSchema>,
-    /// Qualified name → index into `schemas`.
+    /// Qualified name → index into `schemas` (the later definition of a
+    /// qualified name wins this text lookup).
     by_qualified: BTreeMap<String, usize>,
+    /// Identity `(package, name)` registry nested references bind through,
+    /// the same one [`resolve_fixed_nested`] binds through.
+    index: NestedIndex,
     /// Memoized per-schema `(size, align)` of the fixed REPRESENTATION
     /// (for fixed schemas: the whole struct; only valid when the schema
     /// is recursively fixed).
@@ -192,10 +226,12 @@ impl LayoutResolver {
         for (idx, schema) in schemas.iter().enumerate() {
             by_qualified.insert(schema.qualified_name(), idx);
         }
+        let index = NestedIndex::from_schemas(&schemas);
         (
             Self {
                 schemas,
                 by_qualified,
+                index,
                 size_align_memo: BTreeMap::new(),
             },
             warnings,
@@ -203,13 +239,43 @@ impl LayoutResolver {
     }
 
     /// Compute the wire layout for the schema with this qualified name.
-    /// Returns `None` for unknown schemas.
+    /// Returns `None` for an unknown schema and for one whose layout cannot
+    /// be computed (logged; [`Self::try_layout_of`] names the reason).
     pub fn layout_of(&mut self, qualified_name: &str) -> Option<WireLayout> {
-        let idx = *self.by_qualified.get(qualified_name)?;
-        Some(self.layout_of_idx(idx))
+        match self.try_layout_of(qualified_name) {
+            Ok(layout) => Some(layout),
+            Err(LayoutError::UnknownSchema(_)) => None,
+            Err(error) => {
+                tracing::warn!(schema = %qualified_name, error = %error, "schema has no wire layout");
+                None
+            }
+        }
     }
 
-    fn layout_of_idx(&mut self, idx: usize) -> WireLayout {
+    /// Compute the wire layout for the schema with this qualified name, or
+    /// say why it has none.
+    pub fn try_layout_of(&mut self, qualified_name: &str) -> Result<WireLayout, LayoutError> {
+        let idx = *self
+            .by_qualified
+            .get(qualified_name)
+            .ok_or_else(|| LayoutError::UnknownSchema(qualified_name.to_string()))?;
+        self.layout_of_idx(idx)
+    }
+
+    /// The schemas this resolver lays out, in input order (after its own
+    /// resolution pass): index `i` here is index `i` of
+    /// [`Self::layout_at`].
+    pub(crate) fn schemas(&self) -> &[MessageSchema] {
+        &self.schemas
+    }
+
+    /// The wire layout of the `idx`-th schema, by identity rather than by
+    /// qualified text (two schemas can share the text, see [`NestedIndex`]).
+    pub(crate) fn layout_at(&mut self, idx: usize) -> Result<WireLayout, LayoutError> {
+        self.layout_of_idx(idx)
+    }
+
+    fn layout_of_idx(&mut self, idx: usize) -> Result<WireLayout, LayoutError> {
         let schema = self.schemas[idx].clone();
         let mut cursor = 0usize;
         let mut struct_align = 1usize;
@@ -224,9 +290,13 @@ impl LayoutResolver {
                 });
                 continue;
             }
-            let (size, align) = self.size_align_of(&field.field_type, idx);
-            let offset = align_up(cursor, align);
-            cursor = offset + size;
+            let (size, align) = self.size_align_of(&field.field_type, &field.name, idx)?;
+            let overflow = || LayoutError::FixedSectionOverflow {
+                schema: schema.qualified_name(),
+                field: field.name.clone(),
+            };
+            let offset = checked_align_up(cursor, align).ok_or_else(overflow)?;
+            cursor = offset.checked_add(size).ok_or_else(overflow)?;
             struct_align = struct_align.max(align);
             fixed_fields.push(FieldLayout {
                 name: field.name.clone(),
@@ -241,7 +311,12 @@ impl LayoutResolver {
             // Matches the generated `_marker: [u8; 0]` ZST FixedSection.
             0
         } else {
-            align_up(cursor, struct_align)
+            checked_align_up(cursor, struct_align).ok_or_else(|| {
+                LayoutError::FixedSectionOverflow {
+                    schema: schema.qualified_name(),
+                    field: "<trailing padding>".to_string(),
+                }
+            })?
         };
         let fixed_align = if fixed_fields.is_empty() {
             1
@@ -249,24 +324,30 @@ impl LayoutResolver {
             struct_align
         };
 
-        WireLayout {
+        Ok(WireLayout {
             qualified_name: schema.qualified_name(),
             schema_hash: schema.schema_hash(),
             fixed_size,
             fixed_align,
             fixed_fields,
             variable_fields,
-        }
+        })
     }
 
     /// `(size, align)` of one FIXED field type, mirroring the SHM storage
     /// types the generator emits.
     ///
     /// `parent_idx` provides the package context for resolving
-    /// unqualified nested references (same lookup the resolver used —
-    /// by construction a `fixed: Some(_)` reference resolves).
-    fn size_align_of(&mut self, ft: &FieldType, parent_idx: usize) -> (usize, usize) {
-        match ft {
+    /// unqualified nested references (the resolver's own binding, so a
+    /// `fixed: Some(_)` reference the resolver stamped binds the same
+    /// target here). `field` names the field for the error.
+    fn size_align_of(
+        &mut self,
+        ft: &FieldType,
+        field: &str,
+        parent_idx: usize,
+    ) -> Result<(usize, usize), LayoutError> {
+        Ok(match ft {
             FieldType::Bool | FieldType::I8 | FieldType::U8 => (1, 1),
             FieldType::I16 | FieldType::U16 => (2, 2),
             FieldType::I32 | FieldType::U32 | FieldType::F32 => (4, 4),
@@ -276,17 +357,19 @@ impl LayoutResolver {
                 element_type,
                 length,
             } => {
-                let (elem_size, elem_align) = self.size_align_of(element_type, parent_idx);
+                let (elem_size, elem_align) =
+                    self.size_align_of(element_type, field, parent_idx)?;
                 // Element size includes the element's trailing padding, so
                 // N × size matches Rust's array stride exactly. Checked:
-                // a pathological length must fail loudly, not wrap into a
-                // silently wrong layout.
-                let size = elem_size.checked_mul(*length).unwrap_or_else(|| {
-                    panic!(
-                        "fixed-array size overflow ({elem_size} × {length}) in schema '{}'",
-                        self.schemas[parent_idx].qualified_name()
-                    )
-                });
+                // a pathological length is a typed error, never a wrap into
+                // a silently wrong layout and never a panic (a shadowed or
+                // untrusted schema reaches here unvetted).
+                let size = elem_size.checked_mul(*length).ok_or_else(|| {
+                    LayoutError::FixedSectionOverflow {
+                        schema: self.schemas[parent_idx].qualified_name(),
+                        field: field.to_string(),
+                    }
+                })?;
                 (size, elem_align)
             }
             FieldType::Nested {
@@ -299,116 +382,91 @@ impl LayoutResolver {
                     "size_align_of called on an unresolved nested reference — \
                      fixed-section emission gates on resolution"
                 );
-                let target_idx = self.resolve_nested_idx(schema_name, package, parent_idx);
-                self.fixed_struct_size_align(target_idx)
+                let target_idx =
+                    self.resolve_nested_idx(schema_name, package, field, parent_idx)?;
+                self.fixed_struct_size_align(target_idx)?
             }
             // Variable types never reach here: layout_of_idx routes them
             // to the offset table before calling size_align_of.
             FieldType::String | FieldType::Bytes | FieldType::DynamicArray { .. } => {
                 unreachable!("variable field types have no fixed-section layout")
             }
-        }
+        })
     }
 
     /// `(size, align)` of a recursively-fixed schema's full `#[repr(C)]`
     /// struct, INCLUDING trailing padding — memoized.
-    fn fixed_struct_size_align(&mut self, idx: usize) -> (usize, usize) {
+    fn fixed_struct_size_align(&mut self, idx: usize) -> Result<(usize, usize), LayoutError> {
         if let Some(&cached) = self.size_align_memo.get(&idx) {
-            return cached;
+            return Ok(cached);
         }
-        let layout = self.layout_of_idx(idx);
+        let layout = self.layout_of_idx(idx)?;
         let result = (layout.fixed_size, layout.fixed_align);
         self.size_align_memo.insert(idx, result);
-        result
+        Ok(result)
     }
 
-    /// Resolve a nested reference to its schema index using the same
-    /// precedence as `resolve_fixed_nested`'s lookup: qualified →
-    /// same-package → bare `Header` → unambiguous bare.
+    /// Bind a fixed nested reference to its schema index. A `fixed: Some(_)`
+    /// reference is minted (or CLEARED, on a lookup miss or a variable
+    /// target) by the `resolve_fixed_nested` run inside
+    /// [`LayoutResolver::new`], which binds through this same
+    /// [`NestedIndex`] over this same owned set, so a miss here means the
+    /// set's stamps disagree with its definitions: a typed error, never a
+    /// panic.
     fn resolve_nested_idx(
         &self,
         schema_name: &str,
         package: &Option<String>,
+        field: &str,
         parent_idx: usize,
-    ) -> usize {
-        // A `fixed: Some(_)` reference is minted (or CLEARED: the
-        // rewriter resets stale flags on lookup failure / variable
-        // targets) by the `resolve_fixed_nested` run inside
-        // `LayoutResolver::new`, using this same lookup precedence over
-        // this same owned schema set. A miss would require the set to
-        // change between resolution and layout, which ownership prevents.
-        self.lookup_nested_idx(schema_name, package, parent_idx)
-            .unwrap_or_else(|| {
-                unreachable!("resolved nested reference '{schema_name}' not found in schema set")
+    ) -> Result<usize, LayoutError> {
+        self.nested_target_idx(schema_name, package, parent_idx)
+            .ok_or_else(|| LayoutError::UnresolvedNested {
+                schema: self.schemas[parent_idx].qualified_name(),
+                field: field.to_string(),
+                target: match package {
+                    Some(pkg) => format!("{pkg}/{schema_name}"),
+                    None => schema_name.to_string(),
+                },
             })
     }
 
-    /// The qualified name a nested reference in `parent` resolves to, by the
-    /// same precedence the layouts use (see [`Self::resolve_nested_idx`]).
-    /// `None` when `parent` is unknown or the reference resolves to nothing.
-    ///
-    /// For a reader that walks a nested path by name (the capture-time
-    /// `header.stamp` locator), so the type it reads is the type the writer
-    /// embedded.
-    pub(crate) fn nested_target_name(
-        &self,
-        schema_name: &str,
-        package: &Option<String>,
-        parent: &str,
-    ) -> Option<String> {
-        let parent_idx = *self.by_qualified.get(parent)?;
-        let idx = self.lookup_nested_idx(schema_name, package, parent_idx)?;
-        Some(self.schemas[idx].qualified_name())
+    /// The index of the schema the qualified-name text `qualified_name`
+    /// names (the later definition of the text wins, as in
+    /// [`Self::layout_of`]). The entry point for a reader that then walks
+    /// nested references by identity with [`Self::nested_target_idx`].
+    pub(crate) fn index_of(&self, qualified_name: &str) -> Option<usize> {
+        self.by_qualified.get(qualified_name).copied()
     }
 
-    /// The fallible half of [`Self::resolve_nested_idx`]: qualified →
-    /// same-package → bare `Header` → unambiguous bare.
-    fn lookup_nested_idx(
+    /// The index of the schema a nested reference in the `parent_idx`-th
+    /// schema binds to, by the binding the layouts use (see
+    /// [`NestedIndex`]). `None` when the reference resolves to nothing.
+    ///
+    /// For a reader that walks a nested path by name (the capture-time
+    /// `header.stamp` locator): it keeps the index and lays it out with
+    /// [`Self::layout_at`], never going back through qualified text, so the
+    /// type it reads is the type the writer embedded even when a second
+    /// schema shares that text.
+    pub(crate) fn nested_target_idx(
         &self,
         schema_name: &str,
         package: &Option<String>,
         parent_idx: usize,
     ) -> Option<usize> {
-        if let Some(pkg) = package {
-            if let Some(&idx) = self.by_qualified.get(&format!("{pkg}/{schema_name}")) {
-                return Some(idx);
-            }
-        } else {
-            // Same package as the parent.
-            if let Some(parent_pkg) = &self.schemas[parent_idx].package {
-                if let Some(&idx) = self
-                    .by_qualified
-                    .get(&format!("{parent_pkg}/{schema_name}"))
-                {
-                    return Some(idx);
-                }
-            } else if let Some(&idx) = self.by_qualified.get(schema_name) {
-                // Package-less parent: bare key.
-                return Some(idx);
-            }
-            // Bare Header → std_msgs (rosidl legacy special case).
-            if schema_name == "Header" {
-                if let Some(&idx) = self.by_qualified.get("std_msgs/Header") {
-                    return Some(idx);
-                }
-            }
-            // Unambiguous bare fallback.
-            let mut matches = self
-                .by_qualified
-                .iter()
-                .filter(|(k, _)| k.rsplit('/').next() == Some(schema_name));
-            if let (Some((_, &idx)), None) = (matches.next(), matches.next()) {
-                return Some(idx);
-            }
-        }
-        None
+        let parent_package = self.schemas[parent_idx].package.as_deref();
+        self.index
+            .bind(package.as_deref(), schema_name, parent_package)
+            .ok()
+            .map(|bound| bound.idx)
     }
 }
 
+/// Round `value` up to the power-of-two `align`, `None` on overflow.
 #[inline]
-fn align_up(value: usize, align: usize) -> usize {
+fn checked_align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-    (value + align - 1) & !(align - 1)
+    Some(value.checked_add(align - 1)? & !(align - 1))
 }
 
 #[cfg(test)]
@@ -664,5 +722,50 @@ mod tests {
     fn unknown_schema_returns_none() {
         let (mut resolver, _) = LayoutResolver::new(schema_set());
         assert!(resolver.layout_of("nope/Nope").is_none());
+        assert_eq!(
+            resolver.try_layout_of("nope/Nope"),
+            Err(LayoutError::UnknownSchema("nope/Nope".to_string()))
+        );
+    }
+
+    /// A schema set whose fixed stamp names a target that does not bind
+    /// (here injected after resolution, the only way the owned set can
+    /// disagree with its stamps) is a typed error and no layout, never a
+    /// panic.
+    #[test]
+    fn an_unbindable_fixed_stamp_is_a_typed_error_not_a_panic() {
+        let (mut resolver, _) = LayoutResolver::new(schema_set());
+        let pose = resolver
+            .schemas
+            .iter_mut()
+            .find(|s| s.name == "Pose")
+            .expect("pose");
+        let FieldType::Nested { fixed, .. } = &pose.fields[0].field_type else {
+            panic!("position is nested");
+        };
+        let stamp = *fixed;
+        assert!(stamp.is_some(), "Point was stamped fixed");
+        pose.fields[0].field_type = FieldType::Nested {
+            schema_name: "Ghost".into(),
+            package: Some("nope".into()),
+            fixed: stamp,
+        };
+        assert_eq!(
+            resolver.try_layout_of("geometry_msgs/Pose"),
+            Err(LayoutError::UnresolvedNested {
+                schema: "geometry_msgs/Pose".to_string(),
+                field: "position".to_string(),
+                target: "nope/Ghost".to_string(),
+            })
+        );
+        assert!(resolver.layout_of("geometry_msgs/Pose").is_none());
+        // The rest of the set still lays out.
+        assert_eq!(
+            resolver
+                .layout_of("geometry_msgs/Point")
+                .expect("point")
+                .fixed_size,
+            24
+        );
     }
 }

@@ -999,9 +999,12 @@ impl CppBridgedMessage {
                     ..
                 } => {
                     // Sized by encoding into a scratch buffer — ONE
-                    // codec, no size-only twin (see the C bridge).
+                    // codec, no size-only twin (see the C bridge). The
+                    // sizing mark keeps a nested Buffer from being copied
+                    // to host memory just to be measured.
                     let member = self.member(*member_index);
                     let mut buf = Vec::new();
+                    let _sizing = crate::rosidl_buffer::SizingPass::open();
                     encode_complex_cpp(
                         &self.nested_layouts,
                         member,
@@ -1125,6 +1128,13 @@ impl CppBridgedMessage {
                     } else if count == 0 {
                         cursor_append_var(&mut cur, table_base, *var_idx, &[], *elem_size)
                             .map_err(|d| self.encode_err(d))?;
+                    } else if member_is_buffer(member) {
+                        // A `rosidl::Buffer<uint8_t>`: read through the shim,
+                        // which copies a non-CPU backend to host memory.
+                        let bytes = buffer_bytes_of_size(field, count, *elem_size)
+                            .map_err(|d| self.encode_err(d))?;
+                        cursor_append_var(&mut cur, table_base, *var_idx, bytes.as_slice(), 1)
+                            .map_err(|d| self.encode_err(d))?;
                     } else {
                         // Contiguous by the C++ standard for vector<T≠bool>
                         // and std::array; element 0 via the typesupport's
@@ -1132,18 +1142,16 @@ impl CppBridgedMessage {
                         let get = member.get_const_function.ok_or_else(|| {
                             self.encode_err("sequence missing get_const_function")
                         })?;
-                        // Through the noexcept wrapper: a rosidl Buffer on a
-                        // non-CPU backend THROWS from this accessor, and a
-                        // throw across the accessor pointer would be a
-                        // foreign unwind; a nonzero status refuses the frame.
+                        // Through the noexcept wrapper: a throw across the
+                        // accessor pointer would be a foreign unwind, so a
+                        // nonzero status refuses the frame. A rosidl Buffer
+                        // never reaches this accessor (the arm above).
                         let mut elem: *const c_void = std::ptr::null();
                         if ffi::introspection_cpp::rmw_cerulion_member_get_const(
                             get, field, 0, &mut elem,
                         ) != 0
                         {
-                            return Err(self.encode_err(
-                                "sequence accessor threw (a rosidl Buffer on a non-CPU backend)",
-                            ));
+                            return Err(self.encode_err("sequence accessor threw"));
                         }
                         let base = elem as *const u8;
                         if base.is_null() {
@@ -1183,6 +1191,7 @@ impl CppBridgedMessage {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut head = [0u8; WireHeader::SIZE];
         header.write_to_buf(&mut head);
@@ -1852,7 +1861,8 @@ unsafe fn member_name_cpp(member: &CppMessageMember) -> String {
 /// the three-pointer triplet ([`vector_triplet_layout_verified`]). A
 /// BOUNDED sequence is additionally a different C++ type here (rosidl's
 /// `BoundedVector`), which is reason enough on its own; and on Lyrical and
-/// Rolling a `rosidl::Buffer` member is refused first (no triplet exists).
+/// Rolling a `rosidl::Buffer` member is never forged (no triplet exists):
+/// it is read and filled through the shim instead.
 fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool) -> bool {
     // Lyrical and Rolling: a `rosidl::Buffer` member (`is_rosidl_buffer_`)
     // carries no in-struct triplet at all (its storage sits in a
@@ -1871,6 +1881,40 @@ fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool)
         && member.type_id_ != ros_type::BOOLEAN
 }
 
+/// Is this member a `rosidl::Buffer<uint8_t>` (the typesupport's
+/// `is_rosidl_buffer_`, Lyrical and Rolling)? Never before Lyrical.
+fn member_is_buffer(member: &CppMessageMember) -> bool {
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    {
+        member.is_rosidl_buffer_
+    }
+    #[cfg(not(cerulion_has_is_rosidl_buffer))]
+    {
+        let _ = member;
+        false
+    }
+}
+
+/// The bytes of the Buffer member at `field`, which the size pass counted
+/// as `count` elements of `elem_size` bytes. A non-CPU backend is copied to
+/// host memory (and counted, see [`crate::rosidl_buffer`]). Err when the
+/// backend throws, or when the bytes do not match the size the frame was
+/// planned with.
+///
+/// # Safety
+/// `field` is a live `rosidl::Buffer<uint8_t>` member.
+unsafe fn buffer_bytes_of_size(
+    field: *const c_void,
+    count: usize,
+    elem_size: usize,
+) -> Result<crate::rosidl_buffer::BufferBytes, &'static str> {
+    let bytes = crate::rosidl_buffer::read_u8(field)?;
+    if Some(bytes.as_slice().len()) != count.checked_mul(elem_size) {
+        return Err("the rosidl Buffer's length changed between the size and copy passes");
+    }
+    Ok(bytes)
+}
+
 // =====================================================================
 // Sequence access through introspection function pointers
 // =====================================================================
@@ -1878,6 +1922,11 @@ fn is_forgeable_sequence_cpp(member: &CppMessageMember, triplet_layout_ok: bool)
 unsafe fn seq_size(member: &CppMessageMember, field: *const c_void) -> Result<usize, &'static str> {
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         return Ok(member.array_size_);
+    }
+    // A Buffer's generated `size_function` is the backend's virtual
+    // `size()`, which may throw: read it through the shim's catcher.
+    if member_is_buffer(member) {
+        return crate::rosidl_buffer::len_u8(field);
     }
     let size_fn = member
         .size_function
@@ -1911,6 +1960,14 @@ unsafe fn write_prim_seq_cpp(
 ) -> bool {
     if is_bool && member_assign(member).is_none() {
         return false;
+    }
+    // A `rosidl::Buffer<uint8_t>` (Lyrical and Rolling) is filled through
+    // the shim, which leaves a CPU Buffer holding `bytes` whatever backend
+    // the caller's message held before (its generated resize and get
+    // accessors throw on a non-CPU backend). Its elements are bytes, so
+    // `count == bytes.len()`.
+    if member_is_buffer(member) {
+        return count == bytes.len() && crate::rosidl_buffer::assign_u8(field, bytes);
     }
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         if count != member.array_size_ {
@@ -2057,11 +2114,12 @@ unsafe fn element_ptr(
         .get_const_function
         .ok_or("sequence missing get_const_function")?;
     // Every introspection accessor is called through its noexcept catcher:
-    // a throwing accessor (a rosidl Buffer on a non-CPU backend) is a
-    // refused frame, never a foreign unwind.
+    // a throwing accessor is a refused frame, never a foreign unwind. A
+    // rosidl Buffer member never reaches here (its callers read it through
+    // `buffer_bytes_of_size`).
     let mut p: *const c_void = std::ptr::null();
     if ffi::introspection_cpp::rmw_cerulion_member_get_const(get, field, i, &mut p) != 0 {
-        return Err("sequence accessor threw (a rosidl Buffer on a non-CPU backend)");
+        return Err("sequence accessor threw");
     }
     if p.is_null() {
         return Err("sequence element pointer is null");
@@ -2182,6 +2240,13 @@ unsafe fn encode_message_payload_cpp(
                         return Err("sequence accessor threw");
                     }
                     *b = v as u8;
+                }
+            } else if count > 0 && member_is_buffer(member) {
+                if crate::rosidl_buffer::sizing() {
+                    // Measured, not shipped: the Buffer's own length in zeros.
+                    buf.resize(count * elem, 0);
+                } else {
+                    buf.extend_from_slice(buffer_bytes_of_size(field_ptr, count, elem)?.as_slice());
                 }
             } else if count > 0 {
                 let base = element_ptr(member, field_ptr, 0)? as *const u8;
@@ -2548,6 +2613,19 @@ impl CppBridgedMessage {
                         }
                     } else if count == 0 {
                         items.push(SealItem::Empty { forgeable: *forge });
+                    } else if member_is_buffer(member) {
+                        // A `rosidl::Buffer<uint8_t>` is never forgeable: its
+                        // bytes (a host copy for a non-CPU backend) go into
+                        // the owned arena before the commit runs `fini`.
+                        let bytes = buffer_bytes_of_size(field, count, *elem_size)
+                            .map_err(|d| SealRefusal::Encode(self.encode_err(d)))?;
+                        let start = owned.len();
+                        owned.extend_from_slice(bytes.as_slice());
+                        items.push(SealItem::CopyOwned {
+                            start,
+                            len: count,
+                            align: 1,
+                        });
                     } else {
                         let base = element_ptr(member, field, 0)
                             .map_err(|d| SealRefusal::Encode(self.encode_err(d)))?
@@ -2764,20 +2842,62 @@ mod cpp_package_tests {
         }
     }
 
+    #[cfg(cerulion_has_is_rosidl_buffer)]
+    extern "C" {
+        fn rmw_cerulion_fixture_buffer_u8_construct(
+            at: *mut std::os::raw::c_void,
+            data: *const u8,
+            len: usize,
+            backend: *const std::os::raw::c_char,
+            throw_on_copy: std::os::raw::c_int,
+        );
+        fn rmw_cerulion_fixture_buffer_u8_destruct(b: *mut std::os::raw::c_void);
+    }
+
     /// Lyrical and Rolling: a `uint8[]` member flagged as a rosidl Buffer is
     /// never forged and never handed to the `std::vector` shim, while the
     /// same member without the flag (a real vector) is both. The flag is
-    /// the ONLY difference between the two fixtures.
+    /// the ONLY difference between the two fixtures. The flagged member is
+    /// always read through the Buffer shim instead, which downgrades a
+    /// non-CPU Buffer to a host copy rather than refusing the frame.
     #[cfg(cerulion_has_is_rosidl_buffer)]
     #[test]
-    fn a_rosidl_buffer_member_is_never_forged_nor_treated_as_a_u8_vector() {
+    fn a_rosidl_buffer_member_is_never_forged_and_always_downgraded() {
         use crate::ffi::introspection_cpp::is_unbounded_u8_vector;
         let buffer = u8_sequence_member(true);
         assert!(!super::is_forgeable_sequence_cpp(&buffer, true));
         assert!(!is_unbounded_u8_vector(&buffer));
+        assert!(super::member_is_buffer(&buffer));
         let vector = u8_sequence_member(false);
         assert!(super::is_forgeable_sequence_cpp(&vector, true));
         assert!(is_unbounded_u8_vector(&vector));
+        assert!(!super::member_is_buffer(&vector));
+
+        #[repr(C, align(8))]
+        struct Slot([u8; 16]);
+        let mut slot = Slot([0; 16]);
+        let at = slot.0.as_mut_ptr() as *mut std::os::raw::c_void;
+        let bytes = [3u8, 1, 4, 1, 5];
+        unsafe {
+            rmw_cerulion_fixture_buffer_u8_construct(
+                at,
+                bytes.as_ptr(),
+                bytes.len(),
+                c"fixture_device".as_ptr(),
+                0,
+            );
+            let copy = super::buffer_bytes_of_size(at, bytes.len(), 1).expect("downgraded");
+            assert!(
+                copy.is_host_copy(),
+                "a non-CPU Buffer is read as a host copy"
+            );
+            assert_eq!(copy.as_slice(), &bytes);
+            assert!(
+                super::buffer_bytes_of_size(at, bytes.len() + 1, 1).is_err(),
+                "a length that disagrees with the size pass is refused"
+            );
+            rmw_cerulion_fixture_buffer_u8_destruct(at);
+        }
     }
 
     /// A bit-packed `std::vector<bool>` stand-in. The bridge reaches a

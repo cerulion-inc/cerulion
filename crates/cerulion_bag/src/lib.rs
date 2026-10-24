@@ -56,6 +56,8 @@ pub mod schema;
 pub mod writer;
 
 #[cfg(any(test, feature = "test-helpers"))]
+pub mod legacy_fixture;
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_sink;
 
 pub use catalog::{
@@ -73,12 +75,13 @@ pub use provisioning::{
 pub use reader::{
     AdviseCall, AdviseCursor, BagAttachment, BagChannel, BagCompleteness, BagMessage, BagReader,
     FrameSpan, TraceRecordIter, UserFrameWalk, WalkPosition, ADVISE_BEHIND_BATCH_BYTES,
-    ADVISE_MAX_LAG_BYTES,
+    ADVISE_MAX_LAG_BYTES, LEGACY_UPGRADE_CAP_BYTES,
 };
 pub use schema::{
-    SchemaDescriptor, DESCRIPTOR_LEN, DESCRIPTOR_VERSION, FRAME_PRODUCERS_SCHEMA,
-    FRAME_PRODUCERS_TOPIC, NONDETERMINISM_SCHEMA, NONDETERMINISM_TOPIC, RESERVED_PREFIX,
-    SCHEDULER_TRACE_SCHEMA, SCHEDULER_TRACE_TOPIC, SCHEMA_ENCODING, STATE_SCHEMA, STATE_TOPIC,
+    SchemaDescriptor, DESCRIPTOR_LEN, DESCRIPTOR_V1_LEN, DESCRIPTOR_VERSION,
+    FRAME_PRODUCERS_SCHEMA, FRAME_PRODUCERS_TOPIC, NONDETERMINISM_SCHEMA, NONDETERMINISM_TOPIC,
+    RESERVED_PREFIX, SCHEDULER_TRACE_SCHEMA, SCHEDULER_TRACE_TOPIC, SCHEMA_ENCODING, STATE_SCHEMA,
+    STATE_TOPIC, V1_DESCRIPTOR_WIRE_HEADER_VERSION,
 };
 pub use writer::{
     BagWriter, BagWriterConfig, ChunkScope, FileSink, TopicSchema, WriteTarget, WritevOutcome,

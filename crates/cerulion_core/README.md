@@ -41,7 +41,7 @@ walk through the whole loop.
 
 ## What is inside
 
-- **Wire format**: a 32-byte message header with schema-hash validation.
+- **Wire format**: a 40-byte message header with schema-hash validation.
 - **Codegen**: schema parsing (YAML and ROS 2 `.msg`) and Rust code generation.
 - **Transport**: zero-copy publish and subscribe over iceoryx2 shared memory,
   and the zenoh bridge the network gateway runs. All local transport is shared

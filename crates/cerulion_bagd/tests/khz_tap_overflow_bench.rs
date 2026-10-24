@@ -165,7 +165,7 @@ use std::time::{Duration, Instant};
 use cerulion_bagd::{run_bagd, DrainGapHistogram, TapSpec};
 use cerulion_core::codegen::{parse_rosmsg, CdrCodec, MessageSchema};
 use cerulion_core::transport::INGRESS_ROUTE_BUFFER_DEPTH;
-use cerulion_core::wire::MaxSliceLen;
+use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportManager;
 use serial_test::serial;
 
@@ -537,9 +537,9 @@ fn plan_topics(
             // counted drop — `publish_raw` loans exactly `frame.len()`), so a
             // victim whose derived slice is smaller than the configured body
             // publishes frames of the size that slice actually admits. Only
-            // bites for a type whose budget is under `body_len` + 32; every
+            // bites for a type whose budget is under `body_len` plus the header; every
             // schema tier is >= 16 KiB, so it is the FIXED arm that reaches it.
-            let victim_body = body_len.min(victim_msl as usize - 32);
+            let victim_body = body_len.min(victim_msl as usize - WireHeader::SIZE);
             // The VICTIMS — the kHz rows, at the slice under test.
             for i in 0..khz_n {
                 plans.push(Plan {
@@ -855,7 +855,7 @@ fn khz_tap_overflow_at_the_go2_shape() {
     let bytes: u64 = per_thread
         .iter()
         .zip(plans.iter())
-        .map(|((sent, _), p)| sent * (p.body_len as u64 + 32))
+        .map(|((sent, _), p)| sent * (p.body_len as u64 + WireHeader::SIZE as u64))
         .sum();
     println!(
         "\nload {load_before} -> {load_after} | publish wall {:.2} s | offered {:.2} MB/s",

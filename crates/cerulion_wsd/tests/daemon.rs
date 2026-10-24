@@ -8,9 +8,9 @@ use cerulion_cli_engine::node_cmd;
 use cerulion_cli_engine::workspace;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use cerulion_wsd::daemon::{self, RunningWsd, WsdConfig, MAX_REQUEST_LINE_BYTES};
+use cerulion_wsd::hygiene::connect_control_socket;
 use cerulion_wsd::protocol::{HELLO_MARKER, PROTOCOL_VERSION};
 use std::time::Duration;
 
@@ -125,7 +125,7 @@ async fn connect(
     tokio::net::unix::OwnedWriteHalf,
     Value,
 ) {
-    let stream = UnixStream::connect(socket).await.expect("connect");
+    let stream = connect_control_socket(socket).expect("connect");
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut hello = String::new();

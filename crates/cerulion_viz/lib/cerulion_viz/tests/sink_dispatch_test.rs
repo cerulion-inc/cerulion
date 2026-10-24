@@ -137,6 +137,7 @@ fn build_fixed_frame_at(
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -286,6 +287,7 @@ fn build_jpeg_frame(jpeg: &[u8], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -344,6 +346,7 @@ fn build_raw_image_frame(encoding: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -417,6 +420,7 @@ fn build_cloud_frame(points: &[[f32; 4]], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -438,6 +442,7 @@ fn build_tf(seq: u32, ts: u64, transforms_bytes: &[u8]) -> Vec<u8> {
         offset_table_count: TFMessage::VARIABLE_FIELD_COUNT as u32,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -515,6 +520,7 @@ fn build_odometry_frame(
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1333,6 +1339,7 @@ fn canonical_point_fields_are_reported_undecodable_not_empty() {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 1_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -2133,6 +2140,7 @@ fn build_lowstate_frame(qs: &[f32; 20], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2190,6 +2198,7 @@ fn build_wide_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2252,6 +2261,7 @@ fn build_posed_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2296,6 +2306,7 @@ fn build_empty_bank_frame(timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..].copy_from_slice(&payload);
@@ -2911,6 +2922,7 @@ fn build_quaternion_stamped(q: [f64; 4]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 7_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -2977,6 +2989,7 @@ fn build_joint_state(position: &[f64], velocity: &[f64], effort: &[f64]) -> Vec<
         offset_table_count: 5,
         sequence: 0,
         timestamp_ns: 9_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -3068,6 +3081,7 @@ fn build_occupancy_grid(width: u32, height: u32, cells: &[u8]) -> Vec<u8> {
         offset_table_count: 2,
         sequence: 0,
         timestamp_ns: 11_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -3511,6 +3525,7 @@ fn build_header_plus_array_frame(
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -3782,6 +3797,7 @@ fn build_polygon_frame(points: &[[f32; 3]]) -> Vec<u8> {
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -4676,6 +4692,7 @@ fn motion_primitive_frame_at(positions: &[[f64; 3]], timestamp_ns: u64) -> Vec<u
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -5055,6 +5072,7 @@ fn survey_plan_frame(trajectory: &[[f64; 3]], waypoints: &[[f64; 3]]) -> Vec<u8>
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -5448,6 +5466,7 @@ fn acme_frame_at(
         offset_table_count: table_count,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -5587,6 +5606,7 @@ fn build_joint_state_with_names(
         offset_table_count: 5,
         sequence: 0,
         timestamp_ns: 9_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6320,6 +6340,7 @@ fn build_imu_frame(
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6399,6 +6420,7 @@ fn build_string_frame(text: &str, timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6509,6 +6531,7 @@ fn build_laserscan_frame(
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6722,6 +6745,7 @@ fn readings_frame(volts: &[f64]) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -6874,6 +6898,7 @@ fn attitude_report_frame(orientation: [f64; 4], temperature_c: f64) -> Vec<u8> {
         offset_table_count: 0,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

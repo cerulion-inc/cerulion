@@ -138,12 +138,13 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | Core runtime (wire, transport, scheduler, graph, codegen) | `cerulion_core`* |
 | Node-author macros | `cerulion_macros`* |
 | Generated ROS 2 message types | `native_ros2_messages`* |
-| CLI binary / logic / TUI / telemetry | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry` |
+| CLI / Android | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry`, `cerulion_android` |
 | Recording: MCAP writer/reader + daemon | `cerulion_bag`*, `cerulion_bagd`* |
 | ROS 2 RMW layer (via `cerulion ros2 run/launch`) | `rmw_cerulion`* |
 | Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |
 | Local workspace engine daemon | `cerulion_wsd`* |
 | Remote access / pairing / accounts | `cerulion_{connectd,remoted*,pairing,accountd,wire,wireclient,link}`, `cerud` |
+| Robot Context Protocol (MCP server) | `cerulion_rcpd` |
 | Visualization (not in default-members) | `cerulion_viz`* (`lib/*`, `bin/cerulion_vizd`) |
 | Fixtures, benches, examples | `crates/test_fixtures/*`, `benches/`*, `examples/`* |
 
@@ -186,5 +187,4 @@ Unmarked crates have no scoped file: use this page plus the area dossier
 - `crates/<crate>/AGENTS.md` - scoped invariants, serial tests, gotchas.
 - `docs/internals/*.md` - contributor dossiers (test maps, module contracts); each crate
   names its own; `ci-and-gates.md`: the gates.
-- `docs/` - user guides (networking, multi-process, recording/replay, tutorials); hosted at
-  https://docs.cerulion.com, index `/llms.txt`.
+- `docs/` - user guides; hosted at https://docs.cerulion.com, index `/llms.txt`.

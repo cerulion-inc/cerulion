@@ -11,6 +11,15 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   singleton (`get_or_init()`). Tests get isolation via per-test SHM roots
   (`init_for_test` / `build_for_test` / `generate_isolated_config()`), not via a second
   node.
+- The opt-in `local-transport` feature selects
+  `iceoryx2::service::local_threadsafe::Service` and `TransportKind::InProcess`;
+  without it, the runtime keeps `ipc_threadsafe::Service` and
+  `TransportKind::CrossProcess`. Local transport is for threads in one process:
+  explicit cross-process initialization, detached pre-creation for other
+  processes, non-empty process groups, and cdylibs with a different transport
+  kind are refused. Cross-process cdylibs export `CERULION_ABI_VERSION`
+  unchanged; in-process cdylibs encode their transport id above bit 16, so a
+  host can refuse a transport mismatch during the ABI check.
 - ONE EXCEPTION, and it is transient rather than long-lived: every dead-node sweep
   mints its own node. iceoryx2 carries `try_cleanup_dead_nodes` on `&Node`, and the
   cleaner deliberately does not hold the transport, so
@@ -51,8 +60,29 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 ## Wire format and framing
 
-- 32-byte little-endian `WireHeader` (`schema_hash`, `total_size`, offset-table
-  offset/count, `sequence`, `timestamp_ns`). The canonical schema-hash recipe lives in
+- 40-byte little-endian `WireHeader` (`schema_hash`, `total_size`, offset-table
+  offset/count, `sequence`, `timestamp_ns`, `step_tag`), wire header version 2
+  (`wire::WIRE_HEADER_VERSION`). Every boundary a frame crosses states that
+  version: the iceoryx2 data service attribute `cerulion.wire_header_version`
+  (defined on every service this build creates; an opener refuses another stated
+  version and accepts, with a once-per-topic warning, a service stating none),
+  the zenoh key namespace `cerulion_w2` plus the demand GET payload
+  (`refused:wire-header` on a mismatch), the catalog's `wire_header_version`, the
+  `cerulion-netd` banner, the iroh ALPN `cerulion/wire/2` and the bag schema
+  descriptor (version 2). Every check is ONE-DIRECTIONAL: it runs in the newer
+  process, and an older process reads no version, so it is not refused when it
+  opens a service, demands a topic or reads a bag this build made. The supported
+  configuration is one Cerulion release per machine (and one across machines that
+  exchange frames). A bag recorded with version 1 descriptors has its user frames
+  upgraded on read (`wire::upgrade_v1_frame_into`): per message on the message
+  streams; on the frame walks, into ONE copy per reader, reserved at its exact
+  size on the first walk and held for the reader's lifetime (refused above
+  `LEGACY_UPGRADE_CAP_BYTES`, 2 GiB, naming `cerulion bag migrate`), because a
+  walk's spans borrow from the reader; `BagReader::user_frames_as_recorded`
+  walks the recorded bytes and builds nothing (`bag info` uses it). A frame with
+  bytes after its declared `total_size` is upgraded with those bytes kept after
+  it; one shorter than the header, or declaring a size past its end or below the
+  header, is served unchanged and counted (`bag migrate` refuses such a bag). The canonical schema-hash recipe lives in
   exactly ONE place: `MessageSchema::schema_hash` (`src/codegen/schema.rs`). Never
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original
@@ -345,11 +375,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 
 - A graph build starts NOTHING network. The graph process is network-free; the gateway
   is a SEPARATE process driven from the pure `compute_gateway_plan` → `GatewayRuntime`.
-  Plan derivation: explicit `network:` block ⇒ allow-list egress + announces + resolved
-  ingress table; permissive ⇒ allow-all + all produced topics announced; an ingress
+  Plan derivation: explicit `network:` block ⇒ allow-list egress + topic announce
+  tokens when LAN access is open + resolved ingress table; permissive ⇒ allow-all
+  egress, with produced-topic announce tokens declared only when LAN access is open; an ingress
   topic nobody consumes refuses loudly naming the topic + fix
   (`network_graph_wiring_test`).
-- `GatewayRuntime` owns one graph's network plane: announces produced topics, hears
+- `GatewayRuntime` owns one graph's network plane: announces produced topics when
+  LAN access is open, hears
   remote DEMAND tokens, forwards demanded topics' SHM frames to zenoh via listener-less
   taps (egress), re-injects declared ingress topics into local SHM. The zenoh payload is
   the Cerulion wire frame VERBATIM (no envelope); ONE network task serves all topics.

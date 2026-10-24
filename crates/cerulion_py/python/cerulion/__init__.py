@@ -9,6 +9,7 @@ memory. See ``docs/python.md`` for the full contract.
 
 from cerulion._native import (
     WIRE_HEADER_SIZE,
+    WIRE_HEADER_VERSION,
     BorrowLimitExceeded,
     CerulionError,
     EncodeError,
@@ -60,6 +61,7 @@ __all__ = [
     "TransportError",
     "TopicInfo",
     "WIRE_HEADER_SIZE",
+    "WIRE_HEADER_VERSION",
     "connect",
     "open_bag",
     "real_ns",

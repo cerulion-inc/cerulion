@@ -47,10 +47,10 @@ def test_rust_publish_to_python(session, fixture_bin, size):
             assert frame.schema_hash == SCHEMA_HASH
             assert frame.timestamp_ns == TIMESTAMP_NS
             assert frame.sequence == i
-            assert frame.total_size == 32 + size
+            assert frame.total_size == 40 + size
             assert frame.recv_ns > 0
-            assert bytes(frame.raw[:32]) == expected_header_bytes(
-                SCHEMA_HASH, 32 + size, i, TIMESTAMP_NS
+            assert bytes(frame.raw[:40]) == expected_header_bytes(
+                SCHEMA_HASH, 40 + size, i, TIMESTAMP_NS
             )
             expected_body = pattern(size, i)
             assert np.array_equal(frame.as_numpy(), np.frombuffer(expected_body, np.uint8))
@@ -76,9 +76,9 @@ def test_python_publish_to_rust(session, fixture_bin, size):
             loan.timestamp_ns = 100
         lines = [proc.stdout.readline().strip() for _ in range(2)]
         expected = [
-            f"frame seq=0 schema_hash={SCHEMA_HASH} timestamp_ns=99 total_size={32 + size} "
+            f"frame seq=0 schema_hash={SCHEMA_HASH} timestamp_ns=99 total_size={40 + size} "
             f"body_len={size} fnv1a64={fnv1a64(pattern(size, 0)):016x}",
-            f"frame seq=1 schema_hash={SCHEMA_HASH} timestamp_ns=100 total_size={32 + size} "
+            f"frame seq=1 schema_hash={SCHEMA_HASH} timestamp_ns=100 total_size={40 + size} "
             f"body_len={size} fnv1a64={fnv1a64(pattern(size, 1)):016x}",
         ]
         assert lines == expected

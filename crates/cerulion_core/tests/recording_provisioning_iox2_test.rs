@@ -82,6 +82,7 @@ fn producer_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
             node_type: "rec_producer".to_string(),
@@ -510,6 +511,7 @@ fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
             node_type: "discarding_producer".to_string(),
@@ -541,10 +543,10 @@ fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
     }
 
     // Drain (sequence, x) — x is Vector3's first fixed field at frame
-    // bytes [32..40] (f64 LE after the 32-byte WireHeader).
+    // bytes [32..40] (f64 LE after the 40-byte WireHeader).
     let mut out = Vec::new();
     // `try_receive` drains the whole tap queue (FIFO). `msg.payload()` is the
-    // body AFTER the 32-byte header, so Vector3's `x` is body bytes [0..8].
+    // body AFTER the 40-byte header, so Vector3's `x` is body bytes [0..8].
     tap.try_receive(|msg| {
         let x = f64::from_le_bytes(msg.payload()[0..8].try_into().expect("x bytes"));
         out.push((msg.header().sequence, x));

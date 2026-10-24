@@ -110,6 +110,7 @@ fn producer_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: node_id.to_string(),
             node_type: node_type.to_string(),

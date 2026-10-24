@@ -45,7 +45,7 @@ fn write_yaml(root: &Path, file: &str, content: &str) {
 /// refused by the YAML parser's per-dimension array cap before either
 /// fold saw it, so the omission asserts would hold with the folds' ceiling retain
 /// deleted. 520 × `float64[1_048_576]` (each dimension AT the cap) declares
-/// 4,362,076,160 fixed bytes — past `u32::MAX − 32` — and parses.
+/// 4,362,076,160 fixed bytes, past `u32::MAX - 40`, and parses.
 fn hostile_yaml() -> String {
     let mut out = String::from("schemas:\n  HostileY:\n    fields:\n");
     for i in 0..520 {
@@ -571,7 +571,7 @@ fn s3_resolution_is_deterministic_across_builds() {
 
 /// The replay field registry: a composed overflow — every
 /// schema individually sizable, the overflow appearing only after
-/// fixed-nested inlining (Inner's 8 x 536870907 bytes fit the u32 wire
+/// fixed-nested inlining (Inner's 8 x 536870906 bytes fit the u32 wire
 /// ceiling; Outer = Inner[2^33] does not fit usize) — must be scrubbed from
 /// EVERY registry
 /// structure, not just the local hash clone. If the schema stays in
@@ -580,7 +580,7 @@ fn s3_resolution_is_deterministic_across_builds() {
 #[test]
 fn s3_a_composed_overflow_schema_is_scrubbed_everywhere_never_a_panic() {
     let tmp = tempfile::tempdir().unwrap();
-    write_store_msg(tmp.path(), "nav_pkg", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav_pkg", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav_pkg", "Outer", "Inner[8589934592] arr\n");
     write_store_msg(tmp.path(), "nav_pkg", "Goal", GOAL_MSG);
 
@@ -760,7 +760,7 @@ fn s3_a_scrubbed_composed_overflow_does_not_poison_a_siblings_bare_claim() {
     let tmp = tempfile::tempdir().unwrap();
     // p1/Type is the composed bomb (Inner representable at ~4 GiB; Type =
     // Inner[2^33] overflows only after inlining); p2/Type is valid.
-    write_store_msg(tmp.path(), "p1", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "p1", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "p1", "Type", "Inner[8589934592] arr\n");
     write_store_msg(tmp.path(), "p2", "Type", "uint32 a\n");
 
@@ -1076,7 +1076,7 @@ fn r4_a_qualified_name_both_tiers_define_is_refused_on_all_three_resolution_surf
 /// derive from the SAME set.
 ///
 /// Shape: `p1/Inner` (composed past the u32 wire ceiling — `p1/Filler` is
-/// representable at 8·536870907 bytes, seven under the ceiling `u32::MAX − 32`; four
+/// representable at 8·536870906 bytes, seven under the ceiling `u32::MAX - 40`; four
 /// inlined are not) and `p2/Inner`
 /// (sane) are the two global bare candidates for `p3/User`'s bare `Inner`
 /// ref (same-package `p3/Inner` does not exist, so the resolver's
@@ -1092,7 +1092,7 @@ fn r4_a_qualified_name_both_tiers_define_is_refused_on_all_three_resolution_surf
 #[test]
 fn r4_the_hash_map_and_decoder_layouts_derive_from_the_same_post_scrub_set() {
     let tmp = tempfile::tempdir().unwrap();
-    write_store_msg(tmp.path(), "p1", "Filler", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "p1", "Filler", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "p1", "Inner", "Filler[4] a\nstring s\n");
     write_store_msg(tmp.path(), "p2", "Inner", "float64 x\n");
     write_store_msg(tmp.path(), "p3", "User", "Inner val\n");
@@ -1129,7 +1129,7 @@ fn r4_the_hash_map_and_decoder_layouts_derive_from_the_same_post_scrub_set() {
                 "v",
                 FieldType::FixedArray {
                     element_type: Box::new(FieldType::F64),
-                    length: 536870907,
+                    length: 536870906,
                 },
             ));
             s
@@ -1183,7 +1183,7 @@ fn r4_the_hash_map_and_decoder_layouts_derive_from_the_same_post_scrub_set() {
 #[test]
 fn r4_a_composed_overflow_nested_target_degrades_instead_of_panicking_resolution() {
     let tmp = tempfile::tempdir().unwrap();
-    write_store_msg(tmp.path(), "nav_pkg", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav_pkg", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav_pkg", "Outer", "Inner[8589934592] arr\n");
     // The arming reference: resolving Wrapper materializes Outer as a
     // fixed nested target — the exact site that panics without the preflight.
@@ -1313,7 +1313,7 @@ fn r5_a_shadowed_composed_overflow_never_evicts_its_valid_yaml_winner() {
     // declared moment, before the composed probe, so a 2^64 − 8 byte
     // `Filler` would be refused outright and never reach the probe this
     // test pins; the composed ARITHMETIC overflow rides the multiplier.
-    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav_pkg", "X", "Filler[8589934592] arr\n");
     write_yaml(
         tmp.path(),
@@ -1355,7 +1355,7 @@ fn r5_a_hostile_winner_yields_no_entry_never_a_resurrected_loser() {
     // which this test pins — is 4096 capped `Filler[1048576]` fields
     // (4096 × 2^20 × ~2^32 bytes ≈ 2^64: the checked recipe overflows,
     // exactly the shape this test needs under the wire ceiling).
-    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870906] v\n");
     // The shadowed-but-valid store copy of the same qualified name.
     write_store_msg(tmp.path(), "nav_pkg", "Y", "uint32 a\n");
     // The later-wins YAML winner: the inlined Fillers overflow the composed
@@ -1414,7 +1414,7 @@ fn r5_a_hostile_winner_yields_no_entry_never_a_resurrected_loser() {
 #[test]
 fn r6_a_failing_later_wins_winner_never_stays_behind_to_panic_the_decoder() {
     let tmp = tempfile::tempdir().unwrap();
-    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav_pkg", "Filler", "float64[536870906] v\n");
     // Earlier bearer (sorted file walk: a_dup < z_dup): valid.
     write_yaml(
         tmp.path(),
@@ -2250,7 +2250,7 @@ fn r12_schema_list_degrades_a_hostile_composition_instead_of_panicking() {
         "Huge",
         "float64[2305843009213693951] v\n",
     );
-    write_store_msg(tmp.path(), "nav12", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav12", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav12", "Outer", "Inner[8589934592] arr\n");
     write_store_msg(tmp.path(), "nav12", "Wrapper", "Outer o\nfloat64 w\n");
 
@@ -2311,7 +2311,7 @@ fn r12_schema_list_degrades_a_hostile_composition_instead_of_panicking() {
             .unwrap();
     assert_eq!(row("nav12/Wrapper"), Some(wrapper_alone.schema_hash()));
     let inner_alone =
-        cerulion_core::codegen::parse_rosmsg("float64[536870907] v\n", "Inner", Some("nav12"))
+        cerulion_core::codegen::parse_rosmsg("float64[536870906] v\n", "Inner", Some("nav12"))
             .unwrap();
     assert_eq!(row("nav12/Inner"), Some(inner_alone.schema_hash()));
 }
@@ -2389,7 +2389,7 @@ fn r14_the_registry_rejects_an_unrepresentable_fixed_section_instead_of_panickin
         "Huge",
         "float64[2305843009213693951] v\n",
     );
-    write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav14", "Outer", "Inner[2] arr\n");
     write_store_msg(tmp.path(), "nav_pkg", "Goal", GOAL_MSG);
 
@@ -2424,7 +2424,7 @@ fn r14_the_registry_rejects_an_unrepresentable_fixed_section_instead_of_panickin
         .root_layout()
         .expect("layout")
         .fixed_size;
-    assert_eq!(inner_size, 536_870_907 * 8);
+    assert_eq!(inner_size, 536_870_906 * 8);
     let reg = FieldRegistry::from_graph(&one_output_graph("nav_pkg/Goal"), tmp.path());
     let expected = oracle_hash(&mut [goal_store_ir()], "nav_pkg/Goal");
     assert_eq!(reg.expected_schema_hash(TOPIC), Some(expected));
@@ -2664,7 +2664,7 @@ fn r15_schema_list_lists_a_hostile_declaration_unhashed_instead_of_panicking() {
 #[test]
 fn r17_a_preflight_rejected_store_definition_is_refused_never_hashed_from_its_raw_declaration() {
     let tmp = tempfile::tempdir().unwrap();
-    write_store_msg(tmp.path(), "nav17", "Inner", "float64[536870907] v\n");
+    write_store_msg(tmp.path(), "nav17", "Inner", "float64[536870906] v\n");
     write_store_msg(tmp.path(), "nav17", "Outer", "Inner[8589934592] arr\n");
     write_store_msg(tmp.path(), "nav17", "Wrapper", "Outer o\nfloat64 w\n");
     write_store_msg(tmp.path(), "nav17", "Goal", GOAL_MSG);
@@ -2705,7 +2705,7 @@ fn r17_a_preflight_rejected_store_definition_is_refused_never_hashed_from_its_ra
         "the referencing definition survives with its ref variable"
     );
     let inner_alone =
-        cerulion_core::codegen::parse_rosmsg("float64[536870907] v\n", "Inner", Some("nav17"))
+        cerulion_core::codegen::parse_rosmsg("float64[536870906] v\n", "Inner", Some("nav17"))
             .unwrap();
     assert_eq!(row("nav17/Inner"), Some(inner_alone.schema_hash()));
     let goal_alone = cerulion_core::codegen::parse_rosmsg(GOAL_MSG, "Goal", Some("nav17")).unwrap();
@@ -3845,7 +3845,7 @@ fn r24_schema_info_refuses_what_the_parse_gate_refuses() {
 
 /// Wire-size validation: a size surface that
 /// judges the fixed section alone (`<= u32::MAX`) is wrong, because the frame a
-/// publisher writes is the 32-byte `WireHeader`, the fixed section, then one
+/// publisher writes is the 40-byte `WireHeader`, the fixed section, then one
 /// 8-byte offset entry per variable field — so a fixed section of `u32::MAX`
 /// bytes would pass every preflight and reach the recording map as a
 /// descriptor no publisher can emit. The rule is core's
@@ -3857,8 +3857,8 @@ fn r24_schema_info_refuses_what_the_parse_gate_refuses() {
 /// resolved filter) and the replay registry (the recording fold's twin
 /// lives beside the fold): exactly at the ceiling is served with its exact
 /// size, one byte past is refused — for a zero-variable schema (`At` /
-/// `Over` around `u32::MAX − 32`), a one-variable schema (`VarAt` /
-/// `VarOver` around `u32::MAX − 40`, the offset entry), the fixed-section-only extreme
+/// `Over` around `u32::MAX - 40`), a one-variable schema (`VarAt` /
+/// `VarOver` around `u32::MAX - 48`, the offset entry), the fixed-section-only extreme
 /// (`Max`, exactly `u32::MAX`, refused on every surface), a composition
 /// that crosses the ceiling only through resolution (`WrapAt` fits,
 /// `WrapOver` lands one byte past through padding + an inlined 8-byte
@@ -3868,11 +3868,11 @@ fn r24_schema_info_refuses_what_the_parse_gate_refuses() {
 /// and `VarNestAt` / `VarNestOver`, which pin the RESOLVED moment's EXACT
 /// count (`Blob` has a string, so `Blob b` stays a real offset entry after
 /// resolution — the floor would not count it — and one byte past
-/// `u32::MAX − 40` is refused where the floor would accept). A `uint8` run
+/// `u32::MAX - 48` is refused where the floor would accept). A `uint8` run
 /// places every boundary byte-exactly (align 1, no padding of its own).
 #[test]
 fn r26_the_wire_ceiling_counts_the_header_and_the_offset_table_on_every_surface() {
-    const AT: usize = u32::MAX as usize - 32; // 4_294_967_263
+    const AT: usize = u32::MAX as usize - 40; // 4_294_967_255
     const VAR_AT: usize = AT - 8; // one offset entry
     let tmp = tempfile::tempdir().unwrap();
     write_store_msg(tmp.path(), "p26", "At", &format!("uint8[{AT}] a\n"));
@@ -3946,7 +3946,7 @@ fn r26_the_wire_ceiling_counts_the_header_and_the_offset_table_on_every_surface(
             ir("VarAt", &format!("uint8[{VAR_AT}] a\nstring s\n")).schema_hash(),
         ),
         (
-            // AT − 16 = …247; the u64 lands at …248 (align 8) and ends …256.
+            // AT - 16 = ...239; the u64 lands at ...240 (align 8) and ends ...248.
             "p26/WrapAt",
             AT - 7,
             oracle_hash(
@@ -3958,7 +3958,7 @@ fn r26_the_wire_ceiling_counts_the_header_and_the_offset_table_on_every_surface(
             ),
         ),
         (
-            // AT − 7 = …256; the u32 lands there (align 4) and ends …260.
+            // AT - 7 = ...248; the u32 lands there (align 4) and ends ...252.
             "p26/Tight",
             AT - 3,
             oracle_hash(
@@ -4015,7 +4015,7 @@ fn r26_the_wire_ceiling_counts_the_header_and_the_offset_table_on_every_surface(
         .unwrap_err()
         .to_string();
     assert!(
-        max_err.contains("32-byte header"),
+        max_err.contains("40-byte header"),
         "the refusal explains the frame prefix; got {max_err}"
     );
 
@@ -4454,7 +4454,7 @@ fn yaml_entry_of_fixed_bytes(name: &str, bytes: usize) -> (String, MessageSchema
 /// hashes and sizes a workspace YAML entry BEFORE the shared preflight, and a
 /// `schema list` that hashes every YAML entry without the frame-prefix rule, let
 /// a declared-over-ceiling YAML entry (declarable: the parser caps one
-/// dimension at 2^20, and 4096 such `uint8` fields sit past `u32::MAX − 32`)
+/// dimension at 2^20, and 4096 such `uint8` fields sit past `u32::MAX - 40`)
 /// render its parse-time hash and size while every other size surface
 /// refuses it. Both run the ONE preflight first: `schema info` REFUSES
 /// the entry with the store tier's own rejection message, `schema list`
@@ -4464,7 +4464,7 @@ fn yaml_entry_of_fixed_bytes(name: &str, bytes: usize) -> (String, MessageSchema
 /// port on every surface (the both-sides boundary, on the YAML tier).
 #[test]
 fn r27_schema_info_and_list_refuse_an_over_ceiling_yaml_entry_before_hashing_it() {
-    const AT: usize = u32::MAX as usize - 32;
+    const AT: usize = u32::MAX as usize - 40;
     let tmp = tempfile::tempdir().unwrap();
     let (at_text, at_ir) = yaml_entry_of_fixed_bytes("AtCeiling", AT);
     let (over_text, _) = yaml_entry_of_fixed_bytes("Over", AT + 1);
@@ -4493,7 +4493,7 @@ fn r27_schema_info_and_list_refuse_an_over_ceiling_yaml_entry_before_hashing_it(
             "schema 'Over' (schemas/",
             ".yaml) has no wire layout",
             "resolution preflight rejected",
-            "32-byte header",
+            "40-byte header",
         ] {
             assert!(
                 err.contains(needle),
@@ -4560,7 +4560,7 @@ fn r27_schema_info_and_list_refuse_an_over_ceiling_yaml_entry_before_hashing_it(
 /// hashes (hand oracles).
 #[test]
 fn r27_the_hash_map_omits_a_definition_the_wire_ceiling_refuses_at_either_moment() {
-    const AT: usize = u32::MAX as usize - 32;
+    const AT: usize = u32::MAX as usize - 40;
     let tmp = tempfile::tempdir().unwrap();
     write_store_msg(tmp.path(), "p27", "At", &format!("uint8[{AT}] a\n"));
     write_store_msg(tmp.path(), "p27", "Over", &format!("uint8[{}] a\n", AT + 1));
@@ -4852,7 +4852,7 @@ fn r27_a_stem_bound_to_an_ambiguous_entry_is_refused_to_a_fixpoint() {
 /// `port_schema_exists("Sane")` accepts.
 #[test]
 fn r27_a_hostile_sibling_refuses_the_file_view_never_a_sane_entry_by_name() {
-    const AT: usize = u32::MAX as usize - 32;
+    const AT: usize = u32::MAX as usize - 40;
     let tmp = tempfile::tempdir().unwrap();
     let (over_text, _) = yaml_entry_of_fixed_bytes("Hostile", AT + 1);
     write_yaml(
@@ -5330,7 +5330,7 @@ fn r39_a_store_copy_shadowing_a_builtin_that_composed_overflows_is_scrubbed_not_
         tmp.path(),
         "geometry_msgs",
         "Filler",
-        "float64[536870907] v\n",
+        "float64[536870906] v\n",
     );
     write_store_msg(
         tmp.path(),

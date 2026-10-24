@@ -987,6 +987,7 @@ mod tests {
                 offset_table_count: 0,
                 sequence: tick,
                 timestamp_ns: 1_000_000_000 + u64::from(tick),
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut wire[..WireHeader::SIZE]);
             wire[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&0.5f32.to_le_bytes());
@@ -1029,6 +1030,7 @@ mod tests {
                 offset_table_count: 0,
                 sequence: tick,
                 timestamp_ns: 2_000_000_000 + u64::from(tick),
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             }
             .write_to_buf(&mut wire[..WireHeader::SIZE]);
             dispatch_frame(&rec, &walker, "selected", &wire, &mut state);

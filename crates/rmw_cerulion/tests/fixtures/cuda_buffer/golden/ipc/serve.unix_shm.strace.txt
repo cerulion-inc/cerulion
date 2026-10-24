@@ -1,0 +1,30 @@
+socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0) = 3<UNIX:[INODE]>
+connect(3<UNIX:[INODE]>, {sa_family=AF_UNIX, sun_path="/control"}, 11) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD</opt/s2>, "/dev/shm/cuda_vmm_<SERVE_PID>_0", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0666) = 41</dev/shm/cuda_vmm_<SERVE_PID>_0>
+ftruncate(41</dev/shm/cuda_vmm_<SERVE_PID>_0>, 24) = 0
+socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0) = 43<UNIX-STREAM:[INODE]>
+bind(43<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_0"}, 18) = 0
+listen(43<UNIX-STREAM:[INODE]>, 5) = 0
+accept(43<UNIX-STREAM:[INODE]>, NULL, NULL) = 46<UNIX-STREAM:[INODE]>
+sendmsg(46<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[44</dmabuf:>]}], msg_controllen=24, msg_flags=0}, 0) = 1
+accept(43<UNIX-STREAM:[INODE]>, NULL, NULL) = 46<UNIX-STREAM:[INODE]>
+sendmsg(46<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[44</dmabuf:>]}], msg_controllen=24, msg_flags=0}, 0) = 1
+accept(43<UNIX-STREAM:[INODE]>, NULL, NULL) = 46<UNIX-STREAM:[INODE]>
+sendmsg(46<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[44</dmabuf:>]}], msg_controllen=24, msg_flags=0}, 0) = 1
+openat(AT_FDCWD</opt/s2>, "/dev/shm/cuda_vmm_<SERVE_PID>_1", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0666) = 47</dev/shm/cuda_vmm_<SERVE_PID>_1>
+ftruncate(47</dev/shm/cuda_vmm_<SERVE_PID>_1>, 24) = 0
+socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0) = 48<UNIX-STREAM:[INODE]>
+bind(48<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_1"}, 18) = 0
+listen(48<UNIX-STREAM:[INODE]>, 5) = 0
+openat(AT_FDCWD</opt/s2>, "/dev/shm/cuda_vmm_<SERVE_PID>_2", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0666) = 51</dev/shm/cuda_vmm_<SERVE_PID>_2>
+ftruncate(51</dev/shm/cuda_vmm_<SERVE_PID>_2>, 24) = 0
+socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0) = 52<UNIX-STREAM:[INODE]>
+bind(52<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_2"}, 18) = 0
+listen(52<UNIX-STREAM:[INODE]>, 5) = 0
+accept(52<UNIX-STREAM:[INODE]>, NULL, NULL) = 54<UNIX-STREAM:[INODE]>
+sendmsg(54<UNIX-STREAM:[INODE]>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="X", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[53</dmabuf:>]}], msg_controllen=24, msg_flags=0}, 0) = 1
+openat(AT_FDCWD</opt/s2>, "/dev/shm/cuda_vmm_<SERVE_PID>_3", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0666) = 55</dev/shm/cuda_vmm_<SERVE_PID>_3>
+ftruncate(55</dev/shm/cuda_vmm_<SERVE_PID>_3>, 24) = 0
+socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK, 0) = 56<UNIX-STREAM:[INODE]>
+bind(56<UNIX-STREAM:[INODE]>, {sa_family=AF_UNIX, sun_path=@"cuda_vmm_<SERVE_PID>_3"}, 18) = 0
+listen(56<UNIX-STREAM:[INODE]>, 5) = 0
