@@ -15,6 +15,8 @@ esac
 
 build() {
   cargo build -p cerulion_cli -p cerulion_netd
+  # The direct data demand probe runs on the host, beside the host CLI.
+  cargo build -p android_e2e_demand_probe
   cargo ndk -t "$ABI" --platform 30 build -p cerulion_cli -p cerulion_netd
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   cargo ndk -t "$ABI" --platform 30 \
@@ -349,6 +351,30 @@ paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
 grep -Fq 'refused to serve its topic catalog to LAN peers (not authorized)' <<<"$paired_echo" ||
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
 pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
+# Paired direct data demand: `topic echo` reads the catalog before it demands
+# data, so the probe demands the heartbeat (std_msgs/String) without one. A
+# paired app must refuse every demand GET and deliver no frame in the window.
+demand_probe() {
+  host_capture timeout 30 "${HOST_ENV[@]}" "$ROOT/target/debug/android-e2e-demand-probe" \
+    tcp/127.0.0.1:7683 /app/heartbeat 10
+}
+probe_rc=0
+probe_out="$(demand_probe)" || probe_rc=$?
+printf 'rc=%s\n%s\n' "$probe_rc" "$probe_out" > "$OUT/paired-demand-probe.txt"
+(( probe_rc == 0 )) || fail "paired direct demand" "rc=$probe_rc output=$probe_out"
+probe_line="$(grep '^demand_probe ' <<<"$probe_out" | tail -1)"
+probe_field() { sed -nE "s/.* $1=([0-9]+)( .*)?$/\1/p" <<<"$probe_line"; }
+probe_passes="$(probe_field passes)"
+probe_refused="$(probe_field refused_acks)"
+probe_enabled="$(probe_field enabled_acks)"
+probe_wire="$(probe_field wire_header_refused_acks)"
+probe_frames="$(probe_field frames)"
+[[ "$probe_passes" =~ ^[0-9]+$ && "$probe_refused" =~ ^[0-9]+$ && "$probe_enabled" =~ ^[0-9]+$ &&
+  "$probe_wire" =~ ^[0-9]+$ && "$probe_frames" =~ ^[0-9]+$ ]] ||
+  fail "paired direct demand" "no complete probe report: $probe_out"
+(( probe_refused >= 1 && probe_enabled == 0 && probe_wire == 0 && probe_frames == 0 )) ||
+  fail "paired direct demand" "$probe_line"
+pass "paired direct demand" "passes=$probe_passes refused_acks=$probe_refused enabled_acks=0 frames=0"
 device "am force-stop '$APP'"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))

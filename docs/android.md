@@ -463,7 +463,8 @@ cerulion_core = { version = "1", features = ["local-transport"] }
 
 The emulator lane checks decoded topic values on the device and host, a
 recorded MCAP's topic, schema, and frame count, the paired catalog refusal
-with no decoded heartbeat frames, open access, and the app recording. Run it
+with no decoded heartbeat frames, a direct heartbeat data demand that the
+paired app refuses without sending a frame, open access, and the app recording. Run it
 locally with a booted API 30 emulator:
 
 ```sh
@@ -476,8 +477,8 @@ Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
 cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
 The run writes `e2e.log`, `logcat.txt`, device logs, the output and exit code of
-every echo (device and host timer, paired and open heartbeat), and pulled MCAP
-files there. The script needs a dedicated
+every echo (device and host timer, paired and open heartbeat), the paired
+demand probe's report, and pulled MCAP files there. The script needs a dedicated
 device: it refuses to start while a `cerulion` or `cerulion-netd` process is
 running, and clears only its own directory `/data/local/tmp/cer-e2e`, leaving
 the shared `/data/local/tmp/iceoryx2` untouched.
