@@ -85,9 +85,71 @@ public final class MainActivity extends Activity {
         }
     };
 
+    private static final String EXP = "CerExp";
+
+    private void execProbe(String path) {
+        try {
+            Process p = new ProcessBuilder(path).redirectErrorStream(true).start();
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[4096];
+            int n;
+            while ((n = p.getInputStream().read(chunk)) > 0) {
+                buf.write(chunk, 0, n);
+            }
+            String out = new String(buf.toByteArray(), StandardCharsets.UTF_8).trim();
+            int code = p.waitFor();
+            Log.i(EXP, "E3 exec " + path + " exit=" + code + " out=" + out);
+        } catch (Exception error) {
+            Log.e(EXP, "E3 exec " + path + " failed: " + error);
+        }
+    }
+
+    private void runExperiments() {
+        String libDir = getApplicationInfo().nativeLibraryDir;
+        Log.i(EXP, "nativeLibraryDir=" + libDir + " targetSdk=" + getApplicationInfo().targetSdkVersion);
+        execProbe(libDir + "/libexecprobe.so");
+        try {
+            File copy = new File(getFilesDir(), "execprobe");
+            Files.copy(new File(libDir, "libexecprobe.so").toPath(), copy.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            Log.i(EXP, "E3 setExecutable=" + copy.setExecutable(true, true));
+            execProbe(copy.getAbsolutePath());
+        } catch (Exception error) {
+            Log.e(EXP, "E3 copy failed: " + error);
+        }
+        try {
+            String yaml = "prefix: exp\nnodes:\n  - id: ticker\n    type: test_node_macro_period_cdylib\n"
+                    + "    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n";
+            Files.write(new File(getFilesDir(), "graph.yaml").toPath(), yaml.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException error) {
+            Log.e(EXP, "graph.yaml write failed: " + error);
+        }
+        handler.postDelayed(this::expStop, 8000);
+    }
+
+    private void expStop() {
+        Log.i(EXP, "E4 status before stop=" + CerulionRuntime.status());
+        stopRuntime();
+        handler.postDelayed(this::expPollStopped, 200);
+    }
+
+    private void expPollStopped() {
+        String status = CerulionRuntime.status();
+        try {
+            String state = new JSONObject(status).getString("state");
+            if ("stopping".equals(state)) {
+                handler.postDelayed(this::expPollStopped, 200);
+                return;
+            }
+        } catch (JSONException ignored) {
+        }
+        Log.i(EXP, "E4 status after stop=" + status);
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        runExperiments();
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
         if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);
@@ -151,7 +213,7 @@ public final class MainActivity extends Activity {
 
     private String configJson() throws IOException, JSONException {
         JSONObject config = new JSONObject();
-        config.put("listen", new JSONArray().put("tcp/0.0.0.0:7683"));
+        config.put("listen", new JSONArray().put("tcp/0.0.0.0:7684"));
         config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
         config.put("record", new JSONObject().put("file",
                 "app-" + System.currentTimeMillis() + ".mcap"));

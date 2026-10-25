@@ -4470,7 +4470,7 @@ impl DylibNodeEntry {
             sync_head_op_error_latched: false,
             external_source_fn,
             external_is_doorbell_fd: false,
-            leak_library_on_drop: false,
+            leak_library_on_drop: cfg!(target_os = "android"), // RESEARCH: keep node libs mapped on Android
             diag_label: path_str,
             _library: Some(library),
         })

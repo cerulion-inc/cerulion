@@ -933,7 +933,23 @@ fn clear_ready_marker(path: &Path) -> Result<(), EmbedError> {
 
 fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
     let config_path = files_dir.join("iceoryx2.toml");
-    let config_toml = toml::to_string(&IoxConfig::default())
+    // RESEARCH (E4): cross-process transport with root + shm under the app files dir.
+    let shm_dir = files_dir.join("shm");
+    let iox_root = files_dir.join("iox2");
+    for dir in [&shm_dir, &iox_root] {
+        fs::create_dir_all(dir).map_err(|e| EmbedError::Network(format!("mkdir {}: {e}", dir.display())))?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| EmbedError::Network(format!("chmod: {e}")))?;
+    }
+    // SAFETY: research build; called once at start before transport threads exist.
+    unsafe { std::env::set_var("CERULION_SHM_DIR", &shm_dir) };
+    let mut iox_config = IoxConfig::default();
+    {
+        use iceoryx2::prelude::{Path as IoxPath, SemanticString};
+        let root = format!("{}/", iox_root.display());
+        iox_config.global.set_root_path(&IoxPath::new(root.as_bytes()).map_err(|e| EmbedError::Network(format!("root path: {e:?}")))?);
+    }
+    let config_toml = toml::to_string(&iox_config)
         .map_err(|error| EmbedError::Network(format!("serialize iceoryx2 config: {error}")))?;
     fs::write(&config_path, config_toml)
         .map_err(|error| EmbedError::Network(format!("write iceoryx2 config: {error}")))?;
@@ -945,7 +961,7 @@ fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
 }
 
 fn refuse_dlopen_nodes(kind: TransportKind, native_nodes: usize) -> Result<(), EmbedError> {
-    if kind == TransportKind::InProcess && native_nodes > 0 {
+    if std::env::var_os("CER_RESEARCH_ALLOW_DLOPEN").is_none() && kind == TransportKind::InProcess && native_nodes > 0 {
         return Err(EmbedError::Graph(
             "graph nodes loaded from libraries cannot deliver frames under the in-process transport; run the app without graph_yaml".to_string(),
         ));

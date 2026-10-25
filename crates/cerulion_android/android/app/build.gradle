@@ -8,7 +8,7 @@ android {
     ndkVersion "27.2.12479018"
 
     defaultConfig {
-        applicationId 'com.cerulion.sample'
+        applicationId 'com.cerulion.sample.exp'
         minSdk 30
         targetSdk 34
         versionCode 1
