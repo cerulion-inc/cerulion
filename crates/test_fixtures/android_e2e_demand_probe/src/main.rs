@@ -6,24 +6,28 @@
 //! This probe skips the catalog: it boots an ingress-only gateway for ONE topic
 //! with a known schema (`std_msgs/String`), connected to ONE endpoint with
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
-//! bounded window while a local subscriber counts the frames it re-injects.
+//! bounded window. It reports the frames that reached its ingress from the
+//! network (`wire_frames`, whether re-injected or dropped by validation) and the
+//! frames its local subscriber received (`frames`). The probe's own LAN access is
+//! set to open, so its ingress never drops a frame on its own posture.
 //!
 //! Usage: `android-e2e-demand-probe <connect-endpoint> <topic> <window-secs>`
 //!
 //! It prints ONE fact line and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 frames=0
+//! demand_probe topic=/app/heartbeat window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 wire_frames=0 frames=0
 //! ```
 //!
 //! The verdict is the caller's: a paired robot must answer with refused acks
-//! only and deliver no frame; an open one grants and delivers. Setup failures
+//! only and send no frame; an open one grants and delivers. Setup failures
 //! return an error (exit code 1).
 
 use std::error::Error;
 use std::time::{Duration, Instant};
 
 use cerulion_core::message::ShmMessage;
+use cerulion_core::transport::demand_authorizer::LanAccess;
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
 };
@@ -79,6 +83,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }),
         ..Default::default()
     })?;
+    manager
+        .network()
+        .ok_or("the probe's transport has no network")?
+        .set_lan_access(LanAccess::Open);
     let subscriber = manager.create_subscriber(&args.topic)?;
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowList(vec![]),
@@ -97,10 +105,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::thread::sleep(POLL);
     }
     frames += subscriber.try_receive(|_| {})?;
+    // Every frame the ingress callback received lands in exactly one of these
+    // five counters, so their sum is every frame that crossed the network.
+    let ingress = gateway
+        .manager()
+        .network()
+        .and_then(|network| network.ingress_stats(&args.topic))
+        .ok_or("the probe's ingress bridge is not registered")?;
+    let wire_frames = ingress.frames
+        + ingress.schema_mismatch_drops
+        + ingress.decode_errors
+        + ingress.reinject_failure_drops
+        + ingress.lan_refused_drops;
 
     println!(
         "demand_probe topic={} window_s={} passes={} enabled_acks={} refused_acks={} \
-         wire_header_refused_acks={} frames={frames}",
+         wire_header_refused_acks={} wire_frames={wire_frames} frames={frames}",
         args.topic,
         args.window.as_secs(),
         gateway.demand_get_pass_count(),

@@ -368,13 +368,15 @@ probe_passes="$(probe_field passes)"
 probe_refused="$(probe_field refused_acks)"
 probe_enabled="$(probe_field enabled_acks)"
 probe_wire="$(probe_field wire_header_refused_acks)"
+probe_wire_frames="$(probe_field wire_frames)"
 probe_frames="$(probe_field frames)"
 [[ "$probe_passes" =~ ^[0-9]+$ && "$probe_refused" =~ ^[0-9]+$ && "$probe_enabled" =~ ^[0-9]+$ &&
-  "$probe_wire" =~ ^[0-9]+$ && "$probe_frames" =~ ^[0-9]+$ ]] ||
+  "$probe_wire" =~ ^[0-9]+$ && "$probe_wire_frames" =~ ^[0-9]+$ && "$probe_frames" =~ ^[0-9]+$ ]] ||
   fail "paired direct demand" "no complete probe report: $probe_out"
-(( probe_refused >= 1 && probe_enabled == 0 && probe_wire == 0 && probe_frames == 0 )) ||
+(( probe_refused >= 1 && probe_enabled == 0 && probe_wire == 0 && probe_wire_frames == 0 &&
+  probe_frames == 0 )) ||
   fail "paired direct demand" "$probe_line"
-pass "paired direct demand" "passes=$probe_passes refused_acks=$probe_refused enabled_acks=0 frames=0"
+pass "paired direct demand" "passes=$probe_passes refused_acks=$probe_refused enabled_acks=0 wire_frames=0 frames=0"
 device "am force-stop '$APP'"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
