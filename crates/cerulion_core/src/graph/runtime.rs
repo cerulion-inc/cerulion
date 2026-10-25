@@ -11701,7 +11701,9 @@ impl GraphRuntime {
                         continue;
                     }
                     // Classify with the park-aware flag. On the SELECT
-                    // path (`polled_not_selected == false`) a fd >= FD_SETSIZE is
+                    // path (`polled_not_selected == false`) of a build whose
+                    // WaitSet selects (every target but Linux, where it is epoll)
+                    // a fd >= FD_SETSIZE is
                     // AboveSelectLimit; on the park/barrier POLL path the ceiling
                     // lifts and a live high fd classifies Usable (negative/dead are
                     // still refused on either path).
@@ -11799,7 +11801,8 @@ impl GraphRuntime {
                             // (the monitor-wait park is off), so iceoryx2's unchecked
                             // `FD_SET` would be out-of-bounds (HAZARD 2). Reachable
                             // ONLY when `external_fds_are_polled_not_selected()` is
-                            // false — the park/barrier poll(2) path lifts the ceiling
+                            // false on a build whose WaitSet selects (never on Linux);
+                            // the park/barrier poll(2) path lifts the ceiling
                             // (a live high fd classifies Usable there). Same
                             // stranded-helper discipline as the InvalidFd doorbell
                             // arm: close a refused doorbell read end so its cdylib
