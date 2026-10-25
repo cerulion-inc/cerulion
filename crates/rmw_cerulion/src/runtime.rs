@@ -393,6 +393,11 @@ pub fn runtime() -> Result<&'static Runtime, String> {
         return Ok(rt);
     }
     install_tracing();
+    // This library runs inside a ROS 2 process whose own code may wait with
+    // `select()`: the soft open-file limit goes at most to FD_SETSIZE here, and
+    // the transport constructor below keeps that ceiling.
+    #[cfg(unix)]
+    cerulion_core::fd_limit::raise_open_file_limit_for_embedding_host();
     let transport = TransportManager::init(TransportConfig {
         node_name: format!("rmw_cerulion_{}", std::process::id()),
         ..Default::default()
