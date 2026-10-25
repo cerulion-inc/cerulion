@@ -296,11 +296,14 @@ These must pass on a device before anyone claims (f) works:
 
 1. **Never unload node libraries on Android.** In `W/crates/cerulion_core/src/graph/node.rs`,
    construct `DylibNodeEntry` with `leak_library_on_drop: cfg!(target_os = "android")`
-   (line 4820), and update the field docs (4041-4055). Equal choice: open with
+   (line 4820), and update the field docs (4041-4055). Leaking at construction does **not**
+   cover the early returns in `load` (`node.rs:4245-4824`): they drop the local `Library`
+   before `DylibNodeEntry` exists. One of them runs node code that touches `LAST_ERROR`: a
+   failed `cerulion_node_platform_check` (`node.rs:4495-4502`; `codegen.rs:2027-2050`,
+   `1883-1903`). So on Android open with
    `libloading::os::unix::Library::open(path, RTLD_NOW | RTLD_NODELETE)` in place of the
-   `Library::new` call at `node.rs:4265` (NDK doc `:443-461`). Leaking at construction covers
-   every early return in `load` (`node.rs:4245-4824`); none of them touches `LAST_ERROR`
-   (`codegen.rs:1883-1903`). Side
+   `Library::new` call at `node.rs:4265` (NDK doc `:443-461`), which covers failed loads too,
+   or forget the `Library` on every error path after the first node call. Side
    effect: a rebuilt node at the same path does not reload until the process restarts
    (`linker.cpp:1371-1416`, INFERRED). No Android unit test: CI only runs `cargo ndk check` and
    `cargo ndk build` (`.github/workflows/ci.yml:1415-1440`); PR 4 is the real gate.
@@ -354,7 +357,7 @@ Three adversarial reviews checked this note. What changed:
 | `std::env::set_var` for `CERULION_SHM_DIR` | **Accepted.** PR 2 sets it from Java or config |
 | Direct Boot and CE storage | **Added** as a PR 2 choice |
 | "PR 2 safe on its own" / "unit test on Android" / "keep `local-transport` for other users" | **Corrected** in PRs 1-3 |
-| `RTLD_NODELETE` instead of leaking | Equal choice, not cheaper; named in PR 1 |
+| `RTLD_NODELETE` instead of leaking | Preferred in PR 1: a leak at construction misses failed loads |
 | Cheaper options: shared registry (d), build-time (a) | Neither beats (f) for parity; (a) stays the fallback |
 | Recommendation (f) refuted? | **No.** All three reviews kept (f); its claim is now scoped |
 
@@ -364,8 +367,8 @@ Three adversarial reviews checked this note. What changed:
   are not allowed (answer/9888379).
 - Is multi-process parity (fault isolation, `process_groups`) a requirement? If yes, plan (e)
   on top of (f).
-- Does `-Wl,-z,nodelete` on node links, or host-side `RTLD_NODELETE`, read better than
-  leaking? Behavior is the same.
+- Does `-Wl,-z,nodelete` on node links read better than host-side `RTLD_NODELETE`? Both
+  cover failed loads; a leak at construction does not.
 - E3: the denied exec in `files/` logged no `avc` line. Is that denial silent? Not checked.
 - No repo test shows the frame loss itself. `loader_refuses_a_matching_local_transport_cdylib`
   (`local_transport_test.rs:508-512`) covers the refusal, but it is `#[ignore]`, because no
@@ -377,10 +380,10 @@ Repo (`W/`, `main` at `4b08fc18`):
 
 - `crates/cerulion_cli_engine/src/templates.rs:22-41`, `43-60`
 - `crates/cerulion_macros/src/codegen.rs:1-8`, `119`, `661`, `872-877`, `1762`,
-  `1883-1903`, `2091-2120`, `2185-2188`
+  `1883-1903`, `2027-2050`, `2091-2120`, `2185-2188`
 - `crates/cerulion_core/src/graph/node.rs:1605-1691`, `1641-1647`, `2946`, `3820-3826`,
   `3782-4062`, `4041-4055`, `4245-4824`, `4246-4262`, `4265`, `4279-4290`, `4332-4353`,
-  `4820`, `6604-6605`, `6677-6686`
+  `4495-4502`, `4820`, `6604-6605`, `6677-6686`
 - `crates/cerulion_core/src/graph/runtime.rs:4087-4089`, `4162-4183`, `5183-5191`
 - `crates/cerulion_core/src/graph/config.rs:85-96`
 - `crates/cerulion_core/src/graph/partition.rs:169`
