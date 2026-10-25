@@ -725,7 +725,7 @@ pub fn validate_network_ingress(
 ///
 /// The returned plan is [`validate`](crate::transport::gateway::GatewayPlan::validate)d
 /// (announce ∩ ingress must be empty — loop safety) before it is returned. The
-/// egress-graph-owned / ingress-not-produced / canonical-name validation stays
+/// egress-origin / ingress-not-produced / canonical-name validation stays
 /// where it was — a graph-load `validate_graph` error — so this function trusts
 /// an already-validated `config`.
 // hot-path-alloc-ok-fn: cold: derives the gateway PLAN from the graph's `network:` block at BUILD

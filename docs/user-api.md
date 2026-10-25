@@ -2133,7 +2133,10 @@ network:
   bridge gate: its bridge flag structurally never flips on; an
   ingress-only graph installs a deny-all gate). Each entry must be
   **produced by an in-graph node** (derived names and `topic:` overrides
-  both count).
+  both count), unless it is marked `external: true`: a topic a process
+  outside the graph publishes on this machine (a ROS 2 program on
+  `rmw_cerulion`, for example) is listed as `{topic: /chatter, external:
+  true}`, and must have no in-graph producer.
   An entry is a topic name or a map, `{topic: /r/scan, reliability:
   best_effort}`; `reliability` is `reliable` or `best_effort`, which puts
   the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator. An entry
@@ -2164,7 +2167,7 @@ rejection names the offending topic or setting and the fix:
 | Rule | Rejected shape |
 |---|---|
 | Loop safety | The same topic in BOTH `egress` and `ingress` (it would loop back to itself); remove it from one list. |
-| Egress ownership | An `egress` topic no in-graph node produces. |
+| Egress ownership | An `egress` topic no in-graph node produces (list a topic published outside the graph with `external: true`), or an `external: true` topic an in-graph node produces. |
 | Ingress externality | An `ingress` topic an in-graph node produces; remove the entry or the producing node. |
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
