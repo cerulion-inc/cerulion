@@ -41,8 +41,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cerulion_core::graph::config::{GraphConfig, Ros2NodeDef};
-use cerulion_core::graph::node::NodeEntry;
+use cerulion_core::graph::config::{GraphConfig, NodeDef, Ros2NodeDef};
+use cerulion_core::graph::node::NodeInfo;
 use cerulion_core::graph::sim_time::{
     clock_sample_ns, SimClockFeed, SimClockVerdict, SIM_CLOCK_SCHEMA, SIM_CLOCK_TOPIC, SIM_TIME_KEY,
 };
@@ -51,7 +51,6 @@ use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeD
 use cerulion_core::transport::subscriber::{DataOnlySubscriber, OwnedInboundSample};
 use cerulion_core::wire::WireHeader;
 use cerulion_core::{GraphRuntime, MacroPolicy, TransportManager, VirtualClock};
-use indexmap::IndexMap;
 use native_ros2_messages::rosgraph_msgs::Clock;
 
 use crate::error::{CliError, CliResult};
@@ -117,23 +116,24 @@ pub const SIM_TIME_NETWORK_INERT_NOTICE: &str = "sim time (`sim_time: true` in t
     false` and drop `--time-source external` to run the gateway on the live clock.";
 
 /// The ids of `config`'s native nodes whose entry declares the `external`
-/// trigger policy, in declaration order. Read off the loaded entries' own
-/// metadata (`NodeEntry::info`), the same source the built scheduler's
-/// `external_policy_node_ids` would report, so the refusal can be made BEFORE
-/// the build, which under sim time happens only after the first clock sample.
-/// A node whose entry is missing from `factories` is not judged here: the
-/// build refuses it on its own terms. A corrupt entry's metadata error is
-/// surfaced; it would refuse the build anyway.
+/// trigger policy, in declaration order. Read off each node library's own
+/// metadata (`NodeInfo`, through `info_of`), the same source the built
+/// scheduler's `external_policy_node_ids` would report, so the refusal can be
+/// made BEFORE anything starts: `graph run` reads it from the libraries its
+/// params pass already holds, ahead of spawning the graph's `ros2:` entries.
+/// A node `info_of` has no answer for (`None`: its library is not resolved)
+/// is not judged here: the load refuses it on its own terms. An unreadable
+/// library's metadata error is surfaced; it would refuse the load anyway.
 pub fn external_policy_node_ids(
     config: &GraphConfig,
-    factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    info_of: impl Fn(&NodeDef) -> Option<CliResult<NodeInfo>>,
 ) -> CliResult<Vec<String>> {
     let mut ids = Vec::new();
     for node in config.native_nodes() {
-        let Some(entry) = factories.get(&node.id) else {
+        let Some(info) = info_of(node) else {
             continue;
         };
-        if entry.info()?.policy() == Some(MacroPolicy::External) {
+        if info?.policy() == Some(MacroPolicy::External) {
             ids.push(node.id.clone());
         }
     }
@@ -142,14 +142,15 @@ pub fn external_policy_node_ids(
 
 /// Refuse a sim-time run of a graph with external-policy nodes, naming every
 /// offender and the fix ([`SIM_TIME_EXTERNAL_NODES_REJECTION`]). `Ok(())` for
-/// a graph without one, the common path. Called before the run waits for its
-/// first clock sample, so a graph that can never run says so at launch.
+/// a graph without one, the common path. Called before the run starts any
+/// child or waits for its first clock sample, so a graph that can never run
+/// says so at launch and starts nothing.
 pub fn refuse_external_nodes_under_sim_time(
     graph_name: &str,
     config: &GraphConfig,
-    factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    info_of: impl Fn(&NodeDef) -> Option<CliResult<NodeInfo>>,
 ) -> CliResult<()> {
-    let ids = external_policy_node_ids(config, factories)?;
+    let ids = external_policy_node_ids(config, info_of)?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -878,6 +879,8 @@ impl StallWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerulion_core::graph::node::NodeEntry;
+    use indexmap::IndexMap;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
 
@@ -1192,6 +1195,14 @@ mod tests {
         (config, factories)
     }
 
+    /// The metadata lookup `graph run` hands the refusal, answered from
+    /// in-memory entries: a node without an entry has no answer.
+    fn info_of(
+        factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    ) -> impl Fn(&NodeDef) -> Option<CliResult<NodeInfo>> + '_ {
+        |node| factories.get(&node.id).map(|e| Ok(e.info()?))
+    }
+
     #[test]
     #[tracing_test::traced_test]
     fn external_policy_nodes_are_refused_under_sim_time_with_a_fix_that_works() {
@@ -1201,11 +1212,11 @@ mod tests {
             ("imu", MacroPolicy::External),
         ]);
         assert_eq!(
-            external_policy_node_ids(&config, &factories).expect("metadata reads"),
+            external_policy_node_ids(&config, info_of(&factories)).expect("metadata reads"),
             ["camera", "imu"],
             "every external node, in declaration order, and no other"
         );
-        let err = refuse_external_nodes_under_sim_time("lab", &config, &factories)
+        let err = refuse_external_nodes_under_sim_time("lab", &config, info_of(&factories))
             .expect_err("a sim-time run cannot fire an external node")
             .to_string();
         assert!(err.starts_with("graph 'lab':"), "names the graph: {err}");
@@ -1229,10 +1240,10 @@ mod tests {
 
         // The common path: no external node, no refusal, no log line.
         let (config, factories) = sim_graph(&[("ticker", MacroPolicy::Period { period_ms: 10 })]);
-        assert!(external_policy_node_ids(&config, &factories)
+        assert!(external_policy_node_ids(&config, info_of(&factories))
             .expect("metadata reads")
             .is_empty());
-        refuse_external_nodes_under_sim_time("lab", &config, &factories)
+        refuse_external_nodes_under_sim_time("lab", &config, info_of(&factories))
             .expect("a graph without external nodes runs");
     }
 
@@ -1242,7 +1253,7 @@ mod tests {
         // refusal to make, with its own (library not found) text.
         let (config, mut factories) = sim_graph(&[("camera", MacroPolicy::External)]);
         factories.clear();
-        assert!(external_policy_node_ids(&config, &factories)
+        assert!(external_policy_node_ids(&config, info_of(&factories))
             .expect("nothing to read")
             .is_empty());
     }

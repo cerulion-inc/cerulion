@@ -6075,6 +6075,30 @@ pub fn graph_run(
 
     let _exit_hygiene = crate::ipc_cleanup::ExitHygieneGuard::armed();
 
+    // SIM TIME: nothing sweeps an external-policy node's fd or doorbell
+    // between clock samples (the same rule as the virtual poll loop), so such
+    // a graph is refused rather than run blind. Judged HERE, before the
+    // graph's `ros2:` children are spawned and before the run directory is
+    // written, so a graph that can never run starts nothing: no child gets to
+    // run its startup side effects for a run that is refused. The metadata
+    // comes from the libraries the params pass above already holds (the same
+    // memo), so no library is loaded an extra time; a node whose library is
+    // not resolved is left to the load below, which refuses it by name. With
+    // sim time's own text, because the virtual loop's fix (`--time-source
+    // real`) resolves back to sim time on a `sim_time: true` graph.
+    if time_source == TimeSource::External {
+        crate::sim_time_run::refuse_external_nodes_under_sim_time(graph_name, &config, |node| {
+            match cdylib_cache.get(node.node_type.as_str()) {
+                Some(Ok(lib)) => Some(crate::node_inspector::NodeInspector::inspect(
+                    &params_inspector,
+                    &lib.path,
+                    &node.node_type,
+                )),
+                _ => None,
+            }
+        })?;
+    }
+
     // `ros2:` entries: spawn the graph's ROS 2 half NOW — before the deployment
     // dispatch, so every run shape (supervisor, recording, both monolith arms)
     // gets them — on the same staged transport env `cerulion ros2 run` uses
@@ -6618,19 +6642,9 @@ pub fn graph_run(
             // sample (`crate::sim_time_run`). Nothing is built until the first
             // sample places the epoch, so nothing time-triggered fires before
             // time is valid. A replay-class run: no gateway, no pause page (a
-            // simulator owns this clock; pause the simulator).
-            //
-            // The same rule as the virtual poll loop: nothing sweeps an
-            // external-policy node's fd or doorbell between clock samples, so
-            // such a graph is refused rather than run blind. Judged on the
-            // loaded entries' metadata BEFORE the transport exists and BEFORE
-            // the wait for a clock, so a graph that can never run says so at
-            // launch, not after the simulator starts; and with sim time's own
-            // text, because the virtual loop's fix (`--time-source real`)
-            // resolves back to sim time on a `sim_time: true` graph.
-            crate::sim_time_run::refuse_external_nodes_under_sim_time(
-                graph_name, &config, &factories,
-            )?;
+            // simulator owns this clock; pause the simulator). A graph with
+            // an external-policy node never gets here: it was refused before
+            // any `ros2:` child was spawned (above).
             let clock = Arc::new(cerulion_core::VirtualClock::new());
             let transport =
                 cerulion_core::TransportManager::init(cerulion_core::TransportConfig {
@@ -30739,6 +30753,47 @@ nodes:
                 && exempt.contains("RunPartitionOutcome::AlreadyCurrent"),
             "a file that already carries the derived partition needs no write, so the \
              refusal must exempt `AlreadyCurrent`"
+        );
+    }
+
+    /// A sim-time graph with an external-policy node is refused before the
+    /// run starts anything: before its `ros2:` children are spawned (a child
+    /// would otherwise run its startup side effects for a run that never
+    /// happens) and before the run directory is written. And it is refused
+    /// once: the sim-time arm no longer carries a second, later copy.
+    ///
+    /// STRUCTURAL because the spawn needs a ROS 2 install on PATH; the
+    /// refusal itself is behaviourally pinned (its text, its offenders, the
+    /// launch timing) by `sim_time_graph_run_test` and `sim_time_run`'s own
+    /// unit arms.
+    #[test]
+    fn graph_run_refuses_external_nodes_under_sim_time_before_spawning_ros2_children() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let refusal = format!("refuse_external_nodes_under_{}(", "sim_time");
+        let at = body
+            .find(refusal.as_str())
+            .expect("the sim-time external-node refusal must still be in graph_run");
+        assert_eq!(
+            body.matches(refusal.as_str()).count(),
+            1,
+            "the refusal is made once, ahead of every side effect"
+        );
+        let spawn = body
+            .find("Ros2Children::spawn(")
+            .expect("the ros2 children spawn must still be in graph_run");
+        let run_dir = body
+            .find("run_dir::mint_run_id(")
+            .expect("the run directory write must still be in graph_run");
+        assert!(
+            at < spawn && at < run_dir,
+            "the refusal must come before the ros2 spawn and the run directory write"
+        );
+        let gate = &body[..at];
+        assert!(
+            gate.rfind("if time_source == TimeSource::External {")
+                .is_some_and(|g| !body[g..at].contains('}')),
+            "the refusal is gated on sim time and on nothing else"
         );
     }
 

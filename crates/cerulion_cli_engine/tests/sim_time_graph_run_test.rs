@@ -202,12 +202,15 @@ fn run(args: RunArgs<'_>) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// The run directories `CERULION_HOME` holds, or none.
+/// The run directories `CERULION_HOME` holds: none when `runs/` does not
+/// exist. Any other read error fails the test, so a refusal arm can never
+/// pass because it could not look.
 fn run_dirs(home: &Path) -> Vec<PathBuf> {
     let runs = home.join("runs");
     match std::fs::read_dir(&runs) {
         Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
-        Err(_) => Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("cannot read {}: {e}", runs.display()),
     }
 }
 
