@@ -699,6 +699,8 @@ The `cdylib` is what `cerulion node build` and `cerulion graph run` load. The `r
 timer = { path = "../nodes/timer", default-features = false }
 ```
 
+Keep that crate out of the node workspace: give it its own `[workspace]` table and build it from its own directory. Cargo merges a package's features across everything one build selects, so a build that also selects the node packages (a plain `cargo build` at the node workspace root, for example) turns their default `cdylib` feature back on, compiles the C exports into the linking crate, and two linked nodes then fail to link on the shared `cerulion_node_info` name.
+
 That crate names the node by the entry type the macro generates, `<Struct>Entry` (here `timer::TimerNodeEntry`). The entry has the struct's visibility, so the struct must be `pub` for another crate to name it.
 
 A node crate made before this layout needs two edits to link this way: change `crate-type = ["cdylib"]` to `crate-type = ["cdylib", "rlib"]` in its `Cargo.toml`, and change `struct <Name>` to `pub struct <Name>` on the `#[cerulion_node]` struct in `src/lib.rs`. Nothing else changes: the node still builds and runs with `cerulion node build` and `cerulion graph run` as before.
