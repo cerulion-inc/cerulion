@@ -2583,6 +2583,13 @@ impl GatewayRuntime {
         self.get_demand_state.refusal_count()
     }
 
+    /// Observable state (Principle #3): cumulative demand GETs the producer
+    /// queryable refused with `refused:wire-header`, because the demanding
+    /// machine's wire header version differs from this build's.
+    pub fn demand_wire_header_refusal_count(&self) -> u64 {
+        self.get_demand_state.wire_header_refusal_count()
+    }
+
     /// Observable state (Principle #3): cumulative GET-expiry disables the reconciler
     /// thread applied (a topic released because its last GET aged past the TTL
     /// AND liveliness was also absent — the composition rule).
@@ -2622,6 +2629,15 @@ impl GatewayRuntime {
         self.demand_get_state
             .as_ref()
             .map(|s| s.refused_ack_count())
+            .unwrap_or(0)
+    }
+
+    /// Cumulative "refused:wire-header" acks the DEMANDER received (Principle
+    /// #3): a producer runs a build with a different wire header version.
+    pub fn demand_wire_header_refused_ack_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.wire_header_refused_ack_count())
             .unwrap_or(0)
     }
 

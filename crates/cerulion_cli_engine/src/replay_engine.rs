@@ -2565,7 +2565,7 @@ pub enum ViolationClass {
         replayed: usize,
     },
     /// A frame's bytes differed. `index` is the 0-based frame position; the
-    /// diff is bit-exact over the FULL wire frame (32-byte header + payload).
+    /// diff is bit-exact over the FULL wire frame (40-byte header + payload).
     ByteMismatch {
         /// The 0-based frame index of the first differing frame.
         index: usize,
@@ -2721,7 +2721,7 @@ struct TopicStats {
     /// aggregate fold already parses every header, so this costs nothing extra
     /// and — unlike the bag CHANNEL descriptor, which the synthetic test bags
     /// stamp `0` — is the ACTUAL byte the candidate must reproduce. `None` until
-    /// a header parses (a sub-32-byte frame contributes none).
+    /// a header parses (a sub-40-byte frame contributes none).
     first_schema_hash: Option<u64>,
     /// Aggregate-pass transient: current equal-timestamp run length.
     run: usize,
@@ -2806,14 +2806,18 @@ fn seq_run_hits_window(run: &SeqRun, expected: u32, gap_len: u32) -> bool {
 impl RecordedMessages {
     /// Wrap an already-opened, gate-verified bag: ONE streaming pass over the
     /// user frames computes the per-topic aggregates (`TopicStats`); nothing
-    /// per-frame is retained (the caller typically also hands a clone of the
-    /// same `Arc` to [`RecordedTrace`] — one map, two views).
+    /// per-frame is retained here (the caller typically also hands a clone of
+    /// the same `Arc` to [`RecordedTrace`]: one map, two views). For a bag
+    /// recorded with the 32-byte wire header, the reader's first walk builds
+    /// its one upgraded copy of the frames, held as long as the reader is.
     ///
-    /// Returns the raw [`cerulion_bag::BagError`] — a walk failure means the
-    /// BAG is corrupt (bad footer, torn framing, compressed/foreign chunk), the
-    /// same failure class as every other bag read, so the CALLER maps it to the
-    /// exit-2 `ReplayError::BagOpen` with the bag path (never exit-5 `Internal`,
-    /// which would misroute the operator to "file a tool bug" for a bad bag).
+    /// Returns the raw [`cerulion_bag::BagError`]: a walk failure is a fact
+    /// about the BAG (bad footer, torn framing, compressed or foreign chunk,
+    /// or a 32-byte-header bag too large to upgrade in memory, whose error
+    /// names `cerulion bag migrate`), the same failure class as every other
+    /// bag read, so the CALLER maps it to the exit-2 `ReplayError::BagOpen`
+    /// with the bag path (never exit-5 `Internal`, which would misroute the
+    /// operator to "file a tool bug" for a bag).
     pub fn from_reader(reader: Arc<BagReader>) -> Result<Self, cerulion_bag::BagError> {
         let mut stats: IndexMap<String, TopicStats> = IndexMap::new();
         {
@@ -19269,7 +19273,7 @@ fn open_injectors(
     for topic in external {
         // Largest recorded frame (from the aggregate pass — no span retained).
         let max_frame = recorded_messages.max_frame_len(topic);
-        // `MaxSliceLen` floors at the 32-byte header; size to the largest frame.
+        // `MaxSliceLen` floors at the 40-byte header; size to the largest frame.
         let msl =
             MaxSliceLen::try_new(max_frame.max(WireHeader::SIZE) as u32).ok_or_else(|| {
                 ReplayError::Internal {
@@ -20130,7 +20134,7 @@ fn validate_recording_consistency(
             check.fault = Some(ReplayError::RecordingInconsistent {
                 detail: format!(
                     "frame {i} on graph-produced topic '{topic}' has no parseable wire \
-                     header ({} bytes) — graph publishers always stamp a 32-byte header",
+                     header ({} bytes), graph publishers always stamp a 40-byte header",
                     frame.len()
                 ),
             });
@@ -27253,6 +27257,7 @@ mod frame_feed_tests {
                     offset_table_count: 0,
                     sequence: i,
                     timestamp_ns: 10 + u64::from(i),
+                    step_tag: cerulion_core::wire::StepTag::UNTAGGED,
                 };
                 let mut buf = vec![0u8; total];
                 h.write_to_buf(&mut buf[..WireHeader::SIZE]);
@@ -28392,6 +28397,7 @@ mod frame_ordinal_collection_tests {
             offset_table_count: 0,
             sequence,
             timestamp_ns: u64::from(sequence) + 1,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut out);
         out

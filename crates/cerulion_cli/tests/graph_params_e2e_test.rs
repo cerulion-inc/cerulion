@@ -156,7 +156,7 @@ fn spawn_run(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf) {
     (ChildGuard::single_process(child), stderr_path)
 }
 
-/// Decode a recorded `Vector3` frame: a 32-byte wire header then three
+/// Decode a recorded `Vector3` frame: a 40-byte wire header then three
 /// little-endian `f64`.
 fn vector3(frame: &[u8]) -> (f64, f64, f64) {
     assert_eq!(

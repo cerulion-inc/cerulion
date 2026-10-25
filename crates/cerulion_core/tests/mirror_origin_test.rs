@@ -464,10 +464,11 @@ fn a_child_remote_publisher_respects_the_local_source_lifetime() {
     const CHILD_CONFIG: &str = "CERULION_MIRROR_LEASE_TEST_CONFIG";
     const CHILD_SOCKET: &str = "CERULION_MIRROR_LEASE_TEST_SOCKET";
     const TOPIC: &str = "/marker/cross_process";
-    // schema=0x1234, size=36, no offset table, seq=42, timestamp=100, payload.
-    const FRAME: [u8; 36] = [
-        0x34, 0x12, 0, 0, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2A, 0, 0, 0, 0x64,
-        0, 0, 0, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44,
+    // schema=0x1234, size=44, no offset table, seq=42, timestamp=100, untagged,
+    // payload.
+    const FRAME: [u8; 44] = [
+        0x34, 0x12, 0, 0, 0, 0, 0, 0, 0x2C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2A, 0, 0, 0, 0x64,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44,
     ];
     fn receive(stream: &mut UnixStream) -> u8 {
         let mut byte = [0];

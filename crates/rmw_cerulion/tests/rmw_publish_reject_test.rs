@@ -536,7 +536,7 @@ fn serialized_publish_round_trips_and_restamps_the_sequence() {
     }
 }
 
-/// A frame too short to hold the 32-byte wire header is REJECTED with
+/// A frame too short to hold the 40-byte wire header is REJECTED with
 /// `RMW_RET_INVALID_ARGUMENT` and nothing reaches the subscriber.
 ///
 /// Hand oracle: the subscriber sees NO message at all after the reject, and

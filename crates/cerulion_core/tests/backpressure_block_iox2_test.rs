@@ -214,7 +214,7 @@ fn block_input_meta(depth: usize) -> InputMeta {
 }
 
 /// Decode the producer's `n` value (Vector3.x, written as `n as f64`) from an
-/// inbound frame BODY. `deliver_raw_frame` strips the 32-byte `WireHeader`
+/// inbound frame BODY. `deliver_raw_frame` strips the 40-byte `WireHeader`
 /// before invoking the `try_receive` callback, so `payload` is the Vector3
 /// fixed section (`x,y,z` f64); `x` is the first f64 at `[0..8]` little-endian.
 fn decode_n(payload: &[u8]) -> u32 {

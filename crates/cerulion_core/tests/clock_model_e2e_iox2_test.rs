@@ -273,6 +273,6 @@ fn publish_stamp_follows_active_virtual_clock_not_wall() {
         "the virtual stamp ({stamped}) must NOT be wall time (>= {wall_at_publish})"
     );
 
-    // Sanity: WireHeader::SIZE is the 32-byte header these bytes carry.
-    assert_eq!(WireHeader::SIZE, 32, "WireHeader is 32 bytes");
+    // Sanity: WireHeader::SIZE is the 40-byte header these bytes carry.
+    assert_eq!(WireHeader::SIZE, 40, "WireHeader is 40 bytes");
 }

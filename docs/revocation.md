@@ -89,7 +89,7 @@ silent no-op, and a missing or unusable cache never denies access.
 | The desk sends it on the connection it already has, right after the catalog admission gate | **BOTH** desk paths: `cerulion-netd`'s iroh WAN plane (every dial of a WAN robot) **and** the `cerulion connect` verb (`cerulion_connectd`'s session driver) |
 | The robot verifies + applies it | `cerulion_remoted`'s `sync_epoch` wire verb → `SharedTrust::apply_epoch` |
 
-Both desk paths dial the same `cerulion/wire/1` control plane and run the same shared
+Both desk paths dial the same `cerulion/wire/2` control plane and run the same shared
 substrate, so they cannot diverge in what a push does or reports. The outcome is
 observable state, not just a log line (Principle #3):
 `IrohMirrorPlane::last_push_outcome(robot)` on the WAN plane and
@@ -165,7 +165,7 @@ artifact or the new one, never a truncated (and therefore unreadable) one.
 This mirrors how owner-signed **grants** travel (one canonical wire shape in
 `cerulion_pairing`, a desk-side resolver next to `resolve_owner_grant`, a loud
 robot-side decode), on the plane the desk is already on: the WAN dial uses
-`cerulion/wire/1`, so the push is a control verb there rather than a second
+`cerulion/wire/2`, so the push is a control verb there rather than a second
 `cerulion/ops/1` connection.
 
 **The desk is a courier, not a trust anchor.** There is no desk-side signature check.

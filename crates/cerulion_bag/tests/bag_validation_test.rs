@@ -505,12 +505,14 @@ fn attachment_roundtrips_on_a_message_free_bag() {
 fn descriptor_encode_decode_byte_oracle() {
     let d = SchemaDescriptor::new(0x0102_0304_0506_0708, 0x1112_1314);
     let bytes = d.encode();
-    // 18-byte little-endian layout: version(2) recipe(4) hash(8) size(4).
-    let expected: [u8; 18] = [
-        0x01, 0x00, // version = 1
+    // 20-byte little-endian layout: version(2) recipe(4) hash(8) size(4)
+    // wire_header_version(2).
+    let expected: [u8; 20] = [
+        0x02, 0x00, // version = 2
         0x03, 0x00, 0x00, 0x00, // recipe = 3
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // hash LE
         0x14, 0x13, 0x12, 0x11, // size LE
+        0x02, 0x00, // wire header version = 2
     ];
     assert_eq!(bytes, expected);
     assert_eq!(SchemaDescriptor::decode(&bytes).unwrap(), d);

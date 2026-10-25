@@ -53,7 +53,12 @@ fn sizes_and_consts_are_locked() {
         std::mem::size_of::<WireEntry>(),
         "OffsetEntry size drift"
     );
-    assert_eq!(std::mem::size_of::<WireHdr>(), 32);
+    assert_eq!(std::mem::size_of::<WireHdr>(), 40);
+    assert_eq!(
+        cerulion_wire::WIRE_HEADER_VERSION,
+        cerulion_core::wire::WIRE_HEADER_VERSION,
+        "wire header version drift"
+    );
     assert_eq!(WireEntry::SIZE, 8);
 }
 
@@ -86,6 +91,10 @@ fn header_field_offsets_match_core() {
         offset_of!(WireHdr, timestamp_ns),
         offset_of!(CoreHeader, timestamp_ns)
     );
+    assert_eq!(
+        offset_of!(WireHdr, step_tag),
+        offset_of!(CoreHeader, step_tag)
+    );
 
     // The absolute wire-contract offsets (little-endian, from frame start).
     assert_eq!(offset_of!(WireHdr, schema_hash), 0);
@@ -94,20 +103,22 @@ fn header_field_offsets_match_core() {
     assert_eq!(offset_of!(WireHdr, offset_table_count), 16);
     assert_eq!(offset_of!(WireHdr, sequence), 20);
     assert_eq!(offset_of!(WireHdr, timestamp_ns), 24);
+    assert_eq!(offset_of!(WireHdr, step_tag), 32);
 }
 
 /// A header serialized by `cerulion_core::WireHeader::write_to_buf` parses
 /// field-identically with `cerulion-wire`, AND `cerulion-wire`'s encoder
-/// reproduces the exact same 32 bytes (both directions).
+/// reproduces the exact same 40 bytes (both directions).
 #[test]
 fn header_roundtrips_byte_identically_between_crates() {
     let core = CoreHeader {
         schema_hash: 0xFEED_FACE_1234_5678,
         total_size: 4096,
-        offset_table_offset: 40,
+        offset_table_offset: 48,
         offset_table_count: 2,
         sequence: 99,
         timestamp_ns: 987_654_321,
+        step_tag: cerulion_core::wire::StepTag::new(7, 1234).unwrap(),
     };
     let mut core_bytes = [0u8; CoreHeader::SIZE];
     core.write_to_buf(&mut core_bytes);
@@ -120,6 +131,11 @@ fn header_roundtrips_byte_identically_between_crates() {
     assert_eq!(w.offset_table_count, core.offset_table_count);
     assert_eq!(w.sequence, core.sequence);
     assert_eq!(w.timestamp_ns, core.timestamp_ns);
+    assert_eq!(w.step_tag, core.step_tag.raw());
+    assert_eq!(
+        w.step_tag, 0x0007_0000_0000_04D3,
+        "rank 7, step 1234 stored as 1235"
+    );
 
     // ENCODE side: cerulion-wire encodes a header with the SAME hand-oracle
     // values → byte-identical to core's write_to_buf output.
@@ -130,6 +146,7 @@ fn header_roundtrips_byte_identically_between_crates() {
         offset_table_count: core.offset_table_count,
         sequence: core.sequence,
         timestamp_ns: core.timestamp_ns,
+        step_tag: core.step_tag.raw(),
     };
     assert_eq!(
         w_hand.to_bytes(),
@@ -218,6 +235,7 @@ fn full_frame_agrees_across_core_primitives_cerulion_wire_and_frame_walker() {
         offset_table_count: count as u32,
         sequence: 7,
         timestamp_ns: 12_345,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; CoreHeader::SIZE];
     core_hdr.write_to_buf(&mut frame);
@@ -289,7 +307,7 @@ fn builtin_walker() -> FrameWalker {
 }
 
 /// Drain the subscriber and return the LAST delivered frame re-assembled as
-/// full wire bytes (32-byte header + payload). `write_to_buf` is
+/// full wire bytes (40-byte header + payload). `write_to_buf` is
 /// `read_from_buf`'s exact inverse, so the reassembled bytes equal the bytes
 /// the publisher committed.
 fn capture_last_frame(sub: &CerulionSubscriber) -> Vec<u8> {

@@ -784,6 +784,7 @@ impl ScriptedNetd {
                             let catalogs = served
                                 .iter()
                                 .map(|t| cerulion_core::CatalogReply {
+                                    wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                                     version:
                                         cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
                                     robot: t.robot.clone(),

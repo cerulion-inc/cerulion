@@ -204,7 +204,7 @@ fn schema_info_entries(
         // nothing before resolution, so the parse-time size is bounded by
         // fields × 2^20 × 8 bytes and no usize overflow is declarable — but
         // 512 such fields DO declare a fixed section past the u32 wire
-        // ceiling (the frame prefix: 32-byte header + fixed section + offset
+        // ceiling (the frame prefix: 40-byte header + fixed section + offset
         // table), and a hash/size of that entry is a contract no frame can
         // carry. Such an entry is REFUSED with the same message the store
         // tier gives a rejected definition, never rendered with its
@@ -373,9 +373,9 @@ pub(crate) fn offset_table_entries(schema: &MessageSchema, moment: SizeMoment) -
 
 /// The wire-representability CEILING — the ONE rule every size-fold
 /// surface applies, stated by `cerulion_core::wire` and consulted here:
-/// a schema is representable iff its FRAME PREFIX — the 32-byte
+/// a schema is representable iff its FRAME PREFIX (the 40-byte
 /// `WireHeader`, the fixed section and one 8-byte `OffsetEntry` per
-/// variable field, i.e. its smallest possible frame — fits the wire's
+/// variable field, i.e. its smallest possible frame) fits the wire's
 /// `u32` `total_size` (which is also the type of every recorded
 /// `wire_fixed_size` descriptor). A ceiling on the fixed section alone
 /// (`fixed_size <= u32::MAX`, the earlier rule) accepted a schema
@@ -423,7 +423,7 @@ pub(crate) fn representable_layout(
             offset_table_entries = entries,
             max_fixed_size = cerulion_core::wire::max_wire_fixed_size(entries),
             context = %context,
-            "schema's RESOLVED frame prefix (the 32-byte header, the fixed section after \
+            "schema's RESOLVED frame prefix (the 40-byte header, the fixed section after \
              fixed-nested inlining, and the offset table) exceeds the u32 wire \
              total_size — unrepresentable on the wire, reported as unresolved (hostile \
              or corrupt declaration; the rest still resolve)"
@@ -461,7 +461,7 @@ pub(crate) fn wire_representable_or_warn(
             max_fixed_size = cerulion_core::wire::max_wire_fixed_size(entries),
             moment = ?moment,
             context = %context,
-            "schema's frame prefix (the 32-byte header, the fixed section and the offset \
+            "schema's frame prefix (the 40-byte header, the fixed section and the offset \
              table) exceeds the u32 wire total_size — unrepresentable on the wire, \
              skipped (hostile or corrupt declaration; the rest still load)"
         );
@@ -2758,7 +2758,7 @@ pub(crate) fn preflight_resolution_set(schemas: &mut Vec<MessageSchema>, context
     // remote render) served a hash and size for a frame no producer can
     // emit (the fold defect, at the resolver seam). What this seam
     // must exclude is ONLY what would PANIC the layout walker: a declared
-    // section so close to `usize::MAX` that adding the 32-byte header and
+    // section so close to `usize::MAX` that adding the 40-byte header and
     // the offset table overflows (`float64[2^61 − 1]` = 2^64 − 8 bytes,
     // measured). A member past the u32 ceiling but within `usize` stays,
     // composes, and is refused — with every parent that inlines it — by
@@ -3969,7 +3969,7 @@ fn store_schema_entry(
 /// [`WorkspaceSchemaEntry::schema_hash`] is `None`). The workspace-YAML
 /// parser caps every `FixedArray` length up front, so the ARITHMETIC arm is
 /// reachable from the `.msg` store only; the wire-ceiling arm is reachable
-/// from both (4096 capped `uint8` fields sit past `u32::MAX − 32`).
+/// from both (4096 capped `uint8` fields sit past `u32::MAX - 40`).
 fn preflight_rejection_error(qualified: &str, location: &str, schema: &MessageSchema) -> CliError {
     let entries = offset_table_entries(schema, SizeMoment::Declared);
     let reason = match schema.checked_wire_fixed_size() {
@@ -3977,7 +3977,7 @@ fn preflight_rejection_error(qualified: &str, location: &str, schema: &MessageSc
         Ok(size) if exceeds_wire_ceiling(size, entries) => {
             let max = cerulion_core::wire::max_wire_fixed_size(entries);
             format!(
-                "its declared frame prefix — the 32-byte header, the fixed section ({size} \
+                "its declared frame prefix, the 40-byte header, the fixed section ({size} \
                  bytes) and the offset table ({entries} entries) — exceeds the u32 wire \
                  ceiling (the largest fixed section that frame can carry is {max} bytes)"
             )
@@ -5258,7 +5258,7 @@ mod tests {
 
         // Over the u32 wire ceiling: the PRE-EXISTING rejection, on the
         // `Validation` channel. `uint8[1048576]` × 4096 fields sits past
-        // `u32::MAX - 32`; one capped field is not enough, so the file
+        // `u32::MAX - 40`; one capped field is not enough, so the file
         // declares the maximum the YAML parser accepts, repeated.
         let hostile = dir.join("Huge.yaml");
         let mut yaml = String::from("schemas:\n  Huge:\n    fields:\n");
@@ -5411,7 +5411,7 @@ mod tests {
                 cerulion_core::SchemaDoc {
                     qualified: "hostile/Inner".to_string(),
                     encoding: cerulion_core::SchemaEncoding::Msg,
-                    text: "float64[536870907] v\n".to_string(),
+                    text: "float64[536870906] v\n".to_string(),
                     deps: vec![],
                 },
                 cerulion_core::SchemaDoc {
@@ -5609,7 +5609,7 @@ mod tests {
 
     #[test]
     fn render_remote_schema_refuses_a_root_composed_past_the_wire_ceiling() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         let docs = || {
             vec![
                 cerulion_core::SchemaDoc {
@@ -5642,7 +5642,7 @@ mod tests {
             "a root composed past the ceiling takes the verbatim fallback; got:\n{out}"
         );
         assert!(
-            !out.contains("wire fixed size: 4294967264 bytes"),
+            !out.contains("wire fixed size: 4294967256 bytes"),
             "never a size no frame can carry; got:\n{out}"
         );
         let out = render_remote_schema(&cerulion_core::SchemaReply::found(
@@ -5651,7 +5651,7 @@ mod tests {
             docs(),
         ));
         assert!(
-            out.contains("wire fixed size: 4294967256 bytes"),
+            out.contains("wire fixed size: 4294967248 bytes"),
             "one byte under (via the same inlining) renders its exact size; got:\n{out}"
         );
     }

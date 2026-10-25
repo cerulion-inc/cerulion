@@ -557,8 +557,8 @@ pub fn validate_graph_with(
     // Validate max_slice_len is within the wire-format-representable range.
     //
     // Lower bound: `>= WireHeader::SIZE` (the wire frame requires at least the
-    // 32-byte header — a header-only payload like `std_msgs::Empty` whose
-    // `WIRE_FIXED_SIZE = 0` is valid at exactly 32 bytes). Upper bound:
+    // 40-byte header; a header-only payload like `std_msgs::Empty` whose
+    // `WIRE_FIXED_SIZE = 0` is valid at exactly 40 bytes). Upper bound:
     // `<= u32::MAX` (the wire format's `WireHeader::total_size`
     // field is `u32`, so slot sizes above 4 GiB cannot be represented).
     // Failing graph-load surfaces the misconfig with an actionable error
@@ -1398,13 +1398,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 31
+        max_slice_len: 39
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_err(),
-            "max_slice_len: 31 (< WireHeader::SIZE) must fail graph-load"
+            "max_slice_len: 39 (< WireHeader::SIZE) must fail graph-load"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1414,7 +1414,7 @@ nodes:
     }
 
     /// Pin the exact
-    /// floor — `max_slice_len: 32` (exactly `WireHeader::SIZE`) is
+    /// floor: `max_slice_len: 40` (exactly `WireHeader::SIZE`) is
     /// accepted. Mirror of `try_new_accepts_exactly_wire_header_size`
     /// in `max_slice_len_newtype_test.rs`. This is the boundary
     /// (`<`, not `<=`); a future
@@ -1431,13 +1431,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 32
+        max_slice_len: 40
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_ok(),
-            "max_slice_len: 32 (== WireHeader::SIZE) must be accepted (header-only payload). \
+            "max_slice_len: 40 (== WireHeader::SIZE) must be accepted (header-only payload). \
              Error was: {:?}",
             result.err()
         );

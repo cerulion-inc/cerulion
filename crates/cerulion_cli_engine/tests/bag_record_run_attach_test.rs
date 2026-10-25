@@ -114,6 +114,7 @@ fn frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000 + u64::from(seq),
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut buf = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);

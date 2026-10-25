@@ -318,7 +318,7 @@ wrong.
   dependency graph rather than a comment (it also keeps every write on the one
   atomic-secret-write path). Dependency policy: std + serde + dirs + tracing
   ONLY (no transport crates), so it is safe in `default-members`.
-- **`cerulion_wireclient`**: the desk-side `cerulion/wire/1` client substrate
+- **`cerulion_wireclient`**: the desk-side `cerulion/wire/2` client substrate
   (control vocabulary, dial-config parsers, the per-topic re-inject reader). It is
   a crate of its own so that `cerulion_netd` reuses the vocabulary and parsers
   with no netd→connectd cyclic edge: both daemons depend on the substrate rather

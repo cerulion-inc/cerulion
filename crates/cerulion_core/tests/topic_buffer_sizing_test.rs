@@ -1639,7 +1639,10 @@ fn event_caps_cover_every_data_admitted_attacher_on_preexisting_service() {
         .service_builder(&data_name)
         .publish_subscribe::<[u8]>()
         .subscriber_max_buffer_size(4)
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign data service at iceoryx2 defaults (8 subscriber slots)");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "live_subs_test".into(),
@@ -1771,7 +1774,10 @@ fn foreign_typed_service_rejected_with_type_skew_hint() {
     let _foreign = raw_node
         .service_builder(&data_name)
         .publish_subscribe::<u64>()
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign-typed data service");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "type_skew_test".into(),
@@ -2098,7 +2104,10 @@ fn live_derived_event_budget_clamped_at_sanity_bound() {
         .publish_subscribe::<[u8]>()
         .subscriber_max_buffer_size(4)
         .max_subscribers(4200)
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign data service with an unreasonable subscriber count");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "huge_live_test".into(),

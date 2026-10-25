@@ -154,7 +154,7 @@ no entries claims nothing.
 Every size surface (`schema info`'s resolved layout, the gateway's served
 hash bindings, the recorded `wire_fixed_size`, the replay registry and the
 recorder's schema corpus) applies one wire-representability rule: a schema is representable only if
-its smallest frame (the 32-byte wire header, the fixed section, and one
+its smallest frame (the 40-byte wire header, the fixed section, and one
 8-byte offset-table entry per variable field) fits the wire's `u32`
 `total_size`. A definition past that ceiling is refused by `schema info`
 (a `.msg` store definition and a workspace YAML entry alike; the entry is

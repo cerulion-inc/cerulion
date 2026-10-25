@@ -22056,7 +22056,7 @@ fn build_workspace_schema_wire_sizes(
         // bit. It is deliberately the ONE net: a second,
         // conversion-time arm would mask the retain (removing the retain would change
         // nothing observable), whereas its removal TRUNCATES a
-        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967216 — an
+        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967200, an
         // affirmatively wrong descriptor), which is exactly what the
         // unrepresentable-fixed-section test fails on.
         let size = schema.wire_fixed_size() as u32;
@@ -27742,7 +27742,7 @@ nodes:
     #[test]
     fn r29_an_over_ceiling_declaration_is_omitted_by_the_composing_folds_and_influences_no_survivor(
     ) {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         let hostile = tempfile::tempdir().unwrap();
         let control = tempfile::tempdir().unwrap();
         for root in [hostile.path(), control.path()] {
@@ -27822,15 +27822,15 @@ nodes:
     }
     /// Wire-size validation: a
     /// ceiling judging the fixed section alone (`<= u32::MAX`) is wrong, because the frame
-    /// also carries the 32-byte header and one 8-byte offset entry per
+    /// also carries the 40-byte header and one 8-byte offset entry per
     /// variable field, so a fixed section of `u32::MAX` bytes would be recorded
     /// as a descriptor no publisher can emit. Both sides of the boundary on
-    /// the RESOLVED fold: a fixed section exactly at `u32::MAX − 32`
-    /// (`At`) and at `u32::MAX − 40` beside one string (`VarAt`) record
+    /// the RESOLVED fold: a fixed section exactly at `u32::MAX - 40`
+    /// (`At`) and at `u32::MAX - 48` beside one string (`VarAt`) record
     /// their exact sizes; one byte past each (`Over`, `VarOver`) and the
     /// extreme (`Max`, exactly `u32::MAX`) are omitted. Nested
     /// inlining is judged at the resolved moment: `WrapAt` (a `uint8` run
-    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX − 39`)
+    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX - 47`)
     /// records, `WrapOver` (one byte more of run, so padding + inlining
     /// land one past the ceiling) is omitted; `Tight` pins that a reference
     /// resolution INLINES is counted as fixed bytes and never as an offset
@@ -27839,11 +27839,11 @@ nodes:
     /// `msg_store_parity_test`); and `VarNestAt` / `VarNestOver` pin the
     /// RESOLVED moment's EXACT count: `Blob` has a string, so `Blob b` stays
     /// a real offset entry after resolution, which the declared floor would
-    /// not count — at `u32::MAX − 40` it records, one byte more is omitted.
+    /// not count, at `u32::MAX - 48` it records, one byte more is omitted.
     #[cfg(unix)]
     #[test]
     fn r26_the_fold_ceiling_counts_the_header_and_the_offset_table_on_both_sides() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         const VAR_AT: usize = AT - 8;
         let tmp = tempfile::tempdir().unwrap();
         write_store_msg(tmp.path(), "p26", "At", &format!("uint8[{AT}] a\n"));
@@ -27905,9 +27905,9 @@ nodes:
         for (name, size) in [
             ("p26/At", AT),
             ("p26/VarAt", VAR_AT),
-            // AT − 16 = …247, the u64 lands at …248 (align 8), ends …256.
+            // AT - 16 = ...239, the u64 lands at ...240 (align 8), ends ...248.
             ("p26/WrapAt", AT - 7),
-            // AT − 7 = …256, the u32 lands there (align 4), ends …260.
+            // AT - 7 = ...248, the u32 lands there (align 4), ends ...252.
             ("p26/Tight", AT - 3),
             // The still-variable `Blob b` is one entry: the run is the whole
             // fixed section (the reference adds no bytes and no alignment).
@@ -27948,10 +27948,10 @@ nodes:
     fn r12_a_retain_thinned_ambiguity_does_not_resurrect_a_bare_alias() {
         let tmp = tempfile::tempdir().unwrap();
         // `Filler` is representable (~4 GiB, seven bytes under the wire
-        // ceiling `u32::MAX − 32` — a declared-past-u32
+        // ceiling `u32::MAX - 40`, a declared-past-u32
         // ingredient is rejected on every
         // surface); `a9/Type` composes an ARITHMETIC overflow through it.
-        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "a9", "Type", "Filler[8589934592] arr\n");
         write_store_msg(tmp.path(), "b9", "Type", "uint32 a\n");
         std::fs::write(
@@ -28503,7 +28503,7 @@ nodes:
             "Huge",
             "float64[2305843009213693951] v\n",
         );
-        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "nav14", "Outer", "Inner[2] arr\n");
         write_store_msg(tmp.path(), "nav14", "VarOuter", "Inner[2] arr\nstring s\n");
         write_store_msg(tmp.path(), "nav14", "Goal", "float64 x\n");
@@ -28521,7 +28521,7 @@ nodes:
             "schemas:\n  VarY:\n    fields:\n      nav14/Inner[2] arr:\n      string s:\n",
         )
         .unwrap();
-        const INNER_BYTES: u32 = 536_870_907 * 8; // 4_294_967_256 — 7 under u32::MAX − 32
+        const INNER_BYTES: u32 = 536_870_906 * 8; // 4_294_967_248, 7 under u32::MAX - 40
 
         let sizes = build_workspace_schema_wire_sizes(tmp.path());
         for name in ["nav14/Huge", "nav14/Outer", "nav14/VarOuter", "VarY"] {

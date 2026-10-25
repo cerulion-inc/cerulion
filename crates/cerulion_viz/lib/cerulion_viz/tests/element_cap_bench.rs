@@ -354,6 +354,7 @@ fn build_header_plus_array_frame(
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -440,6 +441,7 @@ fn motion_primitive_frame(n: usize) -> Vec<u8> {
         offset_table_count: l.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns: 42_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

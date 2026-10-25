@@ -1144,23 +1144,23 @@ pub(crate) fn variable_schema_listed_tier(qualified_name: &str) -> Option<usize>
         // audit exists to kill. Measured through `CanonicalBodyBuilder`.
         //
         //   autoware LaneletPrimitive   int64 id + a short type string
-        //        ("lane", "crosswalk"): 73 B; x 4 = 292. Breaks only on a
+        //        ("lane", "crosswalk"): 81 B; x 4 = 324. Breaks only on a
         //        ~16 KB `primitive_type` string
         //   autoware LaneletSegment     The preferred primitive plus the
         //        candidates at one route segment. Real roads carry <= 8
-        //        parallel lanelets; at a generous 20 the message is 993 B
-        //        (x 4 = 3,972). Breaks past 362 primitives in ONE segment.
+        //        parallel lanelets; at a generous 20 the message is 1,001 B
+        //        (x 4 = 4,004). Breaks past 361 primitives in ONE segment.
         //        Floor holds at equality — its member LaneletPrimitive is TINY
-        //   vision ObjectHypothesis     A class id string + a score: 80 B at a
-        //        32-char id (x 4 = 320)
+        //   vision ObjectHypothesis     A class id string + a score: 88 B at a
+        //        32-char id (x 4 = 352)
         //   vision ObjectHypothesisWithPose  The same plus a FIXED 344 B
-        //        `PoseWithCovariance`: 432 B (x 4 = 1,728). Floor holds at
+        //        `PoseWithCovariance`: 440 B (x 4 = 1,760). Floor holds at
         //        equality
-        //   vision VisionClass          uint16 + a class name: 106 B at a
-        //        64-char name (x 4 = 424)
+        //   vision VisionClass          uint16 + a class name: 114 B at a
+        //        64-char name (x 4 = 456)
         //   vision VisionInfo           Header + the method + the model
         //        database location + a version. At 512-char paths for BOTH
-        //        strings it is 1,612 B (x 4 = 6,448). Breaks only when the two
+        //        strings it is 1,620 B (x 4 = 6,480). Breaks only when the two
         //        strings together approach 16 KB
         //
         // Each takes a bridged ingress depth of 1024 where the catch-all gave

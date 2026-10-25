@@ -19,8 +19,8 @@ def test_two_publishes_differ_only_in_sequence(session):
     r1 = bytes(f1.raw)
     assert r0[20:24] != r1[20:24]
     assert r0[:20] == r1[:20] and r0[24:] == r1[24:]
-    assert r0 == expected_header_bytes(0xBEEF, 96, 0, 7) + body
-    assert r1 == expected_header_bytes(0xBEEF, 96, 1, 7) + body
+    assert r0 == expected_header_bytes(0xBEEF, 104, 0, 7) + body
+    assert r1 == expected_header_bytes(0xBEEF, 104, 1, 7) + body
     assert pub.sequence == 2
     f0.release()
     f1.release()

@@ -11,7 +11,7 @@
 //! account that grants per-account access, and BOTH demand planes must consult the
 //! SAME `is_allowed(account)` check. The zenoh LAN demand path is UN-gated today; the
 //! iroh WAN plane already gates on `cerulion_remoted::PairingAuthorizer` at the
-//! `cerulion/wire/1` accept. This module installs ONE trait so the LAN plane gains a gate and
+//! `cerulion/wire/2` accept. This module installs ONE trait so the LAN plane gains a gate and
 //! both planes route through one seam, and the account-grant authorizer plugs ONE
 //! `is_allowed`-backed implementation into it without re-plumbing.
 //!
@@ -67,7 +67,7 @@ pub enum DemandSubject {
         /// today (the zenoh demand callbacks do not thread the querier's identity yet).
         locator: Option<String>,
     },
-    /// The iroh WAN demand plane. The demand rides a `cerulion/wire/1` connection whose
+    /// The iroh WAN demand plane. The demand rides a `cerulion/wire/2` connection whose
     /// TLS layer mutually-authenticates a 32-byte ed25519 device key. The
     /// subject carries the **demander's** identity (the party asking for the topic), so
     /// an `is_allowed`-backed authorizer resolves the RIGHT account — NEVER the dial

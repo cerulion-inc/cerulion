@@ -54,8 +54,8 @@ pub struct InputView<'sample, T: ShmMessage + 'sample> {
     sample: SampleHandle<'sample>,
 
     /// SHM-backed reader — the codegen-emitted `<Name><'sample>` type.
-    /// Constructed from `&'sample [u8]` over `[32..total_size]` of the
-    /// sample's payload (after the 32-byte WireHeader).
+    /// Constructed from `&'sample [u8]` over `[WireHeader::SIZE..total_size]` of the
+    /// sample's payload (after the 40-byte WireHeader).
     reader: T::Reader<'sample>,
 
     /// The frame's wire header, as the checks that admitted the frame parsed it.
@@ -165,7 +165,7 @@ impl<'sample, T: ShmMessage + 'sample> std::ops::Deref for InputView<'sample, T>
 /// total_size)` within `raw`, which the caller may slice without further
 /// checks. Refuses, in this order:
 ///
-/// * a frame shorter than the 32-byte header, which has no header to read;
+/// * a frame shorter than the 40-byte header, which has no header to read;
 /// * a header the reader cannot parse;
 /// * a `schema_hash` that is not `T::SCHEMA_HASH`, which means the two ends
 ///   disagree about the message's fields and the frame would be MISREAD rather
@@ -212,7 +212,7 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
         });
     }
     // 8 is the wire format's own alignment: [`WireHeader`] is
-    // `#[repr(C, align(8))]`, the header is exactly 32 bytes so a payload
+    // `#[repr(C, align(8))]`, the header is exactly 40 bytes so a payload
     // starts 8-aligned whenever the frame does, and 8 bytes is the widest
     // primitive a generated fixed section holds.
     const WIRE_ALIGN: usize = 8;
@@ -233,7 +233,7 @@ pub(crate) fn validate_wire_frame<T: ShmMessage>(
 /// so a frame the typed path refuses is refused by the raw path too, for the
 /// same reason and with the same words.
 ///
-/// Parses the 32-byte header exactly once and returns it with the payload
+/// Parses the 40-byte header exactly once and returns it with the payload
 /// range `[WireHeader::SIZE, total_size)`; every later consumer of the header
 /// on this read (the service cursor, the host that needs the schema hash)
 /// takes this copy instead of re-reading the bytes. Refuses, in this order:

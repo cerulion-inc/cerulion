@@ -15,14 +15,15 @@ use crate::wire::WireHeader;
 /// `OutputProxy` path produces for the same field values (pinned by
 /// `dynamic_generated_parity_test`):
 ///
-/// - `[0, 32)` - [`WireHeader`]: `schema_hash`, `total_size`,
-///   `offset_table_offset = 32 + fixed_size`, `offset_table_count`,
-///   `sequence` (0 unless [`FrameCursor::set_sequence`]), `timestamp_ns`.
-/// - `[32, 32 + fixed_size)` - the fixed section; `#[repr(C)]` padding is
+/// - `[0, 40)` - [`WireHeader`]: `schema_hash`, `total_size`,
+///   `offset_table_offset = 40 + fixed_size`, `offset_table_count`,
+///   `sequence` (0 unless [`FrameCursor::set_sequence`]), `timestamp_ns`,
+///   `step_tag` (untagged).
+/// - `[40, 40 + fixed_size)` - the fixed section; `#[repr(C)]` padding is
 ///   zero.
 /// - the offset table - one little-endian `(u32 offset, u32 length)` pair per
 ///   variable field, in declaration order; `offset` is payload-relative
-///   (from byte 32).
+///   (from byte 40).
 /// - variable payloads in declaration order, each placed at the running
 ///   cursor aligned up to [`variable_payload_align`] of its type (2/4/8 for
 ///   primitive arrays, 1 otherwise), alignment padding zero.
@@ -133,6 +134,7 @@ impl<'l> FrameEncoder<'l> {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence: 0,
             timestamp_ns,
+            step_tag: crate::wire::StepTag::UNTAGGED,
         }
         .write_to_buf(frame);
         Ok(FrameCursor {
