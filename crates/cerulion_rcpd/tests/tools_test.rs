@@ -519,6 +519,11 @@ async fn a_second_daemon_on_the_same_receipt_log_is_refused() {
     let receipts = dir.path().join("log.jsonl");
     let mgr = manager("lock");
     let first = open_host(&mgr, &loaded, &receipts).expect("first daemon");
+    let names: Vec<String> = first.list().iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        names.iter().any(|n| n == ESTOP_CLEAR_TOOL),
+        "a host built without with_estop_clear serves estop_clear: {names:?}"
+    );
     let second = open_host(&mgr, &loaded, &receipts);
     let Err(RcpdError::Receipts { reason, .. }) = second else {
         panic!("a second daemon must be refused");
