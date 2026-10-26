@@ -188,7 +188,8 @@ pub fn response_line(text: &str) -> Result<&str, VerbError> {
         || serde_json::from_str::<Value>(text).is_err()
     {
         return Err(VerbError::Internal(
-            "the robot's response text is not one line of JSON".to_string(),
+            "the robot's response text is not one line of JSON free of control characters"
+                .to_string(),
         ));
     }
     Ok(text)

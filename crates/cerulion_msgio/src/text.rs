@@ -424,8 +424,20 @@ fn json_number(n: &Number) -> String {
     }
 }
 
+/// `s` as a JSON string, with DEL and the C1 controls (U+007F to U+009F)
+/// escaped as `\u` sequences beside the C0 escapes serde_json writes, so
+/// the text holds no raw control character.
 fn json_string(s: &str) -> String {
-    serde_json::Value::String(s.to_string()).to_string()
+    let quoted = serde_json::Value::String(s.to_string()).to_string();
+    let mut out = String::with_capacity(quoted.len());
+    for c in quoted.chars() {
+        if ('\u{7f}'..='\u{9f}').contains(&c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -629,6 +641,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back, r#"{"data":"a\"b\nc"}"#);
+    }
+
+    #[test]
+    fn json_strings_escape_del_and_c1_controls() {
+        let w = walker(&[]);
+        let frame =
+            message_frame(&w, "std_msgs/String", "data: \"a\\x7Fb\\u009Bc\"", 0).unwrap();
+        let back = body_to_json(
+            &w,
+            w.schema_hash_for("std_msgs/String").unwrap(),
+            body(&frame),
+        )
+        .unwrap();
+        assert_eq!(back, r#"{"data":"a\u007fb\u009bc"}"#);
+        assert!(!back.chars().any(char::is_control));
+        let parsed: serde_json::Value = serde_json::from_str(&back).unwrap();
+        assert_eq!(parsed["data"], "a\u{7f}b\u{9b}c");
     }
 
     #[test]

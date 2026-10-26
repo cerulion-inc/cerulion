@@ -18,8 +18,9 @@
 //! `service call` and `topic snapshot` run on a desk.
 //!
 //! `topic-publish` and `service-call` check only the e-stop, not the control
-//! lease: they are refused while the robot's e-stop is engaged, and a publish stops before its next frame when the e-stop
-//! engages; a topic under the reserved `/__cerulion` namespace is refused.
+//! lease: they are refused while the robot's e-stop is engaged, and a
+//! publish stops at its next check when the e-stop engages. A topic under
+//! the reserved `/__cerulion` namespace is refused.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the
 //! error's class (`usage: `, `encode: `, `unavailable: `, `internal: `,
@@ -257,8 +258,9 @@ impl VerbHandler for TopicPublishVerb {
             rate_hz,
             wait_subscribers: wait,
         };
-        // The publish loop polls this flag between frames; a watcher thread
-        // clears it when the e-stop engages, and stops when `_stop` drops.
+        // The publish loop polls this flag in the subscriber wait, between
+        // frames and in the linger; a watcher thread clears it when the e-stop
+        // engages, and stops when `_stop` drops.
         let running = Arc::new(AtomicBool::new(true));
         let done = Arc::new(AtomicBool::new(false));
         let watcher = {
