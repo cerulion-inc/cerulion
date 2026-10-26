@@ -27,6 +27,7 @@
 pub mod chain;
 pub mod config;
 pub mod drain_latch;
+pub mod executor;
 pub mod launch_args;
 pub mod node;
 pub mod param_resume;
@@ -58,6 +59,10 @@ pub use chain::{
 };
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
+};
+pub use executor::{
+    derive_units, executor_couplings, expand_process_groups, Coupling, CouplingKind, ExecutorUnit,
+    UnitPlan,
 };
 pub use launch_args::{
     parse_graph_as_written, parse_graph_with_launch_args, parse_override, resolve_args,
