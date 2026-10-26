@@ -510,7 +510,8 @@ pub fn peer_is_same_user(stream: impl AsFd) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn euid() -> u32 {
+#[doc(hidden)]
+pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

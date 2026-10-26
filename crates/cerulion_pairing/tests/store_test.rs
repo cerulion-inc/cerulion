@@ -691,6 +691,29 @@ fn code_pairing_persists_a_row_given_a_valid_witness() {
 }
 
 #[test]
+fn a_code_pairing_of_the_owner_account_is_refused_and_the_owner_row_is_unchanged() {
+    let mut s = store();
+    s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let before = s.access_rows().to_vec();
+    let err = s
+        .establish_code_pairing(
+            &code_confirm(acct(OWNER)),
+            acct(OWNER),
+            "same account".into(),
+            Scope::CODE_PAIR_DEFAULT,
+            T_NOW + 1,
+        )
+        .unwrap_err();
+    assert!(matches!(err, PairingError::CodePairOwnerAccount), "{err:?}");
+    assert_eq!(s.access_rows(), before.as_slice());
+    assert_eq!(
+        s.is_allowed(&acct(OWNER), T_NOW + 1).unwrap().scope,
+        Scope::OWNER_FULL
+    );
+}
+
+#[test]
 fn a_witness_for_one_account_cannot_establish_another() {
     // A confirmation for GUEST cannot be replayed to persist OWNER.
     let mut s = store();

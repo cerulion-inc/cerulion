@@ -3,6 +3,10 @@
 //! REAL `cerulion_accountd` router on an ephemeral port (Principle #13: no mock
 //! service — the actual A2 `POST /v1/robots` issuer serves every request).
 //!
+//! Process-test prerequisites: `cargo build -p cerulion_cli --bin cerulion
+//! -p cerulion_remoted --bin cerulion-remoted`. Relay-disabled process tests
+//! open no discovery or public relay connection.
+//!
 //! Each test spins the real account-service router, drives the blocking
 //! [`login_cmd::run_login`] to a real session (authorizing the device code
 //! out-of-band via the magic-link seam), then calls
@@ -257,4 +261,323 @@ fn register_robot_with_a_bad_session_is_refused_and_names_login() {
         msg.contains("cerulion login"),
         "the refusal names the fix: {msg}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn first_serve_registration_survives_offline_restart_and_rejects_account_switch() {
+    use cerulion_cli_engine::{auth, robot_bootstrap};
+    use cerulion_pairing::format::{PublicKey, RobotId, RootSet};
+    use cerulion_pairing::verify::{PairingPresentation, TrustStore};
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let state = login(port, &email);
+    let root = home_path.join("robot-state");
+    let prepared =
+        robot_bootstrap::prepare(&root).expect("real account service registers first serve");
+    assert_eq!(
+        prepared.owner_account,
+        hex::encode(URL_SAFE_NO_PAD.decode(&state.account_id).unwrap())
+    );
+    let bytes = std::fs::read(&prepared.registration_bundle).unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        bundle.get("device_seed").is_none(),
+        "the handoff never duplicates a key seed"
+    );
+    assert_eq!(
+        bundle["device_key_file"],
+        home_path.join("desk.key").to_str().unwrap()
+    );
+    let decode = |field: &str| hex::decode(bundle[field].as_str().unwrap()).unwrap();
+    let roots: RootSet = postcard::from_bytes(&decode("root_set_postcard")).unwrap();
+    let robot = RobotId(hex::decode(&prepared.robot_id).unwrap().try_into().unwrap());
+    let key = PublicKey(
+        hex::decode(&prepared.endpoint_id)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let now = auth::now_unix_ns();
+    let mut trust = TrustStore::provision(robot, key, roots, &[0x37; 32], now).unwrap();
+    let presentation = PairingPresentation {
+        intermediate: postcard::from_bytes(&decode("intermediate_postcard")).unwrap(),
+        device_cert: postcard::from_bytes(&decode("device_cert_postcard")).unwrap(),
+        grant: postcard::from_bytes(&decode("owner_grant_postcard")).unwrap(),
+        delegation: None,
+    };
+    trust
+        .claim_by_owner_grant(&presentation, &key, now)
+        .expect("bundle verifies through production owner claim");
+    assert!(trust.is_claimed());
+
+    let mut expired = state.clone();
+    expired.expires_at_ns = 0;
+    auth::write_to(&home_path.join("auth.json"), &expired).unwrap();
+    let _offline = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
+    assert_eq!(
+        robot_bootstrap::prepare(&root).unwrap(),
+        prepared,
+        "restart must need no cloud refresh"
+    );
+    assert_eq!(
+        std::fs::read(&prepared.registration_bundle).unwrap(),
+        bytes,
+        "offline restart makes no registration write"
+    );
+
+    expired.account_id = URL_SAFE_NO_PAD.encode([0x79; 32]);
+    auth::write_to(&home_path.join("auth.json"), &expired).unwrap();
+    assert!(robot_bootstrap::prepare(&root)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match"));
+    assert_eq!(
+        std::fs::read(&prepared.registration_bundle).unwrap(),
+        bytes,
+        "account switch cannot rewrite the robot owner"
+    );
+}
+
+#[cfg(unix)]
+fn built_binary(name: &str) -> std::path::PathBuf {
+    let current = std::env::current_exe().unwrap();
+    let path = current.parent().unwrap().parent().unwrap().join(name);
+    assert!(
+        path.is_file(),
+        "build the real process fixture first: {}",
+        path.display()
+    );
+    path
+}
+
+#[cfg(unix)]
+struct ProcessGuard(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn bounded_output(command: &mut std::process::Command) -> std::process::Output {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ProcessGuard(command.spawn().expect("start real worker"));
+    let status = wait_for(|| child.0.try_wait().unwrap(), Duration::from_secs(15))
+        .expect("worker exited within its test deadline");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    use std::io::Read;
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn real_background_worker_refuses_missing_login_without_interactive_flow() {
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("bootstrap-robot")
+            .arg("--state-root")
+            .arg(home.join("robot-state"))
+            .env("CERULION_HOME", &home)
+            .env("CERULION_LOGIN_GATE", "1")
+            .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "failure cannot impersonate a machine result"
+    );
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("run `cerulion login` before serving a robot"),
+        "{error}"
+    );
+    assert!(!home.join("auth.json").exists());
+    assert!(!home.join("desk.key").exists());
+    assert!(!home.join("robot-state").exists());
+    let help = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("--help")
+            .env("CERULION_HOME", &home),
+    );
+    assert!(help.status.success());
+    assert!(!String::from_utf8(help.stdout)
+        .unwrap()
+        .contains("bootstrap-robot"));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_offline() {
+    use cerulion_cli_engine::{auth, robot_bootstrap::BootstrapPrepared};
+    use cerulion_pairing::format::AccountId;
+    use cerulion_pairing::verify::TrustStore;
+    use std::process::{Command, Stdio};
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let state = login(port, &email);
+    let root = home.join("robot-state");
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("bootstrap-robot")
+            .arg("--state-root")
+            .arg(&root)
+            .env("CERULION_LOGIN_GATE", "1"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let prepared: BootstrapPrepared = serde_json::from_slice(&output.stdout).unwrap();
+    let writer = bounded_output(
+        Command::new(built_binary("cerulion-remoted"))
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--provision-bundle")
+            .arg(&prepared.registration_bundle),
+    );
+    assert!(
+        writer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&writer.stdout).unwrap();
+    assert_eq!(result["version"], 1);
+    assert_eq!(result["robot_id"], prepared.robot_id);
+    assert_eq!(result["endpoint_id"], prepared.endpoint_id);
+    assert_eq!(result["owner_account"], prepared.owner_account);
+    let remoted = root.join("remoted");
+    let mac = std::fs::read(remoted.join("trust_store.mac_key")).unwrap();
+    let trust = TrustStore::load(remoted.join("trust_store"), &mac).unwrap();
+    assert!(trust.is_claimed());
+    assert_eq!(
+        trust.owner(),
+        Some(AccountId(
+            URL_SAFE_NO_PAD
+                .decode(&state.account_id)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        ))
+    );
+    assert_eq!(
+        hex::encode(trust.robot_transport_key().0),
+        prepared.endpoint_id
+    );
+
+    // Prove the actual server can load the files and bind the registered key.
+    // Empty relay configuration has no public discovery or relay side effects.
+    let mut server = ProcessGuard(
+        Command::new(built_binary("cerulion-remoted"))
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--relay-disabled")
+            .env_remove("CERULION_NETWORK")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(home.join("server.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let facts = wait_for(
+        || {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "server exited before binding"
+            );
+            std::fs::read(remoted.join("beacon_facts.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("real server bound and published facts");
+    assert_eq!(facts["eid"], prepared.endpoint_id);
+    assert_eq!(facts["claimable"], "0");
+    assert!(facts["iroh_port"].as_u64().is_some_and(|port| port > 0));
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+
+    // With the issuer unreachable and the login token expired, both actual
+    // workers still accept the already committed same-account ownership.
+    let before = std::fs::read(remoted.join("trust_store")).unwrap();
+    let mut expired = state;
+    expired.expires_at_ns = 0;
+    auth::write_to(&home.join("auth.json"), &expired).unwrap();
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("bootstrap-robot")
+            .arg("--state-root")
+            .arg(&root)
+            .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cached: BootstrapPrepared = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cached, prepared);
+    let writer = bounded_output(
+        Command::new(built_binary("cerulion-remoted"))
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--provision-bundle")
+            .arg(&prepared.registration_bundle),
+    );
+    assert!(
+        writer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert_eq!(std::fs::read(remoted.join("trust_store")).unwrap(), before);
 }

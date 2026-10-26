@@ -176,7 +176,7 @@ pub async fn serve_endpoint(
         shared,
         lease,
         sessions,
-        RemotedClock::wall(),
+        access_clock.clone(),
         &config.receipt_file,
         config.log_root.clone(),
         "cerulion-remoted",
@@ -198,7 +198,8 @@ pub async fn serve_endpoint(
     let robot = cerulion_core::graph::robot_identity_from_env();
     let base = match manager {
         Some(m) => WirePlane::with_manager(robot, m),
-        None => WirePlane::lazy(robot),
+        None => WirePlane::lazy(robot)
+            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
     };
     //
     // Install the epoch-sync sink on the SAME plane (this line is the wiring
@@ -357,7 +358,8 @@ pub async fn handle_accepted_with_wire(
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
 ) {
-    let decision = classify.classify_accept(&accepted.alpn, accepted.remote_id.as_bytes());
+    let (decision, unpaired) = classify
+        .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
     tracing::info!(
         remote_id = %accepted.remote_id,
         alpn = %String::from_utf8_lossy(&accepted.alpn),
@@ -383,7 +385,7 @@ pub async fn handle_accepted_with_wire(
     // ── The wire-ALPN dispatch arm ──────────────────────────
     if matches!(decision, AcceptDecision::WireAdmit) {
         if let Some(plane) = wire {
-            crate::wire::serve_wire_connection(accepted.connection, plane).await;
+            crate::wire::serve_wire_connection(accepted.connection, plane, classify).await;
             return;
         }
         // WireAdmit but no wire plane wired (ops-only builds + the
@@ -395,7 +397,7 @@ pub async fn handle_accepted_with_wire(
     // the QUIC handshake then stalls must not hold this task + connection forever.
     match tokio::time::timeout(
         HANDSHAKE_DEADLINE,
-        report_decision(&accepted.connection, &decision),
+        report_decision(&accepted.connection, &decision, unpaired),
     )
     .await
     {
@@ -425,17 +427,62 @@ pub async fn handle_accepted_with_wire(
 async fn report_decision(
     connection: &Connection,
     decision: &AcceptDecision,
+    unpaired: bool,
 ) -> Result<(), LinkError> {
     let (mut send, mut recv) = accept_frame_stream(connection).await?;
     // Drain the peer's hello (its presence is what fired accept_bi).
     let _ = read_frame(&mut recv, MAX_HELLO_LEN).await?;
     // The decision is small structured JSON; serialization cannot fail for it.
-    let bytes = serde_json::to_vec(decision).unwrap_or_default();
+    let bytes = admission_payload(decision, unpaired);
     write_frame(&mut send, &bytes).await?;
     let _ = send.finish();
     // Hold the connection until the peer finishes (EOF) so the reply is delivered.
     let _ = read_frame(&mut recv, MAX_HELLO_LEN).await;
     Ok(())
+}
+
+fn admission_payload(decision: &AcceptDecision, unpaired: bool) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Reply<'a> {
+        #[serde(flatten)]
+        decision: &'a AcceptDecision,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admission_code: Option<&'static str>,
+    }
+    let admission_code =
+        (unpaired && matches!(decision, AcceptDecision::Refuse { .. })).then_some("unpaired");
+    serde_json::to_vec(&Reply {
+        decision,
+        admission_code,
+    })
+    .expect("admission reply contains only JSON-compatible fields")
+}
+
+#[cfg(test)]
+mod admission_reply_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_explicit_unpaired_refusal_carries_the_retry_code() {
+        let refused = AcceptDecision::Refuse {
+            reason: "access refused".into(),
+        };
+        assert_eq!(
+            admission_payload(&refused, true),
+            br#"{"decision":"refuse","reason":"access refused","admission_code":"unpaired"}"#,
+        );
+        for decision in [
+            refused,
+            AcceptDecision::WireAdmit,
+            AcceptDecision::OpsBootstrapOnly,
+        ] {
+            let reply = admission_payload(&decision, false);
+            let value: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+            assert!(value.get("admission_code").is_none());
+        }
+        let admitted = admission_payload(&AcceptDecision::WireAdmit, true);
+        assert_eq!(admitted, br#"{"decision":"wire_admit"}"#);
+    }
 }
 
 /// Load the device key, trust store, and device→account side-map from disk.

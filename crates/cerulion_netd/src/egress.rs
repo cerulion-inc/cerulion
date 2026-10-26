@@ -176,6 +176,13 @@ impl std::error::Error for EgressError {
 /// on release / disconnect. `Send + Sync`: shared across the daemon's per-connection
 /// threads.
 pub trait EgressPlane: Send + Sync {
+    /// Read only this plane's accumulated metadata. No gateway boot, network query,
+    /// mirror registration or discovery occurs here. A plane without metadata
+    /// reports an error instead of a positive empty snapshot.
+    fn serving_schema_snapshot(&self) -> Result<crate::protocol::ServingSchemaSnapshot, String> {
+        Err("this daemon has no local serving-schema provider".to_string())
+    }
+
     /// Ensure `plan`'s produced topics are registered and egress-on-demand on the
     /// machine's shared session. Topic announce tokens are declared when LAN access
     /// permits them. On the FIRST call this BOOTS the embedded gateway;
@@ -539,6 +546,14 @@ impl GatewayEgressPlane {
         self.beacon.decision()
     }
 
+    /// Refresh existing mDNS endpoint facts without restarting the LAN gateway.
+    pub fn refresh_robot_beacon(
+        &self,
+        expected_eid: &str,
+    ) -> Result<bool, cerulion_mdns::MdnsError> {
+        self.beacon.refresh_robot_facts(expected_eid)
+    }
+
     /// The shared transport manager (diagnostics / the daemon's shutdown drop).
     pub fn manager(&self) -> &Arc<TransportManager> {
         &self.manager
@@ -832,6 +847,20 @@ impl GatewayEgressPlane {
 impl EgressPlane for GatewayEgressPlane {
     fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
         self.manager.network().map(|network| network.lan_access())
+    }
+
+    fn serving_schema_snapshot(&self) -> Result<crate::protocol::ServingSchemaSnapshot, String> {
+        let schema_serving = self
+            .accumulated_serving
+            .try_lock()
+            .map_err(|error| format!("local serving metadata unavailable: {error}"))?
+            .clone();
+        let ix_config_json = serde_json::to_string(&self.manager.iox_config())
+            .map_err(|error| format!("cannot serialize serving namespace: {error}"))?;
+        Ok(crate::protocol::ServingSchemaSnapshot {
+            schema_serving,
+            ix_config_json,
+        })
     }
 
     fn register_egress(
