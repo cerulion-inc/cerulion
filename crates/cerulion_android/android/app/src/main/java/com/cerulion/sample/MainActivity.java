@@ -104,6 +104,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        CerulionRuntime.loadLibrary("cerulion_android");
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
         if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);

@@ -53,10 +53,27 @@ public final class JniSmoke {
         throw new AssertionError("timed out waiting for the host lifecycle to settle");
     }
 
+    private static String illegalState(Runnable call) {
+        try {
+            call.run();
+            return "no-exception";
+        } catch (IllegalStateException error) {
+            return error.getMessage();
+        }
+    }
+
     public static void main(String[] args) throws Exception {
+        System.out.println("status-before-load="
+                + illegalState(() -> CerulionRuntime.status()));
+        CerulionRuntime.loadLibrary(args[1]);
+        System.out.println("load-again=" + illegalState(() -> CerulionRuntime.loadLibrary(args[1])));
+        System.out.println("load-other="
+                + illegalState(() -> CerulionRuntime.loadLibrary("other_runtime")));
         System.out.println("status-before-init=" + state(CerulionRuntime.status()));
         System.out.println("init-bad=" + CerulionRuntime.init(args[0] + "/missing", "jni-test"));
         System.out.println("init-ok=" + CerulionRuntime.init(args[0], "jni-test"));
+        String initStatus = CerulionRuntime.status();
+        System.out.println("linked-nodes=" + initStatus.contains("\"linked_nodes\":[]"));
         System.out.println("publish-before-start="
                 + CerulionRuntime.publish("/jni/heartbeat", "{\"data\":\"before\"}"));
 
