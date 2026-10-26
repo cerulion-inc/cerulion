@@ -474,8 +474,9 @@ on the schema hash. In every run the probe's ingress must lose no frame to a
 decode error, a local re-injection failure or its own LAN posture. No host
 network daemon runs while the probe does, so the app is the only peer that can
 answer its demand or send it a frame, and the verdict fails a run with more
-acks than demand passes (a second peer answering). The probe's argument
-errors are checked before the device is used.
+acks than demand passes (a second peer answering). Before the device is used,
+the probe must refuse each bad argument and a connect endpoint its session
+cannot open, with exit code 1 and no report.
 `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
 `tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
 locally with a booted API 30 emulator:

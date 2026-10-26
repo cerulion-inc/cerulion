@@ -110,10 +110,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }),
         ..Default::default()
     })?;
-    manager
+    let network = manager
         .network()
-        .ok_or("the probe's transport has no network")?
-        .set_lan_access(LanAccess::Open);
+        .ok_or("the probe's transport has no network")?;
+    network.set_lan_access(LanAccess::Open);
+    // The zenoh session opens lazily, on its first use. Open it here, so a
+    // connect endpoint it cannot take fails with this message before the
+    // probe builds anything on it.
+    network
+        .session()
+        .map_err(|error| format!("the probe's session did not open: {error}"))?;
     let subscriber = manager.create_subscriber(&args.topic)?;
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowList(vec![]),

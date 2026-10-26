@@ -134,20 +134,20 @@ host_echo() {
 }
 PROBE="$ROOT/target/debug/android-e2e-demand-probe"
 PROBE_ENDPOINT=tcp/127.0.0.1:7683
-# probe_argument_error WANT ARG...: the probe refuses a bad argument before it
-# opens a session, so this needs no device: exit 1, WANT in its output, and no
-# report line.
-probe_argument_error() {
-  local want=$1 rc=0 out
-  shift
+# probe_refuses LABEL WANT ARG...: the probe refuses a bad argument, or an
+# endpoint its session cannot open, before it demands anything, so this needs
+# no device: exit 1, WANT in its output, and no report line.
+probe_refuses() {
+  local label=$1 want=$2 rc=0 out
+  shift 2
   out="$(host_capture timeout 10 "${HOST_ENV[@]}" "$PROBE" "$@")" || rc=$?
-  (( rc == 1 )) || fail "probe argument errors" "rc=$rc args=$* output=$out"
-  grep -Fq -- "$want" <<<"$out" ||
-    fail "probe argument errors" "args=$* expected '$want' output=$out"
+  (( rc == 1 )) || fail "$label" "rc=$rc args=$* output=$out"
+  grep -Fq -- "$want" <<<"$out" || fail "$label" "args=$* expected '$want' output=$out"
   if grep -q '^demand_probe ' <<<"$out"; then
-    fail "probe argument errors" "args=$* printed a report: $out"
+    fail "$label" "args=$* printed a report: $out"
   fi
 }
+probe_argument_error() { probe_refuses "probe argument errors" "$@"; }
 # run_probe LABEL EXPECT SCHEMA FILE: one direct data demand for the heartbeat
 # over a 10 s window, judged by android_e2e_probe_verdict.sh. `topic echo`
 # reads the catalog before it demands data; the probe demands without one.
@@ -239,6 +239,10 @@ probe_argument_error "window 'ten' is not a whole number of seconds" "$PROBE_END
 probe_argument_error 'window must be at least one second' "$PROBE_ENDPOINT" /app/heartbeat \
   std_msgs/String 0
 pass "probe argument errors" "cases=6 rc=1 no report"
+# A connect endpoint zenoh cannot parse: the probe's session does not open.
+probe_refuses "probe setup error" "the probe's session did not open" not-an-endpoint \
+  /app/heartbeat std_msgs/String 1
+pass "probe setup error" "rc=1 no report"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
 # The busy-device check runs BEFORE any rm or force-stop: a device that is
