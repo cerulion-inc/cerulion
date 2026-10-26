@@ -1478,6 +1478,7 @@ name = "cerulion_device"
 version = "1.0.0"
 dependencies = [
  "libc",
+ "libloading",
  "thiserror 2.0.17",
  "tracing",
 ]

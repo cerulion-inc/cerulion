@@ -6,7 +6,9 @@ use crate::backend::BackendKind;
 /// Why a device operation refused or failed.
 ///
 /// A backend that cannot run on this machine reports [`Self::LibraryNotFound`]
-/// or [`Self::NoDevice`] from its `probe`. Every later failure names the
+/// or [`Self::NoDevice`] from its `probe` (HIP also reports
+/// [`Self::Unsupported`] for a runtime major whose attribute numbers were
+/// not checked). Every later failure names the
 /// backend and the call that failed, so a mid-run driver error is never
 /// mistaken for an absent GPU.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

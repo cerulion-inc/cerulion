@@ -203,10 +203,10 @@ TF_EXCLUDE=""
 
 # cerulion_device/src: the address translation a GPU publish or receive runs
 # per message (`SegmentRegistry::device_address`, in segment.rs) and the
-# value types it returns (backend.rs). The rest is cold: error values
-# (error.rs) and the copy-based backend (host_shm.rs), whose constructor
-# builds its name once.
-DEVICE_EXCLUDE="error.rs host_shm.rs"
+# value types it returns (backend.rs). The rest is cold: driver probing and
+# library loading (cuda.rs, hip.rs, metal.rs, loader.rs, error.rs) and the
+# copy-based oracle backend (host_shm.rs), whose probe builds its name once.
+DEVICE_EXCLUDE="cuda.rs error.rs hip.rs host_shm.rs loader.rs metal.rs"
 
 TARGETS=(
     "crates/cerulion_core/src/transport|$TRANSPORT_EXCLUDE"

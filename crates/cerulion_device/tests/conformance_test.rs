@@ -3,16 +3,19 @@
 //! backend that probes on this machine.
 //!
 //! HostShm always runs, so CI exercises the suite on every platform. A
-//! backend that does not probe is reported as SKIP on stderr and does not
-//! run. Set `CERULION_DEVICE_REQUIRE` to a comma list of backend names to
-//! make a missing backend a failure; a name this build has no backend for
-//! fails too. That is how a hardware run proves a backend ran, not just
-//! that nothing failed.
+//! vendor backend whose library or device is absent is reported as SKIP on
+//! stderr and does not run. Set `CERULION_DEVICE_REQUIRE` to a comma list of
+//! backend names (`cuda,metal`) to make a missing backend a failure. That is
+//! how a hardware run proves a backend ran, not just that nothing failed.
 //!
 //! Each check registers a real POSIX shared-memory object, the kind of
-//! mapping the transport hands out, and moves bytes through the backend's
-//! copy path. One check compares each handed-out address with an oracle:
-//! the host address itself on HostShm. The cross-process check maps the object read-only in a child process, as a
+//! mapping the transport hands out, and moves bytes through the DEVICE's
+//! copy path (`cuMemcpyDtoH` on CUDA, a blit on Metal). A copy alone does
+//! not prove the translation (the CUDA driver also resolves a registered
+//! host pointer), so one check compares each handed-out address with an
+//! oracle: the host address on HostShm, the driver's own
+//! `cuPointerGetAttribute` answer on CUDA, the byte offset on Metal. The
+//! cross-process check maps the object read-only in a child process, as a
 //! subscriber does, and reads it through the device there.
 //!
 //! ```bash
@@ -24,8 +27,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use cerulion_device::{
-    Access, BackendKind, DeviceAddress, DeviceBackend, DeviceError, Fence, HostShm,
-    SegmentRegistry, Stream,
+    Access, BackendKind, Cuda, DeviceAddress, DeviceBackend, DeviceError, Fence, Hip, HostShm,
+    Metal, SegmentRegistry, Stream,
 };
 
 /// The bytes every check writes: a fixed function of the index, so any
@@ -167,7 +170,12 @@ fn required() -> Vec<String> {
 /// Every backend that probes here, plus a SKIP line for each that does not.
 fn backends() -> Vec<Arc<dyn DeviceBackend>> {
     let required = required();
-    let probes: [(BackendKind, Probe); 1] = [(BackendKind::HostShm, Ok(Arc::new(HostShm::new())))];
+    let probes: [(BackendKind, Probe); 4] = [
+        (BackendKind::HostShm, Ok(Arc::new(HostShm::new()))),
+        (BackendKind::Cuda, Cuda::probe(0).map(|b| Arc::new(b) as _)),
+        (BackendKind::Hip, Hip::probe(0).map(|b| Arc::new(b) as _)),
+        (BackendKind::Metal, Metal::probe().map(|b| Arc::new(b) as _)),
+    ];
     // A required name with no probe row in this build would otherwise never
     // be checked, and the run would pass without it.
     for name in &required {
@@ -256,6 +264,44 @@ fn the_device_reads_what_the_cpu_wrote_at_every_offset() {
     }
 }
 
+/// The CUDA driver's own answer for the device alias of a registered host
+/// address: `cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_DEVICE_POINTER)`,
+/// called through a separate dlopen with device 0's primary context
+/// current. It shares no code with the backend's translation, which reads
+/// `cuMemHostGetDevicePointer` once at the segment base and adds offsets.
+fn cuda_driver_alias(host: usize) -> u64 {
+    type Res = libc::c_int;
+    type Ctx = *mut libc::c_void;
+    /// `CU_POINTER_ATTRIBUTE_DEVICE_POINTER` from cuda.h.
+    const DEVICE_POINTER: libc::c_int = 3;
+    // SAFETY: the declarations match cuda.h; every out-pointer is a live
+    // local; the push and pop are paired on this thread.
+    unsafe {
+        let lib = libloading::Library::new("libcuda.so.1").expect("libcuda.so.1");
+        let retain: libloading::Symbol<unsafe extern "C" fn(*mut Ctx, libc::c_int) -> Res> =
+            lib.get(b"cuDevicePrimaryCtxRetain\0").unwrap();
+        let release: libloading::Symbol<unsafe extern "C" fn(libc::c_int) -> Res> =
+            lib.get(b"cuDevicePrimaryCtxRelease_v2\0").unwrap();
+        let push: libloading::Symbol<unsafe extern "C" fn(Ctx) -> Res> =
+            lib.get(b"cuCtxPushCurrent_v2\0").unwrap();
+        let pop: libloading::Symbol<unsafe extern "C" fn(*mut Ctx) -> Res> =
+            lib.get(b"cuCtxPopCurrent_v2\0").unwrap();
+        let get: libloading::Symbol<
+            unsafe extern "C" fn(*mut libc::c_void, libc::c_int, u64) -> Res,
+        > = lib.get(b"cuPointerGetAttribute\0").unwrap();
+        let mut ctx: Ctx = std::ptr::null_mut();
+        assert_eq!(retain(&mut ctx, 0), 0, "cuDevicePrimaryCtxRetain");
+        assert_eq!(push(ctx), 0, "cuCtxPushCurrent_v2");
+        let mut alias = 0u64;
+        let code = get((&mut alias as *mut u64).cast(), DEVICE_POINTER, host as u64);
+        let mut popped: Ctx = std::ptr::null_mut();
+        assert_eq!(pop(&mut popped), 0, "cuCtxPopCurrent_v2");
+        assert_eq!(release(0), 0, "cuDevicePrimaryCtxRelease_v2");
+        assert_eq!(code, 0, "cuPointerGetAttribute(DEVICE_POINTER, {host:#x})");
+        alias
+    }
+}
+
 /// A copy through the driver cannot prove the translation: with unified
 /// addressing the driver resolves a registered HOST pointer by itself, so a
 /// backend that handed out the host address would still copy the right
@@ -278,6 +324,23 @@ fn the_registry_hands_out_the_device_alias_not_the_host_address() {
                 (BackendKind::HostShm, DeviceAddress::Flat(a)) => {
                     assert_eq!(a, host as u64, "{kind} offset {offset}");
                 }
+                (BackendKind::Cuda, DeviceAddress::Flat(a)) => {
+                    assert_eq!(a, cuda_driver_alias(host), "{kind} offset {offset}");
+                    if !caps.host_pointer_is_device_pointer {
+                        assert_ne!(
+                            a, host as u64,
+                            "{kind} offset {offset}: the device reports that host \
+                             pointers are not device pointers, yet the registry \
+                             handed out the host address"
+                        );
+                    }
+                }
+                (BackendKind::Metal, DeviceAddress::Buffer { offset: at, .. }) => {
+                    assert_eq!(at, offset, "{kind}");
+                }
+                // HIP has no hardware run yet; its alias oracle comes with
+                // the AMD probe.
+                (BackendKind::Hip, DeviceAddress::Flat(_)) => {}
                 (kind, address) => panic!("{kind}: unexpected address shape {address:?}"),
             }
         }
@@ -535,12 +598,15 @@ fn copies_refuse_mismatched_lengths_and_writes_through_read_only_segments() {
 
 #[test]
 fn a_backend_refuses_the_other_address_shape() {
-    use cerulion_device::BufferHandle;
+    use cerulion_device::{BufferHandle, DeviceAddress};
     for backend in backends() {
         let kind = backend.caps().kind;
-        let wrong = DeviceAddress::Buffer {
-            buffer: BufferHandle::from_ptr(std::ptr::null_mut()),
-            offset: 0,
+        let wrong = match kind {
+            BackendKind::Metal => DeviceAddress::Flat(0),
+            _ => DeviceAddress::Buffer {
+                buffer: BufferHandle::from_ptr(std::ptr::null_mut()),
+                offset: 0,
+            },
         };
         let mut out = [0u8; 4];
         // SAFETY: the address has the wrong shape, so the backend refuses it
@@ -577,4 +643,24 @@ fn concurrent_first_attaches_register_the_mapping_once() {
         });
         assert_eq!(registry.len(), 1, "{kind}");
     }
+}
+
+#[test]
+fn metal_refuses_an_unaligned_blit_through_the_registry() {
+    let Some(backend) = backends()
+        .into_iter()
+        .find(|b| b.caps().kind == BackendKind::Metal)
+    else {
+        return;
+    };
+    let mut shm = Shm::create("unaligned-metal", LEN);
+    shm.bytes_mut()[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let registry = SegmentRegistry::new(backend);
+    // SAFETY: `shm` outlives `registry`.
+    unsafe { registry.attach(shm.ptr) }.unwrap();
+    let mut out = [0u8; 3];
+    let err = registry
+        .copy_to_host(&shm.bytes()[1..4], &mut out)
+        .unwrap_err();
+    assert!(matches!(err, DeviceError::Unsupported { .. }), "{err}");
 }
