@@ -32,7 +32,7 @@ pub const VIZD_HEARTBEAT: EventSpec = EventSpec {
 
 /// The client, or `None` until the CLI has shown its first-run notice on
 /// this machine: the daemon prints no notice of its own, so it sends nothing
-/// before a person could have read one. A CI run needs no notice.
+/// before the CLI has shown one. A CI run needs no notice.
 fn client_after_notice() -> Option<Client> {
     notice_cleared(
         cerulion_telemetry::ci::detected(),

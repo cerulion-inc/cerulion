@@ -114,7 +114,7 @@ shown only once it has been written, so a run that is killed while printing
 it shows it again next time, and two first commands started at the same
 moment may both show it (neither sends). A command whose stderr is not a
 terminal prints no notice and sends as usual; the notice is then printed by
-the first command run on a terminal. The vizd daemon prints no notice of its
+the first command that could send, run on a terminal. The vizd daemon prints no notice of its
 own and sends nothing until the CLI has shown it on the machine (or under
 CI), so a `cerulion viz` that prints the notice may start a daemon that
 sends. `cerulion telemetry status` prints the link to this page.
