@@ -201,11 +201,19 @@ SCHEDULER_EXCLUDE="catchup_clamp_wiring_tests.rs wake.rs"
 # is the runtime half of the same contract.
 TF_EXCLUDE=""
 
+# cerulion_device/src: the address translation a GPU publish or receive runs
+# per message (`SegmentRegistry::device_address`, in segment.rs) and the
+# value types it returns (backend.rs). The rest is cold: error values
+# (error.rs) and the copy-based backend (host_shm.rs), whose constructor
+# builds its name once.
+DEVICE_EXCLUDE="error.rs host_shm.rs"
+
 TARGETS=(
     "crates/cerulion_core/src/transport|$TRANSPORT_EXCLUDE"
     "crates/cerulion_core/src/graph|$GRAPH_EXCLUDE"
     "crates/cerulion_core/src/scheduler|$SCHEDULER_EXCLUDE"
     "crates/cerulion_tf/src|$TF_EXCLUDE"
+    "crates/cerulion_device/src|$DEVICE_EXCLUDE"
 )
 
 # nullglob: a missing/empty target dir must yield an empty array (and trip the

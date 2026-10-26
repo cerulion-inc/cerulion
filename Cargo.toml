@@ -42,6 +42,7 @@ members = [
     "crates/cerulion_pairing",
     "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
     "crates/cerulion_tf",        # pure SE(3) transform math (std + thiserror; no cerulion_core dep)
+    "crates/cerulion_device",    # GPU residence: one device trait, dlopen backends (no SDK at build)
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
@@ -358,6 +359,8 @@ default-members = [
     # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
     # default build: its HTTP side runs on hyper, already here.
     "crates/cerulion_rcpd",
+    # GPU residence backends; vendor libraries are opened at run time.
+    "crates/cerulion_device",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
     # default-member netd would unify the iroh tree into the CLI + vizd via

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cerulion_device` - GPU residence for Cerulion message payloads.
+#
+# One `DeviceBackend` trait and its first backend, HostShm: plain shared
+# memory as its own device, which needs no GPU and runs the conformance
+# suite on every machine.
+# std + thiserror + libc + tracing ONLY.
+[package]
+name = "cerulion_device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "GPU residence for Cerulion payloads: one device backend trait, a shared-memory segment registry, and a host shared-memory backend"
+keywords = ["robotics", "gpu", "cuda", "metal", "cerulion"]
+categories = ["science::robotics", "hardware-support"]
+# Not published to crates.io: no published crate depends on it yet.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+libc = "0.2"
+tracing = "0.1.44"
