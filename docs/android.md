@@ -463,8 +463,16 @@ cerulion_core = { version = "1", features = ["local-transport"] }
 
 The emulator lane checks decoded topic values on the device and host, a
 recorded MCAP's topic, schema, and frame count, the paired catalog refusal
-with no decoded heartbeat frames, a direct heartbeat data demand that the
-paired app refuses without sending a frame, open access, and the app recording. Run it
+with no decoded heartbeat frames, open access, and the app recording. It also
+sends a heartbeat data demand directly, without reading the catalog first,
+through a host probe (`crates/test_fixtures/android_e2e_demand_probe`). The
+paired app must refuse that demand twice in a row and send no frame. The open
+app must grant the same demand and deliver frames, which shows that the paired
+refusal comes from the posture and not from the topic or the allow-list. When
+the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
+on the schema hash. The probe's argument errors are checked before the device
+is used. `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict,
+and `tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
 locally with a booted API 30 emulator:
 
 ```sh
@@ -477,8 +485,9 @@ Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
 cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
 The run writes `e2e.log`, `logcat.txt`, device logs, the output and exit code of
-every echo (device and host timer, paired and open heartbeat), the paired
-demand probe's report, and pulled MCAP files there. The script needs a dedicated
+every echo (device and host timer, paired and open heartbeat), the report of
+every demand probe run (`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`),
+and pulled MCAP files there. The script needs a dedicated
 device: it refuses to start while a `cerulion` or `cerulion-netd` process is
 running, and clears only its own directory `/data/local/tmp/cer-e2e`, leaving
 the shared `/data/local/tmp/iceoryx2` untouched.

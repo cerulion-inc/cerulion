@@ -132,6 +132,35 @@ host_echo() {
   host_capture timeout "${2:-8}" "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
     CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic"
 }
+PROBE="$ROOT/target/debug/android-e2e-demand-probe"
+PROBE_ENDPOINT=tcp/127.0.0.1:7683
+# probe_argument_error WANT ARG...: the probe refuses a bad argument before it
+# opens a session, so this needs no device: exit 1, WANT in its output, and no
+# report line.
+probe_argument_error() {
+  local want=$1 rc=0 out
+  shift
+  out="$(host_capture timeout 10 "${HOST_ENV[@]}" "$PROBE" "$@")" || rc=$?
+  (( rc == 1 )) || fail "probe argument errors" "rc=$rc args=$* output=$out"
+  grep -Fq -- "$want" <<<"$out" ||
+    fail "probe argument errors" "args=$* expected '$want' output=$out"
+  if grep -q '^demand_probe ' <<<"$out"; then
+    fail "probe argument errors" "args=$* printed a report: $out"
+  fi
+}
+# run_probe LABEL EXPECT SCHEMA FILE: one direct data demand for the heartbeat
+# over a 10 s window, judged by android_e2e_probe_verdict.sh. `topic echo`
+# reads the catalog before it demands data; the probe demands without one.
+run_probe() {
+  local label=$1 expect=$2 schema=$3 file=$4 rc=0 out verdict
+  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "$PROBE_ENDPOINT" /app/heartbeat \
+    "$schema" 10)" || rc=$?
+  printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
+  (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
+  verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$out")" ||
+    fail "$label" "$verdict"
+  pass "$label" "$verdict"
+}
 cleanup() {
   local rc=$?
   set +e
@@ -179,6 +208,18 @@ if grep -qE '/basic_timer/timer/count|/app/heartbeat' <<<"$host_local"; then
   fail "host local topics" "the host already publishes a test topic"
 fi
 pass "host local topics" "no local test publisher"
+probe_argument_error 'usage: android-e2e-demand-probe'
+probe_argument_error 'usage: android-e2e-demand-probe' "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String 10 extra
+probe_argument_error "topic 'app/heartbeat' is not canonical" "$PROBE_ENDPOINT" app/heartbeat \
+  std_msgs/String 10
+probe_argument_error "schema 'std_msgs/Float64' is not one this probe knows" "$PROBE_ENDPOINT" \
+  /app/heartbeat std_msgs/Float64 10
+probe_argument_error "window 'ten' is not a whole number of seconds" "$PROBE_ENDPOINT" \
+  /app/heartbeat std_msgs/String ten
+probe_argument_error 'window must be at least one second' "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String 0
+pass "probe argument errors" "cases=6 rc=1 no report"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
 # The busy-device check runs BEFORE any rm or force-stop: a device that is
@@ -351,32 +392,10 @@ paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
 grep -Fq 'refused to serve its topic catalog to LAN peers (not authorized)' <<<"$paired_echo" ||
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
 pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
-# Paired direct data demand: `topic echo` reads the catalog before it demands
-# data, so the probe demands the heartbeat (std_msgs/String) without one. A
-# paired app must refuse every demand GET and deliver no frame in the window.
-demand_probe() {
-  host_capture timeout 30 "${HOST_ENV[@]}" "$ROOT/target/debug/android-e2e-demand-probe" \
-    tcp/127.0.0.1:7683 /app/heartbeat 10
-}
-probe_rc=0
-probe_out="$(demand_probe)" || probe_rc=$?
-printf 'rc=%s\n%s\n' "$probe_rc" "$probe_out" > "$OUT/paired-demand-probe.txt"
-(( probe_rc == 0 )) || fail "paired direct demand" "rc=$probe_rc output=$probe_out"
-probe_line="$(grep '^demand_probe ' <<<"$probe_out" | tail -1)"
-probe_field() { sed -nE "s/.* $1=([0-9]+)( .*)?$/\1/p" <<<"$probe_line"; }
-probe_passes="$(probe_field passes)"
-probe_refused="$(probe_field refused_acks)"
-probe_enabled="$(probe_field enabled_acks)"
-probe_wire="$(probe_field wire_header_refused_acks)"
-probe_wire_frames="$(probe_field wire_frames)"
-probe_frames="$(probe_field frames)"
-[[ "$probe_passes" =~ ^[0-9]+$ && "$probe_refused" =~ ^[0-9]+$ && "$probe_enabled" =~ ^[0-9]+$ &&
-  "$probe_wire" =~ ^[0-9]+$ && "$probe_wire_frames" =~ ^[0-9]+$ && "$probe_frames" =~ ^[0-9]+$ ]] ||
-  fail "paired direct demand" "no complete probe report: $probe_out"
-(( probe_refused >= 1 && probe_enabled == 0 && probe_wire == 0 && probe_wire_frames == 0 &&
-  probe_frames == 0 )) ||
-  fail "paired direct demand" "$probe_line"
-pass "paired direct demand" "passes=$probe_passes refused_acks=$probe_refused enabled_acks=0 wire_frames=0 frames=0"
+# Paired direct data demand: a paired app must refuse every answered demand
+# and send no frame. It runs twice, and both runs must give that verdict.
+run_probe "paired direct demand" paired std_msgs/String paired-demand-probe.txt
+run_probe "paired direct demand, second run" paired std_msgs/String paired-demand-probe-2.txt
 device "am force-stop '$APP'"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
@@ -401,6 +420,27 @@ printf 'rc=%s\n%s\n' "$open_rc" "$open_echo" > "$OUT/open-echo.txt"
   fail "open heartbeat" "rc=$open_rc output=$open_echo"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
+# The host netd that `topic echo` spawned would bridge the heartbeat into local
+# shared memory, where the probe's own subscriber would count it. Stop it, so
+# every frame the probe counts came through the probe's own ingress.
+if HOST_NETD_OWNED; then
+  host_netd="$(cat "$HOST_NETD_PID")"
+  kill -TERM "$host_netd" >/dev/null 2>&1 || true
+  deadline=$((SECONDS + 20))
+  while kill -0 "$host_netd" >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || fail "host netd stop" "pid $host_netd is still alive"
+    sleep 1
+  done
+  rm -f "$HOST_NETD_PID"
+fi
+# Open control: the same demand IS granted and delivered when the app is open.
+# The app's refused ack does not say why it refused, so this is what ties the
+# paired refusal to the posture and not to the topic, schema or allow-list.
+run_probe "open direct demand" open std_msgs/String open-demand-probe.txt
+# Edge: the topic is std_msgs/String, the probe expects std_msgs/Int32. The
+# frames cross the network and the ingress drops every one on the schema.
+run_probe "open demand, wrong schema" schema-mismatch std_msgs/Int32 \
+  open-schema-mismatch-probe.txt
 app_bag="$(device logcat -d -s CerulionSample:I 2>/dev/null | tr -d '\r' |
   grep '"lan_access":"open"' | grep -o '"record_path":"[^"]*\.mcap"' | tail -1 |
   sed 's/.*"\([^"]*\)"$/\1/')"
