@@ -30,9 +30,8 @@ rules for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
   hand-serializer vectors (`format_vectors_test.rs`): a format change updates encoder
   AND oracle. A store-format bump migrates or refuses old files loudly (v3 -> v4
   migrates); epoch apply is monotonic wholesale-replace.
-- Access rows are keyed by (account, device); `TrustStore::cloud_allowed` is the one
-  allow-from-cloud predicate, surfaced as `KeyAccess::CloudRefused` and refused on
-  every plane and verb via `authorizer::cloud_refusal`.
+- Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
+  `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.

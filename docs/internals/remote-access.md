@@ -475,7 +475,7 @@ The hosted service's device is admitted exactly this way, as a cloud row.
 keys proves neither, so `code-pair-finish` binds the guest to the self-account
 derived from the authenticated transport key and refuses any other value; an
 account certificate requires the full roots-verified chain whose device key equals
-the transport peer key, presented through `pair` (certificate presentation, below).
+the transport peer key, presented through `pair` (certificate presentation, above).
 The owner row is never preserved for a guest, because that
 would hand the guest the owner's authority outright
 (`crates/cerulion_remoted/tests/code_pair_account_test.rs`).

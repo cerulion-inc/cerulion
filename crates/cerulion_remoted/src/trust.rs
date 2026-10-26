@@ -346,14 +346,15 @@ impl SharedTrust {
     }
 
     /// Set the robot's allow-from-cloud switch for the caller `device_key`, which
-    /// must be bound to the OWNER account through a row that is not itself a cloud
-    /// row (a cloud device never controls the switch that gates it). Persists the
-    /// store before returning.
+    /// must be bound to the OWNER account through a row whose principal is not
+    /// cloud. The new value is written to disk first and published to the live
+    /// store only after the write succeeds; on a write failure the live switch
+    /// keeps its old value.
     pub fn set_allow_cloud(&self, device_key: &[u8; 32], allow: bool) -> Result<(), TrustError> {
         let key = PublicKey(*device_key);
         let now_ns = self.clock.now_ns();
         let _writer = self.writer_lock();
-        let mut guard = self.lock();
+        let guard = self.lock();
         let account = guard
             .index
             .account_for(&key)
@@ -365,15 +366,17 @@ impl SharedTrust {
         if row.principal_kind == cerulion_pairing::format::PrincipalKind::Cloud {
             return Err(TrustError::Pairing(PairingError::NotOwner));
         }
-        guard.store.set_allow_cloud(&account, allow)?;
-        if self.mac_key.is_empty() {
-            return Ok(());
-        }
-        let store_snapshot = guard.store.clone();
+        let mut staged = guard.store.clone();
+        staged.set_allow_cloud(&account, allow)?;
         drop(guard);
-        store_snapshot
-            .save(&self.mac_key)
-            .map_err(|e| TrustError::Persist(format!("trust store (allow-from-cloud): {e}")))
+        if !self.mac_key.is_empty() {
+            staged
+                .save(&self.mac_key)
+                .map_err(|e| TrustError::Persist(format!("trust store (allow-from-cloud): {e}")))?;
+        }
+        // The writer lock is still held, so no other mutation ran in between.
+        self.lock().store.set_allow_cloud(&account, allow)?;
+        Ok(())
     }
 
     /// The robot's allow-from-cloud switch.
@@ -771,6 +774,34 @@ mod tests {
                 KeyAccess::Allowed(Scope::OWNER_FULL)
             );
         }
+    }
+
+    #[test]
+    fn a_failed_switch_write_leaves_the_live_switch_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let blocker = dir.path().join("trust_store.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(matches!(
+            shared.set_allow_cloud(&[7; 32], false),
+            Err(TrustError::Persist(_))
+        ));
+        assert!(shared.allow_cloud(), "the live switch is unchanged");
+        let reload_switch = || {
+            reload(
+                &dir.path().join("trust_store"),
+                &dir.path().join("device_index.json"),
+            )
+            .allow_cloud()
+        };
+        assert!(reload_switch());
+        std::fs::remove_dir(&blocker).unwrap();
+        shared.set_allow_cloud(&[7; 32], false).unwrap();
+        assert!(!shared.allow_cloud());
+        assert!(!reload_switch(), "a successful write persists");
     }
 
     #[test]

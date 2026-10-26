@@ -20,7 +20,12 @@
 //! | `inventory` / `log-tail` | Normal | `CAP_OBSERVE` (role ≥ `VIEWER`) — read-only observation. |
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
+//! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
 //! | *any other* | — | **DENY** (deny-by-default; an unclassified verb is refused, never fail-open — a new mutating verb must be classified here). |
+//!
+//! Before the class is consulted, a key whose access is
+//! [`KeyAccess::CloudRefused`] (a cloud row while the allow-from-cloud switch
+//! is OFF) is denied for every verb, bootstrap and e-stop included.
 //!
 //! "Role ≥ X" means numerically ≤ X's value — a lower `Role` value is higher
 //! privilege (`OWNER=1 < OPERATOR=2 < VIEWER=3`).

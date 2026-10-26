@@ -397,15 +397,12 @@ impl TrustStore {
         if self.inner.revoked_accounts.contains(account) {
             return None;
         }
+        // A device's own row decides for that device: a revoked or expired
+        // device row does not fall back to the account-wide row.
         let row = self
             .row_for(account, Some(device))
             .or_else(|| self.row_for(account, None))?;
-        // `Some(exp)` is a finite bound: allowed only strictly before it (mirrors
-        // the `[not_before, not_after)` half-open validity window, so
-        // `now_ns >= not_after_ns` denies). `None` never expires. A device's own
-        // row decides for that device: a revoked or expired device row does not
-        // fall back to the account-wide row.
-        (!row.revoked && row.expires_at_ns.is_none_or(|exp| now_ns < exp)).then_some(row)
+        row_active(row, now_ns).then_some(row)
     }
 
     /// Whether `account` has access at all: its account-wide row when that is
@@ -417,7 +414,6 @@ impl TrustStore {
         if self.inner.revoked_accounts.contains(account) {
             return None;
         }
-        let active = |r: &&AccessRow| !r.revoked && r.expires_at_ns.is_none_or(|exp| now_ns < exp);
         let mut rows = self
             .inner
             .access_rows
@@ -425,8 +421,8 @@ impl TrustStore {
             .filter(|r| &r.account == account);
         rows.clone()
             .find(|r| r.device.is_none())
-            .filter(active)
-            .or_else(|| rows.find(|r| r.device.is_some() && active(r)))
+            .filter(|r| row_active(r, now_ns))
+            .or_else(|| rows.find(|r| r.device.is_some() && row_active(r, now_ns)))
     }
 
     /// The row keyed by exactly `(account, device)` (`None` = account-wide).
@@ -503,7 +499,7 @@ impl TrustStore {
             self.inner.access_rows.clear();
         }
         self.inner.ownership = OwnershipState::Claimed(account);
-        // The owner row supersedes any prior row for that account.
+        // The owner row replaces the account's account-wide row, if any.
         self.upsert_active_row(AccessRow {
             account,
             // The owner row is account-wide: each of the owner's devices that
@@ -1125,6 +1121,10 @@ impl TrustStore {
         if !self.is_claimed() {
             return Err(PairingError::RobotUnclaimed);
         }
+        if verified.principal_kind == crate::format::PrincipalKind::Cloud && !self.inner.allow_cloud
+        {
+            return Err(PairingError::CloudAccessDisabled);
+        }
         let device = Some(verified.device_key);
         if let Some(row) = self
             .inner
@@ -1415,6 +1415,14 @@ impl TrustStore {
 /// [`AccessRow`] expiry: a finite bound becomes the row's honorable expiry, while the
 /// unbounded sentinel (`u64::MAX`, the [`crate::format::AccessGrant`] "no expiry"
 /// encoding) becomes `None` so the row never rots. Pure so it is oracle-testable.
+/// Whether `row` admits at `now_ns`: not revoked, and `now_ns` strictly before a
+/// finite expiry (the `[not_before, not_after)` half-open window, so
+/// `now_ns >= expiry` denies). `None` never expires. The one rule behind
+/// [`TrustStore::is_allowed`] and [`TrustStore::account_access`].
+fn row_active(row: &AccessRow, now_ns: u64) -> bool {
+    !row.revoked && row.expires_at_ns.is_none_or(|exp| now_ns < exp)
+}
+
 fn access_row_expiry(not_after_ns: u64) -> Option<u64> {
     (not_after_ns != u64::MAX).then_some(not_after_ns)
 }
@@ -2265,6 +2273,53 @@ mod owner_certificate_state_tests {
         store.owner_readmit(&OWNER, &guest).unwrap();
         assert!(store.is_allowed(&guest, &key(10), 3).is_some());
         assert!(store.is_allowed(&guest, &key(11), 3).is_some());
+    }
+
+    #[test]
+    fn strong_chain_and_owner_grant_paths_write_no_cloud_row_while_the_switch_is_off() {
+        let (mut store, _) = fixture();
+        store.set_allow_cloud(&OWNER, false).unwrap();
+        let rows = store.access_rows().to_vec();
+        // `verify_and_establish` and `establish_by_owner_grant` both persist
+        // through `establish_pairing`.
+        for source in [PairingSource::StrongChain, PairingSource::OwnerSignedGrant] {
+            let cloud = VerifiedPairing::new(
+                AccountId([6; 32]),
+                Scope::CODE_PAIR_DEFAULT,
+                PrincipalKind::Cloud,
+                key(12),
+            );
+            assert!(matches!(
+                store.establish_pairing(&cloud, source, None, 2, None),
+                Err(PairingError::CloudAccessDisabled)
+            ));
+            assert_eq!(store.access_rows(), rows.as_slice());
+        }
+        let human = VerifiedPairing::new(
+            AccountId([6; 32]),
+            Scope::CODE_PAIR_DEFAULT,
+            PrincipalKind::Human,
+            key(13),
+        );
+        store
+            .establish_pairing(&human, PairingSource::StrongChain, None, 2, None)
+            .unwrap();
+        assert_eq!(store.access_rows().len(), rows.len() + 1);
+    }
+
+    #[test]
+    fn an_expired_device_row_denies_that_device_while_the_account_wide_row_admits_others() {
+        let (mut store, desk) = fixture();
+        store.verify_owner_certificate(&desk, &key(3), 2).unwrap();
+        store.inner.access_rows[1].expires_at_ns = Some(5);
+        assert!(store.is_allowed(&OWNER, &key(3), 4).is_some());
+        assert!(store.is_allowed(&OWNER, &key(3), 5).is_none());
+        assert!(store.is_allowed(&OWNER, &key(3), 6).is_none());
+        assert_eq!(store.is_allowed(&OWNER, &key(7), 6).unwrap().device, None);
+        // An expired account-wide row denies a device with no row of its own.
+        store.inner.access_rows[0].expires_at_ns = Some(6);
+        assert!(store.is_allowed(&OWNER, &key(7), 6).is_none());
+        assert!(store.is_allowed(&OWNER, &key(7), 5).is_some());
     }
 
     /// The v3 body as a v3 writer laid it out (field order is the wire).
