@@ -159,27 +159,28 @@ async fn late_registration_serves_exact_nested_closure_and_names_builtin_wire_ha
         .create_publisher_simple(RAW_TOPIC, MaxSliceLen::const_new(256))
         .unwrap();
     desk.send(&WireRequest::Catalog).await;
-    // Wait for the actual catalog's introspection subscriptions, not a sleep
-    // chosen to approximate gateway scheduling. Both frames are fixed oracles.
-    bounded("catalog subscribers", async {
-        let mut custom_sent = false;
-        let mut builtin_sent = false;
-        while !custom_sent || !builtin_sent {
-            if !custom_sent && netd.manager.topic_subscriber_count(TOPIC) > 0 {
-                custom.publish_raw(&frame(CUSTOM_HASH)).unwrap();
-                custom_sent = true;
-            }
-            if !builtin_sent && netd.manager.topic_subscriber_count(RAW_TOPIC) > 0 {
-                builtin.publish_raw(&frame(BUILTIN_HASH)).unwrap();
-                builtin_sent = true;
-            }
-            if !custom_sent || !builtin_sent {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+    // The catalog's introspection subscribers attach at a time this test does
+    // not observe (other subscribers already count toward
+    // `topic_subscriber_count`), so both fixed oracle frames are republished
+    // every 10 ms until the catalog reply arrives. The reply future is pinned
+    // once and polled to completion, never dropped mid-frame; publication
+    // stops when it resolves or the bound fires.
+    let reply = bounded("catalog reply", async {
+        let reply = desk.receive();
+        tokio::pin!(reply);
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                reply = &mut reply => break reply,
+                _ = tick.tick() => {
+                    custom.publish_raw(&frame(CUSTOM_HASH)).unwrap();
+                    builtin.publish_raw(&frame(BUILTIN_HASH)).unwrap();
+                }
             }
         }
     })
     .await;
-    let WireResponse::Catalog(catalog) = desk.receive().await else {
+    let WireResponse::Catalog(catalog) = reply else {
         panic!("expected named catalog")
     };
     let custom_row = catalog
