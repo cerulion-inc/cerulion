@@ -22,7 +22,7 @@ stop path (a hardwired e-stop) to stop motion. The `teleop` verb is classified
 and the daemon does not run the deadman yet. The deadman and renewal rules below
 are the contract a teleop handler runs under.
 
-## The deadman: a quiet operator stops the robot
+## The deadman: a quiet operator loses the lease
 
 Actuation is held by a control lease, and the holder must renew it inside the
 deadman window. Miss the window and the deadman fires, putting the robot into
@@ -76,9 +76,10 @@ to hold at the transport layer too, so ops sessions are served **concurrently**:
 one shared ops server handles every session at once, with the receipt log behind
 a brief append lock. A stalled or hostile session parks on a blocking read
 holding no lock, so it cannot delay anyone else, and a reconnect loop cannot
-hold a permit to keep a legitimate e-stop waiting. The safety effect runs before
-its audit receipt, and the only contention it meets is brief locks (the receipt
-append, the access check), none held across I/O. Hash-chain integrity survives:
+hold a permit to keep a legitimate e-stop waiting. The safety effect takes only
+the control-lease lock and runs before its audit receipt, so it never waits on
+the audit log. Its reply then waits for the receipt append, a brief lock held
+across one write and sync of the receipt file. Hash-chain integrity survives:
 each append is one atomic critical section, so concurrent appends form one valid
 tamper-evident chain.
 
@@ -100,15 +101,17 @@ re-presents the same identity, so a teleop handler renews the same lease: no
 fresh grant, no re-arbitration, no gap in actuation. An engaged e-stop persists
 across reconnects (the remote plane has no verb that clears it), and a
 different paired device cannot take the floor from the one that engaged it. A
-drop **longer** than the window fires the deadman, which is correct: the
-operator is gone.
+drop **longer** than the window lapses the lease under the deadman contract,
+which is correct: the operator is gone.
 
 ## It never bricks offline
 
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
-the connect path: mDNS or a direct dial for discovery, a direct iroh dial with
-the relay disabled for transport, and offline verification against the local
-root set and the durable access list. Established pairings do not expire (a
+the connect path: a direct iroh dial to the robot address you give
+(`--addr ip:port`), with the relay disabled (`--relay-disabled`), and offline
+verification against the durable access list. mDNS supplies the robot's
+endpoint id to `cerulion pair`; it does not supply a dial address, so an
+offline connect needs `--addr`. Established pairings do not expire (a
 time-boxed guest grant from the owner is the exception), last until revoked
 (see [`docs/revocation.md`](revocation.md)), and never re-run the certificate
 chain per connect; the access row is the truth.
