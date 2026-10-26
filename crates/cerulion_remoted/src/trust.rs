@@ -691,7 +691,8 @@ mod tests {
         shared
             .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
             .unwrap();
-        let before = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        let owner_row = postcard::to_stdvec(shared.lock().store.access_rows()).unwrap();
+        assert_eq!(shared.lock().store.access_rows().len(), 1);
         let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
         assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
         assert_eq!(
@@ -704,10 +705,19 @@ mod tests {
             shared.snapshot_for_key(&key).1,
             KeyAccess::Allowed(Scope::OWNER_FULL)
         );
-        assert_eq!(
-            postcard::to_stdvec(shared.lock().store.access_rows()).unwrap(),
-            before
-        );
+        // The owner row is byte-for-byte unchanged and the device row follows it.
+        let check = |shared: &SharedTrust| {
+            let guard = shared.lock();
+            let rows = guard.store.access_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(postcard::to_stdvec(&rows[..1]).unwrap(), owner_row);
+            assert_eq!(rows[1].account, OWNER);
+            assert_eq!(rows[1].device, Some(PublicKey(key)));
+            assert_eq!(rows[1].scope, Scope::OWNER_FULL);
+            assert_eq!(rows[1].principal_kind, PrincipalKind::Human);
+            assert_eq!(rows[1].source, PairingSource::CertificatePresentation);
+        };
+        check(&shared);
         let loaded = reload(
             &dir.path().join("trust_store"),
             &dir.path().join("device_index.json"),
@@ -716,10 +726,7 @@ mod tests {
             loaded.snapshot_for_key(&key).1,
             KeyAccess::Allowed(Scope::OWNER_FULL)
         );
-        assert_eq!(
-            postcard::to_stdvec(loaded.lock().store.access_rows()).unwrap(),
-            before
-        );
+        check(&loaded);
         assert_eq!(loaded.lock().store.high_water_ns(), T_NOW + 1);
     }
 

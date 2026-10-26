@@ -113,7 +113,7 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[tokio::test]
-async fn signed_registration_publishes_claimed_v3_state_with_the_login_key() {
+async fn signed_registration_publishes_claimed_v4_state_with_the_login_key() {
     let (_temporary, config, _bundle) = setup();
     let result = provision(&config, NOW).unwrap();
     assert_eq!(
@@ -128,7 +128,7 @@ async fn signed_registration_publishes_claimed_v3_state_with_the_login_key() {
     assert_eq!(fs::read(dir.join(DEVICE_KEY_FILENAME)).unwrap(), SEED);
     let mac = fs::read(dir.join(TRUST_STORE_MAC_KEY_FILENAME)).unwrap();
     let store_bytes = fs::read(dir.join(TRUST_STORE_FILENAME)).unwrap();
-    assert_eq!(&store_bytes[8..10], &[3, 0]);
+    assert_eq!(&store_bytes[8..10], &[4, 0]);
     let store = TrustStore::load(dir.join(TRUST_STORE_FILENAME), &mac).unwrap();
     assert_eq!(store.robot_id(), ROBOT);
     assert_eq!(store.owner(), Some(OWNER));
