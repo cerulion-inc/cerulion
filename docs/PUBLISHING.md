@@ -29,10 +29,11 @@ dev-dependencies are stripped by `cargo package`):
 | `cerulion_telemetry` | (none) |
 | `cerulion_wireclient` | `cerulion_link`, `cerulion_core`, `cerulion_pairing` |
 | `cerulion_bag` | `cerulion_core` |
+| `cerulion_msgio` | `cerulion_core`, `native_ros2_messages` |
 | `cerulion_netd` | `cerulion_core`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `native_ros2_messages`, `cerulion_link`, `cerulion_wireclient`, `cerulion_pairing` |
 | `cerulion_bagd` | `cerulion_core`, `cerulion_bag`, `native_ros2_messages`, `cerulion_netd` |
 | `cerulion_wsd` | `cerulion_core`, `cerulion_cli_engine`, `cerulion_hygiene` |
-| `cerulion_cli_engine` | `cerulion_core`, `native_ros2_messages`, `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `cerulion_pairing`, `cerulion_bag`, `cerulion_bagd`, `cerulion_netd` |
+| `cerulion_cli_engine` | `cerulion_core`, `cerulion_msgio`, `native_ros2_messages`, `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `cerulion_pairing`, `cerulion_bag`, `cerulion_bagd`, `cerulion_netd` |
 | `cerulion_cli_tui` | `cerulion_cli_engine`, `cerulion_core` |
 | `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_telemetry` |
 | `cerulion_android` | `cerulion_bag`, `cerulion_bagd`, `cerulion_cli_engine`, `cerulion_core`, `cerulion_mdns` |
@@ -44,7 +45,7 @@ Publish in this order:
    **`cerulion_telemetry`** (no internal dependency; independent of one another)
 2. **`cerulion_core`** and **`cerulion_mdns`**
 3. **`native_ros2_messages`**, **`cerulion_bag`** and **`cerulion_wireclient`**
-4. **`cerulion`** and **`cerulion_netd`**
+4. **`cerulion`**, **`cerulion_netd`** and **`cerulion_msgio`**
 5. **`cerulion_bagd`**
 6. **`cerulion_cli_engine`**
 7. **`cerulion_cli_tui`**, **`cerulion_wsd`** and **`cerulion_android`**

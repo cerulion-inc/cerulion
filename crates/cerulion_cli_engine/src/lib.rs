@@ -269,7 +269,7 @@ pub mod state_arm_attach;
 // The workspace `.msg` schema store reader
 // (`schemas/<pkg>/msg/<Type>.msg`), shared by attach's resolvability chain
 // and `schema list`/`info`. Pure (`parse_rosmsg`); no DDS, no transport.
-pub mod schema_store;
+pub use cerulion_msgio::schema_store;
 // OPTIONAL SYSTEM dependencies for node crates. A Cargo build script
 // cannot enable a feature of its own crate, so "link GStreamer if this machine
 // has it" cannot be expressed in Cargo at all — the probe lives here, and

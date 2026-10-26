@@ -2859,6 +2859,21 @@ jobs:
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
 
+      # `cerulion_msgio` — messages as text on local shared memory (publish,
+      # service call, snapshot, decode), extracted from `cerulion_cli_engine` so
+      # `cerulion-remoted` serves the same operations as ops verbs. Named here for
+      # the same reason as `cerulion_discovery` above: an extraction un-runs its
+      # tests unless the new package has its own step.
+      - name: cerulion_msgio tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
+        run: cargo test -p cerulion_msgio
+      - name: selection marker, cerulion_msgio
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_msgio (selected: $SELECTED)"
+
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So
       # cerulion_wireclient — a workspace member excluded from default-members because
@@ -3707,6 +3722,21 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_discovery (selected: $SELECTED)"
+
+      # `cerulion_msgio` — messages as text on local shared memory (publish,
+      # service call, snapshot, decode), extracted from `cerulion_cli_engine` so
+      # `cerulion-remoted` serves the same operations as ops verbs. Named here for
+      # the same reason as `cerulion_discovery` above: an extraction un-runs its
+      # tests unless the new package has its own step.
+      - name: cerulion_msgio tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
+        run: cargo test -p cerulion_msgio
+      - name: selection marker, cerulion_msgio
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_msgio (selected: $SELECTED)"
 
       # The test jobs enumerate packages explicitly: there is NO blanket
       # `cargo test --workspace` step (it would hang on iceoryx2's SHM singleton). So

@@ -126,13 +126,6 @@ pub(crate) fn verb_exit_code(result: Result<String, VerbError>) -> ExitCode {
             println!("{line}");
             ExitCode::SUCCESS
         }
-        Err(VerbError::Cli(e)) => {
-            eprintln!(
-                "Error: {}",
-                cerulion_cli_engine::error::render_user_error(&e)
-            );
-            ExitCode::from(1)
-        }
         Err(e) => {
             eprintln!("Error: {e}");
             ExitCode::from(e.exit_code())
