@@ -49,7 +49,18 @@ pub fn pid_namespace_id() -> u32 {
                 let digits: String = s.chars().filter(char::is_ascii_digit).collect();
                 digits.parse::<u64>().ok()
             })
-            .map_or(0, |inode| inode as u32)
+            .map_or_else(
+                || {
+                    #[cfg(target_os = "linux")]
+                    tracing::warn!(
+                        "/proc/self/ns/pid is unreadable, so rmw gids carry pid namespace \
+                         id 0; two containers that share /dev/shm without /proc can then \
+                         mint equal gids for equal pids"
+                    );
+                    0
+                },
+                |inode| inode as u32,
+            )
     })
 }
 

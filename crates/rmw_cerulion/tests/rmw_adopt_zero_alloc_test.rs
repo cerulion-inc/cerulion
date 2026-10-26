@@ -691,6 +691,87 @@ fn a_copy_path_take_costs_zero_rust_allocations() {
     }
 }
 
+
+/// More publishers on one topic than the old 16-entry gid cache held. Each
+/// take WITH a message-info pointer resolves the sender's gid; once every
+/// publisher has been seen, that lookup is a cache hit and allocates
+/// nothing. A cache smaller than the topic's publisher count would miss on
+/// every take here, and each miss walks the publisher list, which allocates.
+#[test]
+#[serial]
+fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations() {
+    const PUBLISHERS: usize = 20;
+    let _env = EnvVarGuard::unset(ADOPT_TAKE_ENV);
+    unsafe {
+        let suffix = unique_suffix();
+        let (node, first, subscription) = setup_pair("manypub", suffix);
+        let ts = scan_ts(&format!("Zamanypub{suffix}"));
+        let topic = CString::new(format!("/rmw_adopt_za/manypub/{suffix}")).expect("topic");
+        let qos = ffi::rmw_qos_profile_t {
+            history: ffi::RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+            depth: 8,
+            reliability: ffi::RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+            durability: ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE,
+            deadline: ffi::rmw_time_t { sec: 0, nsec: 0 },
+            lifespan: ffi::rmw_time_t { sec: 0, nsec: 0 },
+            liveliness: ffi::RMW_QOS_POLICY_LIVELINESS_AUTOMATIC,
+            liveliness_lease_duration: ffi::rmw_time_t { sec: 0, nsec: 0 },
+            avoid_ros_namespace_conventions: false,
+        };
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let mut publishers = vec![first];
+        for _ in 1..PUBLISHERS {
+            let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            assert!(!p.is_null(), "publisher {} of {PUBLISHERS}", publishers.len() + 1);
+            publishers.push(p);
+        }
+
+        let mut msg: Box<CScan> = Box::new(std::mem::zeroed());
+        scan_init(&mut *msg as *mut _ as *mut c_void, 0);
+        let take_with_info = |msg: &mut CScan| {
+            let mut taken = false;
+            let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
+            let ret = rmw_take_with_info(
+                subscription,
+                msg as *mut _ as *mut c_void,
+                &mut taken,
+                &mut info,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(ret, RMW_RET_OK);
+            assert!(taken, "a published frame must be takeable");
+            info
+        };
+        // Warm-up: one frame from every publisher, so each origin is cached.
+        for (i, p) in publishers.iter().enumerate() {
+            publish_scan(*p, 16, i as f32);
+            let info = take_with_info(&mut msg);
+            assert_ne!(info.publisher_gid.data[..16], [0u8; 16], "publisher {i}'s gid");
+        }
+        // Measured: one more frame from every publisher, taken with info.
+        for (i, p) in publishers.iter().enumerate() {
+            publish_scan(*p, 16, 100.0 + i as f32);
+        }
+        ALLOCATOR.enable();
+        for _ in 0..PUBLISHERS {
+            take_with_info(&mut msg);
+        }
+        let allocs = ALLOCATOR.disable();
+        assert_eq!(
+            allocs, 0,
+            "a take with info from {PUBLISHERS} publishers must cost zero RUST \
+             allocations once every publisher's gid is cached"
+        );
+
+        scan_fini(&mut *msg as *mut _ as *mut c_void);
+        for p in publishers {
+            assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
+        }
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
 unsafe fn sub_data(subscription: *const ffi::rmw_subscription_t) -> &'static SubscriptionData {
     &*((*subscription).data as *const SubscriptionData)
 }

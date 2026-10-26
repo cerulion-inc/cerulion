@@ -69,6 +69,8 @@
 //!
 //! - Client GUIDs are a pure function of `(node_id, service, instance)`
 //!   — see [`derive_client_guid`]. Same inputs → same GUID, every run.
+//!   A caller may pass its own GUID instead: `rmw_cerulion` passes a
+//!   host-unique entity gid (process id included), which differs per run.
 //! - Sequence numbers are a per-client monotonic counter starting at 1.
 //! - Timestamps come from the transport's [`Clock`] (the `VirtualClock`
 //!   under replay).

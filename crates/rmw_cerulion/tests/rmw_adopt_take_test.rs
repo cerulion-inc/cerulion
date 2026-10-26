@@ -854,6 +854,16 @@ fn adopted_take_serves_shm_in_place_with_exact_registered_ranges() {
         let (taken, msg1, info) = take_scan(subscription);
         assert!(taken, "a published frame must be takeable");
         assert!(info.source_timestamp > 0, "wire timestamp reaches info");
+        // The adopted take reports the sending publisher's gid, the one
+        // rmw_get_gid_for_publisher returns, never the all-zero gid.
+        let mut pub_gid: ffi::rmw_gid_t = std::mem::zeroed();
+        assert_eq!(rmw_get_gid_for_publisher(publisher, &mut pub_gid), RMW_RET_OK);
+        assert_eq!(
+            info.publisher_gid.data[..16],
+            pub_gid.data[..16],
+            "the adopted take's publisher_gid is the publisher's gid"
+        );
+        assert_ne!(info.publisher_gid.data[..16], [0u8; 16], "not the all-zero gid");
 
         // Pointer identity: each forged member IS a registered range.
         let segs = fake_segments();
