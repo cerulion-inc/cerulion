@@ -105,6 +105,75 @@ fn public_key_at(path: &Path) -> CliResult<[u8; 32]> {
         .to_bytes())
 }
 
+/// The file the robot's remote-plane daemon applies fetched epochs from, in
+/// its state directory (`cerulion_remoted::epoch_pull::EPOCH_PENDING_FILE`).
+const EPOCH_PENDING_FILE: &str = "epoch.pending";
+/// The remote-plane daemon's state subdirectory (`cerulion_remoted::config::REMOTED_SUBDIR`).
+const REMOTED_SUBDIR: &str = "remoted";
+
+/// The hidden robot-side revocation sync: fetch this registered robot's current
+/// signed access-list epoch from the account service with this machine's login
+/// (refreshing a stale session, serialized across processes), and leave it for
+/// the remote-plane daemon to verify and apply. Writes one JSON line
+/// `{"version":1,"epoch":N}` (`null` when the robot has no epoch yet).
+///
+/// # Errors
+///
+/// Refuses loudly when no robot registration exists under `state_root`, when
+/// the login is not the registration's owner, or when the fetch fails; a
+/// failure changes nothing on the robot.
+pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
+    trusted_root(state_root)?;
+    let bundle_path = state_root.join(BUNDLE_FILE);
+    let bundle: RegistrationBundle = match fs::symlink_metadata(&bundle_path) {
+        Ok(_) => serde_json::from_slice(&read_private(&bundle_path, MAX_BUNDLE_BYTES)?)
+            .map_err(|_| refused("the robot registration is malformed"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refused(&format!(
+                "no robot registration exists in {}; the revocation sync runs only on a \
+                 registered robot",
+                state_root.display()
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let session = account_cmd::require_session()?;
+    let login = auth::load()
+        .state()
+        .cloned()
+        .ok_or_else(|| refused("run `cerulion login` before serving a robot"))?;
+    if hex::encode(account_identity::pairing_account_id(&login.account_id)?.0)
+        != bundle.owner_account
+    {
+        return Err(refused(
+            "this login is not the robot registration's owner; revocations were not synced",
+        ));
+    }
+    let robot_id: [u8; 32] = hex::decode(&bundle.robot_id)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| refused("the robot registration's robot id is malformed"))?;
+    let access = account_cmd::fetch_robot_access(&session, &URL_SAFE_NO_PAD.encode(robot_id))?;
+    let epoch = match account_cmd::epoch_cache_artifact_from(&access)? {
+        None => None,
+        Some(artifact) => {
+            let postcard = URL_SAFE_NO_PAD
+                .decode(artifact.as_bytes())
+                .map_err(|_| refused("the fetched epoch did not encode"))?;
+            let pending = state_root.join(REMOTED_SUBDIR).join(EPOCH_PENDING_FILE);
+            auth::atomic_write_secret(&pending, hex::encode(postcard).as_bytes())?;
+            Some(access.epoch)
+        }
+    };
+    serde_json::to_writer(
+        &mut *out,
+        &serde_json::json!({ "version": 1, "epoch": epoch }),
+    )
+    .map_err(|_| refused("could not encode the worker result"))?;
+    writeln!(out)?;
+    Ok(())
+}
+
 /// Prepare a verified account-service registration for the robot writer.
 /// This worker never opens a listener or prompts in a background process.
 pub fn prepare(state_root: &Path) -> CliResult<BootstrapPrepared> {

@@ -207,7 +207,7 @@ fn run(
         is_executable,
     )?;
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
-    let mut registration = Command::new(cli);
+    let mut registration = Command::new(&cli);
     registration
         .arg("bootstrap-robot")
         .arg("--state-root")
@@ -247,6 +247,7 @@ fn run(
             .map_err(|error| format!("starting robot server: {error}"))?,
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
+    let mut epoch_sync = EpochSync::new(cli, root.clone(), Instant::now());
     let refresh_deadline = Instant::now() + FACT_REFRESH_WINDOW;
     let mut next_refresh = Instant::now();
     let mut refresh_failed = false;
@@ -255,6 +256,7 @@ fn run(
             return Err(format!("robot server exited ({status})"));
         }
         let now = Instant::now();
+        epoch_sync.poll(now);
         if !refresh_failed && now < refresh_deadline && now >= next_refresh {
             match refresh_facts(&provisioned.endpoint_id) {
                 Ok(true) => {
@@ -271,6 +273,121 @@ fn run(
         std::thread::sleep(POLL_INTERVAL);
     }
     Ok(())
+}
+
+/// How often a serving robot fetches its own revocation epoch: the longest a
+/// revocation waits when the revoked key never connects.
+const EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(300);
+/// The bound on one revocation fetch (the worker's HTTP request and write).
+const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(60);
+/// The shortest gap between two fetches started by connection requests.
+const EPOCH_EARLY_FETCH_GAP: Duration = Duration::from_secs(5);
+/// The first wait after a failed fetch; doubles per consecutive failure.
+const EPOCH_SYNC_FIRST_RETRY: Duration = Duration::from_secs(5);
+/// The longest wait between failed fetches; fetching never stops.
+const EPOCH_SYNC_MAX_RETRY: Duration = Duration::from_secs(300);
+/// The file remoted writes to ask for an early fetch
+/// (`cerulion_remoted::epoch_pull::EPOCH_REQUEST_FILE`).
+const EPOCH_REQUEST_FILE: &str = "epoch.request";
+const REMOTED_SUBDIR: &str = "remoted";
+
+/// The wait after `failures` consecutive failed fetches (at least 1).
+fn epoch_sync_delay(failures: u32) -> Duration {
+    EPOCH_SYNC_FIRST_RETRY
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(EPOCH_SYNC_MAX_RETRY)
+}
+
+/// The robot's revocation sync: runs the hidden `robot-sync-epoch` worker at
+/// start, every [`EPOCH_SYNC_PERIOD`], and early (at most every
+/// [`EPOCH_EARLY_FETCH_GAP`]) when remoted asks; backs off on failure. A
+/// failure never stops the robot: remoted applies only a verified epoch.
+struct EpochSync {
+    cli: PathBuf,
+    root: PathBuf,
+    child: Option<(OwnedChild, Instant)>,
+    next: Instant,
+    last_start: Option<Instant>,
+    failures: u32,
+}
+
+impl EpochSync {
+    fn new(cli: PathBuf, root: PathBuf, now: Instant) -> Self {
+        Self {
+            cli,
+            root,
+            child: None,
+            next: now,
+            last_start: None,
+            failures: 0,
+        }
+    }
+
+    /// Advance at `now`: reap a finished or overdue worker, honor a request,
+    /// start the next fetch when due. Never blocks.
+    fn poll(&mut self, now: Instant) {
+        if let Some((child, deadline)) = &mut self.child {
+            let finished = match child.0.try_wait() {
+                Ok(Some(status)) => Some(status.success()),
+                Ok(None) if now >= *deadline => Some(false),
+                Ok(None) => None,
+                Err(_) => Some(false),
+            };
+            match finished {
+                None => return,
+                Some(ok) => {
+                    // Dropping the child kills an overdue worker and reaps it.
+                    self.child = None;
+                    self.finish(ok, now);
+                }
+            }
+        }
+        let request = self.root.join(REMOTED_SUBDIR).join(EPOCH_REQUEST_FILE);
+        if std::fs::remove_file(&request).is_ok() && self.failures == 0 {
+            let earliest = self
+                .last_start
+                .map_or(now, |last| last + EPOCH_EARLY_FETCH_GAP);
+            self.next = self.next.min(earliest.max(now));
+        }
+        if now >= self.next {
+            self.start(now);
+        }
+    }
+
+    fn start(&mut self, now: Instant) {
+        self.last_start = Some(now);
+        let spawned = Command::new(&self.cli)
+            .arg("robot-sync-epoch")
+            .arg("--state-root")
+            .arg(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn();
+        match spawned {
+            Ok(child) => self.child = Some((OwnedChild(child), now + EPOCH_SYNC_DEADLINE)),
+            Err(error) => {
+                tracing::warn!(error = %error, "robot revocation sync could not start");
+                self.finish(false, now);
+            }
+        }
+    }
+
+    fn finish(&mut self, ok: bool, now: Instant) {
+        if ok {
+            self.failures = 0;
+            self.next = now + EPOCH_SYNC_PERIOD;
+        } else {
+            self.failures = self.failures.saturating_add(1);
+            let delay = epoch_sync_delay(self.failures);
+            tracing::warn!(
+                failures = self.failures,
+                retry_in_s = delay.as_secs(),
+                "robot revocation sync failed; the robot keeps its current access list"
+            );
+            self.next = now + delay;
+        }
+    }
 }
 
 struct OwnedChild(Child);

@@ -581,3 +581,68 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
     );
     assert_eq!(std::fs::read(remoted.join("trust_store")).unwrap(), before);
 }
+
+#[test]
+#[serial]
+fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registration() {
+    use cerulion_cli_engine::account_cmd::{revoke_robot_access, RevokeTarget};
+    use cerulion_cli_engine::robot_bootstrap;
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let state = login(port, &email);
+
+    // Refused loudly where no robot registration exists.
+    let unregistered = home_path.join("not-a-robot");
+    std::fs::create_dir(&unregistered).unwrap();
+    let err = robot_bootstrap::sync_epoch(&unregistered, &mut Vec::new()).unwrap_err();
+    assert!(
+        err.to_string().contains("no robot registration exists"),
+        "{err}"
+    );
+
+    let root = home_path.join("robot-state");
+    let prepared = robot_bootstrap::prepare(&root).unwrap();
+    let robot_id: [u8; 32] = hex::decode(&prepared.robot_id).unwrap().try_into().unwrap();
+    // Nothing revoked yet: no epoch, nothing written.
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":null,\"version\":1}\n"
+    );
+    let pending = root.join("remoted").join("epoch.pending");
+    assert!(!pending.exists());
+
+    // The owner revokes a desk device at the account service; the robot's own
+    // sync fetches it with no desk involved.
+    let revoked = [0x5b_u8; 32];
+    revoke_robot_access(
+        &state.session_token,
+        &URL_SAFE_NO_PAD.encode(robot_id),
+        &RevokeTarget::Device(URL_SAFE_NO_PAD.encode(revoked)),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":1,\"version\":1}\n"
+    );
+    let wire = cerulion_pairing::verify::EpochSyncWire::from_postcard(
+        &hex::decode(std::fs::read_to_string(&pending).unwrap().trim()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire.signed_epoch.epoch_data.robot.0, robot_id);
+    assert_eq!(
+        wire.signed_epoch.epoch_data.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+}

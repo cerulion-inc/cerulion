@@ -1062,6 +1062,24 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     if state.session_is_valid(auth::now_unix_ns()) {
         return Ok(None); // still fresh — no cloud call.
     }
+    // A refresh token is single-use, so refreshes are serialized across
+    // processes: hold the refresh lock, re-read, and exchange only if the stored
+    // session is still stale. A process that waited finds the session a peer
+    // just refreshed and returns without a request.
+    let auth_path = auth::auth_json_path().ok_or_else(|| {
+        CliError::Login(
+            "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
+        )
+    })?;
+    let _refreshing = auth::hold_refresh_lock(&auth_path)
+        .map_err(|e| CliError::Login(format!("could not refresh the session: {e}")))?;
+    let loaded = auth::load_from(&auth_path);
+    let Some(state) = loaded.state() else {
+        return Ok(None);
+    };
+    if state.session_is_valid(auth::now_unix_ns()) {
+        return Ok(None);
+    }
     let base = account_service_base();
     let client = http_client()?;
     let refreshed: TokenResponse = post_json(
@@ -1089,11 +1107,6 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     // So the exchange runs unlocked and the publication is conditional — a peer
     // that signed out or logged in while we were refreshing is NOT overwritten
     // with the session it just retired.
-    let auth_path = auth::auth_json_path().ok_or_else(|| {
-        CliError::Login(
-            "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
-        )
-    })?;
     let published = auth::with_store_lock(&auth_path, || {
         match auth::load_from(&auth_path).state() {
             Some(current) if current.refresh_token == state.refresh_token => {

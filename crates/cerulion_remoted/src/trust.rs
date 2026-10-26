@@ -950,6 +950,101 @@ mod tests {
         );
     }
 
+    // ── the robot's own revocation fetch (epoch_pull) ─────────────────────────
+
+    fn write_pending(dir: &std::path::Path, epoch: cerulion_pairing::format::SignedEpoch) {
+        let wire = cerulion_pairing::verify::EpochSyncWire {
+            version: cerulion_pairing::verify::EPOCH_SYNC_WIRE_VERSION,
+            intermediate: good_intermediate_cert(),
+            signed_epoch: epoch,
+        };
+        std::fs::write(
+            dir.join(crate::epoch_pull::EPOCH_PENDING_FILE),
+            hex::encode(postcard::to_stdvec(&wire).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_fetched_epoch_cuts_the_revoked_desk_with_no_desk_push() {
+        use crate::epoch_pull::{EpochPull, PullOutcome, EPOCH_PENDING_FILE};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let account_a = AccountId([20; 32]);
+        let (k_a, k_b) = ([2u8; 32], [3u8; 32]);
+        for key in [k_a, k_b] {
+            shared
+                .verify_and_establish(&pair_chain(account_a, key, VIEWER_SCOPE), &key, None, T_NOW)
+                .unwrap();
+        }
+        let pull = EpochPull::new(dir.path(), shared.clone(), RemotedClock::fixed(T_NOW));
+        assert_eq!(pull.apply_pending(), PullOutcome::Nothing);
+
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        assert_eq!(pull.apply_pending(), PullOutcome::Applied { epoch: 1 });
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert_eq!(shared.snapshot_for_key(&k_a).1, KeyAccess::DeviceRevoked);
+        assert!(matches!(
+            shared.snapshot_for_key(&k_b).1,
+            KeyAccess::Allowed(_)
+        ));
+        let reloaded = reload(
+            &dir.path().join("trust_store"),
+            &dir.path().join("device_index.json"),
+        );
+        assert_eq!(reloaded.snapshot_for_key(&k_a).1, KeyAccess::DeviceRevoked);
+
+        // The same epoch again changes nothing.
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        assert_eq!(pull.apply_pending(), PullOutcome::NotNewer);
+        // Garbage, and an epoch the robot's own CA did not sign, change nothing.
+        std::fs::write(dir.path().join(EPOCH_PENDING_FILE), "not an epoch").unwrap();
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        let forged = AccessListEpoch {
+            version: FORMAT_VERSION,
+            robot: ROBOT,
+            epoch: 2,
+            revoked_accounts: vec![],
+            revoked_devices: vec![PublicKey(k_b)],
+            issued_at_ns: ISSUED,
+            issuer_key: pubkey(&int_sk()),
+        }
+        .sign(&SigningKey::from_bytes(&[0x99; 32]));
+        write_pending(dir.path(), forged);
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert!(matches!(
+            shared.snapshot_for_key(&k_b).1,
+            KeyAccess::Allowed(_)
+        ));
+    }
+
+    #[test]
+    fn an_admitted_key_asks_for_an_early_fetch_once_per_recheck_interval() {
+        use crate::epoch_pull::{EpochPull, EPOCH_REQUEST_FILE};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        let pull = EpochPull::new(dir.path(), shared, RemotedClock::fixed(T_NOW));
+        let request = dir.path().join(EPOCH_REQUEST_FILE);
+        // An unknown key never asks.
+        assert!(!pull.note_accept(&[0x42; 32]));
+        assert!(!request.exists());
+        assert!(pull.note_accept(&[1u8; 32]));
+        assert!(request.exists());
+        std::fs::remove_file(&request).unwrap();
+        assert!(
+            !pull.note_accept(&[1u8; 32]),
+            "seen within the recheck interval"
+        );
+        assert!(!request.exists());
+    }
+
     // ── SharedTrust::apply_epoch device revocation ───────────────────────────
 
     /// The intermediate cert the store trusts (`int_sk` signed by the single root),

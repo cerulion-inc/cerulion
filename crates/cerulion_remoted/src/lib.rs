@@ -84,6 +84,7 @@ pub mod clock;
 pub mod config;
 pub mod daemon;
 pub mod device_index;
+pub mod epoch_pull;
 pub mod error;
 pub mod flashback;
 pub mod forward;

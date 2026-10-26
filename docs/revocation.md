@@ -25,10 +25,10 @@ cut a compromised laptop without locking the account's phone out of the robot.
    the monotonic per-robot **epoch**, and returns a fresh `SignedEpoch` (signed by
    the intermediate). `GET /v1/robots/{robot_id}/access` inspects the current state +
    re-fetches the signed epoch to sync.
-2. **Sync to the robot: DESKS PUSH IT ON CONNECT** (by design):
-   the signed epoch reaches the robot because every desk that dials it **delivers the
-   epoch it has cached**. See [Epoch delivery](#epoch-delivery) below. The
-   robot then calls `SharedTrust::apply_epoch`, which applies + persists it.
+2. **Sync to the robot, two ways** (see [Epoch delivery](#epoch-delivery) below):
+   a registered robot **fetches its own epoch** from the account service, and every
+   desk that dials it **delivers the epoch it has cached**. Either way the robot
+   calls `SharedTrust::apply_epoch`, which applies + persists it.
    `apply_epoch` is **monotonic**: it only accepts a strictly-newer epoch, so a
    rolled-back clock or a replayed old epoch changes nothing.
 3. **Enforcement**:
@@ -71,9 +71,31 @@ belongs at the mint).
 
 ## Epoch delivery
 
-**Desks push; robots never poll.** A robot has no outbound cloud connection of its own,
-so the parties that already talk to it are the delivery mechanism: when a desk dials a
-robot, it hands over the latest epoch it has cached.
+**The robot fetches; desks also push.** Only the robot's own fetch stops a stolen
+or otherwise hostile desk: such a desk will not deliver its own revocation, so a
+revocation that travelled only through desks would never reach the robot while that
+desk keeps connecting. The desk path speeds delivery through honest desks and covers
+robots that are not registered to an account.
+
+**The robot's own fetch** (registered robots, account-first). `cerulion-netd`'s
+robot supervisor runs a hidden internal worker, `cerulion robot-sync-epoch`, that
+fetches `GET /v1/robots/{id}/access` with the robot's own login and leaves the
+signed epoch in `<state>/remoted/epoch.pending`; `cerulion-remoted` applies it
+through `SharedTrust::apply_epoch`, re-verifying it against the robot's own roots.
+The worker runs at start, every `EPOCH_SYNC_PERIOD` (300 s), and early, at most every
+5 s, when an admitted key that has not connected in the last `KEY_RECHECK_INTERVAL`
+(60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
+and the sweep below evicts live sessions. A failed fetch backs off from 5 s doubling
+to 300 s and changes nothing: only a verified, strictly newer epoch removes a key, so
+a robot never strands. Worst-case lag from the owner's revoke to enforcement: about
+`EPOCH_SYNC_PERIOD` when the revoked key stays away, a few seconds when it connects.
+The fetch needs the robot's login to stay valid; a robot whose login lapses keeps
+its last applied epoch.
+
+**The desk push.** When a desk dials a robot, it hands over the latest epoch it has
+cached. Before `topic list` probes the account's robots and before `viz --robot`
+dials its robot, the desk refreshes that robot's cache from the account service
+(the stored session only, within `EPOCH_SYNC_BUDGET`, 1 s, never blocking the dial).
 
 **It is UNCONDITIONAL: there is no flag, env gate or config knob to withhold it**
 (by design). Revocation propagation is not something a user opts into: a
@@ -83,7 +105,7 @@ silent no-op, and a missing or unusable cache never denies access.
 
 | Step | Where |
 |---|---|
-| An online sync fetches `GET /v1/robots/{id}/access` and caches `{ intermediate, signed_epoch }` at `~/.cerulion/epochs/<robot>.epoch` (`base64url(postcard(EpochSyncWire))`) | Studio / the account page / a CLI sync (`cerulion_cli_engine::account_cmd::sync_robot_epoch_to_cache`) |
+| An online sync fetches `GET /v1/robots/{id}/access` and caches `{ intermediate, signed_epoch }` at `~/.cerulion/epochs/<robot>.epoch` (`base64url(postcard(EpochSyncWire))`) | The account-robot listing and `viz --robot` before each dial (`AccountRobotDirectory::sync_robot_epoch`), Studio / the account page (`cerulion_cli_engine::account_cmd::sync_robot_epoch_to_cache`) |
 | The desk reads that cache at dial time and hex-encodes it | `cerulion_wireclient::config::resolve_epoch_sync` |
 | The desk decides what to send + what the answer meant | `cerulion_wireclient::epoch` (`prepare_epoch_push` / `classify_epoch_reply`); ONE implementation, shared |
 | The desk sends it on the connection it already has, right after the catalog admission gate | **BOTH** desk paths: `cerulion-netd`'s iroh WAN plane (every dial of a WAN robot) **and** the `cerulion connect` verb (`cerulion_connectd`'s session driver) |

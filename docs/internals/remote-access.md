@@ -498,7 +498,17 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   Rollback-floor-gated like every other acceptance path. Pinned by
   `store_test.rs` + `chain_verify_test.rs`; device granularity end-to-end by
   `multi_device_revoke_e2e_test.rs`.
-- **Desks push; robots never poll.** Both desk dial paths carry the cached epoch
+- **The robot fetches its own epoch.** On a registered robot, netd's supervisor
+  runs the hidden `cerulion robot-sync-epoch --state-root <root>` worker (an
+  internal process, never an operator command; it refuses without a robot
+  registration) at start, every 300 s, early on remoted's `epoch.request`, with
+  5 s to 300 s backoff. It fetches `/v1/robots/{id}/access` with the robot's own
+  login and writes `remoted/epoch.pending` (`hex(postcard(EpochSyncWire))`);
+  `cerulion_remoted::epoch_pull` applies it within 2 s. This is the path that cuts
+  a stolen desk. Session refreshes are serialized across processes by an
+  exclusive lock beside `auth.json` (`.auth-refresh.lock`): a refresh token is
+  single-use, and the loser of a race uses the session the winner wrote.
+- **Desks also push.** Both desk dial paths carry the cached epoch
   unconditionally; there is deliberately NO knob to withhold it (by
   design: a withholding knob would be a footgun). The shared substrate is
   `wireclient::epoch` (`prepare_epoch_push` / `classify_epoch_reply`); the robot

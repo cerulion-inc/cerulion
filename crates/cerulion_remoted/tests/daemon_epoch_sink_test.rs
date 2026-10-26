@@ -338,3 +338,110 @@ async fn daemon_serve_endpoint_applies_a_pushed_epoch_through_the_production_wir
     let _ = shutdown_tx.send(());
     let _ = bounded("serve shutdown", serve).await;
 }
+
+/// Whether `ep` is admitted to the robot's wire plane (a catalog answer).
+async fn wire_admitted(ep: &cerulion_link::Endpoint, robot_addr: EndpointAddr) -> bool {
+    let Ok(conn) = bounded("dial", dial(ep, robot_addr, alpn::WIRE)).await else {
+        return false;
+    };
+    let Ok((mut s, mut r)) = open_frame_stream(&conn).await else {
+        return false;
+    };
+    let bytes = serde_json::to_vec(&WireRequest::Catalog).unwrap();
+    if bounded("write", write_frame(&mut s, &bytes)).await.is_err() {
+        return false;
+    }
+    match bounded("read", read_frame(&mut r, DEFAULT_MAX_FRAME_LEN)).await {
+        Ok(raw) => {
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+            v.get("reply").and_then(|x| x.as_str()) == Some("catalog")
+        }
+        Err(_) => false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk_push() {
+    let robot_ep = disabled_endpoint([0x33; 32]).await;
+    let robot_addr = loopback_addr(robot_ep.id(), &robot_ep.bound_sockets());
+    let probe_ep = disabled_endpoint([0x45; 32]).await;
+    let probe_key = *probe_ep.id().as_bytes();
+
+    let root_set = RootSet::new(vec![pk(&sk(1))], 1).unwrap();
+    let mut store = TrustStore::provision(ROBOT, pk(&sk(0x77)), root_set, CHASSIS, 0).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let verified = store
+        .verify_new_pairing(
+            &presentation_for(probe_key, PROBE),
+            &PublicKey(probe_key),
+            T_NOW,
+        )
+        .unwrap();
+    store
+        .establish_pairing(
+            &verified,
+            cerulion_pairing::verify::PairingSource::StrongChain,
+            Some("desk".into()),
+            T_NOW,
+            None,
+        )
+        .unwrap();
+    let mut index = DeviceAccountIndex::new();
+    index.bind(PublicKey(probe_key), PROBE);
+
+    let manager = test_manager("pull");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("remoted")).unwrap();
+    let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    std::fs::create_dir_all(&config.log_root).unwrap();
+    let pending = dir.path().join("remoted").join("epoch.pending");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        let _ = serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &robot_ep,
+            RemotedClock::fixed(T_NOW),
+            Some(Duration::from_millis(200)),
+            Some(manager),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await;
+    });
+
+    assert!(
+        wire_admitted(&probe_ep, robot_addr.clone()).await,
+        "pre-condition: the key is admitted before any epoch"
+    );
+    // The robot's own sync worker left an epoch revoking PROBE; no desk pushes.
+    std::fs::write(
+        &pending,
+        hex::encode(
+            EpochSyncWire::new(intermediate_cert(), epoch(3, vec![PROBE]))
+                .to_postcard()
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut refused = false;
+    while std::time::Instant::now() < until {
+        if !pending.exists() && !wire_admitted(&probe_ep, robot_addr.clone()).await {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        refused,
+        "serve_endpoint polls the fetched epoch and the revoked key is refused"
+    );
+    let _ = shutdown_tx.send(());
+    let _ = bounded("serve shutdown", serve).await;
+}

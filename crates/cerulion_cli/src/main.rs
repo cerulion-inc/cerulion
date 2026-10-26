@@ -101,24 +101,31 @@ fn main() -> ExitCode {
     }
 
     let matches = families::cli_command().get_matches();
-    // The internal first-serve registration worker that `cerulion-netd`
-    // starts: dispatched before telemetry, logging and the login gate, so it
-    // never starts a browser login, records no event, and its JSON stdout
-    // carries nothing else. The engine requires an existing login.
+    // The internal workers `cerulion-netd` starts on a robot (first-serve
+    // registration, the revocation sync): dispatched before telemetry,
+    // logging and the login gate, so they never start a browser login, record
+    // no event, and their JSON stdout carries nothing else. The engine
+    // requires an existing login.
     #[cfg(unix)]
-    if matches.subcommand_name() == Some("bootstrap-robot") {
-        if let Commands::BootstrapRobot { state_root } = Cli::from_arg_matches(&matches)
+    if matches!(
+        matches.subcommand_name(),
+        Some("bootstrap-robot" | "robot-sync-epoch")
+    ) {
+        let worker = match Cli::from_arg_matches(&matches)
             .unwrap_or_else(|e| e.exit())
             .command
         {
-            return match bootstrap_robot(&state_root) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
+            Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
+            Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
+            _ => unreachable!("the subcommand name selected an internal worker"),
+        };
+        return match worker {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     // One `cli_command_run` per invocation, recorded around the whole
     // dispatch so every intercept below is covered. `None` (nothing is
@@ -1187,10 +1194,17 @@ fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
     cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
 }
 
+#[cfg(unix)]
+fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
+    cerulion_cli_engine::robot_bootstrap::sync_epoch(state_root, &mut std::io::stdout().lock())
+}
+
 fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
         #[cfg(unix)]
         Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
+        #[cfg(unix)]
+        Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
         Commands::Workspace { action } => match action {
             WorkspaceAction::Create { name, starter } => {
                 let cwd = std::env::current_dir()?;

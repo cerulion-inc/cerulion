@@ -1154,12 +1154,19 @@ pub fn store_lock_path(auth_path: &Path) -> PathBuf {
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(1_000);
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The never-renamed sibling of `auth.json` whose exclusive lock serializes
+/// session refreshes across processes (a refresh token is single-use).
+pub const REFRESH_LOCK_FILE: &str = ".auth-refresh.lock";
+/// How long a refresh waits for a peer's refresh to finish: the refresh
+/// request's own HTTP timeout plus margin.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A held store lock: released when dropped, and by the KERNEL if this process
 /// dies holding it — which is what makes a crashed writer unable to wedge the
 /// store for the next login.
 #[cfg(unix)]
 #[must_use = "the lock is released the moment this value drops"]
-struct StoreLock {
+pub(crate) struct StoreLock {
     /// Kept solely to HOLD the `flock` (it is owned by the open file
     /// DESCRIPTION), never read.
     _file: std::fs::File,
@@ -1168,13 +1175,36 @@ struct StoreLock {
 /// Non-Unix: no `flock`, nothing held. `~/.cerulion` is a Unix path story and a
 /// fake lock claiming exclusion would be worse than none.
 #[cfg(not(unix))]
-struct StoreLock;
+pub(crate) struct StoreLock;
 
-#[cfg(unix)]
 fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(&store_lock_path(auth_path), auth_path, LOCK_WAIT, "writing")
+}
+
+/// The exclusive lock that serializes session refreshes across processes, held
+/// across the refresh request ([`REFRESH_LOCK_WAIT`] bounds the wait for it).
+/// Separate from the store lock, so a store write never waits on the network.
+pub(crate) fn hold_refresh_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(
+        &auth_path.with_file_name(REFRESH_LOCK_FILE),
+        auth_path,
+        REFRESH_LOCK_WAIT,
+        "refreshing the session in",
+    )
+}
+
+/// An exclusive `flock` on `path` (created 0600 if absent), retried every
+/// [`LOCK_POLL`] until `wait` passes.
+#[cfg(unix)]
+fn hold_lock_file(
+    path: &Path,
+    auth_path: &Path,
+    wait: std::time::Duration,
+    doing: &str,
+) -> std::io::Result<StoreLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let path = store_lock_path(auth_path);
+    let path = path.to_path_buf();
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             create_secret_dir(parent)?;
@@ -1190,7 +1220,7 @@ fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
         .mode(0o600)
         .open(&path)?;
 
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match flock_exclusive_nonblocking(&file) {
             Ok(()) => return Ok(StoreLock { _file: file }),
@@ -1199,10 +1229,10 @@ fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         format!(
-                            "another Cerulion process is writing {} and did not finish within \
+                            "another Cerulion process is {doing} {} and did not finish within \
                              {}ms",
                             auth_path.display(),
-                            LOCK_WAIT.as_millis()
+                            wait.as_millis()
                         ),
                     ));
                 }
@@ -1233,7 +1263,12 @@ fn flock_exclusive_nonblocking(f: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn hold_store_lock(_auth_path: &Path) -> std::io::Result<StoreLock> {
+fn hold_lock_file(
+    _path: &Path,
+    _auth_path: &Path,
+    _wait: std::time::Duration,
+    _doing: &str,
+) -> std::io::Result<StoreLock> {
     Ok(StoreLock)
 }
 

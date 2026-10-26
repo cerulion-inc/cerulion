@@ -29,6 +29,7 @@ use crate::authorizer::{AcceptDecision, PairingAuthorizer};
 use crate::clock::RemotedClock;
 use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
+use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
@@ -162,6 +163,13 @@ pub async fn serve_endpoint(
     let shared =
         SharedTrust::new_with_clock(trust_store, device_index, mac_key, access_clock.clone());
     let classify = Arc::new(PairingAuthorizer::from_shared(shared.clone()));
+    // The robot's own revocation fetch: the supervisor's sync worker leaves
+    // fetched epochs in the state directory, applied here on a poll.
+    let pull = config
+        .store_file
+        .parent()
+        .map(|dir| Arc::new(EpochPull::new(dir, shared.clone(), access_clock.clone())));
+    let poller = pull.clone().map(|pull| tokio::spawn(pull.run()));
     // The wire plane's epoch-sync sink gets the SAME live handle + the SAME
     // trusted clock the accept gate and the access list run on, so a desk-pushed
     // epoch is authoritative everywhere at once.
@@ -220,7 +228,12 @@ pub async fn serve_endpoint(
         "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
     );
 
-    serve_with_wire(endpoint, classify, Some(ops), Some(wire), shutdown).await
+    let served =
+        serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
+    if let Some(poller) = poller {
+        poller.abort();
+    }
+    served
 }
 
 /// Assert the loaded trust store belongs to THIS device: the endpoint id (the
@@ -277,6 +290,20 @@ pub async fn serve_with_wire(
     wire: Option<Arc<WirePlane>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
+    serve_with_epoch_pull(endpoint, classify, ops, wire, None, shutdown).await
+}
+
+/// [`serve_with_wire`] that also tells `pull` about every accepted key, so a
+/// key not seen recently requests an early revocation fetch
+/// ([`EpochPull::note_accept`]).
+pub async fn serve_with_epoch_pull(
+    endpoint: &Endpoint,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    pull: Option<Arc<EpochPull>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -293,6 +320,9 @@ pub async fn serve_with_wire(
                         break;
                     }
                     Ok(Some(a)) => {
+                        if let Some(pull) = &pull {
+                            pull.note_accept(a.remote_id.as_bytes());
+                        }
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();

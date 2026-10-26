@@ -2945,3 +2945,108 @@ fn inconsistent_hosted_certification_preserves_previous_auth_and_certificate_byt
         );
     }
 }
+
+#[test]
+#[serial]
+fn concurrent_refreshes_spend_the_refresh_token_once_and_both_end_with_the_new_session() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // A refresh endpoint that answers slowly, so the two refreshes overlap, and
+    // counts every exchange it receives.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&exchanges);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert!(first.starts_with("POST /v1/auth/refresh "), "{first}");
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["refresh_token"], "single-use-refresh");
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                let reply = serde_json::json!({
+                    "session_token": "rotated-session",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            });
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let auth_path = home.path().join("auth.json");
+    auth::write_to(
+        &auth_path,
+        &auth::AuthState {
+            account_id: "refresh-race-account".into(),
+            session_token: "stale-session".into(),
+            refresh_token: "single-use-refresh".into(),
+            expires_at_ns: 1,
+            logged_in_ever: true,
+            role: None,
+        },
+    )
+    .unwrap();
+
+    // Two independent refreshes at once (each thread opens its own lock file
+    // descriptor, so the kernel flock arbitrates them as it does two processes).
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                login_cmd::refresh_session_if_stale()
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    for result in &results {
+        if let Err(error) = result {
+            panic!("a refresh failed: {error}");
+        }
+    }
+    assert_eq!(
+        exchanges.load(Ordering::SeqCst),
+        1,
+        "the refresh token was spent once"
+    );
+    match auth::load_from(&auth_path) {
+        LoadedAuth::Present(state) => {
+            assert_eq!(state.session_token, "rotated-session");
+            assert_eq!(state.refresh_token, "rotated-refresh");
+            assert!(state.session_is_valid(auth::now_unix_ns()));
+        }
+        other => panic!("expected the refreshed session, got {other:?}"),
+    }
+}

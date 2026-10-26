@@ -217,6 +217,13 @@ pub enum Commands {
         #[arg(long, value_hint = clap::ValueHint::DirPath)]
         state_root: PathBuf,
     },
+    /// Internal robot-side revocation sync worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    RobotSyncEpoch {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
     /// Workspace management
     Workspace {
         #[command(subcommand)]
@@ -680,6 +687,8 @@ impl Commands {
         match self {
             #[cfg(unix)]
             Commands::BootstrapRobot { .. } => OneShot,
+            #[cfg(unix)]
+            Commands::RobotSyncEpoch { .. } => OneShot,
             // ── Long-running / runtime verbs: keep the `info` default ──
             Commands::Graph { action } => match action {
                 // Runtime loops: the live run, the live profiler, and the

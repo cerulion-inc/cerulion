@@ -174,3 +174,123 @@ fn a_failure_after_a_healthy_run_counts_as_the_first_attempt() {
     assert_eq!(counted_attempt(3, Duration::from_secs(86_400)), 1);
     assert_eq!(counted_attempt(1, Duration::ZERO), 1);
 }
+
+#[test]
+fn epoch_sync_delays_double_from_five_seconds_to_a_five_minute_cap_without_stopping() {
+    let secs: Vec<u64> = [1, 2, 3, 4, 5, 6, 7, 100]
+        .iter()
+        .map(|failures| epoch_sync_delay(*failures).as_secs())
+        .collect();
+    assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300]);
+}
+
+/// A stand-in worker: appends one line to `log` per run, exits with `code`.
+fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("runs.log");
+    let script = dir.join("cerulion");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+fn runs(log: &Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+}
+
+/// Poll at `now` until the running worker has been reaped.
+fn settle(sync: &mut EpochSync, now: Instant) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while sync.child.is_some() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+        sync.poll(now);
+    }
+    assert!(sync.child.is_none(), "the worker finished");
+}
+
+#[test]
+fn epoch_sync_fetches_at_start_then_each_period_and_early_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_worker(dir.path(), 0);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(cli, root.clone(), t0);
+    sync.poll(t0);
+    settle(&mut sync, t0);
+    assert_eq!(runs(&log), 1);
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim(),
+        format!("robot-sync-epoch --state-root {}", root.display())
+    );
+    // Nothing more until the period, unless remoted asks.
+    sync.poll(t0 + Duration::from_secs(60));
+    assert!(sync.child.is_none());
+    let request = root.join("remoted").join("epoch.request");
+    std::fs::write(&request, b"").unwrap();
+    // Within the early-fetch gap of the last start: deferred to the gap's end.
+    sync.poll(t0 + Duration::from_secs(2));
+    assert!(!request.exists(), "the request is consumed");
+    assert!(sync.child.is_none());
+    sync.poll(t0 + Duration::from_secs(5));
+    settle(&mut sync, t0 + Duration::from_secs(5));
+    assert_eq!(runs(&log), 2);
+    let t1 = t0 + Duration::from_secs(5);
+    sync.poll(t1 + EPOCH_SYNC_PERIOD - Duration::from_secs(1));
+    assert!(sync.child.is_none());
+    sync.poll(t1 + EPOCH_SYNC_PERIOD);
+    settle(&mut sync, t1 + EPOCH_SYNC_PERIOD);
+    assert_eq!(runs(&log), 3);
+}
+
+#[test]
+fn a_failing_epoch_sync_backs_off_and_keeps_trying() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_worker(dir.path(), 1);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(cli, root.clone(), t0);
+    sync.poll(t0);
+    settle(&mut sync, t0);
+    assert_eq!(sync.failures, 1);
+    // A request does not cut a backoff short.
+    std::fs::write(root.join("remoted").join("epoch.request"), b"").unwrap();
+    sync.poll(t0 + Duration::from_secs(4));
+    assert!(sync.child.is_none());
+    sync.poll(t0 + Duration::from_secs(5));
+    settle(&mut sync, t0 + Duration::from_secs(5));
+    assert_eq!(runs(&log), 2);
+    assert_eq!(sync.failures, 2);
+    assert_eq!(
+        sync.next,
+        t0 + Duration::from_secs(5) + Duration::from_secs(10)
+    );
+}
+
+#[test]
+fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("cerulion");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = dir.path().join("state");
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(script, root, t0);
+    sync.poll(t0);
+    assert!(sync.child.is_some());
+    sync.poll(t0 + EPOCH_SYNC_DEADLINE);
+    assert!(
+        sync.child.is_none(),
+        "the overdue worker was killed and reaped"
+    );
+    assert_eq!(sync.failures, 1);
+}
