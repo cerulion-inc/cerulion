@@ -174,7 +174,10 @@ fn gid_bytes(gid: &ffi::rmw_gid_t) -> [u8; 16] {
         ffi::implementation_identifier_ptr(),
         "the gid names this implementation"
     );
-    assert!(gid.data[16..].iter().all(|b| *b == 0), "storage tail is zero");
+    assert!(
+        gid.data[16..].iter().all(|b| *b == 0),
+        "storage tail is zero"
+    );
     gid.data[..16].try_into().expect("16 bytes")
 }
 
@@ -230,7 +233,9 @@ unsafe fn publish(publisher: *const ffi::rmw_publisher_t, x: f64) {
     );
 }
 
-unsafe fn take_with_info(subscription: *const ffi::rmw_subscription_t) -> (CPoint, ffi::rmw_message_info_t) {
+unsafe fn take_with_info(
+    subscription: *const ffi::rmw_subscription_t,
+) -> (CPoint, ffi::rmw_message_info_t) {
     let mut out = CPoint::default();
     let mut taken = false;
     let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
@@ -272,7 +277,10 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
 
         let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
         assert!(!subscription.is_null());
-        assert!((*subscription).can_loan_messages, "fixed POD type loans on take");
+        assert!(
+            (*subscription).can_loan_messages,
+            "fixed POD type loans on take"
+        );
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
         assert!(!publisher.is_null());
         let second = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
@@ -283,7 +291,10 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
         let pub_bytes = gid_bytes(&pub_gid);
         assert_this_process_layout(&pub_bytes);
         assert_this_process_layout(&gid_bytes(&second_gid));
-        assert!(!gids_equal(&pub_gid, &second_gid), "two publishers, two gids");
+        assert!(
+            !gids_equal(&pub_gid, &second_gid),
+            "two publishers, two gids"
+        );
 
         // rmw_take: no info out-parameter, the message still arrives.
         publish(publisher, 1.0);
@@ -336,7 +347,14 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
         info_seq.capacity = 2;
         let mut n = 0usize;
         assert_eq!(
-            rmw_take_sequence(subscription, 2, &mut seq, &mut info_seq, &mut n, std::ptr::null_mut()),
+            rmw_take_sequence(
+                subscription,
+                2,
+                &mut seq,
+                &mut info_seq,
+                &mut n,
+                std::ptr::null_mut()
+            ),
             RMW_RET_OK
         );
         assert_eq!(n, 2);
@@ -365,7 +383,8 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
         assert_eq!(gid_bytes(&info.publisher_gid), pub_bytes);
         // The frame this take returned is the native wire frame; keep it for
         // the native publisher arm below.
-        let frame = std::slice::from_raw_parts(serialized.buffer, serialized.buffer_length).to_vec();
+        let frame =
+            std::slice::from_raw_parts(serialized.buffer, serialized.buffer_length).to_vec();
         free(serialized.buffer as *mut c_void);
 
         // rmw_take_loaned_message_with_info.
@@ -400,7 +419,10 @@ fn every_take_path_reports_the_publishing_rmw_publishers_gid() {
             .expect("native publisher on the rmw topic");
         native.publish_raw(&frame).expect("native publish");
         let (out, info) = take_with_info(subscription);
-        assert_eq!(out.x, 6.0, "the native publisher re-sent the serialized frame");
+        assert_eq!(
+            out.x, 6.0,
+            "the native publisher re-sent the serialized frame"
+        );
         assert_eq!(gid_bytes(&info.publisher_gid), [0u8; 16]);
         assert!(!gids_equal(&info.publisher_gid, &pub_gid));
         assert!(!gids_equal(&info.publisher_gid, &second_gid));
@@ -448,12 +470,21 @@ fn endpoint_info_reports_the_same_gids() {
 
         let mut arr: ffi::rmw_topic_endpoint_info_array_t = std::mem::zeroed();
         assert_eq!(
-            rmw_get_subscriptions_info_by_topic(node, &mut allocator, topic.as_ptr(), false, &mut arr),
+            rmw_get_subscriptions_info_by_topic(
+                node,
+                &mut allocator,
+                topic.as_ptr(),
+                false,
+                &mut arr
+            ),
             RMW_RET_OK
         );
         assert_eq!(arr.size, 1);
         let sub_gid = (*arr.info_array).endpoint_gid;
-        assert!(sub_gid[16..].iter().all(|b| *b == 0), "storage tail is zero");
+        assert!(
+            sub_gid[16..].iter().all(|b| *b == 0),
+            "storage tail is zero"
+        );
         let sub_bytes: [u8; 16] = sub_gid[..16].try_into().unwrap();
         assert_this_process_layout(&sub_bytes);
         assert_ne!(sub_gid, pub_gid.data, "publisher and subscription differ");
@@ -508,7 +539,13 @@ struct Child {
 fn spawn_child(topic: &str, type_name: &str, x: f64) -> Child {
     let exe = std::env::current_exe().expect("current_exe");
     let mut process = std::process::Command::new(exe)
-        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            CHILD_TEST,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(ENV_CHILD, "1")
         .env(ENV_TOPIC, topic)
         .env(ENV_TYPE, type_name)
@@ -596,10 +633,20 @@ fn gids_are_unique_across_processes_and_a_cross_process_take_reports_the_childs_
         let a = spawn_child(&ros_topic, &type_name, 10.0);
         let b = spawn_child(&ros_topic, &type_name, 20.0);
 
-        assert_eq!(a.gid[8..], b.gid[8..], "equal entity numbers in the two children");
+        assert_eq!(
+            a.gid[8..],
+            b.gid[8..],
+            "equal entity numbers in the two children"
+        );
         assert_ne!(a.gid, b.gid, "gids differ across processes");
-        assert_eq!(u32::from_le_bytes(a.gid[4..8].try_into().unwrap()), a.process.id());
-        assert_eq!(u32::from_le_bytes(b.gid[4..8].try_into().unwrap()), b.process.id());
+        assert_eq!(
+            u32::from_le_bytes(a.gid[4..8].try_into().unwrap()),
+            a.process.id()
+        );
+        assert_eq!(
+            u32::from_le_bytes(b.gid[4..8].try_into().unwrap()),
+            b.process.id()
+        );
 
         for _ in 0..2 {
             let (out, info) = take_with_info(subscription);

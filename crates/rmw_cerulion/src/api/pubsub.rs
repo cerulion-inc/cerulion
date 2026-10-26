@@ -2328,6 +2328,23 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 return std::ptr::null_mut();
             }
         };
+        // The publisher gid each take reports is read from the topic's
+        // publisher directory. A subscription without one would report the
+        // all-zero gid on every take, and rclcpp would then deliver each
+        // intra-process message twice, so the create fails instead.
+        let publisher_directory = match rt.transport.open_publisher_directory(&topic) {
+            Ok(d) => d,
+            Err(e) => {
+                let reason = format!(
+                    "subscription creation failed on {topic}: the topic's publisher \
+                     directory did not open ({e}), and without it a take cannot report \
+                     which publisher sent a message"
+                );
+                tracing::error!("{reason}");
+                let _ = ffi::rcutils_set_error_state_best_effort(&reason);
+                return std::ptr::null_mut();
+            }
+        };
         // The effective borrow budget is the
         // service's real capacity — smaller than the requested floor when the
         // service already existed (the floor is CREATE-leg-only). The adopt
@@ -2398,29 +2415,14 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // rmw_get_subscriptions_info_by_topic reports and the registry
         // deregister key.
         let gid = crate::gid::mint_gid();
-        // The publisher gid each take reports is read from the topic's
-        // publisher directory. A subscription without one would report the
-        // all-zero gid on every take, and rclcpp would then deliver each
-        // intra-process message twice, so the create fails instead.
-        let publisher_directory = match rt.transport.open_publisher_directory(&topic) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(
-                    topic = %topic,
-                    error = %e,
-                    "subscription creation failed: the topic's publisher directory \
-                     did not open, and without it a take cannot report which \
-                     publisher sent a message"
-                );
-                return std::ptr::null_mut();
-            }
-        };
 
         let type_name = ros_graph_type_name(bridge.qualified_name());
         // Adopt-take hot path: the
         // adoption scratch is reserved UP FRONT to the type's forgeable-
         // member count — the high-water bound both Vecs ever reach — so the
-        // FIRST adopted take allocates only the structural Arc. A
+        // FIRST adopted take allocates only the structural Arc, plus, when
+        // the take asks for message info, the one publisher-list walk that
+        // resolves a publisher's gid the first time it is seen. A
         // `Vec::new()` here would make the first adopted receive grow both
         // scratch Vecs before the one allocation the contract allows. Zero
         // for a type with no forgeable member (no reservation at all).

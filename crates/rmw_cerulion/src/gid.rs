@@ -131,7 +131,9 @@ impl PublisherGidResolver {
     /// A resolver over `directory`. `None` resolves every origin to the
     /// all-zero gid.
     pub fn new(directory: Option<PublisherDirectory>) -> Self {
-        let publishers = directory.as_ref().map_or(1, PublisherDirectory::max_publishers);
+        let publishers = directory
+            .as_ref()
+            .map_or(1, PublisherDirectory::max_publishers);
         let capacity = RESOLVER_CACHE_PER_PUBLISHER * publishers.max(1);
         Self {
             directory,

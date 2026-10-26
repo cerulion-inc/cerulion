@@ -439,7 +439,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         let mut frame: Option<Vec<u8>> = None;
         let mut info_out: Option<(u64, u64, u128)> = None;
         let receive = inner.subscriber.try_receive_one(|msg| {
-        let origin = msg.origin();
+            let origin = msg.origin();
             // Reassemble the full frame (header + payload) — "cerulion"
             // serialization format IS the wire frame.
             let header = msg.header();
@@ -450,9 +450,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
             frame = Some(buf);
         });
         let publisher_gid = match info_out {
-            Some((_, _, origin)) if !message_info.is_null() => {
-                inner.publisher_gids.resolve(origin)
-            }
+            Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
             _ => [0u8; 16],
         };
         drop(inner);

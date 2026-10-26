@@ -691,7 +691,6 @@ fn a_copy_path_take_costs_zero_rust_allocations() {
     }
 }
 
-
 /// More publishers on one topic than the old 16-entry gid cache held. Each
 /// take WITH a message-info pointer resolves the sender's gid; once every
 /// publisher has been seen, that lookup is a cache hit and allocates
@@ -722,7 +721,11 @@ fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations()
         let mut publishers = vec![first];
         for _ in 1..PUBLISHERS {
             let p = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
-            assert!(!p.is_null(), "publisher {} of {PUBLISHERS}", publishers.len() + 1);
+            assert!(
+                !p.is_null(),
+                "publisher {} of {PUBLISHERS}",
+                publishers.len() + 1
+            );
             publishers.push(p);
         }
 
@@ -746,7 +749,11 @@ fn a_copy_path_take_with_info_from_many_publishers_costs_zero_rust_allocations()
         for (i, p) in publishers.iter().enumerate() {
             publish_scan(*p, 16, i as f32);
             let info = take_with_info(&mut msg);
-            assert_ne!(info.publisher_gid.data[..16], [0u8; 16], "publisher {i}'s gid");
+            assert_ne!(
+                info.publisher_gid.data[..16],
+                [0u8; 16],
+                "publisher {i}'s gid"
+            );
         }
         // Measured: one more frame from every publisher, taken with info.
         for (i, p) in publishers.iter().enumerate() {

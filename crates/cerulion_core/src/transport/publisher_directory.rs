@@ -45,7 +45,8 @@ pub(crate) fn port_name(name: &str) -> Result<PortName, String> {
 /// cache its answers per origin. A publisher that has detached is no longer
 /// listed, so a sample still queued from it resolves to `None`.
 pub struct PublisherDirectory {
-    data_service: iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>,
+    data_service:
+        iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>,
 }
 
 impl std::fmt::Debug for PublisherDirectory {
