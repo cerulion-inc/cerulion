@@ -2564,7 +2564,16 @@ mod refresh_lock_tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // Kill the holder however this test ends.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         let stdout = holder.stdout.take().unwrap();
+        let mut holder = Reap(holder);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -2588,8 +2597,8 @@ mod refresh_lock_tests {
             "the lock is held by the live holder"
         );
         // SIGKILL: no destructor runs; the kernel drops the flock with the process.
-        holder.kill().unwrap();
-        holder.wait().unwrap();
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
         let (held, waited) = done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the waiter acquired the lock after the holder died");

@@ -160,7 +160,21 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
             let postcard = URL_SAFE_NO_PAD
                 .decode(artifact.as_bytes())
                 .map_err(|_| refused("the fetched epoch did not encode"))?;
-            let pending = state_root.join(REMOTED_SUBDIR).join(EPOCH_PENDING_FILE);
+            // Only into the remote-plane daemon's provisioned, owner-only
+            // directory; this worker never creates it.
+            let remoted = state_root.join(REMOTED_SUBDIR);
+            match fs::symlink_metadata(&remoted) {
+                Ok(meta)
+                    if meta.is_dir()
+                        && meta.uid() == cerulion_hygiene::euid()
+                        && meta.mode() & 0o077 == 0 => {}
+                _ => {
+                    return Err(refused(
+                        "the robot's remote-plane state is not provisioned; revocations were not synced",
+                    ))
+                }
+            }
+            let pending = remoted.join(EPOCH_PENDING_FILE);
             auth::atomic_write_secret(&pending, hex::encode(postcard).as_bytes())?;
             Some(access.epoch)
         }

@@ -248,6 +248,27 @@ fn run(
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
     let mut epoch_sync = EpochSync::new(cli, root.clone(), Instant::now());
+    let result = supervise_server(
+        &mut child,
+        &mut epoch_sync,
+        running,
+        &provisioned.endpoint_id,
+        &refresh_facts,
+    );
+    epoch_sync.stop();
+    result
+}
+
+/// While `running`: watch the server child (its exit is an error), advance the
+/// revocation sync, and refresh the LAN advertisement's endpoint facts during
+/// the first [`FACT_REFRESH_WINDOW`].
+fn supervise_server(
+    child: &mut OwnedChild,
+    epoch_sync: &mut EpochSync,
+    running: &AtomicBool,
+    endpoint_id: &str,
+    refresh_facts: &impl Fn(&str) -> Result<bool, String>,
+) -> Result<(), String> {
     let refresh_deadline = Instant::now() + FACT_REFRESH_WINDOW;
     let mut next_refresh = Instant::now();
     let mut refresh_failed = false;
@@ -258,9 +279,9 @@ fn run(
         let now = Instant::now();
         epoch_sync.poll(now);
         if !refresh_failed && now < refresh_deadline && now >= next_refresh {
-            match refresh_facts(&provisioned.endpoint_id) {
+            match refresh_facts(endpoint_id) {
                 Ok(true) => {
-                    tracing::info!(endpoint_id = %provisioned.endpoint_id, "robot endpoint facts refreshed in the LAN advertisement")
+                    tracing::info!(%endpoint_id, "robot endpoint facts refreshed in the LAN advertisement")
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -278,8 +299,12 @@ fn run(
 /// How often a serving robot fetches its own revocation epoch: the longest a
 /// revocation waits when the revoked key never connects.
 const EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(300);
-/// The bound on one revocation fetch (the worker's HTTP request and write).
-const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(60);
+/// The bound on one revocation fetch: above the worker's own worst case (a
+/// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
+/// access request), so the deadline never cuts a refresh in flight.
+const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
+/// How long shutdown waits for a running fetch before stopping it.
+const EPOCH_SYNC_STOP_GRACE: Duration = Duration::from_secs(5);
 /// The shortest gap between two fetches started by connection requests.
 const EPOCH_EARLY_FETCH_GAP: Duration = Duration::from_secs(5);
 /// The first wait after a failed fetch; doubles per consecutive failure.
@@ -371,6 +396,22 @@ impl EpochSync {
                 self.finish(false, now);
             }
         }
+    }
+
+    /// Shutdown: give a running fetch [`EPOCH_SYNC_STOP_GRACE`] to finish, then
+    /// stop it (dropping the child kills and reaps it).
+    fn stop(&mut self) {
+        let Some((mut child, _)) = self.child.take() else {
+            return;
+        };
+        let until = Instant::now() + EPOCH_SYNC_STOP_GRACE;
+        while Instant::now() < until {
+            if !matches!(child.0.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        drop(child);
     }
 
     fn finish(&mut self, ok: bool, now: Instant) {

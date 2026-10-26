@@ -630,6 +630,17 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
         &RevokeTarget::Device(URL_SAFE_NO_PAD.encode(revoked)),
     )
     .unwrap();
+    // Refused while the remote-plane state is not provisioned; never created.
+    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap_err();
+    assert!(err.to_string().contains("not provisioned"), "{err}");
+    assert!(!root.join("remoted").exists());
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("remoted"))
+            .unwrap();
+    }
     let mut out = Vec::new();
     robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
     assert_eq!(

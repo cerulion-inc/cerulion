@@ -28,6 +28,8 @@ use crate::trust::SharedTrust;
 
 /// The fetched epoch the sync worker leaves for remoted to apply.
 pub const EPOCH_PENDING_FILE: &str = "epoch.pending";
+/// The name a fetched epoch is moved to while it is applied.
+const EPOCH_CLAIMED_FILE: &str = "epoch.pending.applying";
 /// The file remoted writes to ask the supervisor for an early fetch.
 pub const EPOCH_REQUEST_FILE: &str = "epoch.request";
 /// How often remoted looks for a fetched epoch: the longest a fetched
@@ -78,20 +80,27 @@ impl EpochPull {
         }
     }
 
-    /// Apply [`EPOCH_PENDING_FILE`] if present, then remove it.
+    /// Apply [`EPOCH_PENDING_FILE`] if present. The file is first claimed by
+    /// renaming it aside, so an epoch the worker writes while this one is
+    /// being applied is left for the next poll; the claimed file is removed.
     pub fn apply_pending(&self) -> PullOutcome {
-        let path = self.dir.join(EPOCH_PENDING_FILE);
-        let bytes = match read_pending(&path) {
-            Ok(None) => return PullOutcome::Nothing,
-            Ok(Some(bytes)) => bytes,
-            Err(reason) => {
-                remove_quietly(&path);
-                tracing::warn!(%reason, "cerulion_remoted: discarded a fetched revocation epoch");
+        let pending = self.dir.join(EPOCH_PENDING_FILE);
+        let claimed = self.dir.join(EPOCH_CLAIMED_FILE);
+        match std::fs::rename(&pending, &claimed) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PullOutcome::Nothing,
+            Err(e) => {
+                let reason = format!("could not claim the fetched epoch: {e}");
+                tracing::warn!(%reason, "cerulion_remoted: a fetched revocation epoch waits");
                 return PullOutcome::Rejected { reason };
             }
+        }
+        let outcome = match read_pending(&claimed) {
+            Ok(None) => PullOutcome::Nothing,
+            Ok(Some(bytes)) => self.apply(&bytes),
+            Err(reason) => PullOutcome::Rejected { reason },
         };
-        remove_quietly(&path);
-        let outcome = self.apply(&bytes);
+        remove_quietly(&claimed);
         match &outcome {
             PullOutcome::Applied { epoch } => {
                 tracing::info!(

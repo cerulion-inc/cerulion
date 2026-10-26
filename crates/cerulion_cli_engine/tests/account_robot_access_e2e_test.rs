@@ -473,5 +473,22 @@ fn a_listing_refreshes_the_listed_robots_revocation_epoch_into_the_dialed_routes
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
+
+    // `viz --robot` refreshes its selected robot before the dial too.
+    let second = [0x5c_u8; 32];
+    revoke_robot_access(
+        "account-access-session-fixture",
+        &URL_SAFE_NO_PAD.encode(fixture.robot_id),
+        &RevokeTarget::Device(URL_SAFE_NO_PAD.encode(second)),
+    )
+    .unwrap();
+    std::fs::remove_file(&cache).unwrap();
+    let target = account_robot_access::prepare_viz_target(&route, &[], &[]).unwrap();
+    assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+    let artifact = std::fs::read_to_string(&cache).expect("the selected robot's epoch is cached");
+    let wire: cerulion_pairing::verify::EpochSyncWire =
+        postcard::from_bytes(&URL_SAFE_NO_PAD.decode(artifact.trim()).unwrap()).unwrap();
+    assert_eq!(wire.signed_epoch.epoch_data.revoked_devices.len(), 2);
+    drop(target);
     daemon.shutdown();
 }

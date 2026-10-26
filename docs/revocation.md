@@ -87,8 +87,16 @@ The worker runs at start, every `EPOCH_SYNC_PERIOD` (300 s), and early, at most 
 (60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
 and the sweep below evicts live sessions. A failed fetch backs off from 5 s doubling
 to 300 s and changes nothing: only a verified, strictly newer epoch removes a key, so
-a robot never strands. Worst-case lag from the owner's revoke to enforcement: about
-`EPOCH_SYNC_PERIOD` when the revoked key stays away, a few seconds when it connects.
+a robot never strands.
+
+Worst-case lag from the owner's revoke to enforcement, on a robot whose login is
+valid: one fetch period plus one fetch plus one poll, about
+`EPOCH_SYNC_PERIOD` (300 s) + `EPOCH_SYNC_DEADLINE` (120 s) + 2 s. That bound holds
+whether or not the revoked key connects, and it is what applies to a desk holding one
+connection open, a key that connected within the last 60 s, and a robot whose
+fetches are backing off. Enforcement comes within seconds (the early fetch plus one
+poll) only when the revoked key opens a new connection after 60 s away while fetches
+are succeeding.
 The fetch needs the robot's login to stay valid; a robot whose login lapses keeps
 its last applied epoch.
 

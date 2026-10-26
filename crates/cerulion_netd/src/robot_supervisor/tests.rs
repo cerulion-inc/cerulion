@@ -294,3 +294,27 @@ fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
     );
     assert_eq!(sync.failures, 1);
 }
+
+#[test]
+fn the_server_loop_runs_the_revocation_sync_while_the_server_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_worker(dir.path(), 0);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let mut server = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
+    let mut sync = EpochSync::new(cli, root, Instant::now());
+    let running = Arc::new(AtomicBool::new(true));
+    let stopper = Arc::clone(&running);
+    let watched = log.clone();
+    let stop = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        while runs(&watched) == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stopper.store(false, Ordering::SeqCst);
+    });
+    let result = supervise_server(&mut server, &mut sync, &running, "eid", &|_| Ok(false));
+    stop.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(runs(&log), 1, "the loop started the revocation sync");
+}

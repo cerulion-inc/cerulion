@@ -200,10 +200,16 @@ pub fn list() -> CliResult<AccountListing> {
     };
     let mut diagnostic = sync_epochs(&directory, &rows);
     let deadline = Instant::now() + LIST_PROBE_BUDGET;
+    let mut probed = 0usize;
     for row in &mut rows {
         if matches!(row.robot.endpoint, RobotEndpoint::Unknown { .. }) {
             continue;
         }
+        // Probe only the robots whose revocations were just refreshed.
+        if probed == MAX_PROBED_ROBOTS {
+            break;
+        }
+        probed += 1;
         let Some(budget) = probe_budget(deadline, Instant::now()) else {
             break;
         };

@@ -427,6 +427,12 @@ async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk
         wire_admitted(&probe_ep, robot_addr.clone()).await,
         "pre-condition: the key is admitted before any epoch"
     );
+    // That admitted key had not connected before, so the accept asked the
+    // supervisor for an early fetch.
+    assert!(
+        dir.path().join("remoted").join("epoch.request").exists(),
+        "an accept of a key not seen recently requests an early epoch fetch"
+    );
     // The robot's own sync worker left an epoch revoking PROBE; no desk pushes.
     // The worker writes it owner-only (0600) through an atomic rename.
     let staged = dir.path().join("remoted").join(".epoch.pending.tmp");
