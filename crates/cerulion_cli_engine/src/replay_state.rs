@@ -1771,6 +1771,7 @@ mod tests {
             offset_table_count: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
+            step_tag: cerulion_core::StepTag::UNTAGGED,
         }
         .write_to_buf(&mut frame[..cerulion_core::WireHeader::SIZE]);
         frame[cerulion_core::WireHeader::SIZE..].copy_from_slice(&payload);

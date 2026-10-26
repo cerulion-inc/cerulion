@@ -259,6 +259,18 @@ The native benchmark loans that payload without filling it. Timing starts after 
 
 This workload comparison uses a nominal 100 Hz offered load. The stock ROS 2 lane pipelines requests: at 16 MiB a round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes recording; the ROS 2 and zenoh lanes do not. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
 
+### Free run and lockstep
+
+A multi-process graph free-runs by default: each process steps on its own clock and none waits on a barrier. `CERULION_EXECUTION_MODE=lockstep` opts out into barrier lockstep. Measured on one build and one Linux x86_64 machine, two processes, fixed 100 Hz, six interleaved reps per mode, recording enabled:
+
+| Payload | Free run (default), p50 / p99 in µs | Lockstep, p50 / p99 in µs |
+|---|---:|---:|
+| 64 B | 4.23 / 7.60 | 5.08 / 10.47 |
+| 1 MiB | 4.56 / 9.01 | 5.44 / 10.63 |
+| 16 MiB | 5.22 / 12.34 | 7.22 / 13.64 |
+
+Free run has the lower median and the lower p99 at every measured size; the lockstep median is about 20% higher up to 1 MiB. This machine is not the one behind the table above, so compare within each table. [All ten sizes](docs/PERFORMANCE.md#free-run-against-lockstep) · [Results and provenance](docs/benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/).
+
 ### ROS 2 over Cerulion
 
 The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion's transport, measured in the same harness, posture and pacing as every other line: three ROS 2 nodes in three processes, with loaned publishing and loaned subscription takes. At 1 MiB that is **11.12 µs p50 / 37.21 µs p99**, beside **11.0 ms / 43.4 ms** for stock `rmw_fastrtps_cpp`, the chart's own stock ROS 2 line. The median stays between 10.43 and 10.65 µs from 64 B to 256 KiB and reaches 17.47 µs at 16 MiB. [Methodology](benches/latency/METHODOLOGY.md) · [Results and provenance](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/).
@@ -267,7 +279,15 @@ The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion'
 
 ![Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.](docs/media/platform-rtt.svg)
 
-These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. A producer-driven macOS wake path is on the [roadmap](#roadmap).
+These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. That M4 row predates the macOS data wake: on macOS 14.4 and later, a two-process consumer now blocks on a kernel wake word that the producer's publish rings, instead of waking on the park's recheck timer. Measured before and after that change on an Apple M3 Max, five reps per cell with the two builds alternating. This pair uses quiescent pacing rather than the charts' fixed 100 Hz and a different machine, so compare within the table only, and its recorder state is not recorded:
+
+| Payload | Two-process before, p50 / p99 in µs | Two-process after, p50 / p99 in µs |
+|---|---:|---:|
+| 64 B | 70.17 / 141.54 | 10.42 / 28.21 |
+| 4 KiB | 77.75 / 143.79 | 12.79 / 29.83 |
+| 1 MiB | 80.12 / 152.42 | 16.14 / 41.67 |
+
+Single-process medians on that machine rose by one to three ticks of its 24 MHz clock, inside overlapping per-rep ranges (64 B: 4.46 before, 4.50 µs after). The M4 chart row has not been re-measured since the change. [Results and provenance](docs/benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/).
 
 Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99; both figures show round trips.
 

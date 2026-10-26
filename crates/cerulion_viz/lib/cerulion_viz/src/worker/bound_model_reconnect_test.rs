@@ -168,6 +168,7 @@ fn lowstate_frame(hash: u64, tick: u32, angle: f32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: tick,
         timestamp_ns: 1_000_000_000 + u64::from(tick),
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame[..WireHeader::SIZE]);
     frame[WireHeader::SIZE..WireHeader::SIZE + 4].copy_from_slice(&angle.to_le_bytes());

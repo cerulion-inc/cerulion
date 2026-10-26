@@ -152,7 +152,7 @@ pub struct GraphConfig {
     /// Under `cerulion graph run` on the real clock, an absent block (and a
     /// block whose `mode` is `disabled`) means the PERMISSIVE default: one
     /// gateway outside the graph process opens the machine's zenoh session and
-    /// announces every topic the graph produces. On the default Unix path that
+    /// announces the topics the graph produces when LAN access is open. On the default Unix path that
     /// gateway is hosted by `cerulion-netd`, which listens and advertises over
     /// mDNS only when `CERULION_NETD_LISTEN` is set; the per-run fallback
     /// gateway child listens on port 7683 (`CERULION_GATEWAY_PORT` overrides
@@ -311,7 +311,7 @@ pub enum NetworkMode {
     /// The block imposes NO restriction, exactly like an absent block. The
     /// default when `mode:` is omitted. Under `cerulion graph run` on the real
     /// clock that is the PERMISSIVE default (a gateway process, mDNS
-    /// discovery, every produced topic announced), NOT "no network": the local-only
+    /// discovery, produced topics announced when LAN access is open), NOT "no network": the local-only
     /// switch is `graph run --network off`. Declaring `egress`/`ingress` under
     /// this mode is a graph-load error.
     #[default]
@@ -338,7 +338,8 @@ pub enum NetworkMode {
 /// cross-machine story is impossible without it.
 ///
 /// `egress` topics LEAVE this machine (each must be produced by an in-graph
-/// node); `ingress` topics ARRIVE from the network (each must NOT have an
+/// node, or be marked [`EgressTopic::external`] when a process outside the
+/// graph publishes it); `ingress` topics ARRIVE from the network (each must NOT have an
 /// in-graph producer — they are external sources). Every topic name must be
 /// canonical absolute (leading `/`). The full contract is enforced at
 /// graph-load by the `validate_network_block` arm in `super::validation`.
@@ -361,9 +362,10 @@ pub struct NetworkBlock {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<String>,
     /// Canonical absolute topics this graph EXPORTS to the network. Each
-    /// must be produced by an in-graph node (validated at graph-load). An
-    /// entry is a topic name, or a map naming the topic and its put policy
-    /// (see [`EgressTopic`]).
+    /// must be produced by an in-graph node, or be marked `external: true`
+    /// when a process outside the graph publishes it (validated at
+    /// graph-load). An entry is a topic name, or a map naming the topic, its
+    /// put policy and its origin (see [`EgressTopic`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<EgressTopic>,
     /// Canonical absolute topics this graph IMPORTS from the network. Each
@@ -399,11 +401,13 @@ fn is_default_reliability(r: &EgressReliability) -> bool {
 ///     reliability: best_effort        # datagrams on a mixed_rel QUIC link
 ///   - topic: /robot/odom
 ///     reliability: reliable           # reliable whatever default_reliability says
+///   - topic: /chatter
+///     external: true                  # published by a process outside this graph
 /// ```
 ///
-/// The bare string is the map with no `reliability`, and an entry with no
-/// `reliability` serializes back to the bare string. Unknown map keys are a
-/// parse error.
+/// The bare string is the map with no `reliability` and `external: false`,
+/// and such an entry serializes back to the bare string. Unknown map keys are
+/// a parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTopic {
     /// Canonical absolute topic name.
@@ -411,14 +415,34 @@ pub struct EgressTopic {
     /// The topic's own put reliability. `None` puts it at the block's
     /// [`NetworkBlock::default_reliability`].
     pub reliability: Option<EgressReliability>,
+    /// `true` when a process outside this graph publishes the topic on this
+    /// machine, for example a ROS 2 program running on `rmw_cerulion`.
+    /// Graph-load validation requires an entry with `false` (the default) to
+    /// be produced by an in-graph node, and an entry with `true` to have no
+    /// in-graph producer. The gateway treats both alike: the topic is on the
+    /// egress allow-list and announced, and its tap opens the topic's shared
+    /// memory service once a remote demands it and a publisher has created
+    /// the service.
+    pub external: bool,
 }
 
 impl EgressTopic {
-    /// An entry for `topic` with no `reliability` of its own.
+    /// An entry for `topic` with no `reliability` of its own, produced by an
+    /// in-graph node.
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
             reliability: None,
+            external: false,
+        }
+    }
+
+    /// An entry for `topic` with no `reliability` of its own, published by a
+    /// process outside this graph (`external: true`).
+    pub fn external(topic: impl Into<String>) -> Self {
+        Self {
+            external: true,
+            ..Self::new(topic)
         }
     }
 
@@ -427,6 +451,7 @@ impl EgressTopic {
         Self {
             topic: topic.into(),
             reliability: Some(reliability),
+            external: false,
         }
     }
 
@@ -435,6 +460,11 @@ impl EgressTopic {
     /// `default` otherwise.
     pub fn effective_reliability(&self, default: EgressReliability) -> EgressReliability {
         self.reliability.unwrap_or(default)
+    }
+
+    /// The topic name.
+    pub fn as_str(&self) -> &str {
+        &self.topic
     }
 }
 
@@ -450,6 +480,62 @@ impl From<String> for EgressTopic {
     }
 }
 
+impl AsRef<str> for EgressTopic {
+    fn as_ref(&self) -> &str {
+        &self.topic
+    }
+}
+
+impl std::fmt::Display for EgressTopic {
+    /// Writes the topic name; an entry's own `reliability` and `external` are
+    /// not written.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.topic)
+    }
+}
+
+// A topic name compares equal to an entry when the entry is that name's bare
+// spelling: the same `topic`, no `reliability` of its own and `external:
+// false`. An entry that sets a `reliability` or `external: true` is not equal
+// to any string, which keeps these impls
+// consistent with `EgressTopic == EgressTopic`. A `Vec<EgressTopic>` compares
+// with a `Vec<String>` or a `Vec<&str>` through them.
+impl PartialEq<str> for EgressTopic {
+    fn eq(&self, other: &str) -> bool {
+        self.reliability.is_none() && !self.external && self.topic == other
+    }
+}
+
+impl PartialEq<&str> for EgressTopic {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+
+impl PartialEq<String> for EgressTopic {
+    fn eq(&self, other: &String) -> bool {
+        *self == **other
+    }
+}
+
+impl PartialEq<EgressTopic> for str {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == *self
+    }
+}
+
+impl PartialEq<EgressTopic> for &str {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == **self
+    }
+}
+
+impl PartialEq<EgressTopic> for String {
+    fn eq(&self, other: &EgressTopic) -> bool {
+        *other == **self
+    }
+}
+
 /// The map spelling of [`EgressTopic`].
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -457,16 +543,19 @@ struct EgressTopicMap {
     topic: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reliability: Option<EgressReliability>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    external: bool,
 }
 
 impl Serialize for EgressTopic {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.reliability.is_none() {
+        if self.reliability.is_none() && !self.external {
             serializer.serialize_str(&self.topic)
         } else {
             EgressTopicMap {
                 topic: self.topic.clone(),
                 reliability: self.reliability,
+                external: self.external,
             }
             .serialize(serializer)
         }
@@ -479,7 +568,9 @@ impl<'de> Deserialize<'de> for EgressTopic {
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = EgressTopic;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a topic name, or a map with `topic` and optional `reliability`")
+                f.write_str(
+                    "a topic name, or a map with `topic` and optional `reliability` and `external`",
+                )
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EgressTopic, E> {
                 Ok(EgressTopic::new(v))
@@ -493,6 +584,7 @@ impl<'de> Deserialize<'de> for EgressTopic {
                 Ok(EgressTopic {
                     topic: m.topic,
                     reliability: m.reliability,
+                    external: m.external,
                 })
             }
         }
@@ -632,6 +724,23 @@ pub struct NodeDef {
     /// execution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse: Option<bool>,
+    /// OPTIONAL per-instance values for the node type's `#[param]` fields:
+    /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
+    /// left}`). Absent names keep the macro default. Resolved ONCE at graph
+    /// build against the node's declared specs
+    /// ([`NodeInfo::params`](super::node::NodeInfo::params)) by
+    /// [`resolve_graph_params`](super::params::resolve_graph_params): an
+    /// unknown name, a value of the wrong type or a value outside the
+    /// declared bounds refuses the graph before any node runs. Values are
+    /// fixed for the run and travel with the effective graph into a
+    /// recording, so a resim applies the recorded values.
+    ///
+    /// Per INSTANCE, like an output's `topic:` or `history_size`: one node
+    /// type runs twice with different settings by staging it twice with
+    /// different maps. A `ros2:` entry takes its parameters under
+    /// `ros2.params` instead; this key on such an entry is refused.
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub params: indexmap::IndexMap<String, super::params::ParamValue>,
 }
 
 impl NodeDef {
@@ -1318,6 +1427,76 @@ tls:
         assert!(err.to_string().contains("topic"), "{err}");
     }
 
+    /// `external: true` parses on the map spelling, serializes back as a map
+    /// (never the bare string, which would drop it) and round-trips; a
+    /// non-boolean value is a parse error naming the key.
+    #[test]
+    fn egress_external_entry_parses_and_round_trips() {
+        let net: NetworkBlock = serde_yaml::from_str(
+            "mode: peer\negress:\n  - topic: /chatter\n    external: true\n  - topic: /r/odom\n    external: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            net.egress,
+            vec![
+                EgressTopic::external("/chatter"),
+                EgressTopic::new("/r/odom")
+            ]
+        );
+        let out = serde_yaml::to_string(&net).unwrap();
+        assert!(out.contains("- topic: /chatter\n"), "{out}");
+        assert!(out.contains("  external: true\n"), "{out}");
+        assert!(out.contains("- /r/odom\n"), "{out}");
+        let back: NetworkBlock = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(back, net);
+        let err = serde_yaml::from_str::<NetworkBlock>(
+            "egress:\n  - topic: /chatter\n    external: yes please\n",
+        )
+        .unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("external") && err.contains("expected a boolean"),
+            "{err}"
+        );
+    }
+
+    /// `external` and `reliability` on one entry: both keys survive a round
+    /// trip, and an external topic reaches `egress_qos` through its own
+    /// `reliability` or through `default_reliability`.
+    #[test]
+    fn egress_external_entry_carries_reliability() {
+        let yaml = "mode: peer\nlisten:\n  - udp/0.0.0.0:7684?rel=1;mixed_rel=1\negress:\n  - topic: /chatter\n    reliability: best_effort\n    external: true\n";
+        let net: NetworkBlock = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            net.egress,
+            vec![EgressTopic {
+                topic: "/chatter".to_string(),
+                reliability: Some(EgressReliability::BestEffort),
+                external: true,
+            }]
+        );
+        let out = serde_yaml::to_string(&net).unwrap();
+        assert!(
+            out.contains("reliability: best_effort") && out.contains("external: true"),
+            "{out}"
+        );
+        assert_eq!(serde_yaml::from_str::<NetworkBlock>(&out).unwrap(), net);
+        let qos = net.to_network_config().unwrap().egress_qos;
+        assert_eq!(qos.len(), 1);
+        assert_eq!(qos[0].topic, "/chatter");
+
+        let by_default = NetworkBlock {
+            mode: NetworkMode::Peer,
+            default_reliability: EgressReliability::BestEffort,
+            egress: vec![EgressTopic::external("/chatter")],
+            ..NetworkBlock::default()
+        };
+        let qos = by_default.to_network_config().unwrap().egress_qos;
+        assert_eq!(qos.len(), 1);
+        assert_eq!(qos[0].topic, "/chatter");
+        assert_eq!(qos[0].reliability, EgressReliability::BestEffort);
+    }
+
     /// `tls` maps 1:1 and only egress entries put best effort reach
     /// `egress_qos`.
     #[test]
@@ -1581,5 +1760,99 @@ network:
         .unwrap();
         assert!(disabled.network_transport_config().is_none());
         assert!(!disabled.has_enabled_network());
+    }
+
+    /// A 1.0 `egress:` list of topic names, block or flow style, parses to
+    /// bare entries and serializes back to the same list of strings.
+    #[test]
+    fn egress_string_list_parses_and_serializes_back_as_strings() {
+        for yaml in [
+            "mode: peer\negress:\n  - /a/x\n  - /b/y\n",
+            "mode: peer\negress: [/a/x, /b/y]\n",
+        ] {
+            let block: NetworkBlock = serde_yaml::from_str(yaml).expect(yaml);
+            assert_eq!(
+                block.egress,
+                vec![EgressTopic::new("/a/x"), EgressTopic::new("/b/y")],
+                "{yaml}"
+            );
+            assert_eq!(block.egress, vec!["/a/x".to_string(), "/b/y".to_string()]);
+            let value = serde_yaml::to_value(&block).unwrap();
+            assert_eq!(
+                value["egress"],
+                serde_yaml::from_str::<serde_yaml::Value>("[/a/x, /b/y]").unwrap(),
+                "{yaml}"
+            );
+            let back: NetworkBlock =
+                serde_yaml::from_str(&serde_yaml::to_string(&block).unwrap()).unwrap();
+            assert_eq!(back, block, "{yaml}");
+        }
+    }
+
+    /// Bare names and maps mix in one list, and only a map entry keeps a
+    /// `reliability` of its own.
+    #[test]
+    fn egress_list_mixes_bare_names_and_maps() {
+        let block: NetworkBlock = serde_yaml::from_str(
+            "mode: peer\negress:\n  - /r/cmd\n  - topic: /r/scan\n    reliability: best_effort\n  - topic: /r/odom\n",
+        )
+        .unwrap();
+        assert_eq!(
+            block.egress,
+            vec![
+                EgressTopic::new("/r/cmd"),
+                EgressTopic::with_reliability("/r/scan", EgressReliability::BestEffort),
+                EgressTopic::new("/r/odom"),
+            ]
+        );
+        let value = serde_yaml::to_value(&block).unwrap();
+        assert_eq!(
+            value["egress"],
+            serde_yaml::from_str::<serde_yaml::Value>(
+                "[/r/cmd, {topic: /r/scan, reliability: best_effort}, /r/odom]"
+            )
+            .unwrap()
+        );
+    }
+
+    /// Rust code that held the list as strings: entries build from `&str` and
+    /// `String`, compare with both in either order, and read back as `&str`.
+    /// An entry with its own `reliability` or `external: true` equals no string.
+    #[test]
+    fn egress_topic_builds_from_and_compares_with_strings() {
+        let block = NetworkBlock {
+            mode: NetworkMode::Peer,
+            egress: vec!["/a/x".into(), String::from("/b/y").into()],
+            ..NetworkBlock::default()
+        };
+        assert_eq!(block.egress, vec!["/a/x", "/b/y"]);
+        assert_eq!(block.egress, vec!["/a/x".to_string(), "/b/y".to_string()]);
+        assert!(block.egress.iter().any(|t| t == "/b/y"));
+        assert!(block.egress.iter().all(|t| t != "/c/z"));
+        let wanted = String::from("/b/y");
+        assert!(block.egress.iter().any(|t| *t == wanted));
+
+        let bare = EgressTopic::new("/a/x");
+        assert!(bare == *"/a/x" && *"/a/x" == bare);
+        assert!(bare == "/a/x" && "/a/x" == bare);
+        let owned = String::from("/a/x");
+        assert!(bare == owned && owned == bare);
+        assert!(bare != "/a/y");
+        assert_eq!(bare.as_str(), "/a/x");
+        assert_eq!(AsRef::<str>::as_ref(&bare), "/a/x");
+        assert_eq!(bare.to_string(), "/a/x");
+
+        for reliability in [EgressReliability::Reliable, EgressReliability::BestEffort] {
+            let set = EgressTopic::with_reliability("/a/x", reliability);
+            assert!(set != "/a/x" && "/a/x" != set, "{reliability:?}");
+            assert!(set != owned && owned != set, "{reliability:?}");
+            assert_eq!(set.as_str(), "/a/x");
+            assert_eq!(set.to_string(), "/a/x");
+        }
+
+        let external = EgressTopic::external("/a/x");
+        assert!(external != "/a/x" && "/a/x" != external);
+        assert!(external != owned && owned != external);
+        assert_eq!(external.as_str(), "/a/x");
     }
 }

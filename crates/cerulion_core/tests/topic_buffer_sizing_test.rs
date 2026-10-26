@@ -78,6 +78,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -92,6 +93,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth32_consumer".to_string(),
@@ -416,6 +418,7 @@ fn default_opener_attaches_to_low_depth_topic() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -430,6 +433,7 @@ fn default_opener_attaches_to_low_depth_topic() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "depth2_consumer".to_string(),
@@ -609,6 +613,7 @@ fn history_above_input_depth_warns_at_build() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "deep_producer".to_string(),
@@ -623,6 +628,7 @@ fn history_above_input_depth_warns_at_build() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "shallow_history_consumer".to_string(),
@@ -634,6 +640,7 @@ fn history_above_input_depth_warns_at_build() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "exact_fit".to_string(),
                 node_type: "exact_fit_history_consumer".to_string(),
@@ -900,6 +907,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "trigger_producer".to_string(),
@@ -914,6 +922,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "triggered_consumer".to_string(),
@@ -925,6 +934,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "plain".to_string(),
                 node_type: "plain_consumer".to_string(),
@@ -1084,6 +1094,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "trigger_producer".to_string(),
@@ -1098,6 +1109,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "unified".to_string(),
                 node_type: "triggered_consumer".to_string(),
@@ -1109,6 +1121,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "blocked".to_string(),
                 node_type: "block_triggered_consumer".to_string(),
@@ -1621,7 +1634,10 @@ fn event_caps_cover_every_data_admitted_attacher_on_preexisting_service() {
         .service_builder(&data_name)
         .publish_subscribe::<[u8]>()
         .subscriber_max_buffer_size(4)
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign data service at iceoryx2 defaults (8 subscriber slots)");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "live_subs_test".into(),
@@ -1753,7 +1769,10 @@ fn foreign_typed_service_rejected_with_type_skew_hint() {
     let _foreign = raw_node
         .service_builder(&data_name)
         .publish_subscribe::<u64>()
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign-typed data service");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "type_skew_test".into(),
@@ -2080,7 +2099,10 @@ fn live_derived_event_budget_clamped_at_sanity_bound() {
         .publish_subscribe::<[u8]>()
         .subscriber_max_buffer_size(4)
         .max_subscribers(4200)
-        .create()
+        .create_with_attributes(
+            &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                .expect("attribute"),
+        )
         .expect("foreign data service with an unreasonable subscriber count");
     let config = cerulion_core::transport::TransportConfig {
         node_name: "huge_live_test".into(),

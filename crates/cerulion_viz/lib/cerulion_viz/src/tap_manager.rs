@@ -500,7 +500,7 @@ fn drain_tap(topic: &str, tap: &mut AttachedTap, max: usize) -> Vec<Vec<u8>> {
             }
         };
         for sample in tap.scratch.iter() {
-            // `OwnedInboundSample::payload()` is the FULL wire frame (32-byte
+            // `OwnedInboundSample::payload()` is the FULL wire frame (40-byte
             // header + body), already sliced to `total_size` — exactly what the
             // FrameWalker decodes. One small per-frame copy (the terminal copy),
             // then the borrow is released when scratch is cleared next iteration.

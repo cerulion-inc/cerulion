@@ -21,7 +21,7 @@ unbounded message field straight into a loan slot, and it is transparent to
 a node that never arms a borrow window. The package is assembled from the
 release archive, so the bytes in the package are the release bytes. The rmw
 library is built inside the `ros:jazzy` image against the real Jazzy headers
-(`tools/scripts/build_rmw_jazzy.sh`); the hook is plain Rust over libc and is
+(`tools/scripts/build_rmw.sh jazzy`); the hook is plain Rust over libc and is
 built on the release runner like the binaries. The release workflow installs
 each package in a clean Jazzy container and runs a talker and a listener
 through it, checks that stock rclpy loads the shipped rmw, then checks that

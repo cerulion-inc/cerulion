@@ -773,7 +773,20 @@ pub mod wire;
 ///   about whether a replay diverged.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 27;
+///
+/// - v28: the wire header grows from 32 to 40 bytes. [`wire::WireHeader`] gains
+///   `step_tag` at byte 32, `WireHeader::SIZE` becomes 40 and
+///   [`wire::WIRE_HEADER_VERSION`] becomes 2. No struct in the `abi_layout`
+///   table changes, so the pin's rows are unchanged; the bump is for the
+///   frames themselves. A node library compiles `WireHeader::SIZE` into every
+///   loan, every header write and every payload slice it makes, so one built
+///   against an earlier core writes 32-byte headers into slots this core reads
+///   as 40-byte ones: the schema hash still matches, the sequence and timestamp
+///   still parse, and every payload field is read eight bytes off. Bumping here
+///   turns that silent misread into a load refusal naming the rebuild.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 28;
 
 // Re-export commonly used types
 #[cfg(unix)]
@@ -807,7 +820,7 @@ pub use transport::cerulion_q::{
     RunsReply, SchemaDoc, SchemaEncoding, SchemaReply, UndescribableRun, UnusableRunsAnswer,
 };
 pub use transport::demand_authorizer::{
-    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
+    AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
 pub use transport::events::PubSubEvent;
@@ -832,7 +845,7 @@ pub use transport::{
     ix_config_shm_identity_from_json, IceoryxShmIdentity, NetworkPosture, TopicRequirements,
     TransportConfig, TransportManager,
 };
-pub use wire::{WireError, WireHeader};
+pub use wire::{StepTag, WireError, WireHeader};
 
 // Re-export `tracing` at the crate root so codegen-
 // emitted code can use the fully-qualified `::cerulion_core::tracing::warn!`

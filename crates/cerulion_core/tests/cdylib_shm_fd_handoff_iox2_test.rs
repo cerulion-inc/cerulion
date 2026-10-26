@@ -101,6 +101,7 @@ fn run_and_shut_down_cdylib_graph(prefix: &str) -> Arc<cerulion_core::TransportM
             Box::new(DylibNodeEntry::load(&path).expect("load fixture cdylib")),
         );
         nodes.push(NodeDef {
+            params: Default::default(),
             fuse: None,
             ros2: None,
             id,

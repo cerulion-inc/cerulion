@@ -460,9 +460,9 @@ def test_forwarding_a_received_view_preserves_padding_bytes(session):
     sub = session.subscriber(topic, schema="Padded", schemas=schemas)
     # Seven nonzero padding bytes between tag and value; no variable fields,
     # so the (empty) offset table sits right after the 16-byte fixed section,
-    # at frame offset 32 + 16.
+    # at frame offset 40 + 16.
     body = bytes([1]) + b"\xaa" * 7 + struct.pack("<Q", 5)
-    header = struct.pack("<QIIIIQ", schemas.schema_hash("Padded"), 32 + len(body), 48, 0, 0, 0)
+    header = struct.pack("<QIIIIQQ", schemas.schema_hash("Padded"), 40 + len(body), 56, 0, 0, 0, 0)
     raw.publish_frame(header + body)
     frame = sub.receive(1000)
     assert frame is not None

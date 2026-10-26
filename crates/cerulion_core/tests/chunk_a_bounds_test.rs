@@ -19,16 +19,16 @@
 //!
 //! 1. `total_size = 0` / `total_size < WireHeader::SIZE` — a clamp such as
 //!    `header.total_size as usize.max(WireHeader::SIZE)` would
-//!    silently coerce any sub-header `total_size` up to 32. The frame
+//!    silently coerce any sub-header `total_size` up to 40. The frame
 //!    would then be handed to the callback as a zero-byte payload (or the
 //!    typed `try_view` would happily succeed on garbage).
 //! 2. `total_size > raw.len()` — would compute an out-of-bounds slice.
 //!    The drain rejects this rather than truncating.
 //! 3. Underfill — publisher loaned `max_slice_len = 256` but the
-//!    finalised frame was 56 bytes (`WireHeader::SIZE + Vector3 (24)`).
+//!    finalised frame was 64 bytes (`WireHeader::SIZE + Vector3 (24)`).
 //!    Without the clamp the callback's payload slice would span
-//!    `raw[32..raw.len()]` (224 bytes including pad). With it, it spans
-//!    `raw[32..total_size]` (24 bytes — just the Vector3).
+//!    `raw[40..raw.len()]` (216 bytes including pad). With it, it spans
+//!    `raw[40..total_size]` (24 bytes, just the Vector3).
 //! 4. An in-code pipeline must not call `clock.advance(N)` after
 //!    `runtime.step(N)`: that double-counts time. The scheduler advances the
 //!    clock internally. That regression is
@@ -68,6 +68,7 @@ fn build_frame(total_size: u32, frame_len: usize) -> Vec<u8> {
         offset_table_count: Vector3::VARIABLE_FIELD_COUNT as u32,
         sequence: 0,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);
     buf.truncate(frame_len);
@@ -190,7 +191,7 @@ fn test_try_view_rejects_oversized_total_size() {
     let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(256), 0);
     let mut subscriber = tt.subscriber(&topic);
 
-    // Frame is 56 bytes, but the header claims 1024 — would have read
+    // Frame is 64 bytes, but the header claims 1024, would have read
     // 968 bytes past the buffer end if not bounds-checked.
     let frame_len = WireHeader::SIZE + Vector3::WIRE_FIXED_SIZE;
     let frame = build_frame(1024, frame_len);
@@ -237,7 +238,7 @@ fn test_drain_samples_skips_oversized_total_size() {
 ///
 /// Without the clamp (`payload_len = raw.len() - WireHeader::SIZE` or
 /// `&raw[WireHeader::SIZE..]`): callback would observe
-/// `max_slice_len - 32 = 224` bytes of trailing pad.
+/// `max_slice_len - 40 = 216` bytes of trailing pad.
 /// With it (`payload_len = total_size - WireHeader::SIZE`,
 /// `&raw[WireHeader::SIZE..total_size]`): callback observes exactly
 /// `Vector3::WIRE_FIXED_SIZE = 24` bytes.
@@ -251,14 +252,14 @@ fn test_drain_samples_clamps_payload_to_total_size() {
     // A realistic underfill: publisher loaned 256 bytes (max_slice_len)
     // but the actual finalised frame is just `WireHeader + Vector3`.
     let max_slice_len: usize = 256;
-    let actual_total: usize = WireHeader::SIZE + Vector3::WIRE_FIXED_SIZE; // 56
+    let actual_total: usize = WireHeader::SIZE + Vector3::WIRE_FIXED_SIZE; // 64
     assert!(
         actual_total < max_slice_len,
         "test setup invalid: pad must be > 0"
     );
 
     // Build the frame at the FULL max_slice_len, but the WireHeader
-    // says total_size = 56. Fill the pad with a recognisable byte so
+    // says total_size = 64. Fill the pad with a recognisable byte so
     // a regression test can prove no pad bytes leak.
     const PAD_SENTINEL: u8 = 0xCD;
     let mut frame = vec![PAD_SENTINEL; max_slice_len];
@@ -269,6 +270,7 @@ fn test_drain_samples_clamps_payload_to_total_size() {
         offset_table_count: Vector3::VARIABLE_FIELD_COUNT as u32,
         sequence: 0,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     // Zero out the Vector3 fixed-section so the legitimate payload
@@ -312,7 +314,7 @@ fn test_try_view_clamps_payload_to_total_size() {
     let mut publisher = tt.publisher(&topic, MaxSliceLen::const_new(256), 0);
     let mut subscriber = tt.subscriber(&topic);
 
-    // Same construction as the drain test: 256 byte buffer, 56 byte total_size.
+    // Same construction as the drain test: 256 byte buffer, 64 byte total_size.
     let max_slice_len: usize = 256;
     let actual_total: usize = WireHeader::SIZE + Vector3::WIRE_FIXED_SIZE;
     let mut frame = vec![0xCDu8; max_slice_len];
@@ -323,6 +325,7 @@ fn test_try_view_clamps_payload_to_total_size() {
         offset_table_count: Vector3::VARIABLE_FIELD_COUNT as u32,
         sequence: 0,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     // Write a known Vector3 (1.0, 2.0, 3.0) into the fixed section

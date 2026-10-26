@@ -81,6 +81,61 @@ pub const RERUN_URL_ENV: &str = "CERULION_RERUN_URL";
 // per-run graph machinery.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The `cerulion-vizd` daemon's own kill switch, the one `cerulion viz --robot`
+/// reads beside `CERULION_NETWORK` ([`remote_viz_refusal_from`]).
+pub const VIZD_NETWORK_ENV: &str = "CERULION_VIZD_NETWORK";
+
+/// The refusal `cerulion viz --robot ROBOT` prints, before it spawns or contacts
+/// the daemon, when a kill switch keeps the command local: `CERULION_NETWORK`
+/// under the run and query parse ([`crate::graph_cmd::network_env_kill_from`]),
+/// or `CERULION_NETD_NETWORK` / `CERULION_VIZD_NETWORK` at exactly `off` (the
+/// daemons' own parse; vizd resolves a remote attach through netd). `None` when
+/// none is engaged. Reads the environment once.
+pub fn remote_viz_refusal(robot: &str) -> Option<String> {
+    remote_viz_refusal_from(
+        robot,
+        std::env::var("CERULION_NETWORK").ok(),
+        std::env::var(crate::graph_cmd::NETD_NETWORK_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(VIZD_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+/// The pure half of [`remote_viz_refusal`] (`None` = the variable is not set).
+pub fn remote_viz_refusal_from(
+    robot: &str,
+    network: Option<String>,
+    netd: Option<&str>,
+    vizd: Option<&str>,
+) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut vars = Vec::new();
+    if let Some(label) = crate::graph_cmd::network_env_kill_from(network).refusal_label() {
+        labels.push(label);
+        vars.push("CERULION_NETWORK");
+    }
+    for (name, value) in [
+        (crate::graph_cmd::NETD_NETWORK_ENV, netd),
+        (VIZD_NETWORK_ENV, vizd),
+    ] {
+        if crate::graph_cmd::netd_network_off_from(value) {
+            labels.push(format!("{name}=off"));
+            vars.push(name);
+        }
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cerulion viz --robot {}: remote visualization is disabled by {}; unset {} to attach \
+         a robot's topics (local topics need no --robot)",
+        crate::topic_cmd::sanitize_display(robot),
+        labels.join(" and "),
+        vars.join(" and ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +152,53 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Workspace not found"), "got: {msg}");
         assert!(msg.contains("cerulion workspace"), "got: {msg}");
+    }
+
+    /// `--robot` refuses under any of the three kill switches, naming each engaged variable
+    /// and the unset remedy; with neither engaged it proceeds.
+    #[test]
+    fn remote_viz_refuses_under_any_kill_switch() {
+        assert_eq!(remote_viz_refusal_from("go2", None, None, None), None);
+        assert_eq!(
+            remote_viz_refusal_from("go2", Some(" ".into()), Some("OFF"), Some("OFF")),
+            None
+        );
+        assert_eq!(
+            remote_viz_refusal_from("go2", Some(" Off ".into()), None, None).as_deref(),
+            Some(
+                "cerulion viz --robot go2: remote visualization is disabled by \
+                 CERULION_NETWORK=off; unset CERULION_NETWORK to attach a robot's topics \
+                 (local topics need no --robot)"
+            )
+        );
+        assert_eq!(
+            remote_viz_refusal_from("go2", None, None, Some("off")).as_deref(),
+            Some(
+                "cerulion viz --robot go2: remote visualization is disabled by \
+                 CERULION_VIZD_NETWORK=off; unset CERULION_VIZD_NETWORK to attach a robot's \
+                 topics (local topics need no --robot)"
+            )
+        );
+        assert_eq!(
+            remote_viz_refusal_from("go2", None, Some("off"), None).as_deref(),
+            Some(
+                "cerulion viz --robot go2: remote visualization is disabled by \
+                 CERULION_NETD_NETWORK=off; unset CERULION_NETD_NETWORK to attach a robot's \
+                 topics (local topics need no --robot)"
+            )
+        );
+        let all =
+            remote_viz_refusal_from("go2\u{1b}[2J", Some("on".into()), Some("off"), Some("off"))
+                .expect("all engaged");
+        assert!(
+            all.starts_with(
+                "cerulion viz --robot go2\u{fffd}[2J: remote visualization is disabled by \
+                 CERULION_NETWORK=on (an unrecognized value, which fails closed to local-only) \
+                 and CERULION_NETD_NETWORK=off and CERULION_VIZD_NETWORK=off; unset \
+                 CERULION_NETWORK and CERULION_NETD_NETWORK and CERULION_VIZD_NETWORK"
+            ),
+            "{all}"
+        );
     }
 
     #[test]

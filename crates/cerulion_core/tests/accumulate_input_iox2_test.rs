@@ -300,6 +300,7 @@ fn writer_def(id: &str) -> NodeDef {
 fn writer_on(id: &str, topic: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "writer".to_string(),
@@ -324,6 +325,7 @@ fn input(name: &str, source: &str) -> InputDef {
 fn reader_def(node_type: &str, inputs: Vec<InputDef>) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: "reader".to_string(),
         node_type: node_type.to_string(),
@@ -383,6 +385,7 @@ fn build(prefix: &str, reader: Box<dyn NodeEntry>) -> GraphRuntime {
             writer_def("writer_b"),
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "reader".to_string(),
                 node_type: "reader".to_string(),

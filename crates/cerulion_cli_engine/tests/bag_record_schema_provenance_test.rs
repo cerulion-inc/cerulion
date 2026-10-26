@@ -115,7 +115,7 @@ const PAYLOAD_LEN: usize = 16;
 /// At ~1 KiB a frame, four or five frames fill a file, so the same window rolls
 /// several times even when the producer is starved to a fraction of its rate.
 /// Bounded by the publisher's `MaxSliceLen::const_new(1024)`, hence 960 + a
-/// 32-byte header = 992.
+/// 40-byte header = 1000.
 const ROTATION_PAYLOAD_LEN: usize = 960;
 
 fn frame_sized(hash: u64, seq: u32, payload_len: usize) -> Vec<u8> {
@@ -130,6 +130,7 @@ fn frame_sized(hash: u64, seq: u32, payload_len: usize) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000_000_000 + u64::from(seq) * 10_000_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut buf = vec![0u8; total];
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);

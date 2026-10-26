@@ -290,6 +290,7 @@ fn build_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: producer_type.to_string(),
@@ -298,6 +299,7 @@ fn build_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "hold_consumer".to_string(),
@@ -830,6 +832,7 @@ fn build_one_input_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: producer_type.to_string(),
@@ -838,6 +841,7 @@ fn build_one_input_graph(
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: consumer_type.to_string(),
@@ -883,6 +887,7 @@ fn data_trigger_consumer_holds_silent_context() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "trig_producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -891,6 +896,7 @@ fn data_trigger_consumer_holds_silent_context() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ctx_producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -899,6 +905,7 @@ fn data_trigger_consumer_holds_silent_context() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "trig_ctx_consumer".to_string(),
@@ -1381,6 +1388,7 @@ fn two_non_trigger_inputs_hold_independently() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -1389,6 +1397,7 @@ fn two_non_trigger_inputs_hold_independently() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -1397,6 +1406,7 @@ fn two_non_trigger_inputs_hold_independently() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "two_input_consumer".to_string(),
@@ -1641,6 +1651,7 @@ fn build_external_snapshot_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
             node_type: "hold_consumer".to_string(),
@@ -1846,6 +1857,7 @@ fn build_producer_via_worker_path(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
             node_type: "hold_producer".to_string(),
@@ -2184,6 +2196,7 @@ fn external_topic_excluded_from_union_and_harvest() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2192,6 +2205,7 @@ fn external_topic_excluded_from_union_and_harvest() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "extcons".to_string(),
                 node_type: "trig_consumer".to_string(),
@@ -2332,6 +2346,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_a".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2340,6 +2355,7 @@ fn override_applies_only_to_its_topic_not_siblings() {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "prod_b".to_string(),
                 node_type: "hold_producer".to_string(),
@@ -2480,6 +2496,7 @@ fn build_producer_override_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "producer".to_string(),
             node_type: "hold_producer".to_string(),

@@ -101,7 +101,7 @@ fn encode_after_new_does_not_allocate() {
     };
     let allocs = ALLOCATOR.disable();
 
-    assert_eq!(n, 80);
+    assert_eq!(n, 88);
     assert_eq!(
         allocs, 0,
         "FrameEncoder::begin..finish allocated {allocs} time(s)"
@@ -114,7 +114,7 @@ fn view_validation_and_field_access_do_not_allocate() {
     let set = probe_set();
     let layout = set.layout("Probe").expect("Probe");
     let enc = FrameEncoder::new(layout).expect("valid layout");
-    let mut buf = [0u8; 80];
+    let mut buf = [0u8; 88];
     {
         let mut cur = enc.begin(&mut buf, &[2, 16], 7).expect("begin");
         cur.variable_field_mut("name")
@@ -138,7 +138,7 @@ fn view_validation_and_field_access_do_not_allocate() {
     assert_eq!(allocs, 0, "FrameView happy path allocated {allocs} time(s)");
 }
 
-/// `FrameView::new` and `with_layout` each parse the 32-byte header exactly
+/// `FrameView::new` and `with_layout` each parse the 40-byte header exactly
 /// once per frame. Counted, not reasoned about: a second parse changes no
 /// answer, only time, so a result test cannot catch it
 /// (`wire_header_parsed_once_test` pins the transport read entries the same
@@ -149,7 +149,7 @@ fn view_parses_the_header_once_per_frame() {
     let set = probe_set();
     let layout = set.layout("Probe").expect("Probe");
     let enc = FrameEncoder::new(layout).expect("valid layout");
-    let mut buf = [0u8; 80];
+    let mut buf = [0u8; 88];
     {
         let mut cur = enc.begin(&mut buf, &[2, 16], 7).expect("begin");
         cur.variable_field_mut("name")
@@ -161,7 +161,7 @@ fn view_parses_the_header_once_per_frame() {
     reset_header_parse_count();
     let view = FrameView::new(set.walker(), &buf).expect("valid");
     let by_hash = header_parse_count();
-    assert_eq!(view.total_size(), 80);
+    assert_eq!(view.total_size(), 88);
     assert_eq!(
         by_hash, 1,
         "FrameView::new parsed the header {by_hash} time(s); the hash lookup and the \
@@ -171,7 +171,7 @@ fn view_parses_the_header_once_per_frame() {
     reset_header_parse_count();
     let view = FrameView::with_layout(layout, &buf).expect("valid");
     let by_layout = header_parse_count();
-    assert_eq!(view.total_size(), 80);
+    assert_eq!(view.total_size(), 88);
     assert_eq!(
         by_layout, 1,
         "FrameView::with_layout parsed the header {by_layout} time(s)"

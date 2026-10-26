@@ -89,6 +89,7 @@ fn oracle_frame(hash: u64, seq: u32) -> Vec<u8> {
         sequence: seq,
         // Wire stamps 10 ms apart, which is also what `bag play` paces on.
         timestamp_ns: 2_000_000_000 + u64::from(seq) * 10_000_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut buf = vec![0u8; total];
     header.write_to_buf(&mut buf[..WireHeader::SIZE]);

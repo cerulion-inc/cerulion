@@ -5,7 +5,7 @@
 //! `pub(crate)` machinery the runtime owns), so this class keeps its own
 //! `u32` counter - the exact precedent `rmw_cerulion` sets: take the
 //! sequence at COMMIT (a failed loan burns none), rewrite
-//! `WireHeader.sequence`, `write_to_buf` into `bytes_mut()[..32]` LAST so
+//! `WireHeader.sequence`, `write_to_buf` into `bytes_mut()[..WireHeader::SIZE]` LAST so
 //! every byte the consumer reads is initialised, then `send_raw_loan`,
 //! `check_subscriber_events`, `notify_sent_sample` (Err → debug, never
 //! fatal: the data is already committed to SHM).
@@ -170,7 +170,7 @@ impl Publisher {
             byte.write(0);
         }
         // SAFETY: the loan is exactly `WireHeader::SIZE + len` bytes; the
-        // body loop wrote [32,32+len) and the zero-fill wrote [0,32),
+        // body loop wrote [SIZE,SIZE+len) and the zero-fill wrote [0,SIZE),
         // covering every byte of the slot before `assume_init` (the real
         // header is stamped by `commit_loan` below).
         let loan = unsafe { loan.assume_init() };

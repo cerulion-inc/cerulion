@@ -86,6 +86,20 @@ pub async fn build_endpoint(config: EndpointConfig) -> Result<Endpoint, LinkErro
     Ok(endpoint)
 }
 
+/// The remedy a failed dial on `alpn` names. The wire plane's ALPN carries the
+/// wire header version (`cerulion/wire/2`), so a robot from a release with the
+/// 32-byte header (`cerulion/wire/1`) shares no ALPN with this desk and the
+/// handshake fails: say so, since the transport error alone cannot.
+fn dial_hint(alpn: &[u8]) -> &'static str {
+    if alpn == crate::alpn::WIRE {
+        " (if the robot runs a Cerulion release with the 32-byte wire header, it serves \
+         cerulion/wire/1 and cannot accept this desk's cerulion/wire/2: install the same \
+         Cerulion release on both machines)"
+    } else {
+        ""
+    }
+}
+
 /// Dial a peer over `alpn`, returning the established [`Connection`].
 ///
 /// `peer` may be a bare [`EndpointId`] (resolved via discovery — requires a
@@ -105,6 +119,7 @@ pub async fn dial(
         .await
         .map_err(|e| LinkError::Connect {
             peer: peer_hex,
+            hint: dial_hint(alpn),
             source: Box::new(e),
         })?;
     tracing::debug!(
@@ -320,6 +335,15 @@ mod tests {
     fn public_hex_of(secret: &[u8; 32]) -> String {
         let pk = SecretKey::from_bytes(secret).public();
         crate::hex32(pk.as_bytes())
+    }
+
+    /// A failed wire-plane dial names the release-mismatch remedy; the ops
+    /// plane's carries none.
+    #[test]
+    fn a_wire_dial_failure_names_the_wire_header_release_remedy() {
+        let hint = dial_hint(crate::alpn::WIRE);
+        assert!(hint.contains("cerulion/wire/1") && hint.contains("same Cerulion release"));
+        assert_eq!(dial_hint(crate::alpn::OPS), "");
     }
 
     #[test]

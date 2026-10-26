@@ -439,7 +439,7 @@ fn build_latency_graph(payload_size: usize) -> GraphRuntime {
 
     // Sized to fit the payload + WireHeader + Image fixed section + offset
     // table for the variable fields, with slop. Mirrors the bench's sizing.
-    let max_slice_len = 32 + 64 + 8 * 3 + payload_size + 256;
+    let max_slice_len = cerulion_core::wire::WireHeader::SIZE + 64 + 8 * 3 + payload_size + 256;
     let yaml = format!(
         r#"
 name: graph_latency_gate

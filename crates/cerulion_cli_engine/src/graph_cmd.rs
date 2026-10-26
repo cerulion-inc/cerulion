@@ -738,6 +738,23 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
 }
 
+/// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
+///
+/// This uses the same environment overrides and target capabilities as `graph run`.
+pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
+    let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
+    let env_doorbell = std::env::var(DOORBELL_ENV).ok();
+    resolve_monitor_wait_policy(MonitorWaitInputs {
+        mode: MonitorWaitMode::Auto,
+        env_monitor_wait: env_monitor_wait.as_deref(),
+        env_doorbell: env_doorbell.as_deref(),
+        is_live: true,
+        primitive_available: cerulion_core::monitor_wait::monitor_wait_available(),
+        data_wake_available: cerulion_core::doorbell::wake_word_block_primitive_available(),
+        ns: cerulion_core::doorbell::default_namespace(),
+    })
+}
+
 /// Build a (schema name → recipe-3 `schema_hash`) map from every
 /// `*.yaml` in the workspace `schemas/` directory PLUS every workspace
 /// `.msg` store schema (`schemas/<pkg>/msg/<Type>.msg`, read via the shared
@@ -1418,23 +1435,14 @@ pub fn graph_read(graphs_dir: &Path, name: &str) -> CliResult<GraphConfig> {
 /// the file and the splice would land on another — which is the whole class
 /// the precondition exists to close.
 pub fn graph_read_raw(graphs_dir: &Path, name: &str) -> CliResult<(GraphConfig, String)> {
-    let graph_path = graphs_dir.join(format!("{}.yaml", name));
-    if !graph_path.exists() {
-        return Err(CliError::GraphNotFound {
-            name: name.to_string(),
-        });
-    }
-    let yaml = std::fs::read_to_string(&graph_path)?;
-    // Use the raw parser so an absent `prefix:` line stays absent when
-    // CLI commands like `node stage` round-trip the YAML back to disk.
-    let mut config = parse_graph_raw(&yaml)?;
-    // This is the seam where a graph acquires its identity. Every
-    // CLI verb resolves a graph by joining `graphs/{name}.yaml`, so `name` IS
-    // the file stem, and every identity surface downstream reads it back
-    // through `GraphConfig::identity()`. A legacy `name:` that disagrees warns
-    // here, once, at the one place both values are in scope.
-    cerulion_core::graph::adopt_file_stem_identity(&mut config, name);
-    Ok((config, yaml))
+    // The raw parser keeps an absent `prefix:` line absent when CLI commands
+    // like `node stage` round-trip the YAML back to disk, and it is where a
+    // graph acquires its identity: every CLI verb resolves a graph by joining
+    // `graphs/{name}.yaml`, so `name` IS the file stem. Launch arguments
+    // resolve to their declared defaults on this path; `graph run` reads
+    // through the same function with the operator's overrides.
+    crate::graph_launch_args::graph_read_raw_with_launch_args(graphs_dir, name, &[])
+        .map(|(config, yaml, _)| (config, yaml))
 }
 
 // There is deliberately NO whole-file graph writer (`serde_yaml::to_string` + a truncating
@@ -1845,6 +1853,21 @@ fn render_node_entry(node: &NodeDef, indent: &str, nested_step: usize) -> String
             }
         }
     }
+    if !node.params.is_empty() {
+        // Declaration order, one scalar per line. A string goes through
+        // `render_scalar` so `"2.0"` stays a string; a number or bool is its
+        // `Display`, which keeps a float's decimal point (`2.0`, `-0.0`), so
+        // each value re-parses as the same `ParamValue`.
+        use cerulion_core::graph::params::ParamValue;
+        out.push_str(&format!("{key}params:\n"));
+        for (name, value) in &node.params {
+            let rendered = match value {
+                ParamValue::Str(s) => render_scalar(s),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("{key}  {}: {rendered}\n", render_scalar(name)));
+        }
+    }
     out
 }
 
@@ -2091,6 +2114,7 @@ pub fn build_node_def(
 
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id,
         node_type: node_type.to_string(),
@@ -2276,7 +2300,10 @@ pub fn graph_validate_with_inspector(
     inspector: &dyn crate::node_inspector::NodeInspector,
 ) -> CliResult<ValidationReport> {
     let graphs_dir = workspace_root.join("graphs");
-    let mut config = graph_read(&graphs_dir, graph_name)?;
+    // The declared defaults, with the record of which launch argument fed
+    // which `params:` value, so the params check can name the argument.
+    let (mut config, _, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(&graphs_dir, graph_name, &[])?;
     // Fill the DEFAULT PREFIX before anything judges this config.
     //
     // `graph_read` deliberately uses the RAW parser so an absent `prefix:` line
@@ -2304,13 +2331,18 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
+    // Both checks that read a node library (the ingress gate and the params
+    // check) go through ONE memo, so each library's static initialization
+    // and teardown run once per validation, not once per check and node.
+    let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
         graph_name,
         &config,
         &cdylib_cache,
         true,
-        inspector,
+        &inspector,
+        &launch_arg_sources,
     ))
 }
 
@@ -2376,6 +2408,10 @@ fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache)
         // into the same sentence from `GraphRuntime::build`.
         || label.starts_with(DATA_TRIGGER_CHECK_PREFIX)
         || label.starts_with(SYNC_TRIGGER_CHECK_PREFIX)
+        // The graph BUILD resolves every node's `params:` again before any
+        // transport resource exists, so a failing params line blocks the run
+        // under the flag with the same sentence.
+        || label.starts_with(crate::graph_params_check::PARAMS_CHECK_PREFIX)
     {
         return true;
     }
@@ -2816,6 +2852,7 @@ fn graph_validate_with_cache(
     cdylib_cache: &ResolvedCdylibCache,
     check_network_ingress: bool,
     inspector: &dyn crate::node_inspector::NodeInspector,
+    launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
     let nodes_dir = workspace_root.join("nodes");
     let mut checks = Vec::new();
@@ -3477,6 +3514,17 @@ fn graph_validate_with_cache(
         }
     }
 
+    // Every node's `params:` against the specs its library declares, read
+    // through the caller's inspector once per resolved type. The graph build
+    // re-runs the same resolution, so a failing line here is a blocking one
+    // (`failing_check_blocks_the_run`).
+    checks.extend(crate::graph_params_check::params_checks(
+        config,
+        &resolved_library_paths(cdylib_cache),
+        inspector,
+        launch_arg_sources,
+    ));
+
     tracing::info!(graph = %graph_name, "graph validation complete");
 
     ValidationReport {
@@ -3611,6 +3659,20 @@ impl NetworkEnvKill {
     pub fn is_off(&self) -> bool {
         !matches!(self, NetworkEnvKill::Unset)
     }
+
+    /// How a refusal names this setting: `CERULION_NETWORK=off`, or the
+    /// unrecognized value that failed closed, trimmed and terminal-sanitized.
+    /// `None` when the variable is unset.
+    pub fn refusal_label(&self) -> Option<String> {
+        match self {
+            NetworkEnvKill::Unset => None,
+            NetworkEnvKill::Off => Some(format!("{NETWORK_ENV}=off")),
+            NetworkEnvKill::Unrecognized(value) => Some(format!(
+                "{NETWORK_ENV}={} (an unrecognized value, which fails closed to local-only)",
+                crate::topic_cmd::sanitize_display(value.trim())
+            )),
+        }
+    }
 }
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
@@ -3621,8 +3683,14 @@ impl NetworkEnvKill {
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
 pub fn network_env_kill() -> NetworkEnvKill {
-    match std::env::var(NETWORK_ENV) {
-        Ok(v) => {
+    network_env_kill_from(std::env::var(NETWORK_ENV).ok())
+}
+
+/// The pure half of [`network_env_kill`]: classify one `CERULION_NETWORK` value
+/// (`None` = the variable is not set).
+pub fn network_env_kill_from(value: Option<String>) -> NetworkEnvKill {
+    match value {
+        Some(v) => {
             let trimmed = v.trim();
             if trimmed.is_empty() {
                 NetworkEnvKill::Unset
@@ -3632,22 +3700,95 @@ pub fn network_env_kill() -> NetworkEnvKill {
                 NetworkEnvKill::Unrecognized(v)
             }
         }
-        Err(_) => NetworkEnvKill::Unset,
+        None => NetworkEnvKill::Unset,
     }
 }
 
-/// Is the REMOTE network tier suppressed by the
-/// `CERULION_NETWORK` kill-switch, for the discovery-side callers that carry no
-/// `GraphConfig` — `schema info`'s remote fetch and `topic echo`'s remote
-/// decode-seed? Uses the SAME parse as [`resolve_run_network`]
-/// ([`network_env_kill`], the ONE env-parse). Emits the fail-closed warn on an
-/// unrecognized value; returns `true` iff the tier must stay LOCAL-ONLY. The
+/// The `cerulion-netd` daemon's own kill switch. The query verbs read it beside
+/// `CERULION_NETWORK` ([`query_network_kill`]), so with it engaged they neither
+/// query netd nor open their own discovery session.
+pub const NETD_NETWORK_ENV: &str = "CERULION_NETD_NETWORK";
+
+/// The kill-switch state the query verbs (`topic list`, `topic echo`,
+/// `topic hz`, `topic info`, `schema info`) act on: `CERULION_NETWORK` under the
+/// [`network_env_kill`] parse, plus [`NETD_NETWORK_ENV`] under netd's own
+/// byte-exact parse (only exactly `off` engages it). Either one engaged makes
+/// the query LOCAL-ONLY. Runs (`graph run`, `node run`, `ros2 attach`) read
+/// `CERULION_NETWORK` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryNetworkKill {
+    /// The `CERULION_NETWORK` decision.
+    pub network: NetworkEnvKill,
+    /// `CERULION_NETD_NETWORK` is exactly `off`.
+    pub netd_off: bool,
+}
+
+impl QueryNetworkKill {
+    /// No switch engaged.
+    pub const UNSET: Self = Self {
+        network: NetworkEnvKill::Unset,
+        netd_off: false,
+    };
+
+    /// True when either switch is engaged: the query must stay LOCAL-ONLY.
+    pub fn is_off(&self) -> bool {
+        self.network.is_off() || self.netd_off
+    }
+
+    /// Both switches are engaged.
+    pub fn both_engaged(&self) -> bool {
+        self.network.is_off() && self.netd_off
+    }
+
+    /// The `unset ...` remedy naming every engaged variable. With only
+    /// `CERULION_NETD_NETWORK` engaged it names that one; otherwise it names
+    /// `CERULION_NETWORK`, plus `CERULION_NETD_NETWORK` when both are engaged.
+    pub fn unset_remedy(&self) -> &'static str {
+        match (self.network.is_off(), self.netd_off) {
+            (false, true) => "unset CERULION_NETD_NETWORK",
+            (true, true) => "unset CERULION_NETWORK and CERULION_NETD_NETWORK",
+            _ => "unset CERULION_NETWORK",
+        }
+    }
+}
+
+/// Classify one `CERULION_NETD_NETWORK` value the way `cerulion-netd` does:
+/// only the exact value `off` engages it (`None` = not set).
+pub fn netd_network_off_from(value: Option<&str>) -> bool {
+    value == Some("off")
+}
+
+/// Read both query-side kill switches from the environment ONCE. Pure over the
+/// environment; it emits no log.
+pub fn query_network_kill() -> QueryNetworkKill {
+    query_network_kill_from(
+        std::env::var(NETWORK_ENV).ok(),
+        std::env::var(NETD_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+/// The pure half of [`query_network_kill`].
+pub fn query_network_kill_from(network: Option<String>, netd: Option<&str>) -> QueryNetworkKill {
+    QueryNetworkKill {
+        network: network_env_kill_from(network),
+        netd_off: netd_network_off_from(netd),
+    }
+}
+
+/// Is the REMOTE network tier suppressed by a query-side kill switch
+/// ([`query_network_kill`]: `CERULION_NETWORK`, or `CERULION_NETD_NETWORK=off`),
+/// for the discovery-side callers that carry no `GraphConfig`: `topic list`,
+/// `schema info`'s remote fetch, and the `topic echo`/`hz`/`info` remote tiers?
+/// `CERULION_NETWORK` goes through the SAME parse as [`resolve_run_network`]
+/// ([`network_env_kill_from`]). Emits the fail-closed warn on an unrecognized
+/// `CERULION_NETWORK` value; returns `true` iff the tier must stay LOCAL-ONLY. The
 /// caller MUST consult this BEFORE opening any discovery session so a
 /// kill-switched run never touches the network (the LOCAL-ONLY
 /// contract).
 pub fn remote_network_suppressed() -> bool {
-    match network_env_kill() {
-        NetworkEnvKill::Unset => false,
+    let kill = query_network_kill();
+    match kill.network {
+        NetworkEnvKill::Unset => kill.netd_off,
         NetworkEnvKill::Off => true,
         NetworkEnvKill::Unrecognized(v) => {
             tracing::warn!(
@@ -3684,6 +3825,26 @@ pub const GATEWAY_BIND_RETRIES: u16 = 8;
 /// so tests pin the exact text.
 pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
 
+fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+    match access {
+        Some(cerulion_core::LanAccess::Open) => {
+            tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        }
+        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+            graph = %graph_name,
+            lan_access = "paired",
+            "LAN access is paired-only: the gateway refuses every LAN peer"
+        ),
+        // netd predates the posture field: report unknown rather than
+        // assuming an open posture it may not have.
+        None => tracing::warn!(
+            graph = %graph_name,
+            lan_access = "unknown",
+            "permissive egress: netd did not report a LAN-access posture (unknown -              older daemon without the field); see `cerulion netd status`"
+        ),
+    }
+}
+
 /// The resolved network decision for a `graph run` — the single
 /// output of [`resolve_run_network`]. There is no
 /// `Option<NetworkConfig>` funnel and no multi-process network rejection.
@@ -3709,8 +3870,8 @@ pub enum RunNetwork {
     /// (verbatim — the user's config is truth).
     Strict(cerulion_core::NetworkConfig),
     /// No (or disabled) `network:` block under the real clock ⇒ run the
-    /// gateway PERMISSIVE: every produced topic is announced + egressable
-    /// (to any LAN peer, no pairing required). Carries the SYNTHESIZED permissive
+    /// gateway PERMISSIVE: every produced topic is egressable, and its announce
+    /// token is declared when LAN access is open. Carries the SYNTHESIZED permissive
     /// `NetworkConfig` (peer mode, gossip on, multicast scouting per
     /// `CERULION_MULTICAST_SCOUTING`, no connect endpoints, listen
     /// on the well-known gateway port). Permissive has NO ingress by
@@ -4375,8 +4536,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and — for a permissive run — fires the one-shot
-/// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and for a permissive run reports the LAN posture
+/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4443,9 +4604,10 @@ fn spawn_gateway(
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
     // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker.
+    // spawn site, never in a worker. A paired LAN access posture (the gateway child
+    // inherits this env) refuses every LAN peer, so the egress is not open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     }
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
@@ -4704,7 +4866,27 @@ fn register_egress_with_netd(
     ix_config_json: Option<&str>,
 ) -> Result<NetdEgressGuard, cerulion_netd::ClientError> {
     let mut client = cerulion_netd::NetdClient::connect_or_spawn()?;
+    // Check netd's posture BEFORE registering: a registration's topics and
+    // schemas stay served on the shared gateway after release, so refusing an
+    // open netd after registering would not close the LAN access. A paired run
+    // rides only a netd that reports paired; otherwise dropping the client
+    // registers nothing and the caller falls back to a per-run gateway child,
+    // which enforces this run's own posture.
+    let requested = cerulion_core::LanAccess::from_env();
+    if requested == cerulion_core::LanAccess::Paired {
+        let reported = client.lan_access()?;
+        if !netd_posture_acceptable(reported, requested) {
+            drop(client);
+            return Err(netd_posture_refusal(reported));
+        }
+    }
     let resp = client.register_egress(&launch.plan, &launch.schema_serving, ix_config_json)?;
+    // The register response reports the posture too, so the check never
+    // rests on the probe alone.
+    if !netd_posture_acceptable(resp.lan_access, requested) {
+        drop(client);
+        return Err(netd_posture_refusal(resp.lan_access));
+    }
     tracing::info!(
         graph = %graph_name,
         registered_topics = resp.registered_topics,
@@ -4712,10 +4894,10 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run — parity with the child-spawn path
-    // (`spawn_gateway`), so a permissive desk still gets the exposure notice.
+    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // Missing posture is UNKNOWN (an older daemon) - never assume open.
     if launch.permissive {
-        tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
+        permissive_egress_breadcrumb(graph_name, resp.lan_access);
     }
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
@@ -4724,6 +4906,35 @@ fn register_egress_with_netd(
     // NO reconnect: recovery is not this watch's job.
     let watch = spawn_netd_liveness_watch(client.control_fd(), graph_name.to_string());
     Ok(NetdEgressGuard { watch, client })
+}
+
+/// The error that sends a paired run to its own gateway because netd
+/// `reported` a posture other than paired.
+#[cfg(unix)]
+fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_netd::ClientError {
+    let reported = match reported {
+        Some(cerulion_core::LanAccess::Open) => "reports open LAN access",
+        Some(cerulion_core::LanAccess::Paired) => "reports paired LAN access",
+        None => "did not report its LAN access posture (an older daemon)",
+    };
+    cerulion_netd::ClientError::Protocol(format!(
+        "cerulion-netd {reported} and this run requires paired access, so the run uses its \
+         own gateway; restart cerulion-netd with paired access to share its session"
+    ))
+}
+
+/// Whether a run that requires `requested` LAN access may ride a netd
+/// that reported `reported`. A paired run rides only a netd that reports
+/// paired: one that reports open serves its LAN openly, and one that
+/// reports no posture (an older daemon) may. An open run accepts any netd,
+/// because a paired netd is only stricter.
+#[cfg(unix)]
+fn netd_posture_acceptable(
+    reported: Option<cerulion_core::LanAccess>,
+    requested: cerulion_core::LanAccess,
+) -> bool {
+    requested == cerulion_core::LanAccess::Open
+        || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
 /// Establish the network-egress overlay for a real-clock live run. `None`
@@ -4890,8 +5101,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     let mut booted: Option<cerulion_core::GatewayRuntime> = None;
     // The ACTUAL bound listen port of the successful attempt — the
     // mDNS SRV port. Permissive: the ladder value we set below. Strict:
-    // parsed from the verbatim config listen list (`None` ⇒ no tcp/ port, the
-    // mDNS discovery beacon is skipped with a loud warn).
+    // parsed from the verbatim config listen list (`None` ⇒ no usable nonzero
+    // first TCP listen port, the mDNS discovery beacon is skipped with a loud warn).
     let mut resolved_port: Option<u16> = None;
     for attempt in 0..attempts {
         let mut net = base_net.clone();
@@ -4999,12 +5210,12 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             }
         }
         None => {
-            // Strict-with-no-parseable-port: skip the mDNS beacon loudly (never
-            // crash). Permissive always resolves a port, so this is strict-only.
+            // Strict-with-no-usable-first-TCP-port: skip the mDNS beacon loudly
+            // (never crash). Permissive always resolves a port, so this is strict-only.
             tracing::warn!(
                 graph = %graph_name,
                 listen = %base_net.listen_endpoints.join(","),
-                "gateway listen endpoints carry no parseable tcp/ port — the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
+                "gateway listen endpoints provide no usable nonzero TCP listen port; the mDNS discovery beacon is skipped; the gateway still serves egress/ingress"
             );
             None
         }
@@ -5034,22 +5245,51 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     Ok(())
 }
 
+/// Env var that turns the open-file refusal of `graph run` and `graph profile`
+/// into a warning: `"0"` starts the graph anyway, `"1"` or unset refuses.
+/// Exact match only; any other non-empty value warns and keeps the refusal.
+const OPEN_FILE_CHECK_ENV: &str = "CERULION_OPEN_FILE_CHECK";
+
 /// Raises this process's open-file soft limit and refuses `config` when its
-/// estimated start-up need is above the limit in force afterwards. An
-/// unreadable limit refuses nothing (the raise has already warned).
+/// estimated start-up need is above the limit in force afterwards, unless
+/// [`OPEN_FILE_CHECK_ENV`] is `0`. An unreadable limit refuses nothing (the
+/// raise has already warned).
 #[cfg(unix)]
 fn refuse_if_open_file_limit_too_low(config: &GraphConfig) -> CliResult<()> {
     let limit = cerulion_core::fd_limit::raise_open_file_limit().limit();
-    open_file_limit_verdict(config, limit, cerulion_core::fd_limit::select_ceiling())
+    let check = std::env::var(OPEN_FILE_CHECK_ENV).ok();
+    open_file_limit_verdict(
+        config,
+        limit,
+        cerulion_core::fd_limit::select_ceiling(),
+        cerulion_core::fd_limit::RemedyPlatform::current(),
+        check.as_deref(),
+    )
 }
 
-/// The pure half of [`refuse_if_open_file_limit_too_low`].
+/// The pure half of [`refuse_if_open_file_limit_too_low`]; `check` is the raw
+/// [`OPEN_FILE_CHECK_ENV`] value.
 #[cfg(unix)]
 fn open_file_limit_verdict(
     config: &GraphConfig,
     limit: Option<cerulion_core::fd_limit::OpenFileLimit>,
     select_ceiling: Option<u64>,
+    platform: cerulion_core::fd_limit::RemedyPlatform,
+    check: Option<&str>,
 ) -> CliResult<()> {
+    let enforce = match check {
+        None | Some("" | "1") => true,
+        Some("0") => false,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "{OPEN_FILE_CHECK_ENV} accepts `0` (start a graph the open-file check would \
+                 refuse) or `1` (refuse it, the default); this value is ignored and the check \
+                 refuses"
+            );
+            true
+        }
+    };
     let Some(limit) = limit else {
         return Ok(());
     };
@@ -5058,19 +5298,30 @@ fn open_file_limit_verdict(
         outputs: config.nodes.iter().map(|n| n.outputs.len()).sum(),
         inputs: config.nodes.iter().map(|n| n.inputs.len()).sum(),
     };
-    match cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling) {
-        Some(shortfall) => Err(CliError::Validation(format!(
-            "graph '{}': {shortfall}",
+    let Some(shortfall) =
+        cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling, platform)
+    else {
+        return Ok(());
+    };
+    if enforce {
+        return Err(CliError::Validation(format!(
+            "graph '{}': {shortfall} To start it anyway, set {OPEN_FILE_CHECK_ENV}=0.",
             config.identity()
-        ))),
-        None => Ok(()),
+        )));
     }
+    tracing::warn!(
+        graph = %config.identity(),
+        shortfall = %shortfall,
+        "{OPEN_FILE_CHECK_ENV}=0: starting a graph the open-file check refuses; past the limit \
+         iceoryx2 fails to create ports with errors that do not name it"
+    );
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
 mod open_file_limit_verdict_tests {
     use super::*;
-    use cerulion_core::fd_limit::OpenFileLimit;
+    use cerulion_core::fd_limit::{OpenFileLimit, RemedyPlatform};
     use cerulion_core::graph::config::InputDef;
 
     /// `chains` source -> sink pairs: two nodes, one output and one input
@@ -5078,6 +5329,7 @@ mod open_file_limit_verdict_tests {
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id,
             node_type: "n".to_string(),
@@ -5119,22 +5371,29 @@ mod open_file_limit_verdict_tests {
         }
     }
 
-    #[test]
-    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
-        let limit = OpenFileLimit {
-            soft: 1024,
-            hard: 1024,
-        };
-        // 64 + 40 x 15 + 40 x 23 = 1584 files.
-        let err = open_file_limit_verdict(&graph_of(40), Some(limit), None)
-            .expect_err("40 chains need about 1584 files");
+    const LINUX: RemedyPlatform = RemedyPlatform::Linux;
+    const LOW: OpenFileLimit = OpenFileLimit {
+        soft: 1024,
+        hard: 1024,
+    };
+
+    fn refusal(check: Option<&str>) -> String {
+        let err = open_file_limit_verdict(&graph_of(40), Some(LOW), None, LINUX, check)
+            .expect_err("40 chains need about 1480 files");
         let CliError::Validation(text) = err else {
             panic!("expected a Validation refusal, got {err:?}");
         };
+        text
+    }
+
+    #[test]
+    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
+        // 40 + 40 x 14 + 40 x 22 = 1480 files.
+        let text = refusal(None);
         assert!(
             text.starts_with(
                 "graph 'fd_budget': this graph has 80 nodes with 40 output and 40 input ports, \
-                 and starting it opens about 1584 files in this process"
+                 and starting it is estimated to open about 1480 files in this process"
             ),
             "{text}"
         );
@@ -5142,7 +5401,32 @@ mod open_file_limit_verdict_tests {
             text.contains("RLIMIT_NOFILE) is 1024 with a hard limit of 1024"),
             "{text}"
         );
-        assert!(text.contains("`ulimit -Hn 1584`"), "{text}");
+        assert!(text.contains("`ulimit -Hn 1480`"), "{text}");
+        assert!(
+            text.ends_with(" To start it anyway, set CERULION_OPEN_FILE_CHECK=0."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_check_refuses_when_its_env_var_is_one_empty_or_unrecognised() {
+        let unset = refusal(None);
+        for value in ["1", "", "off", "false", " 0"] {
+            assert_eq!(refusal(Some(value)), unset, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn the_check_set_to_zero_starts_a_graph_it_would_refuse() {
+        assert!(open_file_limit_verdict(&graph_of(40), Some(LOW), None, LINUX, Some("0")).is_ok());
+        assert!(open_file_limit_verdict(
+            &graph_of(40),
+            Some(LOW),
+            Some(1024),
+            RemedyPlatform::MacOs,
+            Some("0")
+        )
+        .is_ok());
     }
 
     #[test]
@@ -5151,12 +5435,12 @@ mod open_file_limit_verdict_tests {
             soft: 524_288,
             hard: 524_288,
         };
-        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None).is_ok());
+        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None, LINUX, None).is_ok());
     }
 
     #[test]
     fn an_unreadable_limit_refuses_nothing() {
-        assert!(open_file_limit_verdict(&graph_of(10_000), None, None).is_ok());
+        assert!(open_file_limit_verdict(&graph_of(10_000), None, None, LINUX, None).is_ok());
     }
 }
 
@@ -5328,6 +5612,11 @@ pub fn graph_run(
     // external clocks, non-Unix — each of which says so at launch rather than
     // swallowing the flag.
     no_rings: bool,
+    // `graph run <NAME> [NAME:=VALUE]...`: the launch-argument overrides,
+    // already parsed. They apply to the graph READ below and nowhere else;
+    // the run executes, validates and records the resolved graph. Internal
+    // callers (`node run`, `ros2 attach`) pass none.
+    launch_args: &[cerulion_core::graph::LaunchOverride],
 ) -> CliResult<()> {
     // CPU C-state cap. Acquired AFTER the runtime is built —
     // not here — so the cap can be DERIVED from the graph's own tightest
@@ -5400,7 +5689,19 @@ pub fn graph_run(
     // ONE read: `config` and the bytes the auto-partition preflight splices
     // must describe the SAME revision (see
     // `run_auto_partition_preflight`).
-    let (mut config, raw_graph_yaml) = graph_read_raw(graphs_dir, graph_name)?;
+    let (mut config, raw_graph_yaml, launch_arg_sources) =
+        crate::graph_launch_args::graph_read_raw_with_launch_args(
+            graphs_dir,
+            graph_name,
+            launch_args,
+        )?;
+    // `--yes` saves a partition derived from the graph as DECLARED (what
+    // `graph partition` derives). Whether this run's overrides moved its
+    // wiring is judged on the bytes just read, BEFORE the prefix fill below
+    // (the fill would differ from the declared defaults on a prefix-less
+    // file); the auto-partition pre-flight refuses the save when they did.
+    let wiring_overridden = !launch_args.is_empty()
+        && crate::graph_launch_args::overrides_change_wiring(&raw_graph_yaml, &config)?;
 
     // LOAD-BEARING because the run gate fails closed: fill the DEFAULT PREFIX
     // before anything JUDGES this config.
@@ -5480,6 +5781,14 @@ pub fn graph_run(
         crate::partition_emit::PartitionIntent::Derive
     );
 
+    // The params passes below (the validation report's check, the pre-write
+    // refusal and the effective-graph fill) read node libraries through one
+    // memo over a loader that keeps each library loaded for the whole run, so
+    // the run's own node load reuses it: a library's static initialization
+    // runs once per run, however many passes read its info.
+    let params_libraries = crate::graph_params_check::KeepLoaded::default();
+    let params_inspector = crate::graph_params_check::OncePerLibrary::new(&params_libraries);
+
     if !skip_validate {
         // A run that is about to DERIVE a partition validates REPLACE-SCOPED:
         // the block on disk is what it is here to replace, so it must not be
@@ -5503,7 +5812,8 @@ pub fn graph_run(
             report_config,
             &cdylib_cache,
             false,
-            &crate::node_inspector::InProcessInspector,
+            &params_inspector,
+            &launch_arg_sources,
         );
         if !report.all_passed() {
             // Print the whole report first: the refusal names the
@@ -5585,13 +5895,22 @@ pub fn graph_run(
     // runs on the same `validate_schema_value`-shaped values the report's
     // producer check sees.
     refuse_ambiguous_output_schemas(workspace_root, &config)?;
+    // Params the build would refuse, refused NOW, before the auto-partition
+    // pre-flight can write the graph file: `--no-validate` skips the report,
+    // not this, so a run refused over its params never mutates the file.
+    crate::graph_params_check::refuse_unresolvable_params(
+        &config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+        &launch_arg_sources,
+    )?;
 
     // This process holds every topic of the graph while it starts, a set of
     // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
     // now (the transport constructors would on their own, later) and refuse,
-    // before any side effect, a graph that needs more than this process may
-    // hold; past the limit iceoryx2 fails with port-creation errors that never
-    // name it.
+    // before the graph file or run directory is touched, a graph estimated to
+    // need more than this process may hold; past the limit iceoryx2 fails with
+    // port-creation errors that never name it.
     #[cfg(unix)]
     refuse_if_open_file_limit_too_low(&config)?;
 
@@ -5645,32 +5964,46 @@ pub fn graph_run(
     // a written file would produce (the in-memory == written equality pin).
     // Reached only after EVERY pre-run rejection (the record guard + the
     // external-clock check above) — a refused run never mutates the file.
-    let (mut config, partition_provenance) =
-        if let crate::partition_emit::PartitionIntent::Derive = partition_intent {
-            let consent = partition_consent
-                .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
-            let pre = crate::partition_emit::run_auto_partition_preflight(
-                workspace_root,
-                graph_name,
-                config,
-                &raw_graph_yaml,
-                &crate::partition_emit::PreflightOptions {
-                    // Lenient only on the zero-flag default —
-                    // an explicit --auto-partition asked for cost-aware
-                    // behavior, so a broken default artifact stays a hard Err.
-                    lenient_costs: !consent.auto_partition,
-                    assume_yes: consent.assume_yes,
-                },
-            )?;
-            // The OUTCOME is the run's partition PROVENANCE — kept
-            // rather than discarded, because the file cannot tell you: on the
-            // no-TTY floor the run executes derived groups the file does not
-            // carry.
-            let provenance = run_dir_partition_provenance(pre.outcome);
-            (pre.config, provenance)
-        } else {
-            (config, crate::run_dir::PartitionProvenance::Declared)
-        };
+    let (mut config, partition_provenance) = if let crate::partition_emit::PartitionIntent::Derive =
+        partition_intent
+    {
+        let consent = partition_consent
+            .expect("PartitionIntent::Derive is only produced from a Some(consent) seam");
+        // A partition the file keeps must hold for the graph as declared,
+        // not for one run's overrides. Under such overrides the pre-flight
+        // runs with saving OFF, so it can never write; only an outcome that
+        // WOULD have written (`InMemory`) refuses the run's `--yes`. A file
+        // that already carries exactly the derived partition needs no
+        // write, so that run proceeds.
+        let refuse_save = consent.assume_yes && wiring_overridden;
+        let pre = crate::partition_emit::run_auto_partition_preflight(
+            workspace_root,
+            graph_name,
+            config,
+            &raw_graph_yaml,
+            &crate::partition_emit::PreflightOptions {
+                // Lenient only on the zero-flag default:
+                // an explicit --auto-partition asked for cost-aware
+                // behavior, so a broken default artifact stays a hard Err.
+                lenient_costs: !consent.auto_partition,
+                assume_yes: consent.assume_yes && !refuse_save,
+            },
+        )?;
+        if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
+        {
+            return Err(
+                crate::graph_launch_args::refuse_persist_under_wiring_overrides(graph_name),
+            );
+        }
+        // The OUTCOME is the run's partition PROVENANCE, kept
+        // rather than discarded, because the file cannot tell you: on the
+        // no-TTY floor the run executes derived groups the file does not
+        // carry.
+        let provenance = run_dir_partition_provenance(pre.outcome);
+        (pre.config, provenance)
+    } else {
+        (config, crate::run_dir::PartitionProvenance::Declared)
+    };
 
     // The deployment is RESOLVED here rather than inside the `match`
     // below, for two reasons that are both load-bearing.
@@ -5754,6 +6087,18 @@ pub fn graph_run(
     // lifted out, so deployment planning, the recording's topic derivation
     // and the runtime build below see a plain native graph; the entries are
     // spawned beside it once the run's side effects begin.
+    //
+    // First, each node's `params:` is completed to the RESOLVED map (the
+    // graph's values over the declared defaults, in declaration order), so the
+    // document both embeds render carries the values in force and a resim
+    // applies them even after a node's `#[param]` default changed. Best
+    // effort: a node whose library will not read, or whose values the build
+    // refuses, keeps its map as written and the build below says why.
+    crate::graph_params_check::fill_resolved_params(
+        &mut config,
+        &resolved_library_paths(&cdylib_cache),
+        &params_inspector,
+    );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
 
@@ -7552,7 +7897,7 @@ pub fn graph_run_worker(
     // the ~5s boundary timeout. Positioned BEFORE `run_live` (the first barrier
     // arrival), with a hard deadline so a dead supervisor can never hang the
     // worker forever.
-    wait_for_go(
+    let shared_start_epoch = wait_for_go(
         Path::new(&plan.go_path),
         &plan.group,
         &running,
@@ -7764,10 +8109,12 @@ pub fn graph_run_worker(
     // producer-clock values, and cross-rank stamp arithmetic (Sync's window
     // spread, `expect_within`'s elapsed) would otherwise cross unrelated clock
     // domains. Every rank ARMS its placement HERE, after GO, and `run_live`
-    // reads `real_ns()` — machine-wide boot-monotonic, so no distribution is
-    // needed — at its wall-clock anchor, so the ranks' placement instants
-    // differ by the GO fan-out only and not by the seconds of sequential-spawn
-    // skew a build-time placement would bake in. The primitive also re-phases
+    // places it at the deployment's shared start epoch from the GO sentinel
+    // (8.95), a `real_ns()` instant, machine-wide boot-monotonic, so every rank
+    // within one gating quantum of it places the same value; a rank later
+    // places a fresh `real_ns()` at its anchor instead. Either way no rank
+    // bakes in the seconds of sequential-spawn skew a build-time placement
+    // would. The primitive also re-phases
     // the `Period` deadlines and re-seeds the watchdog windows the build
     // anchored at 0 (see `place_gating_epoch` for why a bare `clock.set` would
     // hang on the first step). A lockstep rank keeps its quantum timeline; a
@@ -7794,8 +8141,24 @@ pub fn graph_run_worker(
             group = %plan.group,
             rank = plan.rank,
             "free-run traced rank: gating clock epoch armed for the live loop's wall-clock \
-             anchor (read from real_ns() immediately before the first delta)"
+             anchor (placed at the shared start epoch, or at real_ns() there when more than one \
+             gating quantum late)"
         );
+    }
+    // (8.95) The deployment's SHARED START EPOCH, read from the GO sentinel:
+    // `run_live` waits for it after its prologue; a rank there within one
+    // gating quantum places a traced rank's armed epoch (8.9) at exactly this
+    // value and back-dates its wall anchors to it, and a later one warns and
+    // starts its own timeline. `None` only when Ctrl-C ended the GO wait;
+    // `run_live` then runs its prologue and no step.
+    if let Some(epoch_ns) = shared_start_epoch {
+        if let Err(e) = runtime.start_live_at_shared_epoch(epoch_ns) {
+            runtime.shutdown();
+            return Err(CliError::Validation(format!(
+                "graph run-worker: group '{}' could not arm the shared start epoch: {e}",
+                plan.group
+            )));
+        }
     }
     tracing::info!(group = %plan.group, "worker live loop starting — press Ctrl+C to stop");
     if let Err(e) = runtime.run_live(&running) {
@@ -8326,14 +8689,30 @@ fn credit_open_refusal_message(topic: &str, ns: &str, id: &str, e: &std::io::Err
     }
 }
 
-/// Block until the deployment-wide GO sentinel appears (the supervisor touches it
-/// once ALL workers are built + READY — see `WorkerPlan::go_path` for the
-/// start-gate contract). 20 ms poll; a LOUD error at the deadline — a worker must
-/// never hang forever on a dead supervisor. The deadline is the plan's
-/// `go_deadline_ms` (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned
-/// worker legitimately waits out every later sibling's sequential READY window,
-/// so a fixed deadline would spuriously fail-loud large slow deployments. A
-/// Ctrl-C (`running` flipping false) returns `Ok` early: `run_live` checks
+/// Write the GO sentinel carrying `epoch_ns` so a polling worker never reads a
+/// half-written file: the text goes to a sibling `.tmp` file first and is renamed
+/// over `go_path`, and a rename within one directory is atomic, so `exists()`
+/// turns true only once the whole line is there.
+fn write_go_sentinel(go_path: &Path, epoch_ns: u64) -> std::io::Result<()> {
+    let mut tmp = go_path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, crate::multiprocess::encode_go_sentinel(epoch_ns))?;
+    std::fs::rename(&tmp, go_path)
+}
+
+/// Block until the deployment-wide GO sentinel appears (the supervisor writes it
+/// once ALL workers are built + READY; see `WorkerPlan::go_path` for the
+/// start-gate contract) and return the shared start epoch it carries
+/// (`multiprocess::parse_go_sentinel`). 2 ms poll, so a worker sees GO well
+/// inside the `SHARED_START_LEAD_NS` the supervisor leaves before the epoch. A
+/// LOUD error on a sentinel that cannot be read or does not parse, and a LOUD
+/// error at the deadline, so a worker never hangs forever on a dead
+/// supervisor. The deadline is the plan's `go_deadline_ms`
+/// (`GO_BASE_MS + n * READY_BUDGET_MS`): the first-spawned worker legitimately
+/// waits out every later sibling's sequential READY window, so a fixed deadline
+/// would spuriously fail-loud large slow deployments. A
+/// Ctrl-C (`running` flipping false) returns `Ok(None)` early: `run_live` checks
 /// `running` first and exits immediately, so the worker drains cleanly instead
 /// of sitting out the deadline.
 fn wait_for_go(
@@ -8341,16 +8720,35 @@ fn wait_for_go(
     group: &str,
     running: &AtomicBool,
     deadline: Duration,
-) -> CliResult<()> {
+) -> CliResult<Option<u64>> {
     let start = Instant::now();
     loop {
         if go_path.exists() {
-            tracing::info!(group = %group, "GO observed — entering live loop");
-            return Ok(());
+            let text = std::fs::read_to_string(go_path).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' saw the GO sentinel `{}` but cannot \
+                     read it: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let epoch_ns = crate::multiprocess::parse_go_sentinel(&text).map_err(|e| {
+                CliError::Validation(format!(
+                    "graph run-worker: group '{group}' cannot use the GO sentinel `{}`: {e}",
+                    go_path.display()
+                ))
+            })?;
+            let now_ns = cerulion_core::real_ns();
+            tracing::info!(
+                group = %group,
+                epoch_ns,
+                lead_ns = epoch_ns as i128 - now_ns as i128,
+                "GO observed; the live loop starts at the shared start epoch"
+            );
+            return Ok(Some(epoch_ns));
         }
         if !running.load(Ordering::Relaxed) {
             tracing::info!(group = %group, "Ctrl-C during GO wait — draining without stepping");
-            return Ok(());
+            return Ok(None);
         }
         if start.elapsed() >= deadline {
             return Err(CliError::Validation(format!(
@@ -8359,7 +8757,7 @@ fn wait_for_go(
                 go_path.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -10239,7 +10637,7 @@ fn graph_run_supervisor(
     #[cfg(unix)]
     let recorded_topics: Option<Vec<cerulion_bagd::RecordedTopic>> = match record_entry_infos {
         Some(infos) => {
-            let recorded = resolve_recorded_topics(workspace_root, &config, infos)?;
+            let recorded = resolve_recorded_topics(workspace_root, &config, infos, None)?;
             if recorded.is_empty() {
                 return Err(CliError::Validation(format!(
                     "`graph run --record`: graph '{}' has no graph-owned (in-graph-producer) \
@@ -11520,7 +11918,9 @@ fn graph_run_supervisor(
     // withholding GO keeps every not-yet-released worker from stepping at all
     // (each exits via `wait_for_go`'s `running` check).
     if running.load(Ordering::Relaxed) {
-        std::fs::write(&go_path, b"go").map_err(|e| {
+        let epoch_ns =
+            cerulion_core::real_ns().saturating_add(crate::multiprocess::SHARED_START_LEAD_NS);
+        write_go_sentinel(Path::new(&go_path), epoch_ns).map_err(|e| {
             CliError::Validation(format!(
                 "graph run (multi-process): cannot write the GO sentinel `{go_path}`: {e} — \
                  deployment aborted (all workers killed)"
@@ -13858,6 +14258,10 @@ pub fn graph_profile(
             "ros2 entries are not profiled (spawned processes, not scheduled nodes) — the cost snapshot covers the native nodes only"
         );
     }
+    // The profile runs the graph live in this process, which holds every topic
+    // while it starts: the same open-file check as `graph run`.
+    #[cfg(unix)]
+    refuse_if_open_file_limit_too_low(&config)?;
 
     // Source-derived entry infos (policy per node) — feeds the SAME
     // trigger-edge derivation the harvest consumes (the graph_levels
@@ -14534,14 +14938,14 @@ pub fn write_profile_artifact_atomically(
 /// callers need so none of it has to be re-derived from the path
 /// (and so the staleness walk runs exactly once per resolution).
 #[derive(Clone, Debug)]
-struct ResolvedCdylib {
-    path: std::path::PathBuf,
+pub(crate) struct ResolvedCdylib {
+    pub(crate) path: std::path::PathBuf,
     /// True when the artifact came from `target/release/`.
     release: bool,
     /// Best-effort staleness verdict: true when a build
     /// input under `nodes/<type>/` is strictly newer than the
     /// artifact.
-    stale: bool,
+    pub(crate) stale: bool,
 }
 
 impl ResolvedCdylib {
@@ -14609,6 +15013,23 @@ fn warn_if_stale(node_type: &str, lib: &ResolvedCdylib) {
 /// `graph_validate` and `graph_run` so a validated run
 /// walks each `src/` tree exactly once total rather than twice.
 type ResolvedCdylibCache = indexmap::IndexMap<String, Result<ResolvedCdylib, String>>;
+
+/// The cdylib path of every node TYPE in `cache` that resolved, for the
+/// passes that read a library's node info through a `NodeInspector` (the
+/// params check and the params fill). A type that did not resolve is absent;
+/// its own cdylib check already says why.
+fn resolved_library_paths(
+    cache: &ResolvedCdylibCache,
+) -> indexmap::IndexMap<String, std::path::PathBuf> {
+    cache
+        .iter()
+        .filter_map(|(node_type, lib)| {
+            lib.as_ref()
+                .ok()
+                .map(|lib| (node_type.clone(), lib.path.clone()))
+        })
+        .collect()
+}
 
 /// Resolve every distinct node type in `config` to its cdylib once,
 /// returning a per-type memo. The staleness walk runs exactly once
@@ -15072,7 +15493,7 @@ fn arch_filter<'a>(
 /// The lookup is silent: staleness is computed once and returned on
 /// the [`ResolvedCdylib`] for the caller to surface (report entry or
 /// [`warn_if_stale`]).
-fn find_cdylib(
+pub(crate) fn find_cdylib(
     workspace_root: &Path,
     node_type: &str,
     prefer_release: bool,
@@ -20360,7 +20781,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         entry_infos.insert(id.clone(), entry.info()?);
     }
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
-    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos)?;
+    let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
         return Err(CliError::Validation(format!(
             "`graph run --record`: graph '{graph_name}' has no graph-owned (in-graph-producer) \
@@ -21122,7 +21543,7 @@ fn resolve_recorded_wire_size(
 ///   `OutputMeta::wire_fixed_size` (`<T as ShmMessage>::WIRE_FIXED_SIZE`,
 ///   the layout the node's Rust type really writes), with the workspace
 ///   `schemas/` set as the CROSS-CHECK and the fallback. See
-///   [`resolve_recorded_wire_size`] for the arms; this moved off
+///   `resolve_recorded_wire_size` for the arms; this moved off
 ///   the file for the same reason the HASH lives on the node:
 ///   a file that describes a different layout mislabels every frame on the
 ///   channel. `0` when neither source can size the port (e.g. a ROS2
@@ -21149,27 +21570,41 @@ fn resolve_recorded_wire_size(
 /// Recording a fabricated hash would mislabel every frame on that channel — a
 /// replay-grade bag with a fabricated hash is worse than no bag — so the
 /// recording ABORTS loudly naming node/output/topic.
+///
+/// `workspace_root` is the workspace directory whose `schemas/` files size
+/// output ports when the producing node does not provide a fixed wire size.
 #[cfg(unix)]
-fn resolve_recorded_topics(
+pub fn resolve_recorded_topics(
     workspace_root: &Path,
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    selected: Option<&std::collections::HashSet<String>>,
 ) -> CliResult<Vec<cerulion_bagd::RecordedTopic>> {
     let wire_sizes = build_workspace_schema_wire_sizes(workspace_root);
     // IndexMap keyed by resolved topic → dedup deterministically (first producer
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
+    // Every graph-produced topic, selected or not: the external-consumer
+    // classification below is about who PRODUCES a topic, not what this
+    // recording selects.
+    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
+            produced.insert(topic.clone());
+            // The selection applies BEFORE the metadata lookup: a names-only
+            // output the recording does not select must not fail startup.
+            if selected.is_some_and(|set| !set.contains(&topic)) {
+                continue;
+            }
             if out.contains_key(&topic) {
                 continue;
             }
             let Some(info) = entry_infos.get(&node_def.id) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: node '{}' (topic '{topic}') has no loaded NodeEntry \
+                    "recording: node '{}' (topic '{topic}') has no loaded NodeEntry \
                      info, so its output's AUTHORITATIVE wire schema hash is unavailable — a \
                      replay-grade bag with a fabricated hash is worse than no bag. Recording \
                      aborted.",
@@ -21178,7 +21613,7 @@ fn resolve_recorded_topics(
             };
             let Some(meta) = info.output_meta().iter().find(|m| m.name == output.name) else {
                 return Err(CliError::Validation(format!(
-                    "`graph run --record`: output '{}.{}' (topic '{topic}') carries no \
+                    "recording: output '{}.{}' (topic '{topic}') carries no \
                      OutputMeta — its node reports names-only port info (a raw-FFI cdylib built \
                      without per-port metadata), so the AUTHORITATIVE wire schema hash is \
                      unavailable and the channel would be mislabeled. Recording aborted; rebuild \
@@ -21291,19 +21726,7 @@ fn resolve_recorded_topics(
     // consumed∧¬produced classification `replay_engine::classify_topics`
     // applies at replay time.
     {
-        let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
-        for node_def in &config.nodes {
-            for input in &node_def.inputs {
-                let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
-                if out.contains_key(&topic) {
-                    continue; // graph-produced — recorded, nothing to flag.
-                }
-                let consumers = unrecorded.entry(topic).or_default();
-                if !consumers.contains(&node_def.id) {
-                    consumers.push(node_def.id.clone());
-                }
-            }
-        }
+        let unrecorded = external_consumers(config, &produced);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -21316,6 +21739,31 @@ fn resolve_recorded_topics(
         }
     }
     Ok(out.into_values().collect())
+}
+
+/// The topics a graph consumes but does not produce, each with its consumer
+/// node ids (deduped, config order). A graph-produced topic is never external,
+/// even when a recording's topic selection leaves it out of the bag: replay
+/// re-runs its producer and regenerates it.
+#[cfg(unix)]
+fn external_consumers(
+    config: &GraphConfig,
+    produced: &std::collections::HashSet<String>,
+) -> indexmap::IndexMap<String, Vec<String>> {
+    let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
+    for node_def in &config.nodes {
+        for input in &node_def.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if produced.contains(&topic) {
+                continue; // graph-produced - replay regenerates it.
+            }
+            let consumers = unrecorded.entry(topic).or_default();
+            if !consumers.contains(&node_def.id) {
+                consumers.push(node_def.id.clone());
+            }
+        }
+    }
+    unrecorded
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -21544,7 +21992,7 @@ fn build_workspace_schema_wire_sizes(
         // bit. It is deliberately the ONE net: a second,
         // conversion-time arm would mask the retain (removing the retain would change
         // nothing observable), whereas its removal TRUNCATES a
-        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967216 — an
+        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967200, an
         // affirmatively wrong descriptor), which is exactly what the
         // unrepresentable-fixed-section test fails on.
         let size = schema.wire_fixed_size() as u32;
@@ -21618,6 +22066,21 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paired run rides only a netd that reports paired: an open or an
+    /// unknown posture is refused. An open run accepts every netd. Hand
+    /// oracle over all six (reported, requested) pairs.
+    #[cfg(unix)]
+    #[test]
+    fn netd_posture_acceptable_requires_a_reported_paired_netd_for_a_paired_run() {
+        use cerulion_core::LanAccess::{Open, Paired};
+        assert!(!netd_posture_acceptable(None, Paired));
+        assert!(!netd_posture_acceptable(Some(Open), Paired));
+        assert!(netd_posture_acceptable(Some(Paired), Paired));
+        assert!(netd_posture_acceptable(None, Open));
+        assert!(netd_posture_acceptable(Some(Paired), Open));
+        assert!(netd_posture_acceptable(Some(Open), Open));
+    }
 
     // ======================================================================
     // The scrub fixpoint's NO-PROGRESS fallback, DRIVEN.
@@ -22929,6 +23392,7 @@ nodes:
                 schema_hash: 0x0821_C823_0000_0001,
                 qualified: "pkg/Type".to_string(),
             }],
+            served_topics: vec![],
         };
         let handoff = GatewayHandoff {
             graph_name: "g".to_string(),
@@ -23856,6 +24320,33 @@ nodes:
     /// `pkg13::Type` graph backed by `schemas/pkg13/msg/Type.msg` records
     /// the REAL size (and the normalized provenance spelling). Removing
     /// core's deserializer normalization fails it.
+    /// A recording that selects a subset of outputs must not reclassify an
+    /// unselected graph-produced topic as external: replay re-runs its
+    /// producer. Only a topic no node produces is external.
+    #[cfg(unix)]
+    #[test]
+    fn an_unselected_produced_topic_is_not_an_external_consumer() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let produced: std::collections::HashSet<String> = config
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.outputs.iter().map(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                })
+            })
+            .collect();
+        let external = external_consumers(&config, &produced);
+        assert_eq!(
+            external.into_iter().collect::<Vec<_>>(),
+            vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn r13_a_coloned_graph_spelling_records_the_real_wire_size() {
@@ -23876,7 +24367,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
@@ -23991,7 +24483,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xABCD, None).with_wire_fixed_size(1 << 20)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size,
@@ -24036,7 +24529,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0x5151, None).with_wire_fixed_size(64)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 64,
             "an unregistered schema must not be recorded as a 0-byte layout"
@@ -24089,7 +24583,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xAB, None).with_wire_fixed_size(96)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 96,
             "the node sizes a port the map deliberately refuses to bind"
@@ -24131,7 +24626,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded[0].wire_fixed_size, 0);
         assert_eq!(recorded[0].schema_name, "");
         // The half the name promises: the `is_empty()` gate on the `Unknown`
@@ -24193,7 +24689,8 @@ nodes:
             // `OutputMeta::new` alone: no `with_wire_fixed_size`.
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x7777, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "with no producer claim the workspace file is still the source"
@@ -24261,7 +24758,8 @@ nodes:
                 vec![OutputMeta::new("o".to_string(), 0xBB, None).with_wire_fixed_size(128)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1, "one topic, one channel");
         assert_eq!(recorded[0].topic, "/tf");
         assert_eq!(
@@ -24319,7 +24817,8 @@ nodes:
         let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
             indexmap::IndexMap::new();
         infos.insert("n".to_string(), info);
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 8,
             "the workspace file sizes a port whose info block does not"
@@ -24352,8 +24851,8 @@ nodes:
                 ],
             ),
         );
-        let first = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
-        let second = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let first = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
+        let second = resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         let render = |v: &[cerulion_bagd::RecordedTopic]| {
             v.iter()
                 .map(|t| {
@@ -24410,7 +24909,8 @@ nodes:
                 ],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded
                 .iter()
@@ -24496,7 +24996,8 @@ nodes:
                 vec![OutputMeta::new("oa".to_string(), 0xA, None).with_wire_fixed_size(4)],
             ),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "PREMISE: the two sources agree, so 4 is recorded either way"
@@ -24530,6 +25031,7 @@ nodes:
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
                     node_type: "cam".to_string(),
@@ -24560,6 +25062,7 @@ nodes:
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
                     node_type: "cam2".to_string(),
@@ -24606,7 +25109,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         // ORACLE: exactly two topics — the derived /rr/cam/img and the
         // override /tf (deduped across cam + cam2); the external consumer-only
@@ -24686,7 +25189,7 @@ nodes:
             ),
         );
 
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect("full-meta graph must resolve");
         let topics: Vec<&str> = recorded.iter().map(|r| r.topic.as_str()).collect();
 
@@ -24723,9 +25226,13 @@ nodes:
             "cam".to_string(),
             NodeInfo::from_names(vec!["ext".to_string()], vec!["img".to_string()]),
         );
-        let err = resolve_recorded_topics(tmp.path(), &config, &infos)
+        let err = resolve_recorded_topics(tmp.path(), &config, &infos, None)
             .expect_err("a names-only NodeInfo must abort the recording");
         let msg = err.to_string();
+        assert!(
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
         assert!(msg.contains("cam.img"), "names node.output: {msg}");
         assert!(msg.contains("/rr/cam/img"), "names the topic: {msg}");
         assert!(
@@ -24743,10 +25250,15 @@ nodes:
         // output-missing message above also contains "cam", so a text-collapse
         // mutation merging the two arms' diagnostics must fail here.
         let empty: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
-        let err = resolve_recorded_topics(tmp.path(), &config, &empty)
+        let err = resolve_recorded_topics(tmp.path(), &config, &empty, None)
             .expect_err("a missing NodeEntry info must abort the recording");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("no loaded NodeEntry info"),
+            msg.starts_with("recording: "),
+            "uses caller-neutral wording: {msg}"
+        );
+        assert!(
+            msg.contains("no loaded NodeEntry info"),
             "the node-missing arm's DISTINCT diagnostic: {err}"
         );
     }
@@ -24873,6 +25385,7 @@ nodes:
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -24950,6 +25463,7 @@ nodes:
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25032,6 +25546,7 @@ nodes:
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
                 node_type: "n".to_string(),
@@ -25128,10 +25643,13 @@ nodes:
     ///   the `Lockstep` arm of the build-path match (a free-run rank that
     ///   opened the barrier would wait at a generation no sibling arrives at);
     /// * the epoch is ARMED at EXACTLY ONE site (`run_live` places it at its
-    ///   wall-clock anchor), AFTER the GO wait (so the ranks' placement
-    ///   instants differ by the GO fan-out, never by the sequential-spawn
-    ///   skew) and BEFORE `run_live` (an epoch is an origin;
-    ///   the primitive refuses a placement after the first step);
+    ///   wall-clock anchor, at the shared start epoch the GO sentinel carries,
+    ///   or at a fresh real_ns() when more than one gating quantum late),
+    ///   AFTER the GO wait (never baking in the sequential-spawn skew) and
+    ///   BEFORE `run_live` (an epoch is an origin; the primitive refuses a
+    ///   placement after the first step);
+    /// * the shared start is armed at EXACTLY ONE site, from the GO wait's
+    ///   epoch, before `run_live` and under no build-path guard;
     /// * the build-path decision precedes every consumer of it (the clock
     ///   mint, the barrier open, the build, the recording configuration, the
     ///   epoch, the cohort leave).
@@ -25251,6 +25769,38 @@ nodes:
             body[go..epoch].matches("WorkerBuildPath::").count(),
             1,
             "exactly ONE build-path token between GO and the arming — the guard itself"
+        );
+        // The SHARED START: one arming site, fed by the epoch the GO wait
+        // returns, after that wait and before run_live, and under NO build-path
+        // guard: every rank (traced, plain free run, lockstep) starts at the
+        // deployment's shared epoch. Nesting it inside the traced arm above
+        // would leave plain free-run ranks starting one GO poll apart; the
+        // brace balance from the traced guard's line to the call is exactly
+        // the one `if let Some(..)` that opens around it.
+        assert!(
+            body.contains("let shared_start_epoch = wait_for_go("),
+            "the GO wait's returned epoch is bound for the shared start"
+        );
+        assert_eq!(
+            body.matches("start_live_at_shared_epoch(").count(),
+            1,
+            "exactly ONE shared-start arming"
+        );
+        let shared = body.find("start_live_at_shared_epoch(").unwrap();
+        assert!(
+            go < shared && shared < run_live,
+            "the shared start is armed after the GO wait and before run_live"
+        );
+        assert_eq!(
+            body[go..shared].matches("WorkerBuildPath::").count(),
+            1,
+            "no build-path token guards the shared start beyond the traced epoch's own guard"
+        );
+        let depth = body[guard_line..shared].matches('{').count() as i64
+            - body[guard_line..shared].matches('}').count() as i64;
+        assert_eq!(
+            depth, 1,
+            "the shared start sits outside the traced arm, inside only its own `if let Some`"
         );
         // The clock-config half is bound to its arm: the nearest build-path
         // token before `configure_traced_runtime_free_run(` is FreeRunTraced
@@ -27104,7 +27654,7 @@ nodes:
     #[test]
     fn r29_an_over_ceiling_declaration_is_omitted_by_the_composing_folds_and_influences_no_survivor(
     ) {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         let hostile = tempfile::tempdir().unwrap();
         let control = tempfile::tempdir().unwrap();
         for root in [hostile.path(), control.path()] {
@@ -27184,15 +27734,15 @@ nodes:
     }
     /// Wire-size validation: a
     /// ceiling judging the fixed section alone (`<= u32::MAX`) is wrong, because the frame
-    /// also carries the 32-byte header and one 8-byte offset entry per
+    /// also carries the 40-byte header and one 8-byte offset entry per
     /// variable field, so a fixed section of `u32::MAX` bytes would be recorded
     /// as a descriptor no publisher can emit. Both sides of the boundary on
-    /// the RESOLVED fold: a fixed section exactly at `u32::MAX − 32`
-    /// (`At`) and at `u32::MAX − 40` beside one string (`VarAt`) record
+    /// the RESOLVED fold: a fixed section exactly at `u32::MAX - 40`
+    /// (`At`) and at `u32::MAX - 48` beside one string (`VarAt`) record
     /// their exact sizes; one byte past each (`Over`, `VarOver`) and the
     /// extreme (`Max`, exactly `u32::MAX`) are omitted. Nested
     /// inlining is judged at the resolved moment: `WrapAt` (a `uint8` run
-    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX − 39`)
+    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX - 47`)
     /// records, `WrapOver` (one byte more of run, so padding + inlining
     /// land one past the ceiling) is omitted; `Tight` pins that a reference
     /// resolution INLINES is counted as fixed bytes and never as an offset
@@ -27201,11 +27751,11 @@ nodes:
     /// `msg_store_parity_test`); and `VarNestAt` / `VarNestOver` pin the
     /// RESOLVED moment's EXACT count: `Blob` has a string, so `Blob b` stays
     /// a real offset entry after resolution, which the declared floor would
-    /// not count — at `u32::MAX − 40` it records, one byte more is omitted.
+    /// not count, at `u32::MAX - 48` it records, one byte more is omitted.
     #[cfg(unix)]
     #[test]
     fn r26_the_fold_ceiling_counts_the_header_and_the_offset_table_on_both_sides() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         const VAR_AT: usize = AT - 8;
         let tmp = tempfile::tempdir().unwrap();
         write_store_msg(tmp.path(), "p26", "At", &format!("uint8[{AT}] a\n"));
@@ -27267,9 +27817,9 @@ nodes:
         for (name, size) in [
             ("p26/At", AT),
             ("p26/VarAt", VAR_AT),
-            // AT − 16 = …247, the u64 lands at …248 (align 8), ends …256.
+            // AT - 16 = ...239, the u64 lands at ...240 (align 8), ends ...248.
             ("p26/WrapAt", AT - 7),
-            // AT − 7 = …256, the u32 lands there (align 4), ends …260.
+            // AT - 7 = ...248, the u32 lands there (align 4), ends ...252.
             ("p26/Tight", AT - 3),
             // The still-variable `Blob b` is one entry: the run is the whole
             // fixed section (the reference adds no bytes and no alignment).
@@ -27310,10 +27860,10 @@ nodes:
     fn r12_a_retain_thinned_ambiguity_does_not_resurrect_a_bare_alias() {
         let tmp = tempfile::tempdir().unwrap();
         // `Filler` is representable (~4 GiB, seven bytes under the wire
-        // ceiling `u32::MAX − 32` — a declared-past-u32
+        // ceiling `u32::MAX - 40`, a declared-past-u32
         // ingredient is rejected on every
         // surface); `a9/Type` composes an ARITHMETIC overflow through it.
-        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "a9", "Type", "Filler[8589934592] arr\n");
         write_store_msg(tmp.path(), "b9", "Type", "uint32 a\n");
         std::fs::write(
@@ -27510,7 +28060,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 4,
             "recorded through the stem binding"
@@ -27581,7 +28132,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0x2727, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 — never a guessed document"
@@ -27661,7 +28213,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(
             recorded[0].wire_fixed_size, 0,
             "recorded 0 with the unknown-size attribution, never the store's 4"
@@ -27813,7 +28366,8 @@ nodes:
             "n".to_string(),
             NodeInfo::with_meta(vec![], vec![OutputMeta::new("o".to_string(), 0xABCD, None)]),
         );
-        let recorded = resolve_recorded_topics(tmp.path(), &config, &infos).expect("resolves");
+        let recorded =
+            resolve_recorded_topics(tmp.path(), &config, &infos, None).expect("resolves");
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].wire_fixed_size, 16,
@@ -27861,7 +28415,7 @@ nodes:
             "Huge",
             "float64[2305843009213693951] v\n",
         );
-        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "nav14", "Outer", "Inner[2] arr\n");
         write_store_msg(tmp.path(), "nav14", "VarOuter", "Inner[2] arr\nstring s\n");
         write_store_msg(tmp.path(), "nav14", "Goal", "float64 x\n");
@@ -27879,7 +28433,7 @@ nodes:
             "schemas:\n  VarY:\n    fields:\n      nav14/Inner[2] arr:\n      string s:\n",
         )
         .unwrap();
-        const INNER_BYTES: u32 = 536_870_907 * 8; // 4_294_967_256 — 7 under u32::MAX − 32
+        const INNER_BYTES: u32 = 536_870_906 * 8; // 4_294_967_248, 7 under u32::MAX - 40
 
         let sizes = build_workspace_schema_wire_sizes(tmp.path());
         for name in ["nav14/Huge", "nav14/Outer", "nav14/VarOuter", "VarY"] {
@@ -28075,6 +28629,7 @@ nodes:
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
                 node_type: "driver".to_string(),
@@ -28143,6 +28698,7 @@ nodes:
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -30054,6 +30610,62 @@ nodes:
         );
     }
 
+    /// A `graph run --yes` saves a partition for the graph as DECLARED. Whether this run's
+    /// launch-argument overrides moved the wiring is judged on the bytes of
+    /// the one read, before the prefix fill (which would differ from the
+    /// declared defaults on a prefix-less file). Under such overrides the
+    /// pre-flight runs with saving OFF, so it cannot write the graph file, and
+    /// only an outcome that would have written refuses the run: a file that
+    /// already carries the derived partition (`AlreadyCurrent`) proceeds.
+    #[test]
+    fn graph_run_refuses_a_yes_save_under_wiring_overrides_before_the_preflight_writes() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let read = body
+            .find("graph_read_raw_with_launch_args(")
+            .expect("the graph read must still be there");
+        let judged = body
+            .find("overrides_change_wiring(")
+            .expect("the wiring judgement must still be there");
+        let fill = read
+            + body[read..]
+                .find("default_prefix(")
+                .expect("the prefix fill must follow the read");
+        assert!(
+            read < judged && judged < fill,
+            "the wiring is judged on the bytes just read, BEFORE the prefix fill"
+        );
+
+        let gate = body
+            .find("let refuse_save = consent.assume_yes && wiring_overridden;")
+            .expect("the save gate must be computed from --yes and the wiring judgement");
+        let preflight = body
+            .find("run_auto_partition_preflight(")
+            .expect("the pre-flight must still be there");
+        assert!(
+            gate < preflight,
+            "the save gate is decided before the pre-flight runs"
+        );
+        let save_off = preflight
+            + body[preflight..]
+                .find("assume_yes: consent.assume_yes && !refuse_save,")
+                .expect("the pre-flight must run with saving OFF under wiring overrides");
+        let refused = body
+            .find("refuse_persist_under_wiring_overrides(")
+            .expect("the save refusal must still be there");
+        assert!(
+            save_off < refused,
+            "the refusal reads the outcome of a pre-flight that could not write"
+        );
+        let exempt = &body[preflight..refused];
+        assert!(
+            exempt.contains("if refuse_save && pre.outcome != ")
+                && exempt.contains("RunPartitionOutcome::AlreadyCurrent"),
+            "a file that already carries the derived partition needs no write, so the \
+             refusal must exempt `AlreadyCurrent`"
+        );
+    }
+
     /// `graph run` arms the graceful-exit
     /// hygiene pass, and arms it as a TEARDOWN rather than as startup work.
     ///
@@ -30100,7 +30712,7 @@ nodes:
         // the first preflight step and the deployment REJECTION is the last, so
         // both must precede the arming.
         let read = body
-            .find("graph_read_raw(graphs_dir, graph_name)?")
+            .find("graph_read_raw_with_launch_args(")
             .expect("the graph read must still be there");
         assert!(
             read < armed,
@@ -30179,6 +30791,7 @@ nodes:
             RecordCpu::Auto,
             /* partition_consent */ None,
             /* no_rings */ true,
+            /* launch_args */ &[],
         );
         assert!(err.is_err(), "a graph that does not exist must be refused");
         assert_eq!(
@@ -32460,6 +33073,7 @@ network:
             nodes: (0..n)
                 .map(|i| NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
                     node_type: node_type.to_string(),
@@ -34479,6 +35093,7 @@ struct Sink {
                 RecordCpu::Auto,
                 /* partition_consent */ None,
                 /* no_rings */ true,
+                /* launch_args */ &[],
             )
         };
         let msg = run()
@@ -36640,6 +37255,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
                 node_type: "ticker".to_string(),
@@ -36698,6 +37314,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
                     node_type: "fast".to_string(),
@@ -36712,6 +37329,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                 },
                 NodeDef {
                     fuse: None,
+                    params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
                     node_type: "slow".to_string(),
@@ -39758,6 +40376,7 @@ mod worker_tests {
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
                 node_type: id.to_string(),
@@ -41488,6 +42107,7 @@ mod supervisor_tests {
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
                 node_type: "t".to_string(),
@@ -42473,12 +43093,68 @@ mod supervisor_tests {
 
     /// Pre-created GO file → immediate Ok.
     #[test]
-    fn wait_for_go_returns_ok_on_existing_sentinel() {
+    fn wait_for_go_returns_the_epoch_an_existing_sentinel_carries() {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("d.go");
+        write_go_sentinel(&go, 987_654_321).unwrap();
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .expect("existing GO must be Ok");
+        assert_eq!(epoch, Some(987_654_321));
+    }
+
+    /// A sentinel written while the worker polls is picked up, epoch intact.
+    #[test]
+    fn wait_for_go_returns_the_epoch_of_a_sentinel_written_during_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("late.go");
+        let writer_go = go.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            write_go_sentinel(&writer_go, 42).unwrap();
+        });
+        let running = AtomicBool::new(true);
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("GO arrives");
+        writer.join().unwrap();
+        assert_eq!(epoch, Some(42));
+    }
+
+    /// The atomic write leaves no `.tmp` sibling behind and replaces an older
+    /// sentinel whole.
+    #[test]
+    fn write_go_sentinel_replaces_whole_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("w.go");
+        write_go_sentinel(&go, 1).unwrap();
+        write_go_sentinel(&go, 22).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&go).unwrap(),
+            "cerulion-go-v1 epoch_ns=22\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("w.go")]);
+    }
+
+    /// A sentinel from an older build (bare `go`) is a LOUD error naming the
+    /// file and the build mismatch, never a guessed epoch.
+    #[test]
+    fn wait_for_go_refuses_an_unparseable_sentinel_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("old.go");
         std::fs::write(&go, b"go").unwrap();
         let running = AtomicBool::new(true);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5)).expect("existing GO must be Ok");
+        let msg = wait_for_go(&go, "g", &running, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("cannot use the GO sentinel")
+                && msg.contains("old.go")
+                && msg.contains("not written by this build's supervisor"),
+            "{msg}"
+        );
     }
 
     /// `running` already false (Ctrl-C) → immediate Ok without a sentinel
@@ -42488,8 +43164,9 @@ mod supervisor_tests {
         let tmp = tempfile::tempdir().unwrap();
         let go = tmp.path().join("never.go");
         let running = AtomicBool::new(false);
-        wait_for_go(&go, "g", &running, Duration::from_secs(5))
+        let epoch = wait_for_go(&go, "g", &running, Duration::from_secs(5))
             .expect("Ctrl-C during GO wait must drain cleanly, not error");
+        assert_eq!(epoch, None, "no sentinel was read, so no epoch");
     }
 
     /// No sentinel within the deadline → LOUD Err naming both suspects (a dead

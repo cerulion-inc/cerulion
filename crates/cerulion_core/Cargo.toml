@@ -174,7 +174,7 @@ dirs = "6"
 
 # Graph loading
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 # Dynamic library loading for cdylib nodes
 libloading = "0.8"
@@ -276,6 +276,9 @@ local-transport = []
 # codegen-emitted test-only items (`<Name>Shm::take_overflow`) are visible
 # to integration tests in `cerulion_core/tests/`.
 native_ros2_messages = { path = "../native_ros2_messages", features = ["test-helpers"] }
+# Generated .msg fixture for codegen_defaults_compiled_test (constants and
+# string/array defaults no vendored message carries).
+codegen_fixture_msgs = { path = "../test_fixtures/codegen_fixture_msgs", features = ["test-helpers"] }
 # Self-reference enables `test-helpers` for integration tests / examples
 # (the items behind `#[cfg(any(test, feature = "test-helpers"))]` are
 # visible to `tests/*.rs` and `examples/*.rs` but NOT to downstream crates).

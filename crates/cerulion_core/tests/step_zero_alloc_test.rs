@@ -226,12 +226,19 @@ static LATENCY_FIRES: AtomicU64 = AtomicU64::new(0);
 struct PingNode {
     #[output]
     ping_out: Image,
+    /// A `#[param]` ON the measured chain, set by the graph (`first_byte:
+    /// 128`), so this gate measures the tick path WITH a param in use: the
+    /// value is written into the field once at graph build and the tick reads
+    /// a plain field, so it must add nothing to the per-step alloc count.
+    #[param(default = 0, min = 0, max = 255)]
+    first_byte: i32,
 }
 
 #[cerulion_node_impl]
 impl PingNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         let n = PAYLOAD_SIZE.load(Ordering::Relaxed);
+        let first_byte = self.first_byte as u8;
         self.ping_out.height = 1;
         self.ping_out.width = 2;
         self.ping_out.step = 0;
@@ -247,7 +254,7 @@ impl PingNode {
             .loan_data(n)
             .map_err(|e| NodeError::Logic(e.to_string()))?;
         if let Some(first) = dst.first_mut() {
-            *first = 0x80;
+            *first = first_byte;
         }
         Ok(())
     }
@@ -349,6 +356,8 @@ prefix: {prefix}
 nodes:
   - id: ping
     type: ping_node
+    params:
+      first_byte: 128
     outputs:
       - name: ping_out
         schema: sensor_msgs/Image
@@ -914,6 +923,7 @@ static GATED_FIRES: AtomicU64 = AtomicU64::new(0);
 fn vec_feeder_def(id: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        params: Default::default(),
         ros2: None,
         id: id.to_string(),
         node_type: "block_ping_node".to_string(),
@@ -950,6 +960,7 @@ fn build_gated_runtime() -> GraphRuntime {
         // DAG edge → stays a level-0 root sharing the level with `feeder`).
         NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "gated".to_string(),
             node_type: "gated_closure".to_string(),

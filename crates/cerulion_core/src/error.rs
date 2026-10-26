@@ -422,6 +422,7 @@ pub enum InertReason {
     /// `FD_SET`). Distinct from `InvalidFd`: the fd is FINE — the WATCH MECHANISM
     /// has the ceiling. Fixed by enabling the park (which polls via `poll(2)`, no
     /// ceiling) OR shrinking the graph so the descriptor is minted below FD_SETSIZE.
+    /// Never produced on Linux, where the WaitSet waits with epoll.
     FdAboveSelectLimit,
     /// The node's fd aliases one an already-bound sibling owns (a dup collides on the
     /// WaitSet attachment id — one node would silently never wake).

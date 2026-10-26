@@ -57,8 +57,8 @@ use crate::error::CliError;
 pub use cerulion_mdns::{MdnsAdvertiseGuard, CERULION_SERVICE_TYPE};
 // The bounded browse lives in `cerulion_mdns` so `cerulion-netd`'s boot fold
 // runs the same record-to-locator mapping as the ladder.
-pub use cerulion_mdns::browse_rung;
 use cerulion_mdns::instance_from_fullname;
+pub use cerulion_mdns::{browse_rung, browse_rung_report, BrowseRungReport};
 
 use cerulion_mdns::{advertise_gateway as advertise_gateway_raw, is_valid_eid};
 

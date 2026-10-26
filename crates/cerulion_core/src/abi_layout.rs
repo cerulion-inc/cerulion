@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 27;
+const EXPECTED_ABI: u32 = 28;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \

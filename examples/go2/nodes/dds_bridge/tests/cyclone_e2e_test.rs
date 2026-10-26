@@ -139,6 +139,7 @@ fn cyclone_peer_cloud_reaches_cerulion_subscriber_byte_exact() {
         prefix: "cyc".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            params: Default::default(),
             ros2: None,
             id: "bridge".to_string(),
             node_type: "dds_bridge".to_string(),

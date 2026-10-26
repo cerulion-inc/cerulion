@@ -2,13 +2,15 @@
 //! A process that builds a transport runs on a raised open-file soft limit.
 //!
 //! Each arm re-runs this test binary as a child whose soft `RLIMIT_NOFILE` is
-//! set to 256 before `exec`, the way a login shell with a low default starts a
-//! graph. The child reads its soft limit, builds a transport on an isolated
-//! iceoryx2 root and nothing else (no direct call into `fd_limit`), reads the
-//! limit again and prints both. The expected value is derived here from the
-//! hard limit and the platform rule, never from the code under test: the hard
-//! limit on Linux, at most 1048576 there, and at most 1024 (`FD_SETSIZE`)
-//! elsewhere.
+//! set before `exec`, the way a login shell with a low default starts a graph.
+//! The child reads its soft limit, builds a transport on an isolated iceoryx2
+//! root, reads the limit again and prints both. In the transport arms the
+//! child calls nothing else; in the embedding-host arms it first calls
+//! `fd_limit::raise_open_file_limit_for_embedding_host`, as `rmw_cerulion`
+//! and `cerulion_py` do. The expected value is derived here from the hard
+//! limit and the platform rule, never from the code under test: for a
+//! transport, the hard limit on Linux, at most 1048576 there, and at most 1024
+//! (`FD_SETSIZE`) elsewhere; for an embedding host, at most 1024 everywhere.
 #![cfg(unix)]
 
 use std::os::unix::process::CommandExt;
@@ -18,7 +20,11 @@ use cerulion_core::transport::{TransportConfig, TransportManager};
 
 const CHILD: &str = "child_reports_its_open_file_limit_around_a_transport_build";
 const CHILD_ENV: &str = "CER_TEST_OPEN_FILE_LIMIT_CHILD";
+/// The child's value of [`CHILD_ENV`] that makes it raise as an embedding host
+/// before its transport build.
+const HOST: &str = "host";
 const LOW_SOFT: u64 = 256;
+const FD_SETSIZE: u64 = 1024;
 
 fn nofile() -> (u64, u64) {
     let mut rl = libc::rlimit {
@@ -54,12 +60,19 @@ fn to_rlim(value: u64) -> libc::rlim_t {
 /// Runs the child arm with its soft limit set to `LOW_SOFT` and its hard limit
 /// to `hard`, and returns the child's `(soft at start, soft after, hard)`.
 fn run_child(hard: u64) -> (u64, u64, u64) {
+    run_child_as("1", LOW_SOFT, hard)
+}
+
+/// Runs the child arm with [`CHILD_ENV`] set to `mode` and its limits set to
+/// `soft` and `hard`, and returns the child's `(soft at start, soft after,
+/// hard)`.
+fn run_child_as(mode: &str, soft: u64, hard: u64) -> (u64, u64, u64) {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = Command::new(exe);
     cmd.args(["--exact", CHILD, "--ignored", "--nocapture"])
-        .env(CHILD_ENV, "1");
+        .env(CHILD_ENV, mode);
     let rl = libc::rlimit {
-        rlim_cur: to_rlim(LOW_SOFT),
+        rlim_cur: to_rlim(soft),
         rlim_max: to_rlim(hard),
     };
     // SAFETY: the closure runs in the forked child before `exec` and calls
@@ -133,14 +146,53 @@ fn a_child_whose_hard_limit_equals_its_soft_limit_keeps_both() {
     assert_eq!((start, after, hard), (LOW_SOFT, LOW_SOFT, LOW_SOFT));
 }
 
+#[test]
+fn an_embedding_host_raises_a_low_soft_limit_no_higher_than_fd_setsize() {
+    let (_, hard) = nofile();
+    assert!(
+        hard > LOW_SOFT,
+        "this arm needs a hard limit above {LOW_SOFT}, the machine has {hard}"
+    );
+    let (start, after, child_hard) = run_child_as(HOST, LOW_SOFT, hard);
+    assert_eq!(
+        start, LOW_SOFT,
+        "the child must start at the low soft limit"
+    );
+    assert_eq!(child_hard, hard, "the hard limit is never changed");
+    assert_eq!(
+        after,
+        hard.min(FD_SETSIZE),
+        "an embedding host's soft limit after its transport build"
+    );
+}
+
+#[test]
+fn an_embedding_host_keeps_a_soft_limit_already_above_fd_setsize() {
+    let (_, hard) = nofile();
+    let soft = 4 * FD_SETSIZE;
+    assert!(
+        hard >= soft,
+        "this arm needs a hard limit of at least {soft}, the machine has {hard}"
+    );
+    let (start, after, _) = run_child_as(HOST, soft, hard);
+    assert_eq!(
+        (start, after),
+        (soft, soft),
+        "a soft limit is never lowered"
+    );
+}
+
 /// The child half: inert unless the parent arm started it.
 #[test]
 #[ignore = "child process of the arms above; inert on its own"]
 fn child_reports_its_open_file_limit_around_a_transport_build() {
-    if std::env::var_os(CHILD_ENV).is_none() {
+    let Some(mode) = std::env::var_os(CHILD_ENV) else {
         return;
-    }
+    };
     let (start, _) = nofile();
+    if mode == HOST {
+        cerulion_core::fd_limit::raise_open_file_limit_for_embedding_host();
+    }
     let config = TransportConfig {
         node_name: format!("open_file_limit_{}", std::process::id()),
         ..Default::default()

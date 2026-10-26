@@ -184,6 +184,7 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
                 node_type: "stale_wake_producer".to_string(),
@@ -198,6 +199,7 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
             },
             NodeDef {
                 fuse: None,
+                params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
                 node_type: "stale_wake_consumer".to_string(),

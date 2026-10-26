@@ -18,9 +18,10 @@ default + gateway, the discovery ladder, and pairing.
 
 ## TL;DR
 
-- **Open by default.** A real-clock `graph run` (monolith OR multi-process),
+- **Open by default on non-Android.** A real-clock `graph run` (monolith OR multi-process),
   `node run`, or `ros2 attach` with NO `network:` block runs PERMISSIVE: one
-  zenoh session announces every produced topic, and peers find each other
+  zenoh session announces produced topics when LAN access is open, and peers
+  find each other
   over mDNS (`_cerulion._tcp`) when the machine to be found listens (on the
   default Unix path, `CERULION_NETD_LISTEN` set; see
   [Making a robot discoverable](#making-a-robot-discoverable)). Zenoh multicast scouting is OFF by default
@@ -60,13 +61,13 @@ default + gateway, the discovery ladder, and pairing.
   connect phase hard-bounded at 1 s, and the demand/announce reply gathers
   (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
   LOCAL list has already printed by then. `--local` (also spelled
-  `--no-network`) or `CERULION_NETWORK=off` skips the remote query; the
+  `--no-network`), `CERULION_NETWORK=off` or `CERULION_NETD_NETWORK=off` skips the remote query; the
   environment parser preserves its fail-closed behavior for other nonempty values; extra `--connect`/`--listen` locators reach peers the ladder can't
   find.
 - **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
   gateway beacon and the PRIMARY discovery mechanism on every network: "your
   robot shows up like a Chromecast"; SRV = the bound port, TXT `robot=<name>`.
-  **The beacon is gated on having a LISTEN endpoint**, so which path you are on
+  **The beacon is gated on a nonzero fixed LISTEN port**, so which path you are on
   decides whether it exists: a per-run gateway child binds 7683 and beacons; the
   default netd-hosted plane listens and beacons **only when
   `CERULION_NETD_LISTEN` is set** (see "Making a robot discoverable" below).
@@ -80,12 +81,45 @@ default + gateway, the discovery ladder, and pairing.
   chunk, `cerulion_ann/{robot}{topic}`, so even absolute mirror topics
   attribute exactly) OR an mDNS browse answers for it (a browse answer is
   itself a live gateway); mDNS also enriches announce rows with the
-  locator. Never a mere candidate. mDNS finds robots; zenoh connects and
+  locator. Port-zero and loopback TCP endpoints are not advertised. The Android
+  beacon is withdrawn when its gateway stops; netd holds its beacon for the
+  plane lifetime. Never a mere candidate. mDNS finds robots; zenoh connects and
   does everything after. (There is no per-candidate verify probe: presence
   IS the verification.)
-- **Open by default is unauthenticated.** A robot with no `network:` block is
-  viewable by any peer on the LAN; restrict it with a `network:` block or
-  `--network off`.
+- **Open access is unauthenticated.** On non-Android platforms, a robot with
+  no `network:` block is viewable by any peer on the LAN; restrict it with a
+  `network:` block or `--network off`, or refuse every LAN peer with
+  `CERULION_LAN_ACCESS=paired`, which also stops LAN peers publishing into
+  the robot's ingress topics.
+- **Android is paired by default.** On an Android device the gateway and
+  `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
+  re-inject no frame a LAN peer publishes, so the LAN can neither read nor
+  write topics, unless `CERULION_LAN_ACCESS=open` is set. Commands from a
+  paired desk travel over the remote plane; an Android app selects the same posture
+  with its `lan_access` key (see [Android](android.md)). The gateway keeps the
+  posture in front of every installed demand authorizer; changing an inner
+  authorizer does not disable it. Choose the posture at startup with
+  `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
+  mode, the robot identity announcement remains, but topic announce tokens are
+  withheld, so topic
+  names are not exposed on the LAN. The mDNS beacon remains available when the
+  first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
+  access after a paired start does not replay topic announcements withheld
+  while paired.
+
+A refused catalog is not an empty catalog: topic resolution names the robot,
+states that its topics were not searched, and recommends
+`CERULION_LAN_ACCESS=open` (or `"lan_access": "open"` for an Android app) on a
+trusted development network. Pairing does not open a LAN lookup, because a LAN
+peer carries no paired identity.
+
+`CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
+`paired`. The netd egress response includes the shared gateway's posture, so
+`graph run` reports the posture of the process serving the run rather than
+assuming its own environment matches netd. A run that requires `paired` asks netd
+for its posture before it registers any topic, and shares netd only when netd
+reports `paired`; when netd reports `open` or reports no posture, the run
+registers nothing with netd and uses its own gateway, which enforces `paired`.
 
 ## The decision matrix
 
@@ -127,6 +161,12 @@ Selection wins over explicit list locators and `--scan`. The
 flag: trimmed, case-insensitive `off` suppresses networking; unset or
 whitespace-only has no effect; every other nonempty value warns and fails
 closed. No run or inspection flag enables networking over this kill-switch.
+The inspection verbs and `schema info` also stay local under the network
+daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
+parse), opening no discovery session of their own. `cerulion viz --robot`
+refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
+`CERULION_VIZD_NETWORK=off`, and `cerulion pair` refuses under
+`CERULION_NETWORK`.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
@@ -345,7 +385,11 @@ serialized plan + the run's iceoryx2 namespace.
   dispatches inbound GETs by verb. The `demand` verb: the DEMANDER (dialer) runs
   a ~2 s demand-GET loop that GETs `cerulion_q/{robot_or_*}/demand{topic}` (a
   dialer query: reaches the accepter), which pulls that topic's egress ON with a
-  synchronous `enabled`/`refused` ack. The `catalog` verb answers a
+  synchronous `enabled/w2`/`refused` ack. The GET carries the demander's wire
+  header version (two bytes); a producer at another version (or a demander that
+  sends none, a release before the version existed) answers
+  `refused:wire-header`, enables nothing, and both sides log the mismatch once
+  per run of refusals. The `catalog` verb answers a
   `cerulion_q/{robot}/catalog` GET with the robot's full topic catalog (every
   produced/announced topic + its schema hash **when the gateway knows it**
   (the field is `Option<u64>`, absent for a boot-announced topic whose hash the
@@ -458,7 +502,7 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node; only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
 | `tls` | Certificate files for `quic/` locators (see below). |
 
@@ -603,7 +647,8 @@ Strict block, which topics cross the machine boundary is declared in YAML.
 
 - **Egress = a per-graph export SCOPE.** An `egress` topic must be
   graph-OWNED: produced by an in-graph node, under its derived name
-  (`/{prefix}/{node}/{output}`) or a `topic:` override. The gateway
+  (`/{prefix}/{node}/{output}`) or a `topic:` override, unless the entry is
+  marked `external: true` (below). The gateway
   announces exactly the declared list and taps only a declared topic a
   remote actually demands. A remote demand for an UNdeclared produced topic
   is refused at the bridge scoping filter (its flag structurally never
@@ -623,6 +668,34 @@ Strict block, which topics cross the machine boundary is declared in YAML.
   gateway booted still sees the announces: every declared egress topic
   carries a standing announce token, so discovery is not a race.
 
+### Topics published outside the graph
+
+A process outside the graph file can publish on this machine's shared
+memory: a ROS 2 program running on `rmw_cerulion`, for example. Under a
+Strict block its topic leaves the machine only when `egress:` lists it, and
+the entry says it has no in-graph producer:
+
+```yaml
+network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  egress:
+    - /robot/odom              # produced by a node in this graph
+    - topic: /chatter
+      external: true           # published by a ROS 2 program on rmw_cerulion
+```
+
+The gateway announces `/chatter` from boot and taps it when a remote demands
+it. Until the outside program has created the topic, the tap attach fails,
+is counted, logs once at warn, and is retried on every gateway pass. An
+outside topic that `egress:` does not list is still announced when its
+publisher registers it, and a remote demand for it is refused at the bridge
+scoping filter, so none of its frames leave the machine.
+`external: true` on a topic an in-graph node produces is a graph-load error,
+and so is an unmarked entry with no in-graph producer; that error names the
+`external: true` spelling.
+
 ### Loop-safety rules (graph-load validation)
 
 Every rejection names the offending topic or setting and states the fix:
@@ -630,7 +703,8 @@ Every rejection names the offending topic or setting and states the fix:
 1. **No topic in both lists** (it would loop back to itself): remove it
    from one list. The gateway ALSO refuses a plan whose announce and ingress
    sets intersect, as a structural backstop.
-2. **Egress must be produced in-graph.**
+2. **Egress must be produced in-graph**, unless the entry is `external:
+   true`; an `external: true` entry must NOT be produced in-graph.
 3. **Ingress must NOT be produced in-graph.**
 4. **Canonical absolute names only** (bare names rejected with the expected
    `/`-prefixed form; malformed shapes rejected like any topic name).
@@ -961,8 +1035,12 @@ status reply):
 
 ```
 {"hello":"cerulion-netd","protocol":6}
-{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"]}
+{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
+
+`lan_access` is the shared gateway's LAN posture (`open` or `paired`). A daemon
+without a network session, or an older daemon, omits it, and the omission means
+unknown, never open.
 
 Interpreting `connect_endpoints`:
 
@@ -1057,9 +1135,9 @@ Then `cerulion graph run go2_driver` on the robot and
 ## What crosses the wire
 
 Local delivery stays zero-copy shared memory; only egress topics pay the
-network. An exported frame travels as the SAME unified wire format (32-byte
+network. An exported frame travels as the SAME unified wire format (40-byte
 `WireHeader` + payload) VERBATIM as the zenoh payload on the key
-`cerulion{topic}`: no envelope, no per-hop translation, so the receiving
+`cerulion_w2{topic}`: no envelope, no per-hop translation, so the receiving
 side feeds the bytes straight into its subscriber path and schema hashes
 validate end-to-end. Discovery rides the separate liveliness key-spaces: the
 demand space `cerulion_lv{topic}` (a remote subscriber asking for a topic,
@@ -1135,7 +1213,7 @@ Notes:
 - **`/tf` and `/tf_static` are symmetric**: same schema and wire path; the
   only difference is publishing cadence (dynamic vs latched-once), a node
   concern.
-- **Byte-identity.** The `TFMessage` frame (32-byte `WireHeader` + offset
+- **Byte-identity.** The `TFMessage` frame (40-byte `WireHeader` + offset
   table + opaque `transforms` bytes) is re-injected verbatim (sequence,
   timestamp, nested transform bytes intact), pinned end-to-end by
   `crates/cerulion_core/tests/network_tf_e2e_test.rs`.

@@ -65,6 +65,7 @@ fn oracle_frame(seq: u32, timestamp_ns: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0; size as usize];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -556,6 +557,7 @@ fn serve_role() {
             schema_hash: Vector3::SCHEMA_HASH,
             qualified: "geometry_msgs/Vector3".to_string(),
         }],
+        served_topics: vec![],
     };
     let mut gateway =
         GatewayRuntime::new_with_schema_serving(manager, plan, serving).expect("start gateway");

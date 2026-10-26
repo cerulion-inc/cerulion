@@ -681,6 +681,7 @@ fn one_runs_reply(robot: &str, run_id: &str, graph: &str) -> RunsReply {
 /// catalog — NOT fake data, a DI test fixture).
 fn one_catalog(robot: &str, topic: &str, schema_name: &str) -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
@@ -1805,6 +1806,70 @@ fn register_egress_cfg(id: u64, topics: &[&str], ix_config_json: Option<&str>) -
 
 fn release_egress(id: u64) -> Request {
     Request::ReleaseEgress { id }
+}
+
+/// An egress plane with a fixed LAN posture that counts registrations, for
+/// the pre-registration posture probe.
+struct PostureEgressPlane {
+    posture: Option<cerulion_core::LanAccess>,
+    registers: AtomicUsize,
+}
+
+impl EgressPlane for PostureEgressPlane {
+    fn register_egress(
+        &self,
+        _id: EgressId,
+        _plan: &GatewayPlan,
+        _serving: &SchemaServing,
+        _ix_config_json: Option<&str>,
+    ) -> Result<bool, EgressError> {
+        self.registers.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+        self.posture
+    }
+
+    fn release_egress(&self, _id: EgressId) {}
+}
+
+/// A paired run asks netd for its LAN posture BEFORE it registers egress,
+/// because a registration lingers on the shared gateway after release. The
+/// probe reports the egress plane's posture (open, paired, or UNKNOWN for a
+/// plane without one) and registers nothing. Hand oracle per posture.
+#[test]
+fn status_reports_the_lan_posture_without_registering_egress() {
+    use cerulion_core::LanAccess::{Open, Paired};
+    for (tag, posture) in [
+        ("lanopen", Some(Open)),
+        ("lanpair", Some(Paired)),
+        ("lannone", None),
+    ] {
+        let (dir, sock) = unique_socket(tag);
+        let plane = Arc::new(PostureEgressPlane {
+            posture,
+            registers: AtomicUsize::new(0),
+        });
+        let netd = daemon::start_with_egress(
+            sock.clone(),
+            Arc::new(SpyPlane::default()) as Arc<dyn MirrorPlane>,
+            Arc::clone(&plane) as Arc<dyn EgressPlane>,
+            NetdConfig {
+                idle_grace: LONG_GRACE,
+                idle_watch_poll: Duration::from_millis(25),
+                ..NetdConfig::default()
+            },
+        )
+        .expect("daemon start");
+        let mut client =
+            cerulion_netd::NetdClient::connect_existing_at(sock.clone()).expect("connect");
+        assert_eq!(client.lan_access().expect("status"), posture, "{tag}");
+        assert_eq!(plane.registers.load(Ordering::SeqCst), 0, "{tag}");
+        drop(client);
+        drop(netd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

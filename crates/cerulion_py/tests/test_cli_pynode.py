@@ -170,6 +170,7 @@ def test_cli_python_node_build_info_and_graph_run(tmp_path):
         "  inp (geometry_msgs/Vector3)\n"
         "Outputs:\n"
         "  out (geometry_msgs/Vector3)\n"
+        "Params: none\n"
     )
 
     if not ROOT_TARGET:
