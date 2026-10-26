@@ -180,7 +180,7 @@ hostname, which you can read off `cerulion topic list` and pass instead.
 
 `--single-process` is a recommendation: networked multi-process runs are
 first-class, but this walkthrough uses one process, and the flag also skips
-the partition prompt. The transform tree is a second run,
+deriving a partition. The transform tree is a second run,
 `cerulion graph run tf --release --single-process`, in another shell (both
 runs converge on the machine's one `cerulion-netd`, so the identity exported
 above already applies to it).

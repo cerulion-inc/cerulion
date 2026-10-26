@@ -13,8 +13,14 @@ use pyo3::prelude::*;
 ///
 /// Idempotent: the core singleton returns the already-initialised
 /// manager on repeat calls.
+///
+/// Raises the soft open-file limit (`RLIMIT_NOFILE`) of this process at most
+/// to `FD_SETSIZE` (1024), so every descriptor stays below the number
+/// `select.select` refuses; a soft limit already above it is kept.
 #[pyfunction]
 pub fn connect(node_name: &str) -> PyResult<()> {
+    #[cfg(unix)]
+    cerulion_core::fd_limit::raise_open_file_limit_for_embedding_host();
     TransportManager::init(TransportConfig {
         node_name: node_name.to_string(),
         ..Default::default()
