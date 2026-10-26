@@ -1113,7 +1113,6 @@ impl FusionDecision {
     pub fn source(&self) -> FusionSource {
         self.source
     }
-
 }
 
 /// Resolve the fusion decision for one graph build.
@@ -1242,7 +1241,11 @@ mod fusion_resolution_tests {
         }
         let config = graph("    isolate: true\n").expect("`isolate: true` parses");
         assert_eq!(
-            config.nodes.iter().find(|n| n.id == "sink").and_then(|n| n.isolate),
+            config
+                .nodes
+                .iter()
+                .find(|n| n.id == "sink")
+                .and_then(|n| n.isolate),
             Some(true)
         );
         // Anti-tautology: the same graph without the key parses, so the

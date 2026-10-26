@@ -400,7 +400,10 @@ fn merge_verdict(
     }
     if let Some(&deadline_ns) = graph.tick_within_ns.get(node) {
         if over(deadline_ns) {
-            return Err(verdict(BudgetAgainst::Deadline { deadline_ns }, deadline_ns));
+            return Err(verdict(
+                BudgetAgainst::Deadline { deadline_ns },
+                deadline_ns,
+            ));
         }
     }
     Ok(Some(unit_ns))
@@ -560,7 +563,10 @@ pub fn derive_units(
             union(&mut parent, pair[0], pair[1]);
         }
         let r = root(&mut parent, local[0]);
-        block_topics.entry(r).or_default().push(coupling.topic.clone());
+        block_topics
+            .entry(r)
+            .or_default()
+            .push(coupling.topic.clone());
     }
     let mut topics_by_root: IndexMap<usize, Vec<String>> = IndexMap::new();
     for (r, topics) in block_topics {
@@ -684,7 +690,6 @@ pub fn expand_process_groups(
         units: units_by_host,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

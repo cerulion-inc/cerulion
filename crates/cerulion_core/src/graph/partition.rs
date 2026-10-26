@@ -3521,7 +3521,10 @@ mod block_colocation_tests {
         for id in ["mid", "tail", "side"] {
             infos.insert(
                 id.to_string(),
-                NodeInfo::with_meta(vec![meta("inp", true, BackpressurePolicy::DropOldest)], vec![]),
+                NodeInfo::with_meta(
+                    vec![meta("inp", true, BackpressurePolicy::DropOldest)],
+                    vec![],
+                ),
             );
         }
         let mut edges = TriggerEdges::new();
@@ -3537,8 +3540,8 @@ mod block_colocation_tests {
             edge_rate_mhz: BTreeMap::new(),
             hop: HopCosts::platform_default(),
         };
-        let out = auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1)
-            .expect("derive");
+        let out =
+            auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1).expect("derive");
         let group_of = |id: &str| {
             out.groups
                 .iter()
@@ -3547,11 +3550,27 @@ mod block_colocation_tests {
                 .expect("every node is in a group")
         };
         // `src` fans out to `mid` and `side`, so the chain is `mid -> tail`.
-        let chains = chain_colocation_seeds(&infos, &GraphTopology::build(&config, &infos).unwrap(), &edges);
+        let chains = chain_colocation_seeds(
+            &infos,
+            &GraphTopology::build(&config, &infos).unwrap(),
+            &edges,
+        );
         assert_eq!(chains, vec![vec!["mid".to_string(), "tail".to_string()]]);
-        assert_eq!(group_of("mid"), group_of("tail"), "the chain must share a group");
-        assert_ne!(group_of("mid"), group_of("side"), "the fan-out sibling is no chain member");
-        assert_ne!(group_of("src"), group_of("mid"), "a fan-out edge is no link");
+        assert_eq!(
+            group_of("mid"),
+            group_of("tail"),
+            "the chain must share a group"
+        );
+        assert_ne!(
+            group_of("mid"),
+            group_of("side"),
+            "the fan-out sibling is no chain member"
+        );
+        assert_ne!(
+            group_of("src"),
+            group_of("mid"),
+            "a fan-out edge is no link"
+        );
         assert!(
             out.fusions.is_empty() && out.rejections.iter().all(|r| r.producer != "mid"),
             "the chain is a seed, never a candidate: {:?}",
@@ -3560,7 +3579,10 @@ mod block_colocation_tests {
         // Every chain the shared analysis finds lies inside one group.
         for chain in &chains {
             let g = group_of(&chain[0]);
-            assert!(chain.iter().all(|n| group_of(n) == g), "chain {chain:?} split");
+            assert!(
+                chain.iter().all(|n| group_of(n) == g),
+                "chain {chain:?} split"
+            );
         }
     }
 

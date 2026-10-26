@@ -304,7 +304,13 @@ fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
     let (graph, prefix) = unique_names("units_chain");
     let nodes = vec![
         node_def("pace", "ri_pace", &[], &["out", "side"], &[]),
-        node_def("fast", "ri_fast_relay", &[("inp", "pace/out")], &["out"], &[]),
+        node_def(
+            "fast",
+            "ri_fast_relay",
+            &[("inp", "pace/out")],
+            &["out"],
+            &[],
+        ),
         node_def(
             "slow",
             "ri_sink",

@@ -25,8 +25,8 @@ use cerulion_core::graph::chain::{census_chains, ChainCensus, Colocation, MAX_FU
 use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
 use cerulion_core::graph::topology::{GraphTopology, Levels, TriggerEdges};
 use cerulion_core::graph::{
-    build_trigger_edges, expand_process_groups, parse_graph, GraphConfig, HopCosts,
-    PartitionCosts, UnitGraph, UnitPlan, UnitProfile,
+    build_trigger_edges, expand_process_groups, parse_graph, GraphConfig, HopCosts, PartitionCosts,
+    UnitGraph, UnitPlan, UnitProfile,
 };
 use indexmap::IndexSet;
 use std::collections::BTreeMap;
@@ -998,7 +998,11 @@ fn every_fused_chain_lies_inside_one_executor_unit() {
         },
     };
     let (census, plan) = unit_census(&h, Some(&costs));
-    assert_eq!(plan.groups.len(), 1, "a profiled chain under budget is one unit");
+    assert_eq!(
+        plan.groups.len(),
+        1,
+        "a profiled chain under budget is one unit"
+    );
     assert_eq!(chains(&census), vec!["src->relay->sink"]);
     assert_chains_inside_units(&census, &plan);
 }

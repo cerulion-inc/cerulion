@@ -7158,8 +7158,7 @@ pub fn graph_run_worker_host(
             let spawned = std::thread::Builder::new()
                 .name(format!("cerulion-unit-{i}"))
                 .spawn_scoped(scope, move || {
-                    let outcome =
-                        graph_run_worker(workspace_root, path, Arc::clone(&unit_running));
+                    let outcome = graph_run_worker(workspace_root, path, Arc::clone(&unit_running));
                     unit_running.store(false, Ordering::Relaxed);
                     outcome
                 });
@@ -9443,7 +9442,11 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
                 }
             }
             ChildPoll::Exited(status) => {
-                deaths.extend(g.units().into_iter().map(|u| (u, format!("exited {status}"))));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, format!("exited {status}"))),
+                );
             }
             ChildPoll::Lost => {
                 deaths.extend(
@@ -10616,9 +10619,12 @@ fn single_process_hosts_units(
     }
     let mut one = config.clone();
     let host = config.identity().to_string();
-    one.process_groups = [(host.clone(), one.native_nodes().map(|n| n.id.clone()).collect())]
-        .into_iter()
-        .collect();
+    one.process_groups = [(
+        host.clone(),
+        one.native_nodes().map(|n| n.id.clone()).collect(),
+    )]
+    .into_iter()
+    .collect();
     one.process_group_order = Vec::new();
     let entry_infos = source_entry_infos(
         &workspace_root.join("nodes"),
@@ -11054,7 +11060,8 @@ fn graph_run_supervisor(
     // Executor units: split every process group into units (chains on one
     // thread each) before planning, so each unit gets its own worker plan and
     // every edge between units the wiring of an edge between processes.
-    let units = plan_supervisor_units(workspace_root, &config, &loaded_entry_infos, execution_mode)?;
+    let units =
+        plan_supervisor_units(workspace_root, &config, &loaded_entry_infos, execution_mode)?;
     let config = units.config.clone();
     let mut plan = crate::multiprocess::plan_deployment(&config, &levels, tightest, &nonce)
         .map_err(CliError::from)?;
@@ -12083,7 +12090,11 @@ fn graph_run_supervisor(
         );
         let mut guard = ChildGuard::new(child, host.clone());
         if idxs.len() > 1 {
-            guard = guard.hosting(idxs.iter().map(|&i| plan.workers[i].group.clone()).collect());
+            guard = guard.hosting(
+                idxs.iter()
+                    .map(|&i| plan.workers[i].group.clone())
+                    .collect(),
+            );
         }
         // Block until every plan of this process is READY, Ctrl-C, the child
         // dies first, or the deadline elapses. On an `Err`, `guards`
@@ -12690,7 +12701,9 @@ fn graph_run_supervisor(
                                     config.identity(),
                                     &units
                                         .iter()
-                                        .map(|u| (u.clone(), format!("worker process died ({status})")))
+                                        .map(|u| {
+                                            (u.clone(), format!("worker process died ({status})"))
+                                        })
                                         .collect::<Vec<_>>(),
                                     worker_iox2_config.as_ref(),
                                 );
@@ -12703,8 +12716,8 @@ fn graph_run_supervisor(
                                 #[cfg(unix)]
                                 if let Some(plane) = trace_plane.as_mut() {
                                     for unit in &units {
-                                    plane.record_departure(unit);
-                                }
+                                        plane.record_departure(unit);
+                                    }
                                 }
                                 #[cfg(unix)]
                                 if let Some(rec) = recording.take() {
@@ -12723,8 +12736,10 @@ fn graph_run_supervisor(
                                 // (serial per-death graces would exceed the
                                 // survivors' ~5s boundary timeout at k >= 5 deaths
                                 // and cascade a partial loss into all-crashed).
-                                let mut batch: Vec<(String, String)> =
-                                    units.iter().map(|u| (u.clone(), format!("exited {status}"))).collect();
+                                let mut batch: Vec<(String, String)> = units
+                                    .iter()
+                                    .map(|u| (u.clone(), format!("exited {status}")))
+                                    .collect();
                                 let sweep = sweep_additional_deaths(&mut guards);
                                 batch.extend(sweep.deaths);
                                 // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12852,7 +12867,12 @@ fn graph_run_supervisor(
                                 config.identity(),
                                 &units
                                     .iter()
-                                    .map(|u| (u.clone(), "worker process became unpollable (Lost)".to_string()))
+                                    .map(|u| {
+                                        (
+                                            u.clone(),
+                                            "worker process became unpollable (Lost)".to_string(),
+                                        )
+                                    })
                                     .collect::<Vec<_>>(),
                                 worker_iox2_config.as_ref(),
                             );
@@ -12879,8 +12899,10 @@ fn graph_run_supervisor(
                         PeerLossPolicy::Continue => {
                             // The same batched sweep as the Exited(nonzero)
                             // arm — see the comment there.
-                            let mut batch: Vec<(String, String)> =
-                                units.iter().map(|u| (u.clone(), "unpollable (Lost)".to_string())).collect();
+                            let mut batch: Vec<(String, String)> = units
+                                .iter()
+                                .map(|u| (u.clone(), "unpollable (Lost)".to_string()))
+                                .collect();
                             let sweep = sweep_additional_deaths(&mut guards);
                             batch.extend(sweep.deaths);
                             // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -13399,7 +13421,9 @@ pub(crate) fn render_unit_plan(
         "  tick budget: {}",
         match profile {
             Some(label) => format!("from profile {label}"),
-            None => "no profile, so no chain merges: every data-triggered node is a unit of its own".to_string(),
+            None =>
+                "no profile, so no chain merges: every data-triggered node is a unit of its own"
+                    .to_string(),
         }
     );
     let whole: indexmap::IndexMap<&str, &str> = units
@@ -41183,9 +41207,13 @@ mod worker_tests {
             barrier_id: "id".to_string(),
             expected: 3,
         };
-        for (rank, (group, host)) in [("cam", None), ("work.pace", Some("work")), ("work.fast", Some("work"))]
-            .into_iter()
-            .enumerate()
+        for (rank, (group, host)) in [
+            ("cam", None),
+            ("work.pace", Some("work")),
+            ("work.fast", Some("work")),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut w = minimal_plan("{}");
             w.group = group.to_string();
@@ -41199,7 +41227,9 @@ mod worker_tests {
             .map(|(host, idxs)| {
                 (
                     host.clone(),
-                    idxs.iter().map(|&i| plan.workers[i].group.clone()).collect(),
+                    idxs.iter()
+                        .map(|&i| plan.workers[i].group.clone())
+                        .collect(),
                 )
             })
             .collect();

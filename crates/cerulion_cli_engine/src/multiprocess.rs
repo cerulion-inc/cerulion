@@ -2802,8 +2802,7 @@ pub fn plan_executor_units(
                 .collect();
             only.extend(keep.iter().cloned());
             let trial = expand_process_groups(config, &graph, profile, &only);
-            if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges)
-            {
+            if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges) {
                 keep.insert(host.clone());
                 kept_whole.push((host.clone(), format!("its split is refused: {e}")));
             }
@@ -2814,7 +2813,12 @@ pub fn plan_executor_units(
             kept_whole = config
                 .process_groups
                 .keys()
-                .map(|h| (h.clone(), format!("the split partition is refused: {first}")))
+                .map(|h| {
+                    (
+                        h.clone(),
+                        format!("the split partition is refused: {first}"),
+                    )
+                })
                 .collect();
             plan = expand_process_groups(config, &graph, profile, &keep);
         }

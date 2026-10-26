@@ -55,9 +55,8 @@ pub(crate) mod waitset;
 pub use chain::{
     census_chains, consumer_link_bar, linear_chains, linear_links, log_fusion_decision,
     refuse_branching_producers, resolve_fusion, topic_link_bar, trigger_edge_counts, ChainBar,
-    ChainCensus, Colocation,
-    ConsumerEdgeVerdict, ConsumerFireClass, FusedChain, FusionDecision, FusionSource,
-    FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
+    ChainCensus, Colocation, ConsumerEdgeVerdict, ConsumerFireClass, FusedChain, FusionDecision,
+    FusionSource, FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
 };
 pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
