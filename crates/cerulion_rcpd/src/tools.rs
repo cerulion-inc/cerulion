@@ -499,22 +499,7 @@ impl ToolHost {
         let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
         let digest = args_digest(&clean);
-        let intent = {
-            let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
-            // Closed again under the lock: a clear that opened the latch
-            // after the store above has released the lock by now.
-            self.latch.store(true, Ordering::SeqCst);
-            if !matches!(self.latch_file.try_exists(), Ok(true)) {
-                if let Err(e) = write_synced(&self.latch_file, &format!("{reason}\n")) {
-                    tracing::error!(
-                        error = %e,
-                        latch = %self.latch_file.display(),
-                        "latch file not written; the e-stop will not survive a restart"
-                    );
-                }
-            }
-            self.record(ESTOP_TOOL, &digest, ReceiptOutcome::Intent)
-        };
+        let intent = self.engage_latch(&reason, &digest);
         tracing::warn!(reason = %reason, "e-stop engaged");
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, ESTOP_TOOL, &clean);
@@ -546,6 +531,69 @@ impl ToolHost {
         CallToolResult::success(vec![ContentBlock::text(body.to_string())])
     }
 
+    /// The locked half of `estop`, after its lock-free close: inside
+    /// `latch_io`, close the latch again, write the file when it is absent,
+    /// and write the `intent` receipt.
+    fn engage_latch(&self, reason: &str, digest: &str) -> Option<Receipt> {
+        let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+        // Closed again under the lock: a clear that opened the latch after
+        // the lock-free close has released the lock by now.
+        self.latch.store(true, Ordering::SeqCst);
+        if !matches!(self.latch_file.try_exists(), Ok(true)) {
+            if let Err(e) = write_synced(&self.latch_file, &format!("{reason}\n")) {
+                tracing::error!(
+                    error = %e,
+                    latch = %self.latch_file.display(),
+                    "latch file not written; the e-stop will not survive a restart"
+                );
+            }
+        }
+        self.record(ESTOP_TOOL, digest, ReceiptOutcome::Intent)
+    }
+
+    /// The locked half of `estop_clear`: inside `latch_io`, write the
+    /// `intent` receipt, delete the file and open the latch. Returns the
+    /// intent and whether the latch was closed, or the refusal to return.
+    fn open_latch(&self, digest: &str) -> Result<(Receipt, bool), CallToolResult> {
+        let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(intent) = self.record(ESTOP_CLEAR_TOOL, digest, ReceiptOutcome::Intent) else {
+            return Err(refusal(
+                "receipt_failed",
+                "the e-stop was not cleared: its receipt could not be written",
+                None,
+                Value::Null,
+            ));
+        };
+        match std::fs::remove_file(&self.latch_file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.record(
+                    ESTOP_CLEAR_TOOL,
+                    digest,
+                    ReceiptOutcome::Error(String::from("clear_failed")),
+                );
+                return Err(refusal(
+                    "clear_failed",
+                    &format!(
+                        "the e-stop stays engaged: the latch file {} could not be deleted: {e}",
+                        self.latch_file.display()
+                    ),
+                    Some(&intent),
+                    json!({ "estopped": self.estopped() }),
+                ));
+            }
+        }
+        Ok((intent, self.latch.swap(false, Ordering::SeqCst)))
+    }
+
+    /// Journal an `estop_clear` frame, latch-gated: an `estop` that closes the
+    /// latch before this frame is published keeps it off the calls topic, so
+    /// the graph's last frame is that `estop`.
+    async fn journal_clear(&self, call_id: u64, frame: String) -> Result<Value, JournalError> {
+        self.journal.call(call_id, frame, ESTOP_TIMEOUT, true).await
+    }
+
     async fn estop_clear(&self, args: &JsonObject) -> CallToolResult {
         let digest = args_digest(&Value::Object(args.clone()));
         if self.estop_clear == EstopClear::Operator {
@@ -569,42 +617,9 @@ impl ToolHost {
         let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
         let _serial = self.call_lock.lock().await;
-        let (intent, was_estopped) = {
-            let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
-            // The intent is on disk before the latch opens, and in the same
-            // lock as every engage, so the log orders clears and engages as
-            // they took effect.
-            let Some(intent) = self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Intent)
-            else {
-                return refusal(
-                    "receipt_failed",
-                    "the e-stop was not cleared: its receipt could not be written",
-                    None,
-                    Value::Null,
-                );
-            };
-            match std::fs::remove_file(&self.latch_file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    self.record(
-                        ESTOP_CLEAR_TOOL,
-                        &digest,
-                        ReceiptOutcome::Error(String::from("clear_failed")),
-                    );
-                    return refusal(
-                        "clear_failed",
-                        &format!(
-                            "the e-stop stays engaged: the latch file {} could not be \
-                             deleted: {e}",
-                            self.latch_file.display()
-                        ),
-                        Some(&intent),
-                        json!({ "estopped": self.estopped() }),
-                    );
-                }
-            }
-            (intent, self.latch.swap(false, Ordering::SeqCst))
+        let (intent, was_estopped) = match self.open_latch(&digest) {
+            Ok(opened) => opened,
+            Err(refused) => return refused,
         };
         if !was_estopped {
             // Nothing was latched: the graph is not told.
@@ -623,10 +638,7 @@ impl ToolHost {
         tracing::warn!(reason = %reason, "e-stop cleared");
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, ESTOP_CLEAR_TOOL, &clean);
-        // Latch-gated: an `estop` that closes the latch before this frame is
-        // published keeps it off the calls topic, so the graph's last frame is
-        // that `estop`.
-        let answer = self.journal.call(call_id, frame, ESTOP_TIMEOUT, true).await;
+        let answer = self.journal_clear(call_id, frame).await;
         let (result, graph_error) = match answer {
             Ok(result) => {
                 self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Ok);
@@ -676,4 +688,73 @@ fn reason_arg(args: &JsonObject) -> String {
         .chars()
         .take(ESTOP_REASON_MAX_CHARS)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use cerulion_core::{TransportConfig, TransportManager};
+
+    use super::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL};
+    use crate::journal::{Journal, JournalError};
+    use crate::manifest::JournalConfig;
+
+    /// A host with no tools on topics private to `tag`, with no graph
+    /// answering, and its latch.
+    fn host(tag: &str, receipts: &Path) -> (ToolHost, Arc<AtomicBool>) {
+        let tag = format!("rcpd_latch_unit_{tag}_{}", std::process::id());
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: tag.clone(),
+                ..Default::default()
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("transport");
+        let journal_config = JournalConfig {
+            calls_topic: format!("/{tag}/calls"),
+            results_topic: format!("/{tag}/results"),
+        };
+        let latch = Arc::new(AtomicBool::new(false));
+        let lock = ReceiptLock::acquire(receipts).expect("lock");
+        let journal =
+            Journal::spawn(mgr, journal_config, Vec::new(), latch.clone()).expect("journal");
+        let host =
+            ToolHost::open(Vec::new(), journal, latch.clone(), receipts, lock).expect("host");
+        (host, latch)
+    }
+
+    #[test]
+    fn a_clear_between_the_lock_free_close_and_the_lock_does_not_open_an_engage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receipts = dir.path().join("log.jsonl");
+        let (host, latch) = host("reclose", &receipts);
+        // `estop` has done its lock-free close; a clear takes the lock first.
+        latch.store(true, Ordering::SeqCst);
+        let (_, was) = host.open_latch("d").expect("clear");
+        assert!(was);
+        assert!(!host.estopped());
+        // Then `estop` takes the lock.
+        host.engage_latch("late", "d").expect("intent");
+        assert!(
+            host.estopped(),
+            "the engage closes the latch again under the lock"
+        );
+        assert!(latch_path(&receipts).exists(), "and writes its file");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clear_frame_is_not_published_once_an_estop_closed_the_latch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (host, latch) = host("gated", &dir.path().join("log.jsonl"));
+        latch.store(true, Ordering::SeqCst);
+        let frame = Journal::frame(1, ESTOP_CLEAR_TOOL, &serde_json::json!({}));
+        assert_eq!(
+            host.journal_clear(1, frame).await,
+            Err(JournalError::Estopped)
+        );
+    }
 }
