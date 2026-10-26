@@ -167,8 +167,9 @@ fn linked_nodes_run_record_restart_and_refuse_unlinked_types() {
         ])
     );
 
-    // Run, stop, and run again in the same process: each start builds fresh
-    // node instances, so the relay's tick count starts again at 1.
+    // Run, stop, and run again in the same process: the second start makes
+    // its nodes again from the registry, and frames must flow and be
+    // recorded again.
     run_once(&mut runtime, files_dir, &prefix, "first.mcap");
     run_once(&mut runtime, files_dir, &prefix, "second.mcap");
 
