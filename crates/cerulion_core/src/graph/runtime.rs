@@ -1709,12 +1709,12 @@ impl BlockCredit<'_> {
     /// content of the check and lives one line away from [`Self::is_saturated`],
     /// whose comparison is the other one. Never a verdict — see
     /// `cerulion_cli_engine::replay_rederive`'s conservation rule.
-    #[must_use]
     ///
     /// Never `true` for an edge that declares `block_timeout_ms`: a live
     /// timeout release forgives the count, so the recording legally publishes
     /// past `depth` on that edge, and a replay (which bypasses the gate, and so
     /// the release) cannot tell when it did.
+    #[must_use]
     pub fn conservation_broken(&self) -> bool {
         !self.block_timeout && self.outstanding > self.depth
     }
