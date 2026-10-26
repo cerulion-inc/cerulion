@@ -9328,6 +9328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_macro_gate_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_macro_holdblock_cdylib"
 version = "0.1.0"
 dependencies = [

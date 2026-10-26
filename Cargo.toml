@@ -83,6 +83,9 @@ members = [
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
+    # A period cdylib whose tick is held open while a file exists; two
+    # instances of it must tick concurrently (per-instance lock pin).
+    "crates/test_fixtures/test_node_macro_gate_cdylib",
     # Raw-FFI cdylib whose info JSON declares a param but which exports no
     # cerulion_node_init_with_params symbol; the host must refuse it at info time.
     "crates/test_fixtures/test_node_params_no_symbol_cdylib",
