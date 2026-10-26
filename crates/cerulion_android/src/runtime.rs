@@ -495,6 +495,8 @@ impl EmbeddedRuntime {
             status.state = RuntimeState::Starting;
             status.graph = None;
             status.nodes = 0;
+            // `nodes::register` may have run after this runtime was made.
+            status.linked_nodes = crate::nodes::linked_node_types();
             status.listen = config.listen.clone();
             status.lan_access = None;
             status.mdns_advertised = false;

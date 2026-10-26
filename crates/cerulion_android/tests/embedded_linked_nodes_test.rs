@@ -28,6 +28,10 @@ const JNI_VERSION_1_6: i32 = 0x0001_0006;
 const VECTOR3: &str = "geometry_msgs/Vector3";
 
 fn graph_yaml(prefix: &str, source_type: &str) -> String {
+    graph_yaml_with_relay(prefix, source_type, "test_node_macro_relay_rlib")
+}
+
+fn graph_yaml_with_relay(prefix: &str, source_type: &str, relay_type: &str) -> String {
     format!(
         "prefix: {prefix}
 nodes:
@@ -37,7 +41,7 @@ nodes:
       - name: cmd
         schema: {VECTOR3}
   - id: relay
-    type: test_node_macro_relay_rlib
+    type: {relay_type}
     inputs:
       - name: cmd
         source: source/cmd
@@ -184,6 +188,39 @@ fn linked_nodes_run_record_restart_and_refuse_unlinked_types() {
         error.to_string(),
         "node type 'timer' is not linked into this app library (linked: test_node_macro_period_cdylib, test_node_macro_relay_rlib); add the node crate to the app runtime crate and list it in cerulion_android::embed_nodes!"
     );
+
+    // A type registered after the runtime was made is listed by the next
+    // start, and its factory may read the registry while it builds the node.
+    cerulion_android::nodes::register(&[cerulion_android::nodes::LinkedNode {
+        node_type: "late_relay",
+        factory: || {
+            assert!(
+                cerulion_android::nodes::linked_node_types().contains(&"late_relay".to_string())
+            );
+            Box::new(test_node_macro_relay_rlib::RelayNodeEntry::new())
+        },
+    }])
+    .expect("register a type after the runtime was made");
+    let late = json!({
+        "graph_yaml": graph_yaml_with_relay(&prefix, "test_node_macro_period_cdylib", "late_relay"),
+    })
+    .to_string();
+    runtime
+        .start(&late)
+        .expect("start a graph with the late type");
+    let status = runtime.status_handle().lock().unwrap().clone();
+    assert_eq!(status.state, RuntimeState::Running);
+    assert_eq!(status.nodes, 2);
+    assert_eq!(
+        status.linked_nodes,
+        [
+            "late_relay",
+            "test_node_macro_period_cdylib",
+            "test_node_macro_relay_rlib"
+        ]
+    );
+    assert_relay_counts_up(&relay_frames_live(&format!("/{prefix}/relay/echo"), 3));
+    runtime.stop().expect("stop the late-type graph");
 
     // Under the in-process transport a graph with native nodes refuses
     // node_lib_dir: nodes cannot be loaded from separate libraries there.

@@ -80,8 +80,8 @@ impl Registry {
         }
     }
 
-    fn make(&self, node_type: &str) -> Option<Box<dyn NodeEntry>> {
-        self.nodes.get(node_type).map(|factory| factory())
+    fn factory(&self, node_type: &str) -> Option<NodeFactory> {
+        self.nodes.get(node_type).copied()
     }
 
     fn unlinked(&self, node_type: &str) -> EmbedError {
@@ -124,8 +124,12 @@ pub(crate) fn check() -> Result<(), EmbedError> {
 }
 
 /// A fresh entry for `node_type`, or `None` when it is not linked.
+///
+/// The factory runs after the registry lock is released, so a node
+/// constructor may call [`linked_node_types`].
 pub(crate) fn make(node_type: &str) -> Option<Box<dyn NodeEntry>> {
-    registry().make(node_type)
+    let factory = registry().factory(node_type);
+    factory.map(|factory| factory())
 }
 
 /// The graph error for a node type that is not linked; it names the type
@@ -174,15 +178,15 @@ mod tests {
             .expect("two distinct types");
         assert_eq!(registry.types(), ["period", "relay"]);
         assert!(registry.check().is_ok());
-        let made = registry.make("relay").expect("relay is linked");
+        let made = registry.factory("relay").expect("relay is linked")();
         let info = made.info().expect("relay info");
         assert_eq!(info.input_names(), ["cmd"]);
         assert_eq!(info.output_names(), ["echo"]);
-        let made = registry.make("period").expect("period is linked");
+        let made = registry.factory("period").expect("period is linked")();
         let info = made.info().expect("period info");
         assert!(info.input_names().is_empty());
         assert_eq!(info.output_names(), ["cmd"]);
-        assert!(registry.make("timer").is_none());
+        assert!(registry.factory("timer").is_none());
     }
 
     #[test]
