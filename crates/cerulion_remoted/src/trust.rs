@@ -958,11 +958,14 @@ mod tests {
             intermediate: good_intermediate_cert(),
             signed_epoch: epoch,
         };
-        std::fs::write(
-            dir.join(crate::epoch_pull::EPOCH_PENDING_FILE),
-            hex::encode(postcard::to_stdvec(&wire).unwrap()),
-        )
-        .unwrap();
+        let path = dir.join(crate::epoch_pull::EPOCH_PENDING_FILE);
+        std::fs::write(&path, hex::encode(postcard::to_stdvec(&wire).unwrap())).unwrap();
+        owner_only(&path, 0o600);
+    }
+
+    fn owner_only(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
@@ -980,8 +983,20 @@ mod tests {
                 .verify_and_establish(&pair_chain(account_a, key, VIEWER_SCOPE), &key, None, T_NOW)
                 .unwrap();
         }
+        owner_only(dir.path(), 0o700);
         let pull = EpochPull::new(dir.path(), shared.clone(), RemotedClock::fixed(T_NOW));
         assert_eq!(pull.apply_pending(), PullOutcome::Nothing);
+
+        // A pending file another user could have written (group/world bits) is
+        // refused unread and removed.
+        write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
+        owner_only(&dir.path().join(EPOCH_PENDING_FILE), 0o644);
+        assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
+        assert!(!dir.path().join(EPOCH_PENDING_FILE).exists());
+        assert!(matches!(
+            shared.snapshot_for_key(&k_a).1,
+            KeyAccess::Allowed(_)
+        ));
 
         write_pending(dir.path(), device_revoke_epoch(1, vec![PublicKey(k_a)]));
         assert_eq!(pull.apply_pending(), PullOutcome::Applied { epoch: 1 });
@@ -1002,6 +1017,7 @@ mod tests {
         assert_eq!(pull.apply_pending(), PullOutcome::NotNewer);
         // Garbage, and an epoch the robot's own CA did not sign, change nothing.
         std::fs::write(dir.path().join(EPOCH_PENDING_FILE), "not an epoch").unwrap();
+        owner_only(&dir.path().join(EPOCH_PENDING_FILE), 0o600);
         assert!(matches!(pull.apply_pending(), PullOutcome::Rejected { .. }));
         let forged = AccessListEpoch {
             version: FORMAT_VERSION,

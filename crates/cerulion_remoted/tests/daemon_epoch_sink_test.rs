@@ -394,6 +394,14 @@ async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk
     let manager = test_manager("pull");
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("remoted")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("remoted"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
     let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
     std::fs::create_dir_all(&config.log_root).unwrap();
     let pending = dir.path().join("remoted").join("epoch.pending");
@@ -420,8 +428,10 @@ async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk
         "pre-condition: the key is admitted before any epoch"
     );
     // The robot's own sync worker left an epoch revoking PROBE; no desk pushes.
+    // The worker writes it owner-only (0600) through an atomic rename.
+    let staged = dir.path().join("remoted").join(".epoch.pending.tmp");
     std::fs::write(
-        &pending,
+        &staged,
         hex::encode(
             EpochSyncWire::new(intermediate_cert(), epoch(3, vec![PROBE]))
                 .to_postcard()
@@ -429,6 +439,11 @@ async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk
         ),
     )
     .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::rename(&staged, &pending).unwrap();
     let until = std::time::Instant::now() + Duration::from_secs(10);
     let mut refused = false;
     while std::time::Instant::now() < until {

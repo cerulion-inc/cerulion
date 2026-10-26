@@ -2536,6 +2536,68 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod refresh_lock_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    const HOLDER_ENV: &str = "CERULION_TEST_REFRESH_LOCK_HOLDER";
+    const THIS_TEST: &str =
+        "auth::refresh_lock_tests::a_killed_refresh_lock_holder_never_wedges_the_next_refresh";
+
+    #[test]
+    fn a_killed_refresh_lock_holder_never_wedges_the_next_refresh() {
+        // Child mode: hold the lock, announce it, and wait to be killed.
+        if let Some(path) = std::env::var_os(HOLDER_ENV) {
+            let _held = hold_refresh_lock(Path::new(&path)).unwrap();
+            println!("REFRESH_LOCK_HELD");
+            std::thread::sleep(Duration::from_secs(120));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", THIS_TEST, "--nocapture", "--test-threads=1"])
+            .env(HOLDER_ENV, &auth_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = holder.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("REFRESH_LOCK_HELD") {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("the holder process took the lock");
+        // While the holder lives, the lock is not free.
+        let path = auth_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let held = hold_refresh_lock(&path).is_ok();
+            let _ = done_tx.send((held, started.elapsed()));
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the lock is held by the live holder"
+        );
+        // SIGKILL: no destructor runs; the kernel drops the flock with the process.
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        let (held, waited) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiter acquired the lock after the holder died");
+        assert!(held);
+        assert!(waited < REFRESH_LOCK_WAIT, "{waited:?}");
+    }
+}
+
 #[cfg(test)]
 mod debug_redaction_tests {
     use super::*;
