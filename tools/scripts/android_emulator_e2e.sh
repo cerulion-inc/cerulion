@@ -133,6 +133,12 @@ host_echo() {
     CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic"
 }
 PROBE="$ROOT/target/debug/android-e2e-demand-probe"
+# The robot identity the sample app runs under, read from the app source the
+# APK is built from. Every demand ack the probe counts must come from it.
+APP_IDENTITY="$(sed -nE 's/.*CerulionRuntime\.init\(getFilesDir\(\)\.getAbsolutePath\(\), "([A-Za-z0-9_-]+)"\).*/\1/p' \
+  "$ROOT/crates/cerulion_android/android/app/src/main/java/com/cerulion/sample/MainActivity.java" | head -1)"
+[[ -n "$APP_IDENTITY" ]] ||
+  fail "app identity" "could not read the robot name the sample app passes to CerulionRuntime.init"
 PROBE_ENDPOINT=tcp/127.0.0.1:7683
 # probe_refuses LABEL WANT ARG...: the probe refuses a bad argument, or an
 # endpoint its session cannot open, before it demands anything, so this needs
@@ -157,25 +163,37 @@ run_probe() {
     "$schema" 10)" || rc=$?
   printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
   (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
-  verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$out")" ||
+  verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$APP_IDENTITY" "$out")" ||
     fail "$label" "$verdict"
   pass "$label" "$verdict"
 }
+# host_netd_pids: the pids of the live host processes named cerulion-netd. A
+# zombie is dead: it holds no socket and answers nothing, so it is left out.
+host_netd_pids() {
+  ps -A -o pid= -o stat= -o comm= | awk '{
+    pid = $1; stat = $2; $1 = ""; $2 = ""; sub(/^ +/, "")
+    n = split($0, path, "/")
+    if (path[n] == "cerulion-netd" && stat !~ /^Z/) print pid
+  }'
+}
 # stop_host_netd: stop the host network daemon that `host_list` and
-# `host_echo` spawned, if any. The probe runs with no other zenoh peer on the
-# host: a live host netd would bridge the heartbeat into the shared memory the
-# probe's subscriber reads (frames that never crossed the probe's ingress),
-# and its own demand queryable can answer the probe's demand with `refused`
-# for a topic it does not produce (an ack the paired verdict would count as
-# the app's posture refusal).
+# `host_echo` spawned, then require that NO cerulion-netd is alive on the
+# host. The probe runs with no other zenoh peer on the host: a live host netd
+# would bridge the heartbeat into the shared memory the probe's subscriber
+# reads (frames that never crossed the probe's ingress), and its own demand
+# queryable can answer the probe's demand with `refused` for a topic it does
+# not produce (an ack the paired verdict would count as the app's posture
+# refusal). The check reads the process table, not the pid file: a netd whose
+# pid file is missing or elsewhere still fails it. The run refused to start
+# while a host netd was running, so any one alive now is this run's.
 stop_host_netd() {
-  local host_netd deadline
-  HOST_NETD_OWNED || return 0
-  host_netd="$(cat "$HOST_NETD_PID")"
-  kill -TERM "$host_netd" >/dev/null 2>&1 || true
+  local alive deadline
+  HOST_NETD_OWNED && { kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1 || true; }
   deadline=$((SECONDS + 20))
-  while kill -0 "$host_netd" >/dev/null 2>&1; do
-    (( SECONDS < deadline )) || fail "host netd stop" "pid $host_netd is still alive"
+  while :; do
+    alive="$(host_netd_pids | tr '\n' ' ')"
+    [[ -n "${alive// /}" ]] || break
+    (( SECONDS < deadline )) || fail "host netd stop" "a host netd is still alive: pids=${alive% }"
     sleep 1
   done
   rm -f "$HOST_NETD_PID"
@@ -221,6 +239,12 @@ if [[ "$("${ADB[@]}" shell getprop sys.boot_completed | tr -d '\r')" != 1 ]]; th
 fi
 device_serial="$("${ADB[@]}" get-serialno | tr -d '\r')"
 pass "emulator boot" "serial=$device_serial"
+# The demand probe must be the only zenoh peer on the host when it runs, and
+# stop_host_netd can only prove that if no host netd ran before this run.
+host_netd="$(host_netd_pids | tr '\n' ' ')"
+[[ -z "${host_netd// /}" ]] ||
+  fail "host netd free" "a cerulion-netd already runs on the host: pids=${host_netd% }"
+pass "host netd free" "no host netd"
 host_local="$("${HOST_ENV[@]}" "$HOST_CER" topic list --local 2>&1)" ||
   fail "host local topics" "$host_local"
 if grep -qE '/basic_timer/timer/count|/app/heartbeat' <<<"$host_local"; then

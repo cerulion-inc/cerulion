@@ -5,8 +5,9 @@
 # The verdict script reads the one report line the Android e2e's direct data
 # demand probe prints and decides whether it matches what a posture must do.
 # Every report below is written by hand in the probe's line shape. The first
-# case is the line CI's emulator run printed for the paired app; the open and
-# schema mismatch lines use the counts a manual open run gave. Each case states
+# case has the counts CI's emulator run printed for the paired app; the open
+# and schema mismatch lines use the counts a manual open run gave. Every ack in
+# them names the app's robot identity, `android-app`. Each case states
 # the exit status and the exact stdout, or a fragment of it, that the verdict
 # must give. One case per behaviour; the first failing assertion prints one
 # `FAIL:` line and exits 1. The case count is asserted against CASES_EXPECTED
@@ -15,7 +16,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=33
+CASES_EXPECTED=39
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 verdict="$script_dir/android_e2e_probe_verdict.sh"
@@ -55,12 +56,15 @@ expect_output() {
     esac
 }
 
+# The robot identity the sample app runs under: every ack must come from it.
+app=android-app
+
 # report FIELD=VALUE... : one probe report line. The fields come in the order
 # the probe prints them; a case overrides only the ones it is about.
 report() {
     local passes=5 enabled=0 refused=5 wire_header=0 mismatch=0 decode=0 reinject=0
     local lan_refused=0 wire=0 frames=0
-    local schema=std_msgs/String
+    local schema=std_msgs/String peers=$app
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -68,6 +72,7 @@ report() {
             enabled_acks=*) enabled=${arg#*=} ;;
             refused_acks=*) refused=${arg#*=} ;;
             wire_header_refused_acks=*) wire_header=${arg#*=} ;;
+            ack_peers=*) peers=${arg#*=} ;;
             schema_mismatch_drops=*) mismatch=${arg#*=} ;;
             decode_errors=*) decode=${arg#*=} ;;
             reinject_failure_drops=*) reinject=${arg#*=} ;;
@@ -78,8 +83,8 @@ report() {
             *) printf 'report: unknown field %s\n' "$arg" >&2; exit 1 ;;
         esac
     done
-    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
-        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$decode" \
+    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$mismatch" "$decode" \
         "$reinject" "$lan_refused" "$wire" "$frames"
 }
 
@@ -92,155 +97,183 @@ mismatch_ok=$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 \
     schema_mismatch_drops=20 wire_frames=20 frames=0)
 
 # --- paired ------------------------------------------------------------------
-run_case paired_every_demand_refused paired "$log_line
+run_case paired_every_demand_refused paired "$app" "$log_line
 $paired_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0'
+expect_exact 'passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0'
 
-run_case paired_one_grant paired "$(report enabled_acks=1 refused_acks=4)"
+run_case paired_one_grant paired "$app" "$(report enabled_acks=1 refused_acks=4)"
 expect_status 1
 expect_output 'a paired app granted 1 demand(s)'
 
-run_case paired_frame_on_the_wire paired "$(report wire_frames=2)"
+run_case paired_frame_on_the_wire paired "$app" "$(report wire_frames=2)"
 expect_status 1
 expect_output 'a paired app sent 2 frame(s)'
 
 # A frame the probe's subscriber received that never crossed its ingress came
 # by another path (a host netd bridging into shared memory, say).
-run_case paired_frame_off_the_ingress paired "$(report frames=1)"
+run_case paired_frame_off_the_ingress paired "$app" "$(report frames=1)"
 expect_status 1
 expect_output 'frames=1 is more than wire_frames=0'
 
 # One GET per pass reaches one peer, the app, so it answers at most once a
 # pass. More acks than passes means another peer answered too, and its refusal
 # would be counted as the app's posture.
-run_case paired_more_acks_than_passes paired "$(report refused_acks=6)"
+run_case paired_more_acks_than_passes paired "$app" "$(report refused_acks=6)"
 expect_status 1
 expect_output '6 ack(s) from 5 pass(es): more than one peer answered'
 
-run_case paired_no_answer paired "$(report refused_acks=0)"
+run_case paired_no_answer paired "$app" "$(report refused_acks=0 ack_peers=)"
 expect_status 1
 expect_output 'no demand was refused'
 
 # The probe's own LAN access is open, so its ingress must never refuse a frame.
-run_case paired_lan_refused paired "$(report lan_refused_drops=1 wire_frames=1)"
+run_case paired_lan_refused paired "$app" "$(report lan_refused_drops=1 wire_frames=1)"
 expect_status 1
 expect_output "the probe's ingress refused 1 frame(s) on its own LAN posture"
 
-run_case paired_wire_header_refusal paired "$(report refused_acks=4 wire_header_refused_acks=1)"
+run_case paired_wire_header_refusal paired "$app" "$(report refused_acks=4 wire_header_refused_acks=1)"
 expect_status 1
 expect_output 'refused 1 demand(s) on the wire header'
 
+# The ack names its sender. A host netd that outlived its stop answers the
+# probe's wildcard demand with `refused` for a topic it does not produce: the
+# same counts as the app's posture refusal, from the wrong peer.
+run_case paired_refusals_from_another_peer paired "$app" "$(report ack_peers=host-box)"
+expect_status 1
+expect_output 'ack(s) came from host-box, not only from the app android-app'
+
+run_case paired_refusals_from_the_app_and_another paired "$app" \
+    "$(report refused_acks=4 ack_peers=android-app,host-box)"
+expect_status 1
+expect_output 'ack(s) came from android-app,host-box, not only from the app android-app'
+
 # --- open --------------------------------------------------------------------
-run_case open_granted_and_delivered open "$open_ok"
+run_case open_granted_and_delivered open "$app" "$open_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
+expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
 
 # The refused ack is the same bytes for every refusal reason, so an open app
 # that refuses even one demand makes a paired refusal prove nothing.
-run_case open_one_refusal open "$(report enabled_acks=4 refused_acks=1 wire_frames=20 frames=20)"
+run_case open_one_refusal open "$app" "$(report enabled_acks=4 refused_acks=1 wire_frames=20 frames=20)"
 expect_status 1
 expect_output 'an open app refused 1 demand(s)'
 
-run_case open_granted_no_frame open "$(report enabled_acks=4 refused_acks=0)"
+run_case open_granted_no_frame open "$app" "$(report enabled_acks=4 refused_acks=0)"
 expect_status 1
 expect_output 'an open app delivered no frame'
 
-run_case open_never_granted open "$(report refused_acks=0)"
+run_case open_never_granted open "$app" "$(report refused_acks=0 ack_peers=)"
 expect_status 1
 expect_output 'an open app granted no demand'
 
-run_case open_schema_drops open "$(report enabled_acks=4 refused_acks=0 schema_mismatch_drops=1 wire_frames=21 frames=20)"
+run_case open_schema_drops open "$app" "$(report enabled_acks=4 refused_acks=0 schema_mismatch_drops=1 wire_frames=21 frames=20)"
 expect_status 1
 expect_output 'dropped 1 frame(s) on the schema'
 
-run_case open_more_dropped_than_received open "$(report enabled_acks=4 refused_acks=0 schema_mismatch_drops=21 wire_frames=20)"
+run_case open_more_dropped_than_received open "$app" "$(report enabled_acks=4 refused_acks=0 schema_mismatch_drops=21 wire_frames=20)"
 expect_status 1
 expect_output 'schema_mismatch_drops=21 is more than wire_frames=20'
 
-run_case open_decode_errors open "$(report enabled_acks=4 refused_acks=0 decode_errors=1 wire_frames=20 frames=19)"
+run_case open_decode_errors open "$app" "$(report enabled_acks=4 refused_acks=0 decode_errors=1 wire_frames=20 frames=19)"
 expect_status 1
 expect_output 'the ingress dropped 1 frame(s) as undecodable'
 
-run_case open_more_delivered_than_received open "$(report enabled_acks=4 refused_acks=0 wire_frames=2 frames=3)"
+run_case open_more_delivered_than_received open "$app" "$(report enabled_acks=4 refused_acks=0 wire_frames=2 frames=3)"
 expect_status 1
 expect_output 'frames=3 is more than wire_frames=2'
 
 # --- schema mismatch -----------------------------------------------------------
-run_case mismatch_every_frame_dropped schema-mismatch "$mismatch_ok"
+run_case mismatch_every_frame_dropped schema-mismatch "$app" "$mismatch_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=20 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=0'
+expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=20 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=0'
 
-run_case mismatch_frame_delivered schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20 frames=3)"
+run_case mismatch_frame_delivered schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20 frames=3)"
 expect_status 1
 expect_output 'delivered 3 frame(s) under the wrong schema'
 
-run_case mismatch_one_refusal schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=1 schema_mismatch_drops=20 wire_frames=20)"
+run_case mismatch_one_refusal schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=1 schema_mismatch_drops=20 wire_frames=20)"
 expect_status 1
 expect_output 'an open app refused 1 demand(s)'
 
-run_case mismatch_never_granted schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=0 refused_acks=0 schema_mismatch_drops=20 wire_frames=20)"
+run_case mismatch_never_granted schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=0 refused_acks=0 ack_peers= schema_mismatch_drops=20 wire_frames=20)"
 expect_status 1
 expect_output 'an open app granted no demand'
 
 # Every frame must die on the schema; one lost another way is not the check.
-run_case mismatch_some_not_on_the_schema schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20)"
+run_case mismatch_some_not_on_the_schema schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20)"
 expect_status 1
 expect_output 'schema_mismatch_drops=17 is not every one of wire_frames=20'
 
-run_case mismatch_reinject_failures schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=18 reinject_failure_drops=2 wire_frames=20)"
+run_case mismatch_reinject_failures schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=18 reinject_failure_drops=2 wire_frames=20)"
 expect_status 1
 expect_output 'the ingress dropped 2 frame(s) on local re-injection'
 
-run_case mismatch_no_drop schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0)"
+run_case mismatch_no_drop schema-mismatch "$app" "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0)"
 expect_status 1
 expect_output 'no frame was dropped on the schema'
 
 # --- the report itself -------------------------------------------------------
-run_case no_report paired "$log_line"
+run_case no_report paired "$app" "$log_line"
 expect_status 1
 expect_output 'no probe report line'
 
-run_case two_reports paired "$paired_ok
+run_case two_reports paired "$app" "$paired_ok
 $paired_ok"
 expect_status 1
 expect_output '2 probe report lines'
 
 # `wire_frames=` must never be read as `frames=`.
-run_case frames_missing paired "${paired_ok% frames=0}"
+run_case frames_missing paired "$app" "${paired_ok% frames=0}"
 expect_status 1
 expect_output "field 'frames' is missing"
 
-run_case field_not_a_number paired "${paired_ok% frames=0} frames=x"
+run_case field_not_a_number paired "$app" "${paired_ok% frames=0} frames=x"
 expect_status 1
 expect_output "field 'frames' is not a whole number: x"
 
-run_case field_twice paired "$paired_ok frames=0"
+run_case field_twice paired "$app" "$paired_ok frames=0"
 expect_status 1
 expect_output "field 'frames' appears 2 times"
 
-run_case no_pass paired "$(report passes=0 refused_acks=0)"
+run_case peer_without_an_ack paired "$app" "$(report refused_acks=0)"
+expect_status 1
+expect_output 'ack_peers=android-app names a peer, but no ack was counted'
+
+run_case ack_peers_missing paired "$app" "${paired_ok/ ack_peers=android-app/}"
+expect_status 1
+expect_output "field 'ack_peers' is missing"
+
+run_case ack_peers_not_names paired "$app" "${paired_ok/ack_peers=android-app/ack_peers=android-app;x}"
+expect_status 1
+expect_output "field 'ack_peers' is not a list of robot names: android-app;x"
+
+run_case no_pass paired "$app" "$(report passes=0 refused_acks=0 ack_peers=)"
 expect_status 1
 expect_output 'the demander ran no pass'
 
 # --- usage -------------------------------------------------------------------
-run_case unknown_expectation granted "$paired_ok"
+run_case unknown_expectation granted "$app" "$paired_ok"
 expect_status 2
-expect_output 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <probe-output>'
+expect_output 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>'
 
-run_case missing_output paired
+run_case missing_output paired "$app"
+expect_status 2
+expect_output 'usage: android_e2e_probe_verdict.sh'
+
+run_case identity_not_a_robot_name paired 'bad/name' "$paired_ok"
 expect_status 2
 expect_output 'usage: android_e2e_probe_verdict.sh'
 
 # --- determinism: the same report gives the same bytes ---------------------------
-run_case paired_twice paired "$paired_ok"
+run_case paired_twice paired "$app" "$paired_ok"
 first=$output
-second=$("$verdict" paired "$paired_ok")
+second=$("$verdict" paired "$app" "$paired_ok")
 [ "$first" = "$second" ] || fail "two verdicts on one report differ: $second"
 
-run_case open_twice open "$open_ok"
+run_case open_twice open "$app" "$open_ok"
 first=$output
-second=$("$verdict" open "$open_ok")
+second=$("$verdict" open "$app" "$open_ok")
 [ "$first" = "$second" ] || fail "two verdicts on one report differ: $second"
 
 case_name=

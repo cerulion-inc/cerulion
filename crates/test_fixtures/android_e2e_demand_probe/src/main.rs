@@ -6,12 +6,13 @@
 //! This probe skips the catalog: it boots an ingress-only gateway for ONE topic
 //! with the schema it is told to expect, connected to ONE endpoint with
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
-//! bounded window. It reports the frames that reached its ingress from the
-//! network (`wire_frames`, whether re-injected or dropped by validation), each
-//! drop bucket by name (`schema_mismatch_drops` when the schema hash was not
-//! the expected one, `decode_errors`, `reinject_failure_drops`,
-//! `lan_refused_drops`), and the frames its local subscriber received
-//! (`frames`). The probe's own LAN access is set to open, so its ingress never
+//! bounded window. It reports the demand acks it counted and the robots that
+//! sent them (`ack_peers`, sorted and joined by `,`, empty when no ack came),
+//! the frames that reached its ingress from the network (`wire_frames`,
+//! whether re-injected or dropped by validation), each drop bucket by name
+//! (`schema_mismatch_drops` when the schema hash was not the expected one,
+//! `decode_errors`, `reinject_failure_drops`, `lan_refused_drops`), and the
+//! frames its local subscriber received (`frames`). The probe's own LAN access is set to open, so its ingress never
 //! drops a frame on its own posture.
 //!
 //! Usage: `android-e2e-demand-probe <connect-endpoint> <topic> <schema> <window-secs>`
@@ -20,13 +21,13 @@
 //! and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
+//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
 //! ```
 //!
 //! The verdict is the caller's (`tools/scripts/android_e2e_probe_verdict.sh`):
-//! a paired robot must answer with refused acks only and send no frame; an
-//! open one grants and delivers, and drops every frame when the expected
-//! schema is not the topic's. A bad argument or a setup failure returns an
+//! every ack must come from the app; a paired app must answer with refused
+//! acks only and send no frame; an open one grants and delivers, and drops
+//! every frame when the expected schema is not the topic's. A bad argument or a setup failure returns an
 //! error (exit code 1) and prints no fact line.
 
 use std::error::Error;
@@ -161,7 +162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "demand_probe topic={} schema={} window_s={} passes={} enabled_acks={} refused_acks={} \
-         wire_header_refused_acks={} schema_mismatch_drops={schema_mismatch_drops} \
+         wire_header_refused_acks={} ack_peers={} schema_mismatch_drops={schema_mismatch_drops} \
          decode_errors={decode_errors} reinject_failure_drops={reinject_failure_drops} \
          lan_refused_drops={lan_refused_drops} wire_frames={wire_frames} frames={frames}",
         args.topic,
@@ -171,6 +172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         gateway.demand_enabled_ack_count(),
         gateway.demand_refused_ack_count(),
         gateway.demand_wire_header_refused_ack_count(),
+        gateway.demand_ack_peers().join(","),
     );
     Ok(())
 }

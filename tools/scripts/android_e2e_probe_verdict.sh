@@ -3,9 +3,10 @@
 # direct data demand probe (crates/test_fixtures/android_e2e_demand_probe)
 # matches what the app's LAN posture must do.
 #
-#   android_e2e_probe_verdict.sh paired|open|schema-mismatch <probe-output>
+#   android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>
 #
-# <probe-output> is everything the probe printed. It must hold exactly one
+# <app-identity> is the robot identity the app runs under: every counted ack
+# must come from it. <probe-output> is everything the probe printed. It must hold exactly one
 # `demand_probe ...` report line; other lines (logs) are ignored.
 #
 #   paired           every answered demand is refused, none is granted, and no
@@ -19,7 +20,11 @@
 #                    demand is granted, frames reach the ingress, and every one
 #                    is dropped on the schema hash, so none is delivered.
 #
-# In every expectation the ingress must lose no frame to a decode error, a
+# In every expectation the acks must come from the app alone (`ack_peers` is
+# exactly <app-identity>, or empty when no ack was counted): an ack from any
+# other peer, such as a host netd that answers the wildcard demand with
+# `refused` for a topic it does not produce, would be counted as the app's.
+# The ingress must also lose no frame to a decode error, a
 # local re-injection failure or its own LAN posture (the probe's is open): a
 # frame lost that way would hide behind the counts the rules above read.
 #
@@ -33,18 +38,24 @@ set -euo pipefail
 set -f
 
 usage() {
-    printf '%s\n' 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <probe-output>' >&2
+    printf '%s\n' 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>' >&2
     exit 2
 }
 
-[ "$#" -eq 2 ] || usage
+[ "$#" -eq 3 ] || usage
 expect=$1
+app=$2
 case "$expect" in
     paired | open | schema-mismatch) ;;
     *) usage ;;
 esac
+# A robot identity: 1 to 63 ASCII letters, digits, '_' or '-'.
+case "$app" in
+    '' | *[!A-Za-z0-9_-]*) usage ;;
+esac
+[ "${#app}" -le 63 ] || usage
 
-reports=$(printf '%s\n' "$2" | grep '^demand_probe ' || true)
+reports=$(printf '%s\n' "$3" | grep '^demand_probe ' || true)
 if [ -z "$reports" ]; then
     count=0
 else
@@ -57,8 +68,9 @@ reject() {
 [ "$count" -ne 0 ] || reject 'no probe report line'
 [ "$count" -eq 1 ] || reject "$count probe report lines, expected 1"
 
-# field NAME: the value of the one `NAME=` token on the report line.
-field() {
+# raw_field NAME: the value of the one `NAME=` token on the report line,
+# which may be empty.
+raw_field() {
     local name=$1 token value='' seen=0
     for token in $reports; do
         case "$token" in
@@ -70,8 +82,15 @@ field() {
     done
     [ "$seen" -ne 0 ] || reject "field '$name' is missing"
     [ "$seen" -eq 1 ] || reject "field '$name' appears $seen times"
+    printf '%s\n' "$value"
+}
+
+# field NAME: the one `NAME=` value, which must be a whole number.
+field() {
+    local value
+    value=$(raw_field "$1") || { printf '%s\n' "$value"; exit 1; }
     case "$value" in
-        '' | *[!0-9]*) reject "field '$name' is not a whole number: $value" ;;
+        '' | *[!0-9]*) reject "field '$1' is not a whole number: $value" ;;
     esac
     printf '%s\n' "$value"
 }
@@ -82,6 +101,13 @@ passes=$(field passes) || { printf '%s\n' "$passes"; exit 1; }
 enabled=$(field enabled_acks) || { printf '%s\n' "$enabled"; exit 1; }
 refused=$(field refused_acks) || { printf '%s\n' "$refused"; exit 1; }
 wire_header=$(field wire_header_refused_acks) || { printf '%s\n' "$wire_header"; exit 1; }
+peers=$(raw_field ack_peers) || { printf '%s\n' "$peers"; exit 1; }
+# Robot names joined by ','; empty when no ack was counted.
+case ",$peers," in
+    *[!A-Za-z0-9_,-]* | *,,*)
+        [ -z "$peers" ] || reject "field 'ack_peers' is not a list of robot names: $peers"
+        ;;
+esac
 mismatch=$(field schema_mismatch_drops) || { printf '%s\n' "$mismatch"; exit 1; }
 decode=$(field decode_errors) || { printf '%s\n' "$decode"; exit 1; }
 reinject=$(field reinject_failure_drops) || { printf '%s\n' "$reinject"; exit 1; }
@@ -96,6 +122,12 @@ frames=$(field frames) || { printf '%s\n' "$frames"; exit 1; }
 acks=$((enabled + refused + wire_header))
 [ "$acks" -le "$passes" ] ||
     reject "$acks ack(s) from $passes pass(es): more than one peer answered"
+if [ "$acks" -eq 0 ]; then
+    [ -z "$peers" ] || reject "ack_peers=$peers names a peer, but no ack was counted"
+else
+    [ "$peers" = "$app" ] ||
+        reject "the ack(s) came from ${peers:-no peer}, not only from the app $app"
+fi
 # Every frame the ingress received is either delivered or dropped, so neither
 # count can be more than the frames that crossed the network.
 [ "$frames" -le "$wire" ] || reject "frames=$frames is more than wire_frames=$wire"
@@ -131,6 +163,6 @@ case "$expect" in
         ;;
 esac
 
-printf 'passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
-    "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$decode" "$reinject" \
+printf 'passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+    "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$mismatch" "$decode" "$reinject" \
     "$lan_refused" "$wire" "$frames"

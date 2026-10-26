@@ -472,9 +472,11 @@ refusal comes from the posture and not from the topic or the allow-list. When
 the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
 on the schema hash. In every run the probe's ingress must lose no frame to a
 decode error, a local re-injection failure or its own LAN posture. No host
-network daemon runs while the probe does, so the app is the only peer that can
-answer its demand or send it a frame, and the verdict fails a run with more
-acks than demand passes (a second peer answering). Before the device is used,
+network daemon runs while the probe does: the run stops the one it started and
+fails while any `cerulion-netd` process is still alive on the host. The probe
+names the robot that sent each demand ack it counted, and the verdict fails a
+run with an ack from any robot other than the app, or with more acks than
+demand passes (a second peer answering). Before the device is used,
 the probe must refuse each bad argument and a connect endpoint its session
 cannot open, with exit code 1 and no report.
 `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
@@ -500,7 +502,8 @@ needs a dedicated device: it refuses to start while a `cerulion` or
 untouched.
 Host commands run with their own `HOME` and `XDG_RUNTIME_DIR` and without the
 caller's other `CERULION_*` variables, so they start a fresh network daemon,
-and the run refuses a host that already publishes a test topic locally. It sets
+and the run refuses a host that already publishes a test topic locally or
+already runs a `cerulion-netd` process. It sets
 the Android login gate off, reads the app recording named by the open run's
 `record_path`, waits for its closing MCAP magic before reading it, and bounds
 every device wait.
