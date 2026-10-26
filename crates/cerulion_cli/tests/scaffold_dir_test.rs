@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The scaffold directory guard the box suites hold their workspaces in: the
-//! directory is gone after a pass, an early return and a panic, and a panic
-//! keeps it only when keeping was asked for.
+//! The scaffold directory guard the Linux-only multi-process suites hold their
+//! workspaces in: the directory is gone after a pass, an early return and a
+//! panic, and a panic keeps it only when keeping was asked for.
 
 mod scaffold_dir;
 
