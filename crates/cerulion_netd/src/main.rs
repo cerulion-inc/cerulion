@@ -96,6 +96,23 @@ ENVIRONMENT:
                                  graph run) and idle self-exit is DISABLED (the
                                  daemon runs until SIGINT/SIGTERM).
                                  CERULION_NETD_NETWORK=off wins.
+    CERULION_NETD_TLS_ROOT_CA    Absolute path of the PEM certificate(s) the peer of
+                                 a quic/ CONNECT locator must chain to. A quic/
+                                 connect locator needs it, and it is refused when
+                                 no connect locator is quic/.
+    CERULION_NETD_TLS_CERTIFICATE
+                                 Absolute path of the PEM certificate a quic/
+                                 LISTEN locator presents; it must not be marked
+                                 CA:TRUE.
+    CERULION_NETD_TLS_PRIVATE_KEY
+                                 Absolute path of the PEM private key for
+                                 CERULION_NETD_TLS_CERTIFICATE. A quic/ listen
+                                 locator needs both, and both are refused when no
+                                 listen locator is quic/.
+                                 The daemon refuses to start, naming the variable,
+                                 on a locator or TLS setting that cannot work,
+                                 including a datagram-only locator (plain udp/,
+                                 or rel=0).
     CERULION_NETD_NETWORK=off    Force a strictly LOCAL-ONLY daemon (no network ever).
     CERULION_MULTICAST_SCOUTING=on
                                  Turn zenoh multicast scouting (periodic scout
@@ -215,7 +232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // locators stay first and verbatim; discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
-    let (network, peer_fold) = match net::network_config_from_env() {
+    let (network, peer_fold) = match net::network_config_from_env()? {
         Some(cfg) => {
             let (cfg, fold) = discovery_fold::fold_discovered_peers(cfg);
             (Some(cfg), fold)
@@ -806,6 +823,25 @@ mod tests {
         // able to find where revocations are read from).
         assert!(WAN_USAGE.contains(cerulion_netd::wan::EPOCH_DIR_ENV));
         assert!(WAN_USAGE.contains(cerulion_netd::wan::RELAY_DISABLED_ENV));
+    }
+
+    /// `--help` lists each network variable as exactly one row, at the start of
+    /// a line.
+    #[test]
+    fn usage_lists_each_network_variable_once() {
+        for var in [
+            net::CONNECT_ENV,
+            net::LISTEN_ENV,
+            net::TLS_ROOT_CA_ENV,
+            net::TLS_CERTIFICATE_ENV,
+            net::TLS_PRIVATE_KEY_ENV,
+        ] {
+            let rows = USAGE
+                .lines()
+                .filter(|l| l.trim_start().starts_with(var) && l.starts_with("    C"))
+                .count();
+            assert_eq!(rows, 1, "{var} rows in --help:\n{USAGE}");
+        }
     }
 
     #[cfg(not(feature = "wan"))]

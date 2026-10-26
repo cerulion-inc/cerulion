@@ -374,8 +374,9 @@ pub struct NetworkBlock {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<String>,
     /// Certificate files for `quic/` locators in `listen` / `connect`.
-    /// Graph-load validation refuses the block on a graph with no `quic/`
-    /// locator, and a `quic/` locator without the files it needs.
+    /// Graph-load validation refuses a block that sets no file, each file
+    /// without the `quic/` locator that reads it, and a `quic/` locator
+    /// without the files it needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<NetworkTls>,
     /// The put reliability of every `egress` entry that sets no

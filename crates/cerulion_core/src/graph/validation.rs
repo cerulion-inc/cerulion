@@ -963,11 +963,18 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 
 /// The carrier rules of [`validate_network_block`], on an enabled or inert
 /// block alike (a locator or certificate setting that cannot work is wrong
-/// whatever the mode):
+/// whatever the mode). They are
+/// [`check_carrier_settings`](crate::transport::carrier::check_carrier_settings),
+/// which `cerulion-netd` applies to its environment too:
 ///
-/// 7. **Known carrier**: every `listen` / `connect` locator classifies under
-///    [`classify_locator`] (`tcp/`, `quic/`, `udp/`, with zenoh-valid `rel` and
-///    `mixed_rel` values).
+/// 7. **Known carrier, not datagram only**: every `listen` / `connect` locator
+///    classifies under
+///    [`classify_locator`](crate::transport::carrier::classify_locator)
+///    (`tcp/`, `quic/`, `udp/`, with zenoh-valid `rel` and `mixed_rel` values),
+///    and none is a datagram-only link (plain `udp/`, `udp/...?rel=0`,
+///    `quic/...?rel=0`): zenoh sends every message on such a link once, with no
+///    retransmission, so a reliable topic or one of zenoh's own declarations is
+///    lost with the packet that carried it.
 /// 8. **`quic/` has its certificate files**: a `quic/` LISTEN locator needs
 ///    `tls.certificate` and `tls.private_key`; a `quic/` CONNECT locator needs
 ///    `tls.root_ca`. A certificate without its key (or a key without its
@@ -975,7 +982,7 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 /// 9. **No inert `tls` setting**: `root_ca` is read only by a `quic/` connect
 ///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
 ///    a connecting peer for no certificate), so each is refused without the
-///    locator that reads it.
+///    locator that reads it, and a `tls:` block that sets no file is refused.
 /// 10. **Best effort needs a datagram link**: `default_reliability:
 ///     best_effort`, and a `reliability: best_effort` egress topic, each need
 ///     at least one `listen` or `connect` locator with `mixed_rel=1`
@@ -983,87 +990,33 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 ///     `mixed_rel=auto` does not count, because it falls back to streams only.
 ///     Without one the topics would ride the reliable link with nothing saying
 ///     so. The default is refused even when every egress entry sets its own
-///     `reliability`.
+///     `reliability`. When other locators carry no datagram link, a WARN names
+///     them: a peer reached through one of them receives the best-effort topics
+///     on its reliable link.
 fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> TransportResult<()> {
-    use crate::transport::carrier::{classify_locator, Carrier, EgressReliability};
+    use crate::transport::carrier::{
+        check_carrier_settings, classify_locator, stream_only_locators, CarrierSettingNames,
+        EgressReliability,
+    };
     let err = |reason: String| TransportError::GraphError { reason };
-
-    let mut quic_listen = false;
-    let mut quic_connect = false;
-    let mut datagram_link = false;
-    for (list, locators) in [("listen", &net.listen), ("connect", &net.connect)] {
-        for loc in locators {
-            let carrier =
-                classify_locator(loc).map_err(|reason| err(format!("network {list}: {reason}")))?;
-            if matches!(carrier, Carrier::Quic { .. }) {
-                if list == "listen" {
-                    quic_listen = true;
-                } else {
-                    quic_connect = true;
-                }
-            }
-            datagram_link |= carrier.has_datagram_link();
-        }
-    }
-
-    let tls = net.tls.as_ref();
-    if let Some(tls) = tls {
-        if tls.root_ca.is_some() && !quic_connect {
-            return Err(err(
-                "network tls.root_ca is set but no connect locator is quic/, so it would \
-                 change nothing (a quic/ listener asks a connecting peer for no certificate); \
-                 remove it or add a quic/ connect locator"
-                    .to_string(),
-            ));
-        }
-        if (tls.certificate.is_some() || tls.private_key.is_some()) && !quic_listen {
-            return Err(err(
-                "network tls.certificate / tls.private_key are set but no listen locator is \
-                 quic/, so they would change nothing (only a quic/ listener presents them); \
-                 remove them or add a quic/ listen locator"
-                    .to_string(),
-            ));
-        }
-        for (key, path) in [
-            ("root_ca", &tls.root_ca),
-            ("certificate", &tls.certificate),
-            ("private_key", &tls.private_key),
-        ] {
-            if let Some(p) = path {
-                if !p.is_absolute() {
-                    return Err(err(format!(
-                        "network tls.{key} '{}' is not an absolute path; tls paths are read by \
-                         the gateway process, whose working directory is not the graph's",
-                        p.display()
-                    )));
-                }
-            }
-        }
-        if tls.certificate.is_some() != tls.private_key.is_some() {
-            return Err(err(
-                "network tls sets one of certificate / private_key without the other; a quic/ \
-                 listener presents the certificate and signs with its key, so set both"
-                    .to_string(),
-            ));
-        }
-    }
-    if quic_listen && tls.is_none_or(|t| t.certificate.is_none()) {
-        return Err(err(
-            "network listen has a quic/ locator but no tls.certificate / tls.private_key; a \
-             quic/ listener must present a certificate (or use tcp/, or \
-             udp/<ip>:<port>?rel=1;mixed_rel=1 on a WireGuard overlay)"
-                .to_string(),
-        ));
-    }
-    if quic_connect && tls.is_none_or(|t| t.root_ca.is_none()) {
-        return Err(err(
-            "network connect has a quic/ locator but no tls.root_ca; set it to the PEM \
-             certificate(s) the peer's certificate chains to (a self-signed peer certificate is \
-             its own root)"
-                .to_string(),
-        ));
-    }
-
+    let explicit_best_effort = net
+        .egress
+        .iter()
+        .find(|e| e.reliability == Some(EgressReliability::BestEffort))
+        .map(|e| e.topic.as_str());
+    check_carrier_settings(
+        &net.listen,
+        &net.connect,
+        net.tls.as_ref(),
+        explicit_best_effort,
+        &CarrierSettingNames::GRAPH,
+    )
+    .map_err(err)?;
+    let datagram_link = net
+        .listen
+        .iter()
+        .chain(&net.connect)
+        .any(|l| classify_locator(l).is_ok_and(|c| c.has_datagram_link()));
     if net.default_reliability == EgressReliability::BestEffort && !datagram_link {
         return Err(err(
             "network default_reliability is best_effort, but no listen or connect locator is \
@@ -1075,20 +1028,23 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
                 .to_string(),
         ));
     }
-    if let Some(be) = net
+    let best_effort = net
         .egress
         .iter()
-        .find(|e| e.reliability == Some(EgressReliability::BestEffort))
-    {
-        if !datagram_link {
-            return Err(err(format!(
-                "network egress topic '{}' is reliability: best_effort, but no listen or \
-                 connect locator is certain to have a datagram link (mixed_rel=auto falls back to \
-                 streams when the peer does not offer it), so it would ride the reliable link; add \
-                 mixed_rel=1 to a quic/ locator ('quic/<host>:<port>?mixed_rel=1') or use \
-                 'udp/<host>:<port>?rel=1;mixed_rel=1'",
-                be.topic
-            )));
+        .filter(|e| {
+            e.effective_reliability(net.default_reliability) == EgressReliability::BestEffort
+        })
+        .map(|e| e.topic.as_str())
+        .collect::<Vec<_>>();
+    if !best_effort.is_empty() {
+        let stream_only = stream_only_locators(&net.listen, &net.connect);
+        if !stream_only.is_empty() {
+            tracing::warn!(
+                topics = ?best_effort,
+                locators = ?stream_only,
+                "network: best_effort topics reach a peer behind these locators on its \
+                 reliable link (no datagram link: mixed_rel=1 is absent)"
+            );
         }
     }
     Ok(())
@@ -1785,6 +1741,13 @@ nodes:
     - topic: /robo/cam/cloud
       reliability: reliable
 "#,
+            r#"network:
+  mode: peer
+  connect:
+    - quic/10.0.0.2:7447?rel=1;mixed_rel=1
+  tls:
+    root_ca: /etc/cerulion/peers.pem
+"#,
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();
             assert!(
@@ -1809,11 +1772,11 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n",
-                &["quic/ locator but no tls.certificate"][..],
+                &["quic/ locator but no network tls.certificate"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n",
-                &["no tls.root_ca"][..],
+                &["quic/ locator but no network tls.root_ca"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: /c/a.pem\n",
@@ -1825,15 +1788,15 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  tls:\n    root_ca: /c/ca.pem\n",
-                &["tls.root_ca is set but no connect locator is quic/"][..],
+                &["tls.root_ca is set but no network connect locator is quic/"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n    root_ca: /c/ca.pem\n",
-                &["tls.root_ca is set but no connect locator is quic/"][..],
+                &["tls.root_ca is set but no network connect locator is quic/"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n  tls:\n    root_ca: /c/ca.pem\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
-                &["no listen locator is quic/"][..],
+                &["no network listen locator is quic/"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
@@ -1841,7 +1804,7 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
-                &["no listen or connect locator is certain to have a datagram link"][..],
+                &["no network listen or network connect locator is certain to have a datagram link"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n",
@@ -1858,6 +1821,44 @@ nodes:
             (
                 "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684?rel=1;mixed_rel=auto\n  default_reliability: best_effort\n",
                 &["network default_reliability is best_effort", "mixed_rel=auto falls back"][..],
+            ),
+            // Datagram-only links carry reliable topics and zenoh's own
+            // declarations with no retransmission, so each spelling is refused
+            // with the reliable spellings to use instead.
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684\n",
+                &[
+                    "network listen: locator 'udp/0.0.0.0:7684' is a datagram-only link",
+                    "udp/<host>:<port>?rel=1;mixed_rel=1",
+                    "quic/<host>:<port>?mixed_rel=1",
+                ][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - udp/10.0.0.2:7684?rel=0\n",
+                &["network connect: locator 'udp/10.0.0.2:7684?rel=0' is a datagram-only link"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447?rel=0\n  tls:\n    root_ca: /c/ca.pem\n",
+                &["network connect: locator 'quic/10.0.0.2:7447?rel=0' is a datagram-only link"][..],
+            ),
+            // A best_effort-only graph is refused too: the declarations that
+            // route its topics ride the same link.
+            (
+                "network:\n  mode: peer\n  listen:\n    - udp/0.0.0.0:7684\n    - quic/0.0.0.0:7447?mixed_rel=1\n  egress:\n    - topic: /robo/cam/cloud\n      reliability: best_effort\n  tls:\n    certificate: /c/a.pem\n    private_key: /c/a.key\n",
+                &["'udp/0.0.0.0:7684' is a datagram-only link"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447?rel=2\n",
+                &["rel=2", "zenoh accepts rel=0 or rel=1"][..],
+            ),
+            // An empty tls block reads nothing, on a TCP graph or a quic/ one.
+            (
+                "network:\n  mode: peer\n  listen:\n    - tcp/0.0.0.0:7447\n  tls: {}\n",
+                &["the tls block sets none of network tls.root_ca"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n  tls: {}\n",
+                &["the tls block sets none of"][..],
             ),
         ] {
             let config = parse_graph(&graph_with_network(block)).unwrap();
