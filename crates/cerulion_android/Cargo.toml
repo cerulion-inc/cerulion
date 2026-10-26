@@ -1,9 +1,20 @@
 [package]
 name = "cerulion_android"
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Embedded Cerulion runtime for Android apps: Java facade, JNI bindings and graph nodes linked into the app library"
+readme = "README.md"
+keywords = ["robotics", "android", "jni", "embedded", "cerulion"]
+categories = ["science::robotics", "os::android-apis"]
+# A crates.io download carries this crate's sources, the Java facade an app
+# compiles against, its README, the text of its license and this manifest.
+# The sample Gradle project and the integration tests serve work inside this
+# repository, so they stay out of the package.
+include = ["src/*.rs", "java/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
