@@ -3288,7 +3288,15 @@ impl Scheduler {
         match &node.policy {
             TriggerPolicy::Data => {
                 node.data_backlog_hint = false;
-                let consumed = node.pending_data_count.min(u64::from(planned.fire_count));
+                // A `consume = latest` fire spends EVERY pending arrival, as
+                // `decide_node` does live: on the Separate discipline each
+                // queued frame signalled one, and the one fire's read drained
+                // them all.
+                let consumed = if node.data_consume_latest && planned.fire_count > 0 {
+                    node.pending_data_count
+                } else {
+                    node.pending_data_count.min(u64::from(planned.fire_count))
+                };
                 node.pending_data_count -= consumed;
                 node.pending_data_count_shared
                     .store(node.pending_data_count, Ordering::Release);
@@ -3843,12 +3851,6 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Configure a per-node tick execution
-    /// deadline. After this call, every `fire_node` measures the
-    /// tick callback's wall-clock duration; if it exceeds
-    /// `within_ms`, the node's `tick_within_missed_count`
-    /// increments.
-    // hot-path-alloc-ok-fn: cold: per-node QoS registration at graph BUILD
     /// Declare that `node_id`'s `Data` trigger input is `consume = latest`.
     ///
     /// From then on a step that finds any pending arrival fires the node
@@ -3856,6 +3858,7 @@ impl Scheduler {
     /// arrival. The arrivals beyond the first are not owed fires: the one
     /// fire's read drains the queue to the newest frame. Refused for a node
     /// whose policy is not `Data`, the [`Self::set_trigger_refill`] rule.
+    // hot-path-alloc-ok-fn: cold: graph BUILD, once per `consume = latest` node
     pub fn set_data_consume_latest(&mut self, node_id: &str) -> TransportResult<()> {
         let node = self
             .nodes
@@ -3876,6 +3879,12 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Configure a per-node tick execution
+    /// deadline. After this call, every `fire_node` measures the
+    /// tick callback's wall-clock duration; if it exceeds
+    /// `within_ms`, the node's `tick_within_missed_count`
+    /// increments.
+    // hot-path-alloc-ok-fn: cold: per-node QoS registration at graph BUILD
     pub fn set_tick_within(&mut self, node_id: &str, within_ms: u64) -> TransportResult<()> {
         let node = self
             .nodes

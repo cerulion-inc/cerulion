@@ -5424,6 +5424,24 @@ impl DylibNodeEntry {
                 entry.name
             ));
         }
+        // `latest` is the data-trigger node's knob: under any other policy
+        // the runtime never reads it (a Sync node fires once per aligned set),
+        // so loading it would ignore the declaration in silence. The macro
+        // refuses the same shapes at compile time.
+        if let Some(entry) = input_entries.iter().find(|e| {
+            matches!(e.consume, Some(ConsumeJson::Latest))
+                && !matches!(
+                    &policy,
+                    Some(MacroPolicy::DataTrigger { input_name }) if *input_name == e.name
+                )
+        }) {
+            return Err(format!(
+                "input '{}' in cerulion_node_info() JSON declares `\"consume\":\"latest\"`, \
+                 which applies only to the trigger input of a data-trigger node (policy \
+                 `data_trigger` naming that input)",
+                entry.name
+            ));
+        }
         for (idx, name) in input_names.iter().enumerate() {
             if input_names[..idx].contains(name) {
                 // `parse_info_json` returns `Err(String)`; the caller wraps it
@@ -7405,10 +7423,11 @@ mod tests {
         let json = r#"{
             "inputs":[
                 {"name":"cam","trigger":true,"consume":"latest"},
-                {"name":"cmd","trigger":true,"consume":"fifo"},
+                {"name":"cmd","consume":"fifo","trigger":true},
                 {"name":"ctx"}
             ],
-            "outputs":[]
+            "outputs":[],
+            "policy":{"data_trigger":{"input_name":"cam"}}
         }"#;
         let info = DylibNodeEntry::parse_info_json(json).unwrap();
         let consume: Vec<InputConsume> = info.input_meta.iter().map(|m| m.consume).collect();
@@ -7433,8 +7452,33 @@ mod tests {
 
     #[test]
     fn info_json_unknown_consume_value_refuses_the_load() {
-        assert!(DylibNodeEntry::parse_info_json(
+        let err = DylibNodeEntry::parse_info_json(
             r#"{"inputs":[{"name":"cam","trigger":true,"consume":"lifo"}],"outputs":[]}"#,
+        )
+        .expect_err("lifo is not a consume mode");
+        assert!(err.contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn info_json_latest_outside_a_data_trigger_policy_refuses_the_load() {
+        for policy in [
+            r#""policy":{"sync_window_ms":20}"#,
+            r#""policy":{"data_trigger":{"input_name":"other"}}"#,
+            r#""policy":{"period_ms":10}"#,
+        ] {
+            let json = format!(
+                r#"{{"inputs":[{{"name":"cam","trigger":true,"consume":"latest"}},
+                    {{"name":"other","trigger":true}}],"outputs":[],{policy}}}"#
+            );
+            let err = DylibNodeEntry::parse_info_json(&json).expect_err(policy);
+            assert!(
+                err.contains("input 'cam'") && err.contains("data-trigger node"),
+                "{policy}: {err}"
+            );
+        }
+        // No policy at all is refused the same way.
+        assert!(DylibNodeEntry::parse_info_json(
+            r#"{"inputs":[{"name":"cam","trigger":true,"consume":"latest"}],"outputs":[]}"#,
         )
         .is_err());
     }

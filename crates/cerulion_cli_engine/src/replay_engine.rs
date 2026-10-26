@@ -17010,6 +17010,53 @@ mod node_trigger_decl_tests {
             }
         );
     }
+
+    /// A data-trigger node is judged by the latest rule exactly when its
+    /// trigger input declares `consume = latest`, and replay injects that
+    /// edge as drain-to-latest; the `fifo` default keeps the FIFO pair.
+    #[test]
+    fn a_latest_data_trigger_is_declared_and_injected_as_latest() {
+        use super::{input_consume_mode, replay_inject::ConsumeMode};
+        use cerulion_core::graph::node::InputConsume;
+        let data = |consume| {
+            NodeInfo::with_meta(
+                vec![InputMeta {
+                    name: "cam".to_string(),
+                    schema_hash: 0,
+                    trigger: true,
+                    depth: 4,
+                    backpressure: BackpressurePolicy::DropOldest,
+                    expect_within_ms: None,
+                    consume,
+                }],
+                vec![],
+            )
+            .with_policy(MacroPolicy::DataTrigger {
+                input_name: "cam".to_string(),
+            })
+        };
+        let wired = vec![InputDef {
+            name: "cam".to_string(),
+            source: "/cam".to_string(),
+        }];
+        let cam = vec!["cam".to_string()];
+        let latest = data(InputConsume::Latest);
+        let fifo = data(InputConsume::Fifo);
+        assert_eq!(
+            node_trigger_decl(&latest, &wired, None),
+            TriggerDecl::DataLatest {
+                trigger_inputs: cam.clone()
+            }
+        );
+        assert_eq!(
+            node_trigger_decl(&fifo, &wired, None),
+            TriggerDecl::Data {
+                trigger_inputs: cam
+            }
+        );
+        assert_eq!(input_consume_mode(&latest, "cam"), ConsumeMode::Latest);
+        assert_eq!(input_consume_mode(&fifo, "cam"), ConsumeMode::EachFifo);
+    }
 }
 
 #[cfg(test)]

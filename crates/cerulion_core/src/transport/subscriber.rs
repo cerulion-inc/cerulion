@@ -1874,14 +1874,6 @@ impl CerulionSubscriber {
         self.consume_mode = ConsumeMode::EachFifo;
     }
 
-    /// Is this subscriber a per-message FIFO consumer? `false` for a
-    /// latest-value context input and for a `consume = latest` trigger input,
-    /// which both drain to the newest frame.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn is_fifo_consume_for_test(&self) -> bool {
-        self.consume_mode == ConsumeMode::EachFifo
-    }
-
     /// Declare this input a PER-SET Sync TRIGGER. Called by the graph
     /// runtime at WIRING time beside [`Self::mark_fifo_consume`], on the
     /// per-set arm only.

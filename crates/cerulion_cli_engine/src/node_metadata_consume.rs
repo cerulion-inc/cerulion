@@ -22,6 +22,14 @@ pub(crate) const CONSUME_NEEDS_TRIGGER: &str =
      A non-trigger input never fires the node; it is a latest-value read that already \
      serves the newest frame on every fire, so it has no consumption order to choose.";
 
+/// The refusal for `consume = latest` on an input of a `sync_window_ms` /
+/// `unbounded_sync` node (the macro's `SYNC_CONSUME_LATEST_REFUSED`).
+pub(crate) const SYNC_CONSUME_LATEST_REFUSED: &str =
+    "`consume = latest` is not accepted on a trigger input of a `sync_window_ms` or \
+     `unbounded_sync` node: a Sync node fires once per aligned set of its trigger inputs, \
+     in set order, and does not take a per-input consumption mode. `consume = latest` \
+     applies to the one trigger input of a data-triggered node.";
+
 /// Where the walk is inside a `consume = <mode>`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum State {

@@ -22,7 +22,7 @@
 //! | backpressure | `consume = latest` |
 //! |---|---|
 //! | `drop_oldest` | evictions at the queue are counted; the read serves the newest survivor |
-//! | `block` | the read empties the queue every step, so the producer is never paced; superseded frames are not served |
+//! | `block` | each fire's read empties the queue, so the producer is paced only while a deferred fire spans `depth` publishes; superseded frames are not served |
 //! | `sample(N)` | the gate admits the drain's newest frame at most once per N ms; a decimated one is counted |
 //!
 //! `#[serial]`: the forced-Separate arms mutate the process-global
@@ -382,15 +382,11 @@ fn sample_gates_the_newest_frame_of_each_drain() {
     );
 }
 
-/// `block` composition. A `period_ms = 1` producer publishes one frame per
-/// step into a depth-4 `block` edge whose consumer is throttled to one fire
-/// per 3 ms. Every step's read drains the queue, so it never fills and the
-/// producer is never deferred, and each fire reads the newest frame:
-/// 1, then every third frame. As `fifo` the same graph paces the producer and
-/// serves 1, 2, 3, ... contiguously (`fifo_consume_iox2_test`).
-#[test]
-#[serial]
-fn block_with_latest_never_paces_the_producer_and_serves_the_newest() {
+/// A `period_ms = 1` producer publishing its fire count into a depth-4
+/// `block` edge, read by a `consume = latest` consumer throttled to one fire
+/// per `throttle_ms`. Returns (observed, the sink's block defers, frames
+/// published) after 30 steps.
+fn run_block(prefix: &str, throttle_ms: u64) -> (Vec<u64>, u64, u64) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let counter = Arc::new(AtomicU64::new(0));
     let counter_c = Arc::clone(&counter);
@@ -408,7 +404,7 @@ fn block_with_latest_never_paces_the_producer_and_serves_the_newest() {
     let c = Consumer {
         depth: 4,
         backpressure: BackpressurePolicy::Block,
-        throttle_ms: Some(3),
+        throttle_ms: Some(throttle_ms),
         ..Consumer::latest()
     };
     let producer_node = NodeDef {
@@ -434,7 +430,7 @@ fn block_with_latest_never_paces_the_producer_and_serves_the_newest() {
     );
     let clock = Arc::new(VirtualClock::new());
     let mut runtime = GraphRuntime::build_for_test(
-        graph("latblock", vec![producer_node, sink_node("producer/out")]),
+        graph(prefix, vec![producer_node, sink_node("producer/out")]),
         factories,
         clock,
         16,
@@ -444,22 +440,43 @@ fn block_with_latest_never_paces_the_producer_and_serves_the_newest() {
         runtime.step(Duration::from_millis(1));
     }
     let observed = seen.lock().unwrap().clone();
+    let deferred = runtime
+        .node_handle("sink")
+        .unwrap()
+        .backpressure_block_fires_deferred_count("inp");
+    let published = counter.load(Ordering::Relaxed);
+    (observed, deferred, published)
+}
+
+/// `block` composition, a consumer that keeps up with the queue: throttled
+/// to one fire per 3 ms against a depth of 4, each fire drains the 3 frames
+/// queued since the last one, so the queue never fills and the producer is
+/// never paced. Each fire reads the newest frame: 1, then every third.
+#[test]
+#[serial]
+fn block_with_latest_serves_the_newest_and_paces_nothing_while_the_queue_fits() {
+    let (observed, deferred, published) = run_block("latblock", 3);
     let expected: Vec<u64> = (0..observed.len() as u64).map(|k| 1 + 3 * k).collect();
     assert!(observed.len() >= 9, "a real stream: {observed:?}");
     assert_eq!(observed, expected);
-    assert_eq!(
-        runtime
-            .node_handle("producer")
-            .unwrap()
-            .backpressure_block_fires_deferred_count("inp")
-            + runtime
-                .node_handle("sink")
-                .unwrap()
-                .backpressure_block_fires_deferred_count("inp"),
-        0,
-        "the queue never fills, so the block gate never defers"
-    );
-    assert_eq!(counter.load(Ordering::Relaxed), 30, "one publish per step");
+    assert_eq!(deferred, 0, "the queue never fills, so the block gate never defers");
+    assert_eq!(published, 30, "one publish per step");
+}
+
+/// `block` composition, a deferred fire spanning `depth` publishes: throttled
+/// to one fire per 6 ms against a depth of 4, the queue fills four steps
+/// after a fire and the block gate holds the producer until the next fire
+/// drains it. Each fire reads the newest frame, which is the fourth published
+/// since the last fire: 1, 5, 9, ...
+#[test]
+#[serial]
+fn block_with_latest_paces_the_producer_while_a_deferred_fire_spans_the_depth() {
+    let (observed, deferred, published) = run_block("latblockp", 6);
+    let expected: Vec<u64> = (0..observed.len() as u64).map(|k| 1 + 4 * k).collect();
+    assert!(observed.len() >= 4, "a real stream: {observed:?}");
+    assert_eq!(observed, expected);
+    assert!(deferred > 0, "the full queue defers the producer");
+    assert!(published < 30, "the producer was paced: {published} publishes");
 }
 
 /// Through a dlopen'd `#[cerulion_node]` cdylib: `consume = latest` reaches
@@ -529,4 +546,71 @@ fn a_cdylib_declaring_latest_forwards_only_the_newest_frame() {
         })
         .expect("drain cmd stream");
     assert_eq!(forwarded, vec![5, 7]);
+}
+
+/// The subscriber's own state machine, driven by hand on a drain-to-latest
+/// subscriber (the mode a `consume = latest` trigger input is wired in):
+///
+/// * a boundary drain pops the whole queue and freezes the newest frame;
+/// * a REFILL with that frame still unread pops nothing, even with newer
+///   frames queued behind it, because it asks whether the fire just run took
+///   the head;
+/// * a boundary with the frame unread and nothing newer re-offers it;
+/// * a boundary with the frame unread and a newer frame queued replaces it;
+/// * the tick's read serves whatever is frozen.
+#[test]
+#[serial]
+fn the_latest_drain_holds_an_unread_frame_and_never_refills_past_it() {
+    use cerulion_core::transport::{TransportConfig, TransportManager};
+
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "latest_slot".into(),
+            clock: Arc::new(cerulion_core::clock::RealClock),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = "latest_slot";
+    let mut publisher = mgr
+        .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("publisher");
+    let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+    let mut send = |x: u64| {
+        let mut p = publisher.loan_proxy::<Vector3>().expect("loan");
+        p.x = x as f64;
+    };
+    let read = |sub: &mut cerulion_core::transport::subscriber::CerulionSubscriber| {
+        sub.try_view::<Vector3, _>(|v| v.x as u64)
+            .expect("read")
+    };
+
+    send(1);
+    send(2);
+    send(3);
+    let (popped, ts) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 3, "the boundary drain pops the whole queue");
+    assert!(ts.is_some());
+
+    send(4);
+    assert_eq!(
+        sub.refill_for_trigger(),
+        (0, None),
+        "a refill never pops past an unread frame"
+    );
+
+    let (popped, _) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 1, "frame 4 replaces the unread frame 3");
+    let (popped, ts) = sub.snapshot_latest_for_trigger();
+    assert_eq!(popped, 1, "nothing newer: the unread frame 4 is re-offered");
+    assert!(ts.is_some());
+    assert_eq!(read(&mut sub), Some(4), "the tick reads the newest frame");
+
+    assert_eq!(
+        sub.snapshot_latest_for_trigger(),
+        (0, None),
+        "a read frame is not re-offered"
+    );
 }

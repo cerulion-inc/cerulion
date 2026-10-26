@@ -255,6 +255,24 @@ fn validate_trigger_inference(
         return;
     }
 
+    // A Sync node fires once per aligned SET, so a per-input
+    // `consume = latest` has no meaning on its trigger inputs. Refused at
+    // ANY trigger count: with one trigger the node still carries the Sync
+    // policy, and the runtime wires that input through the Sync site, which
+    // never reads `consume`.
+    if has_sync || has_unbounded_sync {
+        for input in field_attrs
+            .inputs
+            .iter()
+            .filter(|i| i.consume == Some(crate::parse::ParsedConsume::Latest))
+        {
+            errors.push(syn::Error::new(
+                input.field_name.span(),
+                SYNC_CONSUME_LATEST_REFUSED,
+            ));
+        }
+    }
+
     match trigger_count {
         0 => {
             // sync_window_ms or unbounded_sync alone (no triggers) is invalid
@@ -295,20 +313,6 @@ fn validate_trigger_inference(
             // error because removing the sync attr is the user's call.
         }
         _ => {
-            // A Sync node fires once per aligned SET, so a per-input
-            // `consume = latest` has no meaning on its own trigger inputs.
-            if has_sync || has_unbounded_sync {
-                for input in field_attrs
-                    .inputs
-                    .iter()
-                    .filter(|i| i.consume == Some(crate::parse::ParsedConsume::Latest))
-                {
-                    errors.push(syn::Error::new(
-                        input.field_name.span(),
-                        SYNC_CONSUME_LATEST_REFUSED,
-                    ));
-                }
-            }
             // 2+ trigger inputs require one of: sync_window_ms, unbounded_sync
             if !has_sync && !has_unbounded_sync {
                 let trigger_names: Vec<String> = field_attrs

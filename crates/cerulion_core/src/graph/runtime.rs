@@ -7586,6 +7586,11 @@ impl GraphRuntime {
                     .is_some_and(|m| m.consume == InputConsume::Latest);
                 if consume_latest {
                     consume_latest_nodes.push(node_def.id.clone());
+                    // No cursor (a latest input serves no per-frame position a
+                    // resume could place), but the node STATES its table, an
+                    // empty one, so a resume reads this input as drain-to-latest
+                    // rather than as a node that states nothing.
+                    service_cursors.entry(node_def.id.clone()).or_default();
                 } else if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
                     body_sub.mark_fifo_consume();
                     // Mint this input's SERVICE CURSOR here, at the
