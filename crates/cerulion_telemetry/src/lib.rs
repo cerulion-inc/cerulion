@@ -13,6 +13,8 @@
 //!   guarded when they were built. [`Client`] sends them from one bounded
 //!   queue on one worker thread and never holds process exit longer than its
 //!   shutdown budget ([`DEFAULT_SHUTDOWN_BUDGET`], 300 ms).
+//! * **CI, in both feature states:** [`ci`] detects a CI run, which still
+//!   sends, tagged `ci: true`.
 //! * **No key, no client.** [`Client::from_env`] is `None` unless
 //!   `POSTHOG_API_KEY` is set and consent resolves enabled.
 //! * **Every property is guarded** (the `guard` module): keys must be in the
@@ -21,6 +23,7 @@
 //!   counted, never sent.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod ci;
 pub mod client;
 pub mod consent;
 mod error;

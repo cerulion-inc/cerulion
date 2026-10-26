@@ -5,10 +5,12 @@
 //!
 //! Nothing is sent unless [`Client::from_env_or_key`] returns a client, which
 //! needs a key (`POSTHOG_API_KEY`, else the `CERULION_POSTHOG_KEY` a release
-//! build was compiled with) and consent. The run that prints the notice sends nothing, so the
-//! user reads it before the first event leaves the machine.
+//! build was compiled with) and consent. The run that prints the notice
+//! sends nothing, nor, outside CI, does any run without a terminal before the
+//! notice was shown, so the user reads it before the first event leaves the
+//! machine.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -49,8 +51,9 @@ const BAKED_KEY: Option<&str> = option_env!("CERULION_POSTHOG_KEY");
 /// inside an unrecorded verb, sends nothing either.
 static SENDING: AtomicBool = AtomicBool::new(false);
 
-/// Set when [`CommandRun::start`] could have sent but printed the notice
-/// instead: a first login inside this run leaves its anonymous id pending.
+/// Set when [`CommandRun::start`] could have sent but the notice was owed:
+/// this run printed it, or had no terminal to print it on (outside CI). A
+/// first login inside this run leaves its anonymous id pending.
 static NOTICE_RUN: AtomicBool = AtomicBool::new(false);
 
 /// Set when [`login_anon_id`] found an unmerged anonymous id it could not
@@ -62,11 +65,23 @@ static UNCARRIED: AtomicBool = AtomicBool::new(false);
 /// one [`DEFAULT_SHUTDOWN_BUDGET`].
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
 
+/// Whether this process runs under CI, read once so the `ci` tag and every
+/// decision made from it agree.
+static CI_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// See [`CI_RUN`]. A CI run prints no notice, sends every event under the
+/// random id with no person profile, and never joins that id to an account.
+fn ci_run() -> bool {
+    *CI_RUN.get_or_init(cerulion_telemetry::ci::detected)
+}
+
 /// Next to the consent file: an anonymous id that a signed-in account has
-/// not been merged with yet. Holds no data; its presence is the flag. The
-/// CLI itself has sent nothing by the time the notice run ends, so what this
-/// merge joins to the account are the events another surface on the
-/// machine, such as the vizd daemon, sent under the same consent file's id.
+/// not been merged with yet. Holds no data; its presence is the flag.
+/// Outside CI the CLI itself has sent nothing by the time the notice run
+/// ends, so what this merge joins to the account are the events another
+/// surface on the machine, such as the vizd daemon, sent under the same
+/// consent file's id. CI events under the id carry no person profile and
+/// are never joined.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -81,14 +96,13 @@ const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 #[cfg(feature = "telemetry")]
 const ANON_ACCOUNT_FILE: &str = "telemetry_anon_account";
 
-/// Printed to stderr once per machine, on the first run that could send.
-pub const NOTICE: &str = "\
-Cerulion sends usage events from this CLI: the verb you ran, its exit code, \
-a rough duration and how it was installed, under your Cerulion account id \
-once you sign in and a random anonymous id before that. Never arguments, \
-paths, topic names or data.
-Turn it off with `cerulion telemetry off` or DO_NOT_TRACK=1. Details: \
-https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
+/// Printed to stderr once per machine, on the first run that could send and
+/// whose stderr is a terminal. One line, so it stays out of the way.
+pub const NOTICE: &str = "Cerulion sends usage telemetry; turn it off with \
+`cerulion telemetry off` (details: `cerulion telemetry status`).";
+
+/// What is sent, in full; printed by `cerulion telemetry status`.
+const DETAILS_URL: &str = "https://github.com/cerulion-inc/cerulion/blob/main/docs/telemetry.md";
 
 /// Verbs that record no `cli_command_run`: the consent verb itself (an
 /// opt-out must not be counted), the completion hook a shell runs on every
@@ -110,6 +124,7 @@ pub fn common() -> Common {
         .into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         channel: None,
+        ci: ci_run(),
     }
 }
 
@@ -167,7 +182,8 @@ pub struct CommandRun {
 
 impl CommandRun {
     /// Begin recording, or `None` when nothing may be sent: no key or no
-    /// consent, an unrecorded verb, or this run printed the first-run notice.
+    /// consent, an unrecorded verb, this run printed the first-run notice, or
+    /// the notice is owed and stderr is not a terminal (outside CI).
     pub fn start(matches: &clap::ArgMatches) -> Option<CommandRun> {
         let (verb, sub) = matches.subcommand()?;
         let subverb = sub.subcommand_name();
@@ -175,18 +191,23 @@ impl CommandRun {
             return None;
         }
         let client = Client::from_env_or_key(BAKED_KEY, common())?;
-        // Printed under the consent lock before it is recorded: concurrent
-        // first runs print it once, and a run killed in between prints it
-        // again next time. The run that prints it sends nothing.
-        // A closed stderr must not stop the command: the notice is then never
-        // saved as shown, so a later run shows it, and this run sends nothing.
+        // The notice is owed until a run whose stderr is a terminal prints
+        // it; that run sends nothing, so a person reads it before the first
+        // event leaves the machine. A CI run prints nothing and sends (tagged
+        // `ci`), terminal or not, and leaves the notice owed. Any other run
+        // without a terminal prints nothing, sends nothing, and leaves the
+        // notice owed. A closed stderr must not stop the command: the notice
+        // is then never saved as shown, so a later run shows it.
         match consent::notice_shown() {
             Ok(true) => {}
+            Ok(false) | Err(cerulion_telemetry::Error::Json(_)) if ci_run() => {}
             // Written outside the consent lock, so a stderr nobody drains
             // holds up only this run. Two first runs at once may both show
             // it; neither sends. It is saved as shown only once written.
             Ok(false) | Err(cerulion_telemetry::Error::Json(_)) => {
-                if writeln!(std::io::stderr(), "{NOTICE}\n").is_ok() {
+                if std::io::stderr().is_terminal()
+                    && writeln!(std::io::stderr(), "{NOTICE}").is_ok()
+                {
                     let _ = consent::mark_notice_shown();
                 }
                 NOTICE_RUN.store(true, Ordering::Relaxed);
@@ -249,7 +270,12 @@ pub fn emit(spec: EventSpec, props: Props) {
     let Some(client) = guard.as_ref() else {
         return;
     };
-    match auth::load().state().and_then(|s| hosted_sub(&s.account_id)) {
+    let account = if ci_run() {
+        None
+    } else {
+        auth::load().state().and_then(|s| hosted_sub(&s.account_id))
+    };
+    match account {
         Some(sub) => {
             consent::while_enabled(|| client.capture(spec, &sub, props));
         }
@@ -406,6 +432,11 @@ fn settle_anon_account() -> bool {
 fn merge_pending_alias(client: &Client) {
     #[cfg(feature = "telemetry")]
     {
+        // A CI run joins nothing to an account; the marker waits for a run
+        // outside CI.
+        if ci_run() {
+            return;
+        }
         let Some(path) = pending_alias_path().filter(|p| p.exists()) else {
             return;
         };
@@ -452,6 +483,10 @@ fn hosted_sub(account_id: &str) -> Option<String> {
 /// is asked right before the device-start request, and only when a login
 /// runs.
 pub fn login_anon_id() -> Option<String> {
+    // A CI run never joins the random id to an account.
+    if ci_run() {
+        return None;
+    }
     // Only a machine that never signed in carries its id. A signed-out
     // record still names the account that was here, and a corrupt one may:
     // the next sign-in can be someone else, so neither counts as never.
@@ -487,8 +522,8 @@ pub fn login_anon_id() -> Option<String> {
         }
         return Some(anon_id);
     }
-    // Only the notice run defers a merge; any other non-sending run mints no
-    // id and writes no consent file.
+    // Only a run that owed the notice defers a merge; any other non-sending
+    // run mints no id and writes no consent file.
     if NOTICE_RUN.load(Ordering::Relaxed)
         && consent::status().enabled
         && consent::anon_id().ok().flatten().is_some()
@@ -512,6 +547,11 @@ pub fn login_completed(outcome: &LoginOutcome) {
     #[cfg(not(feature = "telemetry"))]
     let carried = outcome.telemetry_anon_id.as_deref();
     if !SENDING.load(Ordering::Relaxed) || !consent::status().enabled {
+        return;
+    }
+    if ci_run() {
+        // No merge from CI: the event goes out under the random id.
+        emit(CLI_LOGIN_COMPLETED, login_props(outcome.switched_account));
         return;
     }
     let Some(sub) = hosted_sub(&outcome.state.account_id) else {
@@ -659,6 +699,7 @@ pub fn run_verb(action: TelemetryAction, out: &mut impl Write) -> CliResult<()> 
             writeln!(out, "consent file: {}", path.display()).map_err(io)?;
         }
     }
+    writeln!(out, "what is sent: {DETAILS_URL}").map_err(io)?;
     Ok(())
 }
 

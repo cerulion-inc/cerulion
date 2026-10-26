@@ -30,8 +30,18 @@ Every event carries:
 |---|---|---|
 | `surface` | `cli` | `cli` or `vizd` |
 | `env` | `prod` | `prod` for a release build, `dev` for a debug build |
-| `app_version` | `0.4.0` | the binary's version |
-| an id | see below | who the event belongs to |
+| `app_version` | `1.0.0` | the binary's version |
+| `ci` | `false` | `true` when the run is under CI (see below) |
+| `$lib` | `cerulion_telemetry` | the sending library, a PostHog field |
+| `$lib_version` | `1.0.0` | that library's version |
+| an id | see below | who the event belongs to (`distinct_id`) |
+
+Each event also has a `uuid` (a time-ordered UUID v7) and the `timestamp`
+it was queued at.
+Every event sent under the random id, which includes every event from a CI
+run, carries `$process_person_profile: false`, so PostHog creates no person
+profile for it. Requests carry the header
+`User-Agent: cerulion_telemetry/<version>`.
 
 The events:
 
@@ -51,6 +61,7 @@ The events:
 | `pair_completed` | `cerulion pair` | `is_success` |
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
+| `$create_alias` | a first login's own run, or, when that run sent nothing, the next run outside CI that sends (see below) | `alias`: the random id being joined to the account |
 
 The command's name (`verb` and `subverb` above) is the only part of a command
 line that is sent. Never sent: command arguments, file or directory names,
@@ -60,15 +71,19 @@ like a URL, an email address or a path, or is longer than 128 characters, is
 dropped instead of sent.
 
 The id is your Cerulion account id once this machine has signed in, and a
-random `anon:<uuid>` before that. The random id lives in the consent file.
+random `anon:<uuid>` before that; a CI run always uses the random id. The
+random id lives in the consent file.
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are
-joined to the account. Nothing else is added to the login. A machine that
-signed out keeps its account on record and carries nothing. If that first
-login happens in the run that printed the notice, which sends nothing, an
+joined to the account; the CLI also sends a `$create_alias` event for the
+join. A CI run never joins: its login carries no id and sends no alias.
+Nothing else is added to the login. A machine that signed out keeps its account on record and carries nothing. If that first
+login happens in a run that owed the notice (the run that printed it, or
+one without a terminal before it was shown), which sends nothing, an
 empty `telemetry_alias_pending` file next to the consent file marks the join
-as owed, and the next run that sends makes it and deletes the file. Only a
+as owed, and the next run outside CI that sends makes it and deletes the
+file. Only a
 hosted account id is joined this way; the events of any other account stay
 under the random id. A `telemetry_anon_account` file next to the consent
 file records the account the random id was used for. It is created, empty,
@@ -76,7 +91,7 @@ before a login carries the id, and the account is written into it once the
 login completes. A login that fails after that request keeps it: the
 account service may have joined the id anyway, so the id is never carried
 again and is replaced when an account next signs in. A run that sends
-under an account records the account too, and a run that sends nothing
+while signed in records the account too, CI included, and a run that sends nothing
 records nothing. A random id with a record is never carried into a later
 login, even after the sign-in state is removed. When a different account
 signs in on the same machine, the random id is replaced, so later anonymous
@@ -88,11 +103,34 @@ subprocesses a command starts for itself.
 
 ## The first-run notice
 
-The first command that could send prints a short notice on stderr and sends
-nothing. Later commands send. The notice is shown once per machine: it is
-saved as shown only once it has been written, so a run that is killed while
-printing it shows it again next time, and two first commands started at the
-same moment may both show it (neither sends).
+The first command that could send, run with stderr on a terminal, prints one
+line on stderr, and the CLI sends nothing in that run:
+
+```text
+Cerulion sends usage telemetry; turn it off with `cerulion telemetry off` (details: `cerulion telemetry status`).
+```
+
+Later commands send. The notice is shown once per machine: it is saved as
+shown only once it has been written, so a run that is killed while printing
+it shows it again next time, and two first commands started at the same
+moment may both show it (neither sends). A command whose stderr is not a
+terminal prints no notice and, until the notice has been shown, sends
+nothing, unless it runs under CI. The vizd daemon prints no notice of its
+own and sends nothing until the CLI has shown it on the machine (or under
+CI), so a `cerulion viz` that prints the notice may start a daemon that
+sends. `cerulion telemetry status` prints the link to this page.
+
+## CI runs
+
+A run is under CI when one of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`,
+`BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`,
+`TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, `CODEBUILD_BUILD_ID`, `DRONE` or
+`APPVEYOR` is set and not empty; `CI` set to `false`, `0`, `no` or `off`
+does not count. A CI run prints no notice, on a terminal or not, and still
+sends. Its events carry `ci: true`, go out under the random id with no
+person profile, and are never joined to an account, so CI traffic can be
+filtered out of user counts. It leaves the notice owed to the first run
+outside CI. The settings below turn telemetry off in CI as anywhere else.
 
 ## Turning it off
 
@@ -101,7 +139,7 @@ Any one of these turns telemetry off:
 ```bash
 cerulion telemetry off     # persists for this machine
 export DO_NOT_TRACK=1      # any tool that honours the convention
-export CERULION_TELEMETRY=0
+export CERULION_TELEMETRY=0   # or false, off, no
 ```
 
 `cerulion telemetry status` prints the current decision and which setting
@@ -109,7 +147,8 @@ made it; `cerulion telemetry on` turns it back on. The settings are checked
 in this order, and the first one that decides wins:
 
 1. `DO_NOT_TRACK=1` (or `true`) turns telemetry off.
-2. `CERULION_TELEMETRY=0` turns it off, `CERULION_TELEMETRY=1` turns it on.
+2. `CERULION_TELEMETRY` set to `0`, `false`, `off` or `no` (either case)
+   turns it off, and exactly `1` turns it on. Any other value is ignored.
 3. The consent file, written by `cerulion telemetry on|off`.
 4. Otherwise telemetry is on (a build without a key still sends nothing).
 
@@ -132,6 +171,17 @@ but cannot be read counts as off.
 
 ## Where events go
 
-Events are sent to PostHog over HTTPS in one small batch when a command
-exits. Sending never delays a command by more than 300 ms: if the network is
-slow or down, the events are dropped, never written to disk and retried.
+Events are sent to PostHog's US cloud (`https://us.i.posthog.com`; any run
+uses `POSTHOG_HOST` instead when it is set) over HTTPS. Each event is sent
+as soon as it is queued, so a long command such as `cerulion graph run`
+sends `graph_run_started` while it runs. Sending never delays a command's
+exit by more than 300 ms: if the network is slow or down, the events are
+dropped, never written to disk and retried.
+
+PostHog records the IP address each request comes from (`$ip`) and, from
+it, an approximate location stored with the event as `$geoip_*` properties:
+continent, country, region, city, postal code, time zone, and a latitude and
+longitude near the city. Events
+are kept for PostHog's event retention period, from one to seven years
+depending on the project's plan
+(<https://posthog.com/docs/data/events-retention>).

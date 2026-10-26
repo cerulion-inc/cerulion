@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Enabled/disabled resolution and the shared consent file.
 //!
-//! Precedence (highest first): `DO_NOT_TRACK=1` > `CERULION_TELEMETRY=0|1` >
+//! Precedence (highest first): `DO_NOT_TRACK=1` > `CERULION_TELEMETRY` (`0|false|off|no`
+//! or `1`) >
 //! `${CERULION_HOME:-~/.cerulion}/telemetry.json` > default (enabled).
 //!
 //! The file is shared with Cerulion Studio, which reads and writes the same
@@ -29,7 +30,7 @@ pub enum Source {
     NotCompiled,
     /// `DO_NOT_TRACK=1` (<https://consoledonottrack.com>).
     DoNotTrack,
-    /// `CERULION_TELEMETRY=0` or `=1`.
+    /// `CERULION_TELEMETRY` set to an off or on spelling.
     EnvVar,
     /// `telemetry.json`'s `enabled` field.
     File,
@@ -49,8 +50,10 @@ pub struct Status {
 ///
 /// `DO_NOT_TRACK` counts as set for `1` or `true` (case-insensitive), the
 /// convention says `1`, and treating `true` as a request to track would be the
-/// wrong way to be strict. `CERULION_TELEMETRY` is honoured only for exactly
-/// `0` or `1`; any other spelling falls through to the file.
+/// wrong way to be strict. `CERULION_TELEMETRY` turns telemetry off for `0`,
+/// `false`, `off` or `no` (case-insensitive) and on only for exactly `1`:
+/// an opt-in overrides the consent file, so it takes the one deliberate
+/// spelling. Any other value falls through to the file.
 pub fn resolve(
     do_not_track: Option<&str>,
     cerulion_telemetry: Option<&str>,
@@ -65,20 +68,20 @@ pub fn resolve(
             source: Source::DoNotTrack,
         };
     }
-    match cerulion_telemetry.map(str::trim) {
-        Some("0") => {
+    if let Some(value) = cerulion_telemetry.map(str::trim) {
+        let is = |words: &[&str]| words.iter().any(|w| value.eq_ignore_ascii_case(w));
+        if is(&["0", "false", "off", "no"]) {
             return Status {
                 enabled: false,
                 source: Source::EnvVar,
-            }
+            };
         }
-        Some("1") => {
+        if value == "1" {
             return Status {
                 enabled: true,
                 source: Source::EnvVar,
-            }
+            };
         }
-        _ => {}
     }
     match file_enabled {
         Some(enabled) => Status {
