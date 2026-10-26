@@ -137,6 +137,7 @@ mod tests {
     #[test]
     fn indexing_preserves_first_wins_and_topic_binding_precedes_hash_binding() {
         let schemas = LocalSchemas::from_serving(SchemaServing {
+            served_topics: vec!["/reading".into()],
             topic_schemas: vec![
                 TopicSchema {
                     topic: "/reading".into(),

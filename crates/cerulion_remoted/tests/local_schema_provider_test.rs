@@ -33,6 +33,7 @@ const BUILTIN_HASH: u64 = 0x1112_1314_1516_1718;
 
 fn serving() -> SchemaServing {
     SchemaServing {
+        served_topics: vec![TOPIC.into(), RAW_TOPIC.into()],
         topic_schemas: vec![TopicSchema {
             topic: TOPIC.into(),
             schema_name: ROOT.into(),
@@ -110,6 +111,7 @@ fn frame(hash: u64) -> [u8; WireHeader::SIZE] {
         offset_table_count: 0,
         sequence: 7,
         timestamp_ns: 19,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut bytes);
     bytes

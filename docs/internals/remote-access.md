@@ -412,8 +412,10 @@ network-serving run registers the machine. The gate is the LISTEN locator
 (`CERULION_NETD_LISTEN`): it is what makes netd a standing gateway, and only a
 standing gateway starts `robot_supervisor`. netd is spawn-once, so the variable
 must be in netd's OWN environment before the first command that spawns it; a
-netd already running without it must be stopped, and a failed registration is
-not retried until netd restarts.
+netd already running without it must be stopped. A failed registration, or a
+`cerulion-remoted` that exits, is retried with a backoff that doubles from 5 s
+to a 300 s cap, at most 30 attempts per netd lifetime; each failure is a
+warning naming the reason and the next wait.
 
 The supervisor resolves two SIBLINGS of the running netd binary and runs them in
 turn: `cerulion bootstrap-robot --state-root <root>`, a hidden login-gated
@@ -430,12 +432,15 @@ The robot's identity is the login device key, so the endpoint id a desk dials is
 the key registration proved possession of. Roots come from the issuer's
 well-known endpoint. Registration is idempotent: an already-registered machine
 does nothing. If the account service is unreachable at first serve the WAN plane
-refuses loudly with the reason and the LAN plane keeps serving; there is no
-retry loop that hides the outage.
+refuses loudly with the reason, the LAN plane keeps serving, and the supervisor
+retries on the backoff above.
 
 **On the desk, there is no pairing step.** `topic list` and `viz --robot` read
 the account's robots from the issuer's owner-only list endpoint and mark each
-one with a bounded presence probe. Selection is by exact, case-sensitive display
+one with a bounded presence probe. The directory fetch inside `topic list` has
+its own 2 s deadline (`LISTING_FETCH_BUDGET`, session refresh included); past it,
+or on any error, the listing prints its LAN half and one
+`account robots not listed: <reason>` line. Selection is by exact, case-sensitive display
 name, or by the reserved `account:<robot id>` route; a display name shared with a
 LAN robot is reported as a collision and refused rather than guessed. A
 directory entry is never reachability evidence by itself. The first demand of a
