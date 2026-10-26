@@ -18,8 +18,9 @@ daemon's memory, so a daemon restart clears it. Nothing outside the daemon can
 read that state yet: an engage returns a reply to the caller, writes a warning
 to the log, and asks Flashback to save a recording. A robot still needs its own
 stop path (a hardwired e-stop) to stop motion. Only the `cerulion-remoted`
-daemon serves `engage-estop` and `restart`: a process that hosts the remote plane
-as a library refuses both with an `unsupported_host` error. An Android app can
+daemon serves `engage-estop`, `restart` and the act verbs (`topic-publish`,
+`service-call`, `topic-snapshot`, `topic-echo-once`): a process that hosts the
+remote plane as a library refuses each with an `unsupported_host` error. An Android app can
 host the plane in its own process (see
 [Host the paired remote plane](android.md#host-the-paired-remote-plane)); a
 paired desk reads its catalog, schemas and topics there and cannot publish

@@ -94,6 +94,8 @@ pub mod node_params_info;
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
 // iroh-free; the CPace ceremony lives in the spawned sibling).
 pub mod pair_cmd;
+/// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
+pub mod robot_act;
 // Login-gated ownership at install: `register_robot` (`POST
 // /v1/robots`) binds the logged-in account as THIS machine's owner and returns
 // the offline-verifiable owner grant. The install-funnel entry (a robot install,

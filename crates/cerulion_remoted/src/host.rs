@@ -22,13 +22,19 @@
 //!
 //! ## Daemon-only verbs
 //!
-//! Two ops verbs act on things only the daemon has, so a host built with
+//! Six ops verbs act on things only the daemon has, so a host built with
 //! [`RemotePlane::new`] refuses them by name with a clear `unsupported_host`
 //! error, after the authorizer has classified the caller as usual:
 //!
 //! - `restart` restarts a graph's systemd unit;
 //! - `engage-estop` engages the daemon's control lease and asks for an incident
-//!   capture. A host that served it would report an e-stop that stops nothing.
+//!   capture. A host that served it would report an e-stop that stops nothing;
+//! - `topic-publish` and `service-call` send through the process's transport
+//!   singleton only while the daemon's e-stop is clear, and a host serves no
+//!   e-stop that could stop them;
+//! - `topic-snapshot` and `topic-echo-once` read through that singleton and the
+//!   daemon's schema directory, not the host's transport and schemas. A desk
+//!   reads a host's topics over the wire plane.
 //!
 //! ## What a host takes on
 //!
@@ -109,8 +115,8 @@ impl KeyProvider for KeyFiles {
 pub(crate) enum OpsHost {
     /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages `lease`.
     Daemon { lease: Arc<Mutex<ControlLease>> },
-    /// A library host: `restart` and `engage-estop` are refused by name, so it
-    /// has no lease to engage.
+    /// A library host: `restart`, `engage-estop` and the act verbs are refused
+    /// by name, so it has no lease to engage.
     Embedded,
 }
 
@@ -168,8 +174,8 @@ impl RemotePlane {
     /// `<state_root>/remoted/`). `robot` is the identity every wire reply names;
     /// `control_socket` is the local network daemon's control socket the
     /// `catalog` and `schema` replies read; `relay` is the endpoint's relay
-    /// posture. `restart` and `engage-estop` are refused, and the kill switch is
-    /// not read (see the module docs).
+    /// posture. `restart`, `engage-estop` and the act verbs are refused, and the
+    /// kill switch is not read (see the module docs).
     pub fn new(
         state_root: impl AsRef<Path>,
         robot: impl Into<String>,
@@ -187,8 +193,8 @@ impl RemotePlane {
     /// A library host's plane that reads the served topics' schemas from
     /// `schemas` in this process instead of a network daemon's control socket.
     /// Everything else is as [`RemotePlane::new`]: files under
-    /// `<state_root>/remoted/`, `restart` and `engage-estop` refused, no kill
-    /// switch read. The `catalog` still lists the live topics of the plane's
+    /// `<state_root>/remoted/`, `restart`, `engage-estop` and the act verbs
+    /// refused, no kill switch read. The `catalog` still lists the live topics of the plane's
     /// transport; `schemas` names their schemas and serves the `schema` verb.
     pub fn in_process(
         state_root: impl AsRef<Path>,
@@ -360,8 +366,8 @@ impl BoundPlane {
             HostKind::Daemon => (OpsHost::daemon(), DAEMON_SERVER_NAME),
             HostKind::Embedded => {
                 tracing::info!(
-                    "cerulion_remoted: serving as a library host; restart and engage-estop \
-                     are refused (daemon only)"
+                    "cerulion_remoted: serving as a library host; restart, engage-estop \
+                     and the act verbs are refused (daemon only)"
                 );
                 (OpsHost::Embedded, EMBEDDED_SERVER_NAME)
             }
@@ -390,7 +396,8 @@ impl RemotedConfig {
     ///
     /// It uses the configured state files and relay, the robot identity from the
     /// environment (`CERULION_ROBOT_IDENTITY`, else the hostname), the default
-    /// control socket, and every ops verb including `restart` and `engage-estop`.
+    /// control socket, and every ops verb including `restart`, `engage-estop`
+    /// and the act verbs.
     /// [`run`](crate::daemon::run) serves it with [`RemotedConfig::key_files`].
     /// A host embeds [`RemotePlane::new`] instead.
     #[doc(hidden)]

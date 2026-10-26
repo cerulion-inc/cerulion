@@ -27,7 +27,8 @@
 //!   through a [`KeyProvider`] and binds the endpoint; [`BoundPlane::serve`] runs
 //!   the accept loop. The daemon's [`run`] serves
 //!   [`RemotedConfig::daemon_plane`] with the [`KeyFiles`] provider; a library
-//!   host refuses the daemon-only `restart` and `engage-estop` verbs by name.
+//!   host refuses the daemon-only `restart`, `engage-estop` and act verbs by
+//!   name.
 //! - [`daemon`]: the kill switch, then the serving core: the `accept_one` loop dispatching on
 //!   the negotiated protocol. Each accepted connection is classified by the
 //!   authorizer and handed to the wire plane or the ops plane; a connection that is
@@ -83,6 +84,7 @@
 // `cerulion_cli_engine/tests/library_print_ban_test.rs`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod act_verbs;
 pub mod authorizer;
 pub mod beacon_facts;
 pub mod clock;

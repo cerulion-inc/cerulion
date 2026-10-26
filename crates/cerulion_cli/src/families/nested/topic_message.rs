@@ -40,6 +40,11 @@ enum TopicMessageAction {
         /// no LAN offer.
         #[arg(long)]
         local: bool,
+        /// Run on the paired robot NAME (a `~/.cerulion/robots.toml` name or
+        /// endpoint id) through its ops plane instead of on this machine.
+        #[arg(long, value_name = "NAME", conflicts_with = "local",
+              add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// How many frames to publish
         #[arg(long, value_name = "N", default_value_t = 1,
               value_parser = clap::value_parser!(u64).range(1..))]
@@ -73,6 +78,11 @@ enum TopicMessageAction {
         /// Read genuine local shared-memory producers only.
         #[arg(long)]
         local: bool,
+        /// Run on the paired robot NAME (a `~/.cerulion/robots.toml` name or
+        /// endpoint id) through its ops plane instead of on this machine.
+        #[arg(long, value_name = "NAME", conflicts_with = "local",
+              add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Where to write the JPEG (default: a file in the system temp
         /// directory)
         #[arg(short = 'o', long = "output", value_name = "PATH")]
@@ -150,6 +160,7 @@ fn run(action: TopicMessageAction) -> Result<String, VerbError> {
     match action {
         TopicMessageAction::Pub {
             local,
+            robot,
             times,
             rate,
             wait_subscribers,
@@ -166,10 +177,14 @@ fn run(action: TopicMessageAction) -> Result<String, VerbError> {
                 wait_subscribers: seconds("--wait-subscribers", wait_subscribers)?,
                 scope: TopicScope::from_local(local),
             };
-            publish::topic_pub(&req, schemas_dir, &running).map(|r| r.line())
+            match robot {
+                Some(robot) => cerulion_cli_engine::robot_act::robot_pub(&robot, &req),
+                None => publish::topic_pub(&req, schemas_dir, &running).map(|r| r.line()),
+            }
         }
         TopicMessageAction::Snapshot {
             local,
+            robot,
             output,
             timeout,
             quality,
@@ -182,7 +197,12 @@ fn run(action: TopicMessageAction) -> Result<String, VerbError> {
                 quality,
                 scope: TopicScope::from_local(local),
             };
-            snapshot::topic_snapshot(&req, schemas_dir, &running).map(|r| r.json_line())
+            match robot {
+                Some(robot) => cerulion_cli_engine::robot_act::robot_snapshot(&robot, &req),
+                None => {
+                    snapshot::topic_snapshot(&req, schemas_dir, &running).map(|r| r.json_line())
+                }
+            }
         }
     }
 }

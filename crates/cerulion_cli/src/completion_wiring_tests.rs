@@ -468,6 +468,9 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion node stage::graph",
         "cerulion node stage::node_type",
         "cerulion pair::robot",
+        "cerulion service call::robot",
+        "cerulion topic pub::robot",
+        "cerulion topic snapshot::robot",
         // The one arg whose source needs a LIVE iceoryx2 topic — behaviourally
         // unreachable in a hermetic test, so the structural pin is what covers
         // it. A live positive is in `topic hz`'s own e2e transcript.

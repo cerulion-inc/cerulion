@@ -57,6 +57,9 @@ cerulion_netd = { workspace = true, default-features = false }
 # PairingAuthorizer implements cerud's `authz::Authorizer` seam, so cerud's
 # server gates every verb through it.
 cerud = { path = "../cerud" }
+# The act verbs' operations (publish, service call, snapshot, decode one
+# message) on local shared memory, shared with the `cerulion` CLI.
+cerulion_msgio = { path = "../cerulion_msgio" }
 # The offline-verifiable trust store + access list + scope/caps model. The
 # accept gate reads it (never re-runs the full chain per connect — the access
 # row is truth).

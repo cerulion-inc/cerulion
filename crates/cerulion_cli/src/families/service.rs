@@ -37,10 +37,16 @@ enum ServiceAction {
     /// rmw_cerulion serve, so `/controller_manager/list_controllers` answers
     /// with no ROS tools installed. TYPE's `.srv` file is read from the
     /// workspace's `schemas/<pkg>/srv/<Type>.srv`. The server must run on
-    /// this machine. Exit 3 when no server or no response arrives within
+    /// this machine, or with `--robot` on that paired robot. Exit 3 when no server or no response arrives within
     /// `--timeout` (one deadline for both), 2 for a usage error or an unknown type, 1 for a value
     /// that does not fit its field.
     Call {
+        /// Call the service on the paired robot NAME (a `~/.cerulion/robots.toml`
+        /// name or endpoint id) through its ops plane instead of on this
+        /// machine.
+        #[arg(long, value_name = "NAME",
+              add = clap_complete::engine::ArgValueCandidates::new(crate::completion::robot_names))]
+        robot: Option<String>,
         /// Seconds to wait in total for a server and its response
         #[arg(long, value_name = "SECS",
               default_value_t = service_cmd::DEFAULT_CALL_TIMEOUT.as_secs_f64())]
@@ -91,6 +97,7 @@ impl VerbFamily for Service {
 fn run(action: ServiceAction) -> Result<String, VerbError> {
     match action {
         ServiceAction::Call {
+            robot,
             timeout,
             service,
             type_name,
@@ -105,7 +112,10 @@ fn run(action: ServiceAction) -> Result<String, VerbError> {
                 request: &request,
                 timeout: seconds("--timeout", timeout)?,
             };
-            service_cmd::service_call(&req, schemas_dir, &running)
+            match robot {
+                Some(robot) => cerulion_cli_engine::robot_act::robot_service_call(&robot, &req),
+                None => service_cmd::service_call(&req, schemas_dir, &running),
+            }
         }
     }
 }

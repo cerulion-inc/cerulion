@@ -42,9 +42,13 @@ the same entry instead of running the daemon.
   reads a key file or the default socket path itself: a serving change lands
   once for both hosts. A library host
   (`RemotePlane::new`) refuses the daemon-only verbs by name with
-  `unsupported_host`: `restart` (it restarts a systemd unit) and `engage-estop`
+  `unsupported_host`: `restart` (it restarts a systemd unit), `engage-estop`
   (it engages the daemon's control lease and incident capture; a host that served
-  it would report an e-stop that stops nothing). The authorizer still runs first,
+  it would report an e-stop that stops nothing), and the act verbs
+  `topic-publish`, `service-call`, `topic-snapshot` and `topic-echo-once` (they
+  run on the process's transport singleton and the daemon's schema directory, and
+  the two that send are gated by the daemon's e-stop, which a library host does
+  not serve). The authorizer still runs first,
   so an unpaired caller is denied as on the daemon. A library host announces
   `cerulion-remote-plane` in the ops handshake, not `cerulion-remoted`, does not
   read the `--network` / `CERULION_NETWORK` kill switch (the host decides
@@ -339,6 +343,28 @@ robot registers (for example `restart` and `engage-estop`).
   issuer down and the relay unreachable: direct dial + the offline trust store;
   the issuer and relay are conveniences, not dependencies
   (`offline_connect_test.rs`).
+
+### 5.1 The act verbs (`act_verbs.rs`)
+
+Four ops verbs run generic operations on the robot's own shared memory for a
+paired peer, so a desk can act on a ROS 2 stack (on `rmw_cerulion`) or a
+Cerulion graph without a LAN egress path for the topic or service:
+
+| verb | row in `classify_verb` | mutating | result |
+|---|---|---|---|
+| `topic-publish` `{topic, type, message, times?, rate_hz?, wait_subscribers_s?}` | `CAP_TELEOP`, role OPERATOR | yes | `{topic, type, frames, subscribers, line}` |
+| `service-call` `{service, type, request?, timeout_s?}` | `CAP_TELEOP`, role OPERATOR | yes | `{response, response_text}` (`response_text`: the response as one JSON line, fields in declaration order) |
+| `topic-snapshot` `{topic, timeout_s?, quality?}` | `CAP_OBSERVE`, role VIEWER | no | `{jpeg_base64, width, height, encoding, stamp_ns, bytes}` |
+| `topic-echo-once` `{topic, timeout_s?}` | `CAP_OBSERVE`, role VIEWER | no | `{type, stamp_ns, sequence, message}` |
+
+The operations are `cerulion_msgio`'s, the ones `cerulion topic pub`,
+`service call` and `topic snapshot` run locally. Types resolve from the
+built-in corpus plus the `.msg`/`.srv` store under the directory
+`CERULION_REMOTED_SCHEMAS_DIR` names (read per call). A failure is
+`CerudError::Verb` whose text starts with the error class (`usage: `,
+`encode: `, `unavailable: `, `internal: `); the desk maps the class to the
+CLI's exit code (2, 1, 3, 1). Timeouts are capped at 60 s and a result at
+12 MiB, inside the 16 MiB ops frame.
 
 ## 6. The wire plane (robot side)
 
@@ -685,6 +711,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 
 | Test file | What it pins (1 line) |
 |---|---|
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, the unavailable class |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

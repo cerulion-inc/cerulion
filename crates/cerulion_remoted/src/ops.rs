@@ -155,9 +155,9 @@ impl OpsServing {
     }
 
     /// [`OpsServing::new`] with the verb set of `host`: a library host registers
-    /// [`DaemonOnlyVerb`] under the `restart` and `engage-estop` names, so the
-    /// authorizer still classifies each call and a permitted caller gets a clear
-    /// refusal instead of an unknown verb.
+    /// [`DaemonOnlyVerb`] under the `restart`, `engage-estop` and act verb
+    /// names, so the authorizer still classifies each call and a permitted
+    /// caller gets a clear refusal instead of an unknown verb.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_host(
         host: OpsHost,
@@ -318,9 +318,10 @@ impl OpsServing {
     }
 }
 
-/// The ops verb registry of `host`: cerud's mechanical verbs and the remote-plane
-/// bootstrap and safety verbs, with `restart` and `engage-estop` refused by name
-/// on an embedded host. Both hosts register the same names.
+/// The ops verb registry of `host`: cerud's mechanical verbs, the remote-plane
+/// bootstrap and safety verbs and the act verbs, with `restart`, `engage-estop`
+/// and the act verbs refused by name on an embedded host. Both hosts register
+/// the same names.
 fn verb_registry(
     host: OpsHost,
     shared: &SharedTrust,
@@ -328,16 +329,19 @@ fn verb_registry(
     clock: RemotedClock,
     log_root: PathBuf,
 ) -> VerbRegistry {
-    let (restart, engage_estop): (Box<dyn VerbHandler>, Box<dyn VerbHandler>) = match host {
-        OpsHost::Daemon { lease } => (
-            Box::new(RestartVerb::new()),
-            Box::new(EngageEstopVerb::new(lease)),
-        ),
-        OpsHost::Embedded => (
-            Box::new(DaemonOnlyVerb::RESTART),
-            Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),
-        ),
-    };
+    let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
+        match host {
+            OpsHost::Daemon { lease } => (
+                Box::new(RestartVerb::new()),
+                Box::new(EngageEstopVerb::new(lease.clone())),
+                Some(lease),
+            ),
+            OpsHost::Embedded => (
+                Box::new(DaemonOnlyVerb::RESTART),
+                Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),
+                None,
+            ),
+        };
     let mut verbs = VerbRegistry::new();
     // cerud's mechanical ops verbs.
     verbs
@@ -367,6 +371,21 @@ fn verb_registry(
         .register(Box::new(crate::robot_settings::CloudAccessVerb::new(
             shared.clone(),
         )));
+    // The act verbs: publish, service call, snapshot, one message.
+    match act_lease {
+        Some(lease) => verbs
+            .register(Box::new(crate::act_verbs::TopicPublishVerb::new(
+                lease.clone(),
+            )))
+            .register(Box::new(crate::act_verbs::ServiceCallVerb::new(lease)))
+            .register(Box::new(crate::act_verbs::TopicSnapshotVerb))
+            .register(Box::new(crate::act_verbs::TopicEchoOnceVerb)),
+        None => verbs
+            .register(Box::new(DaemonOnlyVerb::TOPIC_PUBLISH))
+            .register(Box::new(DaemonOnlyVerb::SERVICE_CALL))
+            .register(Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT))
+            .register(Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE)),
+    };
     verbs
 }
 
@@ -392,7 +411,32 @@ impl DaemonOnlyVerb {
               this host would report an e-stop that stops nothing; stop through the host's \
               own stop path",
     };
+    const TOPIC_PUBLISH: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_PUBLISH,
+        why: ACT_WRITE_WHY,
+    };
+    const SERVICE_CALL: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::SERVICE_CALL,
+        why: ACT_WRITE_WHY,
+    };
+    const TOPIC_SNAPSHOT: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_SNAPSHOT,
+        why: ACT_READ_WHY,
+    };
+    const TOPIC_ECHO_ONCE: Self = DaemonOnlyVerb {
+        name: crate::act_verbs::TOPIC_ECHO_ONCE,
+        why: ACT_READ_WHY,
+    };
 }
+
+/// Why a library host refuses `topic-publish` and `service-call`.
+const ACT_WRITE_WHY: &str = "it sends through the process's transport singleton only while the \
+                             daemon's e-stop is clear, and this host serves no e-stop that \
+                             could stop it";
+/// Why a library host refuses `topic-snapshot` and `topic-echo-once`.
+const ACT_READ_WHY: &str = "it reads through the process's transport singleton and the daemon's \
+                            schema directory, not this host's transport and schemas; read the \
+                            topic over the wire plane";
 
 impl VerbHandler for DaemonOnlyVerb {
     fn name(&self) -> &'static str {
@@ -424,7 +468,7 @@ mod verb_set_tests {
     use cerulion_pairing::format::{PublicKey, RobotId, RootSet};
     use cerulion_pairing::verify::TrustStore;
 
-    fn names(host: OpsHost) -> Vec<String> {
+    fn registry(host: OpsHost) -> VerbRegistry {
         let root = PublicKey(
             ed25519_dalek::SigningKey::from_bytes(&[1; 32])
                 .verifying_key()
@@ -439,13 +483,17 @@ mod verb_set_tests {
         )
         .unwrap();
         let shared = SharedTrust::new(store, DeviceAccountIndex::new(), Vec::new());
-        let registry = verb_registry(
+        verb_registry(
             host,
             &shared,
             SharedCodePairSessions::new(),
             RemotedClock::fixed(0),
             PathBuf::from("logs"),
-        );
+        )
+    }
+
+    fn names(host: OpsHost) -> Vec<String> {
+        let registry = registry(host);
         let mut names: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
         names.sort();
         names
@@ -469,8 +517,43 @@ mod verb_set_tests {
             "pair",
             "present-grant",
             "restart",
+            "service-call",
+            "topic-echo-once",
+            "topic-publish",
+            "topic-snapshot",
         ];
         assert_eq!(daemon, expected);
         assert_eq!(names(OpsHost::Embedded), expected);
+    }
+
+    #[test]
+    fn an_embedded_host_refuses_each_act_verb_by_name() {
+        let registry = registry(OpsHost::Embedded);
+        let args = serde_json::json!({
+            "topic": "/chatter",
+            "type": "std_msgs/msg/String",
+            "message": {"data": "hi"},
+            "service": "/add",
+        });
+        for verb in [
+            crate::act_verbs::TOPIC_PUBLISH,
+            crate::act_verbs::SERVICE_CALL,
+            crate::act_verbs::TOPIC_SNAPSHOT,
+            crate::act_verbs::TOPIC_ECHO_ONCE,
+        ] {
+            let handler = registry.get(verb).unwrap();
+            assert!(!handler.is_mutating(), "{verb} writes no intent receipt");
+            let err = handler.execute(&args).unwrap_err();
+            assert!(
+                matches!(err, CerudError::UnsupportedHost(_)),
+                "{verb}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!(
+                    "{verb} is served only by the cerulion-remoted daemon"
+                )),
+                "{verb}: {err}"
+            );
+        }
     }
 }
