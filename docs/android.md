@@ -470,9 +470,11 @@ paired app must refuse that demand twice in a row and send no frame. The open
 app must grant the same demand and deliver frames, which shows that the paired
 refusal comes from the posture and not from the topic or the allow-list. When
 the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
-on the schema hash. The probe's argument errors are checked before the device
-is used. `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict,
-and `tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
+on the schema hash. In every run the probe's ingress must lose no frame to a
+decode error, a local re-injection failure or its own LAN posture. The probe's
+argument errors are checked before the device is used.
+`tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
+`tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
 locally with a booted API 30 emulator:
 
 ```sh

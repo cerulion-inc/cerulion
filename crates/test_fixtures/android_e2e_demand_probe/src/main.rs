@@ -7,9 +7,10 @@
 //! with the schema it is told to expect, connected to ONE endpoint with
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
 //! bounded window. It reports the frames that reached its ingress from the
-//! network (`wire_frames`, whether re-injected or dropped by validation), the
-//! ones dropped because their schema hash was not the expected one
-//! (`schema_mismatch_drops`), and the frames its local subscriber received
+//! network (`wire_frames`, whether re-injected or dropped by validation), each
+//! drop bucket by name (`schema_mismatch_drops` when the schema hash was not
+//! the expected one, `decode_errors`, `reinject_failure_drops`,
+//! `lan_refused_drops`), and the frames its local subscriber received
 //! (`frames`). The probe's own LAN access is set to open, so its ingress never
 //! drops a frame on its own posture.
 //!
@@ -19,7 +20,7 @@
 //! and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 wire_frames=0 frames=0
+//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
 //! ```
 //!
 //! The verdict is the caller's (`tools/scripts/android_e2e_probe_verdict.sh`):
@@ -36,7 +37,7 @@ use cerulion_core::transport::demand_authorizer::LanAccess;
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
 };
-use cerulion_core::transport::network::NetworkConfig;
+use cerulion_core::transport::network::{IngressStats, NetworkConfig};
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use native_ros2_messages::std_msgs::{Int32, String as RosString};
 
@@ -132,22 +133,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     frames += subscriber.try_receive(|_| {})?;
     // Every frame the ingress callback received lands in exactly one of these
-    // five counters, so their sum is every frame that crossed the network.
-    let ingress = gateway
+    // five counters, so their sum is every frame that crossed the network. The
+    // pattern names every field with no `..`: a counter added to
+    // `IngressStats` stops this build until the sum counts it.
+    let IngressStats {
+        frames: reinjected,
+        schema_mismatch_drops,
+        decode_errors,
+        reinject_failure_drops,
+        lan_refused_drops,
+    } = gateway
         .manager()
         .network()
         .and_then(|network| network.ingress_stats(&args.topic))
         .ok_or("the probe's ingress bridge is not registered")?;
-    let wire_frames = ingress.frames
-        + ingress.schema_mismatch_drops
-        + ingress.decode_errors
-        + ingress.reinject_failure_drops
-        + ingress.lan_refused_drops;
+    let wire_frames = reinjected
+        + schema_mismatch_drops
+        + decode_errors
+        + reinject_failure_drops
+        + lan_refused_drops;
 
     println!(
         "demand_probe topic={} schema={} window_s={} passes={} enabled_acks={} refused_acks={} \
-         wire_header_refused_acks={} schema_mismatch_drops={} wire_frames={wire_frames} \
-         frames={frames}",
+         wire_header_refused_acks={} schema_mismatch_drops={schema_mismatch_drops} \
+         decode_errors={decode_errors} reinject_failure_drops={reinject_failure_drops} \
+         lan_refused_drops={lan_refused_drops} wire_frames={wire_frames} frames={frames}",
         args.topic,
         args.schema,
         args.window.as_secs(),
@@ -155,7 +165,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         gateway.demand_enabled_ack_count(),
         gateway.demand_refused_ack_count(),
         gateway.demand_wire_header_refused_ack_count(),
-        ingress.schema_mismatch_drops,
     );
     Ok(())
 }

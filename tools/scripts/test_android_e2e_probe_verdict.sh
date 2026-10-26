@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=25
+CASES_EXPECTED=32
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 verdict="$script_dir/android_e2e_probe_verdict.sh"
@@ -58,7 +58,8 @@ expect_output() {
 # report FIELD=VALUE... : one probe report line. The fields come in the order
 # the probe prints them; a case overrides only the ones it is about.
 report() {
-    local passes=5 enabled=0 refused=5 wire_header=0 mismatch=0 wire=0 frames=0
+    local passes=5 enabled=0 refused=5 wire_header=0 mismatch=0 decode=0 reinject=0
+    local lan_refused=0 wire=0 frames=0
     local schema=std_msgs/String
     local arg
     for arg in "$@"; do
@@ -68,14 +69,18 @@ report() {
             refused_acks=*) refused=${arg#*=} ;;
             wire_header_refused_acks=*) wire_header=${arg#*=} ;;
             schema_mismatch_drops=*) mismatch=${arg#*=} ;;
+            decode_errors=*) decode=${arg#*=} ;;
+            reinject_failure_drops=*) reinject=${arg#*=} ;;
+            lan_refused_drops=*) lan_refused=${arg#*=} ;;
             wire_frames=*) wire=${arg#*=} ;;
             frames=*) frames=${arg#*=} ;;
             schema=*) schema=${arg#*=} ;;
             *) printf 'report: unknown field %s\n' "$arg" >&2; exit 1 ;;
         esac
     done
-    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s wire_frames=%s frames=%s\n' \
-        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$wire" "$frames"
+    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$decode" \
+        "$reinject" "$lan_refused" "$wire" "$frames"
 }
 
 # A real run interleaves the probe's warn-level log lines with its report.
@@ -90,7 +95,7 @@ mismatch_ok=$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 \
 run_case paired_every_demand_refused paired "$log_line
 $paired_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 wire_frames=0 frames=0'
+expect_exact 'passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0'
 
 run_case paired_one_grant paired "$(report enabled_acks=1 refused_acks=4)"
 expect_status 1
@@ -100,13 +105,20 @@ run_case paired_frame_on_the_wire paired "$(report wire_frames=2)"
 expect_status 1
 expect_output 'a paired app sent 2 frame(s)'
 
-run_case paired_frame_delivered paired "$(report wire_frames=3 frames=3)"
+# A frame the probe's subscriber received that never crossed its ingress came
+# by another path (a host netd bridging into shared memory, say).
+run_case paired_frame_off_the_ingress paired "$(report frames=1)"
 expect_status 1
-expect_output 'a paired app sent 3 frame(s)'
+expect_output 'frames=1 is more than wire_frames=0'
 
 run_case paired_no_answer paired "$(report refused_acks=0)"
 expect_status 1
 expect_output 'no demand was refused'
+
+# The probe's own LAN access is open, so its ingress must never refuse a frame.
+run_case paired_lan_refused paired "$(report lan_refused_drops=1 wire_frames=1)"
+expect_status 1
+expect_output "the probe's ingress refused 1 frame(s) on its own LAN posture"
 
 run_case paired_wire_header_refusal paired "$(report wire_header_refused_acks=1)"
 expect_status 1
@@ -115,7 +127,7 @@ expect_output 'refused 1 demand(s) on the wire header'
 # --- open --------------------------------------------------------------------
 run_case open_granted_and_delivered open "$open_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=0 wire_frames=20 frames=20'
+expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=20'
 
 # The refused ack is the same bytes for every refusal reason, so an open app
 # that refuses even one demand makes a paired refusal prove nothing.
@@ -135,6 +147,14 @@ run_case open_schema_drops open "$(report enabled_acks=4 refused_acks=0 schema_m
 expect_status 1
 expect_output 'dropped 1 frame(s) on the schema'
 
+run_case open_more_dropped_than_received open "$(report enabled_acks=4 refused_acks=0 schema_mismatch_drops=21 wire_frames=20)"
+expect_status 1
+expect_output 'schema_mismatch_drops=21 is more than wire_frames=20'
+
+run_case open_decode_errors open "$(report enabled_acks=4 refused_acks=0 decode_errors=1 wire_frames=20 frames=19)"
+expect_status 1
+expect_output 'the ingress dropped 1 frame(s) as undecodable'
+
 run_case open_more_delivered_than_received open "$(report enabled_acks=4 refused_acks=0 wire_frames=2 frames=3)"
 expect_status 1
 expect_output 'frames=3 is more than wire_frames=2'
@@ -142,11 +162,28 @@ expect_output 'frames=3 is more than wire_frames=2'
 # --- schema mismatch -----------------------------------------------------------
 run_case mismatch_every_frame_dropped schema-mismatch "$mismatch_ok"
 expect_status 0
-expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=20 wire_frames=20 frames=0'
+expect_exact 'passes=5 enabled_acks=4 refused_acks=0 wire_header_refused_acks=0 schema_mismatch_drops=20 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=20 frames=0'
 
 run_case mismatch_frame_delivered schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20 frames=3)"
 expect_status 1
 expect_output 'delivered 3 frame(s) under the wrong schema'
+
+run_case mismatch_one_refusal schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=1 schema_mismatch_drops=20 wire_frames=20)"
+expect_status 1
+expect_output 'an open app refused 1 demand(s)'
+
+run_case mismatch_never_granted schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=0 refused_acks=0 schema_mismatch_drops=20 wire_frames=20)"
+expect_status 1
+expect_output 'an open app granted no demand'
+
+# Every frame must die on the schema; one lost another way is not the check.
+run_case mismatch_some_not_on_the_schema schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=17 wire_frames=20)"
+expect_status 1
+expect_output 'schema_mismatch_drops=17 is not every one of wire_frames=20'
+
+run_case mismatch_reinject_failures schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0 schema_mismatch_drops=18 reinject_failure_drops=2 wire_frames=20)"
+expect_status 1
+expect_output 'the ingress dropped 2 frame(s) on local re-injection'
 
 run_case mismatch_no_drop schema-mismatch "$(report schema=std_msgs/Int32 enabled_acks=4 refused_acks=0)"
 expect_status 1

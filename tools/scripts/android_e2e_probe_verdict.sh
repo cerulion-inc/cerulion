@@ -19,6 +19,10 @@
 #                    demand is granted, frames reach the ingress, and every one
 #                    is dropped on the schema hash, so none is delivered.
 #
+# In every expectation the ingress must lose no frame to a decode error, a
+# local re-injection failure or its own LAN posture (the probe's is open): a
+# frame lost that way would hide behind the counts the rules above read.
+#
 # Exit 0 prints the counters on one line. Exit 1 prints why the report fails.
 # Exit 2 is a usage error. The verdict reads only its arguments, so the same
 # report always gives the same bytes. Oracle table:
@@ -79,6 +83,9 @@ enabled=$(field enabled_acks) || { printf '%s\n' "$enabled"; exit 1; }
 refused=$(field refused_acks) || { printf '%s\n' "$refused"; exit 1; }
 wire_header=$(field wire_header_refused_acks) || { printf '%s\n' "$wire_header"; exit 1; }
 mismatch=$(field schema_mismatch_drops) || { printf '%s\n' "$mismatch"; exit 1; }
+decode=$(field decode_errors) || { printf '%s\n' "$decode"; exit 1; }
+reinject=$(field reinject_failure_drops) || { printf '%s\n' "$reinject"; exit 1; }
+lan_refused=$(field lan_refused_drops) || { printf '%s\n' "$lan_refused"; exit 1; }
 wire=$(field wire_frames) || { printf '%s\n' "$wire"; exit 1; }
 frames=$(field frames) || { printf '%s\n' "$frames"; exit 1; }
 
@@ -90,6 +97,11 @@ frames=$(field frames) || { printf '%s\n' "$frames"; exit 1; }
     reject "schema_mismatch_drops=$mismatch is more than wire_frames=$wire"
 [ "$wire_header" -eq 0 ] ||
     reject "the app refused $wire_header demand(s) on the wire header (a build mismatch)"
+[ "$decode" -eq 0 ] || reject "the ingress dropped $decode frame(s) as undecodable"
+[ "$reinject" -eq 0 ] ||
+    reject "the ingress dropped $reinject frame(s) on local re-injection"
+[ "$lan_refused" -eq 0 ] ||
+    reject "the probe's ingress refused $lan_refused frame(s) on its own LAN posture"
 
 case "$expect" in
     paired)
@@ -107,9 +119,12 @@ case "$expect" in
         [ "$refused" -eq 0 ] || reject "an open app refused $refused demand(s)"
         [ "$enabled" -ge 1 ] || reject 'an open app granted no demand'
         [ "$frames" -eq 0 ] || reject "the probe delivered $frames frame(s) under the wrong schema"
+        [ "$mismatch" -eq "$wire" ] ||
+            reject "schema_mismatch_drops=$mismatch is not every one of wire_frames=$wire"
         [ "$mismatch" -ge 1 ] || reject 'no frame was dropped on the schema, so the check was not exercised'
         ;;
 esac
 
-printf 'passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s wire_frames=%s frames=%s\n' \
-    "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$wire" "$frames"
+printf 'passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+    "$passes" "$enabled" "$refused" "$wire_header" "$mismatch" "$decode" "$reinject" \
+    "$lan_refused" "$wire" "$frames"
