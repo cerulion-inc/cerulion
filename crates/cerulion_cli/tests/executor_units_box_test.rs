@@ -91,6 +91,9 @@ const WARMUP: Duration = Duration::from_secs(2);
 const COOLDOWN: Duration = Duration::from_millis(500);
 /// A baseline leg below this many steady samples measured nothing.
 const MIN_BASELINE_SAMPLES: usize = 2000;
+/// Live eviction runs a stream may show with its units in one process beyond
+/// what the same stream shows with one process per node.
+const EVICTION_TOLERANCE: usize = 2;
 /// A slow leg below this many steady samples measured nothing either.
 const MIN_SLOW_SAMPLES: usize = 1000;
 
@@ -440,7 +443,7 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
     let mut compared = 0usize;
     for fixture in [Fixture::FanOut, Fixture::Ranks3] {
         let (run, units) = record_and_judge(fixture, Placement::OneGroup);
-        let (_, processes) = record_and_judge(fixture, Placement::Declared);
+        let (declared_run, processes) = record_and_judge(fixture, Placement::Declared);
         assert!(
             !units.rows.is_empty(),
             "RI_HARNESS: {} judged no stream",
@@ -459,17 +462,34 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
                 row.node,
                 row.input
             );
+            // Frames each placement evicted live on this stream. Hosting the
+            // units in one process must not make a consumer late enough to
+            // evict where one process per node does not.
             let gaps = sequence_gaps(&run, &row.node, &row.input);
+            let declared_gaps = sequence_gaps(&declared_run, &row.node, &row.input);
+            eprintln!(
+                "UNITS_REPLAY fixture={} node={} input={} one_group_gaps={gaps} \
+                 declared_gaps={declared_gaps} one_group_verdict={}",
+                fixture.name(),
+                row.node,
+                row.input,
+                kind(&row.verdict)
+            );
+            assert!(
+                gaps <= declared_gaps + EVICTION_TOLERANCE,
+                "{}: {}.{} evicted live in {gaps} place(s) with its units in one process but \
+                 {declared_gaps} with one process per node (tolerance {EVICTION_TOLERANCE}): \
+                 hosting the units together made this consumer late",
+                fixture.name(),
+                row.node,
+                row.input
+            );
+            // An evicting stream is not compared: a replay that feeds a real
+            // queue reproduces no eviction under any placement. When the
+            // replay serves each input the frames it was served live, judge
+            // these streams too, under `ReplayMode::ResimVerify`, and require
+            // equality.
             if gaps > 0 {
-                eprintln!(
-                    "UNITS_REPLAY fixture={} node={} input={} live_gaps={gaps} verdict={} \
-                     (an evicting stream: replay through a real queue does not reproduce it \
-                     under any placement, so it is not compared here)",
-                    fixture.name(),
-                    row.node,
-                    row.input,
-                    kind(&row.verdict)
-                );
                 continue;
             }
             let other = processes
