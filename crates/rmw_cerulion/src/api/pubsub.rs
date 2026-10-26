@@ -2399,18 +2399,20 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // deregister key.
         let gid = crate::gid::mint_gid();
         // The publisher gid each take reports is read from the topic's
-        // publisher directory. Without one every take reports the all-zero
-        // gid, which matches no publisher.
+        // publisher directory. A subscription without one would report the
+        // all-zero gid on every take, and rclcpp would then deliver each
+        // intra-process message twice, so the create fails instead.
         let publisher_directory = match rt.transport.open_publisher_directory(&topic) {
-            Ok(d) => Some(d),
+            Ok(d) => d,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     topic = %topic,
                     error = %e,
-                    "the topic's publisher directory did not open, so this \
-                     subscription's takes report an all-zero publisher gid"
+                    "subscription creation failed: the topic's publisher directory \
+                     did not open, and without it a take cannot report which \
+                     publisher sent a message"
                 );
-                None
+                return std::ptr::null_mut();
             }
         };
 
@@ -2448,7 +2450,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 // the first adopted take grows neither (see above).
                 adopt_ranges: Vec::with_capacity(forgeable_members),
                 adopt_registered: Vec::with_capacity(forgeable_members),
-                publisher_gids: crate::gid::PublisherGidResolver::new(publisher_directory),
+                publisher_gids: crate::gid::PublisherGidResolver::new(Some(publisher_directory)),
             }),
             gid,
             decode_failures: std::sync::Mutex::new(

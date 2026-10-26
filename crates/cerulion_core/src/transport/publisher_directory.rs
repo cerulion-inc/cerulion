@@ -39,9 +39,11 @@ pub(crate) fn port_name(name: &str) -> Result<PortName, String> {
 /// A handle on one topic's data service that reads its publishers' port names
 /// ([`crate::transport::TransportManager::open_publisher_directory`]).
 ///
-/// Each lookup walks the service's live publisher list in shared memory; it
-/// allocates nothing. A publisher that has detached is no longer listed, so a
-/// sample still queued from it resolves to `None`.
+/// Each lookup walks the service's live publisher list in shared memory.
+/// iceoryx2's `list_publishers` copies the list's state into two vectors
+/// sized to the service's publisher maximum, so a lookup allocates: callers
+/// cache its answers per origin. A publisher that has detached is no longer
+/// listed, so a sample still queued from it resolves to `None`.
 pub struct PublisherDirectory {
     data_service: iceoryx2::service::port_factory::publish_subscribe::PortFactory<CerService, [u8], ()>,
 }
@@ -63,6 +65,12 @@ impl PublisherDirectory {
         >,
     ) -> Self {
         Self { data_service }
+    }
+
+    /// The most publishers the data service admits at once
+    /// (`max_publishers` in its static config, fixed when it was created).
+    pub fn max_publishers(&self) -> usize {
+        self.data_service.static_config().max_publishers()
     }
 
     /// Calls `f` with the port name of the attached publisher whose publisher

@@ -94,20 +94,25 @@ pub fn parse_publisher_port_name(name: &str) -> Option<[u8; 16]> {
     Some(gid)
 }
 
-/// How many origin ids one subscription's resolver remembers.
-pub const RESOLVER_CACHE_CAPACITY: usize = 16;
+/// How many origin ids a resolver remembers per publisher the topic admits.
+/// Twice the maximum, so every live publisher stays cached while as many
+/// detached ones age out.
+pub const RESOLVER_CACHE_PER_PUBLISHER: usize = 2;
 
 /// Resolves the origin publisher id of a received sample to that publisher's
 /// rmw gid, for one subscription.
 ///
 /// A lookup that misses the cache walks the topic's publisher list once
-/// ([`PublisherDirectory::with_publisher_name`]) and caches the answer,
-/// the all-zero gid included. The cache holds [`RESOLVER_CACHE_CAPACITY`]
-/// entries, reserved at construction, and replaces its entries in turn once
-/// full, so a take allocates nothing here.
+/// ([`PublisherDirectory::with_publisher_name`], which allocates) and caches
+/// the answer, the all-zero gid included. The cache holds
+/// [`RESOLVER_CACHE_PER_PUBLISHER`] entries per publisher the topic admits,
+/// reserved at construction, and replaces its entries in turn once full. A
+/// take allocates only on a miss: once per publisher, plus once more for a
+/// live publisher evicted after as many publishers have come and gone.
 pub struct PublisherGidResolver {
     directory: Option<PublisherDirectory>,
     cache: Vec<(u128, [u8; 16])>,
+    capacity: usize,
     next_replace: usize,
 }
 
@@ -115,9 +120,13 @@ impl PublisherGidResolver {
     /// A resolver over `directory`. `None` resolves every origin to the
     /// all-zero gid.
     pub fn new(directory: Option<PublisherDirectory>) -> Self {
+        let publishers = directory.as_ref().map_or(1, PublisherDirectory::max_publishers);
+        let capacity = RESOLVER_CACHE_PER_PUBLISHER * publishers.max(1);
         Self {
             directory,
-            cache: Vec::with_capacity(RESOLVER_CACHE_CAPACITY),
+            // hot-path-alloc-ok: once per subscription, at create.
+            cache: Vec::with_capacity(capacity),
+            capacity,
             next_replace: 0,
         }
     }
@@ -134,11 +143,11 @@ impl PublisherGidResolver {
             .and_then(|d| d.with_publisher_name(origin, parse_publisher_port_name))
             .flatten()
             .unwrap_or([0u8; 16]);
-        if self.cache.len() < RESOLVER_CACHE_CAPACITY {
+        if self.cache.len() < self.capacity {
             self.cache.push((origin, gid));
         } else {
             self.cache[self.next_replace] = (origin, gid);
-            self.next_replace = (self.next_replace + 1) % RESOLVER_CACHE_CAPACITY;
+            self.next_replace = (self.next_replace + 1) % self.capacity;
         }
         gid
     }
@@ -192,11 +201,13 @@ mod tests {
     #[test]
     fn a_resolver_without_a_directory_resolves_to_zero_and_stays_bounded() {
         let mut r = PublisherGidResolver::new(None);
-        for origin in 0..(3 * RESOLVER_CACHE_CAPACITY as u128) {
+        let capacity = RESOLVER_CACHE_PER_PUBLISHER;
+        assert_eq!(r.capacity, capacity);
+        for origin in 0..(3 * capacity as u128) {
             assert_eq!(r.resolve(origin), [0u8; 16]);
-            assert!(r.cache.len() <= RESOLVER_CACHE_CAPACITY);
+            assert!(r.cache.len() <= capacity);
         }
-        assert_eq!(r.cache.capacity(), RESOLVER_CACHE_CAPACITY);
+        assert_eq!(r.cache.capacity(), capacity);
     }
 
     #[test]
