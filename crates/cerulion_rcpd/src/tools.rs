@@ -227,8 +227,8 @@ pub fn safety_annotations(class: SafetyClass) -> ToolAnnotations {
         .open_world(false)
 }
 
-/// `estop` and `estop_clear`: idempotent, closed world; `estop_clear` adds
-/// `destructiveHint`, since it lets motion calls run again.
+/// `estop` and `estop_clear`: idempotent, closed world, not destructive; the
+/// `estop_clear` listing sets `destructiveHint` on top.
 fn builtin_annotations() -> ToolAnnotations {
     ToolAnnotations::new()
         .read_only(false)
@@ -346,12 +346,14 @@ impl ToolHost {
                 ESTOP_TOOL,
                 match self.estop_clear {
                     EstopClear::Agent => {
-                        "Stop the robot now. Never waits behind another call; every later motion \
-                     call is refused until estop_clear is called or an operator clears the latch."
+                        "Stop the robot now. The latch closes before anything waits, never behind a \
+                     call in flight; every later motion call is refused until estop_clear is \
+                     called or an operator clears the latch."
                     }
                     EstopClear::Operator => {
-                        "Stop the robot now. Never waits behind another call; every later motion \
-                     call is refused until an operator clears the latch."
+                        "Stop the robot now. The latch closes before anything waits, never behind a \
+                     call in flight; every later motion call is refused until an operator \
+                     clears the latch."
                     }
                 },
                 Arc::new(estop),

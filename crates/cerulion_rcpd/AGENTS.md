@@ -24,8 +24,9 @@ User reference: docs/rcp.md.
   writes its file and `intent` inside `latch_io`, so the receipt log orders
   engages and clears as they took effect. An undeletable file leaves the
   latch closed (`clear_failed`); an unreadable one at start counts as present.
-- The journal never publishes a latch-gated request whose caller dropped its
-  reply (a cancelled MCP request); estop frames publish regardless.
+- The journal's `gate` reads the latch, then drops a latch-gated request whose
+  caller dropped its reply (a cancelled MCP request); estop and read frames
+  always publish.
 - `limits.estop_clear: operator` unlists `estop_clear` and refuses it
   (`estop_clear_disabled`, receipted `denied`). The binary applies the switch
   with `ToolHost::with_estop_clear`; a host built without it serves `agent`.

@@ -18,7 +18,8 @@
 //! is published within one pass (about a millisecond) whatever else is
 //! pending. A latch-gated call (every mutating tool) is published only while
 //! the shared e-stop latch is clear; the check runs immediately before the
-//! publish.
+//! publish. A latch-gated call whose caller stopped waiting is never
+//! published.
 //!
 //! Because the calls topic is an input the graph consumes, a `--record` bag
 //! holds every published call, and `cerulion bag play --resim all --verify`
@@ -235,6 +236,36 @@ struct Ports {
     pending: BTreeMap<u64, Pending>,
 }
 
+/// What [`Ports::publish`] does with one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Publish the frame.
+    Publish,
+    /// Answer [`JournalError::Estopped`]; nothing is published.
+    Refuse,
+    /// The caller stopped waiting (its MCP request was cancelled); nothing is
+    /// published or answered.
+    Drop,
+}
+
+/// The gate for a request: a `bypass_latch` request (estop, read tools) is
+/// always published. A latch-gated one is refused while `latch` is closed,
+/// and dropped when `reply_closed` says its caller is gone. The latch is read
+/// first: a latch seen open after an `estop_clear` opened it was opened after
+/// that clear took `call_lock`, which a cancelled call had already released,
+/// so the cancel is visible to `reply_closed`.
+fn gate(bypass_latch: bool, latch: &AtomicBool, reply_closed: impl FnOnce() -> bool) -> Gate {
+    if bypass_latch {
+        Gate::Publish
+    } else if latch.load(Ordering::SeqCst) {
+        Gate::Refuse
+    } else if reply_closed() {
+        Gate::Drop
+    } else {
+        Gate::Publish
+    }
+}
+
 /// The smallest `std_msgs/String` payload a reader can be built over: the
 /// fixed section plus one 8-byte offset table entry per variable field.
 const MIN_STRING_PAYLOAD: usize = RosString::WIRE_FIXED_SIZE + 8 * RosString::VARIABLE_FIELD_COUNT;
@@ -347,15 +378,15 @@ impl Ports {
     }
 
     fn publish(&mut self, request: CallRequest) {
-        // A latch-gated call whose caller stopped waiting (its MCP request was
-        // cancelled) is never published, so it cannot run after a later
-        // estop_clear. An estop frame is published either way.
-        if !request.bypass_latch && request.reply.is_closed() {
-            return;
-        }
-        if !request.bypass_latch && self.latch.load(Ordering::SeqCst) {
-            let _ = request.reply.send(Err(JournalError::Estopped));
-            return;
+        match gate(request.bypass_latch, &self.latch, || {
+            request.reply.is_closed()
+        }) {
+            Gate::Publish => {}
+            Gate::Refuse => {
+                let _ = request.reply.send(Err(JournalError::Estopped));
+                return;
+            }
+            Gate::Drop => return,
         }
         let topic = self.calls_topic.clone();
         let fail = |reason: String| JournalError::Publish { topic, reason };
@@ -442,7 +473,34 @@ impl Ports {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_string;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{decode_string, gate, Gate};
+
+    #[test]
+    fn a_cancelled_gated_call_is_dropped_and_an_estop_or_read_is_not() {
+        let open = AtomicBool::new(false);
+        let closed = AtomicBool::new(true);
+        let (live_tx, _live_rx) = tokio::sync::oneshot::channel::<()>();
+        let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(gone_rx);
+        let live = || live_tx.is_closed();
+        let gone = || gone_tx.is_closed();
+        assert_eq!(gate(false, &open, live), Gate::Publish);
+        assert_eq!(
+            gate(false, &open, gone),
+            Gate::Drop,
+            "a cancelled call is dropped"
+        );
+        assert_eq!(gate(false, &closed, live), Gate::Refuse);
+        assert_eq!(gate(false, &closed, gone), Gate::Refuse);
+        assert_eq!(
+            gate(true, &open, gone),
+            Gate::Publish,
+            "a cancelled estop still publishes"
+        );
+        assert_eq!(gate(true, &closed, gone), Gate::Publish);
+    }
 
     /// A 16-byte window of a zeroed buffer starting `skew` bytes past an
     /// 8-byte boundary.

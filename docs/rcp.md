@@ -166,7 +166,14 @@ answered. A later `estop` closes the latch and writes the file again.
 `estop` closes the latch, then, inside a lock, closes it again, writes the
 file and its `intent` receipt; `estop_clear` writes its `intent`, deletes the
 file and opens the latch inside the same lock. The receipt log therefore
-orders engages and clears as they took effect.
+orders engages and clears as they took effect. An `estop` that lands while
+a clear holds that lock closes the latch at once and publishes its frame
+after the clear's receipt write.
+
+A cancelled MCP request for a latch-gated call (a motion call or
+`estop_clear`) that has not been published yet is never published. A
+cancelled `estop_clear` that already opened the latch leaves it open without
+an `estop_clear` frame on the calls topic.
 Deleting the file and restarting the daemon clears the e-stop under either
 `limits.estop_clear` value.
 

@@ -8,7 +8,14 @@ use std::time::Duration;
 
 fn manifest(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("rcp.yaml");
-    std::fs::write(&path, "robot: smoke\n").expect("write manifest");
+    let prefix = format!("rcpd_smoke_init_{}", std::process::id());
+    std::fs::write(
+        &path,
+        format!(
+            "robot: smoke\njournal:\n  calls_topic: /{prefix}/calls\n  results_topic: /{prefix}/results\n"
+        ),
+    )
+    .expect("write manifest");
     path
 }
 

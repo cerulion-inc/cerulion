@@ -1007,8 +1007,7 @@ async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreein
     let last_builtin = seen
         .iter()
         .filter_map(|c| c["tool"].as_str())
-        .filter(|t| *t == ESTOP_TOOL || *t == ESTOP_CLEAR_TOOL)
-        .last();
+        .rfind(|t| *t == ESTOP_TOOL || *t == ESTOP_CLEAR_TOOL);
     if latched {
         assert_eq!(
             last_builtin,
@@ -1016,49 +1015,4 @@ async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreein
             "the graph's last word is the estop"
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_cancelled_motion_call_is_never_published() {
-    use std::future::Future as _;
-    use std::task::{Context, Poll, Waker};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let prefix = unique("cancel");
-    let loaded = manifest(dir.path(), &prefix);
-    let mgr = manager("cancel");
-    let tap_stop = Arc::new(AtomicBool::new(false));
-    let tap = spawn_tap(mgr.clone(), prefix.clone(), tap_stop.clone());
-    let latch = Arc::new(AtomicBool::new(false));
-    let journal = Journal::spawn(
-        mgr.clone(),
-        loaded.journal.clone(),
-        loaded.state.clone(),
-        latch,
-    )
-    .expect("journal");
-    let frame = |tool: &str| Journal::frame(7, tool, &json!({}));
-    // Polled once, the call is queued; dropped, its caller is gone.
-    {
-        let mut gated =
-            std::pin::pin!(journal.call(7, frame("arm.step"), Duration::from_secs(1), true));
-        let polled = gated.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        assert!(matches!(polled, Poll::Pending));
-    }
-    // A read call cancelled the same way is still published.
-    {
-        let mut read =
-            std::pin::pin!(journal.call(8, frame("arm.peek"), Duration::from_secs(1), false));
-        let polled = read.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        assert!(matches!(polled, Poll::Pending));
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    tap_stop.store(true, Ordering::Relaxed);
-    let tools: Vec<String> = tap
-        .join()
-        .expect("tap")
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
-    assert_eq!(tools, ["arm.peek"], "only the ungated call was published");
 }
