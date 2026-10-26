@@ -1388,6 +1388,7 @@ dependencies = [
  "hex",
  "iceoryx2",
  "if-addrs",
+ "image",
  "indexmap 2.14.0",
  "libc",
  "mdns-sd",

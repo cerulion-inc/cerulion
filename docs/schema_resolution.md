@@ -82,6 +82,13 @@ A type the chain already resolves is never handed to the acquisition ladder.
 The store also makes hand-dropping a `.msg` a first-class workflow: drop a file
 in `schemas/<pkg>/msg/` and it resolves at the next attach.
 
+Service types sit beside the messages as `schemas/<pkg>/srv/<Type>.srv` (a
+ROS 2 `.srv` file copied verbatim). `cerulion service call` reads the one it
+names; its request and response parts are the messages `<pkg>/<Type>_Request`
+and `<pkg>/<Type>_Response`, laid out against the store and the built-in corpus
+like any store message. Attach and the other schema surfaces do not read
+`srv/`.
+
 Store types are first-class across the CLI's schema surfaces, not just at
 attach (msg-store parity): they participate in `graph run`'s
 schema-hash-divergence check, `graph run --record`'s recorded per-channel

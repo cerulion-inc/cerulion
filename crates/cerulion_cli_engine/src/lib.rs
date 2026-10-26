@@ -80,6 +80,8 @@ pub mod hostname_peers;
 pub mod ipc_cleanup;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
+/// Messages as JSON or YAML text for `topic pub` and `service call`.
+pub mod message_text;
 // The LOCAL ament harvest rung — a filesystem-only
 // `SchemaAcquirer` over the host's `$AMENT_PREFIX_PATH` ROS install.
 pub mod local_harvest;
@@ -251,6 +253,8 @@ pub mod ros2_graph;
 pub mod ros2_migrate;
 pub mod schema_cmd;
 pub mod schema_serve;
+/// `cerulion service call`.
+pub mod service_cmd;
 // The macOS `/tmp/*.shm_state` population — detect it, price it, and
 // reclaim only what is PROVABLY dead. `iceoryx2-pal-posix` keeps one such file
 // per SHM segment on a platform with no `/dev/shm`, a SIGKILLed owner leaks it

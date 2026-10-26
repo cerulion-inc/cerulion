@@ -22,6 +22,10 @@
 //! the rest). Enumeration is sorted so the store is byte-deterministic
 //! (Principle #7).
 //!
+//! Service types live beside the messages as `schemas/<pkg>/srv/<Name>.srv`;
+//! [`load_store_service`] reads one by name for `service call`. They are not
+//! part of the message set this store enumerates.
+//!
 //! Consumers of the store (the ONE resolution chain): attach's resolvability
 //! predicate (`ros_cmd::AttachSchemaChain`), `schema list`/`schema info`, and
 //! the bridge codec seed. This module is the shared reader.
@@ -189,6 +193,36 @@ impl SchemaStore {
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
+}
+
+/// Read the service type `package/name` from the store's
+/// `<schemas_dir>/<package>/srv/<name>.srv` file.
+///
+/// The `.srv` text parses with the same [`parse_rossrv`] codegen uses, so its
+/// two parts are the messages `package/<name>_Request` and
+/// `package/<name>_Response`, the names (and therefore the schema hashes) a
+/// ROS 2 node on `rmw_cerulion` gives them. `Ok(None)` when the file does not
+/// exist; an unreadable or unparsable file is an `Err` naming it.
+///
+/// [`parse_rossrv`]: cerulion_core::codegen::parse_rossrv
+pub fn load_store_service(
+    schemas_dir: &Path,
+    package: &str,
+    name: &str,
+) -> Result<Option<cerulion_core::codegen::ServiceDefinition>, String> {
+    let relative = format!("{package}/srv/{name}.srv");
+    let path = schemas_dir
+        .join(package)
+        .join("srv")
+        .join(format!("{name}.srv"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    cerulion_core::codegen::parse_rossrv(&text, name, Some(package), &relative)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Does the built-in ROS 2 registry contain the qualified name `pkg/Type`?
