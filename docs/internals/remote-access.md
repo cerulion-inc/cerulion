@@ -364,7 +364,10 @@ built-in corpus plus the `.msg`/`.srv` store under the directory
 `CerudError::Verb` whose text starts with the error class (`usage: `,
 `encode: `, `unavailable: `, `internal: `); the desk maps the class to the
 CLI's exit code (2, 1, 3, 1). Timeouts are capped at 60 s and a result at
-12 MiB, inside the 16 MiB ops frame.
+12 MiB, inside the 16 MiB ops frame. `topic-publish` and `service-call` are refused while
+the e-stop latch (`cerud::lease::ControlLease`) is engaged; a publish checks
+the latch every 10 ms and stops when it engages. A topic under
+`/__cerulion` is refused. `service-call` also returns `response_text`.
 
 ## 6. The wire plane (robot side)
 

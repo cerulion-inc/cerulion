@@ -646,8 +646,7 @@ mod tests {
     #[test]
     fn json_strings_escape_del_and_c1_controls() {
         let w = walker(&[]);
-        let frame =
-            message_frame(&w, "std_msgs/String", "data: \"a\\x7Fb\\u009Bc\"", 0).unwrap();
+        let frame = message_frame(&w, "std_msgs/String", "data: \"a\\x7Fb\\u009Bc\"", 0).unwrap();
         let back = body_to_json(
             &w,
             w.schema_hash_for("std_msgs/String").unwrap(),

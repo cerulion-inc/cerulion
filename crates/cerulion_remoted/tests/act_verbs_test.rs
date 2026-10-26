@@ -281,8 +281,10 @@ fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable(
     };
     let started = std::time::Instant::now();
     let err = TopicPublishVerb::new(l)
-        .execute(&json!({"topic": "/c1_act/publish/estop", "type": "std_msgs/String",
-                         "message": {"data": "x"}, "wait_subscribers_s": 10}))
+        .execute(
+            &json!({"topic": "/c1_act/publish/estop", "type": "std_msgs/String",
+                         "message": {"data": "x"}, "wait_subscribers_s": 10}),
+        )
         .unwrap_err();
     engager.join().unwrap();
     match err {
@@ -292,5 +294,8 @@ fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable(
         ),
         other => panic!("{other:?}"),
     }
-    assert!(started.elapsed() < Duration::from_secs(5), "the wait ended at the e-stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the wait ended at the e-stop"
+    );
 }

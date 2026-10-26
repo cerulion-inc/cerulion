@@ -323,17 +323,17 @@ pub fn to_rgb(image: &RawImage<'_>) -> Result<Vec<u8>, VerbError> {
             }
             "rgb8" => out.extend_from_slice(line),
             "bgr8" => {
-                for px in line.chunks_exact(3) {
+                for px in line.as_chunks::<3>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0]]);
                 }
             }
             "rgba8" => {
-                for px in line.chunks_exact(4) {
+                for px in line.as_chunks::<4>().0 {
                     out.extend_from_slice(&px[..3]);
                 }
             }
             "bgra8" => {
-                for px in line.chunks_exact(4) {
+                for px in line.as_chunks::<4>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0]]);
                 }
             }

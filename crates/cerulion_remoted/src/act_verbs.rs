@@ -18,8 +18,9 @@
 //! `service call` and `topic snapshot` run on a desk.
 //!
 //! `topic-publish` and `service-call` check only the e-stop, not the control
-//! lease: they are refused while the robot's e-stop is engaged, and a
-//! publish stops at its next check when the e-stop engages. A topic under
+//! lease: each is refused while the e-stop latch (`cerud::lease::ControlLease`)
+//! is engaged, and a publish stops at its next check when the latch
+//! engages. A topic under
 //! the reserved `/__cerulion` namespace is refused.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the

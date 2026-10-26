@@ -202,13 +202,23 @@ pub fn robot_snapshot(
     robot: &str,
     req: &crate::topic_cmd::snapshot::SnapshotRequest<'_>,
 ) -> Result<String, VerbError> {
-    use cerulion_msgio::snapshot::{base64_decode, default_file_name, SnapshotReport};
     let args = serde_json::json!({
         "topic": req.topic,
         "timeout_s": req.timeout.as_secs_f64(),
         "quality": req.quality,
     });
     let result = call_robot_verb(robot, "topic-snapshot", &args, req.timeout)?;
+    write_snapshot(&result, req)
+}
+
+/// Write the JPEG of a `topic-snapshot` result on this machine
+/// (`req.output`, or the default file in the system temp directory) and
+/// return the JSON line the local verb prints, naming the local path.
+pub fn write_snapshot(
+    result: &Value,
+    req: &crate::topic_cmd::snapshot::SnapshotRequest<'_>,
+) -> Result<String, VerbError> {
+    use cerulion_msgio::snapshot::{base64_decode, default_file_name, SnapshotReport};
     let field = |key: &str| {
         result.get(key).and_then(Value::as_i64).ok_or_else(|| {
             VerbError::Internal(format!("the robot's result has no integer `{key}`"))
@@ -306,6 +316,62 @@ mod tests {
         ] {
             assert!(response_line(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_robot_snapshot_is_written_on_this_machine_and_the_line_names_the_local_path() {
+        use crate::topic_cmd::snapshot::SnapshotRequest;
+        use crate::topic_cmd::TopicScope;
+        let jpeg = cerulion_msgio::snapshot::to_jpeg(
+            &cerulion_msgio::snapshot::RawImage {
+                width: 2,
+                height: 1,
+                step: 2,
+                encoding: "mono8",
+                data: &[10, 200],
+            },
+            80,
+        )
+        .unwrap();
+        let result = serde_json::json!({
+            "jpeg_base64": cerulion_msgio::snapshot::base64_encode(&jpeg),
+            "width": 2, "height": 1, "encoding": "mono8", "stamp_ns": 42, "bytes": jpeg.len(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cam.jpg");
+        let req = SnapshotRequest {
+            topic: "/wrist/image_raw",
+            output: Some(&path),
+            timeout: std::time::Duration::from_secs(1),
+            quality: 80,
+            scope: TopicScope::Automatic,
+        };
+        let line = write_snapshot(&result, &req).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), jpeg);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"path": path.to_string_lossy(), "width": 2, "height": 1,
+                "encoding": "mono8", "stamp_ns": 42, "bytes": jpeg.len()})
+        );
+        // No -o: the default file in the system temp directory.
+        let req = SnapshotRequest {
+            output: None,
+            ..req
+        };
+        let line = write_snapshot(&result, &req).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let written = std::path::PathBuf::from(v["path"].as_str().unwrap());
+        assert_eq!(
+            written,
+            std::env::temp_dir().join("cerulion-snapshot-wrist_image_raw-42.jpg")
+        );
+        assert_eq!(std::fs::read(&written).unwrap(), jpeg);
+        std::fs::remove_file(written).unwrap();
+        // A result whose JPEG is not base64 is refused.
+        let mut bad = result.clone();
+        bad["jpeg_base64"] = Value::from("***");
+        assert!(write_snapshot(&bad, &req).is_err());
     }
 
     #[test]
