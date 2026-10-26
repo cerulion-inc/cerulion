@@ -319,8 +319,7 @@ fn a_run_without_a_terminal_shows_no_notice_and_sends_and_the_notice_waits_for_a
     let events = events_sent(&sink);
     let run = the_one(&events, "cli_command_run");
     assert_eq!(run["properties"]["ci"], false, "{events:?}");
-    let id = run["distinct_id"].as_str().unwrap_or_default();
-    assert!(id.starts_with("anon:"), "{events:?}");
+    assert_eq!(run["distinct_id"], anon_id_in(home.path()), "{events:?}");
     let tty = cerulion(home.path(), &sending(&sink), &["graph", "list"]);
     assert!(
         tty.stderr.contains("cerulion telemetry off"),
@@ -404,8 +403,16 @@ fn a_first_login_without_a_terminal_carries_and_merges_the_random_id() {
         "the login carries the random id"
     );
     let events = events_sent(&sink);
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(events.len(), 3, "alias, login and the command: {events:?}");
     let login = the_one(&events, "cli_login_completed");
     assert_eq!(login["distinct_id"], sub, "{events:?}");
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["distinct_id"], sub, "{events:?}");
     assert_eq!(bound_account_in(home.path()), sub);
     let aliases = named(&events, "$create_alias");
     assert_eq!(aliases.len(), 1, "{events:?}");

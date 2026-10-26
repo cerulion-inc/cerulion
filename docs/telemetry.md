@@ -75,26 +75,26 @@ random `anon:<uuid>` before that; a CI run always uses the random id. The
 random id lives in the consent file.
 
 When a machine that has never signed in runs its first login, the login
-request carries the random id so the events from before the login are
-joined to the account; the CLI also sends a `$create_alias` event for the
-join. A CI run never joins: its login carries no id and sends no alias.
-Nothing else is added to the login. A machine that signed out keeps its account on record and carries nothing. If that first
-login happens in the run that printed the notice, which sends nothing, an
-empty `telemetry_alias_pending` file next to the consent file marks the join
-as owed, and the next run outside CI that sends makes it and deletes the
-file. Only a
-hosted account id is joined this way; the events of any other account stay
-under the random id. A `telemetry_anon_account` file next to the consent
-file records the account the random id was used for. It is created, empty,
-before a login carries the id, and the account is written into it once the
-login completes. A login that fails after that request keeps it: the
-account service may have joined the id anyway, so the id is never carried
-again and is replaced when an account next signs in. A run that sends
-while signed in records the account too, CI included, and a run that sends nothing
-records nothing. A random id with a record is never carried into a later
-login, even after the sign-in state is removed. When a different account
-signs in on the same machine, the random id is replaced, so later anonymous
-events are never joined to the previous account.
+request carries the random id so the events from before the login are joined
+to the account; the CLI also sends a `$create_alias` event for the join. A
+CI run never joins: its login carries no id and sends no alias. Nothing else
+is added to the login. A machine that signed out keeps its account on record
+and carries nothing. If that first login happens in the run that printed the
+notice, which sends nothing, an empty `telemetry_alias_pending` file next to
+the consent file marks the join as owed, and the next run outside CI that
+sends makes it and deletes the file. Only a hosted account id is joined this
+way; the events of any other account stay under the random id. A
+`telemetry_anon_account` file next to the consent file records the account
+the random id was used for. It is created, empty, before a login carries the
+id, and the account is written into it once the login completes. A login
+that fails after that request keeps it: the account service may have joined
+the id anyway, so the id is never carried again and is replaced when an
+account next signs in. A run that sends while signed in records the account
+too, CI included, and a run that sends nothing records nothing. A random id
+with a record is never carried into a later login, even after the sign-in
+state is removed. When a different account signs in on the same machine, the
+random id is replaced, so later anonymous events are never joined to the
+previous account.
 
 These commands record no event at all: `cerulion telemetry`, `cerulion
 completions`, `cerulion bagd` (the recorder daemon), and the internal
@@ -114,10 +114,11 @@ shown only once it has been written, so a run that is killed while printing
 it shows it again next time, and two first commands started at the same
 moment may both show it (neither sends). A command whose stderr is not a
 terminal prints no notice and sends as usual; the notice is then printed by
-the first command that could send, run on a terminal. The vizd daemon prints no notice of its
-own and sends nothing until the CLI has shown it on the machine (or under
-CI), so a `cerulion viz` that prints the notice may start a daemon that
-sends. `cerulion telemetry status` prints the link to this page.
+the first command that could send, run on a terminal. The vizd daemon prints
+no notice of its own and sends nothing until the CLI has shown it on the
+machine (or under CI), so a `cerulion viz` that prints the notice may start
+a daemon that sends. `cerulion telemetry status` prints the link to this
+page.
 
 ## CI runs
 
