@@ -30,6 +30,9 @@ cerulion_core = { workspace = true, features = ["local-transport"] }
 # Test seams for this crate's own integration tests (the dev-dependency on
 # itself below turns it on); never enabled by an app build.
 test-helpers = ["cerulion_core/test-helpers"]
+# Run the host build on the in-process transport an Android app uses, so the
+# host tests cover the app's transport. Android builds turn it on already.
+local-transport = ["cerulion_core/local-transport"]
 
 [dev-dependencies]
 cerulion_android = { path = ".", features = ["test-helpers"] }
@@ -37,6 +40,10 @@ cerulion_android = { path = ".", features = ["test-helpers"] }
 # used to seed a TopicServiceConfig for the pure provisioning helpers).
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
 tempfile = "3"
+# Node crates linked as plain libraries, the way an app runtime library links
+# its nodes: `default-features = false` leaves the C exports out.
+test_node_macro_period_cdylib = { path = "../test_fixtures/test_node_macro_period_cdylib", default-features = false }
+test_node_macro_relay_rlib = { path = "../test_fixtures/test_node_macro_relay_rlib" }
 zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
 
 [lints]

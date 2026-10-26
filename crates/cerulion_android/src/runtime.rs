@@ -189,6 +189,8 @@ pub struct Status {
     pub graph: Option<String>,
     /// Number of graph nodes.
     pub nodes: usize,
+    /// Node types linked into the app library, sorted.
+    pub linked_nodes: Vec<String>,
     /// Network listen endpoints.
     pub listen: Vec<String>,
     /// LAN access posture of the running gateway (`paired` or `open`).
@@ -212,6 +214,7 @@ impl Status {
             robot,
             graph: None,
             nodes: 0,
+            linked_nodes: crate::nodes::linked_node_types(),
             listen: Vec::new(),
             lan_access: None,
             mdns_advertised: false,
@@ -821,33 +824,38 @@ impl EmbeddedRuntime {
         embedded: &EmbeddedConfig,
     ) -> Result<GraphInputs, EmbedError> {
         let native_nodes = config.native_nodes().count();
-        refuse_dlopen_nodes(TRANSPORT_KIND, native_nodes)?;
         if native_nodes != config.nodes.len() {
             return Err(EmbedError::Graph(
-                "embedded runtime supports only native cdylib graph nodes".to_string(),
+                "embedded runtime supports only native graph nodes".to_string(),
             ));
         }
-        let node_lib_dir = embedded.node_lib_dir.as_ref().ok_or_else(|| {
-            EmbedError::Graph(
-                "node_lib_dir is required when graph_yaml contains native nodes".to_string(),
-            )
-        })?;
-        if !node_lib_dir.is_absolute() || !node_lib_dir.is_dir() {
-            return Err(EmbedError::InvalidArgument(
-                "node_lib_dir must be an existing absolute directory".to_string(),
-            ));
+        // `validate_paths` already checked that a set directory exists.
+        let node_lib_dir = embedded.node_lib_dir.as_deref();
+        refuse_node_lib_dir_in_process(TRANSPORT_KIND, native_nodes, node_lib_dir.is_some())?;
+        if native_nodes > 0 {
+            crate::nodes::check()?;
         }
         let mut factories = indexmap::IndexMap::new();
         let mut infos = indexmap::IndexMap::new();
         for node in &config.nodes {
-            let path = node_lib_dir.join(cdylib_name(&node.node_type));
-            let entry = DylibNodeEntry::load(&path)
-                .map_err(|error| EmbedError::Graph(error.to_string()))?;
+            // A linked node type wins; a separate library is the host-side
+            // fallback for the cross-process transport only.
+            let entry = match (crate::nodes::make(&node.node_type), node_lib_dir) {
+                (Some(entry), _) => entry,
+                (None, Some(dir)) => {
+                    let path = dir.join(cdylib_name(&node.node_type));
+                    Box::new(
+                        DylibNodeEntry::load(&path)
+                            .map_err(|error| EmbedError::Graph(error.to_string()))?,
+                    ) as Box<dyn NodeEntry>
+                }
+                (None, None) => return Err(crate::nodes::unlinked(&node.node_type)),
+            };
             let info = entry
                 .info()
                 .map_err(|error| EmbedError::Graph(error.to_string()))?;
             infos.insert(node.id.clone(), info);
-            factories.insert(node.id.clone(), Box::new(entry) as Box<dyn NodeEntry>);
+            factories.insert(node.id.clone(), entry);
         }
         Ok(GraphInputs {
             config,
@@ -1614,10 +1622,17 @@ fn install_iceoryx_config(files_dir: &Path) -> Result<(), EmbedError> {
     Ok(())
 }
 
-fn refuse_dlopen_nodes(kind: TransportKind, native_nodes: usize) -> Result<(), EmbedError> {
-    if kind == TransportKind::InProcess && native_nodes > 0 {
+/// The in-process transport an app runs on cannot deliver frames to or from
+/// a node loaded from a separate library, so a graph with native nodes must
+/// take them from the node registry there.
+fn refuse_node_lib_dir_in_process(
+    kind: TransportKind,
+    native_nodes: usize,
+    has_node_lib_dir: bool,
+) -> Result<(), EmbedError> {
+    if kind == TransportKind::InProcess && native_nodes > 0 && has_node_lib_dir {
         return Err(EmbedError::Graph(
-            "graph nodes loaded from libraries cannot deliver frames under the in-process transport; run the app without graph_yaml".to_string(),
+            "node_lib_dir is not supported by the in-process app runtime; link the nodes into the app library with cerulion_android::embed_nodes!".to_string(),
         ));
     }
     Ok(())
@@ -2197,25 +2212,40 @@ mod tests {
         );
     }
 
+    const NODE_LIB_DIR_IN_PROCESS: &str = "node_lib_dir is not supported by the in-process app runtime; link the nodes into the app library with cerulion_android::embed_nodes!";
+
     #[test]
-    fn in_process_transport_refuses_native_nodes() {
-        let error = refuse_dlopen_nodes(TransportKind::InProcess, 1)
-            .expect_err("library node must be refused");
+    fn in_process_transport_refuses_node_lib_dir_with_native_nodes() {
+        let error = refuse_node_lib_dir_in_process(TransportKind::InProcess, 1, true)
+            .expect_err("node_lib_dir with a native node must be refused");
         assert_eq!(error.code(), codes::GRAPH);
+        assert_eq!(error.to_string(), NODE_LIB_DIR_IN_PROCESS);
+    }
+
+    #[test]
+    fn in_process_transport_accepts_node_lib_dir_without_native_nodes() {
+        assert!(refuse_node_lib_dir_in_process(TransportKind::InProcess, 0, true).is_ok());
+    }
+
+    #[test]
+    fn in_process_transport_accepts_native_nodes_without_node_lib_dir() {
+        assert!(refuse_node_lib_dir_in_process(TransportKind::InProcess, 1, false).is_ok());
+    }
+
+    #[test]
+    fn cross_process_transport_accepts_node_lib_dir_with_native_nodes() {
+        assert!(refuse_node_lib_dir_in_process(TransportKind::CrossProcess, 1, true).is_ok());
+    }
+
+    #[test]
+    fn status_json_lists_linked_nodes() {
+        let mut status = Status::new("robot".to_string());
+        status.linked_nodes = vec!["printer".to_string(), "relay".to_string()];
+        let json = serde_json::to_value(&status).expect("status JSON");
         assert_eq!(
-            error.to_string(),
-            "graph nodes loaded from libraries cannot deliver frames under the in-process transport; run the app without graph_yaml"
+            json["linked_nodes"],
+            serde_json::json!(["printer", "relay"])
         );
-    }
-
-    #[test]
-    fn in_process_transport_accepts_zero_native_nodes() {
-        assert!(refuse_dlopen_nodes(TransportKind::InProcess, 0).is_ok());
-    }
-
-    #[test]
-    fn cross_process_transport_accepts_native_nodes() {
-        assert!(refuse_dlopen_nodes(TransportKind::CrossProcess, 1).is_ok());
     }
 
     #[test]
