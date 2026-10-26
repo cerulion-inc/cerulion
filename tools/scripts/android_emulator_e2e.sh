@@ -161,6 +161,25 @@ run_probe() {
     fail "$label" "$verdict"
   pass "$label" "$verdict"
 }
+# stop_host_netd: stop the host network daemon that `host_list` and
+# `host_echo` spawned, if any. The probe runs with no other zenoh peer on the
+# host: a live host netd would bridge the heartbeat into the shared memory the
+# probe's subscriber reads (frames that never crossed the probe's ingress),
+# and its own demand queryable can answer the probe's demand with `refused`
+# for a topic it does not produce (an ack the paired verdict would count as
+# the app's posture refusal).
+stop_host_netd() {
+  local host_netd deadline
+  HOST_NETD_OWNED || return 0
+  host_netd="$(cat "$HOST_NETD_PID")"
+  kill -TERM "$host_netd" >/dev/null 2>&1 || true
+  deadline=$((SECONDS + 20))
+  while kill -0 "$host_netd" >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || fail "host netd stop" "pid $host_netd is still alive"
+    sleep 1
+  done
+  rm -f "$HOST_NETD_PID"
+}
 cleanup() {
   local rc=$?
   set +e
@@ -394,6 +413,8 @@ grep -Fq 'refused to serve its topic catalog to LAN peers (not authorized)' <<<"
 pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
 # Paired direct data demand: a paired app must refuse every answered demand
 # and send no frame. It runs twice, and both runs must give that verdict.
+# With the host netd stopped, the app is the only peer left to answer.
+stop_host_netd
 run_probe "paired direct demand" paired std_msgs/String paired-demand-probe.txt
 run_probe "paired direct demand, second run" paired std_msgs/String paired-demand-probe-2.txt
 device "am force-stop '$APP'"
@@ -420,19 +441,8 @@ printf 'rc=%s\n%s\n' "$open_rc" "$open_echo" > "$OUT/open-echo.txt"
   fail "open heartbeat" "rc=$open_rc output=$open_echo"
 open_ticks="$(printf '%s\n' "$open_echo" | tick_values)"
 assert_increasing "open heartbeat" "$open_ticks"
-# The host netd that `topic echo` spawned would bridge the heartbeat into local
-# shared memory, where the probe's own subscriber would count it. Stop it, so
-# every frame the probe counts came through the probe's own ingress.
-if HOST_NETD_OWNED; then
-  host_netd="$(cat "$HOST_NETD_PID")"
-  kill -TERM "$host_netd" >/dev/null 2>&1 || true
-  deadline=$((SECONDS + 20))
-  while kill -0 "$host_netd" >/dev/null 2>&1; do
-    (( SECONDS < deadline )) || fail "host netd stop" "pid $host_netd is still alive"
-    sleep 1
-  done
-  rm -f "$HOST_NETD_PID"
-fi
+# The open `host_list` and `host_echo` spawned a new host netd: stop it too.
+stop_host_netd
 # Open control: the same demand IS granted and delivered when the app is open.
 # The app's refused ack does not say why it refused, so this is what ties the
 # paired refusal to the posture and not to the topic, schema or allow-list.
