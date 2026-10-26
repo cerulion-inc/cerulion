@@ -6049,8 +6049,22 @@ pub fn graph_run(
     // and that process runs its nodes in executor units: when they split, the
     // run goes through the supervisor with ONE process group holding every
     // node, so one worker process hosts all the units.
+    // The execution mode is read from the environment exactly once per run,
+    // HERE, and the result threaded to every reader below.
+    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
+    // value to "unset" and skips the garbage warn every other unrecognised
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
+    let raw_execution_mode =
+        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
     let single_process = single_process
-        && !single_process_hosts_units(workspace_root, &mut config, time_source)?;
+        && !single_process_hosts_units(
+            workspace_root,
+            &mut config,
+            time_source,
+            execution_mode_request,
+        )?;
     let deployment = resolve_deployment(
         config.has_process_groups(),
         single_process,
@@ -6064,9 +6078,9 @@ pub fn graph_run(
         )));
     }
     let executes_process_groups = matches!(deployment, Ok(Deployment::Supervisor));
-    // The execution mode is RESOLVED here, once, from the same
-    // deployment fact — the environment is read exactly one time per run and
-    // the RESULT is threaded to the run-directory descriptor, the supervisor
+    // The execution mode is RESOLVED here, once, from the deployment fact and
+    // the request read above (the environment's one read per run); the RESULT
+    // is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
     // A supervisor run FREE-RUNS by default;
@@ -6074,13 +6088,6 @@ pub fn graph_run(
     // a run with no ranks is the one-rank lockstep timeline whatever is
     // asked. An explicit `free_run` the route cannot honour warns loudly
     // rather than silently doing nothing.
-    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
-    // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never a recognised
-    // spelling, so it takes the garbage arm and is printed under `got=`.
-    let raw_execution_mode =
-        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
     let execution_mode =
         resolve_run_execution_mode(executes_process_groups, execution_mode_request);
     note_inert_execution_mode_request(executes_process_groups, execution_mode_request);
@@ -10598,13 +10605,10 @@ fn single_process_hosts_units(
     workspace_root: &Path,
     config: &mut GraphConfig,
     time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
 ) -> CliResult<bool> {
     let lockstep = matches!(
-        resolve_execution_mode_request(
-            std::env::var_os(EXECUTION_MODE_ENV)
-                .map(|v| v.to_string_lossy().into_owned())
-                .as_deref()
-        ),
+        execution_mode_request,
         Some(crate::multiprocess::ExecutionMode::Lockstep)
     );
     if time_source != TimeSource::Real || lockstep || !cfg!(unix) {
