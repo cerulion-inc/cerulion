@@ -557,12 +557,13 @@ fn spawn_child(topic: &str, type_name: &str, x: f64) -> Child {
         .expect("spawn child");
     let stdout = process.stdout.take().expect("child stdout");
     let (tx, rx) = std::sync::mpsc::channel();
+    // The reader drains the child's stdout to its end, even after the parent
+    // stops listening: a closed pipe would fail the child's own libtest
+    // summary write with EPIPE and exit it 101.
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
+            let _ = tx.send(line);
         }
     });
     let deadline = Instant::now() + CHILD_TIMEOUT;
