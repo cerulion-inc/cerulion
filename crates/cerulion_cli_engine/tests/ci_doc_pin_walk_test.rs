@@ -327,6 +327,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The user-facing reference page.
     ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
+    // The networking page's worked example of the netd banner.
+    (
+        "cerulion_netd",
+        "networking_doc_banner_test",
+        &["docs"],
+        &[],
+    ),
     // The robot example workspace: its lockfile and member manifests, read for
     // a telemetry edge no robot crate may carry.
     (
