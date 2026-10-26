@@ -1,0 +1,19 @@
+[package]
+name = "test_node_macro_relay_rlib"
+version = "0.1.0"
+edition = "2021"
+# Test fixture — never publish to crates.io.
+publish = false
+
+# Library only, and no `cdylib` feature: the macro's FFI module is never
+# compiled, so this node can only run linked into another library.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+cerulion_core = { path = "../../cerulion_core" }
+native_ros2_messages = { path = "../../native_ros2_messages" }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true
