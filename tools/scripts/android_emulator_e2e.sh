@@ -26,7 +26,10 @@ build() {
   # copy each node crate's own library, so the build copies exactly the one
   # file, into a jniLibs directory emptied of anything an older build left.
   (cd "$RUNTIME_DIR" && cargo ndk -t "$ABI" --platform 30 build --release -p "$RUNTIME_LIB")
-  local runtime_target="${CARGO_TARGET_DIR:-$RUNTIME_DIR/target}"
+  # Cargo ran inside RUNTIME_DIR, so a relative CARGO_TARGET_DIR is relative
+  # to that directory.
+  local runtime_target="${CARGO_TARGET_DIR:-target}"
+  [[ "$runtime_target" = /* ]] || runtime_target="$RUNTIME_DIR/$runtime_target"
   rm -rf "$JNILIBS"
   mkdir -p "$JNILIBS/$ABI"
   cp "$runtime_target/$TRIPLE/release/lib$RUNTIME_LIB.so" "$JNILIBS/$ABI/"

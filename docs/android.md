@@ -266,8 +266,8 @@ empty the app's `jniLibs` directory, and copy only
 `jniLibs/arm64-v8a/`. Do not use `cargo ndk -o` for this library: it also
 copies each node crate's own `.so`, and the app would then ship a second
 runtime. `tools/scripts/android_jnilibs_gate.sh <jniLibs> myapp_runtime`
-checks the result: exactly one library per ABI, every `LOAD` segment aligned
-to 16 KB, `JNI_OnLoad` exported and no node export such as
+checks the result: exactly one library per ABI, built for that ABI, every
+`LOAD` segment aligned to 16 KB, `JNI_OnLoad` exported and no node export such as
 `cerulion_node_info`. In `app/build.gradle`, set `minSdk 30`, the
 `abiFilters` you built, and add the `java/` directory of `cerulion_android`
 to `sourceSets.main.java.srcDirs`. Ship the graph as

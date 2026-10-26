@@ -10,6 +10,8 @@
 #   - exactly one `.so`, and it is `lib<library name>.so`; a second library
 #     (for example a node crate's own `.so`) would put a second runtime with
 #     the same JNI exports into the app;
+#   - an ELF machine type that matches the ABI directory (arm64-v8a is
+#     AArch64, x86_64 is X86-64, armeabi-v7a is ARM, x86 is Intel 80386);
 #   - every LOAD segment aligned to at least 16 KB (0x4000), so the library
 #     loads on devices with 16 KB pages;
 #   - `JNI_OnLoad` and `Java_com_cerulion_android_CerulionRuntime_nativeInit`
@@ -51,12 +53,32 @@ ndk_bin() {
 
 # Prints every problem with one library, one per line; prints nothing when
 # the library is good.
+# The `Machine:` text llvm-readelf prints for the libraries of one ABI
+# directory; empty for a directory name that is not an Android ABI.
+abi_machine() {
+  case "$1" in
+    arm64-v8a) echo AArch64 ;;
+    x86_64) echo "Advanced Micro Devices X86-64" ;;
+    armeabi-v7a) echo ARM ;;
+    x86) echo "Intel 80386" ;;
+    *) echo "" ;;
+  esac
+}
+
 library_problems() {
-  local bin=$1 lib=$2
+  local bin=$1 lib=$2 abi=$3
   local headers
-  if ! headers="$("$bin/llvm-readelf" -lW "$lib" 2>&1)"; then
+  if ! headers="$("$bin/llvm-readelf" -hlW "$lib" 2>&1)"; then
     echo "$lib: llvm-readelf failed: $headers"
     return
+  fi
+  local want machine
+  want="$(abi_machine "$abi")"
+  machine="$(awk -F': *' '$1 ~ /^ *Machine$/ { print $2; exit }' <<<"$headers")"
+  if [[ -z "$want" ]]; then
+    echo "$lib: $abi is not an Android ABI directory (arm64-v8a, x86_64, armeabi-v7a, x86)"
+  elif [[ "$machine" != "$want" ]]; then
+    echo "$lib: ELF machine is ${machine:-unknown}, expected $want for $abi"
   fi
   local index=0 loads=0 align
   while read -r align; do
@@ -109,7 +131,7 @@ jnilibs_problems() {
       echo "$abi_dir: expected lib$name.so, found $(basename "${libs[0]}")"
       continue
     fi
-    library_problems "$bin" "${libs[0]}"
+    library_problems "$bin" "${libs[0]}" "$(basename "$abi_dir")"
   done
 }
 
@@ -120,7 +142,7 @@ check() {
     printf 'FAIL jniLibs gate: %s\n' "$problems" >&2
     return 1
   fi
-  echo "PASS jniLibs gate: $dir holds one 16 KB aligned lib$name.so per ABI with the JNI exports and no node exports"
+  echo "PASS jniLibs gate: $dir holds one 16 KB aligned lib$name.so per ABI, built for that ABI, with the JNI exports and no node exports"
 }
 
 self_test() {
@@ -141,11 +163,16 @@ EOF
   cat >"$work/no_onload.c" <<'EOF'
 int Java_com_cerulion_android_CerulionRuntime_nativeInit(void) { return 0; }
 EOF
-  link() { # <out> <page size> <sources...>
-    local out=$1 page=$2
-    shift 2
+  local clang_x86_64="$bin/x86_64-linux-android30-clang"
+  [[ -x "$clang_x86_64" ]] || { echo "FAIL jniLibs self-test: no NDK clang at $clang_x86_64" >&2; exit 1; }
+  link_with() { # <clang> <out> <page size> <sources...>
+    local cc=$1 out=$2 page=$3
+    shift 3
     mkdir -p "$(dirname "$out")"
-    "$clang" -shared -fPIC -Wl,-z,max-page-size="$page" -o "$out" "$@"
+    "$cc" -shared -fPIC -Wl,-z,max-page-size="$page" -o "$out" "$@"
+  }
+  link() { # <out> <page size> <sources...>; an arm64 library
+    link_with "$clang" "$@"
   }
   local failures=0
   expect() { # <pass|fail> <case> <dir> <expected text in the failure>
@@ -172,6 +199,11 @@ EOF
   expect fail "node exports" "$work/node_exports" "exports cerulion_node_info"
   link "$work/no_onload/arm64-v8a/libapp_runtime.so" 16384 "$work/no_onload.c"
   expect fail "missing JNI_OnLoad" "$work/no_onload" "does not export JNI_OnLoad"
+  link_with "$clang_x86_64" "$work/both/x86_64/libapp_runtime.so" 16384 "$work/good.c"
+  link "$work/both/arm64-v8a/libapp_runtime.so" 16384 "$work/good.c"
+  expect pass "arm64-v8a and x86_64 libraries" "$work/both"
+  link "$work/wrong_abi/x86_64/libapp_runtime.so" 16384 "$work/good.c"
+  expect fail "library built for another ABI" "$work/wrong_abi" "ELF machine is AArch64, expected Advanced Micro Devices X86-64 for x86_64"
   mkdir -p "$work/empty/arm64-v8a"
   expect fail "empty ABI directory" "$work/empty" "found 0"
   (( failures == 0 )) || { echo "FAIL jniLibs self-test: $failures case(s) failed" >&2; exit 1; }
