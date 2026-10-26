@@ -119,6 +119,7 @@ impl Spec {
                 depth: 10,
                 backpressure: *backpressure,
                 expect_within_ms: None,
+                consume: Default::default(),
             })
             .collect();
         let mut info = NodeInfo::with_meta(meta, Vec::new());

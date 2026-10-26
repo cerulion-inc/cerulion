@@ -181,6 +181,14 @@ fn validate_input_attrs(field_attrs: &FieldAttrs, errors: &mut Vec<syn::Error>) 
     }
 }
 
+/// The refusal for `consume = latest` on a trigger input of a
+/// `sync_window_ms` / `unbounded_sync` node.
+pub(crate) const SYNC_CONSUME_LATEST_REFUSED: &str =
+    "`consume = latest` is not accepted on a trigger input of a `sync_window_ms` or \
+     `unbounded_sync` node: a Sync node fires once per aligned set of its trigger inputs, \
+     in set order, and does not take a per-input consumption mode. `consume = latest` \
+     applies to the one trigger input of a data-triggered node.";
+
 /// Validate trigger policy inference for declarative mode.
 ///
 /// Inference rules:
@@ -287,6 +295,20 @@ fn validate_trigger_inference(
             // error because removing the sync attr is the user's call.
         }
         _ => {
+            // A Sync node fires once per aligned SET, so a per-input
+            // `consume = latest` has no meaning on its own trigger inputs.
+            if has_sync || has_unbounded_sync {
+                for input in field_attrs
+                    .inputs
+                    .iter()
+                    .filter(|i| i.consume == Some(crate::parse::ParsedConsume::Latest))
+                {
+                    errors.push(syn::Error::new(
+                        input.field_name.span(),
+                        SYNC_CONSUME_LATEST_REFUSED,
+                    ));
+                }
+            }
             // 2+ trigger inputs require one of: sync_window_ms, unbounded_sync
             if !has_sync && !has_unbounded_sync {
                 let trigger_names: Vec<String> = field_attrs

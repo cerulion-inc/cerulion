@@ -43,8 +43,8 @@ use crate::wire::MaxSliceLen;
 use super::config::{GraphConfig, DEFAULT_MAX_SLICE_LEN};
 use super::node::{
     flood_log_action, AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource,
-    FloodLogAction, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo, OutputMeta,
-    ShutdownSignal,
+    FloodLogAction, InputConsume, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo,
+    OutputMeta, ShutdownSignal,
 };
 use super::tick_failure_latch::{TickFailureLatch, TickFailureLog};
 use super::topology::{GraphTopology, Levels};
@@ -1087,6 +1087,10 @@ struct DataTriggerBinding {
     /// key the consumer opens the matching SHM doorbell on. `Arc<str>` mirrors
     /// `node_id`.
     topic: Arc<str>,
+    /// The input declares `consume = latest`: its drains pop the whole queue
+    /// and serve the newest frame, and the node fires at most once per step.
+    /// `false` for the `fifo` default.
+    consume_latest: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -6298,6 +6302,9 @@ impl GraphRuntime {
         // Collected from each node's macro `throttle_ms()` in the loop below,
         // then composed into that node's pre-fire (defer if throttle OR block).
         let mut throttle_by_node: HashMap<String, u64> = HashMap::new();
+        // Nodes whose data-trigger input declares `consume = latest`, handed
+        // to the scheduler once every node exists in it.
+        let mut consume_latest_nodes: Vec<String> = Vec::new();
         // QoS watchdog registrations, drained into the
         // scheduler AFTER `add_node` (the node must exist before
         // `set_{expect,promise,tick}_within`). The `Arc<AtomicU64>` window
@@ -7565,7 +7572,21 @@ impl GraphRuntime {
                 // own wiring site below: per-set delivery consumes
                 // each member by exactly one set, so drain-to-latest there
                 // would serve the tick a frame the matcher never chose.
-                if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
+                //
+                // `consume = latest` opts OUT of all of that: the body
+                // subscriber keeps the drain-to-latest read a context input
+                // has, the scheduler collapses the node's pending arrivals to
+                // one fire per step, and no refill runs between fires. Read
+                // from the node's own `InputMeta`, the declaration both the
+                // macro and the cdylib info JSON carry.
+                let consume_latest = entry_info
+                    .input_meta
+                    .iter()
+                    .find(|m| m.name == *input_name)
+                    .is_some_and(|m| m.consume == InputConsume::Latest);
+                if consume_latest {
+                    consume_latest_nodes.push(node_def.id.clone());
+                } else if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
                     body_sub.mark_fifo_consume();
                     // Mint this input's SERVICE CURSOR here, at the
                     // ONE site that knows an input is per-message FIFO — so
@@ -7655,6 +7676,7 @@ impl GraphRuntime {
                         warn_suppressed: false,
                         drain: DrainSource::Unified { listener_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
+                        consume_latest,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -7855,6 +7877,7 @@ impl GraphRuntime {
                         warn_suppressed: false,
                         drain: DrainSource::Separate { sub_idx: idx },
                         topic: Arc::<str>::from(trigger_topic.as_str()),
+                        consume_latest,
                     });
                 }
             }
@@ -8687,6 +8710,9 @@ impl GraphRuntime {
         for (node, within_ms) in tick_within_registrations {
             scheduler.set_tick_within(&node, within_ms)?;
         }
+        for node in &consume_latest_nodes {
+            scheduler.set_data_consume_latest(node)?;
+        }
         // Install ONE composed pre-fire per node that has block
         // edges and/or a throttle_ms cap. Defer if EITHER predicate fires.
         // The throttle + block actuators share the scheduler's single
@@ -8882,7 +8908,9 @@ impl GraphRuntime {
         // the live loop's poll cadence, never a same-frame re-fire.
         let mut refill_incapable: Vec<String> = Vec::new();
         for binding in &data_trigger_bindings {
-            if !matches!(binding.drain, DrainSource::Unified { .. }) {
+            // A `consume = latest` input fires once per step on the newest
+            // frame, so there is no burst to refill and nothing is installed.
+            if !matches!(binding.drain, DrainSource::Unified { .. }) || binding.consume_latest {
                 continue;
             }
             if refills_trigger_input.get(binding.node_id.as_ref()) != Some(&true) {
@@ -18120,6 +18148,7 @@ impl GraphRuntime {
             // hot-path-alloc-ok: not a heap allocation: cloning an `Arc`/`Option<Arc>` is a
             // refcount bump — the comment above says so, and `input_name` is an `Option<Arc<str>>`
             let input_name = self.data_trigger_bindings[i].input_name.clone();
+            let consume_latest = self.data_trigger_bindings[i].consume_latest;
 
             // Dispatch on the binding's `DrainSource` — the two
             // drain disciplines are mutually exclusive in the type system, so the
@@ -18389,11 +18418,15 @@ impl GraphRuntime {
                     // The SEPARATE discipline is untouched — it drains a
                     // dedicated subscriber that never re-offers, so its
                     // per-frame signals are per-frame truth.
+                    // A `consume = latest` drain pops the whole queue, so its
+                    // count may exceed one; the gate below mints at most one
+                    // signal either way, which is the one fire a latest input
+                    // gets per step.
                     debug_assert!(
-                        popped <= 1,
+                        popped <= 1 || consume_latest,
                         "unified trigger drain popped {popped} frames for node '{node_id}'; \
                          the mint gate below assumes the EachFifo pop-one contract \
-                         (every data-trigger input is marked `mark_fifo_consume`)"
+                         (every fifo data-trigger input is marked `mark_fifo_consume`)"
                     );
                     if popped > 0 && self.scheduler.pending_data_count(&node_id) == 0 {
                         if let Err(e) = self.scheduler.signal_data(&node_id) {
@@ -19492,6 +19525,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
 
         // Mixed: exactly the marked pair survives.
@@ -19569,6 +19603,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }
     }
 
@@ -19728,6 +19763,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let wired = |name: &str| InputDef {
             name: name.to_string(),
@@ -19796,6 +19832,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let wired = |name: &str, source: &str| InputDef {
             name: name.to_string(),

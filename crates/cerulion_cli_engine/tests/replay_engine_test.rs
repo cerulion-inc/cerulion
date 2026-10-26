@@ -198,6 +198,25 @@ impl RelayNode {
     }
 }
 
+/// The relay with a `consume = latest` trigger: each step that sees frames
+/// fires it once, on the newest.
+#[cerulion_node]
+#[derive(Default)]
+struct LatestRelayNode {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl LatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
 /// A period source at TWICE [`SourceNode`]'s period, so under the reference
 /// run's one-`SourceNode`-period step (`DELTA_MS`) it publishes on every OTHER
 /// step.
@@ -3078,6 +3097,63 @@ fn external_frames_are_reinjected_and_downstream_matches() {
     // (not diffed), so exactly one topic is checked.
     assert_eq!(outcome.topics_checked, 1);
     assert_eq!(outcome.topics_passed, 1);
+}
+
+fn latest_relay_yaml() -> &'static str {
+    "name: lrg\nprefix: lr\nnodes:\n\
+     \x20 - id: relay\n    type: latest_relay_node\n    inputs:\n      - name: inp\n        source: /lr/ext/cam\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![("relay", Box::new(LatestRelayNodeEntry::new()))])
+}
+
+/// A `consume = latest` relay fed BURSTS: the recording is anchored to a hand
+/// oracle (one output per step that saw frames, the step's newest frame plus
+/// 100), and its replay re-injects the bursts and reproduces it byte for byte,
+/// twice identically. As `fifo` the relay would publish one output per frame
+/// (eight), so the oracle half catches the latest wiring being removed, and
+/// the replay half catches the replay injecting a latest edge as FIFO.
+#[test]
+#[serial]
+fn a_latest_relay_fed_bursts_replays_byte_exact() {
+    let per_step: Vec<Vec<f64>> = vec![
+        vec![1.0, 2.0, 3.0],
+        vec![],
+        vec![4.0],
+        vec![5.0, 6.0, 7.0, 8.0],
+        vec![],
+    ];
+    let externals = vec![ExternalDrive {
+        topic: "/lr/ext/cam".to_string(),
+        per_step: per_step.clone(),
+    }];
+    let rec = record_uniform_with_read_log(
+        latest_relay_yaml(),
+        latest_relay_factories,
+        &externals,
+        per_step.len(),
+    );
+    let out: Vec<f64> = rec.messages["/lr/relay/out"].iter().map(|f| frame_x(f)).collect();
+    assert_eq!(out, vec![103.0, 104.0, 108.0], "one output per step that saw frames");
+    assert_eq!(rec.messages["/lr/ext/cam"].len(), 8, "every external frame recorded");
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("latest.mcap");
+    write_bag(&rec, &bag, None);
+    let a = replay(&bag, latest_relay_factories, None, None).expect("replay runs");
+    assert!(
+        a.passed && a.trace_divergence.is_none(),
+        "a latest relay replays byte-exact: {:?} / {:?}",
+        a.violations,
+        a.trace_divergence
+    );
+    let b = replay(&bag, latest_relay_factories, None, None).expect("replay runs");
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 // ===========================================================================

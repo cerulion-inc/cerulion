@@ -209,6 +209,7 @@ fn block_input_meta(depth: usize) -> InputMeta {
         depth,
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
+        consume: Default::default(),
     }
 }
 
@@ -1407,6 +1408,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         vec![],
     )

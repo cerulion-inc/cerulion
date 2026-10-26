@@ -4701,6 +4701,7 @@ fn a_serial_gated_producer_does_not_count_toward_the_shared_pair() {
                     depth: 8,
                     backpressure: BackpressurePolicy::DropOldest,
                     expect_within_ms: None,
+                    consume: Default::default(),
                 }],
                 vec![OutputMeta::new(
                     "out".to_string(),
@@ -6374,6 +6375,7 @@ fn a_closure_node_that_cannot_freeze_is_sized_for_one_record_per_fire() {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         Vec::new(),
     )
@@ -6426,6 +6428,7 @@ fn a_closure_period_burst_stages_no_marker_at_its_derived_capacity() {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         }],
         Vec::new(),
     )

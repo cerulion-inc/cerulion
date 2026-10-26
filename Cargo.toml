@@ -59,6 +59,8 @@ members = [
     "crates/test_fixtures/test_node_macro_external_cdylib",
     # Macro-emitted DataTrigger round-trip fixture.
     "crates/test_fixtures/test_node_macro_data_trigger_cdylib",
+    # `#[input(trigger, consume = latest)]` across the cdylib info JSON.
+    "crates/test_fixtures/test_node_macro_consume_latest_cdylib",
     # The tick that NEVER RETURNS (env-switched), the one condition
     # the wedge alarm exists to report and the only fixture that can produce it.
     "crates/test_fixtures/test_node_hang_cdylib",

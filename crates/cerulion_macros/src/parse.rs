@@ -62,6 +62,18 @@ pub enum ParsedBackpressurePolicy {
     Sample(u64),
 }
 
+/// Consumption mode parsed from `#[input(trigger, consume = fifo | latest)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedConsume {
+    /// One fire per queued frame, in arrival order (the default).
+    Fifo,
+    /// At most one fire per step, reading the newest queued frame.
+    Latest,
+}
+
+/// The accepted `consume` values, quoted in every `consume` refusal.
+pub(crate) const CONSUME_VALUES: &str = "`consume = fifo` (the default) or `consume = latest`";
+
 /// Parsed `#[input(...)]` field attribute.
 ///
 /// The never-executed `fifo` / `lifo` / `max_age_ms` / `filter` attrs
@@ -84,6 +96,9 @@ pub struct FieldInputAttr {
     /// `Some(cap)` for an `#[input(accumulate)]` port (see
     /// `input_accumulate`); the cap is also written into `depth`.
     pub accumulate: Option<usize>,
+    /// The declared `consume = fifo | latest`, `None` when undeclared (the
+    /// `fifo` default). Only a `trigger` input may declare it.
+    pub consume: Option<ParsedConsume>,
 }
 
 /// Parsed `#[output]` field attribute.
@@ -354,7 +369,9 @@ fn parse_input_attr(
         backpressure: None,
         expect_within_ms: None,
         accumulate: None,
+        consume: None,
     };
+    let mut consume_span: Option<proc_macro2::Span> = None;
     let mut accumulate_keys = crate::input_accumulate::AccumulateKeys::default();
 
     // Handle bare `#[input]` with no parentheses
@@ -417,6 +434,29 @@ fn parse_input_attr(
             "accumulate" | "cap" => {
                 crate::input_accumulate::parse_key(ident, &meta, &mut accumulate_keys)?;
             }
+            "consume" => {
+                if consume_span.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("`consume` given twice. Write {CONSUME_VALUES}."),
+                    ));
+                }
+                consume_span = Some(ident.span());
+                let value = meta.value()?;
+                let mode: Ident = value.parse().map_err(|e| {
+                    syn::Error::new(e.span(), format!("`consume` takes {CONSUME_VALUES}."))
+                })?;
+                result.consume = Some(match mode.to_string().as_str() {
+                    "fifo" => ParsedConsume::Fifo,
+                    "latest" => ParsedConsume::Latest,
+                    other => {
+                        return Err(syn::Error::new(
+                            mode.span(),
+                            format!("unknown consume mode `{other}`, expected {CONSUME_VALUES}."),
+                        ));
+                    }
+                });
+            }
             other => {
                 // Bare-ident and `name = value` attrs both land here: the
                 // match keys on the ident BEFORE any `= value` is consumed,
@@ -425,7 +465,7 @@ fn parse_input_attr(
                     ident.span(),
                     format!(
                         "unknown input attribute `{other}`. Supported: `trigger`, `depth`, \
-                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`."
+                         `backpressure`, `expect_within_ms`, `accumulate`, `cap`, `consume`."
                     ),
                 ));
             }
@@ -433,9 +473,20 @@ fn parse_input_attr(
         Ok(())
     })?;
     crate::input_accumulate::finish(accumulate_keys, &mut result)?;
+    if let (Some(span), false) = (consume_span, result.trigger) {
+        return Err(syn::Error::new(span, CONSUME_NEEDS_TRIGGER));
+    }
 
     Ok(result)
 }
+
+/// The refusal for `consume` on a non-trigger input. Shared with the
+/// `cerulion` source reader's mirror of this grammar, which must refuse the
+/// same source with the same words.
+pub(crate) const CONSUME_NEEDS_TRIGGER: &str =
+    "`consume` applies only to a trigger input: write `#[input(trigger, consume = latest)]`. \
+     A non-trigger input never fires the node; it is a latest-value read that already \
+     serves the newest frame on every fire, so it has no consumption order to choose.";
 
 /// Parse the contents of an `#[output(...)]` attribute.
 ///
@@ -670,6 +721,88 @@ mod tests {
         assert_eq!(inp.backpressure, Some(ParsedBackpressurePolicy::Block));
     }
 
+    // ---- `consume = fifo | latest` ----
+
+    fn consume_of(input: DeriveInput) -> Option<ParsedConsume> {
+        extract_field_attrs(&input).unwrap().inputs[0].consume
+    }
+
+    fn consume_refusal(input: DeriveInput) -> String {
+        extract_field_attrs(&input)
+            .expect_err("refused")
+            .to_string()
+    }
+
+    #[test]
+    fn consume_latest_and_fifo_parse_on_a_trigger_input() {
+        assert_eq!(
+            consume_of(parse_quote! {
+                struct N { #[input(trigger, consume = latest)] img: Image }
+            }),
+            Some(ParsedConsume::Latest)
+        );
+        assert_eq!(
+            consume_of(parse_quote! {
+                struct N { #[input(consume = fifo, trigger, depth = 4)] img: Image }
+            }),
+            Some(ParsedConsume::Fifo)
+        );
+        assert_eq!(
+            consume_of(parse_quote! { struct N { #[input(trigger)] img: Image } }),
+            None,
+            "undeclared stays None, the fifo default"
+        );
+    }
+
+    #[test]
+    fn consume_composes_with_every_backpressure_policy() {
+        for bp in [
+            quote::quote!(drop_oldest),
+            quote::quote!(block),
+            quote::quote!(sample(20)),
+        ] {
+            let src: DeriveInput = parse_quote! {
+                struct N { #[input(trigger, consume = latest, backpressure = #bp)] img: Image }
+            };
+            assert_eq!(consume_of(src), Some(ParsedConsume::Latest), "{bp}");
+        }
+    }
+
+    #[test]
+    fn consume_on_a_non_trigger_input_is_refused_naming_the_distinction() {
+        assert_eq!(
+            consume_refusal(parse_quote! {
+                struct N { #[input(consume = latest)] img: Image }
+            }),
+            CONSUME_NEEDS_TRIGGER
+        );
+        assert!(CONSUME_NEEDS_TRIGGER.contains("latest-value read"));
+        assert!(CONSUME_NEEDS_TRIGGER.contains("#[input(trigger, consume = latest)]"));
+    }
+
+    #[test]
+    fn an_unknown_or_missing_consume_value_is_refused_with_the_accepted_values() {
+        assert_eq!(
+            consume_refusal(parse_quote! {
+                struct N { #[input(trigger, consume = lifo)] img: Image }
+            }),
+            "unknown consume mode `lifo`, expected `consume = fifo` (the default) or \
+             `consume = latest`."
+        );
+        assert_eq!(
+            consume_refusal(parse_quote! {
+                struct N { #[input(trigger, consume = 3)] img: Image }
+            }),
+            "`consume` takes `consume = fifo` (the default) or `consume = latest`."
+        );
+        assert_eq!(
+            consume_refusal(parse_quote! {
+                struct N { #[input(trigger, consume = latest, consume = fifo)] img: Image }
+            }),
+            "`consume` given twice. Write `consume = fifo` (the default) or `consume = latest`."
+        );
+    }
+
     // ---- every unrecognized #[input] attr routes to the unknown-attr error ----
 
     /// The tail every unknown-`#[input]`-attr error must render, after the
@@ -677,7 +810,7 @@ mod tests {
     /// varies per test). Anchored on the accepted-set remedy, which is the
     /// only thing this diagnostic owes the reader.
     const UNKNOWN_INPUT_ATTR_TAIL: &str =
-        "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.";
+        "Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`, `consume`.";
 
     fn assert_unknown_attr_error(input: DeriveInput, offending: &str) {
         let err = extract_field_attrs(&input).expect_err("unknown input attr must be rejected");

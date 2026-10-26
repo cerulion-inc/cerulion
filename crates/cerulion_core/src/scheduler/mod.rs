@@ -497,6 +497,12 @@ struct ScheduledNode {
     // Timing state (managed by scheduler)
     next_fire_ns: Option<u64>,
     pending_data_count: u64,
+    /// The node's `Data` trigger input declares `consume = latest`: a step
+    /// with any pending arrival fires the node ONCE and clears the count,
+    /// because that one fire's read drains the queue to its newest frame.
+    /// Set at graph build by [`Scheduler::set_data_consume_latest`]; `false`
+    /// (one fire per arrival) otherwise.
+    data_consume_latest: bool,
     /// Per trigger-input HEAD — the frame this input contributes to
     /// the set currently being formed, keyed by the RESOLVED SOURCE TOPIC.
     ///
@@ -2430,6 +2436,7 @@ impl Scheduler {
             node_id: Arc::clone(&node_id_arc),
             next_fire_ns,
             pending_data_count: 0,
+            data_consume_latest: false,
             sync_heads: IndexMap::new(),
             // Installed later (graph build) for TRANSPORT-backed Sync
             // nodes only; a pure-scheduler embedder keeps the hand-driven
@@ -3842,6 +3849,33 @@ impl Scheduler {
     /// `within_ms`, the node's `tick_within_missed_count`
     /// increments.
     // hot-path-alloc-ok-fn: cold: per-node QoS registration at graph BUILD
+    /// Declare that `node_id`'s `Data` trigger input is `consume = latest`.
+    ///
+    /// From then on a step that finds any pending arrival fires the node
+    /// once and clears the count, where the `fifo` default fires once per
+    /// arrival. The arrivals beyond the first are not owed fires: the one
+    /// fire's read drains the queue to the newest frame. Refused for a node
+    /// whose policy is not `Data`, the [`Self::set_trigger_refill`] rule.
+    pub fn set_data_consume_latest(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        if !matches!(node.policy, TriggerPolicy::Data) {
+            return Err(TransportError::SchedulerError {
+                reason: format!(
+                    "set_data_consume_latest() not valid for node '{}' with policy {:?}: \
+                     `consume = latest` applies to a data-trigger node",
+                    node_id, node.policy
+                ),
+            });
+        }
+        node.data_consume_latest = true;
+        Ok(())
+    }
+
     pub fn set_tick_within(&mut self, node_id: &str, within_ms: u64) -> TransportResult<()> {
         let node = self
             .nodes
@@ -7185,7 +7219,17 @@ impl Scheduler {
                     // due-NOW through `ns_until_next_fire`, so on the live path
                     // the wake window stays at the loop's 1 ms floor until it
                     // clears — never a busy-spin, and never a per-frame tail.
-                    let fire_count = node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP);
+                    //
+                    // A `consume = latest` node fires ONCE however many
+                    // arrivals are pending, and none carry: its read drains
+                    // the queue to the newest frame, so the older arrivals
+                    // have no frame left to serve.
+                    let fire_count = if node.data_consume_latest {
+                        node.pending_data_count = 1;
+                        1
+                    } else {
+                        node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP)
+                    };
                     node.pending_data_count -= fire_count;
                     node.pending_data_count_shared
                         .store(node.pending_data_count, Ordering::Release);

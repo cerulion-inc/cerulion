@@ -198,6 +198,26 @@ pub enum BackpressurePolicy {
     Sample(u64),
 }
 
+/// How a TRIGGER input's queued frames become fires: the
+/// `#[input(trigger, consume = ...)]` value.
+///
+/// It applies to trigger inputs only. A non-trigger input is a latest-value
+/// read that never fires the node, so it has no consumption order; the macro,
+/// the cdylib info-JSON loader and the `cerulion` source reader all refuse
+/// `consume` on one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputConsume {
+    /// One fire per queued frame, in arrival order, each tick reading exactly
+    /// that frame (the default).
+    #[default]
+    Fifo,
+    /// At most one fire per scheduler step: the read drains the queue and
+    /// serves the newest frame. The older frames it drained are not served.
+    /// A frame no fire has read yet is kept until a newer one arrives, so a
+    /// deferred fire (`throttle_ms`, a `block` gate) still reads it.
+    Latest,
+}
+
 /// Metadata describing a declarative input port.
 ///
 /// Produced by `#[input(...)]` field attributes in `#[cerulion_node]`.
@@ -222,6 +242,9 @@ pub struct InputMeta {
     /// (`#[input(trigger)]` and `#[input(expect_within_ms = N)]` are
     /// orthogonal).
     pub expect_within_ms: Option<u64>,
+    /// The declared `consume = fifo | latest` of a trigger input. Always
+    /// [`InputConsume::Fifo`] on a non-trigger input.
+    pub consume: InputConsume,
 }
 
 /// Metadata describing a declarative output port.
@@ -4963,6 +4986,18 @@ impl DylibNodeEntry {
             Sample(u64),
         }
 
+        // The declared `#[input(trigger, consume = ...)]`. ADDITIVE, not an
+        // ABI bump: the macro emits `"consume":"latest"` only for `latest`,
+        // and an absent key is `fifo`, so every cdylib built before the key
+        // existed loads exactly as it did. Unit variants from plain strings,
+        // the `BackpressureJson` shape.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum ConsumeJson {
+            Fifo,
+            Latest,
+        }
+
         impl BackpressureJson {
             fn into_policy(self) -> BackpressurePolicy {
                 match self {
@@ -5024,6 +5059,10 @@ impl DylibNodeEntry {
                 /// `DylibNodeEntry`-loaded consumer.
                 #[serde(default)]
                 schema_hash: u64,
+                /// The declared `consume`; absent = `fifo`. Accepted on a
+                /// trigger input only, checked below.
+                #[serde(default)]
+                consume: Option<ConsumeJson>,
             },
         }
 
@@ -5132,6 +5171,8 @@ impl DylibNodeEntry {
             "expect_within_ms",
             // The per-input port-type layout hash.
             "schema_hash",
+            // The declared consumption mode of a trigger input.
+            "consume",
         ];
         const LEGAL_OUTPUT_KEYS: &[&str] = &[
             "name",
@@ -5238,6 +5279,7 @@ impl DylibNodeEntry {
             // The declared port-type schema hash (0 = legacy /
             // undeclared sentinel).
             schema_hash: u64,
+            consume: Option<ConsumeJson>,
         }
         let input_entries: Vec<NormalizedInput> = parsed
             .inputs
@@ -5255,6 +5297,7 @@ impl DylibNodeEntry {
                     trigger: false,
                     // No declared schema on the bare-string form → 0 sentinel.
                     schema_hash: 0,
+                    consume: None,
                 },
                 InputJson::Full {
                     name,
@@ -5263,6 +5306,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    consume,
                 } => NormalizedInput {
                     name,
                     expect_within_ms,
@@ -5270,6 +5314,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    consume,
                 },
             })
             .collect();
@@ -5365,6 +5410,20 @@ impl DylibNodeEntry {
         // runtime-bound, so this is an `Err` (caught by `info()`'s loud
         // error!-and-default fallback) — the constructors' asserts guard
         // the in-crate paths and must not be reachable from FFI data.
+        // `consume` on a non-trigger input is refused, as the macro refuses
+        // it at compile time: a hand-written info block must not load a
+        // declaration no `#[cerulion_node]` source can produce, and that
+        // the runtime would otherwise ignore without a word.
+        if let Some(entry) = input_entries
+            .iter()
+            .find(|e| e.consume.is_some() && !e.trigger)
+        {
+            return Err(format!(
+                "input '{}' in cerulion_node_info() JSON declares `consume` without \
+                 `\"trigger\":true`; `consume` applies only to a trigger input",
+                entry.name
+            ));
+        }
         for (idx, name) in input_names.iter().enumerate() {
             if input_names[..idx].contains(name) {
                 // `parse_info_json` returns `Err(String)`; the caller wraps it
@@ -5441,6 +5500,10 @@ impl DylibNodeEntry {
                     .map(BackpressureJson::into_policy)
                     .unwrap_or_default(),
                 expect_within_ms: entry.expect_within_ms,
+                consume: match entry.consume {
+                    Some(ConsumeJson::Latest) => InputConsume::Latest,
+                    Some(ConsumeJson::Fifo) | None => InputConsume::Fifo,
+                },
             })
             .collect();
         // Names are already proven unique by the explicit `Err`-returning
@@ -7338,6 +7401,45 @@ mod tests {
     }
 
     #[test]
+    fn info_json_consume_key_reads_latest_and_defaults_absent_to_fifo() {
+        let json = r#"{
+            "inputs":[
+                {"name":"cam","trigger":true,"consume":"latest"},
+                {"name":"cmd","trigger":true,"consume":"fifo"},
+                {"name":"ctx"}
+            ],
+            "outputs":[]
+        }"#;
+        let info = DylibNodeEntry::parse_info_json(json).unwrap();
+        let consume: Vec<InputConsume> = info.input_meta.iter().map(|m| m.consume).collect();
+        assert_eq!(
+            consume,
+            vec![InputConsume::Latest, InputConsume::Fifo, InputConsume::Fifo],
+            "an absent key is the fifo default, and an explicit fifo means the same"
+        );
+    }
+
+    #[test]
+    fn info_json_consume_on_a_non_trigger_input_refuses_the_load() {
+        let err = DylibNodeEntry::parse_info_json(
+            r#"{"inputs":[{"name":"ctx","consume":"latest"}],"outputs":[]}"#,
+        )
+        .expect_err("consume needs trigger");
+        assert!(
+            err.contains("input 'ctx'") && err.contains("applies only to a trigger input"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn info_json_unknown_consume_value_refuses_the_load() {
+        assert!(DylibNodeEntry::parse_info_json(
+            r#"{"inputs":[{"name":"cam","trigger":true,"consume":"lifo"}],"outputs":[]}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_parse_info_json_v6_input_objects_carry_expect_within_ms() {
         // ABI v6: inputs are JSON OBJECTS carrying an
         // optional `expect_within_ms`, and the top-level JSON carries
@@ -8275,6 +8377,7 @@ mod tests {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         assert!(meta.trigger);
         assert_eq!(meta.depth, 1);
@@ -8318,6 +8421,7 @@ mod tests {
             depth,
             backpressure: bp,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let _ = NodeInfo::with_meta(
             vec![
@@ -8340,6 +8444,7 @@ mod tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let info = NodeInfo::with_meta(vec![meta("scan"), meta("imu")], Vec::new());
         assert_eq!(info.input_names, vec!["scan", "imu"]);
@@ -8436,6 +8541,7 @@ mod tests {
                 depth: 1,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                consume: Default::default(),
             }],
             output_meta: vec![OutputMeta {
                 name: "cmd_vel".to_string(),

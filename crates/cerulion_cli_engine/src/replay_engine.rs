@@ -10427,9 +10427,17 @@ fn node_trigger_decl(
             window_ns: None,
             trigger_inputs,
         },
-        Some(MacroPolicy::DataTrigger { input_name }) => replay_rederive::TriggerDecl::Data {
-            trigger_inputs: vec![input_name],
-        },
+        Some(MacroPolicy::DataTrigger { input_name }) => {
+            if consumes_latest(info, &input_name) {
+                replay_rederive::TriggerDecl::DataLatest {
+                    trigger_inputs: vec![input_name],
+                }
+            } else {
+                replay_rederive::TriggerDecl::Data {
+                    trigger_inputs: vec![input_name],
+                }
+            }
+        }
         // External / host-driven / undeclared: no rule to decline (the judge's
         // `Unmodelled` emits no stand-down, deliberately).
         Some(MacroPolicy::External) | None => replay_rederive::TriggerDecl::Unmodelled,
@@ -10544,24 +10552,33 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 /// How ONE input's drain consumes its queue.
 ///
 /// The rule is the graph runtime's own, at the one site that knows it: a
-/// `MacroPolicy::DataTrigger`'s NAMED input is marked `mark_fifo_consume` and
-/// every other input keeps drain-to-latest. Restated here because the marker is
-/// `pub(crate)` in `cerulion_core`, with the mirror named — a wrong `Latest`
-/// label costs a spurious stand-down (loud, safe), a wrong `EachFifo` one would
-/// let an infeasible schedule through, so the conservative direction is the
-/// default and the FIFO arm is the narrow one.
+/// `MacroPolicy::DataTrigger`'s NAMED input is marked `mark_fifo_consume`
+/// unless it declares `consume = latest`, and every other input keeps
+/// drain-to-latest. Restated here because the marker is `pub(crate)` in
+/// `cerulion_core`, with the mirror named — a wrong `Latest` label costs a
+/// spurious stand-down (loud, safe), a wrong `EachFifo` one would let an
+/// infeasible schedule through, so the conservative direction is the default
+/// and the FIFO arm is the narrow one.
 fn input_consume_mode(
     info: &cerulion_core::graph::NodeInfo,
     input: &str,
 ) -> replay_inject::ConsumeMode {
     match info.policy() {
         Some(cerulion_core::graph::node::MacroPolicy::DataTrigger { input_name })
-            if input_name == input =>
+            if input_name == input && !consumes_latest(info, input) =>
         {
             replay_inject::ConsumeMode::EachFifo
         }
         _ => replay_inject::ConsumeMode::Latest,
     }
+}
+
+/// Does `input` declare `consume = latest`? Read from the node's own
+/// `InputMeta`, the declaration the graph runtime wires from.
+fn consumes_latest(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    info.input_meta()
+        .iter()
+        .any(|m| m.name == input && m.consume == cerulion_core::graph::node::InputConsume::Latest)
 }
 
 /// Narrow a kind-6 record's `served_seq` slot to the `u32` the wire carries.
@@ -16948,6 +16965,7 @@ mod node_trigger_decl_tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            consume: Default::default(),
         };
         let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
             .with_policy(MacroPolicy::Sync { window_ms: 10 });
