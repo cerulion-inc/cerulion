@@ -1843,10 +1843,8 @@ fn emit_block_slot_release(
             reason = reason.as_str(),
             held_ms = held_ns / 1_000_000,
             releases,
-            "`block` slot released: producer '{producer}' no longer waits on consumer \
-             '{consumer_node}.{consumer_input}' (topic '{topic}', reason {}). Frames this \
-             consumer has not drained may now be evicted from its queue",
-            reason.as_str()
+            "`block` slot released: the producer no longer waits on this consumer input. \
+             Frames the consumer has not drained may now be evicted from its queue"
         );
     } else {
         tracing::debug!(

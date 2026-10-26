@@ -19961,13 +19961,9 @@ impl CreditDeathWatch {
                             deferred_producer_groups = %groups_field,
                             total_failures = row.latch.total_failures(),
                             "a cross-process `block` edge lost its CONSUMER: its credit slot \
-                             is RELEASED, so producer '{producer_field}' no longer waits on \
-                             '{}.{}' (topic '{}') and resumes publishing. Frames published \
-                             to the dead consumer are lost with it; the topic's other \
-                             consumers keep their own slots",
-                            row.edge.consumer_node,
-                            row.edge.consumer_input,
-                            row.edge.topic
+                             is RELEASED, so the producer no longer waits on that consumer and \
+                             resumes publishing. Frames published to the dead consumer are \
+                             lost with it; the topic's other consumers keep their own slots"
                         ),
                         // The re-announcement exists for the operator who
                         // MISSED the head (the latch's decade ladder), so it
