@@ -1863,7 +1863,7 @@ fn emit_block_slot_release(
 
 /// `1, 10, 100, …`.
 fn is_power_of_ten(mut n: u64) -> bool {
-    while n >= 10 && n % 10 == 0 {
+    while n >= 10 && n.is_multiple_of(10) {
         n /= 10;
     }
     n == 1
