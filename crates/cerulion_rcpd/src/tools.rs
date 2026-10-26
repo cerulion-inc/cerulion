@@ -2,7 +2,8 @@
 //! The tool surface: deny by default, a receipt per call, e-stop always.
 //!
 //! The tools are exactly the manifest's `tools` plus the built-in
-//! [`ESTOP_TOOL`]. A call runs, in order:
+//! [`ESTOP_TOOL`] and, under `limits.estop_clear: agent`, the built-in
+//! [`ESTOP_CLEAR_TOOL`]. A call runs, in order:
 //!
 //! 1. Lookup. A name the manifest does not declare is refused and receipted
 //!    as `denied`.
@@ -24,8 +25,19 @@
 //!
 //! The latch is persisted as a file beside the receipt log
 //! (`<receipts>.estop`). A daemon that starts and finds the file starts with
-//! the latch closed; deleting the file and restarting the daemon is the only
+//! the latch closed (so does a file whose presence cannot be read). Under
+//! `limits.estop_clear: agent` (the default) `estop_clear` writes an `intent`
+//! receipt, deletes the file, opens the latch and journals its own
+//! latch-gated frame; deleting the file and restarting the daemon also clears
+//! it. Under `operator` `estop_clear` is not listed, a call to it is receipted
+//! as `denied`, and deleting the file and restarting the daemon is the only
 //! way to clear it.
+//!
+//! `estop` closes the latch first, then takes `latch_io`, closes it again,
+//! writes the file and its `intent` receipt. `estop_clear` writes its `intent`,
+//! deletes the file and opens the latch inside `latch_io`. The lock is a std
+//! mutex never held across an await, so the receipt log orders engages and
+//! clears as they took effect.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -34,11 +46,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cerud::receipt::{args_digest, Receipt, ReceiptLog, ReceiptOutcome};
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations};
 use serde_json::{json, Value};
 
 use crate::journal::{Journal, JournalError, MAX_CALL_JSON_BYTES};
-use crate::manifest::ToolSpec;
+use crate::manifest::{EstopClear, SafetyClass, ToolSpec};
 use crate::RcpdError;
 
 /// The built-in emergency stop tool.
@@ -56,6 +68,10 @@ pub const ESTOP_REASON_MAX_CHARS: usize = 200;
 
 /// How long `estop` waits for the graph to acknowledge.
 const ESTOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The built-in tool that clears the e-stop latch, served under
+/// `limits.estop_clear: agent`.
+pub const ESTOP_CLEAR_TOOL: &str = "estop_clear";
 
 /// Whether `name` is a valid tool name: 1 to 128 characters from
 /// `[A-Za-z0-9_.-]`.
@@ -132,6 +148,10 @@ pub struct ToolHost {
     receipts: Mutex<ReceiptLog>,
     /// Serializes calls other than `estop`.
     call_lock: tokio::sync::Mutex<()>,
+    /// Who clears the latch.
+    estop_clear: EstopClear,
+    /// Held while the latch and its file change together.
+    latch_io: Mutex<()>,
     /// The high bits of every `call_id`: the start time's low 20 bits of
     /// milliseconds, so an answer meant for an earlier daemon does not match a
     /// call of this one unless the two started a multiple of about 17 minutes
@@ -197,6 +217,42 @@ fn estop_schema() -> Value {
     })
 }
 
+/// The MCP annotations for a safety class: `read` is `readOnlyHint`,
+/// `irreversible` is `destructiveHint`, and every class says it acts on the
+/// robot alone (`openWorldHint: false`).
+pub fn safety_annotations(class: SafetyClass) -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(class == SafetyClass::Read)
+        .destructive(class == SafetyClass::Irreversible)
+        .open_world(false)
+}
+
+/// `estop` and `estop_clear`: idempotent, closed world; `estop_clear` adds
+/// `destructiveHint`, since it lets motion calls run again.
+fn builtin_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false)
+}
+
+/// One manifest tool as `tools/list` serves it: the description ends with
+/// its safety class, and the annotations carry it.
+fn manifest_tool(spec: &ToolSpec) -> Tool {
+    let schema = spec.input_schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        spec.name.clone(),
+        format!(
+            "{} (safety class: {})",
+            spec.description.trim_end(),
+            spec.safety_class.as_str()
+        ),
+        Arc::new(schema),
+    )
+    .annotate(safety_annotations(spec.safety_class))
+}
+
 impl ToolHost {
     /// Open the receipt log at `receipts`, whose `lock` the caller holds, read
     /// the persisted e-stop latch, and serve `tools` over `journal`. `latch`
@@ -218,12 +274,12 @@ impl ToolHost {
         };
         let log = ReceiptLog::open(receipts).map_err(|e| fail(e.to_string()))?;
         let latch_file = latch_path(receipts);
-        if latch_file.exists() {
+        // A file whose presence cannot be read counts as present.
+        if !matches!(latch_file.try_exists(), Ok(false)) {
             latch.store(true, Ordering::SeqCst);
             tracing::error!(
                 latch = %latch_file.display(),
-                "the e-stop latch file exists: starting with the e-stop engaged; \
-                 delete the file and restart to clear it"
+                "the e-stop latch file exists: starting with the e-stop engaged"
             );
         }
         let call_epoch = SystemTime::now()
@@ -236,10 +292,20 @@ impl ToolHost {
             latch_file,
             receipts: Mutex::new(log),
             call_lock: tokio::sync::Mutex::new(()),
+            estop_clear: EstopClear::Agent,
+            latch_io: Mutex::new(()),
             call_epoch,
             next_call: AtomicU64::new(1),
             _log_lock: lock,
         })
+    }
+
+    /// Set who clears the e-stop latch (`limits.estop_clear`). A host built
+    /// without this call serves [`EstopClear::Agent`].
+    #[must_use]
+    pub fn with_estop_clear(mut self, estop_clear: EstopClear) -> Self {
+        self.estop_clear = estop_clear;
+        self
     }
 
     /// The handle for state reads.
@@ -270,27 +336,39 @@ impl ToolHost {
         }
     }
 
-    /// `tools/list`: the manifest's tools, then `estop`.
+    /// `tools/list`: the manifest's tools, then `estop`, then `estop_clear`
+    /// under `limits.estop_clear: agent`.
     pub fn list(&self) -> Vec<Tool> {
-        let mut out: Vec<Tool> = self
-            .tools
-            .iter()
-            .map(|spec| {
-                let schema = spec.input_schema.as_object().cloned().unwrap_or_default();
-                Tool::new(
-                    spec.name.clone(),
-                    spec.description.clone(),
-                    Arc::new(schema),
-                )
-            })
-            .collect();
+        let mut out: Vec<Tool> = self.tools.iter().map(manifest_tool).collect();
         let estop = estop_schema().as_object().cloned().unwrap_or_default();
-        out.push(Tool::new(
-            ESTOP_TOOL,
-            "Stop the robot now. Never waits behind another call; every later motion call is \
-             refused until an operator clears the latch.",
-            Arc::new(estop),
-        ));
+        out.push(
+            Tool::new(
+                ESTOP_TOOL,
+                match self.estop_clear {
+                    EstopClear::Agent => {
+                        "Stop the robot now. Never waits behind another call; every later motion \
+                     call is refused until estop_clear is called or an operator clears the latch."
+                    }
+                    EstopClear::Operator => {
+                        "Stop the robot now. Never waits behind another call; every later motion \
+                     call is refused until an operator clears the latch."
+                    }
+                },
+                Arc::new(estop),
+            )
+            .annotate(builtin_annotations()),
+        );
+        if self.estop_clear == EstopClear::Agent {
+            out.push(
+                Tool::new(
+                    ESTOP_CLEAR_TOOL,
+                    "Clear the e-stop latch so motion calls run again. Waits behind a call in \
+                     flight; the graph is told with its own journaled frame.",
+                    Arc::new(estop_schema().as_object().cloned().unwrap_or_default()),
+                )
+                .annotate(builtin_annotations().destructive(true)),
+            );
+        }
         out
     }
 
@@ -299,6 +377,9 @@ impl ToolHost {
         let args = args.unwrap_or_default();
         if name == ESTOP_TOOL {
             return self.estop(&args).await;
+        }
+        if name == ESTOP_CLEAR_TOOL {
+            return self.estop_clear(&args).await;
         }
         let args_value = Value::Object(args.clone());
         let digest = args_digest(&args_value);
@@ -311,14 +392,22 @@ impl ToolHost {
             let receipt = self.record(verb, &digest, ReceiptOutcome::Denied);
             return refusal(
                 "not_in_manifest",
-                "no such tool: only the manifest's tools and estop exist",
+                match self.estop_clear {
+                    EstopClear::Agent => {
+                        "no such tool: only the manifest's tools, estop and estop_clear exist"
+                    }
+                    EstopClear::Operator => {
+                        "no such tool: only the manifest's tools and estop exist"
+                    }
+                },
                 receipt.as_ref(),
                 Value::Null,
             );
         };
+        let class = json!({ "safety_class": spec.safety_class.as_str() });
         if let Err(reason) = crate::schema::validate(&spec.input_schema, &args) {
             let receipt = self.record(name, &digest, ReceiptOutcome::Error("invalid_args".into()));
-            return refusal("invalid_args", &reason, receipt.as_ref(), Value::Null);
+            return refusal("invalid_args", &reason, receipt.as_ref(), class);
         }
         let _serial = self.call_lock.lock().await;
         let call_id = self.next_call_id();
@@ -336,19 +425,23 @@ impl ToolHost {
                     frame.len()
                 ),
                 receipt.as_ref(),
-                Value::Null,
+                class,
             );
         }
         let mutating = spec.safety_class.is_mutating();
         if mutating && self.estopped() {
             let receipt = self.record(name, &digest, ReceiptOutcome::Denied);
-            return refusal(
-                "estopped",
-                "the e-stop is engaged; an operator must delete the latch file and restart \
-                 cerulion-rcpd",
-                receipt.as_ref(),
-                Value::Null,
-            );
+            let message = match self.estop_clear {
+                EstopClear::Agent => {
+                    "the e-stop is engaged; call estop_clear, or delete the latch file and \
+                     restart cerulion-rcpd"
+                }
+                EstopClear::Operator => {
+                    "the e-stop is engaged; an operator must delete the latch file and restart \
+                     cerulion-rcpd"
+                }
+            };
+            return refusal("estopped", message, receipt.as_ref(), class);
         }
         // A mutating call's intent is on disk before the call is published.
         let intent = if mutating {
@@ -359,7 +452,7 @@ impl ToolHost {
                         "receipt_failed",
                         "the call was not published: its receipt could not be written",
                         None,
-                        Value::Null,
+                        class,
                     );
                 }
             }
@@ -380,14 +473,18 @@ impl ToolHost {
                     "call_id": call_id,
                     "receipt": receipt.as_ref().map(receipt_json),
                     "result": result,
+                    "safety_class": spec.safety_class.as_str(),
                 });
                 CallToolResult::success(vec![ContentBlock::text(body.to_string())])
             }
             Err(e) => {
                 // A timed-out call was published; the graph may still act on it.
                 let extra = match e {
-                    JournalError::Timeout { .. } => json!({ "may_have_executed": true }),
-                    _ => Value::Null,
+                    JournalError::Timeout { .. } => json!({
+                        "may_have_executed": true,
+                        "safety_class": spec.safety_class.as_str(),
+                    }),
+                    _ => class,
                 };
                 refusal(journal_class(&e), &e.to_string(), receipt.as_ref(), extra)
             }
@@ -395,28 +492,28 @@ impl ToolHost {
     }
 
     async fn estop(&self, args: &JsonObject) -> CallToolResult {
-        // Close the latch before anything that can wait or fail.
-        let was_estopped = self.latch.swap(true, Ordering::SeqCst);
-        let reason: String = args
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .chars()
-            .take(ESTOP_REASON_MAX_CHARS)
-            .collect();
-        tracing::warn!(reason = %reason, "e-stop engaged");
-        if !was_estopped {
-            if let Err(e) = write_synced(&self.latch_file, &format!("{reason}\n")) {
-                tracing::error!(
-                    error = %e,
-                    latch = %self.latch_file.display(),
-                    "latch file not written; the e-stop will not survive a restart"
-                );
-            }
-        }
+        // Close the latch before anything that can fail or wait.
+        self.latch.store(true, Ordering::SeqCst);
+        let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
         let digest = args_digest(&clean);
-        let intent = self.record(ESTOP_TOOL, &digest, ReceiptOutcome::Intent);
+        let intent = {
+            let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+            // Closed again under the lock: a clear that opened the latch
+            // after the store above has released the lock by now.
+            self.latch.store(true, Ordering::SeqCst);
+            if !matches!(self.latch_file.try_exists(), Ok(true)) {
+                if let Err(e) = write_synced(&self.latch_file, &format!("{reason}\n")) {
+                    tracing::error!(
+                        error = %e,
+                        latch = %self.latch_file.display(),
+                        "latch file not written; the e-stop will not survive a restart"
+                    );
+                }
+            }
+            self.record(ESTOP_TOOL, &digest, ReceiptOutcome::Intent)
+        };
+        tracing::warn!(reason = %reason, "e-stop engaged");
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, ESTOP_TOOL, &clean);
         let answer = self.journal.urgent(call_id, frame, ESTOP_TIMEOUT).await;
@@ -446,4 +543,135 @@ impl ToolHost {
         });
         CallToolResult::success(vec![ContentBlock::text(body.to_string())])
     }
+
+    async fn estop_clear(&self, args: &JsonObject) -> CallToolResult {
+        let digest = args_digest(&Value::Object(args.clone()));
+        if self.estop_clear == EstopClear::Operator {
+            let receipt = self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Denied);
+            return refusal(
+                "estop_clear_disabled",
+                "limits.estop_clear is operator: an operator clears the e-stop by deleting the \
+                 latch file and restarting cerulion-rcpd",
+                receipt.as_ref(),
+                Value::Null,
+            );
+        }
+        if let Err(reason) = crate::schema::validate(&estop_schema(), args) {
+            let receipt = self.record(
+                ESTOP_CLEAR_TOOL,
+                &digest,
+                ReceiptOutcome::Error("invalid_args".into()),
+            );
+            return refusal("invalid_args", &reason, receipt.as_ref(), Value::Null);
+        }
+        let reason = reason_arg(args);
+        let clean = json!({ "reason": reason });
+        let _serial = self.call_lock.lock().await;
+        let (intent, was_estopped) = {
+            let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+            // The intent is on disk before the latch opens, and in the same
+            // lock as every engage, so the log orders clears and engages as
+            // they took effect.
+            let Some(intent) = self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Intent)
+            else {
+                return refusal(
+                    "receipt_failed",
+                    "the e-stop was not cleared: its receipt could not be written",
+                    None,
+                    Value::Null,
+                );
+            };
+            match std::fs::remove_file(&self.latch_file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.record(
+                        ESTOP_CLEAR_TOOL,
+                        &digest,
+                        ReceiptOutcome::Error(String::from("clear_failed")),
+                    );
+                    return refusal(
+                        "clear_failed",
+                        &format!(
+                            "the e-stop stays engaged: the latch file {} could not be \
+                             deleted: {e}",
+                            self.latch_file.display()
+                        ),
+                        Some(&intent),
+                        json!({ "estopped": self.estopped() }),
+                    );
+                }
+            }
+            (intent, self.latch.swap(false, Ordering::SeqCst))
+        };
+        if !was_estopped {
+            // Nothing was latched: the graph is not told.
+            self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Ok);
+            let body = json!({
+                "call_id": Value::Null,
+                "estopped": self.estopped(),
+                "was_estopped": false,
+                "graph_acknowledged": Value::Null,
+                "graph_error": Value::Null,
+                "receipt": receipt_json(&intent),
+                "result": Value::Null,
+            });
+            return CallToolResult::success(vec![ContentBlock::text(body.to_string())]);
+        }
+        tracing::warn!(reason = %reason, "e-stop cleared");
+        let call_id = self.next_call_id();
+        let frame = Journal::frame(call_id, ESTOP_CLEAR_TOOL, &clean);
+        // Latch-gated: an `estop` that closes the latch before this frame is
+        // published keeps it off the calls topic, so the graph's last frame is
+        // that `estop`.
+        let answer = self.journal.call(call_id, frame, ESTOP_TIMEOUT, true).await;
+        let (result, graph_error) = match answer {
+            Ok(result) => {
+                self.record(ESTOP_CLEAR_TOOL, &digest, ReceiptOutcome::Ok);
+                (result, None)
+            }
+            Err(JournalError::Estopped) => {
+                self.record(
+                    ESTOP_CLEAR_TOOL,
+                    &digest,
+                    ReceiptOutcome::Error(String::from("estop_overtaken")),
+                );
+                return refusal(
+                    "estop_overtaken",
+                    "an estop engaged before the clear reached the graph; the e-stop is engaged",
+                    Some(&intent),
+                    json!({ "estopped": self.estopped() }),
+                );
+            }
+            Err(e) => {
+                self.record(
+                    ESTOP_CLEAR_TOOL,
+                    &digest,
+                    ReceiptOutcome::Error(String::from("graph_unacknowledged")),
+                );
+                (Value::Null, Some(e.to_string()))
+            }
+        };
+        let body = json!({
+            "call_id": call_id,
+            "estopped": self.estopped(),
+            "was_estopped": true,
+            "graph_acknowledged": graph_error.is_none(),
+            "graph_error": graph_error,
+            "receipt": receipt_json(&intent),
+            "result": result,
+        });
+        CallToolResult::success(vec![ContentBlock::text(body.to_string())])
+    }
+}
+
+/// The `reason` argument of `estop` and `estop_clear`, cut to
+/// [`ESTOP_REASON_MAX_CHARS`] characters; empty when absent.
+fn reason_arg(args: &JsonObject) -> String {
+    args.get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(ESTOP_REASON_MAX_CHARS)
+        .collect()
 }

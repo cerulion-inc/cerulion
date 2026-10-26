@@ -78,3 +78,120 @@ fn stdio_answers_initialize_with_the_server_name() {
         "{line}"
     );
 }
+
+/// Start the binary on `manifest_yaml`, initialize, and return the
+/// `tools/list` reply's tools.
+fn tools_over_stdio(manifest_yaml: &str) -> Vec<serde_json::Value> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("rcp.yaml");
+    std::fs::write(&path, manifest_yaml).expect("write manifest");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cerulion-rcpd"))
+        .arg("--manifest")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run cerulion-rcpd");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut send = |text: &str| {
+        stdin
+            .write_all(text.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+            .expect("write request");
+    };
+    send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}"#,
+    );
+    let first = rx.recv_timeout(Duration::from_secs(60));
+    send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    let mut tools = None;
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(60)) {
+        let reply: serde_json::Value = serde_json::from_str(&line).expect("one JSON-RPC line");
+        if reply["id"] == 2 {
+            tools = reply["result"]["tools"].as_array().cloned();
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    first.expect("an initialize reply within 60 s");
+    tools.expect("a tools/list reply within 60 s")
+}
+
+/// A manifest on journal topics private to this process and `tag`, with one
+/// irreversible tool.
+fn cut_manifest(tag: &str) -> String {
+    let prefix = format!("rcpd_smoke_{tag}_{}", std::process::id());
+    format!("robot: smoke\njournal:\n  calls_topic: /{prefix}/calls\n  results_topic: /{prefix}/results\n{CUT_TOOL}")
+}
+
+const CUT_TOOL: &str = "tools:
+  - name: arm.cut
+    description: cut the cable
+    safety_class: irreversible
+    input_schema: { type: object, properties: {} }
+";
+
+fn names(tools: &[serde_json::Value]) -> Vec<&str> {
+    tools.iter().filter_map(|t| t["name"].as_str()).collect()
+}
+
+#[test]
+fn the_binary_serves_an_irreversible_tool_labelled_and_estop_clear_by_default() {
+    let tools = tools_over_stdio(&cut_manifest("default"));
+    assert_eq!(names(&tools), ["arm.cut", "estop", "estop_clear"]);
+    assert_eq!(
+        tools[0]["annotations"]["destructiveHint"], true,
+        "{}",
+        tools[0]
+    );
+}
+
+#[test]
+fn the_binary_applies_operator_clearing_from_the_manifest() {
+    let tools = tools_over_stdio(&format!(
+        "{}limits:\n  estop_clear: operator\n",
+        cut_manifest("operator")
+    ));
+    assert_eq!(names(&tools), ["arm.cut", "estop"]);
+}
+
+#[test]
+fn the_binary_refuses_an_irreversible_tool_under_the_refuse_switch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("rcp.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "{}limits:\n  irreversible: refuse\n",
+            cut_manifest("refuse")
+        ),
+    )
+    .expect("write manifest");
+    let out = Command::new(env!("CARGO_BIN_EXE_cerulion-rcpd"))
+        .arg("--manifest")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run cerulion-rcpd");
+    assert_eq!(out.status.code(), Some(1), "the load fails");
+    assert!(out.stdout.is_empty(), "stdout stays clean");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("arm.cut") && stderr.contains("limits.irreversible"),
+        "{stderr}"
+    );
+}

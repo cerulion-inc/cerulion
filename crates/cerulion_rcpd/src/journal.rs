@@ -347,6 +347,12 @@ impl Ports {
     }
 
     fn publish(&mut self, request: CallRequest) {
+        // A latch-gated call whose caller stopped waiting (its MCP request was
+        // cancelled) is never published, so it cannot run after a later
+        // estop_clear. An estop frame is published either way.
+        if !request.bypass_latch && request.reply.is_closed() {
+            return;
+        }
         if !request.bypass_latch && self.latch.load(Ordering::SeqCst) {
             let _ = request.reply.send(Err(JournalError::Estopped));
             return;

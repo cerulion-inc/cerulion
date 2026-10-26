@@ -144,7 +144,7 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |
 | Local workspace engine daemon | `cerulion_wsd`* |
 | Remote access / pairing / accounts | `cerulion_{connectd,remoted*,pairing,accountd,wire,wireclient,link}`, `cerud` |
-| Robot Context Protocol (MCP server) | `cerulion_rcpd` |
+| Robot Context Protocol (MCP server) | `cerulion_rcpd`* |
 | Visualization (not in default-members) | `cerulion_viz`* (`lib/*`, `bin/cerulion_vizd`) |
 | Fixtures, benches, examples | `crates/test_fixtures/*`, `benches/`*, `examples/`* |
 
