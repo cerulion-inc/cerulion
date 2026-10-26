@@ -19,8 +19,7 @@ cerulion graph validate obstacle_avoidance
 cerulion graph run obstacle_avoidance --release --network off
 ```
 
-Press Enter if offered a partition save prompt. In another terminal in this
-workspace, observe the velocity:
+In another terminal in this workspace, observe the velocity:
 
 ```bash
 CERULION_NETWORK=off cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity

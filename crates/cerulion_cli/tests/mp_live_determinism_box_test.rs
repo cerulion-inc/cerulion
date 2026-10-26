@@ -86,8 +86,13 @@
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The scaffold compiles a 3-node cdylib workspace ONCE per test process (the
-//! dominant cost, minutes on a cold cargo cache) and every arm reuses it.
+//! Each arm scaffolds and builds its own 3-node cdylib workspace in a
+//! [`ScaffoldDir`] it holds, so the workspace is removed when the arm ends,
+//! passing or failing (`CERULION_KEEP_TEST_WS=1` keeps a failed arm's). Every
+//! scaffold of this binary builds into one target directory
+//! ([`scaffold_dir::scaffold_target_dir`]), so the dependencies compile once
+//! (minutes on a cold cache) and later arms rebuild only the node crates and
+//! what depends on the workspace's schemas.
 //!
 //! Each run owns its environment: its own `CERULION_HOME`, a pinned
 //! `RUST_LOG`, the run-shaping `CERULION_*` knobs (peer-loss policy, drain
@@ -112,6 +117,7 @@
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 
 mod mp_support;
+mod scaffold_dir;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -129,6 +135,7 @@ use cerulion_core::{
     TraceEntry, TransportConfig, TransportManager, VirtualClock,
 };
 use mp_support::{dylib_file, ChildGuard};
+use scaffold_dir::{pin_target_dir, scaffold_target_dir, ScaffoldDir};
 use serde::Deserialize;
 use serial_test::serial;
 
@@ -202,23 +209,20 @@ impl Mode {
 }
 
 // ===========================================================================
-// Shared scaffold: built ONCE per test process, memoized.
+// The scaffold: one per arm, removed when the arm's `Scaffold` drops.
 // ===========================================================================
 
-/// The one-per-process scaffolded workspace holding both shapes' graphs. The
-/// `TempDir` is stored so the built cdylibs and YAMLs survive the process.
+/// The scaffolded workspace holding both shapes' graphs.
 struct Scaffold {
-    /// Kept alive for the process lifetime so `ws_root` stays valid.
-    _tmp: tempfile::TempDir,
+    /// Owns the directory `ws_root` lives in and removes it on drop.
+    _dir: ScaffoldDir,
     ws_root: PathBuf,
+    /// Where the node cdylibs are built; handed to the supervisor child as
+    /// `CARGO_TARGET_DIR` and read by the monolith leg.
+    target_dir: PathBuf,
     /// Graph name -> the config written to `graphs/<name>.yaml`, reused as the
     /// monolith oracle leg's config.
     configs: HashMap<&'static str, GraphConfig>,
-}
-
-fn scaffold() -> &'static Scaffold {
-    static SCAFFOLD: OnceLock<Scaffold> = OnceLock::new();
-    SCAFFOLD.get_or_init(build_scaffold)
 }
 
 /// The chain's graph config split per `shape`. Serializing this exact struct
@@ -306,10 +310,12 @@ fn write_output(nodes_dir: &Path, node: &str, stmt: &str) {
         .unwrap_or_else(|e| panic!("DET_HARNESS: write {}: {e}", path.display()));
 }
 
-fn build_scaffold() -> Scaffold {
-    let tmp = tempfile::tempdir().expect("DET_HARNESS: temp dir for scaffold workspace");
+fn scaffold() -> Scaffold {
+    let dir = ScaffoldDir::new("det_ws");
     let ws =
-        workspace::workspace_create(tmp.path(), "det_ws").expect("DET_HARNESS: workspace_create");
+        workspace::workspace_create(dir.path(), "det_ws").expect("DET_HARNESS: workspace_create");
+    let target_dir = scaffold_target_dir(&ws.root, "mp_live_determinism_box_test");
+    pin_target_dir(&ws.root, &target_dir);
     let cargo_toml = ws.root.join("Cargo.toml");
 
     // ticker: pure Period 1ms source (no inputs, one output).
@@ -390,8 +396,9 @@ fn build_scaffold() -> Scaffold {
     }
 
     Scaffold {
-        _tmp: tmp,
+        _dir: dir,
         ws_root: ws.root,
+        target_dir,
         configs,
     }
 }
@@ -602,23 +609,6 @@ fn runs_per_arm() -> usize {
 // in THIS process.
 // ===========================================================================
 
-/// Mirror of `graph_cmd::cdylib_target_base`: honor `CARGO_TARGET_DIR` (absolute
-/// or workspace-relative) exactly as cargo and `node_build` do, else
-/// `<ws>/target`.
-fn cdylib_target_base(ws_root: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(v) if !v.is_empty() => {
-            let dir = PathBuf::from(v);
-            if dir.is_absolute() {
-                dir
-            } else {
-                ws_root.join(dir)
-            }
-        }
-        _ => ws_root.join("target"),
-    }
-}
-
 /// Build the monolith of `config` on an ISOLATED per-test transport (a
 /// distinct shared-memory root from the default namespace the workers used),
 /// load the three debug cdylibs, step `steps` times at 1ms (so the Period
@@ -635,7 +625,7 @@ fn run_monolith(sc: &Scaffold, config: &GraphConfig, steps: u64) -> Vec<TraceEnt
     )
     .expect("DET_HARNESS: init isolated monolith test transport");
 
-    let debug_dir = cdylib_target_base(&sc.ws_root).join("debug");
+    let debug_dir = sc.target_dir.join("debug");
     let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> = indexmap::IndexMap::new();
     for id in ["ticker", "relay", "sink"] {
         let path = debug_dir.join(dylib_file(id));
@@ -661,7 +651,9 @@ fn run_monolith(sc: &Scaffold, config: &GraphConfig, steps: u64) -> Vec<TraceEnt
 }
 
 /// The monolith trace of `shape` covering at least `[0, k]`, built once per
-/// shape and rebuilt longer only when a run reaches past it.
+/// shape and rebuilt longer only when a run reaches past it. The trace depends
+/// only on the node sources and the graph, which every arm's scaffold writes
+/// identically, so the cache outlives the scaffold that produced it.
 fn monolith_covering(sc: &Scaffold, shape: &Shape, k: u64) -> Vec<TraceEntry> {
     static CACHE: OnceLock<Mutex<HashMap<&'static str, Vec<TraceEntry>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -774,6 +766,8 @@ fn spawn_supervisor(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     cmd.args(["graph", "run", shape.graph])
         .current_dir(&sc.ws_root)
+        // The workers load the node cdylibs from this target directory.
+        .env("CARGO_TARGET_DIR", &sc.target_dir)
         // Hermetic: no scouting session or gateway (the kill switch keeps a
         // real-clock run local-only).
         .env("CERULION_NETWORK", "off")
@@ -1035,7 +1029,7 @@ fn summary_line(mode: Mode, ranks: usize, judged: usize, diverged: usize) -> Str
 /// Run the arm: `CER_DET_RUNS` live runs, one verdict line each, a summary
 /// line, then assert every run was equal.
 fn determinism_arm(shape: &Shape, mode: Mode) {
-    let sc = scaffold();
+    let sc = &scaffold();
     let runs = runs_per_arm();
     let mut diverged = Vec::new();
     for run in 1..=runs {
