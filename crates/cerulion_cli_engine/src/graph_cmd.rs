@@ -7084,6 +7084,37 @@ pub fn graph_run(
     ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
 }
 
+/// The transport one worker plan runs on, on the run's shared iceoryx2
+/// config.
+///
+/// A plan that is its own process initializes the process's transport
+/// singleton. A plan hosted with other executor units in one process
+/// ([`WorkerPlan::host`](crate::multiprocess::WorkerPlan::host)) gets a
+/// detached transport of its own: its own iceoryx2 node on the same config,
+/// carrying its own clock, because the singleton carries one clock and each
+/// unit's runtime is refused a transport built with another unit's.
+///
+/// Mp workers are always network-free: the separate gateway process owns the
+/// robot's whole network plane.
+fn worker_transport(
+    plan: &crate::multiprocess::WorkerPlan,
+    clock: Arc<dyn cerulion_core::clock::Clock>,
+    ix_config: iceoryx2::config::Config,
+) -> CliResult<Arc<cerulion_core::TransportManager>> {
+    let config = cerulion_core::TransportConfig {
+        node_name: plan.node_name.clone(),
+        clock,
+        subscriber_buffer_size: 16,
+        network: None,
+    };
+    let transport = if plan.host.is_some() {
+        cerulion_core::TransportManager::detached_with_config(config, ix_config)?
+    } else {
+        cerulion_core::TransportManager::init_with_config(config, ix_config)?
+    };
+    Ok(transport)
+}
+
 /// Run the worker plans of one process: one plan runs on this thread exactly
 /// as [`graph_run_worker`]; several plans (the executor units one process
 /// group was split into) run one per thread.
@@ -7380,22 +7411,10 @@ pub fn graph_run_worker(
         None => Arc::new(cerulion_core::clock::RealClock),
     };
 
-    // (4) init the process transport singleton on the shared, supervisor-minted
-    // iceoryx2 Config so every co-resident worker lands on ONE SHM namespace and
-    // their cross-group pub/sub connect.
-    let transport = cerulion_core::TransportManager::init_with_config(
-        cerulion_core::TransportConfig {
-            node_name: plan.node_name.clone(),
-            clock: Arc::clone(&clock_dyn),
-            subscriber_buffer_size: 16,
-            // Mp workers are ALWAYS network-free — the separate
-            // GATEWAY process (spawned by the supervisor) owns the robot's
-            // whole network plane (one robot = one peer). Networked
-            // multi-process is first-class and never refused.
-            network: None,
-        },
-        ix_config,
-    )?;
+    // (4) the transport on the shared, supervisor-minted iceoryx2 Config, so
+    // every co-resident worker lands on ONE SHM namespace and their
+    // cross-group pub/sub connect.
+    let transport = worker_transport(&plan, Arc::clone(&clock_dyn), ix_config)?;
 
     // (5) OPEN (not create) the shared barrier the supervisor OWNS. Bounded retry:
     // exec startup races the supervisor's `create_owned`, so the segment may be
@@ -7703,12 +7722,11 @@ pub fn graph_run_worker(
 
     // Park the worker's shared-config TransportManager so a
     // tier-2 `Blocking` external-source doorbell mints on THIS manager — the
-    // same explicit wiring as the monolith live arm. Belt-and-suspenders here:
-    // `init_with_config` above primed the process-global singleton with this
-    // SAME manager (`INSTANCE.get_or_init` in `transport/mod.rs`), so the
-    // doorbell fallback chain (`resolve_doorbell_transport`: parked handle →
-    // `TransportManager::get()` singleton) already resolves to it; parking makes
-    // the wiring explicit and immune to a future non-singleton worker transport.
+    // same explicit wiring as the monolith live arm. A plan that is its own
+    // process also primed the process-global singleton with this SAME manager,
+    // so the doorbell fallback chain (`resolve_doorbell_transport`: parked
+    // handle → `TransportManager::get()` singleton) resolves to it either way;
+    // a hosted unit's detached manager is reachable only through this parking.
     runtime.set_live_transport(Arc::clone(&transport));
     // Let `graph pause` hold this rank at a step boundary.
     #[cfg(unix)]
@@ -41115,6 +41133,40 @@ mod worker_tests {
             err.to_string().contains("unparseable `ix_config_json`"),
             "expected the unparseable-config rejection, got: {err}"
         );
+    }
+
+    /// Every executor unit of a worker host runs on a transport carrying its
+    /// OWN clock: a unit's runtime refuses a transport built with another
+    /// clock, so two units in one process that shared the process singleton
+    /// could not both build.
+    #[test]
+    #[serial_test::serial]
+    fn each_unit_of_a_worker_host_gets_a_transport_with_its_own_clock() {
+        let ix = crate::multiprocess::planning_ix_config(
+            "unit_transport",
+            &format!("{}", std::process::id()),
+        )
+        .expect("ix config");
+        let mut clocks = Vec::new();
+        let mut transports = Vec::new();
+        for (i, group) in ["g.a", "g.b"].into_iter().enumerate() {
+            let mut plan = minimal_plan("");
+            plan.group = group.to_string();
+            plan.node_name = format!("unit_transport_{i}");
+            plan.host = Some("g".to_string());
+            let clock: Arc<dyn cerulion_core::clock::Clock> =
+                Arc::new(cerulion_core::VirtualClock::new());
+            let transport =
+                worker_transport(&plan, Arc::clone(&clock), ix.clone()).expect("transport");
+            clocks.push(clock);
+            transports.push(transport);
+        }
+        for (i, (t, c)) in transports.iter().zip(&clocks).enumerate() {
+            assert!(
+                Arc::ptr_eq(&t.clock_arc(), c),
+                "unit {i}'s transport carries another unit's clock"
+            );
+        }
     }
 
     /// The plans of one host are one spawn entry, in spawn order; a plan

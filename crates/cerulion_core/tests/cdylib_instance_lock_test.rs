@@ -16,7 +16,7 @@
 //!
 //! ```bash
 //! cargo build -p test_node_macro_gate_cdylib
-//! cargo test -p cerulion_core --test cdylib_instance_lock_test
+//! cargo test -p cerulion_core --test cdylib_instance_lock_test -- --test-threads=1
 //! ```
 
 use std::sync::mpsc;
@@ -31,6 +31,7 @@ use cerulion_core::transport::subscriber::CerulionSubscriber;
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
+use serial_test::serial;
 
 const GATE_FIXTURE: &str = "test_node_macro_gate_cdylib";
 
@@ -73,6 +74,7 @@ fn read_x(sub: &mut CerulionSubscriber) -> Option<f64> {
 }
 
 #[test]
+#[serial]
 fn a_held_tick_of_one_instance_does_not_hold_another_instance_of_the_same_library() {
     let tt = TestTransport::with_buffer_size(4);
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -147,6 +149,7 @@ fn a_held_tick_of_one_instance_does_not_hold_another_instance_of_the_same_librar
 }
 
 #[test]
+#[serial]
 fn a_shut_down_handle_is_not_found_and_its_twin_keeps_ticking() {
     let tt = TestTransport::with_buffer_size(4);
     let (mut a, _sub_a) = instance(&tt, "sd_a", "", 3.0);
