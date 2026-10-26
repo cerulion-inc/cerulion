@@ -168,7 +168,7 @@ cerulion graph validate obstacle_avoidance
 cerulion graph run obstacle_avoidance --release --record
 ```
 
-On the first run, Cerulion proposes one process per node and asks `Apply this partition to the graph file? [y/N]`. Press **Enter** to use that layout for this run, or **y** to save it in the graph YAML.
+The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
 By default a run is visible to other machines on your network, so Studio and the CLI on another computer can find it; the log says so when the run starts. Add `--network off` to keep a run on this machine.
 

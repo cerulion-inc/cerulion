@@ -887,7 +887,7 @@ desk: cerulion-netd                    ONE subscription on the session it
 | Versioning | Every notification carries a monotonic `version`; `subscribe_*` answers with the current one plus the announcing-robot set. A MISSED notification is harmless: the next carries a newer version and the correct response to any of them is a full refresh. |
 | Slow consumer | The per-connection slot is capacity ONE with a lossless merge: a lagging consumer gets one line describing everything it missed. The watch/forwarder threads never do I/O, so a consumer that stopped reading stalls only itself. |
 | Manual refresh | Unchanged, and still the escape hatch for everything. |
-| Skew | netd bumped its control protocol to **v6**; a new client against an older daemon is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a v6 daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
+| Skew | `subscribe_catalog` needs netd control protocol **v6** or later (the daemon now speaks 8); a new client against a daemon older than v6 is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a newer daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
 
 **What is NOT event-driven:** the LOCAL half. The push above covers REMOTE
 topics; a LOCAL iceoryx2 service appearing or disappearing on the desk carries
@@ -1021,7 +1021,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":6}
+{"hello":"cerulion-netd","protocol":8,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
 
