@@ -648,6 +648,11 @@ pub struct PublisherInner {
     /// `rmw_borrow_zero_alloc_test`). Same-mutex confinement with the
     /// loans: the seal runs under the publisher lock.
     pub seal_scratch: crate::type_bridge::SealScratch,
+    /// The buffer-aware half of this publisher (`crate::buffer_backends`):
+    /// `Some` when its type carries `rosidl::Buffer` fields and a backend
+    /// other than `cpu` is loaded. Under the publisher mutex like the port,
+    /// because a publish reads the port list and sends in one step.
+    pub buffer: Option<crate::buffer_backends::BufferPublisher>,
 }
 
 /// One outstanding publisher-side loan (`rmw_borrow_loaned_message` →
@@ -1093,6 +1098,11 @@ pub struct SubscriptionData {
     /// `Arc`-shared counters and the adopt borrow budget. `None` keeps the
     /// plain copying take in place (see `crate::adopt_take`).
     pub adopt: Option<crate::adopt_take::AdoptTakeState>,
+    /// The buffer-aware half of this subscription
+    /// (`crate::buffer_backends`): `Some` when its type carries
+    /// `rosidl::Buffer` fields and a backend other than `cpu` is loaded.
+    /// Fixed at create.
+    pub buffer: Option<crate::buffer_backends::BufferSubscription>,
 }
 
 impl SubscriptionData {

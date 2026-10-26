@@ -5,8 +5,10 @@
 //! `rosidl::Buffer<uint8_t>`, and a C sequence whose `is_rosidl_buffer` flag
 //! is set points at one. A Buffer can live on an accelerator backend (the
 //! CUDA backend that Isaac ROS 5.0 uses), and then every element accessor of
-//! it throws. rmw_cerulion hosts no buffer backend, so it carries such a
-//! Buffer as host bytes:
+//! it throws. Where this process hosts that backend and every subscriber can
+//! take its descriptor, the Buffer crosses processes as the descriptor and
+//! stays in device memory ([`crate::buffer_backends`]). Everywhere else it is
+//! carried as host bytes:
 //!
 //! * **Publish.** A non-empty Buffer on any backend other than `cpu` is
 //!   copied to host memory with `to_vector()` (the DOWNGRADE) and published
@@ -19,10 +21,10 @@
 //!   that does not own its Buffer is detached and filled as a plain
 //!   sequence).
 //! * **Subscription options.** [`validate_acceptable_buffer_backends`]
-//!   reads `acceptable_buffer_backends`: `cpu` is the only backend installed
-//!   and always acceptable, so a subscription naming another backend starts,
-//!   logs one warning naming the backends it ignores, and receives CPU data;
-//!   only malformed input fails the create.
+//!   reads `acceptable_buffer_backends`: `cpu` is always acceptable, and a
+//!   subscription naming a backend this process has not loaded starts, logs
+//!   one warning naming the backends it ignores, and receives Buffers on them
+//!   as CPU data; only malformed input fails the create.
 //!
 //! The C++ side of every call is `shim/cppstring_shim.cpp`, compiled against
 //! the distro's own `rosidl_buffer` headers, or on a vendored-bindings build
@@ -35,8 +37,8 @@ use std::sync::Mutex;
 #[cfg(cerulion_has_is_rosidl_buffer)]
 use std::os::raw::{c_char, c_int, c_void};
 
-/// The buffer backends this rmw can deliver: `cpu` only (it loads no
-/// backend plugin).
+/// The buffer backend every build delivers. The backend plugins a Lyrical
+/// build loads come on top ([`crate::buffer_backends::installed_backends`]).
 pub const INSTALLED_BUFFER_BACKENDS: &[&str] = &["cpu"];
 
 /// Total number of Buffers copied from a non-CPU backend to host memory by
@@ -159,9 +161,10 @@ impl Drop for PublishScope<'_> {
                 topic_downgrades = n,
                 total_downgrades = downgrade_count(),
                 "a rosidl::Buffer on a non-CPU backend was copied to host memory and published \
-                 as bytes: rmw_cerulion loads no buffer backend, so device memory crosses \
-                 processes as a CPU copy (further frames on this topic are counted, and the \
-                 count is logged at every power of ten)"
+                 as bytes: this process hosts no backend for it, or a subscriber that cannot \
+                 take its descriptor is attached (a native node, a recorder, the gateway, \
+                 rclpy), so device memory crossed processes as a CPU copy (further frames on \
+                 this topic are counted, and the count is logged at every power of ten)"
             );
         } else if announces(n) {
             tracing::warn!(
@@ -179,10 +182,11 @@ impl Drop for PublishScope<'_> {
 /// rmw_zenoh_cpp and rmw_fastrtps_cpp parse it: a comma-separated list, each
 /// name trimmed of spaces and tabs, empty names skipped. `None`, an empty
 /// list and `cpu` mean CPU only, and `any` accepts every installed backend.
-/// CPU is always acceptable, and it is the only backend this rmw has
-/// ([`INSTALLED_BUFFER_BACKENDS`]), so a subscription naming another backend
-/// still receives every frame as CPU data: `Ok` returns the names it ignores
-/// (empty when there are none). `Err` is malformed input only: text that is
+/// CPU is always acceptable ([`INSTALLED_BUFFER_BACKENDS`]), and so is every
+/// backend this process has loaded
+/// ([`crate::buffer_backends::installed_backends`]); a subscription naming
+/// any other backend still receives Buffers on it as CPU data: `Ok` returns
+/// the names it ignores (empty when there are none). `Err` is malformed input only: text that is
 /// not UTF-8, or a name with a character other than an ASCII letter, digit,
 /// `_` or `-`.
 pub fn validate_acceptable_buffer_backends(
@@ -210,7 +214,13 @@ pub fn validate_acceptable_buffer_backends(
     }
     Ok(names
         .into_iter()
-        .filter(|n| *n != "any" && !INSTALLED_BUFFER_BACKENDS.contains(n))
+        .filter(|n| {
+            *n != "any"
+                && !INSTALLED_BUFFER_BACKENDS.contains(n)
+                && !crate::buffer_backends::installed_backends()
+                    .iter()
+                    .any(|b| b == n)
+        })
         .map(str::to_owned)
         .collect())
 }

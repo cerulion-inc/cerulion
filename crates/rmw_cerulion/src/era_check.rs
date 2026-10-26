@@ -255,6 +255,70 @@ pub const CPP_SHIM_BUFFER_PACKAGE: &str = "rosidl_buffer";
 /// about whether the resolved list is non-empty.
 pub const CPP_SHIM_INTROSPECTION_PACKAGE: &str = "rosidl_typesupport_introspection_cpp";
 
+/// The packages whose headers `shim/buffer_shim.cpp` includes, each with the
+/// header that proves the package is there. All four ship with every Lyrical
+/// and Rolling install of rmw_fastrtps_cpp.
+pub const BUFFER_BACKEND_INCLUDE_PACKAGES: &[(&str, &str)] = &[
+    ("rosidl_buffer_backend", "buffer_backend.hpp"),
+    (
+        "rosidl_buffer_backend_registry",
+        "buffer_backend_registry.hpp",
+    ),
+    (
+        "rosidl_typesupport_fastrtps_cpp",
+        "buffer_serialization.hpp",
+    ),
+    ("fastcdr", "Cdr.h"),
+];
+
+/// The libraries the hosted-backend shim links (`lib<name>.so`).
+pub const BUFFER_BACKEND_LIBRARIES: &[&str] = &["rosidl_buffer_backend_registry", "fastcdr"];
+
+/// What [`resolve_package_includes`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIncludes {
+    /// The `-I` directories, first-match order, each once.
+    pub dirs: Vec<std::path::PathBuf>,
+    /// The packages no root served.
+    pub missing: Vec<&'static str>,
+}
+
+/// For each `(package, header)`, the first root that serves
+/// `<root>/<package>/<header>` (the flat layout) or
+/// `<root>/<package>/<package>/<header>` (the per-package layout), the same
+/// two candidates [`cpp_shim_include_dirs`] tries.
+pub fn resolve_package_includes(
+    roots: &[std::path::PathBuf],
+    packages: &[(&'static str, &'static str)],
+    file_exists: &mut dyn FnMut(&std::path::Path) -> bool,
+) -> PackageIncludes {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut missing = Vec::new();
+    for (pkg, header) in packages {
+        let mut found = None;
+        for root in roots {
+            if file_exists(&root.join(pkg).join(header)) {
+                found = Some(root.clone());
+                break;
+            }
+            let nested = root.join(pkg);
+            if file_exists(&nested.join(pkg).join(header)) {
+                found = Some(nested);
+                break;
+            }
+        }
+        match found {
+            Some(dir) => {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+            None => missing.push(*pkg),
+        }
+    }
+    PackageIncludes { dirs, missing }
+}
+
 /// What [`cpp_shim_include_dirs`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CppShimIncludes {
@@ -998,6 +1062,31 @@ pub fn check_distro_claim(claimed: &str, observed: &[&str]) -> DistroClaimVerdic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_backend_packages_resolve_in_both_layouts_and_name_what_is_missing() {
+        use std::path::PathBuf;
+        let present: Vec<PathBuf> = vec![
+            PathBuf::from("/p/include/rosidl_buffer_backend/rosidl_buffer_backend/buffer_backend.hpp"),
+            PathBuf::from("/p/include/rosidl_typesupport_fastrtps_cpp/rosidl_typesupport_fastrtps_cpp/buffer_serialization.hpp"),
+            PathBuf::from("/p/includefastcdr/fastcdr/Cdr.h"),
+        ];
+        let mut probe = |p: &std::path::Path| present.iter().any(|x| x == p);
+        let roots = vec![
+            PathBuf::from("/p/include"),
+            PathBuf::from("/p/includefastcdr"),
+        ];
+        let found = resolve_package_includes(&roots, BUFFER_BACKEND_INCLUDE_PACKAGES, &mut probe);
+        assert_eq!(found.missing, vec!["rosidl_buffer_backend_registry"]);
+        assert_eq!(
+            found.dirs,
+            vec![
+                PathBuf::from("/p/include/rosidl_buffer_backend"),
+                PathBuf::from("/p/include/rosidl_typesupport_fastrtps_cpp"),
+                PathBuf::from("/p/includefastcdr"),
+            ]
+        );
+    }
 
     // ---- capability headers resolve by the anchor's FIRST-match root ----
     // Hand oracles over an injected filesystem; no real dirs.

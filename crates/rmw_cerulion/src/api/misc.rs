@@ -438,17 +438,55 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
 
         let mut frame: Option<Vec<u8>> = None;
         let mut info_out: Option<(u64, u64, u128)> = None;
-        let receive = inner.subscriber.try_receive_one(|msg| {
-            let origin = msg.origin();
-            // Reassemble the full frame (header + payload) — "cerulion"
-            // serialization format IS the wire frame.
-            let header = msg.header();
-            let mut buf = vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
-            header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
-            buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
-            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
-            frame = Some(buf);
-        });
+        // A buffer-aware subscription receives addressed frames
+        // (`crate::buffer_backends`): its own come back as the native frame,
+        // other ports' are passed over, up to the queue's depth.
+        let mut skips_left = runtime::runtime()
+            .map(|rt| rt.transport.subscriber_buffer_size())
+            .unwrap_or(16);
+        let receive = loop {
+            let mut passed_over = false;
+            let receive = inner.subscriber.try_receive_one(|msg| {
+                let header = msg.header();
+                // An addressed frame is never returned as a serialized
+                // message to a subscription that is not buffer-aware.
+                if header.is_rmw_addressed() && !super::pubsub::buffer_half_takes(data, header) {
+                    crate::buffer_backends::note_skipped();
+                    passed_over = true;
+                    return;
+                }
+                #[cfg(cerulion_has_buffer_backends)]
+                {
+                    use super::pubsub::AddressedAsNative;
+                    match super::pubsub::addressed_as_native(data, header, msg.payload()) {
+                        AddressedAsNative::NotAddressed => {}
+                        AddressedAsNative::Native(native) => {
+                            info_out =
+                                Some((header.timestamp_ns, header.sequence as u64, msg.origin()));
+                            frame = Some(native);
+                            return;
+                        }
+                        AddressedAsNative::NotMine | AddressedAsNative::Dropped => {
+                            passed_over = true;
+                            return;
+                        }
+                    }
+                }
+                // Reassemble the full frame (header + payload): "cerulion"
+                // serialization format IS the wire frame.
+                let mut buf =
+                    vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
+                header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
+                buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
+                info_out = Some((header.timestamp_ns, header.sequence as u64, msg.origin()));
+                frame = Some(buf);
+            });
+            if matches!(receive, Ok(true)) && passed_over && skips_left > 0 {
+                skips_left -= 1;
+                continue;
+            }
+            break receive;
+        };
         let publisher_gid = match info_out {
             Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
             _ => [0u8; 16],

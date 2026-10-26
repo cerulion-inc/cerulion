@@ -159,9 +159,27 @@ pub struct WireHeader {
     pub step_tag: StepTag,
 }
 
+/// The `offset_table_offset` an rmw_cerulion ADDRESSED frame carries, with
+/// `offset_table_count` 0 (the bytes `R B U F`, little-endian). An addressed
+/// frame holds CDR addressed to particular buffer-aware rmw subscriptions
+/// (`rmw_cerulion::buffer_backends`), not the topic's native layout, and may
+/// name device memory that only those subscriptions can import: a recorder or
+/// a gateway refuses it ([`WireHeader::is_rmw_addressed`]). No native frame
+/// carries this value: with no offset table the field is 0 or the fixed
+/// section's end, far below 1.18 GB.
+pub const RMW_ADDRESSED_FRAME_MARK: u32 = u32::from_le_bytes(*b"RBUF");
+
 impl WireHeader {
     /// Header size in bytes.
     pub const SIZE: usize = 40;
+
+    /// Whether this is an rmw_cerulion addressed frame
+    /// ([`RMW_ADDRESSED_FRAME_MARK`]), which a recorder or a gateway must not
+    /// keep or forward.
+    #[inline]
+    pub fn is_rmw_addressed(&self) -> bool {
+        self.offset_table_count == 0 && self.offset_table_offset == RMW_ADDRESSED_FRAME_MARK
+    }
 
     /// Create a new, untagged header for the given schema.
     pub fn new(schema_hash: u64, sequence: u32, timestamp_ns: u64) -> Self {
@@ -799,6 +817,20 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_addressed_mark_needs_an_empty_offset_table() {
+        let mut h = WireHeader::new(7, 64, 0);
+        h.offset_table_count = 0;
+        h.offset_table_offset = RMW_ADDRESSED_FRAME_MARK;
+        assert!(h.is_rmw_addressed());
+        h.offset_table_count = 1;
+        assert!(!h.is_rmw_addressed());
+        h.offset_table_count = 0;
+        h.offset_table_offset = WireHeader::SIZE as u32;
+        assert!(!h.is_rmw_addressed());
+        assert_eq!(&RMW_ADDRESSED_FRAME_MARK.to_le_bytes(), b"RBUF");
+    }
 
     #[test]
     fn test_wire_header_size() {

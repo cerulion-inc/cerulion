@@ -31,7 +31,7 @@ extern "C" {
 const ROS_TYPE_UINT8: u8 = 8;
 const HEADLINE: &str = "a rosidl::Buffer on a non-CPU backend was copied to host memory";
 const DECADE: &str = "rosidl::Buffer CPU copies on this topic";
-const SUB_IGNORED: &str = "acceptable_buffer_backends names backends rmw_cerulion does not have";
+const SUB_IGNORED: &str = "acceptable_buffer_backends names backends this process has not loaded";
 
 fn cstr(s: &str) -> *const c_char {
     CString::new(s).expect("cstr").into_raw()

@@ -745,6 +745,11 @@ pub struct GatewayRuntime {
     /// Canonical announce topic → first-warn-then-debug latch for repeated zenoh
     /// put failures (a persistently unreachable peer must not flood the log).
     forward_warn: HashMap<String, AtomicBool>,
+    /// Frames the egress tap drained that were rmw_cerulion ADDRESSED frames
+    /// (`WireHeader::is_rmw_addressed`): CDR for particular local subscriptions,
+    /// possibly naming device memory, never forwarded. Counted, warned once.
+    addressed_refused: AtomicU64,
+    addressed_warned: AtomicBool,
     /// Canonical announce topic → cumulative tap ATTACH failure count
     /// (Principle #3: a topic that cannot egress because its tap never attaches
     /// — e.g. subscriber slots exhausted — must be visible, never
@@ -1279,6 +1284,8 @@ impl GatewayRuntime {
             taps: HashMap::new(),
             forwarded,
             forward_warn,
+            addressed_refused: AtomicU64::new(0),
+            addressed_warned: AtomicBool::new(false),
             attach_failures,
             attach_warn,
             // hot-path-alloc-ok: boot — the reusable drain buffer, allocated once.
@@ -2311,6 +2318,19 @@ impl GatewayRuntime {
     /// counters + latch are interior-mutable). The `network()` is `Some` by
     /// [`Self::new`]'s guarantee.
     fn forward_frame(&self, topic: &str, frame: Vec<u8>) -> bool {
+        if crate::wire::WireHeader::read_from_buf(&frame).is_some_and(|h| h.is_rmw_addressed()) {
+            let n = self.addressed_refused.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.addressed_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    topic = %topic,
+                    refused = n,
+                    "gateway egress refused an rmw_cerulion addressed frame (CDR for particular \
+                     local subscriptions, possibly naming device memory); such frames are never \
+                     forwarded and are counted (further ones are not logged)"
+                );
+            }
+            return false;
+        }
         let Some(network) = self.manager.network() else {
             return false;
         };
@@ -2463,6 +2483,12 @@ impl GatewayRuntime {
         let mut topics: Vec<String> = self.taps.keys().cloned().collect();
         topics.sort();
         topics
+    }
+
+    /// Total rmw_cerulion addressed frames the egress taps drained and refused
+    /// to forward (Principle #3).
+    pub fn addressed_refused_count(&self) -> u64 {
+        self.addressed_refused.load(Ordering::Relaxed)
     }
 
     /// Observable state (Principle #3): cumulative frames SUCCESSFULLY forwarded for

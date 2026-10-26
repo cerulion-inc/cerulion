@@ -2504,9 +2504,9 @@ mod tests {
 
         // Because this arm owns the traced slot, the
         // refusal LINE is asserted rather than discarded: exactly one,
-        // at ERROR, naming the entry point and both sides. The
-        // `rcl_error_channel=unavailable` reading is provable here — a
-        // cargo test process maps no librcutils.
+        // at ERROR, naming the entry point and both sides, and whether
+        // librcutils is mapped in this process (it is only where the build
+        // links the buffer backend registry).
         logs_assert(|lines: &[&str]| {
             let hits: Vec<&str> = lines
                 .iter()
@@ -2527,7 +2527,7 @@ mod tests {
                 "entry=rmw_init",
                 "baked_ros_distro=jazzy",
                 "runtime_ros_distro=foxy\\u{1}",
-                "rcl_error_channel=unavailable",
+                crate::ffi::rcl_error_channel_token(),
             ] {
                 if !hits[0].split_whitespace().any(|token| token == field) {
                     return Err(format!("refusal missing {field}: {}", hits[0]));

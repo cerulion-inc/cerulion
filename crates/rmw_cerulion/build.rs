@@ -250,6 +250,20 @@ fn bake_distro_claim(claim: BakedDistroClaim<'_>) {
     println!("cargo:rustc-env=CERULION_RMW_BUILT_FOR_DISTRO={value}");
 }
 
+/// The directories directly inside `dir` (none when it cannot be read).
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CERULION_RMW_SYS_INCLUDE");
     println!("cargo:rerun-if-env-changed=AMENT_PREFIX_PATH");
@@ -265,6 +279,8 @@ fn main() {
     for (cap, _) in CAPABILITIES {
         println!("cargo:rustc-check-cfg=cfg(cerulion_has_{cap})");
     }
+    println!("cargo:rustc-check-cfg=cfg(cerulion_has_buffer_backends)");
+    println!("cargo:rerun-if-changed=shim/buffer_shim.cpp");
 
     // Load-time era guard input, read here but BAKED only after
     // source selection below: the distro claim derives from the
@@ -546,6 +562,108 @@ fn main() {
     }
     shim.file("shim/cppstring_shim.cpp")
         .compile("rmw_cerulion_cppstring_shim");
+
+    // The hosted rosidl::Buffer backends (src/buffer_backends.rs): on a
+    // generated build of the Buffer era, `shim/buffer_shim.cpp` loads the
+    // installed backend plugins through rosidl_buffer_backend_registry and
+    // serializes through rosidl_typesupport_fastrtps_cpp, as rmw_zenoh_cpp
+    // does, and links the registry and fastcdr. A vendored build has neither
+    // and carries non-CPU Buffers as host copies only, and so does a generated
+    // build that misses one of the packages (with a warning naming it).
+    let hosted: Option<(Vec<PathBuf>, Vec<PathBuf>)> = if buffer_era && generated {
+        let mut probe = |p: &Path| p.is_file();
+        // Every `include*` directory of every ament prefix joins the roots:
+        // fastcdr 2.3 installs its headers under `<prefix>/includefastcdr/`.
+        let prefixes: Vec<PathBuf> = env::var("AMENT_PREFIX_PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        let mut bb_roots = cpp_probe_roots.clone();
+        for prefix in &prefixes {
+            for dir in subdirs(prefix) {
+                let is_include = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("include"));
+                if is_include && !bb_roots.contains(&dir) {
+                    bb_roots.push(dir);
+                }
+            }
+        }
+        let found = era_check::resolve_package_includes(
+            &bb_roots,
+            era_check::BUFFER_BACKEND_INCLUDE_PACKAGES,
+            &mut probe,
+        );
+        if !found.missing.is_empty() {
+            cargo_warning(&format!(
+                "rmw_cerulion: this build does NOT host rosidl::Buffer backends (non-CPU Buffers \
+                 cross processes as host copies): no include directory serves {}. They ship \
+                 with rmw_fastrtps_cpp on every Lyrical and Rolling install \
+                 (ros-<distro>-rmw-fastrtps-cpp).",
+                found.missing.join(", ")
+            ));
+        }
+        // `<prefix>/lib` and its one-level subdirectories (the multiarch
+        // `lib/x86_64-linux-gnu/` fastcdr installs into).
+        let lib_candidates: Vec<PathBuf> = prefixes
+            .iter()
+            .flat_map(|p| {
+                let lib = p.join("lib");
+                std::iter::once(lib.clone()).chain(subdirs(&lib))
+            })
+            .collect();
+        let mut lib_dirs: Vec<PathBuf> = Vec::new();
+        let mut missing_libs: Vec<String> = Vec::new();
+        for lib in era_check::BUFFER_BACKEND_LIBRARIES {
+            let files = [format!("lib{lib}.so"), format!("lib{lib}.dylib")];
+            match lib_candidates
+                .iter()
+                .find(|d| files.iter().any(|f| d.join(f).is_file()))
+            {
+                Some(dir) if !lib_dirs.contains(dir) => lib_dirs.push(dir.clone()),
+                Some(_) => {}
+                None => missing_libs.push(format!("lib{lib}")),
+            }
+        }
+        if found.missing.is_empty() && !missing_libs.is_empty() {
+            cargo_warning(&format!(
+                "rmw_cerulion: this build does NOT host rosidl::Buffer backends (non-CPU Buffers \
+                 cross processes as host copies): {} is in no lib directory of \
+                 AMENT_PREFIX_PATH",
+                missing_libs.join(", ")
+            ));
+        }
+        (found.missing.is_empty() && missing_libs.is_empty()).then_some((found.dirs, lib_dirs))
+    } else {
+        None
+    };
+    if let Some((found_dirs, lib_dirs)) = hosted {
+        let mut bb = cc::Build::new();
+        // `-Wno-format-security`: rcutils' logging macros, expanded inside the
+        // distro's own buffer_serialization.hpp, pass a non-literal format.
+        bb.cpp(true)
+            .flag_if_supported("-std=c++17")
+            .flag_if_supported("-Wno-format-security");
+        for dir in include_dirs
+            .iter()
+            .chain(cpp_includes.dirs.iter())
+            .chain(found_dirs.iter())
+        {
+            bb.include(dir);
+        }
+        bb.file("shim/buffer_shim.cpp")
+            .compile("rmw_cerulion_buffer_shim");
+        for dir in &lib_dirs {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        for lib in era_check::BUFFER_BACKEND_LIBRARIES {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+        println!("cargo:rustc-cfg=cerulion_has_buffer_backends");
+    }
     // The layout discriminator the fingerprint lacks:
     // jazzy/kilted share one capability fingerprint while
     // their rmw_init_options_t layouts DIFFER (168 vs 160 — kilted
