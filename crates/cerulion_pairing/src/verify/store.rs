@@ -2433,6 +2433,59 @@ mod owner_certificate_state_tests {
         assert_eq!(expiries, vec![Some(30), Some(40), Some(40), Some(90)]);
     }
 
+    /// An epoch for the fixture robot revoking `devices`, signed by its issuer.
+    fn epoch(n: u64, devices: Vec<PublicKey>, issued_at_ns: u64) -> crate::format::SignedEpoch {
+        crate::format::AccessListEpoch {
+            version: FORMAT_VERSION,
+            robot: RobotId([5; 32]),
+            epoch: n,
+            revoked_accounts: vec![],
+            revoked_devices: devices,
+            issued_at_ns,
+            issuer_key: PublicKey(SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes()),
+        }
+        .sign(&SigningKey::from_bytes(&[2; 32]))
+    }
+
+    #[test]
+    fn a_lapsed_cloud_row_stays_refused_when_a_later_epoch_drops_its_revocation() {
+        let (mut store, _) = fixture();
+        let cloud = proof_until(9, PrincipalKind::Cloud, 50);
+        store.verify_owner_certificate(&cloud, &key(9), 2).unwrap();
+        // Epoch 1 revokes the cloud device.
+        store
+            .apply_epoch(&epoch(1, vec![key(9)], 10), &cloud.intermediate, 10)
+            .unwrap();
+        assert!(store.is_allowed(&OWNER, &key(9), 10).is_none());
+        // Past the certificate's not_after, epoch 2 prunes the device from the
+        // revoked set; the lapsed row still refuses it.
+        store
+            .apply_epoch(&epoch(2, vec![], 60), &cloud.intermediate, 60)
+            .unwrap();
+        assert!(!store.revoked_devices().contains(&key(9)));
+        assert!(store.is_allowed(&OWNER, &key(9), 60).is_none());
+        // The old certificate cannot bring the row back: it has lapsed too.
+        let rows = store.access_rows().to_vec();
+        assert!(store.verify_owner_certificate(&cloud, &key(9), 61).is_err());
+        assert_eq!(store.access_rows(), rows.as_slice());
+        assert!(store.is_allowed(&OWNER, &key(9), 61).is_none());
+        // The owner's own device row is unaffected throughout.
+        assert!(store.is_allowed(&OWNER, &key(7), 61).is_some());
+    }
+
+    #[test]
+    fn a_cloud_certificate_renewed_before_it_lapses_keeps_the_device_admitted() {
+        let (mut store, _) = fixture();
+        store
+            .verify_owner_certificate(&proof_until(9, PrincipalKind::Cloud, 50), &key(9), 2)
+            .unwrap();
+        store
+            .verify_owner_certificate(&proof_until(9, PrincipalKind::Cloud, 90), &key(9), 45)
+            .unwrap();
+        assert!(store.is_allowed(&OWNER, &key(9), 60).is_some());
+        assert!(store.is_allowed(&OWNER, &key(9), 90).is_none());
+    }
+
     /// The v3 body as a v3 writer laid it out (field order is the wire).
     #[derive(Serialize)]
     struct V3Body {

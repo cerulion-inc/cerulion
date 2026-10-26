@@ -38,6 +38,15 @@ fn caller(seed: u8) -> CallerIdentity {
 
 /// The owner account's certificate chain for device `seed`.
 fn chain(seed: u8, principal_kind: PrincipalKind) -> OwnerCertificatePresentationWire {
+    chain_until(seed, principal_kind, u64::MAX)
+}
+
+/// [`chain`] with the device certificate valid until `not_after_ns`.
+fn chain_until(
+    seed: u8,
+    principal_kind: PrincipalKind,
+    not_after_ns: u64,
+) -> OwnerCertificatePresentationWire {
     let validity = Validity {
         not_before_ns: 0,
         not_after_ns: u64::MAX,
@@ -56,7 +65,10 @@ fn chain(seed: u8, principal_kind: PrincipalKind) -> OwnerCertificatePresentatio
         account: OWNER,
         principal_kind,
         scope: Scope::OWNER_FULL,
-        validity,
+        validity: Validity {
+            not_before_ns: 0,
+            not_after_ns,
+        },
         issued_at_ns: 1,
         issuer_key: pk(2),
     }
@@ -221,4 +233,132 @@ fn only_an_owner_non_cloud_device_may_set_the_switch() {
     assert!(CloudAccessVerb::new(shared)
         .execute_with_caller(&caller(11), &serde_json::json!({ "allow": "no" }))
         .is_err());
+}
+
+/// An epoch for this robot revoking `devices`, signed by the intermediate.
+fn epoch(
+    n: u64,
+    devices: Vec<PublicKey>,
+    issued_at_ns: u64,
+) -> cerulion_pairing::format::SignedEpoch {
+    cerulion_pairing::format::AccessListEpoch {
+        version: FORMAT_VERSION,
+        robot: RobotId([5; 32]),
+        epoch: n,
+        revoked_accounts: vec![],
+        revoked_devices: devices,
+        issued_at_ns,
+        issuer_key: pk(2),
+    }
+    .sign(&sk(2))
+}
+
+/// The robot's trust state viewed at `now_ns` on its own clock.
+fn at(store: TrustStore, now_ns: u64) -> PairingAuthorizer {
+    let mut index = DeviceAccountIndex::new();
+    index.bind(pk(90), OWNER);
+    index.bind(pk(11), OWNER);
+    PairingAuthorizer::from_shared(SharedTrust::new_with_clock(
+        store,
+        index,
+        Vec::new(),
+        cerulion_remoted::RemotedClock::fixed(now_ns),
+    ))
+}
+
+#[test]
+fn a_lapsed_cloud_row_is_refused_at_accept_and_per_verb_after_its_revocation_is_pruned() {
+    let lapses = T_NOW + 50;
+    let roots = RootSet::new(vec![pk(1)], 1).unwrap();
+    let mut store = TrustStore::provision(RobotId([5; 32]), pk(6), roots, CHASSIS, T_NOW).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    let cloud = chain_until(90, PrincipalKind::Cloud, lapses);
+    store
+        .verify_owner_certificate(&cloud, &pk(90), T_NOW + 1)
+        .unwrap();
+    store
+        .verify_owner_certificate(&chain(11, PrincipalKind::Human), &pk(11), T_NOW + 1)
+        .unwrap();
+    store
+        .apply_epoch(
+            &epoch(1, vec![pk(90)], T_NOW + 10),
+            &cloud.intermediate,
+            T_NOW + 10,
+        )
+        .unwrap();
+    store
+        .apply_epoch(
+            &epoch(2, vec![], T_NOW + 60),
+            &cloud.intermediate,
+            T_NOW + 60,
+        )
+        .unwrap();
+    assert!(
+        store.revoked_devices().is_empty(),
+        "the revocation was pruned"
+    );
+    let authz = at(store, T_NOW + 60);
+    let shared = authz.shared().clone();
+    assert_eq!(shared.snapshot_for_key(&pk(90).0).1, KeyAccess::NotAllowed);
+    for verb in [verbs::INVENTORY, verbs::TELEOP, verbs::ENGAGE_ESTOP] {
+        assert!(
+            matches!(
+                authz.authorize_verb(&caller(90), verb),
+                AuthzDecision::Deny { .. }
+            ),
+            "{verb}"
+        );
+    }
+    assert!(matches!(
+        authz.classify_accept(alpn::WIRE, &pk(90).0),
+        AcceptDecision::Refuse { .. }
+    ));
+    assert_eq!(
+        authz.classify_accept(alpn::OPS, &pk(90).0),
+        AcceptDecision::OpsBootstrapOnly
+    );
+    // Re-presenting the lapsed certificate does not bring the row back.
+    assert!(shared
+        .verify_owner_certificate_and_establish(&cloud, &pk(90).0, T_NOW + 61)
+        .is_err());
+    assert_eq!(shared.snapshot_for_key(&pk(90).0).1, KeyAccess::NotAllowed);
+    // The owner's own device is admitted throughout.
+    assert_eq!(
+        authz.authorize_verb(&caller(11), verbs::INVENTORY),
+        AuthzDecision::Allow
+    );
+}
+
+#[test]
+fn a_cloud_certificate_renewed_before_it_lapses_stays_admitted_at_accept_and_per_verb() {
+    let roots = RootSet::new(vec![pk(1)], 1).unwrap();
+    let mut store = TrustStore::provision(RobotId([5; 32]), pk(6), roots, CHASSIS, T_NOW).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    store
+        .verify_owner_certificate(
+            &chain_until(90, PrincipalKind::Cloud, T_NOW + 50),
+            &pk(90),
+            T_NOW + 1,
+        )
+        .unwrap();
+    store
+        .verify_owner_certificate(
+            &chain_until(90, PrincipalKind::Cloud, T_NOW + 90),
+            &pk(90),
+            T_NOW + 45,
+        )
+        .unwrap();
+    let authz = at(store, T_NOW + 60);
+    assert_eq!(
+        authz.authorize_verb(&caller(90), verbs::INVENTORY),
+        AuthzDecision::Allow
+    );
+    assert_eq!(
+        authz.classify_accept(alpn::WIRE, &pk(90).0),
+        AcceptDecision::WireAdmit
+    );
 }
