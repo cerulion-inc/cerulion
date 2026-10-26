@@ -551,7 +551,9 @@ async fn code_pair_start_finish_establishes_a_row_via_a_cpace_witness() {
 
     // The row is on disk with the conservative code-pair default scope.
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
-    let row = store.account_access(&guest, T_NOW).expect("guest row on disk");
+    let row = store
+        .account_access(&guest, T_NOW)
+        .expect("guest row on disk");
     assert_eq!(row.source, PairingSource::CodePaired);
     assert_eq!(row.scope, Scope::CODE_PAIR_DEFAULT);
     let index =

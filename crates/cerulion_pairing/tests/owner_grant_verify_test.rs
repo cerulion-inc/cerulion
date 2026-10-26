@@ -784,7 +784,9 @@ fn a_time_boxed_owner_grant_row_is_denied_once_it_expires() {
     );
     // DENIED at the bound and beyond (`now_ns >= not_after_ns`), with NO revoke.
     assert!(
-        store.account_access(&acct(SUBJECT), GRANT_EXPIRY_NS).is_none(),
+        store
+            .account_access(&acct(SUBJECT), GRANT_EXPIRY_NS)
+            .is_none(),
         "denied exactly at the expiry instant (half-open window)"
     );
     assert!(

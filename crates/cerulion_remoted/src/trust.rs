@@ -47,8 +47,8 @@ use cerulion_pairing::format::{
 };
 use cerulion_pairing::pake::CpaceConfirmed;
 use cerulion_pairing::verify::{
-    AccessRow, EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation, PairingPresentation,
-    TrustStore,
+    AccessRow, EpochOutcome, OwnerCertificatePresentationWire, OwnerGrantPresentation,
+    PairingPresentation, TrustStore,
 };
 use cerulion_pairing::PairingError;
 
@@ -1016,7 +1016,10 @@ mod tests {
         // The row is a real strong-chain row on disk.
         let store = TrustStore::load(dir.path().join("trust_store"), MAC).unwrap();
         assert_eq!(
-            store.is_allowed(&account_a, T_NOW).unwrap().source,
+            store
+                .is_allowed(&account_a, &PublicKey(k), T_NOW)
+                .unwrap()
+                .source,
             PairingSource::StrongChain
         );
     }

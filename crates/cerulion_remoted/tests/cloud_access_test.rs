@@ -105,9 +105,18 @@ fn a_cloud_device_is_admitted_like_any_owner_device_while_the_switch_is_on() {
     let row = shared.snapshot_row_for_key(&pk(90).0).2.unwrap();
     assert_eq!(row.principal_kind, PrincipalKind::Cloud);
     assert_eq!(row.device, Some(pk(90)));
-    assert_eq!(authz.authorize_verb(&caller(90), verbs::INVENTORY), AuthzDecision::Allow);
-    assert_eq!(authz.classify_accept(alpn::OPS, &pk(90).0), AcceptDecision::OpsAdmit);
-    assert_eq!(authz.classify_accept(alpn::WIRE, &pk(90).0), AcceptDecision::WireAdmit);
+    assert_eq!(
+        authz.authorize_verb(&caller(90), verbs::INVENTORY),
+        AuthzDecision::Allow
+    );
+    assert_eq!(
+        authz.classify_accept(alpn::OPS, &pk(90).0),
+        AcceptDecision::OpsAdmit
+    );
+    assert_eq!(
+        authz.classify_accept(alpn::WIRE, &pk(90).0),
+        AcceptDecision::WireAdmit
+    );
 }
 
 #[test]
@@ -117,7 +126,10 @@ fn switch_off_refuses_the_cloud_device_on_every_plane_and_verb_and_nothing_else(
         set(&shared, 11, false).unwrap(),
         serde_json::json!({ "allow_cloud": false })
     );
-    assert_eq!(shared.snapshot_for_key(&pk(90).0).1, KeyAccess::CloudRefused);
+    assert_eq!(
+        shared.snapshot_for_key(&pk(90).0).1,
+        KeyAccess::CloudRefused
+    );
     assert_eq!(shared.snapshot_row_for_key(&pk(90).0).2, None);
     for verb in [
         verbs::INVENTORY,
@@ -145,27 +157,40 @@ fn switch_off_refuses_the_cloud_device_on_every_plane_and_verb_and_nothing_else(
             other => panic!("{plane:?} admitted a cloud device: {other:?}"),
         }
     }
-    match authz.authorize_demand(&DemandSubject::Wan { demander_key: pk(90).0 }, "/tf") {
+    match authz.authorize_demand(
+        &DemandSubject::Wan {
+            demander_key: pk(90).0,
+        },
+        "/tf",
+    ) {
         DemandDecision::Deny { reason } => assert!(reason.contains(REFUSAL), "{reason}"),
         other => panic!("the wire demand admitted a cloud device: {other:?}"),
     }
     // The owner's own device is untouched.
-    assert_eq!(authz.authorize_verb(&caller(11), verbs::INVENTORY), AuthzDecision::Allow);
-    assert_eq!(authz.classify_accept(alpn::WIRE, &pk(11).0), AcceptDecision::WireAdmit);
+    assert_eq!(
+        authz.authorize_verb(&caller(11), verbs::INVENTORY),
+        AuthzDecision::Allow
+    );
+    assert_eq!(
+        authz.classify_accept(alpn::WIRE, &pk(11).0),
+        AcceptDecision::WireAdmit
+    );
     // A new cloud certificate is refused while the switch is off.
     let err = shared
-        .verify_owner_certificate_and_establish(
-            &chain(91, PrincipalKind::Cloud),
-            &pk(91).0,
-            T_NOW,
-        )
+        .verify_owner_certificate_and_establish(&chain(91, PrincipalKind::Cloud), &pk(91).0, T_NOW)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("does not allow access from the cloud"), "{err}");
+    assert!(
+        err.contains("does not allow access from the cloud"),
+        "{err}"
+    );
     assert_eq!(shared.snapshot_for_key(&pk(91).0).1, KeyAccess::Unpaired);
     // Back on: the cloud device is admitted again.
     set(&shared, 11, true).unwrap();
-    assert_eq!(authz.authorize_verb(&caller(90), verbs::INVENTORY), AuthzDecision::Allow);
+    assert_eq!(
+        authz.authorize_verb(&caller(90), verbs::INVENTORY),
+        AuthzDecision::Allow
+    );
 }
 
 #[test]
@@ -182,7 +207,10 @@ fn only_an_owner_non_cloud_device_may_set_the_switch() {
         authz.authorize_verb(&caller(44), verbs::CLOUD_ACCESS),
         AuthzDecision::Deny { .. }
     ));
-    assert_eq!(authz.authorize_verb(&caller(11), verbs::CLOUD_ACCESS), AuthzDecision::Allow);
+    assert_eq!(
+        authz.authorize_verb(&caller(11), verbs::CLOUD_ACCESS),
+        AuthzDecision::Allow
+    );
     // Reading needs no argument and changes nothing.
     assert_eq!(
         CloudAccessVerb::new(shared.clone())

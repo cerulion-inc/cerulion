@@ -417,9 +417,12 @@ impl TrustStore {
         if self.inner.revoked_accounts.contains(account) {
             return None;
         }
-        let active =
-            |r: &&AccessRow| !r.revoked && r.expires_at_ns.is_none_or(|exp| now_ns < exp);
-        let mut rows = self.inner.access_rows.iter().filter(|r| &r.account == account);
+        let active = |r: &&AccessRow| !r.revoked && r.expires_at_ns.is_none_or(|exp| now_ns < exp);
+        let mut rows = self
+            .inner
+            .access_rows
+            .iter()
+            .filter(|r| &r.account == account);
         rows.clone()
             .find(|r| r.device.is_none())
             .filter(active)
@@ -645,7 +648,10 @@ impl TrustStore {
         if owner_row.revoked {
             return Err(PairingError::RevokedByOwner);
         }
-        if owner_row.expires_at_ns.is_some_and(|expiry| now_ns >= expiry) {
+        if owner_row
+            .expires_at_ns
+            .is_some_and(|expiry| now_ns >= expiry)
+        {
             return Err(PairingError::OwnerAccessExpired);
         }
         if !owner_row.scope.is_attenuation_of(&cert.scope) {
@@ -2068,7 +2074,11 @@ mod owner_certificate_state_tests {
     const OWNER: AccountId = AccountId([4; 32]);
 
     fn key(seed: u8) -> PublicKey {
-        PublicKey(SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes())
+        PublicKey(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
     }
 
     /// A roots-verified chain for the owner account's device `seed`.
@@ -2153,9 +2163,7 @@ mod owner_certificate_state_tests {
         let (mut store, proof) = fixture();
         store.inner.access_rows[0].expires_at_ns = Some(3);
         let owner_row = store.access_rows()[0].clone();
-        store
-            .verify_owner_certificate(&proof, &key(3), 2)
-            .unwrap();
+        store.verify_owner_certificate(&proof, &key(3), 2).unwrap();
         assert_eq!(store.access_rows()[0], owner_row);
         assert_eq!(
             store.access_rows()[1],
@@ -2308,7 +2316,12 @@ mod owner_certificate_state_tests {
             chassis_secret_hash: [0x5a; 32],
             access_rows: vec![
                 row([4; 32], Scope::OWNER_FULL, PairingSource::Claim, false),
-                row([6; 32], Scope::CODE_PAIR_DEFAULT, PairingSource::CodePaired, true),
+                row(
+                    [6; 32],
+                    Scope::CODE_PAIR_DEFAULT,
+                    PairingSource::CodePaired,
+                    true,
+                ),
             ],
             current_epoch: 2,
             revoked_accounts: vec![AccountId([8; 32])],

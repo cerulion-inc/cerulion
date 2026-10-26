@@ -206,7 +206,9 @@ pub enum PairingError {
     CodePairOwnerAccount,
     /// A cloud device certificate was presented while this robot's
     /// allow-from-cloud switch is OFF.
-    #[error("this robot does not allow access from the cloud (its allow-from-cloud switch is off)")]
+    #[error(
+        "this robot does not allow access from the cloud (its allow-from-cloud switch is off)"
+    )]
     CloudAccessDisabled,
 
     // ---- owner-signed access grant ---------------------------------------
