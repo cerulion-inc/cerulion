@@ -44,6 +44,7 @@ async fn serve_connection(
                     })
                     .collect(),
                 error: None,
+                wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             }),
             WireRequest::Demand { topic } if first && topic == topics[1] => {
                 // Reset ONLY the control reply stream. The first topic continues

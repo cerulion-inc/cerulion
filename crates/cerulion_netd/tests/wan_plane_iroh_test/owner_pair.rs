@@ -330,6 +330,7 @@ fn peer_catalog_demand_and_transport_errors_are_sanitized_before_surfacing() {
                     robot: "robot".into(),
                     entries: vec![],
                     error: None,
+                    wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 });
                 write_frame(&mut send, &serde_json::to_vec(&reply).unwrap())
                     .await

@@ -40,6 +40,7 @@ impl MirrorPlane for Routes {
                     robot: "display-name".into(),
                     entries: vec![],
                     error: None,
+                    wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
                 },
             }),
         }

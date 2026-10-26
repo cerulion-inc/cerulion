@@ -261,6 +261,7 @@ fn schema_catalog(entries: &[(&str, &str, Option<u64>)]) -> cerulion_core::Catal
             })
             .collect(),
         error: None,
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
     }
 }
 
