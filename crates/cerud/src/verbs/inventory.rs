@@ -10,8 +10,6 @@
 //! real tool-output formats) and thin OS-facing collectors, so the parsing
 //! logic is verified without a specific host.
 
-use serde::{Deserialize, Serialize};
-
 use crate::error::CerudResult;
 use crate::verbs::VerbHandler;
 
@@ -33,26 +31,9 @@ impl VerbHandler for InventoryVerb {
     }
 }
 
-/// The robot's platform inventory. Absent facts are `None`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Inventory {
-    /// Target architecture (`std::env::consts::ARCH`, e.g. `aarch64`).
-    pub arch: String,
-    /// Operating system (`std::env::consts::OS`, e.g. `linux`).
-    pub os: String,
-    /// Kernel release (`uname -r`), or `None` if it could not be read.
-    pub kernel: Option<String>,
-    /// glibc version, or `None` (e.g. non-Linux / musl / read failed).
-    pub glibc: Option<String>,
-    /// CUDA toolkit version, or `None` if not present.
-    pub cuda: Option<String>,
-    /// NVIDIA JetPack / L4T (Tegra) release, or `None` if not a Jetson.
-    pub jetpack_l4t: Option<String>,
-    /// Free bytes on the root filesystem, or `None` if it could not be read.
-    pub disk_free_bytes: Option<u64>,
-    /// The Cerulion version this `cerud` build ships.
-    pub cerulion_version: String,
-}
+/// The robot's platform inventory, defined in `cerulion_ops_proto` and
+/// re-exported at this path.
+pub use cerulion_ops_proto::inventory::Inventory;
 
 /// Assemble an [`Inventory`] from the running host (best-effort probes).
 pub fn probe_inventory() -> Inventory {

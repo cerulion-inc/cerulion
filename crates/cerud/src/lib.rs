@@ -16,7 +16,9 @@
 //!
 //! - [`protocol`]: framed request and response with protocol-version negotiation at
 //!   connect, plus a per-verb authorization seam re-checked server-side on every
-//!   call.
+//!   call. The wire types, the framing and the [`client`] half are defined in the
+//!   permissive `cerulion_ops_proto` crate and re-exported here at their `cerud`
+//!   paths.
 //! - [`transport`]: a [`transport::OpsListener`] seam over "framed bidirectional
 //!   bytes", plus a Unix-domain-socket development transport. `cerulion_remoted`
 //!   plugs the iroh transport in behind the same seam.

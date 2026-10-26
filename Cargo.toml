@@ -240,6 +240,10 @@ members = [
     #    Build it via `cargo build -p cerulion_link` or `--workspace`.
     "crates/cerulion_wire", # permissive standalone wire-format decode seam (no cerulion_core dep)
     "crates/cerulion_link", # thin iroh dial-by-key QUIC wrapper (pulls iroh; NOT in default-members)
+    #  • `cerulion_ops_proto` is the `cerulion/ops/1` wire types and protocol
+    #    client (serde + serde_json + thiserror); `cerud` depends on it and
+    #    re-exports or wraps each item. Lean, so it goes in default-members.
+    "crates/cerulion_ops_proto",
     # The robot-level remote-plane daemon (AGPL). Owns the ONE
     # iroh endpoint and multiplexes the wire+ops ALPNs, gating every accept via a
     # deny-by-default PairingAuthorizer. Links cerulion_link (→ iroh) + cerud +
@@ -360,6 +364,9 @@ default-members = [
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
     "crates/cerulion_wire",
+    # The permissive ops wire types (serde + serde_json + thiserror), a
+    # dependency of the default member `cerud`.
+    "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
     # The RCP daemon adds only rmcp, sse-stream and a second base64 to the

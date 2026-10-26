@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Golden `cerulion/ops/1` frames: the encoder must emit, and the decoder must
 //! accept, the exact bytes in `tests/fixtures/ops_wire_golden.txt`.
 //!
@@ -16,8 +16,8 @@ use std::io::Cursor;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use cerud::protocol::{self, HandshakeReply, Hello, Request, Response};
-use cerud::verbs::inventory::Inventory;
+use cerulion_ops_proto::protocol::{self, HandshakeReply, Hello, Request, Response};
+use cerulion_ops_proto::Inventory;
 
 const FIXTURE: &str = include_str!("fixtures/ops_wire_golden.txt");
 

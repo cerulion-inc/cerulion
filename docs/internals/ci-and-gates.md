@@ -287,15 +287,16 @@ enforces.
 | `the_robot_demo_workspace_is_rerun_free` | Any `examples/go2` crate takes a rerun dependency of any kind. Read from that workspace's committed manifests and lockfile, so dev edges, build edges and every platform count. |
 | `the_robot_workspace_reader_sees_normal_and_dev_packages` | The lockfile reader stops seeing `go2_tf`, or the manifest reader stops seeing `tempfile`, which `dds_bridge` declares only under `[dev-dependencies]`. A dev edge is how the Rerun SDK reached the robot the one time it did, so that is the arm worth a control of its own. |
 | `the_dds_stack_is_confined_to_cerulion_dds` | A second workspace member declares a DDS dependency, or the default build reaches the DDS stack along a route that avoids `cerulion_dds`. |
-| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
+| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, `cerulion_ops_proto` anything but serde, serde_json and thiserror, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
 | `the_confined_crates_reach_nothing_they_forbid` | `cerulion_pairing` reaches iroh or rerun, `cerud` reaches iceoryx2 or zenoh, or `cerulion_link` reaches `cerulion_core`. |
+| `the_permissive_crates_reach_no_agpl_crate` | A workspace crate licensed `MIT OR Apache-2.0` reaches an AGPL workspace crate over normal or build edges, or one of the four documented permissive crates stops declaring that license. A control requires the same check to report `cerud` under `cerulion_remoted`. |
 | `the_heavy_members_stay_out_of_default_members` | One of the eleven deliberate `default-members` exclusions is back in the default set, or a member left the default set with no row saying why. Checked in both directions, and each row names what a plain build would gain. |
 | `the_forbidden_families_exist_in_this_workspace` | A family pattern matches no package in the resolve at all, which would let every rule written over it pass while proving nothing. |
 | `the_checker_reports_a_forbidden_crate_when_one_is_present` | The one checker every rule above calls stops reporting a violation under roots that carry one. |
 | `the_resolver_covers_every_package_cargo_tree_reports` | The dependency closure the rules are stated over misses a package `cargo tree -e normal` reports, which is a place a forbidden crate could sit unseen. A floor on the reported count keeps a broken `cargo tree` invocation from satisfying it with silence. |
 
-Thirteen of the rules are stated over `cargo metadata --format-version 1`, run once per test
-binary; the fourteenth runs `cargo tree` as its oracle. The
+Fourteen of the rules are stated over `cargo metadata --format-version 1`, run once per test
+binary; the fifteenth runs `cargo tree` as its oracle. The
 emitted `resolve.nodes` graph is not walked directly: it carries one feature set per package,
 unified across every member that selects it, so netd appears there with `wan` on and iroh
 attached even though the default build reaches netd through an edge that says
