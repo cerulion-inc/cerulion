@@ -866,10 +866,12 @@ impl BufferPublisher {
     /// `mint_sequence` returns, which is called only once every frame is
     /// built and the subscriber ports are read again and found unchanged.
     /// [`AddressedOutcome::NoDeviceBuffer`] when the first serialization asked
-    /// no backend for a descriptor (the message holds no non-CPU Buffer), and
+    /// no backend for a descriptor (the message holds no non-CPU Buffer),
     /// [`AddressedOutcome::PortsChanged`] when a port came or went while the
-    /// frames were built: nothing is sent and no number is spent in either case,
-    /// and the caller sends the native frame.
+    /// frames were built, and [`AddressedOutcome::TooLarge`] when a built frame
+    /// is longer than `max_frame_len` (the topic's slice): nothing is sent and
+    /// no number is spent in any of these cases, and the caller sends the
+    /// native frame.
     ///
     /// # Safety
     /// `msg` is a live C++ message of this endpoint's type.
@@ -880,6 +882,7 @@ impl BufferPublisher {
         accelerated: &[(u128, [u8; 16])],
         cpu_group: &[u128],
         timestamp_ns: u64,
+        max_frame_len: usize,
         mint_sequence: &mut dyn FnMut() -> u32,
         send: &mut dyn FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<AddressedOutcome, String> {
@@ -927,10 +930,17 @@ impl BufferPublisher {
         if !self.ports_unchanged() {
             return Ok(AddressedOutcome::PortsChanged);
         }
+        if !frames_fit(&frames, max_frame_len) {
+            return Ok(AddressedOutcome::TooLarge);
+        }
         let sequence = mint_sequence();
         let mut sent = 0;
         for (kind, mut frame) in frames {
-            frame[20..24].copy_from_slice(&sequence.to_le_bytes());
+            use cerulion_core::wire::WireHeader;
+            let mut header = WireHeader::read_from_buf(&frame[..WireHeader::SIZE])
+                .ok_or_else(|| "an addressed frame lost its wire header".to_owned())?;
+            header.sequence = sequence;
+            header.write_to_buf(&mut frame[..WireHeader::SIZE]);
             send(&frame)?;
             if kind == FRAME_KIND_ENDPOINT_CDR {
                 note_descriptor_frame();
@@ -993,6 +1003,12 @@ impl BufferPublisher {
     }
 }
 
+/// Whether every built frame fits a slice of `max_frame_len` bytes (header
+/// included).
+pub fn frames_fit(frames: &[(u8, Vec<u8>)], max_frame_len: usize) -> bool {
+    frames.iter().all(|(_, frame)| frame.len() <= max_frame_len)
+}
+
 /// What [`BufferPublisher::publish_addressed`] did.
 #[cfg(cerulion_has_buffer_backends)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,6 +1019,8 @@ pub(crate) enum AddressedOutcome {
     NoDeviceBuffer,
     /// The subscriber ports changed while the frames were built: nothing sent.
     PortsChanged,
+    /// An addressed frame would exceed the topic's slice: nothing sent.
+    TooLarge,
 }
 
 /// The subscription half of a buffer-aware endpoint.
@@ -1186,6 +1204,17 @@ mod tests {
             assert_eq!(buffer_frame_hash(native), buffer_frame_hash(native));
         }
         assert_ne!(buffer_frame_hash(1), buffer_frame_hash(2));
+    }
+
+    #[test]
+    fn a_frame_fits_its_slice_up_to_and_including_the_slice_length() {
+        let frames = vec![
+            (FRAME_KIND_PLAIN_CDR, vec![0u8; 100]),
+            (FRAME_KIND_ENDPOINT_CDR, vec![0u8; 60]),
+        ];
+        assert!(frames_fit(&frames, 100));
+        assert!(!frames_fit(&frames, 99));
+        assert!(frames_fit(&[], 0));
     }
 
     #[test]

@@ -1610,6 +1610,7 @@ unsafe fn publish_buffer_aware(
                 &accelerated,
                 &cpu_group,
                 now,
+                publisher.max_slice_len().get() as usize,
                 &mut mint,
                 &mut |frame| {
                     publisher
@@ -1627,9 +1628,14 @@ unsafe fn publish_buffer_aware(
                     }
                     Some(RMW_RET_OK)
                 }
-                // No non-CPU Buffer in this message, or a subscriber came or
-                // went while the frames were built: the native frame.
-                Ok(AddressedOutcome::NoDeviceBuffer | AddressedOutcome::PortsChanged) => {
+                // No non-CPU Buffer in this message, a subscriber came or
+                // went while the frames were built, or an addressed frame
+                // would not fit the topic's slice: the native frame.
+                Ok(
+                    AddressedOutcome::NoDeviceBuffer
+                    | AddressedOutcome::PortsChanged
+                    | AddressedOutcome::TooLarge,
+                ) => {
                     crate::buffer_backends::note_native_frame();
                     None
                 }
