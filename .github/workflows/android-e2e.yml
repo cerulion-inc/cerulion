@@ -38,6 +38,7 @@ on:
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   pull_request:
@@ -71,6 +72,7 @@ on:
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   # A `merge_group` run is treated like a `pull_request` run. The queue's
