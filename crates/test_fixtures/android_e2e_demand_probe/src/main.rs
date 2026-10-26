@@ -4,24 +4,29 @@
 //! `cerulion topic echo` reads a robot's catalog before it demands data, so a
 //! paired app that refuses its catalog never receives a data demand from it.
 //! This probe skips the catalog: it boots an ingress-only gateway for ONE topic
-//! with a known schema (`std_msgs/String`), connected to ONE endpoint with
+//! with the schema it is told to expect, connected to ONE endpoint with
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
 //! bounded window. It reports the frames that reached its ingress from the
-//! network (`wire_frames`, whether re-injected or dropped by validation) and the
-//! frames its local subscriber received (`frames`). The probe's own LAN access is
-//! set to open, so its ingress never drops a frame on its own posture.
+//! network (`wire_frames`, whether re-injected or dropped by validation), the
+//! ones dropped because their schema hash was not the expected one
+//! (`schema_mismatch_drops`), and the frames its local subscriber received
+//! (`frames`). The probe's own LAN access is set to open, so its ingress never
+//! drops a frame on its own posture.
 //!
-//! Usage: `android-e2e-demand-probe <connect-endpoint> <topic> <window-secs>`
+//! Usage: `android-e2e-demand-probe <connect-endpoint> <topic> <schema> <window-secs>`
 //!
-//! It prints ONE fact line and exits 0 when the window completed:
+//! `<schema>` is `std_msgs/String` or `std_msgs/Int32`. It prints ONE fact line
+//! and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 wire_frames=0 frames=0
+//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 schema_mismatch_drops=0 wire_frames=0 frames=0
 //! ```
 //!
-//! The verdict is the caller's: a paired robot must answer with refused acks
-//! only and send no frame; an open one grants and delivers. Setup failures
-//! return an error (exit code 1).
+//! The verdict is the caller's (`tools/scripts/android_e2e_probe_verdict.sh`):
+//! a paired robot must answer with refused acks only and send no frame; an
+//! open one grants and delivers, and drops every frame when the expected
+//! schema is not the topic's. A bad argument or a setup failure returns an
+//! error (exit code 1) and prints no fact line.
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -33,30 +38,49 @@ use cerulion_core::transport::gateway::{
 };
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{TransportConfig, TransportManager};
-use native_ros2_messages::std_msgs::String as RosString;
+use native_ros2_messages::std_msgs::{Int32, String as RosString};
 
 /// The identity this probe announces. It never serves anything.
 const PROBE_IDENTITY: &str = "android-e2e-demand-probe";
 /// How often the probe drains its subscriber during the window.
 const POLL: Duration = Duration::from_millis(50);
 
-/// The probe's three positional arguments.
+/// The schemas the probe can expect, by name. The e2e demands the heartbeat
+/// (`std_msgs/String`) under its own schema and under `std_msgs/Int32`, which it
+/// does not carry.
+const SCHEMAS: &[(&str, u64)] = &[
+    ("std_msgs/String", RosString::SCHEMA_HASH),
+    ("std_msgs/Int32", Int32::SCHEMA_HASH),
+];
+
+/// The probe's four positional arguments.
 struct Args {
     endpoint: String,
     topic: String,
+    schema: &'static str,
+    schema_hash: u64,
     window: Duration,
 }
 
 fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
-    let usage = "usage: android-e2e-demand-probe <connect-endpoint> <topic> <window-secs>";
-    let (Some(endpoint), Some(topic), Some(window), None) =
-        (argv.next(), argv.next(), argv.next(), argv.next())
-    else {
+    let usage = "usage: android-e2e-demand-probe <connect-endpoint> <topic> <schema> <window-secs>";
+    let (Some(endpoint), Some(topic), Some(schema), Some(window), None) = (
+        argv.next(),
+        argv.next(),
+        argv.next(),
+        argv.next(),
+        argv.next(),
+    ) else {
         return Err(usage.to_string());
     };
     if !topic.starts_with('/') {
         return Err(format!("topic '{topic}' is not canonical (no leading '/')"));
     }
+    let Some(&(schema, schema_hash)) = SCHEMAS.iter().find(|(name, _)| *name == schema) else {
+        return Err(format!(
+            "schema '{schema}' is not one this probe knows (std_msgs/String, std_msgs/Int32)"
+        ));
+    };
     let secs: u64 = window
         .parse()
         .map_err(|_| format!("window '{window}' is not a whole number of seconds"))?;
@@ -66,6 +90,8 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(Args {
         endpoint,
         topic,
+        schema,
+        schema_hash,
         window: Duration::from_secs(secs),
     })
 }
@@ -93,7 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         announce: vec![],
         ingress: vec![GatewayIngressEntry {
             topic: args.topic.clone(),
-            schema_hash: RosString::SCHEMA_HASH,
+            schema_hash: args.schema_hash,
         }],
     };
     let gateway = GatewayRuntime::new(manager, plan)?;
@@ -119,14 +145,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         + ingress.lan_refused_drops;
 
     println!(
-        "demand_probe topic={} window_s={} passes={} enabled_acks={} refused_acks={} \
-         wire_header_refused_acks={} wire_frames={wire_frames} frames={frames}",
+        "demand_probe topic={} schema={} window_s={} passes={} enabled_acks={} refused_acks={} \
+         wire_header_refused_acks={} schema_mismatch_drops={} wire_frames={wire_frames} \
+         frames={frames}",
         args.topic,
+        args.schema,
         args.window.as_secs(),
         gateway.demand_get_pass_count(),
         gateway.demand_enabled_ack_count(),
         gateway.demand_refused_ack_count(),
         gateway.demand_wire_header_refused_ack_count(),
+        ingress.schema_mismatch_drops,
     );
     Ok(())
 }
