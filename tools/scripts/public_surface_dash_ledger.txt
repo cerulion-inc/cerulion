@@ -85,7 +85,6 @@
 7 crates/cerulion_cli_engine/src/run_sweep.rs
 48 crates/cerulion_cli_engine/src/schema_cmd.rs
 16 crates/cerulion_cli_engine/src/schema_serve.rs
-9 crates/cerulion_cli_engine/src/schema_store.rs
 30 crates/cerulion_cli_engine/src/shm_state.rs
 15 crates/cerulion_cli_engine/src/state_arm_attach.rs
 6 crates/cerulion_cli_engine/src/subnet_sweep.rs

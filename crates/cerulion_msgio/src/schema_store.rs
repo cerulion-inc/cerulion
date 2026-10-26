@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The workspace `.msg` schema store — the ament-mirror
+//! The workspace `.msg` schema store: the ament-mirror
 //! `schemas/<pkg>/msg/<Type>.msg` folder.
 //!
 //! Every `.msg` file under `schemas/<pkg>/msg/` is parsed to a
 //! [`MessageSchema`] via the SAME [`parse_rosmsg`] the built-in registry and
-//! codegen use — the package name comes FROM THE PATH (`.msg` text carries no
+//! codegen use: the package name comes FROM THE PATH (`.msg` text carries no
 //! package), so `schemas/sensor_msgs/msg/Imu.msg` parses as `sensor_msgs/Imu`.
 //! The nested `<pkg>/msg/` layout is deliberate:
 //!
@@ -12,13 +12,13 @@
 //!   `share/<pkg>/msg/*.msg` byte-copy lands verbatim (the harvest
 //!   materializes here), and
 //! - it can never collide with the flat `schemas/*.yaml` files the YAML
-//!   reader handles — the store lives in per-package SUBDIRECTORIES, the YAML
+//!   reader handles: the store lives in per-package SUBDIRECTORIES, the YAML
 //!   schemas are FILES directly under `schemas/`.
 //!
 //! Robustness contract (mirrors `schema_cmd::workspace_yaml_files`): a
 //! missing `schemas/` dir is quiet, an unreadable dir/entry is a loud
-//! `warn!` + skip, and a `.msg` that fails to PARSE is a loud `warn!` + skip
-//! — never a silent skip, and never a hard abort (one bad file must not sink
+//! `warn!` + skip, and a `.msg` that fails to PARSE is a loud `warn!` + skip:
+//! never a silent skip, and never a hard abort (one bad file must not sink
 //! the rest). Enumeration is sorted so the store is byte-deterministic
 //! (Principle #7).
 //!
@@ -43,7 +43,7 @@ pub struct StoredSchema {
     /// [`MessageSchema::qualified_name`] is `pkg/Type`.
     pub schema: MessageSchema,
     /// Store-relative provenance path `pkg/msg/Type.msg` (forward slashes,
-    /// deterministic) — what listings and reports display.
+    /// deterministic): what listings and reports display.
     pub relative_path: String,
 }
 
@@ -52,13 +52,13 @@ pub struct StoredSchema {
 #[derive(Debug, Default)]
 pub struct SchemaStore {
     /// Keyed by qualified name `pkg/Type`. A `BTreeMap` keeps enumeration
-    /// sorted (and package-grouped — `pkg/` prefixes sort together), which
+    /// sorted (and package-grouped: `pkg/` prefixes sort together), which
     /// every listing consumer relies on for determinism.
     by_name: BTreeMap<String, StoredSchema>,
 }
 
 impl SchemaStore {
-    /// The empty store — the builtins-only baseline (no `.msg` files).
+    /// The empty store: the builtins-only baseline (no `.msg` files).
     pub fn empty() -> Self {
         Self::default()
     }
@@ -78,7 +78,7 @@ impl SchemaStore {
                     // A non-UTF-8 stem cannot be a valid ROS type name.
                     tracing::warn!(
                         file = %msg_path.display(),
-                        "schema store: .msg file has a non-UTF-8 name — skipped"
+                        "schema store: .msg file has a non-UTF-8 name: skipped"
                     );
                     continue;
                 };
@@ -88,7 +88,7 @@ impl SchemaStore {
                         tracing::warn!(
                             file = %msg_path.display(),
                             error = %e,
-                            "schema store: could not read .msg file — skipped (the rest still load)"
+                            "schema store: could not read .msg file: skipped (the rest still load)"
                         );
                         continue;
                     }
@@ -99,7 +99,7 @@ impl SchemaStore {
                         let relative_path = format!("{pkg}/msg/{stem}.msg");
                         // Distinct paths cannot collide on a case-sensitive
                         // FS, so a duplicate key means a case-fold clash on
-                        // macOS/Windows — later (sorted) file wins, loudly.
+                        // macOS/Windows: later (sorted) file wins, loudly.
                         if let Some(prev) = by_name.insert(
                             qualified.clone(),
                             StoredSchema {
@@ -111,7 +111,7 @@ impl SchemaStore {
                                 schema = %qualified,
                                 kept = %relative_path,
                                 dropped = %prev.relative_path,
-                                "schema store: two files map to one qualified name — later file wins"
+                                "schema store: two files map to one qualified name: later file wins"
                             );
                         }
                     }
@@ -121,7 +121,7 @@ impl SchemaStore {
                             package = %pkg,
                             schema = %stem,
                             error = ?e,
-                            "schema store: failed to parse .msg — skipped (the rest still load)"
+                            "schema store: failed to parse .msg: skipped (the rest still load)"
                         );
                     }
                 }
@@ -141,7 +141,7 @@ impl SchemaStore {
     }
 
     /// Every store entry whose BARE type name (the part after `/`) equals
-    /// `bare` — one per package that defines it, in sorted qualified-name
+    /// `bare`: one per package that defines it, in sorted qualified-name
     /// order. Callers resolve a unique match and treat >1 as ambiguous
     /// (the loud-ambiguity house rule).
     pub fn matches_bare_name(&self, bare: &str) -> Vec<&StoredSchema> {
@@ -162,11 +162,11 @@ impl SchemaStore {
         self.by_name.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Clone every store schema's IR in sorted qualified-name order — the
+    /// Clone every store schema's IR in sorted qualified-name order: the
     /// ONE enumeration seam for consumers that fold the store into a
     /// combined schema set (the graph-run hash-divergence map, the recorded
     /// wire-size map, the replay field registry). Those folds must not
-    /// hand-roll their own `schemas/<pkg>/msg/` walks — the store reader is
+    /// hand-roll their own `schemas/<pkg>/msg/` walks: the store reader is
     /// this module (see the module doc's robustness contract).
     pub fn schemas(&self) -> Vec<MessageSchema> {
         self.by_name.values().map(|s| s.schema.clone()).collect()
@@ -241,7 +241,7 @@ pub fn builtin_has_qualified(qualified: &str) -> bool {
 /// Enumerate `(package_name, <schemas_dir>/<pkg>/msg)` for every package
 /// subdir that carries a `msg/` directory, in sorted package order.
 ///
-/// A missing `schemas_dir` is quiet (`debug!` — legitimately absent, e.g. a
+/// A missing `schemas_dir` is quiet (`debug!`: legitimately absent, e.g. a
 /// pre-store workspace); an unreadable dir or dir-entry is a loud `warn!` +
 /// skip. Non-directory entries (the flat `schemas/*.yaml` files) and package
 /// dirs with no `msg/` subdir are filtered, not skips.
@@ -256,7 +256,7 @@ fn package_msg_dirs(schemas_dir: &Path) -> Vec<(String, PathBuf)> {
             tracing::warn!(
                 dir = %schemas_dir.display(),
                 error = %e,
-                "schema store: schemas/ present but unreadable — skipping the .msg store"
+                "schema store: schemas/ present but unreadable: skipping the .msg store"
             );
             return Vec::new();
         }
@@ -269,7 +269,7 @@ fn package_msg_dirs(schemas_dir: &Path) -> Vec<(String, PathBuf)> {
                 tracing::warn!(
                     dir = %schemas_dir.display(),
                     error = %e,
-                    "schema store: unreadable directory entry — skipped"
+                    "schema store: unreadable directory entry: skipped"
                 );
                 continue;
             }
@@ -285,7 +285,7 @@ fn package_msg_dirs(schemas_dir: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         let Some(pkg) = path.file_name().and_then(|n| n.to_str()) else {
-            tracing::warn!(dir = %path.display(), "schema store: non-UTF-8 package directory name — skipped");
+            tracing::warn!(dir = %path.display(), "schema store: non-UTF-8 package directory name: skipped");
             continue;
         };
         dirs.push((pkg.to_string(), msg_dir));
@@ -304,7 +304,7 @@ fn msg_files(msg_dir: &Path) -> Vec<PathBuf> {
             tracing::warn!(
                 dir = %msg_dir.display(),
                 error = %e,
-                "schema store: msg/ directory unreadable — skipped"
+                "schema store: msg/ directory unreadable: skipped"
             );
             return Vec::new();
         }
@@ -317,7 +317,7 @@ fn msg_files(msg_dir: &Path) -> Vec<PathBuf> {
                 tracing::warn!(
                     dir = %msg_dir.display(),
                     error = %e,
-                    "schema store: unreadable msg/ entry — skipped"
+                    "schema store: unreadable msg/ entry: skipped"
                 );
                 continue;
             }

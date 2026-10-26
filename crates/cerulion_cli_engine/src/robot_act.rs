@@ -176,18 +176,22 @@ pub fn robot_service_call(
         "timeout_s": req.timeout.as_secs_f64(),
     });
     let result = call_robot_verb(robot, "service-call", &args, req.timeout)?;
-    let text = result_str(&result, "response_text")?;
-    // One line of JSON (which escapes every control character) within the
-    // size bound is printed as the robot sent it.
+    response_line(result_str(&result, "response_text")?).map(str::to_string)
+}
+
+/// `text` when it is JSON within the size bound with no raw control
+/// character (a terminal acts on DEL, C1 and carriage return), the shape
+/// the local verb prints. PURE.
+pub fn response_line(text: &str) -> Result<&str, VerbError> {
     if text.len() > MAX_ROBOT_TEXT
-        || text.contains('\n')
+        || text.chars().any(char::is_control)
         || serde_json::from_str::<Value>(text).is_err()
     {
         return Err(VerbError::Internal(
             "the robot's response text is not one line of JSON".to_string(),
         ));
     }
-    Ok(text.to_string())
+    Ok(text)
 }
 
 /// `topic snapshot --robot`: take the snapshot on the robot, write the JPEG
@@ -287,6 +291,20 @@ mod tests {
         let e = outcome(Some(2), b"", &error_line(stderr), "arm").unwrap_err();
         assert_eq!(e.exit_code(), EXIT_UNAVAILABLE);
         assert_eq!(error_line("  plain text \n"), "plain text");
+    }
+
+    #[test]
+    fn a_response_line_with_a_raw_control_character_is_refused() {
+        assert_eq!(response_line(r#"{"ok":true}"#).unwrap(), r#"{"ok":true}"#);
+        for bad in [
+            "{\"a\":\"\u{7f}\"}",
+            "{\"a\":\"\u{9b}2J\"}",
+            "{\"ok\":true}\r",
+            "{\"ok\":\ntrue}",
+            "not json",
+        ] {
+            assert!(response_line(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

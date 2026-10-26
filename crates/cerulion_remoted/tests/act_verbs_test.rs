@@ -267,3 +267,30 @@ fn service_call_with_no_server_is_unavailable() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
+    store();
+    let l = lease();
+    let engager = {
+        let l = l.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            l.lock().unwrap().engage_estop("test");
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = TopicPublishVerb::new(l)
+        .execute(&json!({"topic": "/c1_act/publish/estop", "type": "std_msgs/String",
+                         "message": {"data": "x"}, "wait_subscribers_s": 10}))
+        .unwrap_err();
+    engager.join().unwrap();
+    match err {
+        CerudError::Verb(m) => assert!(
+            m.starts_with("unavailable: ") && m.contains("e-stop engaged after 0 of 1"),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "the wait ended at the e-stop");
+}

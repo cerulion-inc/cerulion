@@ -17,8 +17,8 @@
 //! are [`cerulion_msgio`]'s, the same ones `cerulion topic pub`,
 //! `service call` and `topic snapshot` run on a desk.
 //!
-//! `topic-publish` and `service-call` are refused while the robot's e-stop
-//! is engaged, and a publish stops before its next frame when the e-stop
+//! `topic-publish` and `service-call` check only the e-stop, not the control
+//! lease: they are refused while the robot's e-stop is engaged, and a publish stops before its next frame when the e-stop
 //! engages; a topic under the reserved `/__cerulion` namespace is refused.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the
@@ -140,6 +140,15 @@ fn running() -> AtomicBool {
     AtomicBool::new(true)
 }
 
+/// Sets its flag when dropped, panics included.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Refuse when the robot's e-stop is engaged.
 fn refuse_under_estop(lease: &Mutex<ControlLease>, verb: &str) -> CerudResult<()> {
     let engaged = match lease.lock() {
@@ -249,7 +258,7 @@ impl VerbHandler for TopicPublishVerb {
             wait_subscribers: wait,
         };
         // The publish loop polls this flag between frames; a watcher thread
-        // clears it when the e-stop engages.
+        // clears it when the e-stop engages, and stops when `_stop` drops.
         let running = Arc::new(AtomicBool::new(true));
         let done = Arc::new(AtomicBool::new(false));
         let watcher = {
@@ -264,16 +273,18 @@ impl VerbHandler for TopicPublishVerb {
                 }
             })
         };
-        let report = publish::publish_message(&req, &walker, &name, &running, |_| ());
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let report = {
+            let _stop = SetOnDrop(&done);
+            publish::publish_message(&req, &walker, &name, &running, |_| ())
+        };
         let _ = watcher.join();
-        let report = report.map_err(verb_error)?;
         if !running.load(std::sync::atomic::Ordering::Relaxed) {
+            let sent = report.as_ref().map_or(0, |r| r.frames);
             return Err(verb_error(VerbError::Unavailable(format!(
-                "the robot's e-stop engaged after {} of {times} frames",
-                report.frames
+                "the robot's e-stop engaged after {sent} of {times} frames"
             ))));
         }
+        let report = report.map_err(verb_error)?;
         Ok(json!({
             "topic": report.topic,
             "type": report.type_name,
