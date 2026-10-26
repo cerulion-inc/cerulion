@@ -2456,7 +2456,9 @@ mod owner_certificate_state_tests {
         store
             .apply_epoch(&epoch(1, vec![key(9)], 10), &cloud.intermediate, 10)
             .unwrap();
-        assert!(store.is_allowed(&OWNER, &key(9), 10).is_none());
+        // Device revocation is its own check; the row itself is still live.
+        assert!(store.is_device_revoked(&key(9)));
+        assert!(store.is_allowed(&OWNER, &key(9), 10).is_some());
         // Past the certificate's not_after, epoch 2 prunes the device from the
         // revoked set; the lapsed row still refuses it.
         store
