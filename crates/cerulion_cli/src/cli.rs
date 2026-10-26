@@ -1682,13 +1682,14 @@ pub enum GraphAction {
     /// Show the processes a free run of a graph starts and the executor units
     /// inside each (read-only).
     ///
-    /// Inside one process, nodes run in executor units. A unit is a linear
-    /// chain of trigger edges on one thread; units run independently, so a
-    /// slow unit never holds another unit's fire. A new unit starts at a
-    /// source, a fan-out, a fan-in, a node with `isolate: true`, and a node
-    /// whose profiled tick is long against its period or a downstream
-    /// deadline (from `graphs/<NAME>.costs.yaml`, when present). Every unit is
-    /// printed with its nodes and the reason it starts.
+    /// Inside one process, nodes run in executor units, each on its own
+    /// thread, so a slow unit never holds another unit's fire. Without a
+    /// profile every data-triggered node is a unit of its own. A linear chain
+    /// of trigger edges merges into one unit only where the graph's profile
+    /// (`graphs/<NAME>.costs.yaml`) shows the unit's ticks stay under a
+    /// quarter of its period and of its nodes' `tick_within_ms`;
+    /// `isolate: true` and `isolate: false` override. Every unit is printed
+    /// with its nodes and the reason it starts.
     Plan {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]

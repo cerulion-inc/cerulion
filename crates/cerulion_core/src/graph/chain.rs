@@ -513,17 +513,6 @@ impl ChainCensus {
     }
 }
 
-/// Decide which of the graph's consumer edges could run as fused chains.
-///
-/// Pure: it reads the graph's declarations and returns a verdict for every
-/// consumer edge plus the chains those verdicts assemble into. It opens no
-/// transport, reads no clock and changes no execution path.
-///
-/// `entry_infos` carries each node's macro-declared policy, per-input trigger
-/// marks, backpressure and rate cap, and is the same map
-/// [`GraphTopology::build`] and
-/// [`build_trigger_edges`](crate::graph::build_trigger_edges) are given.
-/// `levels` must be the levelization the run will execute.
 // ==========================================================================
 // The shared link predicates.
 // ==========================================================================
@@ -669,6 +658,17 @@ pub fn linear_chains(links: &[ConsumerEdgeVerdict]) -> Vec<Vec<String>> {
     chains
 }
 
+/// Decide which of the graph's consumer edges could run as fused chains.
+///
+/// Pure: it reads the graph's declarations and returns a verdict for every
+/// consumer edge plus the chains those verdicts assemble into. It opens no
+/// transport, reads no clock and changes no execution path.
+///
+/// `entry_infos` carries each node's macro-declared policy, per-input trigger
+/// marks, backpressure and rate cap, and is the same map
+/// [`GraphTopology::build`] and
+/// [`build_trigger_edges`](crate::graph::build_trigger_edges) are given.
+/// `levels` must be the levelization the run will execute.
 pub fn census_chains(
     config: &GraphConfig,
     entry_infos: &IndexMap<String, NodeInfo>,

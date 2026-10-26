@@ -62,7 +62,7 @@ pub use config::{
     GraphConfig, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef, UNNAMED_GRAPH,
 };
 pub use executor::{
-    derive_units, expand_process_groups, Boundary, BudgetAgainst, BudgetVerdict, Coupling,
+    derive_units, expand_process_groups, expand_process_groups_keyed, Boundary, BudgetAgainst, BudgetVerdict, Coupling,
     ExecutorUnit, UnitGraph, UnitPlan, UnitProfile, BUDGET_DIVISOR,
 };
 pub use launch_args::{
@@ -238,11 +238,6 @@ pub fn adopt_file_stem_identity(config: &mut GraphConfig, stem: &str) {
     config.identity = stem.to_string();
 }
 
-/// Walk the raw YAML text looking for a `policy:` line indented as
-/// a node-level field (matches the `crates/cerulion_core/fixtures/test_graph.yaml`
-/// indentation). Emits a `tracing::warn!` for each occurrence so a graph
-/// written against the old format is told WHERE its trigger policy went — the
-/// parse that follows then refuses the file (`deny_unknown_fields`).
 /// Refuse a node entry that carries the retired `fuse:` key, naming the node
 /// and the key that replaces it.
 ///
@@ -280,6 +275,11 @@ fn refuse_retired_fuse_key(yaml: &str) -> TransportResult<()> {
     Ok(())
 }
 
+/// Walk the raw YAML text looking for a `policy:` line indented as
+/// a node-level field (matches the `crates/cerulion_core/fixtures/test_graph.yaml`
+/// indentation). Emits a `tracing::warn!` for each occurrence so a graph
+/// written against the old format is told WHERE its trigger policy went — the
+/// parse that follows then refuses the file (`deny_unknown_fields`).
 fn warn_on_legacy_policy_block(yaml: &str) {
     for (lineno, raw_line) in yaml.lines().enumerate() {
         let line = raw_line.trim_end();

@@ -2374,10 +2374,19 @@ fn gen_cdylib(
                     drop(guard);
                     // The instance lock waits out a call still running on it;
                     // taking the entry out leaves `None` for any later caller.
-                    let taken = removed.and_then(|instance| match instance.lock() {
-                        Ok(mut slot) => slot.take(),
-                        Err(poisoned) => poisoned.into_inner().take(),
-                    });
+                    // A poisoned instance (a tick that panicked under its lock)
+                    // is refused with code 3, so no node code runs on state a
+                    // panic may have left half-written.
+                    let taken = match removed.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(mut slot)) => slot.take(),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_shutdown: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
                     let mut node = match taken {
                         Some(n) => n,
                         None => {

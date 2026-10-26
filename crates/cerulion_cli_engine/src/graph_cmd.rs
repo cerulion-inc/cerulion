@@ -6225,7 +6225,14 @@ pub fn graph_run(
     // chain never leaves a unit.
     #[cfg(unix)]
     let unit_groups: Option<indexmap::IndexMap<String, Vec<String>>> = executes_process_groups
-        .then(|| run_unit_groups(workspace_root, &config, execution_mode))
+        .then(|| {
+            run_unit_groups(
+                workspace_root,
+                &config,
+                execution_mode,
+                time_source == TimeSource::Real,
+            )
+        })
         .flatten();
     #[cfg(unix)]
     let _run_descriptor = {
@@ -7151,6 +7158,15 @@ pub fn graph_run_worker_host(
         units = plan_paths.len(),
         "worker process hosts several executor units, one thread each"
     );
+    /// Clears `running` when its unit's thread leaves `graph_run_worker`, by
+    /// return or by unwind, so a panicking unit stops its siblings and the
+    /// process exits instead of running on without it.
+    struct StopSiblingsOnExit(Arc<AtomicBool>);
+    impl Drop for StopSiblingsOnExit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
     let outcomes: Vec<CliResult<()>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(plan_paths.len());
         for (i, path) in plan_paths.iter().enumerate() {
@@ -7158,33 +7174,31 @@ pub fn graph_run_worker_host(
             let spawned = std::thread::Builder::new()
                 .name(format!("cerulion-unit-{i}"))
                 .spawn_scoped(scope, move || {
-                    let outcome = graph_run_worker(workspace_root, path, Arc::clone(&unit_running));
-                    unit_running.store(false, Ordering::Relaxed);
-                    outcome
+                    let _stop = StopSiblingsOnExit(Arc::clone(&unit_running));
+                    graph_run_worker(workspace_root, path, unit_running)
                 });
             match spawned {
-                Ok(handle) => handles.push(handle),
+                Ok(handle) => handles.push(Ok(handle)),
                 Err(e) => {
                     running.store(false, Ordering::Relaxed);
-                    handles.push(scope.spawn(move || {
-                        Err(CliError::Validation(format!(
-                            "graph run-worker: cannot start the thread for plan `{}`: {e}",
-                            path.display()
-                        )))
-                    }));
+                    handles.push(Err(CliError::Validation(format!(
+                        "graph run-worker: cannot start the thread for plan `{}`: {e}",
+                        path.display()
+                    ))));
                 }
             }
         }
         handles
             .into_iter()
             .zip(plan_paths)
-            .map(|(handle, path)| {
-                handle.join().unwrap_or_else(|_| {
+            .map(|(handle, path)| match handle {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
                     Err(CliError::Validation(format!(
                         "graph run-worker: the executor thread for plan `{}` panicked",
                         path.display()
                     )))
-                })
+                }),
+                Err(refused) => Err(refused),
             })
             .collect()
     });
@@ -10598,7 +10612,6 @@ fn supervisor_precreate_error(
 // compiler wouldn't reject), mirroring the runtime build-fn family's documented
 // suppression rationale: bundling buys no swap-safety here. (`cpu_dma_lock` is the
 // 9th.)
-#[allow(clippy::too_many_arguments)]
 /// For `--single-process`: put every native node in one process group when
 /// that process splits into more than one executor unit, and say so. Returns
 /// whether it did. A non-real time source, the lockstep execution mode, a
@@ -10626,25 +10639,40 @@ fn single_process_hosts_units(
     .into_iter()
     .collect();
     one.process_group_order = Vec::new();
-    let entry_infos = source_entry_infos(
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = source_entry_infos(
         &workspace_root.join("nodes"),
         &one,
         "--single-process splits the process into executor units by each node's declared \
          trigger policy",
-    )?;
-    let profile = load_unit_profile(workspace_root, config.identity());
-    let units = crate::multiprocess::plan_executor_units(
-        &one,
-        &entry_infos,
-        crate::multiprocess::ExecutionMode::FreeRun,
-        profile
-            .as_ref()
-            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
-                costs,
-                label: label.as_str(),
-            }),
     )
-    .map_err(CliError::from)?;
+    .and_then(|entry_infos| {
+        crate::multiprocess::plan_executor_units(
+            &one,
+            &entry_infos,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+            profile
+                .as_ref()
+                .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                    costs,
+                    label: label.as_str(),
+                }),
+        )
+        .map_err(CliError::from)
+    });
+    let units = match units {
+        Ok(units) => units,
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "--single-process: the executor units could not be derived from the nodes' \
+                 source, so the process runs every node on one level loop"
+            );
+            return Ok(false);
+        }
+    };
     if !units.plan.splits_any() {
         return Ok(false);
     }
@@ -10664,6 +10692,7 @@ fn run_unit_groups(
     workspace_root: &Path,
     config: &GraphConfig,
     execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
 ) -> Option<indexmap::IndexMap<String, Vec<String>>> {
     let entry_infos = source_entry_infos(
         &workspace_root.join("nodes"),
@@ -10676,6 +10705,7 @@ fn run_unit_groups(
         config,
         &entry_infos,
         execution_mode,
+        real_clock,
         profile
             .as_ref()
             .map(|(costs, label)| cerulion_core::graph::UnitProfile {
@@ -10726,12 +10756,14 @@ fn plan_supervisor_units(
     config: &GraphConfig,
     loaded_entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
     execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
 ) -> CliResult<crate::multiprocess::DeploymentUnits> {
     let profile = load_unit_profile(workspace_root, config.identity());
     let units = crate::multiprocess::plan_executor_units(
         config,
         loaded_entry_infos,
         execution_mode,
+        real_clock,
         profile
             .as_ref()
             .map(|(costs, label)| cerulion_core::graph::UnitProfile {
@@ -10769,6 +10801,7 @@ fn plan_supervisor_units(
     Ok(units)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn graph_run_supervisor(
     workspace_root: &Path,
     graphs_dir: &Path,
@@ -13376,6 +13409,7 @@ pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> 
         &config,
         &entry_infos,
         crate::multiprocess::ExecutionMode::FreeRun,
+        true,
         profile
             .as_ref()
             .map(|(costs, label)| cerulion_core::graph::UnitProfile {

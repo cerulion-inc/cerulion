@@ -2538,8 +2538,8 @@ when that output arrives, and never holds another unit's fire.
 
 A node may join its producer's unit only across a **chain link**: the producer's frame is a trigger
 edge, the topic has one in-graph producer and one consumer, the producer feeds no other link, and the
-consumer fires on that frame alone (a data trigger with one trigger edge). These are the same rules the
-fused-chain census and the partitioner use. A link joins the two units only when the graph's profile
+consumer fires on that frame alone (a data trigger with one trigger edge). The fused-chain census and
+the partitioner start from these same link rules; the census then adds its own fusion rules. A link joins the two units only when the graph's profile
 (`graphs/<NAME>.costs.yaml`, written by `cerulion graph profile`) shows it is safe: the unit's summed
 p50 tick, the new node included, stays under a quarter of the period the unit is fed at, and under a
 quarter of the new node's `tick_within_ms`. **Without a profile nothing merges**: every data-triggered
@@ -2557,7 +2557,7 @@ Each unit `cerulion graph plan <NAME>` prints names why its first node starts it
 | tick budget | the profile shows the merged unit would tick for a quarter of its period or more, or of the node's `tick_within_ms` |
 
 Latest-value inputs never join units. Every producer and consumer of a topic with a `block` consumer
-stay in one unit. Units are decided when the graph loads and never move during a run. The cost-aware
+stay in one unit, a node declaring `isolate: true` included. Units are decided when the graph loads and never move during a run. The cost-aware
 partitioner keeps every linear chain in one process group, so a chain's units share one process.
 
 **Overrides: `isolate:`.** `isolate: true` gives a node a unit of its own. `isolate: false` keeps it

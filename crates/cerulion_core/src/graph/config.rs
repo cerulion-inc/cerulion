@@ -732,13 +732,14 @@ pub struct NodeDef {
     /// OPTIONAL per-node executor override, read when a process hosts more
     /// than one node.
     ///
-    /// Inside a process, nodes run in executor units: a linear chain of
-    /// trigger edges shares one thread and one level loop, and a new unit
-    /// starts at a source, a fan-out, a fan-in, and a node the profile shows
-    /// ticking long against its period. `isolate: true` gives this node a unit
-    /// of its own, so its ticks never hold another node's fire. `isolate:
-    /// false` keeps it in the unit of the nodes that trigger it whatever the
-    /// automatic rules say. Absent leaves the choice to those rules.
+    /// Inside a process, nodes run in executor units, each on its own thread.
+    /// Without a profile every data-triggered node is a unit of its own; a
+    /// linear chain of trigger edges shares one unit only where the graph's
+    /// profile shows the merge stays within its tick budget. `isolate: true`
+    /// gives this node a unit of its own (a `block` flow still keeps its
+    /// producer and consumers together). `isolate: false` keeps it in the unit
+    /// of the nodes that trigger it whatever the automatic rules say. Absent
+    /// leaves the choice to those rules.
     /// `cerulion graph plan` shows the units and why each one starts.
     ///
     /// This key replaces `fuse: false`, which is refused at load.

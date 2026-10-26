@@ -35,8 +35,11 @@
 //! * `a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes`:
 //!   the fan-out and three-rank fixtures recorded with every node in one
 //!   process group, re-executed with `bag play --resim all`, and judged with the
-//!   read-identity oracle; each stream's verdict must equal the verdict of the
-//!   same fixture recorded process per node, whose bag has the same rank shape.
+//!   read-identity oracle. Every stream's first live read must be its writer's
+//!   first frame, and every stream that evicted nothing live must judge the
+//!   same as the same fixture recorded process per node, whose bag has the same
+//!   rank shape (an evicting stream is printed, not compared: a replay through
+//!   a real queue reproduces no eviction under any placement).
 //!
 //! Each timing leg prints one line:
 //!
@@ -386,7 +389,10 @@ fn the_unprofiled_merge_mutant_is_caught() {
 }
 
 /// Record `fixture` under `placement`, resim it, judge and print.
-fn record_and_judge(fixture: Fixture, placement: Placement) -> read_identity::Verdict {
+fn record_and_judge(
+    fixture: Fixture,
+    placement: Placement,
+) -> (read_identity::RecordedRun, read_identity::Verdict) {
     let run = read_identity::record_live(fixture, placement);
     let replayed = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
     let outcome = judge_replayed(fixture, &run.live, &replayed, Floors::default())
@@ -395,10 +401,27 @@ fn record_and_judge(fixture: Fixture, placement: Placement) -> read_identity::Ve
         fixture.name(),
         &format!("{}/{}", placement.label(), ReplayMode::ResimNeutral.label()),
     );
-    outcome
+    let verdict = outcome
         .verdict()
         .cloned()
-        .unwrap_or_else(|| panic!("RI_HARNESS: {}: the neutral resim refused", fixture.name()))
+        .unwrap_or_else(|| panic!("RI_HARNESS: {}: the neutral resim refused", fixture.name()));
+    (run, verdict)
+}
+
+/// Live reads that skip frames of their writer: a read whose sequence is not
+/// the previous read's plus one from the same writer. A skip is an eviction,
+/// which a replay that feeds a real queue does not reproduce whatever the
+/// placement.
+fn sequence_gaps(run: &read_identity::RecordedRun, node: &str, input: &str) -> usize {
+    run.live
+        .streams
+        .get(&(node.to_string(), input.to_string()))
+        .map_or(0, |reads| {
+            reads
+                .windows(2)
+                .filter(|w| w[0].writer == w[1].writer && w[1].seq != w[0].seq + 1)
+                .count()
+        })
 }
 
 fn kind(v: &RowVerdict) -> &'static str {
@@ -414,15 +437,41 @@ fn kind(v: &RowVerdict) -> &'static str {
 #[ignore = "box-only: real runs on a quiet Linux host"]
 #[serial]
 fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
+    let mut compared = 0usize;
     for fixture in [Fixture::FanOut, Fixture::Ranks3] {
-        let units = record_and_judge(fixture, Placement::OneGroup);
-        let processes = record_and_judge(fixture, Placement::Declared);
+        let (run, units) = record_and_judge(fixture, Placement::OneGroup);
+        let (_, processes) = record_and_judge(fixture, Placement::Declared);
         assert!(
             !units.rows.is_empty(),
             "RI_HARNESS: {} judged no stream",
             fixture.name()
         );
         for row in &units.rows {
+            // Every unit had its ports built before any unit's first step: a
+            // consumer's first live read is its writer's first frame.
+            let reads = &run.live.streams[&(row.node.clone(), row.input.clone())];
+            assert_eq!(
+                reads.first().map(|r| r.seq),
+                Some(1),
+                "{}: {}.{}'s first live read is not its writer's first frame: a unit of the \
+                 host started before its consumer's ports existed",
+                fixture.name(),
+                row.node,
+                row.input
+            );
+            let gaps = sequence_gaps(&run, &row.node, &row.input);
+            if gaps > 0 {
+                eprintln!(
+                    "UNITS_REPLAY fixture={} node={} input={} live_gaps={gaps} verdict={} \
+                     (an evicting stream: replay through a real queue does not reproduce it \
+                     under any placement, so it is not compared here)",
+                    fixture.name(),
+                    row.node,
+                    row.input,
+                    kind(&row.verdict)
+                );
+                continue;
+            }
             let other = processes
                 .rows
                 .iter()
@@ -448,6 +497,11 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
                 units.render(),
                 processes.render()
             );
+            compared += 1;
         }
     }
+    assert!(
+        compared >= 3,
+        "RI_HARNESS: only {compared} gap-free stream(s) were compared; the arm proves nothing"
+    );
 }

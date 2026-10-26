@@ -2767,15 +2767,21 @@ pub fn plan_executor_units(
     config: &GraphConfig,
     entry_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
     execution_mode: ExecutionMode,
+    real_clock: bool,
     profile: Option<cerulion_core::graph::UnitProfile<'_>>,
 ) -> TransportResult<DeploymentUnits> {
     use cerulion_core::graph::{
-        build_trigger_edges, expand_process_groups, validate_partition, GraphTopology, UnitGraph,
+        build_trigger_edges, expand_process_groups_keyed, validate_partition, GraphTopology,
+        UnitGraph,
+    };
+    let expand = |graph: &UnitGraph, keep: &indexmap::IndexSet<String>| {
+        expand_process_groups_keyed(config, graph, profile, keep, &|name| sanitize_ns(name))
     };
     let mut keep: indexmap::IndexSet<String> = indexmap::IndexSet::new();
     let mut kept_whole: Vec<(String, String)> = Vec::new();
     let whole_reason = match execution_mode {
         ExecutionMode::Lockstep => Some("lockstep execution mode"),
+        ExecutionMode::FreeRun if !real_clock => Some("a time source other than the real clock"),
         ExecutionMode::FreeRun if units_collapsed_by_mutant() => Some("unit-collapse mutant"),
         ExecutionMode::FreeRun => None,
     };
@@ -2789,7 +2795,7 @@ pub fn plan_executor_units(
     let trigger_edges = build_trigger_edges(config, entry_infos);
     let graph = UnitGraph::from_graph(config, entry_infos, &topology, &trigger_edges);
 
-    let mut plan = expand_process_groups(config, &graph, profile, &keep);
+    let mut plan = expand(&graph, &keep);
     if let Err(first) = validate_partition(&plan.groups, config, entry_infos, &trigger_edges) {
         // Find the hosts whose own split is refused, keep those whole.
         let split: Vec<String> = plan.split_hosts().map(|(h, _)| h.to_string()).collect();
@@ -2801,13 +2807,13 @@ pub fn plan_executor_units(
                 .cloned()
                 .collect();
             only.extend(keep.iter().cloned());
-            let trial = expand_process_groups(config, &graph, profile, &only);
+            let trial = expand(&graph, &only);
             if let Err(e) = validate_partition(&trial.groups, config, entry_infos, &trigger_edges) {
                 keep.insert(host.clone());
                 kept_whole.push((host.clone(), format!("its split is refused: {e}")));
             }
         }
-        plan = expand_process_groups(config, &graph, profile, &keep);
+        plan = expand(&graph, &keep);
         if validate_partition(&plan.groups, config, entry_infos, &trigger_edges).is_err() {
             keep = config.process_groups.keys().cloned().collect();
             kept_whole = config
@@ -2820,8 +2826,14 @@ pub fn plan_executor_units(
                     )
                 })
                 .collect();
-            plan = expand_process_groups(config, &graph, profile, &keep);
+            plan = expand(&graph, &keep);
         }
+    }
+    for host in &plan.name_collisions {
+        kept_whole.push((
+            host.clone(),
+            "a unit name would collide with another group's or unit's file name".to_string(),
+        ));
     }
     Ok(DeploymentUnits {
         config: plan.apply(config),

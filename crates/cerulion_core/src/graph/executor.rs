@@ -349,6 +349,8 @@ struct Growing {
     sum_ns: Option<u64>,
     /// The period it is fed at, when known.
     period_ns: Option<u64>,
+    /// The tightest `tick_within_ms` among its members.
+    deadline_ns: Option<u64>,
 }
 
 /// Decide whether `node` may join the unit `unit` across the link from
@@ -385,6 +387,10 @@ fn merge_verdict(
     if budget_mutant() {
         return Ok(Some(unit_ns));
     }
+    let deadline = match (unit.deadline_ns, graph.tick_within_ns.get(node).copied()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     let over = |limit: u64| unit_ns.saturating_mul(BUDGET_DIVISOR) >= limit;
     let verdict = |against: BudgetAgainst, limit: u64| {
         Boundary::OverBudget(BudgetVerdict {
@@ -398,7 +404,7 @@ fn merge_verdict(
     if over(period_ns) {
         return Err(verdict(BudgetAgainst::Period { period_ns }, period_ns));
     }
-    if let Some(&deadline_ns) = graph.tick_within_ns.get(node) {
+    if let Some(deadline_ns) = deadline {
         if over(deadline_ns) {
             return Err(verdict(
                 BudgetAgainst::Deadline { deadline_ns },
@@ -520,9 +526,27 @@ pub fn derive_units(
         if !candidates.contains(first) {
             continue;
         }
+        // The head's unit so far: the head and every node `isolate: false`
+        // already joined to it.
+        let head_root = index(head).map(|i| root(&mut parent, i));
+        let mut sum_ns = Some(0u64);
+        let mut deadline_ns: Option<u64> = None;
+        for (i, member) in members.iter().enumerate() {
+            if Some(root(&mut parent, i)) != head_root {
+                continue;
+            }
+            sum_ns = match (sum_ns, costs.and_then(|c| c.node_p50_ns.get(member))) {
+                (Some(acc), Some(p50)) => Some(acc.saturating_add(*p50)),
+                _ => None,
+            };
+            if let Some(&d) = graph.tick_within_ns.get(member) {
+                deadline_ns = Some(deadline_ns.map_or(d, |x: u64| x.min(d)));
+            }
+        }
         let mut unit = Growing {
-            sum_ns: costs.and_then(|c| c.node_p50_ns.get(head).copied()),
+            sum_ns: costs.and(sum_ns),
             period_ns: head_period_ns(head, graph, costs),
+            deadline_ns,
         };
         let mut at = head;
         while let Some(&next) = link_out.get(at) {
@@ -535,10 +559,14 @@ pub fn derive_units(
                         union(&mut parent, a, b);
                     }
                     unit.sum_ns = sum;
+                    if let Some(&d) = graph.tick_within_ns.get(next) {
+                        unit.deadline_ns = Some(unit.deadline_ns.map_or(d, |x| x.min(d)));
+                    }
                 }
                 Err(boundary) => {
                     starts.insert(next, boundary);
                     unit = Growing {
+                        deadline_ns: graph.tick_within_ns.get(next).copied(),
                         sum_ns: costs.and_then(|c| c.node_p50_ns.get(next).copied()),
                         period_ns: costs
                             .and_then(|c| c.edge_rate_mhz.get(&(at.to_string(), next.to_string())))
@@ -572,6 +600,16 @@ pub fn derive_units(
     for (r, topics) in block_topics {
         let fr = root(&mut parent, r);
         topics_by_root.entry(fr).or_default().extend(topics);
+    }
+    // A `block` flow keeps its nodes together over `isolate: true`; such a
+    // node does not start a unit, and the unit lists the block topic instead.
+    for (i, member) in members.iter().enumerate() {
+        let r = root(&mut parent, i);
+        if topics_by_root.contains_key(&r)
+            && starts.get(member.as_str()) == Some(&Boundary::Isolated)
+        {
+            starts.shift_remove(member.as_str());
+        }
     }
 
     let mut groups: IndexMap<usize, Vec<String>> = IndexMap::new();
@@ -612,6 +650,9 @@ pub struct UnitPlan {
     pub hosts: IndexMap<String, String>,
     /// The units of every declared group, keyed by the declared group name.
     pub units: IndexMap<String, Vec<ExecutorUnit>>,
+    /// Declared groups kept as one unit because a unit name would have keyed
+    /// the same as another group's or unit's.
+    pub name_collisions: Vec<String>,
 }
 
 impl UnitPlan {
@@ -642,34 +683,80 @@ impl UnitPlan {
 ///
 /// `keep_whole` names declared groups that stay one unit whatever the rules
 /// say (a caller uses it for a group whose split partition it refused). A
-/// graph without `process_groups:` yields an empty plan.
+/// graph without `process_groups:` yields an empty plan. Unit names are
+/// compared exactly; [`expand_process_groups_keyed`] compares them under a
+/// caller's normalization.
 pub fn expand_process_groups(
     config: &GraphConfig,
     graph: &UnitGraph,
     profile: Option<UnitProfile<'_>>,
     keep_whole: &IndexSet<String>,
 ) -> UnitPlan {
+    expand_process_groups_keyed(config, graph, profile, keep_whole, &|name| {
+        name.to_string()
+    })
+}
+
+/// [`expand_process_groups`] with unit names compared under `key` (for
+/// example the sanitizing that turns a group name into a file name). A group
+/// whose split would give a unit a name that keys the same as another group
+/// or unit stays one unit, and is listed in [`UnitPlan::name_collisions`].
+pub fn expand_process_groups_keyed(
+    config: &GraphConfig,
+    graph: &UnitGraph,
+    profile: Option<UnitProfile<'_>>,
+    keep_whole: &IndexSet<String>,
+    key: &dyn Fn(&str) -> String,
+) -> UnitPlan {
+    let whole = |host: &str, members: &[String]| {
+        vec![ExecutorUnit {
+            name: host.to_string(),
+            nodes: members.to_vec(),
+            boundaries: Vec::new(),
+            block_topics: Vec::new(),
+        }]
+    };
+    let mut units_by_host: IndexMap<String, Vec<ExecutorUnit>> = config
+        .process_groups
+        .iter()
+        .map(|(host, members)| {
+            let units = if keep_whole.contains(host) {
+                whole(host, members)
+            } else {
+                derive_units(host, members, graph, profile)
+            };
+            (host.clone(), units)
+        })
+        .collect();
+    let mut name_collisions: Vec<String> = Vec::new();
+    loop {
+        let mut owners: IndexMap<String, Vec<&str>> = IndexMap::new();
+        for (host, units) in &units_by_host {
+            for unit in units {
+                owners.entry(key(&unit.name)).or_default().push(host.as_str());
+            }
+        }
+        let colliding: Option<String> = units_by_host
+            .iter()
+            .filter(|(_, units)| units.len() > 1)
+            .find(|(_, units)| units.iter().any(|u| owners[&key(&u.name)].len() > 1))
+            .map(|(host, _)| host.clone());
+        let Some(host) = colliding else {
+            break;
+        };
+        let members = config.process_groups[&host].clone();
+        units_by_host.insert(host.clone(), whole(&host, &members));
+        name_collisions.push(host);
+    }
     let mut groups = IndexMap::new();
     let mut hosts = IndexMap::new();
-    let mut units_by_host = IndexMap::new();
-    for (host, members) in &config.process_groups {
-        let units = if keep_whole.contains(host) {
-            vec![ExecutorUnit {
-                name: host.clone(),
-                nodes: members.clone(),
-                boundaries: Vec::new(),
-                block_topics: Vec::new(),
-            }]
-        } else {
-            derive_units(host, members, graph, profile)
-        };
-        for unit in &units {
+    for (host, units) in &units_by_host {
+        for unit in units {
             groups.insert(unit.name.clone(), unit.nodes.clone());
             if units.len() > 1 {
                 hosts.insert(unit.name.clone(), host.clone());
             }
         }
-        units_by_host.insert(host.clone(), units);
     }
     let order = config
         .process_group_order
@@ -688,6 +775,7 @@ pub fn expand_process_groups(
         order,
         hosts,
         units: units_by_host,
+        name_collisions,
     }
 }
 
@@ -771,7 +859,7 @@ mod tests {
         graph(&[("cam", "det"), ("det", "track")], &[], &[("cam", 1)])
     }
 
-    // ---- K-3: without a profile, every data-triggered node is its own unit.
+    // ---- Without a profile, every data-triggered node is its own unit.
 
     #[test]
     fn without_a_profile_every_data_triggered_node_is_its_own_unit() {
@@ -888,6 +976,40 @@ mod tests {
                 deadline_ns: 10_000_000
             }
         );
+    }
+
+    #[test]
+    fn an_earlier_members_deadline_bounds_every_later_merge() {
+        // `mid` declares tick_within 10 ms; `out` ticks 2 ms more, which
+        // pushes the unit past a quarter of `mid`'s deadline.
+        let mut g = graph(&[("src", "mid"), ("mid", "out")], &[], &[("src", 1000)]);
+        g.tick_within_ns.insert("mid".into(), 10_000_000);
+        let c = costs(&[("src", 0), ("mid", 1_000_000), ("out", 2_000_000)], &[]);
+        let units = derive_units("g", &s(&["src", "mid", "out"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["src", "mid"]), s(&["out"])]);
+        assert!(matches!(
+            start_of(&units, "out"),
+            Some(Boundary::OverBudget(BudgetVerdict {
+                against: BudgetAgainst::Deadline {
+                    deadline_ns: 10_000_000
+                },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_block_flow_keeps_an_isolated_node_and_says_so() {
+        let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
+        g.isolate.insert("b".into(), true);
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["a", "b"]),
+        });
+        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a", "b"])]);
+        assert_eq!(start_of(&units, "b"), None, "b does not start a unit");
+        assert_eq!(units[0].block_topics, s(&["t"]));
     }
 
     // ---- Structure: the shared chain predicate's bars.
@@ -1069,6 +1191,30 @@ mod tests {
         assert_eq!(plan.groups["work"], s(&["pace", "fast"]));
         assert!(plan.hosts.is_empty());
         assert!(!plan.splits_any());
+    }
+
+    #[test]
+    fn a_group_whose_unit_name_collides_stays_one_unit() {
+        // `work`'s unit for `x` would be named `work.x`, which a declared
+        // group already is; under a key folding `.` to `_`, `a-b` and `a_b`
+        // collide too.
+        let config = config_with_groups(&[("work", &["p", "x"]), ("work.x", &["y"])], &[]);
+        let plan = expand_process_groups(&config, &UnitGraph::default(), None, &IndexSet::new());
+        assert_eq!(plan.name_collisions, s(&["work"]));
+        assert_eq!(plan.groups["work"], s(&["p", "x"]));
+        assert_eq!(plan.groups["work.x"], s(&["y"]));
+
+        let config = config_with_groups(&[("g", &["a-b", "a_b"])], &[]);
+        let fold = |n: &str| n.replace(['-', '.'], "_");
+        let plan = expand_process_groups_keyed(
+            &config,
+            &UnitGraph::default(),
+            None,
+            &IndexSet::new(),
+            &fold,
+        );
+        assert_eq!(plan.name_collisions, s(&["g"]));
+        assert_eq!(plan.groups.len(), 1);
     }
 
     #[test]
