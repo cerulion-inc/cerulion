@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=32
+CASES_EXPECTED=33
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 verdict="$script_dir/android_e2e_probe_verdict.sh"
@@ -111,6 +111,13 @@ run_case paired_frame_off_the_ingress paired "$(report frames=1)"
 expect_status 1
 expect_output 'frames=1 is more than wire_frames=0'
 
+# One GET per pass reaches one peer, the app, so it answers at most once a
+# pass. More acks than passes means another peer answered too, and its refusal
+# would be counted as the app's posture.
+run_case paired_more_acks_than_passes paired "$(report refused_acks=6)"
+expect_status 1
+expect_output '6 ack(s) from 5 pass(es): more than one peer answered'
+
 run_case paired_no_answer paired "$(report refused_acks=0)"
 expect_status 1
 expect_output 'no demand was refused'
@@ -120,7 +127,7 @@ run_case paired_lan_refused paired "$(report lan_refused_drops=1 wire_frames=1)"
 expect_status 1
 expect_output "the probe's ingress refused 1 frame(s) on its own LAN posture"
 
-run_case paired_wire_header_refusal paired "$(report wire_header_refused_acks=1)"
+run_case paired_wire_header_refusal paired "$(report refused_acks=4 wire_header_refused_acks=1)"
 expect_status 1
 expect_output 'refused 1 demand(s) on the wire header'
 

@@ -90,6 +90,12 @@ wire=$(field wire_frames) || { printf '%s\n' "$wire"; exit 1; }
 frames=$(field frames) || { printf '%s\n' "$frames"; exit 1; }
 
 [ "$passes" -ge 1 ] || reject 'the demander ran no pass in the window'
+# Each pass sends one GET per selector and blocks for its replies. The probe
+# reaches one peer, the app, so the app answers at most once a pass: more acks
+# than passes means another peer answered, and its acks are not the app's.
+acks=$((enabled + refused + wire_header))
+[ "$acks" -le "$passes" ] ||
+    reject "$acks ack(s) from $passes pass(es): more than one peer answered"
 # Every frame the ingress received is either delivered or dropped, so neither
 # count can be more than the frames that crossed the network.
 [ "$frames" -le "$wire" ] || reject "frames=$frames is more than wire_frames=$wire"
