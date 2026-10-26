@@ -307,7 +307,7 @@ fn the_notice_is_one_short_line() {
 }
 
 #[test]
-fn a_run_without_a_terminal_shows_no_notice_sends_nothing_and_leaves_it_owed() {
+fn a_run_without_a_terminal_shows_no_notice_and_sends_and_the_notice_waits_for_a_terminal() {
     let home = tempfile::tempdir().unwrap();
     let sink = sink();
     let piped = cerulion_piped(home.path(), &sending(&sink), &["graph", "list"]);
@@ -316,11 +316,13 @@ fn a_run_without_a_terminal_shows_no_notice_sends_nothing_and_leaves_it_owed() {
         "{}",
         piped.stderr
     );
-    assert_nothing_sent(&sink, "a first run outside CI and a terminal sends nothing");
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["ci"], false, "{events:?}");
     let tty = cerulion(home.path(), &sending(&sink), &["graph", "list"]);
     assert!(
         tty.stderr.contains("cerulion telemetry off"),
-        "the notice is still owed to the first run on a terminal: {}",
+        "the first run on a terminal prints the notice: {}",
         tty.stderr
     );
     assert_nothing_sent(&sink, "the notice run sends nothing");
@@ -377,10 +379,11 @@ fn a_ci_run_sends_without_a_notice_under_the_random_id_and_leaves_the_notice_owe
 }
 
 #[test]
-fn a_first_login_without_a_terminal_carries_nothing_and_leaves_the_merge_owed() {
+fn a_first_login_without_a_terminal_carries_and_merges_the_random_id() {
     let home = tempfile::tempdir().unwrap();
     let sink = sink();
-    let issuer = issuer("8d1f4e6c-0b2a-4c5d-9e7f-123456789abc");
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let issuer = issuer(sub);
     let env = [
         ("POSTHOG_API_KEY", "k"),
         ("POSTHOG_HOST", sink.url.as_str()),
@@ -392,12 +395,17 @@ fn a_first_login_without_a_terminal_carries_nothing_and_leaves_the_merge_owed() 
         .starts
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("one device-start request");
-    assert!(!start.contains("telemetry_anon_id"), "{start}");
-    assert_nothing_sent(&sink, "a run that owes the notice sends nothing");
+    let anon = anon_id_in(home.path());
     assert!(
-        home.path().join("telemetry_alias_pending").exists(),
-        "the merge is owed to the first run that sends"
+        start.contains(&anon),
+        "the login carries the random id: {start}"
     );
+    let events = events_sent(&sink);
+    let aliases = named(&events, "$create_alias");
+    assert_eq!(aliases.len(), 1, "{events:?}");
+    assert_eq!(aliases[0]["properties"]["alias"], anon, "{events:?}");
+    assert_eq!(aliases[0]["distinct_id"], sub, "{events:?}");
+    assert!(!home.path().join("telemetry_alias_pending").exists());
 }
 
 #[test]

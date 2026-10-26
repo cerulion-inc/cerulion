@@ -79,8 +79,7 @@ request carries the random id so the events from before the login are
 joined to the account; the CLI also sends a `$create_alias` event for the
 join. A CI run never joins: its login carries no id and sends no alias.
 Nothing else is added to the login. A machine that signed out keeps its account on record and carries nothing. If that first
-login happens in a run that owed the notice (the run that printed it, or
-one without a terminal before it was shown), which sends nothing, an
+login happens in the run that printed the notice, which sends nothing, an
 empty `telemetry_alias_pending` file next to the consent file marks the join
 as owed, and the next run outside CI that sends makes it and deletes the
 file. Only a
@@ -114,8 +113,8 @@ Later commands send. The notice is shown once per machine: it is saved as
 shown only once it has been written, so a run that is killed while printing
 it shows it again next time, and two first commands started at the same
 moment may both show it (neither sends). A command whose stderr is not a
-terminal prints no notice and, until the notice has been shown, sends
-nothing, unless it runs under CI. The vizd daemon prints no notice of its
+terminal prints no notice and sends as usual; the notice is then printed by
+the first command run on a terminal. The vizd daemon prints no notice of its
 own and sends nothing until the CLI has shown it on the machine (or under
 CI), so a `cerulion viz` that prints the notice may start a daemon that
 sends. `cerulion telemetry status` prints the link to this page.
@@ -129,8 +128,8 @@ A run is under CI when one of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`,
 does not count. A CI run prints no notice, on a terminal or not, and still
 sends. Its events carry `ci: true`, go out under the random id with no
 person profile, and are never joined to an account, so CI traffic can be
-filtered out of user counts. It leaves the notice owed to the first run
-outside CI. The settings below turn telemetry off in CI as anywhere else.
+filtered out of user counts. It leaves the notice to the first run on a
+terminal outside CI. The settings below turn telemetry off in CI as anywhere else.
 
 ## Turning it off
 

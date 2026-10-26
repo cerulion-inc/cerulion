@@ -104,8 +104,7 @@ fn main() -> ExitCode {
     // One `cli_command_run` per invocation, recorded around the whole
     // dispatch so every intercept below is covered. `None` (nothing is
     // recorded or sent) without a key, without consent, for the internal
-    // subprocess verbs, on the run that prints the first-run notice, and,
-    // outside CI, on a run without a terminal while that notice is owed.
+    // subprocess verbs, and on the run that prints the first-run notice.
     let command_run = telemetry::CommandRun::start(&matches);
     // A registered verb family owns its own dispatch, after the same logging
     // setup, iceoryx2 bridge and login gate a `Commands` verb gets in
