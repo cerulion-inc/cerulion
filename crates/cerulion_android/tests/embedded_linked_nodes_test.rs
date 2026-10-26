@@ -82,6 +82,26 @@ fn relay_frames_live(topic: &str, wanted: usize) -> Vec<(f64, f64)> {
     frames
 }
 
+/// The relay's tick count (`z`) of each frame recorded on `topic`, in order.
+fn bag_relay_ticks(path: &Path, topic: &str) -> Vec<f64> {
+    let reader = BagReader::open(path).expect("open finalized bag");
+    reader
+        .user_message_index()
+        .expect("index messages")
+        .get(topic)
+        .map(|spans| {
+            spans
+                .iter()
+                .map(|span| {
+                    let frame = reader.frame(span);
+                    let payload = &frame[WireHeader::SIZE..];
+                    f64::from_le_bytes(payload[16..24].try_into().expect("z bytes"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn bag_frame_count(path: &Path, topic: &str) -> usize {
     let reader = BagReader::open(path).expect("open finalized bag");
     let channel = reader
@@ -134,6 +154,14 @@ fn run_once(runtime: &mut EmbeddedRuntime, files_dir: &Path, prefix: &str, file:
     let bag = files_dir.join("bags").join(file);
     assert!(bag_frame_count(&bag, &source_topic) > 0);
     assert!(bag_frame_count(&bag, &relay_topic) > 0);
+    // Each start makes a fresh relay from the registry, so the recorded
+    // tick count starts again at 1 (a reused instance would carry on).
+    let ticks = bag_relay_ticks(&bag, &relay_topic);
+    assert_eq!(
+        ticks.first().copied(),
+        Some(1.0),
+        "relay ticks in {file}: {ticks:?}"
+    );
 }
 
 #[test]
