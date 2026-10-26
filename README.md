@@ -409,13 +409,12 @@ Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerul
 
 **Hindsight** investigates MCAP recordings with answers grounded in specific topics and timestamps.
 
-Register the hosted Hindsight endpoint with your client:
+Register the hosted endpoints with your client:
 
 ```bash
-claude mcp add --transport http hindsight https://mcp.cerulion.com/mcp
+claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
+claude mcp add --transport http hindsight https://mcp.cerulion.com/mcp/hindsight
 ```
-
-Cerulion MCP is not hosted yet.
 
 For screenshots and viewport control, use Studio's built-in agent. Cerulion MCP exposes runtime tools and does not include Studio's viewport tools.
 
