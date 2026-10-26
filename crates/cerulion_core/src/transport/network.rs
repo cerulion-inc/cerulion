@@ -932,6 +932,16 @@ pub struct GetDemandState {
 /// shares one overflow latch, so a hostile or huge network cannot grow it.
 const KEYED_LATCHES_CAP: usize = 256;
 
+/// The most distinct replying peers a demander names in its ack peer set;
+/// past it a new peer is counted as an overflow and not stored, so a hostile
+/// or huge network cannot grow the set.
+const ACK_PEERS_CAP: usize = KEYED_LATCHES_CAP;
+
+/// The longest replying peer name (bytes) a demander stores in its ack peer
+/// set. The name is the robot segment of the reply key, which the replier
+/// chooses, so a longer one is counted as overlong and not stored.
+const ACK_PEER_MAX_LEN: usize = super::mirror_registry::MAX_MIRROR_ROBOT_LEN;
+
 /// Flood-suppression latches keyed per (stated version, topic) on the
 /// producer side and per (replying peer, topic) on the demander side, bounded
 /// at [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
@@ -1094,8 +1104,13 @@ pub struct DemandGetState {
     /// cumulative replies acking "refused:wire-header" (the producer runs a
     /// build with a different wire header version).
     wire_header_refused_acks: AtomicU64,
-    /// the replying peers whose acks the three counters above counted.
+    /// the replying peers whose acks the three counters above counted, at most
+    /// [`ACK_PEERS_CAP`] names of at most [`ACK_PEER_MAX_LEN`] bytes each.
     ack_peers: Mutex<BTreeSet<String>>,
+    /// counted acks whose new peer was not stored because the set was full.
+    ack_peer_overflow: AtomicU64,
+    /// counted acks whose peer was not stored because its name was too long.
+    ack_peer_overlong: AtomicU64,
     /// flood suppression for the wire header refusals this demander receives,
     /// one latch per (replying peer, topic), re-armed by a grant from that peer.
     wire_header_latches: Mutex<KeyedLatches<(String, String)>>,
@@ -1168,9 +1183,25 @@ impl DemandGetState {
         self.wire_header_refused_acks.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): counted acks from a new peer that was
+    /// not stored because the peer set held its cap of 256 names. Not 0
+    /// means [`Self::ack_peers`] is incomplete.
+    pub fn ack_peer_overflow_count(&self) -> u64 {
+        self.ack_peer_overflow.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): counted acks whose peer name was
+    /// longer than 256 bytes, so it was not stored. Not 0
+    /// means [`Self::ack_peers`] is incomplete.
+    pub fn ack_peer_overlong_count(&self) -> u64 {
+        self.ack_peer_overlong.load(Ordering::Relaxed)
+    }
+
     /// Observable state (Principle #3): the replying robots whose acks the
     /// ack counters counted, SORTED. An ack this build does not know names no
-    /// peer, as it is in no counter.
+    /// peer, as it is in no counter. A peer past the cap or over the length
+    /// limit is not named: see [`Self::ack_peer_overflow_count`] and
+    /// [`Self::ack_peer_overlong_count`].
     pub fn ack_peers(&self) -> Vec<String> {
         self.ack_peers
             .lock()
@@ -1194,8 +1225,14 @@ impl DemandGetState {
                 .ack_peers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !peers.contains(peer) {
-                peers.insert(peer.to_string());
+            if peer.len() > ACK_PEER_MAX_LEN {
+                self.ack_peer_overlong.fetch_add(1, Ordering::Relaxed);
+            } else if !peers.contains(peer) {
+                if peers.len() < ACK_PEERS_CAP {
+                    peers.insert(peer.to_string());
+                } else {
+                    self.ack_peer_overflow.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         let key = (peer.to_string(), topic.to_string());
@@ -7215,6 +7252,37 @@ mod tests {
                 "go2".to_string(),
             ]
         );
+    }
+
+    /// The peer set stops at its cap: each new peer past it is counted as an
+    /// overflow and not named, while a peer already named is re-counted with
+    /// no overflow. A name over the length limit is counted and not named.
+    #[test]
+    fn the_demander_peer_set_is_bounded_in_count_and_name_length() {
+        let state = DemandGetState::default();
+        for i in 0..ACK_PEERS_CAP + 3 {
+            state.record_ack(&format!("robot-{i:04}"), "/a", ACK_REFUSED);
+        }
+        assert_eq!(state.ack_peers().len(), 256);
+        assert_eq!(state.ack_peer_overflow_count(), 3);
+        // robot-0000 is named; robot-0258 is one of the three not stored.
+        assert_eq!(state.ack_peers()[0], "robot-0000");
+        assert!(!state.ack_peers().contains(&"robot-0258".to_string()));
+        state.record_ack("robot-0000", "/a", ACK_ENABLED);
+        assert_eq!(state.ack_peer_overflow_count(), 3);
+        assert_eq!(state.refused_ack_count(), 259);
+        assert_eq!(state.enabled_ack_count(), 1);
+        assert_eq!(state.ack_peer_overlong_count(), 0);
+
+        let fresh = DemandGetState::default();
+        let at_limit = "r".repeat(256);
+        let over_limit = "r".repeat(257);
+        fresh.record_ack(&over_limit, "/a", ACK_REFUSED);
+        fresh.record_ack(&at_limit, "/a", ACK_REFUSED);
+        assert_eq!(fresh.ack_peer_overlong_count(), 1);
+        assert_eq!(fresh.ack_peers(), vec![at_limit]);
+        assert_eq!(fresh.refused_ack_count(), 2);
+        assert_eq!(fresh.ack_peer_overflow_count(), 0);
     }
 
     /// Two producers on one topic each get their own latch: both refusals are

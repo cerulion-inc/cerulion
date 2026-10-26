@@ -476,7 +476,9 @@ network daemon runs while the probe does: the run stops the one it started and
 fails while any `cerulion-netd` process is still alive on the host. The probe
 names the robot that sent each demand ack it counted, and the verdict fails a
 run with an ack from any robot other than the app, or with more acks than
-demand passes (a second peer answering). Before the device is used,
+demand passes (a second peer answering). The probe names at most 256 robots,
+each at most 256 bytes long, and counts each ack from a robot it did not
+name; the verdict fails a run where either count is not 0. Before the device is used,
 the probe must refuse each bad argument and a connect endpoint its session
 cannot open, with exit code 1 and no report.
 `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and

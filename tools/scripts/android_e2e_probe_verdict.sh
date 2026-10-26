@@ -24,6 +24,8 @@
 # exactly <app-identity>, or empty when no ack was counted): an ack from any
 # other peer, such as a host netd that answers the wildcard demand with
 # `refused` for a topic it does not produce, would be counted as the app's.
+# `ack_peer_overflow` and `ack_peer_overlong` must be 0: each counts acks from
+# a peer the probe did not name, so ack_peers would be incomplete.
 # The ingress must also lose no frame to a decode error, a
 # local re-injection failure or its own LAN posture (the probe's is open): a
 # frame lost that way would hide behind the counts the rules above read.
@@ -108,6 +110,8 @@ case ",$peers," in
         [ -z "$peers" ] || reject "field 'ack_peers' is not a list of robot names: $peers"
         ;;
 esac
+overflow=$(field ack_peer_overflow) || { printf '%s\n' "$overflow"; exit 1; }
+overlong=$(field ack_peer_overlong) || { printf '%s\n' "$overlong"; exit 1; }
 mismatch=$(field schema_mismatch_drops) || { printf '%s\n' "$mismatch"; exit 1; }
 decode=$(field decode_errors) || { printf '%s\n' "$decode"; exit 1; }
 reinject=$(field reinject_failure_drops) || { printf '%s\n' "$reinject"; exit 1; }
@@ -119,6 +123,12 @@ frames=$(field frames) || { printf '%s\n' "$frames"; exit 1; }
 # Each pass sends one GET per selector and blocks for its replies. The probe
 # reaches one peer, the app, so the app answers at most once a pass: more acks
 # than passes means another peer answered, and its acks are not the app's.
+# The probe names at most a capped number of peers, each of bounded length:
+# an ack from a peer it did not name leaves ack_peers incomplete.
+[ "$overflow" -eq 0 ] ||
+    reject "ack_peer_overflow=$overflow ack(s) came from a peer the probe did not name, so ack_peers is incomplete"
+[ "$overlong" -eq 0 ] ||
+    reject "ack_peer_overlong=$overlong ack(s) came from a peer name too long to store, so ack_peers is incomplete"
 acks=$((enabled + refused + wire_header))
 [ "$acks" -le "$passes" ] ||
     reject "$acks ack(s) from $passes pass(es): more than one peer answered"

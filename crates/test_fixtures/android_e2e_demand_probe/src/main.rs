@@ -8,6 +8,8 @@
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
 //! bounded window. It reports the demand acks it counted and the robots that
 //! sent them (`ack_peers`, sorted and joined by `,`, empty when no ack came),
+//! the acks from a peer it did not name because its peer set was full
+//! (`ack_peer_overflow`) or the name was too long to store (`ack_peer_overlong`),
 //! the frames that reached its ingress from the network (`wire_frames`,
 //! whether re-injected or dropped by validation), each drop bucket by name
 //! (`schema_mismatch_drops` when the schema hash was not the expected one,
@@ -21,7 +23,7 @@
 //! and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
+//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app ack_peer_overflow=0 ack_peer_overlong=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
 //! ```
 //!
 //! The verdict is the caller's (`tools/scripts/android_e2e_probe_verdict.sh`):
@@ -162,7 +164,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "demand_probe topic={} schema={} window_s={} passes={} enabled_acks={} refused_acks={} \
-         wire_header_refused_acks={} ack_peers={} schema_mismatch_drops={schema_mismatch_drops} \
+         wire_header_refused_acks={} ack_peers={} ack_peer_overflow={} ack_peer_overlong={} \
+         schema_mismatch_drops={schema_mismatch_drops} \
          decode_errors={decode_errors} reinject_failure_drops={reinject_failure_drops} \
          lan_refused_drops={lan_refused_drops} wire_frames={wire_frames} frames={frames}",
         args.topic,
@@ -173,6 +176,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         gateway.demand_refused_ack_count(),
         gateway.demand_wire_header_refused_ack_count(),
         gateway.demand_ack_peers().join(","),
+        gateway.demand_ack_peer_overflow_count(),
+        gateway.demand_ack_peer_overlong_count(),
     );
     Ok(())
 }

@@ -2652,6 +2652,27 @@ impl GatewayRuntime {
             .unwrap_or_default()
     }
 
+    /// Observable state (Principle #3): counted acks whose new peer the
+    /// DEMANDER did not name because its peer set was full (`0` on a
+    /// pure-egress gateway). Not 0 means [`Self::demand_ack_peers`] is
+    /// incomplete.
+    pub fn demand_ack_peer_overflow_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peer_overflow_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): counted acks whose peer name the
+    /// DEMANDER did not store because it was too long (`0` on a pure-egress
+    /// gateway). Not 0 means [`Self::demand_ack_peers`] is incomplete.
+    pub fn demand_ack_peer_overlong_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peer_overlong_count())
+            .unwrap_or(0)
+    }
+
     /// Observable state (Principle #3): number of producer identities the DEMANDER
     /// harvested from the announce space (`0` ⇒ its GETs still use the wildcard).
     pub fn harvested_identity_count(&self) -> usize {

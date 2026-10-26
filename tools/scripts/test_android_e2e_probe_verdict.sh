@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=39
+CASES_EXPECTED=42
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 verdict="$script_dir/android_e2e_probe_verdict.sh"
@@ -64,7 +64,7 @@ app=android-app
 report() {
     local passes=5 enabled=0 refused=5 wire_header=0 mismatch=0 decode=0 reinject=0
     local lan_refused=0 wire=0 frames=0
-    local schema=std_msgs/String peers=$app
+    local schema=std_msgs/String peers=$app overflow=0 overlong=0
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -73,6 +73,8 @@ report() {
             refused_acks=*) refused=${arg#*=} ;;
             wire_header_refused_acks=*) wire_header=${arg#*=} ;;
             ack_peers=*) peers=${arg#*=} ;;
+            ack_peer_overflow=*) overflow=${arg#*=} ;;
+            ack_peer_overlong=*) overlong=${arg#*=} ;;
             schema_mismatch_drops=*) mismatch=${arg#*=} ;;
             decode_errors=*) decode=${arg#*=} ;;
             reinject_failure_drops=*) reinject=${arg#*=} ;;
@@ -83,8 +85,9 @@ report() {
             *) printf 'report: unknown field %s\n' "$arg" >&2; exit 1 ;;
         esac
     done
-    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
-        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$mismatch" "$decode" \
+    printf 'demand_probe topic=/app/heartbeat schema=%s window_s=10 passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s ack_peer_overflow=%s ack_peer_overlong=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+        "$schema" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$overflow" "$overlong" \
+        "$mismatch" "$decode" \
         "$reinject" "$lan_refused" "$wire" "$frames"
 }
 
@@ -247,6 +250,20 @@ expect_output "field 'ack_peers' is missing"
 run_case ack_peers_not_names paired "$app" "${paired_ok/ack_peers=android-app/ack_peers=android-app;x}"
 expect_status 1
 expect_output "field 'ack_peers' is not a list of robot names: android-app;x"
+
+# A peer set past its cap or a peer name over the length limit leaves
+# ack_peers incomplete, so it cannot show that every ack came from the app.
+run_case ack_peer_overflow paired "$app" "$(report ack_peer_overflow=3)"
+expect_status 1
+expect_output 'ack_peer_overflow=3 ack(s) came from a peer the probe did not name, so ack_peers is incomplete'
+
+run_case ack_peer_overlong paired "$app" "$(report ack_peer_overlong=1)"
+expect_status 1
+expect_output 'ack_peer_overlong=1 ack(s) came from a peer name too long to store, so ack_peers is incomplete'
+
+run_case ack_peer_overflow_missing paired "$app" "${paired_ok/ ack_peer_overflow=0/}"
+expect_status 1
+expect_output "field 'ack_peer_overflow' is missing"
 
 run_case no_pass paired "$app" "$(report passes=0 refused_acks=0 ack_peers=)"
 expect_status 1
