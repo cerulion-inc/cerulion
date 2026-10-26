@@ -664,7 +664,11 @@ impl TrustStore {
             source: PairingSource::CertificatePresentation,
             name: None,
             added_at_ns: now_ns,
-            expires_at_ns: owner_row.expires_at_ns,
+            expires_at_ns: row_expiry(
+                cert.principal_kind,
+                cert.validity.not_after_ns,
+                owner_row.expires_at_ns,
+            ),
             revoked: false,
         };
         self.upsert_active_row(device_row);
@@ -787,6 +791,7 @@ impl TrustStore {
             scope,
             pres.device_cert.cert.principal_kind,
             pres.device_cert.cert.device_key,
+            pres.device_cert.cert.validity.not_after_ns,
         ))
     }
 
@@ -1046,6 +1051,7 @@ impl TrustStore {
             scope,
             pres.subject_cert.cert.principal_kind,
             pres.subject_cert.cert.device_key,
+            pres.subject_cert.cert.validity.not_after_ns,
         ))
     }
 
@@ -1125,6 +1131,11 @@ impl TrustStore {
         {
             return Err(PairingError::CloudAccessDisabled);
         }
+        let expires_at_ns = row_expiry(
+            verified.principal_kind,
+            verified.cert_not_after_ns,
+            expires_at_ns,
+        );
         let device = Some(verified.device_key);
         if let Some(row) = self
             .inner
@@ -1411,10 +1422,24 @@ impl TrustStore {
     }
 }
 
-/// Map an owner-signed grant's validity upper bound (`not_after_ns`) to a durable
-/// [`AccessRow`] expiry: a finite bound becomes the row's honorable expiry, while the
-/// unbounded sentinel (`u64::MAX`, the [`crate::format::AccessGrant`] "no expiry"
-/// encoding) becomes `None` so the row never rots. Pure so it is oracle-testable.
+/// The expiry of a row written from a certificate: `expires_at_ns` for a human
+/// or machine principal; for a cloud principal the earlier of `expires_at_ns`
+/// and the certificate's `not_after` (so the row lapses with the certificate,
+/// and each renewed certificate presented extends it).
+fn row_expiry(
+    principal: crate::format::PrincipalKind,
+    cert_not_after_ns: u64,
+    expires_at_ns: Option<u64>,
+) -> Option<u64> {
+    if principal != crate::format::PrincipalKind::Cloud {
+        return expires_at_ns;
+    }
+    match (expires_at_ns, access_row_expiry(cert_not_after_ns)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Whether `row` admits at `now_ns`: not revoked, and `now_ns` strictly before a
 /// finite expiry (the `[not_before, not_after)` half-open window, so
 /// `now_ns >= expiry` denies). `None` never expires. The one rule behind
@@ -1423,6 +1448,10 @@ fn row_active(row: &AccessRow, now_ns: u64) -> bool {
     !row.revoked && row.expires_at_ns.is_none_or(|exp| now_ns < exp)
 }
 
+/// Map an owner-signed grant's validity upper bound (`not_after_ns`) to a durable
+/// [`AccessRow`] expiry: a finite bound becomes the row's honorable expiry, while the
+/// unbounded sentinel (`u64::MAX`, the [`crate::format::AccessGrant`] "no expiry"
+/// encoding) becomes `None` so the row never rots. Pure so it is oracle-testable.
 fn access_row_expiry(not_after_ns: u64) -> Option<u64> {
     (not_after_ns != u64::MAX).then_some(not_after_ns)
 }
@@ -2091,6 +2120,15 @@ mod owner_certificate_state_tests {
 
     /// A roots-verified chain for the owner account's device `seed`.
     fn proof(seed: u8, principal_kind: PrincipalKind) -> OwnerCertificatePresentationWire {
+        proof_until(seed, principal_kind, 100)
+    }
+
+    /// [`proof`] with the device certificate valid until `not_after_ns`.
+    fn proof_until(
+        seed: u8,
+        principal_kind: PrincipalKind,
+        not_after_ns: u64,
+    ) -> OwnerCertificatePresentationWire {
         let root = SigningKey::from_bytes(&[1; 32]);
         let issuer = SigningKey::from_bytes(&[2; 32]);
         let issuer_key = PublicKey(issuer.verifying_key().to_bytes());
@@ -2113,7 +2151,10 @@ mod owner_certificate_state_tests {
                 account: OWNER,
                 principal_kind,
                 scope: Scope::OWNER_FULL,
-                validity,
+                validity: Validity {
+                    not_before_ns: 0,
+                    not_after_ns,
+                },
                 issued_at_ns: 0,
                 issuer_key,
             }
@@ -2288,6 +2329,7 @@ mod owner_certificate_state_tests {
                 Scope::CODE_PAIR_DEFAULT,
                 PrincipalKind::Cloud,
                 key(12),
+                u64::MAX,
             );
             assert!(matches!(
                 store.establish_pairing(&cloud, source, None, 2, None),
@@ -2300,6 +2342,7 @@ mod owner_certificate_state_tests {
             Scope::CODE_PAIR_DEFAULT,
             PrincipalKind::Human,
             key(13),
+            u64::MAX,
         );
         store
             .establish_pairing(&human, PairingSource::StrongChain, None, 2, None)
@@ -2320,6 +2363,74 @@ mod owner_certificate_state_tests {
         store.inner.access_rows[0].expires_at_ns = Some(6);
         assert!(store.is_allowed(&OWNER, &key(7), 6).is_none());
         assert!(store.is_allowed(&OWNER, &key(7), 5).is_some());
+    }
+
+    #[test]
+    fn a_cloud_row_lapses_with_its_certificate_and_a_renewal_extends_it() {
+        let (mut store, _) = fixture();
+        store
+            .verify_owner_certificate(&proof_until(9, PrincipalKind::Cloud, 50), &key(9), 2)
+            .unwrap();
+        assert_eq!(store.access_rows()[1].expires_at_ns, Some(50));
+        assert!(store.is_allowed(&OWNER, &key(9), 49).is_some());
+        assert!(store.is_allowed(&OWNER, &key(9), 50).is_none());
+        // A certificate whose not_after has passed is refused and stores nothing.
+        let rows = store.access_rows().to_vec();
+        assert!(store
+            .verify_owner_certificate(&proof_until(9, PrincipalKind::Cloud, 50), &key(9), 60)
+            .is_err());
+        assert_eq!(store.access_rows(), rows.as_slice());
+        // A renewed certificate extends the row.
+        store
+            .verify_owner_certificate(&proof_until(9, PrincipalKind::Cloud, 90), &key(9), 61)
+            .unwrap();
+        assert_eq!(store.access_rows()[1].expires_at_ns, Some(90));
+        assert!(store.is_allowed(&OWNER, &key(9), 70).is_some());
+        // A human certificate's row keeps the owner row's expiry (none).
+        store
+            .verify_owner_certificate(&proof_until(3, PrincipalKind::Human, 80), &key(3), 62)
+            .unwrap();
+        assert_eq!(store.access_rows()[2].expires_at_ns, None);
+        assert!(store.is_allowed(&OWNER, &key(3), 95).is_some());
+    }
+
+    #[test]
+    fn a_cloud_row_takes_the_earlier_of_the_certificate_and_grant_expiry() {
+        let (mut store, _) = fixture();
+        let cloud = |seed: u8| {
+            VerifiedPairing::new(
+                AccountId([6; 32]),
+                Scope::CODE_PAIR_DEFAULT,
+                PrincipalKind::Cloud,
+                key(seed),
+                40,
+            )
+        };
+        let source = PairingSource::OwnerSignedGrant;
+        store
+            .establish_pairing(&cloud(20), source, None, 2, Some(30))
+            .unwrap();
+        store
+            .establish_pairing(&cloud(21), source, None, 2, Some(90))
+            .unwrap();
+        store
+            .establish_pairing(&cloud(22), source, None, 2, None)
+            .unwrap();
+        let human = VerifiedPairing::new(
+            AccountId([6; 32]),
+            Scope::CODE_PAIR_DEFAULT,
+            PrincipalKind::Human,
+            key(23),
+            40,
+        );
+        store
+            .establish_pairing(&human, source, None, 2, Some(90))
+            .unwrap();
+        let expiries: Vec<Option<u64>> = store.access_rows()[1..]
+            .iter()
+            .map(|r| r.expires_at_ns)
+            .collect();
+        assert_eq!(expiries, vec![Some(30), Some(40), Some(40), Some(90)]);
     }
 
     /// The v3 body as a v3 writer laid it out (field order is the wire).
