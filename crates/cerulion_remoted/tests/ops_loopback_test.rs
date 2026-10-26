@@ -1012,3 +1012,132 @@ async fn ops_wire_bytes_are_cerud_be_frames_not_link_le_frames() {
         }
     }
 }
+
+// ── allow-from-cloud OFF on the ops plane (cerud framing) ───────────────────
+
+/// The owner account's certificate chain for `device_key` with `principal`.
+fn owner_certificate(
+    device_key: [u8; 32],
+    principal: PrincipalKind,
+) -> cerulion_pairing::verify::OwnerCertificatePresentationWire {
+    let int_pk = pk(&sk(2));
+    let intermediate = IntermediateCert {
+        version: FORMAT_VERSION,
+        intermediate_key: int_pk,
+        validity: wide(),
+        issued_at_ns: ISSUED,
+        max_scope: Scope::OWNER_FULL,
+    }
+    .sign_by_roots(&[&sk(1)]);
+    let device_cert = DeviceCert {
+        version: FORMAT_VERSION,
+        device_key: PublicKey(device_key),
+        account: OWNER,
+        principal_kind: principal,
+        scope: Scope::OWNER_FULL,
+        validity: wide(),
+        issued_at_ns: ISSUED,
+        issuer_key: int_pk,
+    }
+    .sign(&sk(2));
+    cerulion_pairing::verify::OwnerCertificatePresentationWire::new(intermediate, device_cert)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_off_refuses_an_ordinary_ops_hello_with_a_cerud_reject_and_a_human_still_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([209; 32]).await;
+    let cloud = disabled_endpoint([91; 32]).await;
+    let human = disabled_endpoint([92; 32]).await;
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+    let r = build_robot(dir.path(), *robot.id().as_bytes(), true, &[]);
+    for (endpoint, principal) in [
+        (&cloud, PrincipalKind::Cloud),
+        (&human, PrincipalKind::Human),
+    ] {
+        let key = *endpoint.id().as_bytes();
+        r.shared
+            .verify_owner_certificate_and_establish(&owner_certificate(key, principal), &key, T_NOW)
+            .expect("certificate presentation admits the owner device");
+    }
+    r.shared
+        .set_allow_cloud(human.id().as_bytes(), false)
+        .expect("the owner's human device turns cloud access off");
+
+    let (raw_reply, client_error, human_inventory) = with_serving(&r, &robot, async {
+        // 1. A raw ordinary hello in cerud framing (BIG-endian u32 + JSON).
+        let conn = bounded("dial cloud", dial(&cloud, robot_addr.clone(), alpn::OPS))
+            .await
+            .expect("dial");
+        let (mut send, mut recv) = bounded("open_bi", open_frame_stream(&conn))
+            .await
+            .expect("open_bi");
+        let hello = serde_json::to_vec(&Hello::current()).unwrap();
+        bounded(
+            "write len",
+            send.write_all(&(hello.len() as u32).to_be_bytes()),
+        )
+        .await
+        .expect("write len");
+        bounded("write hello", send.write_all(&hello))
+            .await
+            .expect("write hello");
+        let mut len_buf = [0u8; 4];
+        bounded("read len", recv.read_exact(&mut len_buf))
+            .await
+            .expect("read reply len");
+        let mut json = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+        bounded("read json", recv.read_exact(&mut json))
+            .await
+            .expect("read reply json");
+        drop(conn);
+        // 2. The real cerud client over the same plane.
+        let conn = bounded(
+            "dial cloud again",
+            dial(&cloud, robot_addr.clone(), alpn::OPS),
+        )
+        .await
+        .expect("dial");
+        let (send, recv) = bounded("open_bi", open_frame_stream(&conn))
+            .await
+            .expect("open_bi");
+        let ops = QuicOpsStream::new(send, recv);
+        let client_error = bounded(
+            "cloud client",
+            tokio::task::spawn_blocking(move || OpsClient::connect_current(ops).err()),
+        )
+        .await
+        .expect("join");
+        drop(conn);
+        // 3. Positive control: the owner's human device on the same robot.
+        let inventory = run_client(&human, robot_addr.clone(), |c| {
+            c.call("inventory", serde_json::json!({}))
+        })
+        .await;
+        (json, client_error, inventory)
+    })
+    .await;
+
+    match serde_json::from_slice::<HandshakeReply>(&raw_reply).expect("one cerud reply frame") {
+        HandshakeReply::Reject { message, .. } => {
+            assert!(
+                message.contains("allow-from-cloud switch is off"),
+                "{message}"
+            )
+        }
+        other => panic!("a cloud hello with cloud access off was answered {other:?}"),
+    }
+    match client_error {
+        Some(CerudError::HandshakeRejected { reason, .. }) => {
+            assert!(
+                reason.contains("allow-from-cloud switch is off"),
+                "{reason}"
+            )
+        }
+        other => panic!("the cerud client was not rejected: {other:?}"),
+    }
+    assert!(
+        human_inventory.is_ok(),
+        "the owner's human device still runs inventory: {human_inventory:?}"
+    );
+}
