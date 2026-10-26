@@ -599,9 +599,12 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # on any `rerun` feature change.
 re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
 
-# A FORK of iceoryx2 0.10.0 removing the process umask from
-# `UnixDatagramSocket::bind` (iceoryx2-bb-posix) and fixing the macOS shm
-# descriptor table (iceoryx2-pal-posix, below).
+# A FORK of iceoryx2 0.10.0 with three fixes: it removes the process umask from
+# `UnixDatagramSocket::bind` (iceoryx2-bb-posix), fixes the macOS shm descriptor
+# table (iceoryx2-pal-posix, below) and initializes the node counter of the
+# global management segment (iceoryx2, below). It also adds the Android support
+# named at the end of this block. The revision is held by the tag
+# `cerulion-pin-282f479b` on the fork, so it does not depend on a branch.
 #
 # `bind` installed a process global umask of `!permission` for the duration of
 # the bind and restored it on scope exit. The umask is per PROCESS, so while one
@@ -651,8 +654,8 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # built outside this workspace keep the released copy; the host's fixed copy
 # recovers on its own.
 #
-# EXIT CONDITION: drop this entry when an iceoryx2 release carries all three
-# fixes.
+# EXIT CONDITION: drop this entry when an iceoryx2 release carries every change
+# this fork revision adds: the three fixes above and the Android support below.
 # THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
 # build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
 # crates.io members keep theirs, and the same types then exist twice. Every
