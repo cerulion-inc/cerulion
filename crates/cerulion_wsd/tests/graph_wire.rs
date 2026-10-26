@@ -21,17 +21,35 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 type Reader = BufReader<tokio::net::unix::OwnedReadHalf>;
 type Writer = tokio::net::unix::OwnedWriteHalf;
 
+/// Removes a test's scratch path (a directory or a file) when dropped, so an
+/// arm that panics before [`Fixture::stop`] leaves nothing behind either.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        // NotFound is the normal case for a socket the daemon already removed.
+        let _ = if self.0.is_dir() {
+            std::fs::remove_dir_all(&self.0)
+        } else {
+            std::fs::remove_file(&self.0)
+        };
+    }
+}
+
+/// Fields drop in declaration order, so `running` drops before the scratch
+/// paths are removed.
 struct Fixture {
     root: PathBuf,
     socket: PathBuf,
     running: RunningWsd,
+    _parent: RemoveOnDrop,
+    _socket: RemoveOnDrop,
 }
 
 impl Fixture {
+    /// Shut the daemon down; dropping `self` then removes the scratch paths.
     async fn stop(mut self) {
         self.running.shutdown().await;
-        let _ = std::fs::remove_dir_all(self.root.parent().expect("workspace parent"));
-        let _ = std::fs::remove_file(self.socket);
     }
 }
 
@@ -47,9 +65,9 @@ fn unique_path(prefix: &str) -> PathBuf {
 /// output `boxes`) and `logger` (input `data`, a schema the camera does not
 /// produce), plus a daemon serving it.
 async fn fixture() -> Fixture {
-    let parent = unique_path("workspace-parent");
-    std::fs::create_dir_all(&parent).expect("workspace parent");
-    let root = workspace::workspace_create(&parent, "test")
+    let parent = RemoveOnDrop(unique_path("workspace-parent"));
+    std::fs::create_dir_all(&parent.0).expect("workspace parent");
+    let root = workspace::workspace_create(&parent.0, "test")
         .expect("workspace")
         .root;
     for (node, ports) in [
@@ -84,6 +102,7 @@ async fn fixture() -> Fixture {
     )
     .expect("graph yaml");
     let socket = unique_path("socket");
+    let socket_guard = RemoveOnDrop(socket.clone());
     let running = daemon::start(WsdConfig {
         socket_path: socket.clone(),
         inspector_program: None,
@@ -95,6 +114,8 @@ async fn fixture() -> Fixture {
         root,
         socket,
         running,
+        _parent: parent,
+        _socket: socket_guard,
     }
 }
 

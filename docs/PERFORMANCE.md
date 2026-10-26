@@ -47,10 +47,8 @@ rep).
 
 The tail: the multi-process cell's p99 is 6.61 µs at 64 B and
 10.45 µs at 16 MiB, within a few multiples of its p50 at every
-size; lockstep mode holds p99 at 15.89 µs at 64 B and
-45.78 µs at 16 MiB with p50s
-5.54 µs and 14.36 µs.
-Both series are in the package.
+size. The [free run against lockstep](#free-run-against-lockstep) table below
+compares the two execution modes on one build.
 
 > **Benchmark configuration.** These are **internal benchmarks**,
 > single-host ping/pong workloads. They are not guarantees and
@@ -100,8 +98,7 @@ divides one quantity by another gets a meaningless number.
 > 6.61 µs at 64 B to
 > 10.45 µs at 16 MiB, against a
 > p50 of 4.07 µs to
-> 4.43 µs. The lockstep series is
-> listed beside it in the package HEADLINE as a diagnostic. Every measured
+> 4.43 µs. Every measured
 > multi-process p99 above is below 20x its own p50.
 
 | Payload | Cerulion (multi-process, free run enabled) p99 | Cerulion (single process) p99 | ROS 2 (defaults) p99 | ROS 2 (composed + intra-process) p99 |
@@ -119,6 +116,72 @@ divides one quantity by another gets a meaningless number.
 
 > **RT-tuned posture.** The fixed100 campaign ran the STOCK posture only
 > (no RT priority, no DMA lock). No RT-tuned rows are published from it.
+
+### Free run against lockstep
+
+A multi-process run free-runs by default; `CERULION_EXECUTION_MODE=lockstep`
+opts out. The table compares the two on the same build and the same machine:
+the multi-process cell (two processes), main `4ff3326d06` with the latency
+ping change from `bbf276489b` applied, on an x86-64 Linux machine (Ubuntu
+22.04, kernel 6.8, performance governor), STOCK posture, recorder ON, fixed
+100 Hz, k=6 per mode with the reps interleaved, 2000 samples per size per rep.
+Every rep of every cell held 100 Hz and no attempt was refused. p50 is the
+median of the six per-rep p50s and p99 is pooled across the six reps (n=12000
+per size).
+
+| Payload | Free run p50 | Lockstep p50 | Free run p99 | Lockstep p99 |
+|---|---|---|---|---|
+| 64 B | 4.23 µs | 5.08 µs | 7.60 µs | 10.47 µs |
+| 256 B | 4.20 µs | 5.03 µs | 6.85 µs | 8.82 µs |
+| 1 KiB | 4.22 µs | 5.05 µs | 7.58 µs | 8.41 µs |
+| 4 KiB | 4.21 µs | 5.05 µs | 7.98 µs | 8.83 µs |
+| 16 KiB | 4.22 µs | 5.09 µs | 8.50 µs | 9.14 µs |
+| 64 KiB | 4.25 µs | 5.10 µs | 7.62 µs | 9.83 µs |
+| 256 KiB | 4.33 µs | 5.27 µs | 7.68 µs | 9.87 µs |
+| 1 MiB | 4.56 µs | 5.44 µs | 9.01 µs | 10.63 µs |
+| 4 MiB | 4.86 µs | 6.02 µs | 10.10 µs | 11.47 µs |
+| 16 MiB | 5.22 µs | 7.22 µs | 12.34 µs | 13.64 µs |
+
+Free run has the lower median and the lower p99 at every size. The lockstep
+median is about 20% higher than free run's from 64 B to 1 MiB, 24% higher at
+4 MiB and 38% higher at 16 MiB. This machine is not the desktop of the
+fixed100 campaign above, so compare within this table, not across tables.
+Package: [campaign directory](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/),
+[HEADLINE.md](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/HEADLINE.md), and
+[provenance](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/PROVENANCE.txt).
+
+### macOS two-process data wake
+
+On macOS 14.4 and later a producer's publish rings a shared-memory wake word
+that a parked consumer in another process is kernel-blocked on, so a
+two-process hop wakes on the data rather than on the park's recheck timer
+([`deployment_tuning.md`](deployment_tuning.md), "macOS data-wake doorbell").
+Measured before and after that change on one Apple M3 Max (16 cores, macOS
+26.0.1): `benches/latency` round trip, quiescent pacing, default settings, no
+pinning, five reps per cell per build with the two builds alternating within
+one session per cell. Before is main `75b487eaa4`; after is `a0b4529fe7`, a
+commit on the pull request that merged as `64fc0de94c`. Four later commits on
+that pull request touched the doorbell and the graph runtime before it merged.
+p50 is the median of the five per-rep p50s and p99 is pooled across the five
+reps. The recorder state of these runs is not recorded. Quiescent pacing is not
+the fixed 100 Hz of the tables above, so compare within this table only.
+
+| Payload | Two-process p50 before | Two-process p50 after | Two-process p99 before | Two-process p99 after | Single-process p50 before | Single-process p50 after |
+|---|---|---|---|---|---|---|
+| 64 B | 70.17 µs | 10.42 µs | 141.54 µs | 28.21 µs | 4.46 µs | 4.50 µs |
+| 4 KiB | 77.75 µs | 12.79 µs | 143.79 µs | 29.83 µs | 4.46 µs | 4.58 µs |
+| 1 MiB | 80.12 µs | 16.14 µs | 152.42 µs | 41.67 µs | 7.25 µs | 7.38 µs |
+
+The two-process median falls 6.7x at 64 B, 6.1x at 4 KiB and 5.0x at 1 MiB,
+with disjoint per-rep ranges. The single-process rows moved by one to three
+ticks of the 24 MHz timebase (41.667 ns per tick), inside overlapping per-rep
+ranges, so no change in either direction is resolved there. The Apple M4 row of the README platform chart was measured before this
+change and has not been re-measured since. Main has also changed the wake path
+since this pair (a publish now rings every topic a graph produces), and that
+build has not been re-measured on macOS. Package:
+[campaign directory](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/),
+[HEADLINE.md](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/HEADLINE.md), and
+[provenance](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/PROVENANCE.txt).
 
 ### ROS 2 over `rmw_cerulion`, in the same harness
 

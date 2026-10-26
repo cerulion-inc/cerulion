@@ -97,7 +97,9 @@
 //! [`FdSource`] for the full contract.
 //!
 //! **The ceiling is a SELECT-path concern only.** The `FD_SETSIZE`
-//! refusal exists because THIS reactor watches fds with `select`/`FD_SET`. The
+//! refusal exists because THIS reactor watches fds with `select`/`FD_SET` on
+//! every target but Linux, where iceoryx2's reactor is epoll and [`classify`]
+//! applies no ceiling ([`WAITSET_SELECTS`]). The
 //! monitor-wait park / barrier idle path
 //! ([`crate::graph::GraphRuntime::monitor_wait_block`]) never reaches this
 //! reactor — it polls each external fd with `poll(2)`, which has NO fd-number
@@ -159,7 +161,8 @@ use crate::transport::CerService;
 ///   REJECTS any raw `>= FD_SETSIZE` (returns `None`) so such an fd can never
 ///   reach `FD_SET`; the production [`classify`] reports it as
 ///   [`FdVerdict::AboveSelectLimit`] on the select path.
-///   This ceiling is enforced ONLY on the select path. The monitor-wait
+///   This ceiling is enforced ONLY on the select path, and only on a
+///   [`WAITSET_SELECTS`] build: on Linux the WaitSet waits with epoll. The monitor-wait
 ///   park / barrier idle path polls each external fd via `poll(2)` (no fd-number
 ///   ceiling), so [`classify`] with `polled_not_selected == true` lets a LIVE high
 ///   fd through — the ceiling refusal is scoped to callers that actually `FD_SET`.
@@ -210,22 +213,29 @@ pub(crate) enum FdVerdict {
     Negative,
     /// `raw >= libc::FD_SETSIZE` (1024) AND the caller SELECTs — HAZARD 2:
     /// out-of-bounds in iceoryx2's unchecked `FD_SET`. Produced ONLY on the select
-    /// path; a `poll(2)` caller (`polled_not_selected == true`) lifts the ceiling
-    /// and falls through to the liveness probe instead.
+    /// path of a [`WAITSET_SELECTS`] build (never on Linux); a `poll(2)` caller
+    /// (`polled_not_selected == true`) lifts the ceiling and falls through to the
+    /// liveness probe instead.
     AboveSelectLimit,
     /// Not a currently-open descriptor (HAZARD 1 — `FileDescriptor::non_owning_new`
     /// / `fcntl F_GETFD` failed). Dead on ANY path.
     Dead,
 }
 
+/// Whether the iceoryx2 [`WaitSet`] of this build waits with `select()`: its
+/// `ipc_threadsafe` reactor is epoll on Linux and `select()` on every other
+/// target. [`classify`] applies the `FD_SETSIZE` ceiling only when it does.
+pub(crate) const WAITSET_SELECTS: bool = !cfg!(target_os = "linux");
+
 /// Classify `raw` as a WaitSet source, splitting the three refusal
 /// causes the test-only `FdSource::non_owning` flattens into one `None`.
 ///
 /// `polled_not_selected` is the caller's contract about HOW the fd will be
 /// watched:
-/// - `false` = the SELECT-backed iceoryx2 [`WaitSet`] (the default live-loop
-///   reactor + every test reactor seam), which cannot watch an fd `>= FD_SETSIZE`
-///   (HAZARD 2 — out-of-bounds `FD_SET`);
+/// - `false` = the iceoryx2 [`WaitSet`] (the default live-loop reactor + every
+///   test reactor seam), which on a [`WAITSET_SELECTS`] build cannot watch an fd
+///   `>= FD_SETSIZE` (HAZARD 2: out-of-bounds `FD_SET`); on Linux it waits with
+///   epoll and takes any live fd;
 /// - `true` = the monitor-wait park / barrier idle path, which polls each fd via
 ///   `poll(2)` and so has NO fd-number ceiling.
 ///
@@ -241,7 +251,8 @@ pub(crate) fn classify(raw: RawFd, polled_not_selected: bool) -> FdVerdict {
     // before `FD_SET`, so an fd at/above FD_SETSIZE is out-of-bounds UB on the
     // select path. The park/barrier path polls via `poll(2)` (no ceiling), so it
     // skips this refusal and lets a live high fd through to the liveness probe.
-    if !polled_not_selected && (raw as usize) >= libc::FD_SETSIZE {
+    // On Linux the WaitSet's reactor is epoll, which has no fd-number ceiling.
+    if WAITSET_SELECTS && !polled_not_selected && (raw as usize) >= libc::FD_SETSIZE {
         return FdVerdict::AboveSelectLimit;
     }
     // HAZARD 1: `non_owning_new` probes `fcntl F_GETFD`, so a dead fd is refused
@@ -258,8 +269,8 @@ impl FdSource {
     ///
     /// Rejects (returns `None`):
     /// - `raw < 0` (not a real fd);
-    /// - `raw >= libc::FD_SETSIZE` (HAZARD 2 — would be out-of-bounds in
-    ///   iceoryx2's `FD_SET`);
+    /// - `raw >= libc::FD_SETSIZE` on a [`WAITSET_SELECTS`] build (HAZARD 2:
+    ///   would be out-of-bounds in iceoryx2's `FD_SET`);
     /// - a `raw` that is not currently a valid open fd (via
     ///   [`FileDescriptor::non_owning_new`], which itself probes `fcntl F_GETFD`).
     ///
@@ -894,10 +905,18 @@ mod tests {
         // as AboveSelectLimit; the poll path (true) FALLS THROUGH to the liveness
         // probe and finds it Usable — the key property.
         let high_alive = HighFd::new(libc::FD_SETSIZE as RawFd + 76);
-        assert!(matches!(
-            classify(high_alive.high, false),
-            FdVerdict::AboveSelectLimit
-        ));
+        if cfg!(target_os = "linux") {
+            // The Linux WaitSet waits with epoll: no ceiling on either path.
+            assert!(matches!(
+                classify(high_alive.high, false),
+                FdVerdict::Usable(_)
+            ));
+        } else {
+            assert!(matches!(
+                classify(high_alive.high, false),
+                FdVerdict::AboveSelectLimit
+            ));
+        }
         assert!(matches!(
             classify(high_alive.high, true),
             FdVerdict::Usable(_)
