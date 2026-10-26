@@ -2641,6 +2641,17 @@ impl GatewayRuntime {
             .unwrap_or(0)
     }
 
+    /// Observable state (Principle #3): the robots whose demand acks the
+    /// DEMANDER counted, SORTED (empty on a pure-egress gateway with no
+    /// ingress). The ack counters say how many answers came; this says who
+    /// gave them.
+    pub fn demand_ack_peers(&self) -> Vec<String> {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.ack_peers())
+            .unwrap_or_default()
+    }
+
     /// Observable state (Principle #3): number of producer identities the DEMANDER
     /// harvested from the announce space (`0` ⇒ its GETs still use the wildcard).
     pub fn harvested_identity_count(&self) -> usize {

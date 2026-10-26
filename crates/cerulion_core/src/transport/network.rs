@@ -1094,6 +1094,8 @@ pub struct DemandGetState {
     /// cumulative replies acking "refused:wire-header" (the producer runs a
     /// build with a different wire header version).
     wire_header_refused_acks: AtomicU64,
+    /// the replying peers whose acks the three counters above counted.
+    ack_peers: Mutex<BTreeSet<String>>,
     /// flood suppression for the wire header refusals this demander receives,
     /// one latch per (replying peer, topic), re-armed by a grant from that peer.
     wire_header_latches: Mutex<KeyedLatches<(String, String)>>,
@@ -1166,11 +1168,36 @@ impl DemandGetState {
         self.wire_header_refused_acks.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): the replying robots whose acks the
+    /// ack counters counted, SORTED. An ack this build does not know names no
+    /// peer, as it is in no counter.
+    pub fn ack_peers(&self) -> Vec<String> {
+        self.ack_peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Tally one demand ack from `peer` (the replying robot). A grant re-arms
     /// that peer's wire header latch for the topic; a wire header refusal is
     /// counted and loud on the first of a run per (peer, topic).
     // hot-path-alloc-ok-fn: cold, one ack per demand GET reply on the control plane.
     fn record_ack(&self, peer: &str, topic: &str, ack: &[u8]) {
+        if ack == ACK_ENABLED
+            || ack == ACK_REFUSED
+            || ack == ACK_REFUSED_WIRE_HEADER
+            || ack == LEGACY_ACK_ENABLED
+        {
+            let mut peers = self
+                .ack_peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !peers.contains(peer) {
+                peers.insert(peer.to_string());
+            }
+        }
         let key = (peer.to_string(), topic.to_string());
         let mut latches = self
             .wire_header_latches
@@ -7165,6 +7192,29 @@ mod tests {
                 n => Err(format!("expected 1 loud refusal, got {n}")),
             }
         });
+    }
+
+    /// The demander names every peer whose ack it counted, once each and
+    /// sorted. An ack it does not count names no peer.
+    #[test]
+    fn the_demander_names_each_peer_whose_ack_it_counted() {
+        let state = DemandGetState::default();
+        assert!(state.ack_peers().is_empty());
+        state.record_ack("go2", "/a", ACK_REFUSED);
+        state.record_ack("alpha", "/a", ACK_ENABLED);
+        state.record_ack("go2", "/b", ACK_REFUSED);
+        state.record_ack("beta", "/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("gamma", "/a", LEGACY_ACK_ENABLED);
+        state.record_ack("newer", "/a", b"something-newer");
+        assert_eq!(
+            state.ack_peers(),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                "go2".to_string(),
+            ]
+        );
     }
 
     /// Two producers on one topic each get their own latch: both refusals are
