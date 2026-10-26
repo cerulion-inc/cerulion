@@ -176,6 +176,7 @@ fn data_only_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

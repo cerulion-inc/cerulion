@@ -128,6 +128,8 @@ pub mod iceoryx_logger;
 // feature) became its first cross-platform consumer. Pure; `os_sync` re-exports
 // it for its own two switches.
 pub(crate) mod kill_switch;
+#[doc(hidden)]
+pub mod oracle_mutant;
 // The env-gated per-stage latency probe shared by the desk daemons
 // (`cerulion-netd`'s ingress + `cerulion-vizd`'s poll/render path). Inert unless
 // `CERULION_H264_LAT_PROBE` is set.
@@ -786,7 +788,18 @@ pub mod wire;
 ///   turns that silent misread into a load refusal naming the rebuild.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 28;
+///
+/// - v29: the `block` credit word ([`credit::CreditShared`]) grows from 24 to
+///   32 bytes with a `released` word at byte 24, the sticky per-consumer slot
+///   release, and the publish increment reads it before counting. A node
+///   library compiles its own copy of that increment (the publisher's) and of
+///   the drain (the subscriber's `BlockProbe`), both reached through the
+///   `CreditWord` the host hands it, so the two copies must agree on the
+///   word's layout. `BackpressureCounters`, held by the same probe, gains
+///   `block_slot_releases_count`.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 29;
 
 // Re-export commonly used types
 #[cfg(unix)]

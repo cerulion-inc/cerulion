@@ -100,6 +100,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -440,6 +441,7 @@ fn default_opener_attaches_to_low_depth_topic() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -635,6 +637,7 @@ fn history_above_input_depth_warns_at_build() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -647,6 +650,7 @@ fn history_above_input_depth_warns_at_build() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -929,6 +933,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -941,6 +946,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1116,6 +1122,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1128,6 +1135,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

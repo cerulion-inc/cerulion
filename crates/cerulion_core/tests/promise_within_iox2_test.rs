@@ -122,6 +122,7 @@ fn promise_graph(producer_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -579,6 +580,7 @@ fn run_drain_promise(steps: usize) -> (u64, u64) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

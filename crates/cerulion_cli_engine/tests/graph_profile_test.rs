@@ -674,6 +674,7 @@ fn thawed_artifact_feeds_auto_partition() {
                 inputs: vec![InputDef {
                     name: "trigger_in".to_string(),
                     source: "ticker/cmd".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

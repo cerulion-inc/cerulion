@@ -189,10 +189,10 @@ pub enum BackpressurePolicy {
     /// each send; the consumer's subscriber decrements it on drain; the
     /// producer's scheduler pre-fire reads the mirror and skips the tick the
     /// moment `outstanding >= depth` (the declared depth IS the input's
-    /// real iceoryx2 queue, no clamp). Requires an
-    /// all-block topic — a MIXED topic (block + non-block consumers) degrades
-    /// its block consumers to `DropOldest` (deferring would starve the
-    /// non-block sibling).
+    /// real iceoryx2 queue, no clamp). Each block consumer has its own
+    /// mirror (its credit slot); the topic's non-block consumers have none and
+    /// receive whatever the producer publishes. A deferred producer defers its
+    /// whole node, every output included.
     Block,
     /// Accept at most one message per N ms, drop extras.
     Sample(u64),
@@ -848,6 +848,12 @@ impl NodeInfo {
     /// trigger flag, etc.). Empty for nodes without `#[input]` attrs.
     pub fn input_meta(&self) -> &[InputMeta] {
         &self.input_meta
+    }
+
+    /// Mutable input metadata, for the graph's per-input overrides
+    /// (`crate::graph::topology::apply_input_backpressure_overrides`).
+    pub(crate) fn input_meta_mut(&mut self) -> &mut [InputMeta] {
+        &mut self.input_meta
     }
 
     /// Read-only access to output metadata. Empty for nodes without

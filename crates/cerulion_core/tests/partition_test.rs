@@ -32,6 +32,7 @@ fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs

@@ -169,10 +169,12 @@ fn fusion_graph(
                 InputDef {
                     name: "cam".to_string(),
                     source: TOPIC_CAM.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "lidar".to_string(),
                     source: TOPIC_LIDAR.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

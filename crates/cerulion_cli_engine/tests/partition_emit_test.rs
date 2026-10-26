@@ -336,6 +336,7 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 inputs: vec![InputDef {
                     name: "trigger_in".to_string(),
                     source: "ticker/cmd".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1497,6 +1498,7 @@ fn inp(name: &str, source: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: source.to_string(),
+        ..Default::default()
     }
 }
 

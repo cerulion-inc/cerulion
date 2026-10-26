@@ -85,7 +85,7 @@ fn await_until(budget: Duration, what: &str, mut cond: impl FnMut() -> bool) {
 /// offsets are not reachable).
 #[test]
 fn the_mapped_layout_is_pinned() {
-    assert_eq!(std::mem::size_of::<CreditShared>(), 24);
+    assert_eq!(std::mem::size_of::<CreditShared>(), 32);
     assert!(std::mem::align_of::<CreditShared>() >= 8);
     assert_eq!(
         CREDIT_BYTES, 64,

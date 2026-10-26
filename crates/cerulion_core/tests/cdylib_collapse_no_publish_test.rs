@@ -165,6 +165,7 @@ fn build_cdylib_collapse_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -177,6 +178,7 @@ fn build_cdylib_collapse_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

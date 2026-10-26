@@ -241,18 +241,9 @@ worth knowing:
   limit the group reaches the whole graph, which is the `--single-process` shape,
   but derived and announced instead of discovered from a dead worker.
 * **A MIXED topic is co-located WHOLE, sibling included.** A topic with one
-  `block` and one `drop_oldest` consumer degrades its `block` consumer to
-  `drop_oldest` at runtime, but that degrade happens strictly LATER than the
-  build-time check that refuses, and it is decided PER PROCESS from the
-  worker's own topology, where a consumer the worker does not own has been
-  filtered out. So the co-location covers the non-`block` siblings too: group
-  only the producer and the `block` consumer, and that worker reads its local
-  flow as all-`block`, INSTALLS the defer, and throttles the producer to the
-  `block` consumer's drain rate (starving the sibling) while
-  `--single-process` degrades and warns. The mixed-topic warn would fire in
-  NEITHER process, so one graph would run two semantics in silence. A
-  hand-written partition that splits a mixed topic's sibling is refused too,
-  with its own diagnosis (that shape BUILDS; it just runs differently).
+  `block` and one `drop_oldest` consumer keeps both in the producer's group,
+  so neither edge pays a cross-process hop. Only the `block` consumer holds a
+  credit slot, so a hand-written partition may put the sibling anywhere.
 * **A `block` input with NO in-graph producer** is untouched here: it is
   refused at graph build with its own message, identically under
   `--single-process`, and there is nothing to co-locate it with.
@@ -266,20 +257,15 @@ hit**:
 
 | Shape of the SPLIT topic | Verdict | Why |
 |---|---|---|
-| exactly one in-graph producer, every consumer `block` | **accepted** | the supervisor mints it a credit word |
+| exactly one in-graph producer | **accepted** | the supervisor mints each split `block` consumer its own credit word; the topic's other consumers need none |
 | two or more in-graph producers | refused | the word counts ONE producer's outstanding frames; two writers would each spend the other's credit |
-| one producer, but the topic also has a non-`block` consumer | refused | `block` is degraded to `drop_oldest` on a mixed topic, so there is no lossless defer left to credit |
 
-The bars are checked in that order, so a topic hitting BOTH is reported as the
-multi-producer one: it is the one an operator cannot fix by moving a node.
-Note that the third row is about the SPLIT `block` edge on a mixed topic; a
-mixed topic's non-`block` sibling being split from the flow is a *different*
-violation with its own diagnosis (every worker builds, and one of them
-silently installs a defer the monolith degrades).
+A topic's non-`block` consumers are never constrained: they hold no credit and
+may sit in any group.
 
 It is a refusal rather than an automatic repair because the only degrade
-available for those two shapes would be silently rewriting `block` to
-`drop_oldest`, i.e. losing data the operator asked to keep.
+available would be silently rewriting `block` to `drop_oldest`, i.e. losing
+data the operator asked to keep.
 
 One residual applies to a split edge exactly as to a co-located one: on a
 `multi_publisher_topics:` topic the credit word counts IN-GRAPH publishes only, so an out-of-graph

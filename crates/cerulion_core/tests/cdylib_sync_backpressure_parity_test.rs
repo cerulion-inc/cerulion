@@ -321,6 +321,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs

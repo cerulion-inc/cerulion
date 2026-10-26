@@ -235,6 +235,13 @@ pub struct CreditEdgePlan {
     pub producer_ranks: Vec<usize>,
     /// The rank owning the consumer.
     pub consumer_rank: usize,
+    /// The consumer input's `block_timeout_ms`, applied by the producer's
+    /// worker. Absent: no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timeout_ms: Option<u64>,
+    /// The producer node id(s), for the release event's attribution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_nodes: Vec<String>,
 }
 
 /// Mint the deployment's [`CreditEdgePlan`] set — one entry per
@@ -253,10 +260,9 @@ pub struct CreditEdgePlan {
 ///   deliberately does not build. Minting one anyway would hand a producer a
 ///   claim another producer can consume between the read and the publish, i.e.
 ///   silent overshoot on an edge declared LOSSLESS (Principle #6).
-/// * **every consumer on the topic is `block`.** A mixed topic already degrades
-///   its `block` consumers to `drop_oldest` (deferring the producer would
-///   starve the non-block sibling), so a word there would describe an
-///   occupancy nothing gates on.
+/// * **the consumer is `block`.** One entry per `block` consumer: each holds
+///   its own slot. The topic's `drop_oldest` and `sample(N)` consumers hold
+///   none and get no entry.
 /// * **the producer's rank differs from the consumer's.** A co-located edge
 ///   keeps its process-local word: zero syscalls, zero `/dev/shm` objects, and
 ///   the identical arithmetic.
@@ -302,7 +308,12 @@ pub fn credit_edges_for(
         let Some(&producer_rank) = node_rank.get(flow.producers[0].as_str()) else {
             continue;
         };
-        for edge in &flow.consumers {
+        for edge in flow.consumers.iter().filter(|c| {
+            matches!(
+                c.policy,
+                cerulion_core::graph::node::BackpressurePolicy::Block
+            )
+        }) {
             let Some(&consumer_rank) = node_rank.get(edge.node_id.as_str()) else {
                 continue;
             };
@@ -333,6 +344,8 @@ pub fn credit_edges_for(
                 depth,
                 producer_ranks: vec![producer_rank],
                 consumer_rank,
+                block_timeout_ms: edge.block_timeout_ms,
+                producer_nodes: flow.producers.clone(),
             });
         }
     }
@@ -570,7 +583,7 @@ pub(crate) fn reconcile_credit_edges(
 /// building anything — while the mint reads the LOADED cdylibs, because the
 /// credit word must stamp the depth the run will really enforce. Both are the
 /// right input for their own job, and a STALE cdylib makes them disagree about
-/// a topic's `is_all_block()`.
+/// which of a topic's consumers are `block`.
 ///
 /// Neither direction is safe to let through, and neither is loud on its own:
 /// an edge accepted but not minted dies in the consumer's worker blaming an
@@ -2828,6 +2841,7 @@ mod tests {
                 .map(|(name, source)| InputDef {
                     name: name.to_string(),
                     source: source.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             outputs: outputs
@@ -2972,11 +2986,11 @@ mod tests {
         );
     }
 
-    /// A MIXED topic (one `block` consumer, one `drop_oldest` sibling) mints
-    /// NOTHING even when split: the `block` consumer there already degrades to
-    /// `drop_oldest`, so a word would describe an occupancy nothing gates on.
+    /// A split MIXED topic (one `block` consumer, one `drop_oldest` sibling)
+    /// mints exactly one word: the `block` consumer's. The sibling holds no
+    /// slot.
     #[test]
-    fn a_split_mixed_topic_mints_nothing() {
+    fn a_split_mixed_topic_mints_one_word_for_the_block_consumer() {
         let config = config_with(vec![
             node("prod", &[], &["out"]),
             node("sink", &[("gate", "prod/out")], &[]),
@@ -2995,11 +3009,15 @@ mod tests {
         let topo = GraphTopology::build(&config, &infos).expect("topology");
         let edges = credit_edges_for(&topo, &ranks(&[("prod", 0), ("sink", 1), ("other", 1)]))
             .expect("mint");
-        assert!(
-            edges.is_empty(),
-            "a mixed topic's `block` consumer degrades to drop_oldest; crediting it would \
-             describe an occupancy nothing gates on, got {edges:?}"
+        assert_eq!(edges.len(), 1, "one word, the block consumer's: {edges:?}");
+        assert_eq!(
+            (
+                edges[0].consumer_node.as_str(),
+                edges[0].consumer_input.as_str()
+            ),
+            ("sink", "gate")
         );
+        assert_eq!(edges[0].producer_nodes, vec!["prod".to_string()]);
     }
 
     /// A MULTI-PRODUCER flow mints NOTHING even when split — the single-producer scope
@@ -3285,6 +3303,8 @@ mod tests {
             depth: 4,
             producer_ranks: producers.to_vec(),
             consumer_rank,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         }
     }
 
@@ -3604,6 +3624,8 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         let a = edge("/a", "sink_a");
         let b = edge("/b", "sink_b");
@@ -3692,6 +3714,8 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         let accepted = vec![edge("/z"), edge("/a"), edge("/m")];
         let one = credit_edge_drift_refusal("g", &accepted, &[]).unwrap();
@@ -3716,6 +3740,8 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         assert_eq!(render_credit_edge_list(&[]), "");
         assert_eq!(
@@ -3868,9 +3894,9 @@ mod tests {
             "the refused split must mint nothing"
         );
 
-        // ---- (f) MIXED topic: refused, and nothing minted. Same producer,
-        // same `block` consumer, one extra `drop_oldest` sibling — so the ONLY
-        // difference from (a) is the conjunct both halves key on.
+        // ---- (f) MIXED topic: accepted, and the `block` consumer's edge is
+        // minted. Same producer, same `block` consumer, one extra
+        // `drop_oldest` sibling, which holds no slot.
         let mixed_config = config_with(vec![
             node("prod", &[], &["out"]),
             node("sink", &[("gate", "prod/out")], &[]),
@@ -3886,13 +3912,16 @@ mod tests {
         mixed_edges.insert("lossy", "/p/prod/out");
         let mixed_split = groups(&[("front", &["prod", "lossy"]), ("back", &["sink"])]);
         validate_partition(&mixed_split, &mixed_config, &mixed_infos, &mixed_edges)
-            .expect_err("a MIXED topic's split `block` edge is not creditable");
+            .expect("a MIXED topic's split `block` edge is creditable");
         let mixed_topo = GraphTopology::build(&mixed_config, &mixed_infos).expect("topology");
-        assert!(
-            credit_edges_for(&mixed_topo, &ranks_from(&mixed_split))
-                .expect("mint")
-                .is_empty(),
-            "the refused split must mint nothing"
+        let minted = credit_edges_for(&mixed_topo, &ranks_from(&mixed_split)).expect("mint");
+        assert_eq!(
+            minted
+                .iter()
+                .map(|e| (e.consumer_node.as_str(), e.consumer_input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("sink", "gate")],
+            "exactly the block consumer's edge is minted"
         );
     }
 
@@ -4447,10 +4476,12 @@ mod tests {
         by_hand.nodes[4].inputs.push(InputDef {
             name: "by_hand".to_string(),
             source: "/p/n0/out".to_string(),
+            ..Default::default()
         });
         by_hand.nodes[4].inputs.push(InputDef {
             name: "cam".to_string(),
             source: "/ext/cam".to_string(),
+            ..Default::default()
         });
         let members = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
         assert_eq!(
@@ -4526,10 +4557,12 @@ mod tests {
                     InputDef {
                         name: "cam".to_string(),
                         source: "/ext/cam".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "tf".to_string(),
                         source: "/tf".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: Vec::new(),
@@ -5647,6 +5680,7 @@ mod tests {
                 .map(|(name, source)| InputDef {
                     name: name.to_string(),
                     source: source.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             outputs: out_topic

@@ -147,6 +147,7 @@ fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "cam/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

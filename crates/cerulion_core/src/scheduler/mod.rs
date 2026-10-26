@@ -27,6 +27,7 @@
 //! - Insertion order = execution order (Principle #5: Graph is source of truth)
 //! - Integer nanosecond arithmetic throughout (no floating-point drift)
 
+pub mod block;
 pub mod catchup_clamp;
 // The clamp's WIRING pins (all three `decide_node` call
 // sites + the once-per-step read). In-crate because two of the three sites are

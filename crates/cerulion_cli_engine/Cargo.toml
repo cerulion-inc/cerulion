@@ -21,6 +21,8 @@ include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 workspace = true
 
 [features]
+# Forwards cerulion_core's oracle mutants (see that crate's feature).
+oracle-mutants = ["cerulion_core/oracle-mutants"]
 # Exposes the forge-shaped `auth::seed_logged_in_at` test-provisioning
 # helper (writes a logged-in-ever auth.json). NOT enabled by default, so a shipped
 # binary linking this lib carries no one-call "mint a passing login gate" surface;

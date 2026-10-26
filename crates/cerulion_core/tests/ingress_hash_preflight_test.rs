@@ -70,6 +70,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
             inputs: vec![InputDef {
                 name: input_name.to_string(),
                 source: INGRESS_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

@@ -231,6 +231,7 @@ fn node(id: &str, node_type: &str, source: Option<String>, output: bool) -> Node
                 vec![InputDef {
                     name: "inp".to_string(),
                     source,
+                    ..Default::default()
                 }]
             })
             .unwrap_or_default(),
@@ -712,6 +713,7 @@ fn a_fatal_sync_node_stops_while_both_upstreams_keep_publishing() {
         .map(|name| InputDef {
             name: (*name).to_string(),
             source: format!("p{name}/out"),
+            ..Default::default()
         })
         .collect();
     let nodes = vec![

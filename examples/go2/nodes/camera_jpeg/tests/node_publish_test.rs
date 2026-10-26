@@ -204,6 +204,7 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
             inputs: vec![InputDef {
                 name: "h264".to_string(),
                 source: h264_topic.to_string(),
+                ..Default::default()
             }],
             outputs: vec![OutputDef {
                 name: "jpeg".to_string(),

@@ -168,6 +168,7 @@ fn ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -396,6 +397,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC_ZETA.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -408,6 +410,7 @@ fn ws_multi_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC_ALPHA.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -625,6 +628,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC_MIXED.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -637,6 +641,7 @@ fn ws_mixed_variant_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC_MIXED.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

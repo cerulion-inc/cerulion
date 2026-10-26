@@ -358,6 +358,7 @@ fn validator_inert_when_macro_emits_data_trigger() {
                 inputs: vec![InputDef {
                     name: "count".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

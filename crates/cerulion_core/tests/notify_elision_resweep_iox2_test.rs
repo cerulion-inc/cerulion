@@ -152,6 +152,7 @@ fn build_offgate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -240,6 +241,7 @@ fn build_ongate_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

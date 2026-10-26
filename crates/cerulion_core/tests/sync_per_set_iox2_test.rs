@@ -180,10 +180,12 @@ fn pair_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -214,14 +216,17 @@ fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
                 InputDef {
                     name: "cam".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "lidar".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "imu".to_string(),
                     source: TOPIC_C.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -937,14 +942,17 @@ fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "cfg".to_string(),
                     source: TOPIC_C.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1324,10 +1332,12 @@ fn closure_sync_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1561,10 +1571,12 @@ fn degraded_sync_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

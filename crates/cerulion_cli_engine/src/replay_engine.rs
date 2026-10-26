@@ -4100,7 +4100,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             // `build_pass_runtime` moves the entries into the runtime — the
             // candidate's side of the re-derivation comparison, and where each
             // input's consume mode + depth come from.
-            let (node_infos, node_info_notes) = collect_pass_node_infos(plan, &factories);
+            let (node_infos, node_info_notes) = collect_pass_node_infos(plan, &factories, &config);
             let pass = PassInputs {
                 plan,
                 is_last_pass: pass_idx == last_pass,
@@ -10867,7 +10867,7 @@ fn plan_bag_side_admissions(
                     read: decoded.read,
                 });
         }
-        let (node_infos, _notes) = collect_pass_node_infos(plan, factories);
+        let (node_infos, _notes) = collect_pass_node_infos(plan, factories, config);
         // The table is built PER RANK because the wiring answer reads this rank's
         // own declared node metadata. The topic a blocked input consumes is the
         // one `consumed` names it under, which is also the only vocabulary the
@@ -12395,6 +12395,7 @@ fn plan_pass_admission(
 fn collect_pass_node_infos(
     plan: &RankPlan,
     factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    config: &GraphConfig,
 ) -> (
     IndexMap<String, cerulion_core::graph::NodeInfo>,
     Vec<RederivationNote>,
@@ -12437,6 +12438,15 @@ fn collect_pass_node_infos(
                 }
             }
         }
+    }
+    // The graph's per-input `backpressure:` / `depth:` keys, as the replayed
+    // runtime applies them at its own build.
+    if let Err(e) = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut out,
+        cerulion_core::graph::topology::MissingInputMeta::Skip,
+    ) {
+        tracing::warn!(error = %e, "replay: the graph's per-input backpressure keys did not apply");
     }
     (out, notes)
 }
@@ -16965,6 +16975,7 @@ mod node_trigger_decl_tests {
             .map(|n| InputDef {
                 name: n.to_string(),
                 source: format!("/{n}"),
+                ..Default::default()
             })
             .collect()
     }

@@ -95,6 +95,7 @@ fn build_for_test_synthesizes_binding_from_macro_data_trigger() {
                 inputs: vec![InputDef {
                     name: "count".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -177,6 +178,7 @@ fn macro_data_trigger_consumer_fires_when_source_publishes() {
                 inputs: vec![InputDef {
                     name: "count".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -302,6 +304,7 @@ fn build_fails_when_macro_data_trigger_input_loops_to_self() {
             inputs: vec![InputDef {
                 name: "self_loop".to_string(),
                 source: "looper/out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![OutputDef {
                 name: "out".to_string(),
@@ -375,6 +378,7 @@ fn build_fails_when_macro_data_trigger_loops_to_own_overridden_output() {
             inputs: vec![InputDef {
                 name: "self_loop".to_string(),
                 source: "/loop_tf".to_string(),
+                ..Default::default()
             }],
             outputs: vec![OutputDef {
                 name: "out".to_string(),
@@ -477,10 +481,12 @@ fn name_mismatch_error_lists_existing_yaml_inputs() {
                     InputDef {
                         name: "tally".to_string(),
                         source: "src/tally_out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "total".to_string(),
                         source: "src/total_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

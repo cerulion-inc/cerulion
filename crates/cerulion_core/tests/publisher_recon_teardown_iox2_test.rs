@@ -168,6 +168,7 @@ fn recon_graph(prefix: &str) -> GraphConfig {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "recon_xz_prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

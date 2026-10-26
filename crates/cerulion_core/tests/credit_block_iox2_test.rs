@@ -291,6 +291,7 @@ fn topic_in(name: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: TOPIC.to_string(),
+        ..Default::default()
     }
 }
 
@@ -389,6 +390,8 @@ fn binding(
         producer_slot: role
             .is_producer()
             .then(|| cerulion_core::credit::ProducerSlot::new(0)),
+        block_timeout_ms: None,
+        producer_nodes: Vec::new(),
     }
 }
 
@@ -1676,6 +1679,7 @@ fn crediting_one_producer_less_block_input_does_not_exempt_its_neighbour() {
                 vec![InputDef {
                     name: "other".to_string(),
                     source: OTHER_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 vec![],
             ),
@@ -1750,6 +1754,8 @@ fn a_binding_over_a_local_word_does_not_buy_the_exemption() {
         word: CreditWord::local(DEPTH as u32),
         // A pure CONSUMER binding: no producer half, therefore no slot.
         producer_slot: None,
+        block_timeout_ms: None,
+        producer_nodes: Vec::new(),
     }];
     let err = build_err(
         GraphRuntime::build_live_free_run(
@@ -2097,15 +2103,11 @@ fn a_binding_on_an_input_declared_non_block_is_refused_loudly() {
     );
 }
 
-/// A binding on a LOCALLY MIXED topic is refused.
-///
-/// A mixed topic degrades its `block` consumers to `drop_oldest` (deferring the
-/// producer would starve the non-block sibling). A bound edge there would defer
-/// the peer producer on behalf of a consumer that is meanwhile DROPPING — both
-/// halves of the mixed-topic rule broken at once.
+/// A binding on a LOCALLY MIXED topic builds: the `block` consumer holds its
+/// own slot (the bound word) and the `drop_oldest` sibling holds none.
 #[test]
 #[serial]
-fn a_binding_on_a_locally_mixed_topic_is_refused_loudly() {
+fn a_binding_on_a_locally_mixed_topic_wires_the_block_consumer() {
     let ix = cerulion_core::testing::iceoryx_test_config();
     let w = supervisor_word("mixed", "consumer", "inp", DEPTH as u32);
     let clock = Arc::new(VirtualClock::new());
@@ -2131,23 +2133,20 @@ fn a_binding_on_a_locally_mixed_topic_is_refused_loudly() {
         DEPTH,
         CreditRole::Consumer,
     )];
-    let err = build_err(
-        GraphRuntime::build_live_free_run(
-            cfg,
-            fac,
-            &mgr,
-            Arc::clone(&clock) as Arc<dyn Clock>,
-            None,
-            cerulion_core::MonitorWaitPolicy::off(),
-            CrossProcessWiring::with_credit(None, &bind),
-        ),
-        "a credit binding on a locally MIXED topic must be refused",
-    );
-    assert_names(
-        &err.to_string(),
-        &["MIXED", "drop_oldest", TOPIC, "own topic"],
-        "mixed-topic",
-    );
+    let rt = GraphRuntime::build_live_free_run(
+        cfg,
+        fac,
+        &mgr,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        None,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("a credit binding on a mixed topic wires the block consumer");
+    let credits: Vec<_> = rt.block_credits().collect();
+    assert_eq!(credits.len(), 1, "one slot: the block consumer's");
+    assert_eq!(credits[0].consumer_node, "consumer");
+    assert!(credits[0].mapped, "and it is the bound cross-process word");
 }
 
 /// ANTI-TAUTOLOGY for every refusal above, and the arm that proves the
@@ -2377,6 +2376,8 @@ fn prc_a_local_producer_edge_never_joins_the_park_watch_list() {
         role: CreditRole::Producer,
         word: CreditWord::local(DEPTH as u32),
         producer_slot: Some(cerulion_core::credit::ProducerSlot::new(0)),
+        block_timeout_ms: None,
+        producer_nodes: Vec::new(),
     }];
     let (_mgr, rt) = producer_ctx("cbpsl", &ix, "cb_parkset_l", &clock, &bind);
     assert_eq!(

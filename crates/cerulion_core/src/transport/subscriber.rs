@@ -232,7 +232,7 @@ enum BackpressureProbe {
     /// spot what iceoryx2 reclaimed on overflow.
     DropOldest(DropOldestProbe),
     /// `block` consumer-side event probe (see [`BlockProbe`]): installed on
-    /// `block` consumers on all-`block` topics; holds the shared
+    /// `block` consumers; holds the shared
     /// `outstanding` mirror (each drain decrements it, saturating) plus the
     /// threshold + edge state to fire the consumer's event at the defer
     /// line.
@@ -2176,7 +2176,7 @@ impl CerulionSubscriber {
     }
 
     /// `block`: install the consumer-side probe. Called by the graph
-    /// runtime for `block` consumers on all-`block` topics. The `outstanding`
+    /// runtime for `block` consumers. The `outstanding`
     /// `Arc` is the same one registered on the producer's publisher (publish
     /// increment) + its pre-fire check (fullness read); `counters` is the same
     /// set the producer bumps on defer (the event only reads it).

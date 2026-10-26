@@ -287,6 +287,7 @@ fn in_process_chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "ticker/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -335,6 +336,7 @@ fn consumer_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -654,6 +656,7 @@ fn mixed_rank_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "ticker/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -666,6 +669,7 @@ fn mixed_rank_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -853,6 +857,7 @@ fn sync_input_rank_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "ticker/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -866,10 +871,12 @@ fn sync_input_rank_graph(
                     InputDef {
                         name: "local".to_string(),
                         source: "ticker/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "outside".to_string(),
                         source: EXT_TOPIC.to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -1016,6 +1023,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: FEED.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -2740,6 +2748,7 @@ mod box_same_core {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: PING_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "out".to_string(),

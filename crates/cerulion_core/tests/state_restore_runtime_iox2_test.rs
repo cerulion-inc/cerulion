@@ -275,6 +275,7 @@ fn counter_graph(prefix: &str) -> GraphConfig {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "counter/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

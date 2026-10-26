@@ -165,14 +165,17 @@ fn build_graph(
                     InputDef {
                         name: "cam".to_string(),
                         source: TOPIC_CAM.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "lidar".to_string(),
                         source: TOPIC_LIDAR.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "config".to_string(),
                         source: TOPIC_CONFIG.to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -192,6 +195,7 @@ fn build_graph(
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "fuse/fused".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -556,14 +560,17 @@ fn build_seq_graph(
                     InputDef {
                         name: "cam".to_string(),
                         source: TOPIC_CAM.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "lidar".to_string(),
                         source: TOPIC_LIDAR.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "config".to_string(),
                         source: TOPIC_CONFIG.to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -583,6 +590,7 @@ fn build_seq_graph(
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "fuse/fused".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

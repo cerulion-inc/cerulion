@@ -149,10 +149,12 @@ fn graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

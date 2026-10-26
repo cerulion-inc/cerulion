@@ -467,18 +467,22 @@ fn run_freeze(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, [u64; 4])> 
             InputDef {
                 name: "a".to_string(),
                 source: "pa/out".to_string(),
+                ..Default::default()
             },
             InputDef {
                 name: "b".to_string(),
                 source: "pb/out".to_string(),
+                ..Default::default()
             },
             InputDef {
                 name: "c".to_string(),
                 source: "pc/out".to_string(),
+                ..Default::default()
             },
             InputDef {
                 name: "d".to_string(),
                 source: "pd/out".to_string(),
+                ..Default::default()
             },
         ],
         outputs: vec![],
@@ -916,6 +920,7 @@ fn run_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntry> {
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: "feeder/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     });
@@ -1130,6 +1135,7 @@ fn run_block_under_parallel(prefix: &str, threads: &str, steps: u32, extra: usiz
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: "bprod/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     });
@@ -1274,6 +1280,7 @@ fn run_two_block_pairs(prefix: &str, threads: &str, steps: u32) -> Vec<TraceEntr
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: src.to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     };
@@ -1431,6 +1438,7 @@ fn interleaved_gated_node_merges_in_decision_order() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "p0/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1632,6 +1640,7 @@ fn wide_rayon_level_stamps_nonzero_global_level() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "src/out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         });

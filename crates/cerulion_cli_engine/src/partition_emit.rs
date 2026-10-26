@@ -1281,9 +1281,8 @@ fn derive_partition(
             preview,
             "  (co-located because crossing a process boundary costs a real hop; a split \
              `block` edge is legal only where the supervisor can mint it a cross-process \
-             credit word — one in-graph producer, no non-`block` consumers. The non-`block` \
-             siblings join too, or the worker would read its flow as all-`block` and INSTALL \
-             a defer that `--single-process` degrades)"
+             credit word: one in-graph producer. The non-`block` siblings join too, which \
+             keeps the hop off their edges)"
         );
     }
     let _ = writeln!(preview);

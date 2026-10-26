@@ -743,14 +743,14 @@ pub const REMEDY_SINGLE_PROCESS: &str = "running `--single-process`";
 /// observe; the CROSS-PROCESS form — one `MappedCredit` SHM page both address
 /// spaces operate on, carried by `crate::credit::CreditWord` — makes a SPLIT
 /// edge lossless, and the supervisor mints one for every CREDITABLE topic
-/// (exactly one in-graph producer, no non-`block` consumers:
+/// (exactly one in-graph producer and at least one `block` consumer:
 /// [`crate::graph::topology::TopicFlow::credit_bar`]). A hand-written `process_groups:` splitting such
-/// an edge is therefore ACCEPTED; splitting any other `block` topic's flow is
+/// an edge is therefore ACCEPTED; splitting a multi-producer `block` edge is
 /// still refused pre-spawn, naming the bar it hit.
 ///
-/// The constraint covers the WHOLE flow — producers AND every consumer, `block`
-/// or not. See [`block_colocation_seeds`] for why the non-`block` siblings of a
-/// MIXED topic are not optional.
+/// The derivation co-locates the WHOLE flow (producers AND every consumer,
+/// `block` or not) to keep the hop off the edge; a non-`block` consumer in
+/// another group is legal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockColocationSeed {
     /// The resolved topic name.
@@ -763,8 +763,7 @@ pub struct BlockColocationSeed {
     pub block_consumers: Vec<(String, String)>,
     /// Every OTHER `(node, input)` consuming this topic (graph order) — the
     /// non-`block` siblings that make the topic MIXED. Empty on an all-`block`
-    /// topic, and the reason a mixed topic's group is the whole flow: see
-    /// [`block_colocation_seeds`].
+    /// topic. The derivation co-locates them to keep the hop off their edges.
     pub other_consumers: Vec<(String, String)>,
     /// Whether this topic's `block` edges can carry a
     /// cross-process credit word, and if not, why.
@@ -811,45 +810,13 @@ impl BlockColocationSeed {
 
 /// Every co-location constraint this graph's topology carries.
 ///
-/// # The predicate is `has_block_consumer()`, NOT `is_all_block()`
+/// # The predicate is `has_block_consumer()`
 ///
-/// The gate that refuses is PER CONSUMER (`GraphTopology::validate`:
-/// `matches!(c.policy, Block) && flow.producers.is_empty()`) and knows nothing
-/// about mixedness. `is_all_block()` is consulted only LATER, at the runtime's
-/// defer-INSTALL site, which degrades a mixed topic's `block` consumers to
-/// `drop_oldest` with a warn — so on a split mixed topic the degrade can never
-/// rescue anything, because the build is already dead.
-///
-/// It is worse than symmetric: in the consumer's worker subgraph the SIBLING
-/// `drop_oldest` consumer is a foreign node and is dropped, so LOCALLY the flow
-/// reads as all-block with no producer. Global mixedness is structurally
-/// invisible to the check that refuses. Seeding on `is_all_block()` would
-/// therefore leave a legal, documented, separately-tested shape (one `block` +
-/// one `drop_oldest` consumer on one topic) falling straight through into the
-/// exact defect this constraint exists to close.
-///
-/// # The seed is the WHOLE flow — every consumer, not just the `block` ones
-///
-/// Seeding producers + `block` consumers ALONE is not merely a smaller group,
-/// it is a DIFFERENT RUN. That same worker-local invisibility cuts the other
-/// way: co-locate `{producer, block consumer}` and leave the `drop_oldest`
-/// sibling in its own group, and the co-located worker's `TopicFlow` reads
-/// consumers = `[block]` ⇒ `is_all_block()` TRUE ⇒ the runtime INSTALLS the
-/// defer mirror (`runtime.rs`, the `!flow.is_all_block()` gate), while the
-/// monolith and `--single-process` see the mixed flow and DEGRADE `block` to
-/// `drop_oldest` with a warn. The degrade warn then fires in NO process (the
-/// co-located worker is locally all-block; the sibling's worker sees no `block`
-/// consumer at all), so the divergence is silent, and the producer is throttled
-/// to the `block` consumer's drain rate — starving the sibling, which is
-/// exactly the starvation `TopicFlow::is_all_block`'s decision K exists to
-/// prevent. `--record` then captures a different stream per mode from one
-/// graph.
-///
-/// So the seed takes EVERY consumer of a `block`-carrying flow. That makes the
-/// worker's LOCAL mixedness equal the graph's GLOBAL mixedness, so the worker
-/// degrades exactly like the monolith. The cost is a marginally larger group on
-/// a topic whose `block` is degraded anyway; the alternative was not a smaller
-/// group, it was two modes of one graph disagreeing in silence.
+/// A flow seeds when it carries at least one `block` consumer and an in-graph
+/// producer. The seed takes EVERY consumer of that flow, `block` or not, so
+/// the derived partition keeps the whole flow in one process and no edge of it
+/// pays a cross-process hop. Non-`block` consumers are not needed for
+/// correctness: they hold no credit slot.
 ///
 /// A flow with NO in-graph producer is skipped: there is nothing to co-locate
 /// WITH, and such a graph is refused at build with its own specific message,
@@ -1020,11 +987,10 @@ fn seed_and_repair_block_colocation(
              process group. `block` defers the producer's tick through a PROCESS-LOCAL \
              mirror, and crossing a process boundary costs a real hop, so the derivation \
              keeps the flow together. A hand-written split is not automatically refused: \
-             where the topic is CREDITABLE (one in-graph producer, no non-`block` \
-             consumers) the supervisor mints it a cross-process credit word and it runs \
+             where the topic is CREDITABLE (one in-graph producer) the supervisor mints \
+             each split `block` consumer a cross-process credit word and it runs \
              losslessly. Any `mixed_siblings` (non-`block` consumers of the same topic) \
-             join the group too: a worker that cannot SEE them reads its flow as \
-             all-`block` and installs the defer where the monolith degrades it"
+             join the group too, which keeps the hop off their edge"
         );
         for &m in &members[1..] {
             uf.union(first, m);
@@ -2142,35 +2108,17 @@ pub fn validate_partition(
 /// # The predicate is the same one the DERIVATION seeds on
 ///
 /// `has_block_consumer() && !producers.is_empty()`, over the WHOLE flow — see
-/// [`block_colocation_seeds`] for why it is not `is_all_block()` and why the
-/// non-`block` siblings are not optional. The two halves MUST agree: a refusal
+/// [`block_colocation_seeds`]. The two halves MUST agree: a refusal
 /// predicate NARROWER than the seed's would refuse partitions the derivation
 /// itself produces, and a WIDER one would let a shape the derivation declines
 /// to co-locate die in the worker.
 ///
-/// # The two violations are DIFFERENT faults and say so
+/// # Non-`block` consumers are not constrained
 ///
-/// A split producer↔`block`-consumer edge KILLS the consumer's worker at build
-/// (a `Block` consumer on a locally producer-less topic). A split MIXED sibling
-/// does the opposite: every worker builds, and the one holding the producer and
-/// the `block` consumer reads its local flow as all-`block`, INSTALLS the defer
-/// mirror, and throttles the producer to the `block` consumer's drain rate —
-/// starving the sibling — while `--single-process` degrades to `drop_oldest`
-/// with a warn. The degrade warn fires in NO process, so one graph runs two
-/// semantics in silence. Same remedies, different cause: reporting the
-/// build-death text for a shape that builds fine would send the operator
-/// looking for a crash that never happens.
-///
-/// They also take OPPOSITE remedies. Either endpoint of a split `block` edge
-/// may move, but a split MIXED sibling has its producer and `block` consumer
-/// already together — so moving the PRODUCER to the sibling's group splits that
-/// edge and is refused in turn. Only the sibling may move.
-///
-/// And a `BlockEdge` violation is the HEADLINE wherever it was found: the
-/// per-seed ordering below is followed by a global stable partition, because a
-/// mixed sibling on an earlier topic would otherwise headline a refusal whose
-/// diagnosis says every worker builds while a later split `block` edge kills
-/// one.
+/// A `drop_oldest` or `sample(N)` consumer of the same topic holds no credit
+/// slot, so it may sit in any group: the producer defers on the `block`
+/// consumers' slots only, wherever they live, and the other consumers read
+/// whatever the producer publishes.
 ///
 /// A flow with NO in-graph producer is SKIPPED. Such a graph is already refused
 /// at build with its own specific message, identically under
@@ -2204,17 +2152,13 @@ fn validate_block_colocation(
     }
     let mut violations: Vec<BlockColocationViolation> = Vec::new();
     for seed in block_colocation_seeds(topo) {
-        // BLOCK edges before siblings WITHIN a seed. This ordering alone is not
-        // enough — see the global stable partition below.
+        // Only `block` edges: a non-`block` consumer of the same topic holds
+        // no credit and may sit in any process.
         let block_pairs = seed
             .block_consumers
             .iter()
             .map(|edge| (edge, BlockColocationKind::BlockEdge));
-        let sibling_pairs = seed
-            .other_consumers
-            .iter()
-            .map(|edge| (edge, BlockColocationKind::MixedSibling));
-        for ((consumer, input), kind) in block_pairs.chain(sibling_pairs) {
+        for ((consumer, input), kind) in block_pairs {
             for producer in &seed.producers {
                 if producer == consumer {
                     continue;
@@ -2257,7 +2201,6 @@ fn validate_block_colocation(
                         }
                         Some(bar) => BlockColocationViolationKind::BlockEdge { bar: bar.clone() },
                     },
-                    BlockColocationKind::MixedSibling => BlockColocationViolationKind::MixedSibling,
                 };
                 let line = match kind {
                     BlockColocationKind::BlockEdge => format!(
@@ -2265,23 +2208,11 @@ fn validate_block_colocation(
                          `block` input '{consumer}.{input}' (group '{cg}')",
                         seed.topic
                     ),
-                    BlockColocationKind::MixedSibling => format!(
-                        "topic '{}': producer '{producer}' (group '{pg}') is split from its \
-                         non-`block` consumer '{consumer}.{input}' (group '{cg}') on a topic \
-                         that ALSO carries `block` input(s) {}",
-                        seed.topic,
-                        seed.block_consumers
-                            .iter()
-                            .map(|(c, i)| format!("'{c}.{i}'"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
                 };
                 violations.push(BlockColocationViolation {
                     kind: vkind,
                     line,
                     topic: seed.topic.clone(),
-                    producer: producer.clone(),
                     consumer: consumer.clone(),
                     input: input.clone(),
                     producer_group: pg.to_string(),
@@ -2319,18 +2250,7 @@ fn validate_block_colocation(
     // credited set are now returned TOGETHER and the caller chooses.
     credited.sort();
     credited.dedup();
-    // A `BlockEdge` violation is the headline WHEREVER it was found, not merely
-    // wherever it beat a sibling inside its own seed. Ordering block-first per
-    // seed is not enough: a MIXED sibling on an EARLIER topic would otherwise
-    // claim the headline, and its diagnosis says every worker builds — while
-    // the later split `block` edge kills one. Report the arm an operator can
-    // act on. A STABLE partition, so all violations survive and graph order is
-    // preserved within each class; the FIRST record is therefore always the
-    // headline's own line.
-    let (mut ordered, siblings): (Vec<_>, Vec<_>) = violations
-        .into_iter()
-        .partition(|v| matches!(v.kind, BlockColocationViolationKind::BlockEdge { .. }));
-    ordered.extend(siblings);
+    let ordered = violations;
     let more = if ordered.len() > 1 {
         format!(
             "\n  (and {} more split `block`-topic edge(s):\n  - {})",
@@ -2348,7 +2268,6 @@ fn validate_block_colocation(
         kind,
         line: headline,
         topic,
-        producer,
         consumer,
         input,
         producer_group: pg,
@@ -2367,31 +2286,10 @@ fn validate_block_colocation(
          entirely also works: the derived partition co-locates a `block` topic's whole flow \
          automatically"
     );
-    // The remedy ladder is NOT shared, because option (a) is DIRECTIONAL and
-    // the two kinds point OPPOSITE ways.
-    //
-    // On a `BlockEdge` violation either endpoint may move: the two groups hold
-    // one end each, so joining them fixes it whichever way round it is done.
-    //
-    // On a `MixedSibling` violation they do NOT. `pg` already holds the
-    // producer AND its `block` consumer(s) — it must, or this violation would
-    // have been a `BlockEdge` one and the ordering above would have made THAT
-    // the headline — while `cg` holds only the non-`block` sibling. So moving
-    // the PRODUCER into `cg` splits the very `block` edge this partition
-    // currently has intact, and the result is refused again on the next
-    // validation. Only moving the SIBLING (or the whole flow together) fixes
-    // it, and the message says which way and why.
     let remedies = match kind {
         BlockColocationViolationKind::BlockEdge { .. } => format!(
             "Fix by (a) {REMEDY_CO_LOCATE} — move EVERY producer of '{topic}' into group \
              '{cg}' with '{consumer}' (or '{consumer}' into '{pg}') — {tail}"
-        ),
-        BlockColocationViolationKind::MixedSibling => format!(
-            "Fix by (a) {REMEDY_CO_LOCATE} — move '{consumer}' into group '{pg}', which \
-             already holds '{producer}' and its `block` input(s) {block_input_list}, so the \
-             whole flow ends up in ONE group. Do NOT move '{producer}' into '{cg}' instead: \
-             that would SPLIT the `block` edge this partition currently has intact, and the \
-             result is refused in turn — {tail}"
         ),
     };
     let reason = match &kind {
@@ -2400,26 +2298,13 @@ fn validate_block_colocation(
              `block` defers the producer's tick through a mirror the consumer's subscriber \
              decrements. A SPLIT edge can carry that mirror in shared memory — a \
              cross-process credit word — but only for a topic with exactly ONE in-graph \
-             producer and NO non-`block` consumers, and {}. So this mirror stays \
+             producer, and {}. So this mirror stays \
              PROCESS-LOCAL: a producer in another OS process can never observe \
              '{consumer}.{input}''s queue, and the worker owning '{consumer}' would refuse \
              to build. Rewriting it to `drop_oldest` would silently LOSE data, so this is \
              refused instead. {remedies}",
             headline,
             render_credit_bar(&topic, bar)
-        ),
-        BlockColocationViolationKind::MixedSibling => format!(
-            "this partition SPLITS a MIXED `block` topic's non-`block` consumer from the \
-             rest of its flow:\n  - {}{more}\n  A topic carrying BOTH `block` and non-`block` \
-             consumers degrades its `block` consumers to `drop_oldest` — deferring the \
-             producer would starve the non-`block` sibling. That degrade is decided PER \
-             PROCESS from the worker's OWN topology, and a worker cannot see a consumer it \
-             does not own: split like this, the worker holding '{producer}' reads its flow \
-             as all-`block`, INSTALLS the defer, and throttles '{producer}' to the `block` \
-             consumer's drain rate — starving '{consumer}.{input}' — while \
-             `--single-process` degrades and warns. The mixed-topic warn fires in NEITHER \
-             process, so one graph would run two semantics in silence. {remedies}",
-            headline
         ),
     };
     BlockColocationOutcome {
@@ -2525,10 +2410,6 @@ enum BlockColocationKind {
     /// A producer split from a `block` consumer: the consumer's worker cannot
     /// build.
     BlockEdge,
-    /// A MIXED topic's non-`block` consumer split from the flow: every worker
-    /// builds, and the one holding the `block` consumer silently installs a
-    /// defer the monolith degrades.
-    MixedSibling,
 }
 
 /// A RECORDED violation's kind. The `BlockEdge` arm carries its
@@ -2539,7 +2420,6 @@ enum BlockColocationKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BlockColocationViolationKind {
     BlockEdge { bar: CreditBar },
-    MixedSibling,
 }
 
 /// The clause naming WHY a split `block` edge could not be credited.
@@ -2556,15 +2436,6 @@ fn render_credit_bar(topic: &str, bar: &CreditBar) -> String {
         CreditBar::MultipleProducers(n) => format!(
             "topic '{topic}' has {n} in-graph producers, and a credit word counts ONE \
              producer's outstanding frames — two writers would each spend the other's credit"
-        ),
-        CreditBar::MixedTopic { .. } => format!(
-            "topic '{topic}' ALSO carries non-`block` consumer(s) {}, which degrade its \
-             `block` consumers to `drop_oldest` — there is no lossless defer left to credit",
-            bar.siblings()
-                .iter()
-                .map(|e| format!("'{e}'"))
-                .collect::<Vec<_>>()
-                .join(" / ")
         ),
         CreditBar::NoInGraphProducer => {
             format!("topic '{topic}' has no in-graph producer, so there is nothing to defer")
@@ -2585,7 +2456,6 @@ struct BlockColocationViolation {
     /// This violation's own rendered bullet.
     line: String,
     topic: String,
-    producer: String,
     consumer: String,
     input: String,
     producer_group: String,
@@ -2606,7 +2476,6 @@ impl BlockColocationViolation {
             BlockColocationViolationKind::BlockEdge { bar } => {
                 format!("{} — {}", self.line, render_credit_bar(&self.topic, bar))
             }
-            BlockColocationViolationKind::MixedSibling => self.line.clone(),
         }
     }
 }
@@ -3209,6 +3078,7 @@ mod block_colocation_tests {
         InputDef {
             name: name.to_string(),
             source: source.to_string(),
+            ..Default::default()
         }
     }
 
@@ -3566,6 +3436,7 @@ mod block_colocation_tests {
             input: "inp".to_string(),
             policy,
             depth: 4,
+            block_timeout_ms: None,
         };
         TopicFlow {
             topic: "/t".to_string(),
@@ -3591,7 +3462,7 @@ mod block_colocation_tests {
     /// `is_all_block()` was false).
     ///
     /// The bar VALUE is asserted, not just its presence: a classifier that
-    /// always answered `MixedTopic` satisfies a totality-only check.
+    /// always answered one bar satisfies a totality-only check.
     #[test]
     fn the_credit_bar_answers_every_flow_shape_and_names_the_right_bar() {
         for producers in 0..=3 {
@@ -3602,8 +3473,6 @@ mod block_colocation_tests {
                         // No in-graph producer: nothing to defer, and
                         // `validate` refuses `block` here with its own message.
                         (0, _, _) => Some(CreditBar::NoInGraphProducer),
-                        // Multi-producer OUTRANKS the mixed bar: it is the one
-                        // an operator cannot fix by moving a node.
                         (n, _, _) if n > 1 => Some(CreditBar::MultipleProducers(n)),
                         // One producer and NO `block` consumer — whether or
                         // not non-`block` ones exist. There is nothing to
@@ -3613,14 +3482,10 @@ mod block_colocation_tests {
                         // correction; the cube previously CODIFIED the wrong
                         // answer at `(1, 0, >0)`.)
                         (_, 0, _) => Some(CreditBar::NoBlockConsumer),
-                        // One producer, `block` consumer(s) AND a non-`block`
-                        // sibling ⇒ MIXED, naming every sibling in graph order.
-                        (_, _, o) if o > 0 => Some(CreditBar::MixedTopic {
-                            first: "o0.inp".to_string(),
-                            rest: (1..o).map(|i| format!("o{i}.inp")).collect(),
-                        }),
-                        // THE creditable shape, at 1 and at N block consumers
-                        // (the mint emits one word per consumer).
+                        // THE creditable shape: one producer and at least one
+                        // `block` consumer, whatever the other consumers
+                        // declare (the mint emits one word per `block`
+                        // consumer).
                         _ => None,
                     };
                     assert_eq!(
@@ -3641,7 +3506,7 @@ mod block_colocation_tests {
                     // still means what the mint used to mean.
                     assert_eq!(
                         flow.is_creditable(),
-                        flow.producers.len() == 1 && flow.is_all_block(),
+                        flow.producers.len() == 1 && flow.has_block_consumer(),
                         "creditability must equal the mint's own condition at \
                          producers={producers} block={block} other={other}"
                     );
@@ -3660,7 +3525,7 @@ mod block_colocation_tests {
     /// answer to equal the flow's.
     #[test]
     fn the_seed_stamps_the_flows_own_credit_bar() {
-        // One creditable topic, one mixed, one multi-producer — all three seeded.
+        // One plain topic, one mixed, one multi-producer: all three seeded.
         let config = multi_publisher_listed_config_of(
             vec![
                 node("prod", vec![], vec![out("clean"), out("mixed")]),
@@ -3711,15 +3576,14 @@ mod block_colocation_tests {
         // And the three answers really are different, or the arm above would
         // pass against a constructor that stamped `None` on everything.
         let bars: Vec<Option<&CreditBar>> = seeds.iter().map(|s| s.credit_bar()).collect();
+        // The mixed topic is creditable now (its `block` consumer holds its own
+        // slot), so two of the three seeds answer `None`.
         assert!(
-            bars.contains(&None)
-                && bars
-                    .iter()
-                    .any(|b| matches!(b, Some(CreditBar::MixedTopic { .. })))
+            bars.iter().filter(|b| b.is_none()).count() == 2
                 && bars
                     .iter()
                     .any(|b| matches!(b, Some(CreditBar::MultipleProducers(2)))),
-            "the fixture must exercise all three answers; got {bars:?}"
+            "the fixture must exercise both answers; got {bars:?}"
         );
     }
 
@@ -3775,18 +3639,19 @@ mod block_colocation_tests {
         // believed it and overwrote a legal hand-written split with no warning
         // naming what it replaced — silent loss of the operator's own choice.
         //
-        // The refused half is a MIXED `block` topic: one producer whose topic
-        // carries BOTH a `block` consumer and a non-`block` sibling, split. Its
-        // `block` consumers degrade to `drop_oldest`, so there is no lossless
-        // defer left to credit and the walk refuses it. It shares no topic, no
-        // node and no edge with the creditable one above.
-        let mixed_cfg = config_of(vec![
-            node("prod", vec![], vec![out("cmd")]),
-            node("cons", vec![inp("gate", "prod/cmd")], vec![]),
-            node("prod2", vec![], vec![out("tele")]),
-            node("blocker", vec![inp("gate2", "prod2/tele")], vec![]),
-            node("lossy", vec![inp("watch", "prod2/tele")], vec![]),
-        ]);
+        // The refused half is a MULTI-PRODUCER `block` topic split from its
+        // consumer, which the walk refuses. It shares no topic, no node and no
+        // edge with the creditable one above.
+        let mixed_cfg = multi_publisher_listed_config_of(
+            vec![
+                node("prod", vec![], vec![out("cmd")]),
+                node("cons", vec![inp("gate", "prod/cmd")], vec![]),
+                node("prod2", vec![], vec![out_at("tele", "/shared")]),
+                node("prod3", vec![], vec![out_at("tele", "/shared")]),
+                node("blocker", vec![inp("gate2", "/shared")], vec![]),
+            ],
+            &["/shared"],
+        );
         let mut mx_infos: IndexMap<String, NodeInfo> = IndexMap::new();
         mx_infos.insert("prod".to_string(), NodeInfo::with_meta(vec![], vec![]));
         mx_infos.insert(
@@ -3794,25 +3659,18 @@ mod block_colocation_tests {
             NodeInfo::with_meta(vec![meta("gate", true, BackpressurePolicy::Block)], vec![]),
         );
         mx_infos.insert("prod2".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        mx_infos.insert("prod3".to_string(), NodeInfo::with_meta(vec![], vec![]));
         mx_infos.insert(
             "blocker".to_string(),
             NodeInfo::with_meta(vec![meta("gate2", true, BackpressurePolicy::Block)], vec![]),
         );
-        mx_infos.insert(
-            "lossy".to_string(),
-            NodeInfo::with_meta(
-                vec![meta("watch", true, BackpressurePolicy::DropOldest)],
-                vec![],
-            ),
-        );
         let mut mx_edges = TriggerEdges::new();
         mx_edges.insert("cons", "/p/prod/cmd");
-        mx_edges.insert("blocker", "/p/prod2/tele");
-        mx_edges.insert("lossy", "/p/prod2/tele");
+        mx_edges.insert("blocker", "/shared");
         let mut mx_groups: IndexMap<String, Vec<String>> = IndexMap::new();
         mx_groups.insert(
             "front".to_string(),
-            vec!["prod".to_string(), "prod2".to_string(), "lossy".to_string()],
+            vec!["prod".to_string(), "prod2".to_string(), "prod3".to_string()],
         );
         mx_groups.insert(
             "back".to_string(),
@@ -3826,7 +3684,7 @@ mod block_colocation_tests {
         let outcome = validate_block_colocation(&mx_groups, &mx_topo);
         assert!(
             outcome.verdict.is_err(),
-            "precondition: the MIXED-topic split must be REFUSED, or this test \
+            "precondition: the multi-producer split must be REFUSED, or this test \
              proves nothing"
         );
         // THE POINT: the credited edge survives that refusal.
@@ -3878,10 +3736,8 @@ mod block_colocation_tests {
             vec![("s1", "g1"), ("s2", "g2")]
         );
 
-        // REFUSED BY THE CO-LOCATION WALK (a MIXED split) ⇒ none. This is the
-        // half of the documented scope that IS enforced here; a partition
-        // refused for a STRUCTURAL reason still reports its creditable edges,
-        // which the fn's doc states rather than pretends otherwise.
+        // A MIXED split: the `block` consumer's edge is credited, the
+        // `drop_oldest` sibling's is not.
         let mixed = config_of(vec![
             node("prod", vec![], vec![out("cmd")]),
             node("blocker", vec![inp("gate", "prod/cmd")], vec![]),
@@ -3909,9 +3765,12 @@ mod block_colocation_tests {
             vec!["prod".to_string(), "lossy".to_string()],
         );
         mixed_groups.insert("back".to_string(), vec!["blocker".to_string()]);
-        assert!(
+        assert_eq!(
             creditable_split_block_edges(&mixed_groups, &mixed, &mixed_infos, &mixed_edges)
-                .is_empty()
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>(),
+            vec!["/p/prod/cmd -> blocker.gate (front -> back)".to_string()]
         );
     }
 
@@ -3926,7 +3785,7 @@ mod block_colocation_tests {
     /// was a statement about the WORD — a process-local heap cell one address
     /// space cannot show another — and 2d changed which words exist. The shape
     /// it uses is EXACTLY the mint's (`credit_edges_for`: one in-graph
-    /// producer, `is_all_block()`, consumer rank != producer rank), which is
+    /// producer, a `block` consumer, consumer rank != producer rank), which is
     /// why it flips and the multi-producer twin below does not.
     #[test]
     fn a_hand_written_partition_that_splits_a_creditable_block_edge_is_accepted() {
@@ -4063,10 +3922,6 @@ mod block_colocation_tests {
             msg.contains("has 2 in-graph producers"),
             "the refusal must name the actual bar and its COUNT; got: {msg}"
         );
-        assert!(
-            !msg.contains("ALSO carries non-`block` consumer(s)"),
-            "the MIXED bar is the wrong diagnosis for a multi-producer edge; got: {msg}"
-        );
         // WHOLE SENTENCES. Every needle above sits inside ONE unbroken
         // segment, which is how this literal shipped carrying runs of 13-22
         // embedded spaces mid-sentence (a botched line-join baked the
@@ -4074,9 +3929,8 @@ mod block_colocation_tests {
         // a string's contents). A needle spanning a clause boundary fails on a
         // re-break, so these are what pin the RENDERED text.
         for sentence in [
-            "A SPLIT edge can carry that mirror in shared memory — a cross-process credit \
-             word — but only for a topic with exactly ONE in-graph producer and NO \
-             non-`block` consumers",
+            "A SPLIT edge can carry that mirror in shared memory",
+            "but only for a topic with exactly ONE in-graph producer, and topic",
             "Rewriting it to `drop_oldest` would silently LOSE data, so this is refused \
              instead.",
             "Deleting the `process_groups:` block entirely also works: the derived partition \
@@ -4089,12 +3943,10 @@ mod block_colocation_tests {
         }
     }
 
-    /// The OTHER still-refused shape gets the OTHER sentence: a split
-    /// `block` edge on a MIXED topic is refused because the degrade leaves no
-    /// lossless defer to credit — and the message names the sibling that
-    /// caused it, which is the node the operator has to move.
+    /// A split `block` edge on a MIXED topic is credited: the `block`
+    /// consumer holds its own slot, and the `drop_oldest` sibling holds none.
     #[test]
-    fn a_split_block_edge_on_a_mixed_topic_is_refused_naming_the_sibling_that_bars_credit() {
+    fn a_split_block_edge_on_a_mixed_topic_is_credited() {
         let config = config_of(vec![
             node("prod", vec![], vec![out("cmd")]),
             node("blocker", vec![inp("gate", "prod/cmd")], vec![]),
@@ -4122,16 +3974,15 @@ mod block_colocation_tests {
             vec!["prod".to_string(), "lossy".to_string()],
         );
         groups.insert("back".to_string(), vec!["blocker".to_string()]);
-        let msg = validate_partition(&groups, &config, &infos, &edges)
-            .expect_err("a MIXED topic's split block edge is not creditable")
-            .to_string();
-        assert!(
-            msg.contains("ALSO carries non-`block` consumer(s) 'lossy.watch'"),
-            "the mixed bar must name the sibling the operator has to move; got: {msg}"
-        );
-        assert!(
-            !msg.contains("in-graph producers"),
-            "the multi-producer bar is the wrong diagnosis here; got: {msg}"
+        validate_partition(&groups, &config, &infos, &edges)
+            .expect("a mixed topic's split block edge is creditable");
+        assert_eq!(
+            creditable_split_block_edges(&groups, &config, &infos, &edges)
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>(),
+            vec!["/p/prod/cmd -> blocker.gate (front -> back)".to_string()],
+            "the block consumer gets its own credit word; the sibling gets none"
         );
     }
 
@@ -4253,60 +4104,11 @@ mod block_colocation_tests {
         validate_partition(&groups, &config, &infos, &edges).expect("co-located ⇒ valid");
     }
 
-    /// The refusal predicate MUST match the seed's: a MIXED block topic split
-    /// across groups is refused too, because the gate that kills the worker is
-    /// per-consumer and never sees the mixedness.
+    /// A partition that keeps the `block` edge together and puts the MIXED
+    /// topic's NON-`block` sibling in another group is legal: the sibling holds
+    /// no credit slot, and the producer defers on `blocker`'s slot alone.
     #[test]
-    fn a_split_mixed_block_topic_is_refused_too() {
-        let config = config_of(vec![
-            node("prod", vec![], vec![out("cmd")]),
-            node("blocker", vec![inp("gate", "prod/cmd")], vec![]),
-            node("lossy", vec![inp("watch", "prod/cmd")], vec![]),
-        ]);
-        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
-        infos.insert("prod".to_string(), NodeInfo::with_meta(vec![], vec![]));
-        infos.insert(
-            "blocker".to_string(),
-            NodeInfo::with_meta(vec![meta("gate", true, BackpressurePolicy::Block)], vec![]),
-        );
-        infos.insert(
-            "lossy".to_string(),
-            NodeInfo::with_meta(
-                vec![meta("watch", true, BackpressurePolicy::DropOldest)],
-                vec![],
-            ),
-        );
-        let mut edges = TriggerEdges::new();
-        edges.insert("blocker", "/p/prod/cmd");
-        edges.insert("lossy", "/p/prod/cmd");
-        let mut groups: IndexMap<String, Vec<String>> = IndexMap::new();
-        groups.insert(
-            "front".to_string(),
-            vec!["prod".to_string(), "lossy".to_string()],
-        );
-        groups.insert("back".to_string(), vec!["blocker".to_string()]);
-        let err = validate_partition(&groups, &config, &infos, &edges)
-            .expect_err("a split MIXED block topic must be refused too");
-        let msg = err.to_string();
-        assert!(msg.contains("blocker.gate"), "got: {msg}");
-        assert!(
-            msg.contains("SPLITS a `block` edge across process groups"),
-            "the ROOT fault here is the split block edge, so that is the diagnosis; got: {msg}"
-        );
-    }
-
-    /// A partition that keeps the `block` edge together but splits the MIXED
-    /// topic's NON-`block` sibling is refused too — and with its OWN diagnosis.
-    ///
-    /// This shape BUILDS on every worker, which is exactly why it needs the
-    /// refusal: the worker holding `{prod, blocker}` sees consumers =
-    /// `[blocker(Block)]`, reads `is_all_block()` TRUE, and INSTALLS the defer
-    /// mirror, while the monolith sees the mixed flow and degrades to
-    /// `drop_oldest` with a warn. The mixed-topic warn fires in NEITHER process
-    /// (the other worker has no `block` consumer at all), so one graph runs two
-    /// semantics silently and `lossy` is throttled to `blocker`'s drain rate.
-    #[test]
-    fn a_split_mixed_sibling_is_refused_with_its_own_diagnosis() {
+    fn a_split_non_block_sibling_of_a_mixed_topic_is_accepted() {
         let config = config_of(vec![
             node("prod", vec![], vec![out("cmd")]),
             node("blocker", vec![inp("gate", "prod/cmd")], vec![]),
@@ -4334,177 +4136,11 @@ mod block_colocation_tests {
             vec!["prod".to_string(), "blocker".to_string()],
         );
         groups.insert("back".to_string(), vec!["lossy".to_string()]);
-        let err = validate_partition(&groups, &config, &infos, &edges)
-            .expect_err("a split MIXED sibling must be refused");
-        let msg = err.to_string();
-        for needle in [
-            "/p/prod/cmd",
-            "lossy.watch",
-            "blocker.gate",
-            "'front'",
-            "'back'",
-            REMEDY_CO_LOCATE,
-            REMEDY_SINGLE_PROCESS,
-        ] {
-            assert!(
-                msg.contains(needle),
-                "the refusal must name `{needle}`; got: {msg}"
-            );
-        }
+        validate_partition(&groups, &config, &infos, &edges)
+            .expect("a non-block sibling may sit in any group");
         assert!(
-            msg.contains("INSTALLS the defer"),
-            "it must name the DIVERGENCE (a worker installing what the monolith degrades); \
-             got: {msg}"
-        );
-        assert!(
-            msg.contains("in NEITHER process"),
-            "it must say the degrade warn fires nowhere, which is why this is silent; got: {msg}"
-        );
-        // The DISCRIMINATOR: every worker here BUILDS, so borrowing the split
-        // block edge's text would send the operator hunting a crash that never
-        // happens.
-        assert!(
-            !msg.contains("would refuse to build"),
-            "a split sibling builds fine — it must not claim a build death; got: {msg}"
-        );
-        // THE REMEDY DIRECTION. 'front' already holds the producer AND the
-        // `block` consumer; 'back' holds only the sibling. So the fix is to
-        // move the SIBLING — telling the operator to move the PRODUCER instead
-        // splits the `block` edge that is currently intact and the partition is
-        // refused again on the next validation. A remedy that leaves the user
-        // no better off is the misleading-surface class, not a nit.
-        assert!(
-            msg.contains("move 'lossy' into group 'front'"),
-            "the remedy must move the SIBLING into the producer's group; got: {msg}"
-        );
-        assert!(
-            !msg.contains("move 'prod' into group 'back'"),
-            "the remedy must NOT offer to move the producer into the sibling's group — that \
-             SPLITS the intact `block` edge; got: {msg}"
-        );
-        assert!(
-            msg.contains("Do NOT move 'prod' into 'back'"),
-            "it must say WHY the other direction is wrong, not merely omit it; got: {msg}"
-        );
-    }
-
-    /// A split `block` edge is the HEADLINE wherever it is found — including on
-    /// a LATER topic than a mixed-sibling violation.
-    ///
-    /// Block-before-sibling ordering inside one seed is not enough: the mixed
-    /// topic here is enumerated FIRST (asserted, so this arm cannot go vacuous
-    /// if topology order ever changes), and its diagnosis claims every worker
-    /// builds — while `blocker_z`'s worker, split from its producer, dies at
-    /// build. The refusal must report the arm the operator can act on, and
-    /// still list both.
-    ///
-    /// Credit exemption (C5) RE-TARGET: the later topic must now be MULTI-PRODUCER,
-    /// or its split edge is credited and there is no `BlockEdge` violation
-    /// left to headline. The ordering claim under test is unchanged.
-    #[test]
-    fn a_split_block_edge_outranks_an_earlier_topics_mixed_sibling_as_the_headline() {
-        let config = multi_publisher_listed_config_of(
-            vec![
-                node("prod", vec![], vec![out("aaa"), out_at("zzz", "/zzz")]),
-                node("blocker_a", vec![inp("gate", "prod/aaa")], vec![]),
-                node("lossy_a", vec![inp("watch", "prod/aaa")], vec![]),
-                node("prod_z2", vec![], vec![out_at("zzz", "/zzz")]),
-                node("blocker_z", vec![inp("gate", "/zzz")], vec![]),
-            ],
-            &["/zzz"],
-        );
-        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
-        for p in ["prod", "prod_z2"] {
-            infos.insert(p.to_string(), NodeInfo::with_meta(vec![], vec![]));
-        }
-        for b in ["blocker_a", "blocker_z"] {
-            infos.insert(
-                b.to_string(),
-                NodeInfo::with_meta(vec![meta("gate", true, BackpressurePolicy::Block)], vec![]),
-            );
-        }
-        infos.insert(
-            "lossy_a".to_string(),
-            NodeInfo::with_meta(
-                vec![meta("watch", true, BackpressurePolicy::DropOldest)],
-                vec![],
-            ),
-        );
-        let mut edges = TriggerEdges::new();
-        edges.insert("blocker_a", "/p/prod/aaa");
-        edges.insert("lossy_a", "/p/prod/aaa");
-        edges.insert("blocker_z", "/zzz");
-
-        // PRECONDITION, asserted rather than assumed: the MIXED topic really is
-        // enumerated first, so a per-seed-only ordering really would headline
-        // the sibling.
-        let (topo, _) = build_global(&config, &infos, &edges).expect("topology");
-        let seeds = block_colocation_seeds(&topo);
-        assert_eq!(
-            seeds.iter().map(|s| s.topic.as_str()).collect::<Vec<_>>(),
-            vec!["/p/prod/aaa", "/zzz"],
-            "this arm needs the MIXED topic enumerated FIRST or it proves nothing"
-        );
-        // SECOND precondition (credit exemption): the later edge must be one the
-        // credit exemption REJECTS, or this arm silently becomes a test that
-        // no violation is reported at all.
-        assert!(
-            seeds[1].credit_bar().is_some(),
-            "the headline edge must be uncreditable or there is nothing to headline"
-        );
-
-        // front holds the mixed topic's block edge INTACT (prod + blocker_a);
-        // back splits the OTHER topic's block edge and holds the sibling.
-        let mut groups: IndexMap<String, Vec<String>> = IndexMap::new();
-        groups.insert(
-            "front".to_string(),
-            vec![
-                "prod".to_string(),
-                "blocker_a".to_string(),
-                "prod_z2".to_string(),
-            ],
-        );
-        groups.insert(
-            "back".to_string(),
-            vec!["lossy_a".to_string(), "blocker_z".to_string()],
-        );
-        let msg = validate_partition(&groups, &config, &infos, &edges)
-            .expect_err("both violations must refuse")
-            .to_string();
-        // `to_string()` prefixes the error kind, so match the headline clause
-        // rather than the start of the string — and pair it with the ABSENCE of
-        // the sibling headline, which is the real discriminator (the sibling's
-        // BULLET is expected below; only its HEADLINE must be gone).
-        assert!(
-            msg.contains("this partition SPLITS a `block` edge across process groups"),
-            "the BLOCK EDGE is the headline even though the mixed topic sorts first; got: {msg}"
-        );
-        assert!(
-            !msg.contains("SPLITS a MIXED"),
-            "the mixed sibling must NOT headline — it sorts first but every worker builds \
-             under it, while the later split `block` edge kills one; got: {msg}"
-        );
-        assert!(
-            msg.contains("would refuse to build"),
-            "the headline must be the build-death diagnosis; got: {msg}"
-        );
-        // Both survive, and the headline's own bullet leads.
-        assert!(
-            msg.contains("blocker_z.gate") && msg.contains("lossy_a.watch"),
-            "every violation must still be listed; got: {msg}"
-        );
-        // TWO more, not one: `/zzz` now has two producers (the C5 re-target),
-        // and the inner loop records one violation PER producer — so the tail
-        // carries the second producer's split edge as well as the sibling.
-        assert!(
-            msg.contains("(and 2 more split `block`-topic edge(s)"),
-            "the second producer's edge and the sibling must both ride the 'more' list; \
-             got: {msg}"
-        );
-        let head = msg.split("(and 2 more").next().expect("head");
-        assert!(
-            head.contains("blocker_z.gate") && !head.contains("lossy_a.watch"),
-            "the headline's own bullet must be the BLOCK EDGE's line; got: {msg}"
+            creditable_split_block_edges(&groups, &config, &infos, &edges).is_empty(),
+            "the block edge is not split, so nothing is credited"
         );
     }
 

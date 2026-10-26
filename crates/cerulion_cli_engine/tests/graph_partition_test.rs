@@ -2187,7 +2187,7 @@ fn the_consent_preview_frames_co_location_as_a_preference_not_a_refusal() {
         "the preview must frame it as a PREFERENCE; preview:\n{preview}"
     );
     assert!(
-        preview.contains("one in-graph producer, no non-`block` consumers"),
+        preview.contains("credit word: one in-graph producer"),
         "and name the split shape that IS legal; preview:\n{preview}"
     );
     assert!(

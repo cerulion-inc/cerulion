@@ -190,6 +190,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
             inputs: vec![InputDef {
                 name: "tf".to_string(),
                 source: TF_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

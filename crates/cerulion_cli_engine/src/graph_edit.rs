@@ -226,11 +226,13 @@ pub fn graph_wire(
     config.nodes[to_index].inputs.push(InputDef {
         name: to.port.clone(),
         source,
+        ..Default::default()
     });
     validate_after_edit(&config)?;
     let written = InputDef {
         name: to.port.clone(),
         source: source_as_written,
+        ..Default::default()
     };
     let out = splice_add_input(&raw, to_index, &written)?;
     commit(workspace, graph, &raw, out, &config, Vec::new())
@@ -822,6 +824,7 @@ mod tests {
         InputDef {
             name: name.to_string(),
             source: source.to_string(),
+            ..Default::default()
         }
     }
 

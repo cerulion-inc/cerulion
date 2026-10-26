@@ -338,9 +338,8 @@ pub struct CerulionPublisher {
     /// every subscriber's queue), decremented on the consumer's
     /// [`CerulionSubscriber`] drain. The producer's scheduler pre-fire
     /// check reads these to defer the moment any consumer's queue is
-    /// full. Empty unless the graph runtime wired this publisher's topic
-    /// as all-`block` (mixed topics degrade to native drop_oldest and
-    /// install no counter). The frame is never buffered or copied here —
+    /// full. One word per `block` consumer of the topic; the topic's other
+    /// consumers hold none. The frame is never buffered or copied here:
     /// this is a plain atomic mirror, not a data path.
     block_outstanding: Vec<crate::credit::CreditWord>,
     /// Shared `last_publish_ns` anchor for this output's
@@ -2127,7 +2126,7 @@ impl CerulionPublisher {
         // send path, and every frame entering subscriber queues MUST bump the
         // outstanding mirror, else a future `block` topic publishing via the
         // flatten-into-loan path would silently overflow (Principle #6).
-        // No-op (empty `block_outstanding` vec) unless the topic is all-block.
+        // No-op (empty `block_outstanding` vec) unless the topic has a `block` consumer.
         self.record_block_published();
         // A frame went out — reset the output's `promise_within_ms` watchdog
         // (no-op unless one is wired), symmetric with `publish_raw`.
@@ -2216,7 +2215,7 @@ impl CerulionPublisher {
         // mirror; the graph build warns against `block` + `history_size > 0`
         // for exactly this reason. This counts live sends + genuine raw-FFI
         // re-publishes only.)
-        // No-op (empty `block_outstanding` vec) unless the topic is all-block.
+        // No-op (empty `block_outstanding` vec) unless the topic has a `block` consumer.
         self.record_block_published();
         // A frame went out — reset the output's
         // `promise_within_ms` watchdog (no-op unless one is wired).

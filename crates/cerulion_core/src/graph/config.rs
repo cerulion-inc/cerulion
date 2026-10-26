@@ -564,6 +564,10 @@ struct EgressTopicMap {
     external: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     send_queue: Option<NonZeroUsize>,
+    /// Accepted only as `drop_oldest`, which is what network egress always
+    /// does; `block` is refused at parse, by name.
+    #[serde(default, skip_serializing)]
+    backpressure: Option<InputBackpressure>,
 }
 
 impl Serialize for EgressTopic {
@@ -576,6 +580,7 @@ impl Serialize for EgressTopic {
                 reliability: self.reliability,
                 external: self.external,
                 send_queue: self.send_queue,
+                backpressure: None,
             }
             .serialize(serializer)
         }
@@ -602,6 +607,15 @@ impl<'de> Deserialize<'de> for EgressTopic {
             ) -> Result<EgressTopic, A::Error> {
                 let m =
                     EgressTopicMap::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                if m.backpressure == Some(InputBackpressure::Block) {
+                    return Err(serde::de::Error::custom(format!(
+                        "network egress topic '{}' sets `backpressure: block`, which network \
+                         egress cannot honour: the gateway's zenoh put never blocks and drops \
+                         under congestion, so no credit can reach the producer from another \
+                         host. Remove the key (egress is always `drop_oldest`)",
+                        m.topic
+                    )));
+                }
                 Ok(EgressTopic {
                     topic: m.topic,
                     reliability: m.reliability,
@@ -875,11 +889,48 @@ pub fn scalar_param_value(value: &serde_yaml::Value) -> Option<String> {
 ///
 /// `#[serde(deny_unknown_fields)]`: a misspelled key is a loud parse error,
 /// never a silently dropped setting — see [`GraphConfig`] for the rationale.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// The three optional keys set this edge's backpressure from the graph
+/// instead of the node's `#[input(...)]` attribute; each key present wins over
+/// the attribute's value. `block_timeout_ms` is legal only on an edge whose
+/// effective policy is `block`.
+///
+/// ```yaml
+/// inputs:
+///   - name: cmd
+///     source: /planner/cmd
+///     backpressure: block
+///     depth: 4
+///     block_timeout_ms: 250
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputDef {
     pub name: String,
     pub source: String,
+    /// `block` or `drop_oldest`; absent keeps the node's declared policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<InputBackpressure>,
+    /// The input's queue depth (1 to 64); absent keeps the node's declared
+    /// depth. Under `block` it is also the defer line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// Under `block`: release this consumer's slot once it has stayed full,
+    /// with nothing drained, for this many milliseconds. Absent: the producer
+    /// stays deferred until the consumer drains or dies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timeout_ms: Option<u64>,
+}
+
+/// The backpressure policy a graph's `inputs[].backpressure` key names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBackpressure {
+    /// Evict the oldest queued frame when the queue is full; never defers the
+    /// producer.
+    DropOldest,
+    /// Defer the producer while this consumer's queue is at depth.
+    Block,
 }
 
 /// Default buffer size when graph YAML omits `max_slice_len:` AND
@@ -1022,6 +1073,62 @@ mod network_block_tests {
     //! so they carry no hostname/prefix-defaulting dependency — the field
     //! mapping and mode-string parsing are pinned in isolation.
     use super::*;
+
+    /// The per-input backpressure keys parse, and serialize back only when
+    /// set.
+    #[test]
+    fn input_backpressure_keys_parse_and_round_trip() {
+        let yaml = r#"
+prefix: robo
+nodes:
+  - id: sink
+    type: sink
+    inputs:
+      - name: cmd
+        source: /planner/cmd
+        backpressure: block
+        depth: 4
+        block_timeout_ms: 250
+      - name: plain
+        source: /planner/plain
+"#;
+        let config: GraphConfig = serde_yaml::from_str(yaml).unwrap();
+        let i = &config.nodes[0].inputs[0];
+        assert_eq!(i.backpressure, Some(InputBackpressure::Block));
+        assert_eq!((i.depth, i.block_timeout_ms), (Some(4), Some(250)));
+        let plain = &config.nodes[0].inputs[1];
+        assert_eq!(
+            (plain.backpressure, plain.depth, plain.block_timeout_ms),
+            (None, None, None)
+        );
+        let out = serde_yaml::to_string(&config.nodes[0].inputs[1]).unwrap();
+        assert!(
+            !out.contains("backpressure") && !out.contains("depth"),
+            "{out}"
+        );
+        let bad = yaml.replace("backpressure: block", "backpressure: wedge");
+        assert!(serde_yaml::from_str::<GraphConfig>(&bad).is_err());
+    }
+
+    /// `backpressure: block` on a network egress entry is refused by name;
+    /// `drop_oldest` (what egress always does) is accepted.
+    #[test]
+    fn block_on_network_egress_is_refused_at_parse() {
+        let yaml = |bp: &str| {
+            format!(
+                "prefix: robo\nnodes: []\nnetwork:\n  mode: peer\n  egress:\n    - topic: /robo/cmd\n      backpressure: {bp}\n"
+            )
+        };
+        let err = serde_yaml::from_str::<GraphConfig>(&yaml("block"))
+            .expect_err("block on egress must be refused")
+            .to_string();
+        assert!(
+            err.contains("network egress topic '/robo/cmd'") && err.contains("backpressure: block"),
+            "{err}"
+        );
+        let ok: GraphConfig = serde_yaml::from_str(&yaml("drop_oldest")).unwrap();
+        assert_eq!(ok.network.unwrap().egress[0].topic, "/robo/cmd");
+    }
 
     /// A no-`network:` YAML parses to `network == None` AND leaves every
     /// other field untouched (the byte-identical-when-absent contract).

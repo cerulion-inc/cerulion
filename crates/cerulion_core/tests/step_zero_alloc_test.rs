@@ -967,6 +967,7 @@ fn build_gated_runtime() -> GraphRuntime {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "feeder/bp_out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         },

@@ -75,6 +75,10 @@ pub struct BackpressureCounters {
     /// concurrent reader may transiently see this one ahead of
     /// `block_fires_deferred_count`; at quiescence it is `<=` that count.
     pub block_defer_regimes_count: AtomicU64,
+    /// Number of times this `block` input's credit slot was released (its
+    /// consumer stopped, or `block_timeout_ms` passed with nothing drained).
+    /// Bumped by the releaser beside its loud release event.
+    pub block_slot_releases_count: AtomicU64,
 }
 
 impl BackpressureCounters {
@@ -1029,6 +1033,17 @@ impl NodeHandle {
     pub fn backpressure_block_defer_regimes_count(&self, input_name: &str) -> u64 {
         self.backpressure_load(input_name, |c| {
             c.block_defer_regimes_count.load(Ordering::Acquire)
+        })
+    }
+
+    /// Per-input count of `block` credit-slot RELEASES for `input_name`: how
+    /// many times this consumer's slot was given up on its producer's side
+    /// (the consumer node stopped, or `block_timeout_ms` passed with nothing
+    /// drained). Each release also logs a loud `warn!`. Returns 0 if the
+    /// input is unknown.
+    pub fn backpressure_block_slot_releases_count(&self, input_name: &str) -> u64 {
+        self.backpressure_load(input_name, |c| {
+            c.block_slot_releases_count.load(Ordering::Acquire)
         })
     }
 

@@ -638,6 +638,7 @@ fn liveliness_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/livegc/cam".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

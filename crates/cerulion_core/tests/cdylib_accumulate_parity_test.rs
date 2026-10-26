@@ -154,6 +154,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
                 inputs: vec![InputDef {
                     name: "tf".to_string(),
                     source: TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "out".to_string(),
@@ -172,6 +173,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "acc/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

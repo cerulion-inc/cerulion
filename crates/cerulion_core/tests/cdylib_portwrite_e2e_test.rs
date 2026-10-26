@@ -255,6 +255,7 @@ fn run_capture(
                 inputs: vec![InputDef {
                     name: "text_in".to_string(),
                     source: "producer/text".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "image".to_string(),
@@ -273,6 +274,7 @@ fn run_capture(
                 inputs: vec![InputDef {
                     name: "image".to_string(),
                     source: "portwrite/image".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

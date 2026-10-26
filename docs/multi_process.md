@@ -55,17 +55,15 @@ recording's per-edge read log offline).
   another worker cannot see. A SPLIT edge instead carries that mirror in shared
   memory, a **cross-process credit word** the supervisor mints per edge, and
   is then lossless across the boundary. One is minted for exactly the shape it
-  can describe: a topic with **exactly one in-graph producer** and **no
-  non-`block` consumers**. Every other split `block` edge is still refused
-  PRE-SPAWN (a multi-producer topic, because the word counts one producer's
-  outstanding frames; a MIXED topic, because its `block` consumers degrade to
-  `drop_oldest` and there is no lossless defer left to credit), and the refusal
-  names which bar it hit. The derived partition still co-locates every `block`
-  topic's WHOLE FLOW automatically (crossing a boundary costs a real hop
-  whether or not it is correct): its producers, its `block` consumers, and (on
-  a MIXED topic) the non-`block` siblings, without which the co-located worker
-  reads its flow as all-`block` and installs a defer `--single-process`
-  degrades (shown in `graph partition`'s consent preview). One residual is
+  can describe: a topic with **exactly one in-graph producer**, one word per
+  `block` consumer in another process. A split multi-producer `block` edge is
+  still refused PRE-SPAWN (the word counts one producer's outstanding frames),
+  and the refusal names the bar. The topic's non-`block` consumers hold no
+  word and may sit in any group. The derived partition still co-locates every
+  `block` topic's WHOLE FLOW automatically (crossing a boundary costs a real
+  hop): its producers and all its consumers (shown in `graph partition`'s
+  consent preview). When a `block` consumer's worker dies, the supervisor
+  releases that consumer's slot and the producer resumes. One residual is
   worth knowing: on a
   `multi_publisher_topics:`-listed topic the credit word counts IN-GRAPH
   publishes only, so an out-of-graph writer can fill the consumer's queue
@@ -621,10 +619,11 @@ second at 1 kHz, about a minute and a half at 10 Hz. That is acceptable because 
 is permanent: a stalled consumer does not resume on its own, so the warn is
 late, never wrong.
 
-This is the second never-silent carrier for the wedge class, and it covers what the first
-cannot. The supervisor's `CreditDeathWatch` above reports a consumer whose PROCESS DIED; this
-reports one that is alive and idle. Between them both halves of a permanently-deferred
-producer are named.
+This warn only reports. To bound how long an alive-but-idle consumer can hold its
+producer, set `block_timeout_ms` on the consumer input: the producer's worker forgives that
+consumer's slot once it has been full and unmoved for that long, with a `warn!` naming the
+producer, the consumer, the edge and `reason="block_timeout"`. A consumer whose PROCESS
+DIED needs no timeout: the supervisor's `CreditDeathWatch` above releases its slot.
 
 Pinned end to end over REAL processes by `crates/cerulion_cli/tests/credit_death_e2e_test.rs`: the
 loud head and its fields, the ABSENCE of a repeat, the retraction, the free-run `groups=`. The

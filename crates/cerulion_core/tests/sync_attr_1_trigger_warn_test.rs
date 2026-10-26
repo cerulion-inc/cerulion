@@ -71,6 +71,7 @@ fn graph_config(node_id: &str, source_id: Option<&str>) -> GraphConfig {
                 vec![cerulion_core::graph::config::InputDef {
                     name: "data".to_string(),
                     source: format!("{src}/out"),
+                    ..Default::default()
                 }]
             })
             .unwrap_or_default(),

@@ -2108,6 +2108,7 @@ pub fn build_node_def(
             cerulion_core::graph::config::InputDef {
                 name: name.clone(),
                 source: resolved_source,
+                ..Default::default()
             }
         })
         .collect();
@@ -3578,6 +3579,11 @@ fn collect_entry_infos_from_cache(
             inspector.inspect(&lib.path, node_type)?,
         );
     }
+    cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut entry_infos,
+        cerulion_core::graph::topology::MissingInputMeta::Refuse,
+    )?;
     Ok(entry_infos)
 }
 
@@ -5380,6 +5386,7 @@ mod open_file_limit_verdict_tests {
                 vec![InputDef {
                     name: "in".to_string(),
                     source: format!("src{i}/out"),
+                    ..Default::default()
                 }],
                 vec![],
             ));
@@ -7346,8 +7353,8 @@ pub fn graph_run_worker(
                 // is the asymmetry that makes this worth a check. A plan whose
                 // `producer_ranks` names the wrong rank leaves the REAL
                 // producing rank here: it skips, and its local flow then has
-                // producers and NO consumers, so `is_all_block()` (which needs
-                // a non-empty consumer list) is false and the block-wiring
+                // producers and NO consumers, so `has_block_consumer()` is
+                // false and the block-wiring
                 // branch `continue`s too — no defer edge, no publisher mirror,
                 // no credit record, no warn. The producer publishes
                 // UNTHROTTLED while the consumer rank, whose own rank number IS
@@ -7401,6 +7408,8 @@ pub fn graph_run_worker(
                 // read — `None` for a pure consumer, which is exactly the role
                 // that never parks.
                 producer_slot: crate::multiprocess::producer_slot_of(e, plan.rank),
+                block_timeout_ms: e.block_timeout_ms,
+                producer_nodes: e.producer_nodes.clone(),
             });
         }
         bindings
@@ -10647,6 +10656,11 @@ fn graph_run_supervisor(
         for (id, entry) in &planning_factories {
             infos.insert(id.clone(), entry.info()?);
         }
+        cerulion_core::graph::topology::apply_input_backpressure_overrides(
+            &config,
+            &mut infos,
+            cerulion_core::graph::topology::MissingInputMeta::Refuse,
+        )?;
         infos
     };
     #[cfg(unix)]
@@ -11025,6 +11039,11 @@ fn graph_run_supervisor(
     let loaded_topology_for_reconcile =
         cerulion_core::graph::GraphTopology::build(&config, &loaded_entry_infos)
             .map_err(CliError::from)?;
+    // A ring of `block` edges can span workers, and each worker sees only its
+    // own subgraph, so the whole graph is checked here, before any spawn.
+    loaded_topology_for_reconcile
+        .refuse_block_cycles()
+        .map_err(CliError::from)?;
     // The SOURCE view the plan-time acceptance was judged on. Read here rather
     // than threaded from the validation block above because that block is
     // `has_process_groups()`-gated while this runs on every multi-process
@@ -13058,6 +13077,11 @@ pub(crate) fn source_entry_infos(
         }
         entry_infos.insert(node_def.id.clone(), info);
     }
+    cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut entry_infos,
+        cerulion_core::graph::topology::MissingInputMeta::Skip,
+    )?;
     Ok(entry_infos)
 }
 
@@ -19872,6 +19896,22 @@ impl CreditDeathWatch {
                 .unwrap_or_else(|| format!("<rank {rank}>"))
         };
         for action in actions {
+            // Release the dead consumer's slot: THIS edge's word only. Every
+            // other edge (another consumer of the same topic included) keeps
+            // its own word and its own count.
+            let mut slot_released = false;
+            if matches!(
+                action.role,
+                crate::multiprocess::CreditDeathRole::Consumer { .. }
+            ) {
+                if cerulion_core::oracle_mutant::active("block_shared_release") {
+                    for w in &self.watched {
+                        slot_released |= w.word.release_slot();
+                    }
+                } else if let Some(row) = self.watched.get(action.edge_idx) {
+                    slot_released = row.word.release_slot();
+                }
+            }
             let Some(row) = self.watched.get_mut(action.edge_idx) else {
                 // A diagnostic must never wedge the path it observes (the
                 // `lock_regime_latch` precedent). `credit_death_actions`
@@ -19905,22 +19945,29 @@ impl CreditDeathWatch {
                     for r in &deferred_producers {
                         row.named_alive.insert(*r as u32);
                     }
+                    let producer_field = row.edge.producer_nodes.join(",");
                     match row.latch.on_failure() {
                         RegimeDecision::Loud => tracing::warn!(
                             group = %dead_group,
                             node_id = %row.edge.consumer_node,
                             topic = %row.edge.topic,
                             consumer_input = %row.edge.consumer_input,
+                            producer = %producer_field,
+                            reason = cerulion_core::scheduler::block::ReleaseReason::ConsumerDied
+                                .as_str(),
+                            slot_released,
                             dead_rank = action.dead_rank,
                             deferred_producer_ranks = %ranks_field,
                             deferred_producer_groups = %groups_field,
                             total_failures = row.latch.total_failures(),
-                            "a cross-process `block` edge lost its CONSUMER — its credit \
-                             word will never be drained again, so the producer rank(s) \
-                             above are PERMANENTLY deferred at the credit gate on this \
-                             topic. They are not known dead, and will publish nothing more \
-                             here. The wedge alarm cannot see this: a producer deferred at \
-                             the credit gate never entered a tick"
+                            "a cross-process `block` edge lost its CONSUMER: its credit slot \
+                             is RELEASED, so producer '{producer_field}' no longer waits on \
+                             '{}.{}' (topic '{}') and resumes publishing. Frames published \
+                             to the dead consumer are lost with it; the topic's other \
+                             consumers keep their own slots",
+                            row.edge.consumer_node,
+                            row.edge.consumer_input,
+                            row.edge.topic
                         ),
                         // The re-announcement exists for the operator who
                         // MISSED the head (the latch's decade ladder), so it
@@ -25077,6 +25124,7 @@ nodes:
                     inputs: vec![cerulion_core::graph::InputDef {
                         name: "ext".to_string(),
                         source: "/external/imu".to_string(),
+                        ..Default::default()
                     }],
                     outputs: vec![
                         OutputDef {
@@ -40428,6 +40476,8 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
 
         // (1) the CONSUMER node is local.
@@ -40436,6 +40486,7 @@ mod worker_tests {
             vec![InputDef {
                 name: "gate".to_string(),
                 source: "/p/cam/out".to_string(),
+                ..Default::default()
             }],
             vec![],
         )]);
@@ -40486,6 +40537,8 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         check_credit_edges_unique("the worker", &[e("gate"), e("other")])
             .expect("two DISTINCT edges on one topic are ordinary");
@@ -40567,6 +40620,8 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         assert_eq!(credit_role_for(&edge, 0), Some(CreditRole::Producer));
         assert_eq!(credit_role_for(&edge, 1), Some(CreditRole::Consumer));
@@ -40597,6 +40652,8 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         check_credit_producer_ranks("p1", &one).expect("exactly one producer rank is the shape");
         for ranks in [vec![], vec![0, 2]] {
@@ -40717,6 +40774,8 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: producers.to_vec(),
             consumer_rank,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         }
     }
 
@@ -40748,6 +40807,63 @@ mod supervisor_tests {
     fn credit_watch(ns: &str, edges: Vec<crate::multiprocess::CreditEdgePlan>) -> CreditDeathWatch {
         let words = edges.iter().map(|e| credit_word(ns, e)).collect();
         CreditDeathWatch::arm(edges, words)
+    }
+
+    /// A dead consumer's slot is released, and ONLY that slot: a second
+    /// `block` consumer of the same topic, on a live rank, keeps its full
+    /// count and stays armed. The head line names the producer, the consumer,
+    /// the edge and the reason.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_dead_consumer_releases_its_own_slot_and_no_other() {
+        let ns = credit_ns("perslot");
+        let mut dead_edge = credit_edge("/cmd", &[0], 1);
+        dead_edge.producer_nodes = vec!["planner".to_string()];
+        let mut live_edge = credit_edge("/cmd", &[0], 2);
+        live_edge.consumer_node = "logger".to_string();
+        live_edge.producer_nodes = vec!["planner".to_string()];
+        let mut watch = credit_watch(&ns, vec![dead_edge, live_edge]);
+        for row in &watch.watched {
+            row.word.record_published_n(4);
+            assert!(row.word.is_full());
+        }
+        watch.report_deaths(
+            &[("p1".to_string(), 1)],
+            &credit_groups(&[(0, "p0"), (1, "p1"), (2, "p2")]),
+        );
+        let dead = &watch.watched[0].word;
+        assert!(dead.is_released(), "the dead consumer's slot is released");
+        assert_eq!(dead.outstanding(), 0);
+        assert!(!dead.is_full(), "so its producer no longer defers on it");
+        let live = &watch.watched[1].word;
+        assert!(
+            !live.is_released(),
+            "the live consumer's slot is not released"
+        );
+        assert_eq!(live.outstanding(), 4, "and its count is untouched");
+        assert!(live.is_full(), "so it still defers the producer");
+        // Reporting the same death again releases nothing more.
+        assert!(!dead.release_slot());
+
+        logs_assert(|lines: &[&str]| {
+            let heads = credit_lines_at(lines, "WARN", C6_HEAD);
+            let [head] = heads.as_slice() else {
+                return Err(format!("expected exactly 1 WARN head, got {}", heads.len()));
+            };
+            for (k, v) in [
+                ("producer", "planner"),
+                ("node_id", "sink"),
+                ("consumer_input", "gate"),
+                ("topic", "/cmd"),
+                ("reason", "\"consumer_died\""),
+                ("slot_released", "true"),
+            ] {
+                if !credit_has_field(head, k, v) {
+                    return Err(format!("head lacks {k}={v}: {head}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     /// The CONSUMER-death line is LOUD exactly once, at WARN, carrying the
@@ -41817,6 +41933,8 @@ mod supervisor_tests {
                 depth: 4,
                 producer_ranks: vec![0],
                 consumer_rank: 1,
+                block_timeout_ms: None,
+                producer_nodes: Vec::new(),
             },
             CreditEdgePlan {
                 topic: "/b".to_string(),
@@ -41825,6 +41943,8 @@ mod supervisor_tests {
                 depth: 2,
                 producer_ranks: vec![1],
                 consumer_rank: 0,
+                block_timeout_ms: None,
+                producer_nodes: Vec::new(),
             },
         ];
         stamp_credit_edges(&mut plan, &edges);
@@ -41861,6 +41981,8 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         check_credit_depth("p1", "cerdep_x", &edge, 4).expect("an agreeing pair is accepted");
         let err = check_credit_depth("p1", "cerdep_x", &edge, 7)
@@ -41927,6 +42049,8 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         // PermissionDenied: the directory is refusing this user.
         let denied = credit_create_failure_message(
@@ -42065,6 +42189,8 @@ mod supervisor_tests {
             depth: 7,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            block_timeout_ms: None,
+            producer_nodes: Vec::new(),
         };
         stamped.workers[1].credit_edges = vec![edge.clone()];
         let round: crate::multiprocess::WorkerPlan =

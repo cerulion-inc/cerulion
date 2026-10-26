@@ -306,6 +306,7 @@ fn build_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -848,6 +849,7 @@ fn build_one_input_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -913,10 +915,12 @@ fn data_trigger_consumer_holds_silent_context() {
                     InputDef {
                         name: "trig".to_string(),
                         source: "trig_producer/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "ctx".to_string(),
                         source: "ctx_producer/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -1414,10 +1418,12 @@ fn two_non_trigger_inputs_hold_independently() {
                     InputDef {
                         name: "a".to_string(),
                         source: "prod_a/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "b".to_string(),
                         source: "prod_b/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -1658,6 +1664,7 @@ fn build_external_snapshot_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: abs_topic.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -2212,6 +2219,7 @@ fn external_topic_excluded_from_union_and_harvest() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: ext_topic.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

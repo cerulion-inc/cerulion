@@ -217,6 +217,7 @@ fn build_graph(prefix: &str) -> GraphRuntime {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

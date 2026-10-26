@@ -623,7 +623,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 }
                 // `block`: the frame is now in every subscriber's
                 // queue — bump each registered consumer's outstanding
-                // counter (no-op unless this topic is wired all-`block`).
+                // counter (no-op unless this topic has a `block` consumer).
                 // Mirrors the queue depth the producer's pre-fire reads.
                 pubr.record_block_published();
                 // The frame went out — reset this output's

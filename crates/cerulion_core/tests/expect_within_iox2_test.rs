@@ -289,6 +289,7 @@ fn consumer_def(id: &str, node_type: &str) -> NodeDef {
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: "prod/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }

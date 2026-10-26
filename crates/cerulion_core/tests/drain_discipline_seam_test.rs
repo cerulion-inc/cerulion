@@ -220,6 +220,7 @@ fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -300,6 +301,7 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "producer/out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         });
@@ -732,6 +734,7 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -945,6 +948,7 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1195,6 +1199,7 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1367,6 +1372,7 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

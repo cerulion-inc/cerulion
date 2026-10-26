@@ -586,6 +586,7 @@ fn two_node_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -797,6 +798,7 @@ fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: vec![],
@@ -2204,6 +2206,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![relay_out.clone()],
             },
@@ -4008,6 +4011,7 @@ fn relay_def(id: &str, input: &str, source: &str, topic: Option<&str>) -> NodeDe
         inputs: vec![InputDef {
             name: input.to_string(),
             source: source.to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "out".to_string(),
@@ -6293,6 +6297,7 @@ fn wave_graph(
                     .map(|name| InputDef {
                         name: (*name).to_string(),
                         source: source.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 outputs: vec![],

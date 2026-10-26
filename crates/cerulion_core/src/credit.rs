@@ -90,26 +90,24 @@
 //!
 //! # Residuals (named, not implied)
 //!
-//! **The LOST-DECREMENT wedge.** Nothing in this module returns credit on behalf of
-//! a consumer that DIED. `outstanding` is decremented only by
-//! [`CreditShared::record_drained`], which the consumer itself calls, so a
-//! consumer that is SIGKILLed while `outstanding >= depth` pins the word FULL and
-//! its producer defers FOREVER — bounded-loud on the producer's side only in the
-//! sense that its own liveness is unaffected; the edge is simply dead. This is a
-//! deliberate consequence of the [wedge-and-warn decision](self): there
-//! is no auto-release path.
+//! **Per-consumer slot release.** Each word is ONE block consumer's slot
+//! (`credit_edge_id` keys it by topic, consumer node and consumer input), so a
+//! release acts on that consumer alone and leaves every other consumer of the
+//! topic, and every other topic, as it was. Two releases exist:
 //!
-//! The two REMEDIES that decision names live outside this module: (a) the supervisor's
-//! per-edge DEATH WARN — the supervisor already sweeps a dead
-//! rank's stale `parked` bit via [`CreditShared::clear_parked_producer`], and the
-//! same sweep is where a dead CONSUMER's edge is named; and (b) a bounded
-//! producer-side loud warn after N × `cap` of observing the word FULL with
-//! `wake_seq` UNMOVED (full-and-nobody-is-draining is exactly the wedge
-//! signature, and `wake_seq` not moving is what separates it from a merely busy
-//! consumer). Note also that [`CreditShared::record_drained`]`(u64::MAX)` already
-//! functions as a FORCE-RELEASE through any live mapping (the decrement
-//! saturates at zero), so a supervisor holding a mapping has the primitive it
-//! needs without new API.
+//! - [`CreditShared::release_slot`] is STICKY: it marks the slot released,
+//!   zeroes `outstanding` and rings the wake word. From then on
+//!   [`CreditShared::is_full`] is `false` and [`CreditShared::record_published`]
+//!   no longer counts, so the producer stops deferring on this consumer for
+//!   the rest of the run. The supervisor calls it when the consumer's process
+//!   dies; the runtime calls it when the consumer node stops with a fatal
+//!   error.
+//! - [`CreditShared::forgive_outstanding`] zeroes `outstanding` and rings the
+//!   wake word without marking the slot. The producer gets `depth` more
+//!   publishes before the slot can defer it again. The `block_timeout_ms`
+//!   release uses it.
+//!
+//! Whoever releases emits the loud event; this module only moves the word.
 //!
 //! **The macOS park does NOT ride the BARRIER's kill switch.** The wait side's
 //! `os_sync` tier reads the shared backend FACT from
@@ -251,14 +249,18 @@ pub struct CreditShared {
     /// decisions MUST be revisited: both rest on the unlink-first invariant that
     /// an in-place re-arm would break. See the note in `reinit`.
     epoch: AtomicU32,
+    /// Sticky slot release: `0` while the consumer holds the slot, non-zero
+    /// once [`Self::release_slot`] gave it up. Read by [`Self::is_full`] and by
+    /// the publish increment; set once per run, never cleared on a live page.
+    released: AtomicU32,
 }
 
 // SHM mapping across processes requires a stable, atomics-only `repr(C)` layout.
 // Lock the size so a future non-atomic field (padding / bool / pointer) fails the
 // build rather than silently breaking the cross-process mapping.
 const _: () = assert!(
-    core::mem::size_of::<CreditShared>() == 24,
-    "CreditShared layout changed — SHM cross-process mapping requires the 24-byte atomics-only repr(C)"
+    core::mem::size_of::<CreditShared>() == 32,
+    "CreditShared layout changed: SHM cross-process mapping requires the 32-byte atomics-only repr(C)"
 );
 const _: () = assert!(
     core::mem::offset_of!(CreditShared, outstanding) == 0,
@@ -283,6 +285,10 @@ const _: () = assert!(
     "epoch must sit at offset 20 — the owner re-arm epoch"
 );
 const _: () = assert!(
+    core::mem::offset_of!(CreditShared, released) == 24,
+    "released must sit at offset 24, the sticky per-consumer slot release"
+);
+const _: () = assert!(
     core::mem::align_of::<CreditShared>() >= 8,
     "CreditShared must be >=8-byte aligned so its `outstanding` field (offset 0) is a valid 8-byte-aligned atomic target"
 );
@@ -304,6 +310,7 @@ impl CreditShared {
             wake_seq: AtomicU32::new(0),
             parked: AtomicU32::new(0),
             epoch: AtomicU32::new(0),
+            released: AtomicU32::new(0),
         }
     }
 
@@ -348,6 +355,7 @@ impl CreditShared {
         self.depth.store(depth, Ordering::Release);
         self.wake_seq.store(0, Ordering::Release);
         self.parked.store(0, Ordering::Release);
+        self.released.store(0, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Release);
     }
 
@@ -361,8 +369,12 @@ impl CreditShared {
     /// A word stamped `depth == 0` reads full unconditionally; see the
     /// `reinit` note on why that is a plan-stamping bug rather than a
     /// reachable configuration.
+    ///
+    /// A released slot ([`Self::release_slot`]) is never full.
     pub fn is_full(&self) -> bool {
-        self.outstanding.load(Ordering::Acquire) >= u64::from(self.depth.load(Ordering::Acquire))
+        !self.is_released()
+            && self.outstanding.load(Ordering::Acquire)
+                >= u64::from(self.depth.load(Ordering::Acquire))
     }
 
     /// Try to CLAIM room for one frame — `true` if the producer may enter its
@@ -454,7 +466,13 @@ impl CreditShared {
     /// Deliberately issues NO wake: nothing ever parks waiting for the count to
     /// RISE (the release direction is [`record_drained`](Self::record_drained),
     /// which does ring).
+    ///
+    /// On a released slot ([`Self::release_slot`]) this counts nothing and
+    /// returns `0`: nobody drains a released slot, so a count would only climb.
     pub fn record_published_n(&self, n: u64) -> u64 {
+        if self.is_released() {
+            return 0;
+        }
         self.outstanding
             .fetch_add(n, Ordering::Release)
             .wrapping_add(n)
@@ -487,6 +505,52 @@ impl CreditShared {
                 Some(v.saturating_sub(removed))
             });
         self.note_credit_freed();
+    }
+
+    /// Give up this consumer's slot for the rest of the run: mark it
+    /// released, zero `outstanding`, and ring the wake word so a parked
+    /// producer re-derives its gate at once.
+    ///
+    /// Returns `true` for the call that released the slot and `false` when it
+    /// was already released, so the caller emits its loud event once.
+    ///
+    /// Only THIS word changes. Every other block consumer of the topic holds
+    /// its own word and keeps its own count.
+    ///
+    /// A publish that read the slot unreleased just before this call can still
+    /// land its increment after the zeroing store; [`Self::is_full`] reads the
+    /// mark first, so that stray count never defers anyone.
+    pub fn release_slot(&self) -> bool {
+        if self
+            .released
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.outstanding.store(0, Ordering::Release);
+        self.note_credit_freed();
+        true
+    }
+
+    /// Has [`Self::release_slot`] given this slot up (`Acquire`)?
+    pub fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire) != 0
+    }
+
+    /// Zero `outstanding` and ring the wake word, leaving the slot armed.
+    /// Returns the count that was forgiven.
+    ///
+    /// The frames the consumer has not drained stay in its queue; the
+    /// producer may now publish `depth` more, so the queue's own drop-oldest
+    /// overflow evicts the oldest of them. The `block_timeout_ms` release
+    /// uses this.
+    pub fn forgive_outstanding(&self) -> u64 {
+        let forgiven = self.outstanding.swap(0, Ordering::AcqRel);
+        if forgiven != 0 {
+            self.note_credit_freed();
+        }
+        forgiven
     }
 
     // ==================== the producer park's wake word ====================
@@ -1813,13 +1877,14 @@ mod tests {
     fn layout_offsets_and_size_are_pinned() {
         // The const-asserts above already fail the BUILD on drift; this makes
         // the same facts readable in a test run and pins the mapped region.
-        assert_eq!(core::mem::size_of::<CreditShared>(), 24);
+        assert_eq!(core::mem::size_of::<CreditShared>(), 32);
         assert!(core::mem::align_of::<CreditShared>() >= 8);
         assert_eq!(core::mem::offset_of!(CreditShared, outstanding), 0);
         assert_eq!(core::mem::offset_of!(CreditShared, depth), 8);
         assert_eq!(core::mem::offset_of!(CreditShared, wake_seq), 12);
         assert_eq!(core::mem::offset_of!(CreditShared, parked), 16);
         assert_eq!(core::mem::offset_of!(CreditShared, epoch), 20);
+        assert_eq!(core::mem::offset_of!(CreditShared, released), 24);
         assert_eq!(CREDIT_BYTES, 64);
     }
 
@@ -1982,6 +2047,52 @@ mod tests {
             w.wake_seq_snapshot() > before,
             "a drain that really freed a slot must ring the wake word"
         );
+    }
+
+    /// `release_slot` is sticky and once-only: it zeroes the count, rings the
+    /// wake word, and from then on the slot is never full and counts no
+    /// publish. Another word is untouched.
+    #[test]
+    fn a_released_slot_is_never_full_and_counts_nothing() {
+        let w = CreditWord::local(2);
+        let other = CreditWord::local(2);
+        w.record_published_n(2);
+        other.record_published_n(2);
+        assert!(w.is_full() && other.is_full());
+        let seq = w.wake_seq_snapshot();
+        assert!(w.release_slot(), "the first release releases");
+        assert!(!w.release_slot(), "a second release is a no-op");
+        assert!(w.is_released());
+        assert_eq!(w.outstanding(), 0);
+        assert!(
+            w.wake_seq_snapshot() > seq,
+            "the release rings the wake word"
+        );
+        assert!(!w.is_full() && w.try_claim());
+        assert_eq!(w.record_published(), 0, "a released slot counts nothing");
+        assert_eq!(w.outstanding(), 0);
+        assert!(other.is_full(), "another word keeps its count");
+        assert_eq!(other.outstanding(), 2);
+    }
+
+    /// `forgive_outstanding` zeroes the count and rings, but leaves the slot
+    /// armed: it fills and defers again.
+    #[test]
+    fn a_forgiven_slot_stays_armed() {
+        let w = CreditWord::local(2);
+        w.record_published_n(2);
+        let seq = w.wake_seq_snapshot();
+        assert_eq!(w.forgive_outstanding(), 2);
+        assert!(w.wake_seq_snapshot() > seq);
+        assert!(!w.is_released());
+        assert_eq!(w.forgive_outstanding(), 0, "nothing left to forgive");
+        assert_eq!(
+            w.wake_seq_snapshot(),
+            seq + 1,
+            "and an empty forgive rings nothing"
+        );
+        w.record_published_n(2);
+        assert!(w.is_full(), "the slot holds the producer again");
     }
 
     /// The edge id is the three-component key, separator-delimited, and the
@@ -2243,8 +2354,10 @@ mod tests {
         assert!(c.wake_seq_snapshot() == 0, "publishing frees no credit");
         c.record_drained(1);
         assert!(c.wake_seq_snapshot() > 0);
+        assert!(c.release_slot());
 
         c.reinit(5);
+        assert!(!c.is_released(), "reinit re-arms a released slot");
         assert_eq!(c.outstanding(), 0, "reinit clears the outstanding count");
         assert_eq!(c.depth(), 5, "reinit stamps the new depth");
         assert_eq!(c.wake_seq_snapshot(), 0, "reinit re-zeros the epoch word");
