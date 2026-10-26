@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import com.cerulion.android.CerulionRuntime;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.function.IntSupplier;
 
 public final class JniSmoke {
@@ -25,15 +28,51 @@ public final class JniSmoke {
         return Integer.parseInt(status.substring(start, end));
     }
 
+    private static String field(String status, String name) {
+        String marker = "\"" + name + "\":";
+        int start = status.indexOf(marker);
+        if (start < 0) {
+            return "missing";
+        }
+        start += marker.length();
+        int end = status.charAt(start) == '['
+                ? status.indexOf(']', start) + 1
+                : status.indexOf(',', start);
+        return status.substring(start, end);
+    }
+
+    // A JSON string literal for the graph text: quotes, backslashes and
+    // control characters escaped.
+    private static String jsonString(String text) {
+        StringBuilder out = new StringBuilder("\"");
+        for (char c : text.toCharArray()) {
+            switch (c) {
+                case '"': out.append("\\\""); break;
+                case '\\': out.append("\\\\"); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+            }
+        }
+        return out.append('"').toString();
+    }
+
     private static String waitForState(String expected) throws Exception {
+        String status = null;
         for (int attempt = 0; attempt < 500; attempt++) {
-            String status = CerulionRuntime.status();
+            status = CerulionRuntime.status();
             if (expected.equals(state(status))) {
                 return status;
             }
             Thread.sleep(10);
         }
-        throw new AssertionError("timed out waiting for state " + expected);
+        throw new AssertionError("timed out waiting for state " + expected + ": " + status);
     }
 
     // The error code a call returns while a lifecycle transition is in
@@ -73,7 +112,7 @@ public final class JniSmoke {
         System.out.println("init-bad=" + CerulionRuntime.init(args[0] + "/missing", "jni-test"));
         System.out.println("init-ok=" + CerulionRuntime.init(args[0], "jni-test"));
         String initStatus = CerulionRuntime.status();
-        System.out.println("linked-nodes=" + initStatus.contains("\"linked_nodes\":[]"));
+        System.out.println("linked-nodes=" + field(initStatus, "linked_nodes"));
         System.out.println("publish-before-start="
                 + CerulionRuntime.publish("/jni/heartbeat", "{\"data\":\"before\"}"));
 
@@ -96,5 +135,17 @@ public final class JniSmoke {
         int stop = whenSettled(CerulionRuntime::stop);
         String stoppedStatus = waitForState("stopped");
         System.out.println("stop=" + stop + " state=" + state(stoppedStatus));
+
+        // The sample app's graph: every node type in it is linked into the
+        // loaded library, so the start reaches running with all three nodes.
+        String graph = new String(Files.readAllBytes(Paths.get(args[2])), StandardCharsets.UTF_8);
+        String graphConfig = "{\"graph_yaml\":" + jsonString(graph) + "}";
+        int graphStart = whenSettled(() -> CerulionRuntime.start(graphConfig));
+        String graphStatus = waitForState("running");
+        System.out.println("start-graph=" + graphStart + " state=" + state(graphStatus)
+                + " nodes=" + field(graphStatus, "nodes"));
+        int graphStop = whenSettled(CerulionRuntime::stop);
+        String graphStopped = waitForState("stopped");
+        System.out.println("stop-graph=" + graphStop + " state=" + state(graphStopped));
     }
 }
