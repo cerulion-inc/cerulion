@@ -347,3 +347,409 @@ network:
         ORACLE
     );
 }
+
+// ===========================================================================
+// A topic published by a process OUTSIDE the graph (`external: true`)
+// ===========================================================================
+
+/// The iceoryx2 config file (JSON) the outside publisher child opens, so it
+/// shares graph A's shared memory root.
+const ENV_OUTSIDE_IOX2_CONFIG: &str = "CER_NWE2E_OUTSIDE_IOX2_CONFIG";
+/// The comma-separated topics the outside publisher child registers and publishes.
+const ENV_OUTSIDE_TOPICS: &str = "CER_NWE2E_OUTSIDE_TOPICS";
+/// Stop-file path: the child publishes until it appears, then exits 0.
+const ENV_OUTSIDE_STOP: &str = "CER_NWE2E_OUTSIDE_STOP";
+
+/// Child entrypoint, re-invoked as a subprocess via `current_exe`: the
+/// outside publisher. It does what an `rmw_cerulion` publisher does on this
+/// machine (registers the topic over the gateway control channel with its
+/// schema hash, then publishes on the topic's shared memory service) for every
+/// topic in [`ENV_OUTSIDE_TOPICS`], publishing [`ORACLE`] on each every 20 ms
+/// with an advancing timestamp. In a normal suite run the env is absent and
+/// this is a no-op pass.
+///
+/// Exits through `process::exit` with a status the parent reads: 0 when the
+/// stop file appeared, 2 on any failure.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn outside_publisher_child_entrypoint() {
+    let Ok(config_path) = std::env::var(ENV_OUTSIDE_IOX2_CONFIG) else {
+        return; // not the child invocation
+    };
+    let run = || -> Result<(), Box<dyn std::error::Error>> {
+        let topics = std::env::var(ENV_OUTSIDE_TOPICS)?;
+        let stop = std::env::var(ENV_OUTSIDE_STOP)?;
+        let ix: iceoryx2::config::Config =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        let clock = Arc::new(VirtualClock::new());
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("nwe2e_outside_{}", unique_id()),
+                clock: clock.clone(),
+                ..Default::default()
+            },
+            ix,
+        )?;
+        let mut publishers = Vec::new();
+        for topic in topics.split(',') {
+            let publisher = mgr.create_publisher_typed::<Vector3>(topic, None)?;
+            let _newly = mgr.register_dynamic_egress_topic(
+                topic,
+                <Vector3 as cerulion_core::message::ShmMessage>::SCHEMA_HASH,
+            )?;
+            publishers.push(publisher);
+        }
+        // Bounded: about 60 s, then fail loudly.
+        for step in 1..=3000u64 {
+            if std::path::Path::new(&stop).exists() {
+                return Ok(());
+            }
+            clock.set(step * 1_000_000);
+            for publisher in &mut publishers {
+                let mut proxy = publisher.loan_proxy::<Vector3>()?;
+                proxy.x = ORACLE.0;
+                proxy.y = ORACLE.1;
+                proxy.z = ORACLE.2;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err("stop file never appeared within the bound".into())
+    };
+    match run() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("[nwe2e outside publisher] FAILED: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Kills and reaps the outside publisher child on drop, so a parent panic
+/// never leaves it publishing.
+struct OutsideChildGuard {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl Drop for OutsideChildGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Two processes, one Strict `network:` block: graph A lists a topic that a
+/// SEPARATE OS process publishes (the outside publisher child, standing in for
+/// a ROS 2 program on `rmw_cerulion`) as `external: true`, and graph B on a
+/// distinct shared memory root ingresses it over a 127.0.0.1 TCP hop. B's
+/// consumer observes the child's payload bit-for-bit. The child also
+/// publishes and registers a second topic A does NOT list; B ingresses that
+/// one too, and A's bridge never enables it, forwards none of its frames, and
+/// B's second consumer never fires (only listed topics leave).
+#[test]
+fn yaml_network_external_egress_carries_an_outside_publishers_topic() {
+    let id = unique_id();
+    let own = format!("/nwe2e/outside/{id}/own");
+    let listed = format!("/nwe2e/outside/{id}/chatter");
+    let unlisted = format!("/nwe2e/outside/{id}/unlisted");
+
+    // ---- Graph A: one in-graph producer of its own topic, and the outside
+    // publisher's topic listed under `egress:` as `external: true`.
+    let ix_a = cerulion_core::testing::iceoryx_test_config();
+    let mut a_setup: Option<(GraphRuntime, GatewayRuntime, Arc<TransportManager>, u16)> = None;
+    for attempt in 0..3 {
+        let port = probe_ephemeral_port();
+        let yaml_a = format!(
+            r#"
+name: nwe2e_outside_robot
+prefix: nwe2eoa
+nodes:
+  - id: src
+    type: cloud_source
+    outputs:
+      - name: cloud
+        schema: geometry_msgs/Vector3
+        topic: {own}
+network:
+  mode: peer
+  listen:
+    - tcp/127.0.0.1:{port}
+  egress:
+    - {own}
+    - topic: {listed}
+      external: true
+"#
+        );
+        let config_a = parse_graph_raw(&yaml_a).expect("graph A YAML parses");
+        cerulion_core::graph::validate_graph(&config_a)
+            .expect("an external egress topic needs no in-graph producer");
+        let net_a = config_a
+            .network_transport_config()
+            .expect("graph A declares an enabled network block");
+        let clock_a = Arc::new(VirtualClock::new());
+        let mgr_a = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("nwe2e_oa_{id}_{attempt}"),
+                clock: clock_a.clone(),
+                subscriber_buffer_size: 16,
+                network: Some(net_a),
+            },
+            ix_a.clone(),
+        )
+        .expect("init manager A");
+        let mut factories_a: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories_a.insert("src".to_string(), Box::new(CloudSourceEntry::new()));
+        let infos_a: IndexMap<String, NodeInfo> = factories_a
+            .iter()
+            .map(|(k, e)| (k.clone(), e.info().expect("node info")))
+            .collect();
+        let topology_a = GraphTopology::build(&config_a, &infos_a).expect("topology A");
+        let plan_a = compute_gateway_plan(&config_a, &topology_a, &infos_a, NetworkPosture::Strict)
+            .expect("plan A computes")
+            .expect("graph A declares an enabled network block");
+        assert!(
+            plan_a.announce.contains(&listed) && !plan_a.announce.contains(&unlisted),
+            "A's plan announces the external topic and not the unlisted one: {:?}",
+            plan_a.announce
+        );
+        let rt = GraphRuntime::build(config_a, factories_a, &mgr_a, clock_a)
+            .expect("graph A build (network-free)");
+        match GatewayRuntime::new(Arc::clone(&mgr_a), plan_a) {
+            Ok(gateway) => {
+                a_setup = Some((rt, gateway, mgr_a, port));
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "attempt {attempt}: graph A gateway boot failed (probed port {port} likely \
+                     stolen in the probe->rebind window): {e}"
+                );
+            }
+        }
+    }
+    let Some((_rt_a, mut gateway_a, mgr_a, port)) = a_setup else {
+        panic!("could not boot graph A's gateway listener in 3 attempts");
+    };
+
+    // ---- The outside publisher: a separate OS process on A's root.
+    let dir = std::env::temp_dir().join(format!("cer_nwe2e_outside_{id}"));
+    std::fs::create_dir_all(&dir).expect("make temp dir");
+    let config_path = dir.join("ix_config.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string(&ix_a).expect("serialize iceoryx2 config"),
+    )
+    .expect("write iceoryx2 config");
+    let stop_path = dir.join("stop");
+    let mut child = OutsideChildGuard {
+        child: std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "outside_publisher_child_entrypoint",
+                "--nocapture",
+            ])
+            .env(ENV_OUTSIDE_IOX2_CONFIG, &config_path)
+            .env(ENV_OUTSIDE_TOPICS, format!("{listed},{unlisted}"))
+            .env(ENV_OUTSIDE_STOP, &stop_path)
+            .spawn()
+            .expect("spawn the outside publisher"),
+        reaped: false,
+    };
+
+    // Wait until A's gateway has registered the unlisted topic from the
+    // child's control-channel record (the topic is not on A's egress list).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !gateway_a
+        .is_runtime_registered(&unlisted)
+        .expect("is_runtime_registered")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the outside publisher's registration of {unlisted} never reached A's gateway"
+        );
+        gateway_a.drive_once().expect("drive A's gateway");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // ---- Graph B: ingresses BOTH topics, one consumer each.
+    let yaml_b = format!(
+        r#"
+name: nwe2e_outside_workstation
+prefix: nwe2eob
+nodes:
+  - id: sink_listed
+    type: cloud_sink
+    inputs:
+      - name: cloud
+        source: {listed}
+  - id: sink_unlisted
+    type: cloud_sink
+    inputs:
+      - name: cloud
+        source: {unlisted}
+network:
+  mode: peer
+  connect:
+    - tcp/127.0.0.1:{port}
+  ingress:
+    - {listed}
+    - {unlisted}
+"#
+    );
+    let config_b = parse_graph_raw(&yaml_b).expect("graph B YAML parses");
+    let net_b = config_b
+        .network_transport_config()
+        .expect("graph B declares an enabled network block");
+    let clock_b = Arc::new(VirtualClock::new());
+    let mgr_b = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("nwe2e_ob_{id}"),
+            clock: clock_b.clone(),
+            subscriber_buffer_size: 16,
+            network: Some(net_b),
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("init manager B");
+    let seen = |sink: &CloudSink| {
+        (
+            sink.seen_x.load(Ordering::Relaxed),
+            sink.seen_y.load(Ordering::Relaxed),
+            sink.seen_z.load(Ordering::Relaxed),
+        )
+    };
+    let new_sink = || CloudSink {
+        seen_x: Arc::new(AtomicU64::new(UNSEEN)),
+        seen_y: Arc::new(AtomicU64::new(UNSEEN)),
+        seen_z: Arc::new(AtomicU64::new(UNSEEN)),
+        ..Default::default()
+    };
+    let probe_listed = new_sink();
+    let probe_unlisted = new_sink();
+    let mut factories_b: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for (node, probe) in [
+        ("sink_listed", &probe_listed),
+        ("sink_unlisted", &probe_unlisted),
+    ] {
+        let sink = CloudSink {
+            seen_x: Arc::clone(&probe.seen_x),
+            seen_y: Arc::clone(&probe.seen_y),
+            seen_z: Arc::clone(&probe.seen_z),
+            ..Default::default()
+        };
+        factories_b.insert(node.to_string(), Box::new(CloudSinkEntry::with_state(sink)));
+    }
+    let infos_b: IndexMap<String, NodeInfo> = factories_b
+        .iter()
+        .map(|(k, e)| (k.clone(), e.info().expect("node info")))
+        .collect();
+    let topology_b = GraphTopology::build(&config_b, &infos_b).expect("topology B");
+    let plan_b = compute_gateway_plan(&config_b, &topology_b, &infos_b, NetworkPosture::Strict)
+        .expect("plan B computes")
+        .expect("graph B declares an enabled network block");
+    let mut rt_b = GraphRuntime::build(config_b, factories_b, &mgr_b, clock_b)
+        .expect("graph B build (network-free)");
+    let _gateway_b = GatewayRuntime::new(Arc::clone(&mgr_b), plan_b)
+        .expect("graph B gateway boot (its ingress bridge connects to A's live listener)");
+
+    // ---- B's demand for the listed topic flips A's flag through the
+    // allow-list; drive A until its tap on the child's service attaches.
+    let flag = mgr_a
+        .bridge_manager()
+        .register_topic(&listed)
+        .expect("A bridge flag handle");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !flag.load(Ordering::Relaxed) {
+        assert!(
+            Instant::now() < deadline,
+            "B's demand for {listed} never flipped A's bridge flag within 10s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gateway_a.active_tap_topics().contains(&listed) {
+        assert!(
+            Instant::now() < deadline,
+            "A's gateway tap on the outside publisher's service did not attach"
+        );
+        gateway_a.drive_once().expect("drive A's gateway");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // ---- Drive A's gateway and step B until the listed consumer observes the
+    // child's payload bit-for-bit (bounded).
+    const STEP: Duration = Duration::from_millis(1);
+    let oracle_bits = (ORACLE.0.to_bits(), ORACLE.1.to_bits(), ORACLE.2.to_bits());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && seen(&probe_listed) != oracle_bits {
+        gateway_a.drive_once().expect("drive A's gateway forward");
+        rt_b.step(STEP);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        seen(&probe_listed),
+        oracle_bits,
+        "B's consumer of the external egress topic must observe the outside publisher's \
+         payload bit-for-bit ({ORACLE:?})"
+    );
+    assert!(
+        gateway_a.forwarded_count(&listed) > 0,
+        "A's gateway forwarded the listed topic's frames"
+    );
+
+    // ---- Strict scope holds. B's demand for the unlisted topic reaches A and
+    // A's bridge refuses it; then both sides run one more second and the
+    // unlisted topic never egresses.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mgr_a
+        .bridge_manager()
+        .was_egress_refused(&unlisted)
+        .expect("egress gate readable")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "B's demand for {unlisted} never reached A's bridge scoping filter within 10s"
+        );
+        gateway_a.drive_once().expect("drive A's gateway");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !mgr_a
+            .bridge_manager()
+            .was_egress_refused(&listed)
+            .expect("egress gate readable"),
+        "the listed external topic is never refused"
+    );
+    let settle = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle {
+        gateway_a.drive_once().expect("drive A's gateway");
+        rt_b.step(STEP);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !mgr_a
+            .bridge_manager()
+            .is_enabled(&unlisted)
+            .expect("is_enabled unlisted"),
+        "the unlisted topic's bridge must never enable under the Strict block"
+    );
+    assert_eq!(
+        gateway_a.forwarded_count(&unlisted),
+        0,
+        "no frame of the unlisted topic leaves A"
+    );
+    assert_eq!(
+        seen(&probe_unlisted),
+        (UNSEEN, UNSEEN, UNSEEN),
+        "B's consumer of the unlisted topic never fires"
+    );
+
+    // ---- Release the child; it exits 0 (registered and published throughout).
+    std::fs::write(&stop_path, b"done").expect("write stop file");
+    let status = child.child.wait().expect("wait for the outside publisher");
+    child.reaped = true;
+    assert!(status.success(), "outside publisher exited {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
