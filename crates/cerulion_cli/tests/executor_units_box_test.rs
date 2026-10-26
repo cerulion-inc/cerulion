@@ -71,8 +71,8 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::graph::params::ParamValue;
 use read_identity::{
-    graph_config, judge, node_def, unique_names, write_graph, Fixture, Floors, Placement,
-    RowVerdict, SAMPLES_DIR_ENV,
+    graph_config, judge_replayed, node_def, unique_names, write_graph, Fixture, Floors, Placement,
+    ReplayMode, RowVerdict, SAMPLES_DIR_ENV,
 };
 use serial_test::serial;
 
@@ -196,7 +196,7 @@ fn run_leg(leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     let ready = move || start.elapsed() >= BRING_UP;
     let mut vars: Vec<(&str, &Path)> = vec![(SAMPLES_DIR_ENV, &samples)];
     vars.extend_from_slice(env);
-    read_identity::run_live(ws, &graph, &[], &vars, dir.path(), &ready, WINDOW);
+    let _ = read_identity::run_live(ws, &graph, &[], &vars, dir.path(), &ready, WINDOW);
     let n = leg_numbers(&samples);
     eprintln!(
         "UNITS_NB leg={leg} fires={} rate_hz={:.1} p50_us={} p99_us={}",
@@ -325,7 +325,7 @@ fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
     let ready = move || start.elapsed() >= BRING_UP;
     let mut vars: Vec<(&str, &Path)> = vec![(SAMPLES_DIR_ENV, &samples)];
     vars.extend_from_slice(env);
-    read_identity::run_live(ws, &graph, &[], &vars, dir.path(), &ready, WINDOW);
+    let _ = read_identity::run_live(ws, &graph, &[], &vars, dir.path(), &ready, WINDOW);
     let n = leg_numbers(&samples);
     eprintln!(
         "UNITS_NB leg={leg} fires={} rate_hz={:.1} p50_us={} p99_us={}",
@@ -382,11 +382,17 @@ fn the_unprofiled_merge_mutant_is_caught() {
 /// Record `fixture` under `placement`, resim it, judge and print.
 fn record_and_judge(fixture: Fixture, placement: Placement) -> read_identity::Verdict {
     let run = read_identity::record_live(fixture, placement);
-    let replayed = read_identity::resim(&run, None);
-    let verdict = judge(fixture, &run.live, &replayed, Floors::default())
+    let replayed = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let outcome = judge_replayed(fixture, &run.live, &replayed, Floors::default())
         .unwrap_or_else(|e| panic!("RI_HARNESS: {}: {e}", fixture.name()));
-    verdict.print(fixture.name(), &format!("{}/resim", placement.label()));
-    verdict
+    outcome.print(
+        fixture.name(),
+        &format!("{}/{}", placement.label(), ReplayMode::ResimNeutral.label()),
+    );
+    outcome
+        .verdict()
+        .cloned()
+        .unwrap_or_else(|| panic!("RI_HARNESS: {}: the neutral resim refused", fixture.name()))
 }
 
 fn kind(v: &RowVerdict) -> &'static str {

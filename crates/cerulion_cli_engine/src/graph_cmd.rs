@@ -10670,7 +10670,7 @@ fn run_unit_groups(
 
 /// The graph's profile for the executor tick budget: the cost snapshot at
 /// [`default_artifact_path`], when one is present and usable.
-fn load_unit_profile(
+pub(crate) fn load_unit_profile(
     workspace_root: &Path,
     graph_name: &str,
 ) -> Option<(cerulion_core::graph::PartitionCosts, String)> {
