@@ -452,7 +452,7 @@ async fn unpaired_caller_pairs_with_a_valid_presentation_and_a_garbage_one_is_re
     // the viewer's non-revoked row AND the side-map binds the client key → viewer.
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     let row = store
-        .is_allowed(&viewer, T_NOW)
+        .account_access(&viewer, T_NOW)
         .expect("viewer row on disk");
     assert_eq!(row.source, PairingSource::StrongChain);
     assert_eq!(row.name.as_deref(), Some("viewer"));
@@ -551,7 +551,7 @@ async fn code_pair_start_finish_establishes_a_row_via_a_cpace_witness() {
 
     // The row is on disk with the conservative code-pair default scope.
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
-    let row = store.is_allowed(&guest, T_NOW).expect("guest row on disk");
+    let row = store.account_access(&guest, T_NOW).expect("guest row on disk");
     assert_eq!(row.source, PairingSource::CodePaired);
     assert_eq!(row.scope, Scope::CODE_PAIR_DEFAULT);
     let index =
@@ -627,7 +627,7 @@ async fn code_pair_wrong_code_denies_and_burns_bounded_attempts() {
     // No row was ever established (never fail-open).
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     assert!(
-        store.is_allowed(&guest, T_NOW).is_none(),
+        store.account_access(&guest, T_NOW).is_none(),
         "no row on a wrong code"
     );
 }
@@ -697,7 +697,7 @@ async fn code_pair_expired_ttl_denies() {
     }
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     assert!(
-        store.is_allowed(&guest, T_NOW).is_none(),
+        store.account_access(&guest, T_NOW).is_none(),
         "no row after an expired TTL"
     );
 }

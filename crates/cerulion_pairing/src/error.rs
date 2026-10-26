@@ -204,6 +204,10 @@ pub enum PairingError {
     /// owner's access row with the code-pairing scope.
     #[error("code pairing cannot bind the robot's owner account")]
     CodePairOwnerAccount,
+    /// A cloud device certificate was presented while this robot's
+    /// allow-from-cloud switch is OFF.
+    #[error("this robot does not allow access from the cloud (its allow-from-cloud switch is off)")]
+    CloudAccessDisabled,
 
     // ---- owner-signed access grant ---------------------------------------
     /// An owner-signed [`crate::format::AccessGrant`] was presented whose owner

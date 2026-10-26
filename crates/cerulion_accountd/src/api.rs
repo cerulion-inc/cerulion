@@ -273,6 +273,7 @@ fn parse_principal(s: &str) -> Result<PrincipalKind> {
 fn principal_str(kind: u8) -> &'static str {
     match kind {
         2 => "machine",
+        3 => "cloud",
         _ => "human",
     }
 }
@@ -280,6 +281,7 @@ fn principal_str(kind: u8) -> &'static str {
 fn principal_from_u8(kind: u8) -> PrincipalKind {
     match kind {
         2 => PrincipalKind::Machine,
+        3 => PrincipalKind::Cloud,
         _ => PrincipalKind::Human,
     }
 }

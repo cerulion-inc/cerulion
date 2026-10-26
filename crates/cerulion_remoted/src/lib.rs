@@ -93,6 +93,7 @@ pub mod ops;
 pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
+pub mod robot_settings;
 pub mod tap;
 pub mod trust;
 pub mod verbs;

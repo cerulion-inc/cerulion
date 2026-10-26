@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::format::{AccountId, PrincipalKind, Scope};
+use crate::format::{AccountId, PrincipalKind, PublicKey, Scope};
 
 /// How an access-list row was established.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -34,6 +34,13 @@ pub enum PairingSource {
     /// Distinct from [`PairingSource::OwnerGrant`] (the login-gated OWNER claim) so
     /// the provenance of a guest admitted by the owner stays accurate and revocable.
     OwnerSignedGrant,
+    /// A device row for the OWNER account, written when one of the owner's
+    /// devices presents its roots-verified device certificate chain
+    /// ([`crate::verify::TrustStore::verify_owner_certificate`]). No code and no
+    /// user step: the certificate is the proof. The row carries the
+    /// certificate's principal, so a [`PrincipalKind::Cloud`] device stays
+    /// distinguishable from the owner's own devices.
+    CertificatePresentation,
 }
 
 /// One durable access-list entry.
@@ -41,6 +48,13 @@ pub enum PairingSource {
 pub struct AccessRow {
     /// The account this row grants access to.
     pub account: AccountId,
+    /// The device this row belongs to. Rows are keyed by `(account, device)`:
+    /// a new device of an account adds its own row and never rewrites another
+    /// device's row. `None` is an account-wide row: the owner row written by a
+    /// claim, and every row of a store migrated from format v3 (which keyed rows
+    /// by account only). A device with no row of its own falls back to its
+    /// account's account-wide row ([`crate::verify::TrustStore::is_allowed`]).
+    pub device: Option<PublicKey>,
     /// The scope granted.
     pub scope: Scope,
     /// Human vs. machine.

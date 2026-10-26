@@ -89,6 +89,12 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
             required_caps: Scope::CAP_TELEOP,
             max_role: Role::OPERATOR,
         }),
+        // Owner-only robot setting; the handler also requires the caller's
+        // account to be the claimed owner through a non-cloud row.
+        verbs::CLOUD_ACCESS => VerbClass::Normal(AccessRequirement {
+            required_caps: 0,
+            max_role: Role::OWNER,
+        }),
         _ => return None,
     })
 }
@@ -175,6 +181,12 @@ impl PairingAuthorizer {
         // 3. One torn-free read of (claimed, access) for this key.
         let (claimed, access) = self.shared.snapshot_for_key(&device_key);
 
+        // 3a. A cloud row on a robot whose allow-from-cloud switch is OFF is
+        // refused for EVERY verb class, the bootstrap and e-stop verbs included.
+        if let Some(reason) = cloud_refusal(access) {
+            return AuthzDecision::deny(format!("verb '{verb}' refused: {reason}"));
+        }
+
         // 4. UNCLAIMED robot: ONLY `claim` is admissible.
         if !claimed {
             return if matches!(class, VerbClass::Bootstrap) && verb == verbs::CLAIM {
@@ -210,6 +222,9 @@ impl PairingAuthorizer {
                      allowed, but this desk was cut"
                         .to_string(),
                 ),
+                KeyAccess::CloudRefused => AuthzDecision::deny(
+                    "e-stop floor: cloud access is off on this robot".to_string(),
+                ),
                 KeyAccess::Unpaired => AuthzDecision::deny(
                     "e-stop floor requires a PAIRED account; this device key is unpaired \
                      (only bootstrap verbs are admissible)"
@@ -219,6 +234,9 @@ impl PairingAuthorizer {
 
             // Normal verb: paired AND meets the capability + role requirement.
             VerbClass::Normal(req) => match access {
+                KeyAccess::CloudRefused => AuthzDecision::deny(format!(
+                    "verb '{verb}' refused: cloud access is off on this robot"
+                )),
                 KeyAccess::Unpaired => AuthzDecision::deny(format!(
                     "device key is unpaired: verb '{verb}' requires a paired account \
                      (only bootstrap verbs are admissible)"
@@ -262,6 +280,15 @@ impl PairingAuthorizer {
         remote_id: &[u8; 32],
     ) -> (AcceptDecision, bool) {
         let (claimed, access) = self.shared.snapshot_for_key(remote_id);
+        // Every ALPN, served or not, refuses a cloud row while the switch is OFF.
+        if let Some(reason) = cloud_refusal(access) {
+            return (
+                AcceptDecision::Refuse {
+                    reason: reason.to_string(),
+                },
+                false,
+            );
+        }
         let unpaired =
             alpn == cerulion_link::alpn::WIRE && claimed && matches!(access, KeyAccess::Unpaired);
         let decision = if alpn == cerulion_link::alpn::OPS {
@@ -296,9 +323,22 @@ impl PairingAuthorizer {
     }
 }
 
+/// The refusal for a cloud row on a robot whose allow-from-cloud switch is OFF
+/// ([`KeyAccess::CloudRefused`], produced by `TrustStore::cloud_allowed` in
+/// [`SharedTrust::snapshot_for_key`]); `None` for every other access state.
+/// Accept, every verb, and the wire plane's demand and sweep checks call it.
+pub fn cloud_refusal(access: KeyAccess) -> Option<&'static str> {
+    matches!(access, KeyAccess::CloudRefused).then_some(
+        "this robot does not allow access from the cloud (its allow-from-cloud switch is off)",
+    )
+}
+
 /// Whether a key may be admitted to the wire plane (paired + `CAP_OBSERVE`) given
 /// a torn-free `(claimed, access)` read.
 fn wire_admittable(claimed: bool, access: KeyAccess) -> Result<(), String> {
+    if let Some(reason) = cloud_refusal(access) {
+        return Err(format!("wire plane refused: {reason}"));
+    }
     if !claimed {
         return Err(
             "wire plane refused: robot is UNCLAIMED (catalog/demand require a \
@@ -326,6 +366,7 @@ fn wire_admittable(claimed: bool, access: KeyAccess) -> Result<(), String> {
              epoch — this desk was cut"
                 .to_string(),
         ),
+        KeyAccess::CloudRefused => Err("wire plane refused: cloud access is off".to_string()),
         KeyAccess::Allowed(scope) => {
             if (scope.caps & Scope::CAP_OBSERVE) == 0 {
                 Err(

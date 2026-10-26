@@ -579,7 +579,7 @@ async fn post_v1_robots_owner_grant_claims_an_unclaimed_robot_end_to_end() {
         OwnershipState::Claimed(AccountId(installer_account_bytes))
     );
     let row = store
-        .is_allowed(&AccountId(installer_account_bytes), 0)
+        .account_access(&AccountId(installer_account_bytes), 0)
         .unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.source, PairingSource::OwnerGrant);

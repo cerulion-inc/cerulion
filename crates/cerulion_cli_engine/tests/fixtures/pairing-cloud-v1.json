@@ -1,0 +1,21 @@
+{
+  "fixtureVersion": 1,
+  "description": "Fixed serialization oracles for a cloud-principal device certificate, independently assembled from the documented field order. The cloud principal signs as discriminant 3 and travels as postcard variant index 2; a decoder that knows only human and machine refuses it. Signature bytes are a public byte pattern for the codec, not an authenticated credential. u64 fields are decimal strings to preserve precision.",
+  "cloudDevice": {
+    "fields": {
+      "version": 1,
+      "deviceKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "accountHex": "021f0a006866fde5256f57cfad02a022fae9e8e473a6e4d3a471f1f4bd83e917",
+      "principalKind": "cloud",
+      "role": 1,
+      "caps": "15",
+      "notBeforeNs": "1761436800000000000",
+      "notAfterNs": "1761440400000000000",
+      "issuedAtNs": "1761436800000000000",
+      "issuerKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "signatureHex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    },
+    "canonicalHex": "1f000000636572756c696f6e2d70616972696e673a6465766963652d636572743a763101003d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c021f0a006866fde5256f57cfad02a022fae9e8e473a6e4d3a471f1f4bd83e9170301000f0000000000000000004de66fe1711800a00517b6e4711800004de66fe17118d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "postcardHex": "013d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c021f0a006866fde5256f57cfad02a022fae9e8e473a6e4d3a471f1f4bd83e91702010f8080b4b2feadf8b81880c096b8e196f9b8188080b4b2feadf8b818d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a40c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+  }
+}

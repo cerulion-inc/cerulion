@@ -50,7 +50,7 @@ fn owner_certificate_keeps_row_bytes_and_only_advances_floor() {
     assert_eq!(s.high_water_ns(), T_NOW + 1);
     assert_eq!(s.owner(), Some(acct(1)));
     assert_eq!(postcard::to_stdvec(s.access_rows()).unwrap(), before);
-    let row = s.is_allowed(&acct(1), T_NOW + 1).unwrap();
+    let row = s.account_access(&acct(1), T_NOW + 1).unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.added_at_ns, T_NOW);
     assert_eq!(row.expires_at_ns, None);

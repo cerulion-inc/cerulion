@@ -132,9 +132,25 @@ rollback) is `crates/cerulion_pairing/tests/chain_verify_test.rs`.
   the crate holds no key-management policy). `high_water_ns` is the max
   validated time ever observed; a verification whose `now_ns` is behind it is
   refused, so a clock rollback cannot resurrect an expired cert, and the floor
-  survives factory reset. Pinned by `store_test.rs`. A store whose
-  `STORE_FORMAT_VERSION` does not match is REFUSED, never migrated (the
-  documented bump policy in `store.rs`).
+  survives factory reset. Pinned by `store_test.rs`. Format v4 keys access rows
+  by `(account, device)` and carries the allow-from-cloud switch; a v3 store is
+  MIGRATED on load (MAC verified first, every row kept as an account-wide row in
+  order, the switch on, one warning) and saved as v4 on the next write. Any other
+  version is REFUSED (the bump policy in `store.rs`).
+- **Access rows are per device.** A row belongs to `(account, device)`; a new
+  device of an account adds its own row and never rewrites another device's
+  row, the owner row included. `device: None` is an account-wide row (the owner
+  row a claim writes, and every migrated row); a device with no row of its own
+  falls back to it, and a revoked or expired device row never does
+  (`TrustStore::is_allowed`). An owner revoke covers every row of the account.
+- **The cloud principal.** `PrincipalKind::Cloud` (signed discriminant 3, postcard
+  variant index 2) marks a device certificate the hosted service holds for an
+  account. A decoder built before it refuses the certificate. The robot's
+  allow-from-cloud switch (in the trust store, ON by default, set by the owner
+  from a non-cloud device with the `cloud-access` ops verb) gates every cloud row
+  through one predicate, `TrustStore::cloud_allowed`, surfaced as
+  `KeyAccess::CloudRefused` and refused at accept on every ALPN and for every
+  verb, the bootstrap and e-stop verbs included.
 - **CPace fallback ceremony** (`pake.rs`): the CFRG balanced PAKE, run INSIDE an
   already-authenticated channel with both transport identities transcript-bound;
   bounded attempts (config range 1..=5, default 3), code burn, TTL (default
@@ -450,13 +466,17 @@ and presents the owner's certificate chain ONCE, and only on a classified
 unpaired refusal: never after expiry, revocation or a denied permission, and
 never as a silent fallback to a code. On the robot side the `pair` verb admits a
 chain whose account equals the owner account with no robot-scoped grant; every
-other account still needs the full grant presentation.
+other account still needs the full grant presentation. This is **certificate
+presentation**: no code and no user step, and the presenting device gets its own
+row `(owner, device)` with the owner row's scope and the certificate's principal.
+The hosted service's device is admitted exactly this way, as a cloud row.
 
 **Code pairing cannot name an account.** Possession of a code and of the device
 keys proves neither, so `code-pair-finish` binds the guest to the self-account
-derived from the authenticated transport key and refuses any other value; a
-cloud account requires the full roots-verified chain whose device key equals the
-transport peer key. The owner row is never preserved for a guest, because that
+derived from the authenticated transport key and refuses any other value; an
+account certificate requires the full roots-verified chain whose device key equals
+the transport peer key, presented through `pair` (certificate presentation, below).
+The owner row is never preserved for a guest, because that
 would hand the guest the owner's authority outright
 (`crates/cerulion_remoted/tests/code_pair_account_test.rs`).
 

@@ -97,7 +97,13 @@ impl Scope {
     }
 }
 
-/// Whether a principal is a human operator or an autonomous/machine account.
+/// Whether a principal is a human operator, an autonomous/machine account, or
+/// the hosted cloud acting for an account.
+///
+/// Signed bytes carry the `u8` discriminant (Human 1, Machine 2, Cloud 3);
+/// postcard carries the variant index (Human 0, Machine 1, Cloud 2). A decoder
+/// built before `Cloud` refuses index 2, so an older robot rejects a cloud
+/// certificate instead of reading it as another principal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PrincipalKind {
@@ -105,6 +111,9 @@ pub enum PrincipalKind {
     Human = 1,
     /// A machine / service account.
     Machine = 2,
+    /// The hosted cloud service acting for the certificate's account. A robot's
+    /// allow-from-cloud switch admits or refuses every row with this principal.
+    Cloud = 3,
 }
 
 /// A `[not_before, not_after)` validity window in Unix nanoseconds.

@@ -28,13 +28,15 @@ rules for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT
   hand-serializer vectors (`format_vectors_test.rs`): a format change updates encoder
-  AND oracle. A store-format bump REFUSES old files, and epoch apply is monotonic
-  wholesale-replace.
+  AND oracle. A store-format bump migrates or refuses old files loudly (v3 -> v4
+  migrates); epoch apply is monotonic wholesale-replace.
+- Access rows are keyed by (account, device); `TrustStore::cloud_allowed` is the one
+  allow-from-cloud predicate, surfaced as `KeyAccess::CloudRefused` and refused on
+  every plane and verb via `authorizer::cloud_refusal`.
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
-- Peer-supplied text is sanitized and length-bounded where it ENTERS an error or log
-  (`sanitize_peer_text`), never only at render.
+- Peer text is sanitized and bounded where it ENTERS an error or log (`sanitize_peer_text`).
 - Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
@@ -48,10 +50,8 @@ rules for `cerulion_pairing`, `cerulion_link`, `cerulion_wireclient`,
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
-- The whole family is parallel-safe: `cargo test -p <crate>` for pairing / link /
-  wireclient / connectd / remoted / cerud / accountd / cerulion-wire, zero
-  `#[serial]`, zero `#[ignore]`. The e2e suites are LOOPBACK iroh only (relay
-  disabled, direct dial, every await bounded): no relay, WAN or multicast.
+- The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+  e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
 - remoted and link cold-compile the ~390-crate iroh tree. remoted, connectd,
   wireclient, link and accountd are OUT of `default-members`: build them with `-p`.
 

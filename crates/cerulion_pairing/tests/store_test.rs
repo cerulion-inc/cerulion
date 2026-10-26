@@ -118,8 +118,8 @@ fn save_load_round_trips_all_state() {
     assert_eq!(loaded.owner(), Some(acct(OWNER)));
     assert!(loaded.is_claimed());
     assert_eq!(loaded.access_rows().len(), 2);
-    assert!(loaded.is_allowed(&acct(OWNER), T_NOW).is_some());
-    assert!(loaded.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(loaded.account_access(&acct(OWNER), T_NOW).is_some());
+    assert!(loaded.account_access(&acct(GUEST), T_NOW).is_some());
     assert_eq!(loaded.high_water_ns(), s.high_water_ns());
     assert_eq!(loaded.robot_id(), rob(ROBOT));
 }
@@ -203,7 +203,7 @@ fn claim_requires_chassis_secret_and_writes_owner_row() {
     s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
         .unwrap();
     assert_eq!(s.owner(), Some(acct(OWNER)));
-    let row = s.is_allowed(&acct(OWNER), T_NOW).unwrap();
+    let row = s.account_access(&acct(OWNER), T_NOW).unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.source, PairingSource::Claim);
 
@@ -257,7 +257,7 @@ fn epochs_apply_monotonically_and_replace_the_revocation_set() {
     s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
         .unwrap();
     code_pair(&mut s, acct(GUEST), "phone", T_NOW);
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 
     // Epoch 2 revokes GUEST.
     let e2 = make_epoch(rob(ROBOT), 2, vec![acct(GUEST)], pk(&sk(10)), ISSUED).sign(&sk(10));
@@ -265,7 +265,7 @@ fn epochs_apply_monotonically_and_replace_the_revocation_set() {
         s.apply_epoch(&e2, &good_intermediate(), T_NOW).unwrap(),
         EpochOutcome::Applied { newly_revoked: 1 }
     );
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
     assert_eq!(s.current_epoch(), 2);
 
     // Re-applying epoch 2 (or an older one) is a no-op.
@@ -282,7 +282,7 @@ fn epochs_apply_monotonically_and_replace_the_revocation_set() {
     // if applied, un-revoke GUEST) is a true no-op — GUEST stays denied and the
     // epoch number is unchanged.
     assert!(
-        s.is_allowed(&acct(GUEST), T_NOW).is_none(),
+        s.account_access(&acct(GUEST), T_NOW).is_none(),
         "a stale epoch must not restore revoked access"
     );
     assert_eq!(s.current_epoch(), 2);
@@ -293,7 +293,7 @@ fn epochs_apply_monotonically_and_replace_the_revocation_set() {
         s.apply_epoch(&e3, &good_intermediate(), T_NOW).unwrap(),
         EpochOutcome::Applied { newly_revoked: 0 }
     );
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
     assert_eq!(s.current_epoch(), 3);
 }
 
@@ -420,7 +420,7 @@ fn a_revoked_device_cannot_repair_to_escape_the_tombstone() {
         ));
     }
     // No row was written for the account by the refused attempts.
-    assert!(s.is_allowed(&account, T_NOW).is_none());
+    assert!(s.account_access(&account, T_NOW).is_none());
 
     // Only a NEWER epoch dropping the device re-admits it — then it pairs.
     let e3 =
@@ -428,7 +428,7 @@ fn a_revoked_device_cannot_repair_to_escape_the_tombstone() {
     s.apply_epoch(&e3, &good_intermediate(), T_NOW).unwrap();
     s.verify_and_establish(&presentation_for(20, account), &dev, T_NOW, None)
         .expect("a newer epoch dropping the device re-admits it (the only un-revoke)");
-    assert!(s.is_allowed(&account, T_NOW).is_some());
+    assert!(s.account_access(&account, T_NOW).is_some());
 }
 
 #[test]
@@ -480,14 +480,14 @@ fn an_epoch_revoking_the_owner_applies_as_is_no_robot_side_carveout() {
     let mut s = store();
     s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
         .unwrap();
-    assert!(s.is_allowed(&acct(OWNER), T_NOW).is_some());
+    assert!(s.account_access(&acct(OWNER), T_NOW).is_some());
     let e = make_epoch(rob(ROBOT), 2, vec![acct(OWNER)], pk(&sk(10)), ISSUED).sign(&sk(10));
     assert_eq!(
         s.apply_epoch(&e, &good_intermediate(), T_NOW).unwrap(),
         EpochOutcome::Applied { newly_revoked: 1 }
     );
     assert!(
-        s.is_allowed(&acct(OWNER), T_NOW).is_none(),
+        s.account_access(&acct(OWNER), T_NOW).is_none(),
         "the epoch applies as-is; there is no robot-side owner carve-out"
     );
 }
@@ -533,11 +533,11 @@ fn owner_revoke_and_readmit() {
     s.claim(acct(OWNER), CHASSIS, PrincipalKind::Human, T_NOW)
         .unwrap();
     code_pair(&mut s, acct(GUEST), "phone", T_NOW);
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 
     // Revoke-now by the owner.
     s.owner_revoke(&acct(OWNER), &acct(GUEST)).unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
 
     // A non-owner cannot revoke.
     assert!(matches!(
@@ -547,11 +547,11 @@ fn owner_revoke_and_readmit() {
 
     // The owner cannot lock itself out.
     s.owner_revoke(&acct(OWNER), &acct(OWNER)).unwrap();
-    assert!(s.is_allowed(&acct(OWNER), T_NOW).is_some());
+    assert!(s.account_access(&acct(OWNER), T_NOW).is_some());
 
     // Readmit restores access.
     s.owner_readmit(&acct(OWNER), &acct(GUEST)).unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 }
 
 #[test]
@@ -612,7 +612,7 @@ fn owner_revoked_leaf_is_refused_at_verify_and_owner_readmit_restores_pairing() 
     s.establish_pairing(&v, PairingSource::StrongChain, None, T_NOW, None)
         .unwrap();
     s.owner_revoke(&acct(OWNER), &acct(GUEST)).unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
     // Anti-tautology: GUEST is NOT in any epoch set (epoch 0, empty), so the
     // refusal below is genuinely the sticky owner-revoke path, not the epoch path.
     assert_eq!(s.current_epoch(), 0);
@@ -628,7 +628,7 @@ fn owner_revoked_leaf_is_refused_at_verify_and_owner_readmit_restores_pairing() 
         "an owner-revoked leaf must be refused at verify with RevokedByOwner, got {err:?}"
     );
     // The row also stays revoked (belt-and-suspenders — `is_allowed` still denies).
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
 
     // owner_readmit restores pairability: verification succeeds again and the
     // re-established row is allowed.
@@ -639,7 +639,7 @@ fn owner_revoked_leaf_is_refused_at_verify_and_owner_readmit_restores_pairing() 
     s.establish_pairing(&v2, PairingSource::StrongChain, None, T_NOW, None)
         .unwrap();
     assert!(
-        s.is_allowed(&acct(GUEST), T_NOW).is_some(),
+        s.account_access(&acct(GUEST), T_NOW).is_some(),
         "owner_readmit followed by re-pairing restores access"
     );
 }
@@ -653,17 +653,17 @@ fn code_pairing_cannot_readmit_an_owner_revoked_account() {
         .unwrap();
     code_pair(&mut s, acct(GUEST), "phone", T_NOW);
     s.owner_revoke(&acct(OWNER), &acct(GUEST)).unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
 
     // Re-code-pair the SAME account id — must STAY denied (sticky revocation).
     code_pair(&mut s, acct(GUEST), "phone-again", T_NOW);
     assert!(
-        s.is_allowed(&acct(GUEST), T_NOW).is_none(),
+        s.account_access(&acct(GUEST), T_NOW).is_none(),
         "a code pairing must not readmit an owner-revoked account"
     );
     // Only an explicit owner_readmit restores access.
     s.owner_readmit(&acct(OWNER), &acct(GUEST)).unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 }
 
 // ---- Code-pairing requires an unforgeable ceremony-success witness ----------
@@ -684,7 +684,7 @@ fn code_pairing_persists_a_row_given_a_valid_witness() {
         T_NOW,
     )
     .unwrap();
-    let row = s.is_allowed(&acct(GUEST), T_NOW).expect("code-paired");
+    let row = s.account_access(&acct(GUEST), T_NOW).expect("code-paired");
     assert_eq!(row.source, PairingSource::CodePaired);
     // The principal kind comes from the witness (not a caller-chosen argument).
     assert_eq!(row.principal_kind, PrincipalKind::Human);
@@ -708,7 +708,7 @@ fn a_code_pairing_of_the_owner_account_is_refused_and_the_owner_row_is_unchanged
     assert!(matches!(err, PairingError::CodePairOwnerAccount), "{err:?}");
     assert_eq!(s.access_rows(), before.as_slice());
     assert_eq!(
-        s.is_allowed(&acct(OWNER), T_NOW + 1).unwrap().scope,
+        s.account_access(&acct(OWNER), T_NOW + 1).unwrap().scope,
         Scope::OWNER_FULL
     );
 }
@@ -734,8 +734,8 @@ fn a_witness_for_one_account_cannot_establish_another() {
         .unwrap_err();
     assert!(matches!(err, PairingError::WitnessAccountMismatch));
     // Nothing was persisted for either account.
-    assert!(s.is_allowed(&acct(OWNER), T_NOW).is_none());
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_none());
+    assert!(s.account_access(&acct(OWNER), T_NOW).is_none());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_none());
 }
 
 // The impossibility of forging a CpaceConfirmed outside the ceremony
@@ -778,7 +778,7 @@ fn code_pairing_rejects_a_cross_robot_witness() {
         "a witness for a different robot must be refused, got {err:?}"
     );
     assert!(
-        s.is_allowed(&acct(GUEST), T_NOW).is_none(),
+        s.account_access(&acct(GUEST), T_NOW).is_none(),
         "a cross-robot witness must persist no access row"
     );
 }
@@ -805,7 +805,7 @@ fn code_pairing_accepts_a_witness_bound_to_this_robot() {
         T_NOW,
     )
     .unwrap();
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 }
 
 #[test]
@@ -942,13 +942,13 @@ fn pre_claim_pairing_cannot_plant_a_backdoor_that_survives_the_claim() {
     );
     assert_eq!(s.owner(), Some(acct(OWNER)));
     assert!(
-        s.is_allowed(&acct(GUEST), T_NOW).is_none(),
+        s.account_access(&acct(GUEST), T_NOW).is_none(),
         "no backdoor guest row survived the claim"
     );
 
     // (4) Post-claim ceremonies now legitimately add rows.
     code_pair(&mut s, acct(GUEST), "phone", T_NOW);
-    assert!(s.is_allowed(&acct(GUEST), T_NOW).is_some());
+    assert!(s.account_access(&acct(GUEST), T_NOW).is_some());
 }
 
 // ---- B: epoch-vs-owner revocation errors name their cause ------------
@@ -1171,7 +1171,7 @@ fn owner_revoked_delegator_blocks_delegatee_new_pairing() {
     // Give the delegator (0xDD) an access-list row, then owner-revoke it locally.
     code_pair(&mut s, acct(0xDD), "delegator", T_NOW);
     s.owner_revoke(&acct(OWNER), &acct(0xDD)).unwrap();
-    assert!(s.is_allowed(&acct(0xDD), T_NOW).is_none());
+    assert!(s.account_access(&acct(0xDD), T_NOW).is_none());
     // The delegator is NOT in the epoch revocation set — only its local row is
     // revoked (anti-tautology for the mutation check).
     assert_eq!(s.current_epoch(), 0);
@@ -1374,7 +1374,7 @@ fn owner_grant_claim_flips_unclaimed_to_claimed_owner() {
     assert!(s.is_claimed());
 
     let row = s
-        .is_allowed(&acct(OWNER), T_NOW)
+        .account_access(&acct(OWNER), T_NOW)
         .expect("the owner is allowed after the claim");
     assert_eq!(row.scope, Scope::OWNER_FULL, "owner row carries OWNER_FULL");
     assert_eq!(
@@ -1508,7 +1508,7 @@ fn owner_grant_claim_persists_across_save_load() {
     let loaded = TrustStore::load(&path, MAC_KEY).unwrap();
     assert_eq!(loaded.owner(), Some(acct(OWNER)));
     assert!(loaded.is_claimed());
-    let row = loaded.is_allowed(&acct(OWNER), T_NOW).unwrap();
+    let row = loaded.account_access(&acct(OWNER), T_NOW).unwrap();
     assert_eq!(row.source, PairingSource::OwnerGrant);
     assert_eq!(row.scope, Scope::OWNER_FULL);
 }
@@ -1531,7 +1531,7 @@ fn owner_grant_claimed_robot_admits_a_new_guest_pairing() {
         )
         .expect("a claimed robot admits a guest strong-chain pairing");
     assert_eq!(verified.account(), acct(0x0A));
-    assert!(s.is_allowed(&acct(0x0A), T_NOW).is_some());
+    assert!(s.account_access(&acct(0x0A), T_NOW).is_some());
 }
 
 #[test]
@@ -1548,8 +1548,8 @@ fn chassis_claim_still_works_as_recovery_and_matches_owner_grant_claim() {
 
     assert_eq!(a.owner(), b.owner());
     assert_eq!(a.owner(), Some(acct(OWNER)));
-    let ra = a.is_allowed(&acct(OWNER), T_NOW).unwrap();
-    let rb = b.is_allowed(&acct(OWNER), T_NOW).unwrap();
+    let ra = a.account_access(&acct(OWNER), T_NOW).unwrap();
+    let rb = b.account_access(&acct(OWNER), T_NOW).unwrap();
     assert_eq!(ra.scope, Scope::OWNER_FULL);
     assert_eq!(rb.scope, Scope::OWNER_FULL);
     assert_eq!(ra.source, PairingSource::Claim);
@@ -1621,7 +1621,7 @@ fn a_valid_owner_grant_for_a_second_account_cannot_take_over_a_claimed_robot() {
     assert_eq!(s.ownership(), OwnershipState::Claimed(acct(OWNER)));
     assert_eq!(s.owner(), Some(acct(OWNER)));
     assert!(
-        s.is_allowed(&acct(SECOND_OWNER), T_NOW).is_none(),
+        s.account_access(&acct(SECOND_OWNER), T_NOW).is_none(),
         "the takeover account must have no access row"
     );
     assert_eq!(s.access_rows().len(), 1);

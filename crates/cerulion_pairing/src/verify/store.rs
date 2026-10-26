@@ -53,7 +53,14 @@ const STORE_MAGIC: [u8; 8] = *b"CERPAIR\x01";
 // revocation set, applied by `apply_epoch` and consulted at the accept gate). The
 // crate is unmerged, so a v2 file is refused as an unsupported version rather than
 // migrated (same policy the v1→v2 bump used).
-const STORE_FORMAT_VERSION: u16 = 3;
+// v4: access rows are keyed by `(account, device)` (`AccessRow::device`), and
+// `TrustStoreInner` gained `allow_cloud`, the per-robot allow-from-cloud switch.
+// A v3 file is MIGRATED, not refused (robots in the field carry v3 stores): every
+// v3 row becomes an account-wide row (`device: None`), in the same order, and
+// `allow_cloud` starts ON. The MAC is verified with the same key before the v3
+// body is read, and the migration logs once at warn. The next save writes v4.
+const STORE_FORMAT_VERSION: u16 = 4;
+const STORE_FORMAT_VERSION_V3: u16 = 3;
 const CHASSIS_DSI: &[u8] = b"cerulion-pairing:chassis-secret:v1";
 const TAG_LEN: usize = 32;
 const HEADER_LEN: usize = 8 + 2 + 4; // magic + version + body_len
@@ -89,6 +96,76 @@ struct TrustStoreInner {
     revoked_devices: Vec<PublicKey>,
     /// Anti-rollback high-water mark (Unix ns).
     high_water_ns: u64,
+    /// The per-robot allow-from-cloud switch. When `false`, every row whose
+    /// principal is [`crate::format::PrincipalKind::Cloud`] is refused
+    /// ([`TrustStore::cloud_allowed`]) and no new cloud row is written. ON at
+    /// provision, after a factory reset, and for a migrated v3 store.
+    allow_cloud: bool,
+}
+
+/// The v3 body, kept only to migrate a v3 file (field order is the wire).
+#[derive(Deserialize)]
+struct TrustStoreInnerV3 {
+    store_version: u16,
+    robot: RobotId,
+    robot_transport_key: PublicKey,
+    root_set: RootSet,
+    ownership: OwnershipState,
+    chassis_secret_hash: [u8; 32],
+    access_rows: Vec<AccessRowV3>,
+    current_epoch: u64,
+    revoked_accounts: Vec<AccountId>,
+    revoked_devices: Vec<PublicKey>,
+    high_water_ns: u64,
+}
+
+/// A v3 access row: keyed by account only.
+#[derive(Deserialize)]
+struct AccessRowV3 {
+    account: AccountId,
+    scope: Scope,
+    principal_kind: crate::format::PrincipalKind,
+    source: PairingSource,
+    name: Option<String>,
+    added_at_ns: u64,
+    expires_at_ns: Option<u64>,
+    revoked: bool,
+}
+
+impl TrustStoreInnerV3 {
+    /// The v4 state: each row account-wide (`device: None`), order kept,
+    /// allow-from-cloud ON.
+    fn migrate(self) -> TrustStoreInner {
+        let _ = self.store_version;
+        TrustStoreInner {
+            store_version: STORE_FORMAT_VERSION,
+            robot: self.robot,
+            robot_transport_key: self.robot_transport_key,
+            root_set: self.root_set,
+            ownership: self.ownership,
+            chassis_secret_hash: self.chassis_secret_hash,
+            access_rows: self
+                .access_rows
+                .into_iter()
+                .map(|row| AccessRow {
+                    account: row.account,
+                    device: None,
+                    scope: row.scope,
+                    principal_kind: row.principal_kind,
+                    source: row.source,
+                    name: row.name,
+                    added_at_ns: row.added_at_ns,
+                    expires_at_ns: row.expires_at_ns,
+                    revoked: row.revoked,
+                })
+                .collect(),
+            current_epoch: self.current_epoch,
+            revoked_accounts: self.revoked_accounts,
+            revoked_devices: self.revoked_devices,
+            high_water_ns: self.high_water_ns,
+            allow_cloud: true,
+        }
+    }
 }
 
 /// The trust store: root set, ownership, access list, revocation epoch, and the
@@ -138,6 +215,7 @@ impl TrustStore {
                 revoked_accounts: Vec::new(),
                 revoked_devices: Vec::new(),
                 high_water_ns: now_ns,
+                allow_cloud: true,
             },
             path: None,
         })
@@ -218,7 +296,7 @@ impl TrustStore {
             return Err(PairingError::StoreCorrupt("bad magic"));
         }
         let ver = u16::from_le_bytes([framed[8], framed[9]]);
-        if ver != STORE_FORMAT_VERSION {
+        if ver != STORE_FORMAT_VERSION && ver != STORE_FORMAT_VERSION_V3 {
             return Err(PairingError::StoreCorrupt("unsupported format version"));
         }
         let body_len =
@@ -227,7 +305,24 @@ impl TrustStore {
         if body.len() != body_len {
             return Err(PairingError::StoreCorrupt("body length mismatch"));
         }
-        postcard::from_bytes(body).map_err(ser_err)
+        if ver == STORE_FORMAT_VERSION_V3 {
+            let v3: TrustStoreInnerV3 = postcard::from_bytes(body).map_err(ser_err)?;
+            if v3.store_version != STORE_FORMAT_VERSION_V3 {
+                return Err(PairingError::StoreCorrupt("format version mismatch"));
+            }
+            let rows = v3.access_rows.len();
+            tracing::warn!(
+                rows,
+                "trust store migrated from format v3 to v4: every access row is now an \
+                 account-wide row and allow-from-cloud is on; the next save writes v4"
+            );
+            return Ok(v3.migrate());
+        }
+        let inner: TrustStoreInner = postcard::from_bytes(body).map_err(ser_err)?;
+        if inner.store_version != STORE_FORMAT_VERSION {
+            return Err(PairingError::StoreCorrupt("format version mismatch"));
+        }
+        Ok(inner)
     }
 
     // -- accessors -----------------------------------------------------------
@@ -293,18 +388,76 @@ impl TrustStore {
     /// robot's own trusted clock supplies `now_ns` (the same anti-rollback-protected
     /// time every credential path uses); the accept gate reads it here, so an expired
     /// grant refuses at connection accept.
-    pub fn is_allowed(&self, account: &AccountId, now_ns: u64) -> Option<&AccessRow> {
+    pub fn is_allowed(
+        &self,
+        account: &AccountId,
+        device: &PublicKey,
+        now_ns: u64,
+    ) -> Option<&AccessRow> {
         if self.inner.revoked_accounts.contains(account) {
             return None;
         }
-        self.inner.access_rows.iter().find(|r| {
-            &r.account == account
-                && !r.revoked
-                // `Some(exp)` is a finite bound: allowed only strictly before it
-                // (mirrors the `[not_before, not_after)` half-open validity window,
-                // so `now_ns >= not_after_ns` denies). `None` never expires.
-                && r.expires_at_ns.is_none_or(|exp| now_ns < exp)
-        })
+        let row = self
+            .row_for(account, Some(device))
+            .or_else(|| self.row_for(account, None))?;
+        // `Some(exp)` is a finite bound: allowed only strictly before it (mirrors
+        // the `[not_before, not_after)` half-open validity window, so
+        // `now_ns >= not_after_ns` denies). `None` never expires. A device's own
+        // row decides for that device: a revoked or expired device row does not
+        // fall back to the account-wide row.
+        (!row.revoked && row.expires_at_ns.is_none_or(|exp| now_ns < exp)).then_some(row)
+    }
+
+    /// Whether `account` has access at all: its account-wide row when that is
+    /// active, else its first active device row, under the same revocation and
+    /// expiry rules as [`TrustStore::is_allowed`]. For listings and diagnostics;
+    /// admission of a connection always uses [`TrustStore::is_allowed`] with the
+    /// connection's device key.
+    pub fn account_access(&self, account: &AccountId, now_ns: u64) -> Option<&AccessRow> {
+        if self.inner.revoked_accounts.contains(account) {
+            return None;
+        }
+        let active =
+            |r: &&AccessRow| !r.revoked && r.expires_at_ns.is_none_or(|exp| now_ns < exp);
+        let mut rows = self.inner.access_rows.iter().filter(|r| &r.account == account);
+        rows.clone()
+            .find(|r| r.device.is_none())
+            .filter(active)
+            .or_else(|| rows.find(|r| r.device.is_some() && active(r)))
+    }
+
+    /// The row keyed by exactly `(account, device)` (`None` = account-wide).
+    fn row_for(&self, account: &AccountId, device: Option<&PublicKey>) -> Option<&AccessRow> {
+        self.inner
+            .access_rows
+            .iter()
+            .find(|r| &r.account == account && r.device.as_ref() == device)
+    }
+
+    /// The one allow-from-cloud predicate: `false` exactly when `row`'s
+    /// principal is [`crate::format::PrincipalKind::Cloud`] and this robot's
+    /// allow-from-cloud switch is OFF. Every plane's admission (ops, wire, and
+    /// any later one) calls it on the row it is about to honor.
+    pub fn cloud_allowed(&self, row: &AccessRow) -> bool {
+        row.principal_kind != crate::format::PrincipalKind::Cloud || self.inner.allow_cloud
+    }
+
+    /// The allow-from-cloud switch (ON unless the owner turned it off).
+    pub fn allow_cloud(&self) -> bool {
+        self.inner.allow_cloud
+    }
+
+    /// Set the allow-from-cloud switch. Owner only ([`PairingError::NotOwner`]
+    /// otherwise, [`PairingError::Unclaimed`] on an unclaimed robot).
+    pub fn set_allow_cloud(
+        &mut self,
+        requesting_owner: &AccountId,
+        allow: bool,
+    ) -> Result<(), PairingError> {
+        self.assert_owner(requesting_owner)?;
+        self.inner.allow_cloud = allow;
+        tracing::info!(allow, "allow-from-cloud switch set by the owner");
+        Ok(())
     }
 
     // -- ownership lifecycle -------------------------------------------------
@@ -350,6 +503,9 @@ impl TrustStore {
         // The owner row supersedes any prior row for that account.
         self.upsert_active_row(AccessRow {
             account,
+            // The owner row is account-wide: each of the owner's devices that
+            // presents a certificate adds its own row beside it.
+            device: None,
             scope: Scope::OWNER_FULL,
             principal_kind,
             source: PairingSource::Claim,
@@ -391,6 +547,8 @@ impl TrustStore {
         // `revoked_accounts` — a new owner starts from a blank slate (the
         // anti-rollback floor still defends the credential-replay vector).
         self.inner.revoked_devices.clear();
+        // A new owner starts with the switch at its default.
+        self.inner.allow_cloud = true;
         // NOTE: self.inner.high_water_ns is intentionally NOT reset here (see the
         // doc invariants above — the anti-rollback floor survives resale).
         tracing::info!("robot factory-reset to unclaimed");
@@ -433,10 +591,16 @@ impl TrustStore {
         self.verify_chain(pres, authenticated_peer_key, now_ns)
     }
 
-    /// Verify an owner's certificate chain for a new device binding. The existing
-    /// owner row is preserved byte-for-byte; only the rollback floor advances.
-    /// Certificate and issuer scopes must cover that row, because the access index
-    /// maps devices to account-wide permissions, not per-device permissions.
+    /// Certificate presentation: admit one of the OWNER account's devices from
+    /// its roots-verified device certificate chain, with no code and no user step.
+    /// The chain must end in a certificate for `authenticated_peer_key` and the
+    /// robot's owner account, its scope must cover the owner row's scope, and the
+    /// owner row must be active. On success the device gets its own row
+    /// `(owner, device)` with the owner row's scope and expiry and the
+    /// certificate's principal (so a cloud device stays a cloud row); the owner
+    /// row itself is never written. A cloud certificate is refused while the
+    /// allow-from-cloud switch is OFF. A re-presentation refreshes the device's
+    /// row and keeps a sticky owner revocation. The rollback floor advances.
     pub fn verify_owner_certificate(
         &mut self,
         pres: &OwnerCertificatePresentationWire,
@@ -459,7 +623,8 @@ impl TrustStore {
             authenticated_peer_key,
             now_ns,
         )?;
-        if pres.device_cert.cert.account != owner {
+        let cert = &pres.device_cert.cert;
+        if cert.account != owner {
             return Err(PairingError::NotOwner);
         }
         if self.inner.revoked_accounts.contains(&owner) {
@@ -472,23 +637,35 @@ impl TrustStore {
                 epoch: self.inner.current_epoch,
             });
         }
-        let row = self
-            .inner
-            .access_rows
-            .iter()
-            .find(|row| row.account == owner)
+        let owner_row = self
+            .row_for(&owner, None)
             .ok_or(PairingError::StoreCorrupt(
                 "claimed owner has no access row",
             ))?;
-        if row.revoked {
+        if owner_row.revoked {
             return Err(PairingError::RevokedByOwner);
         }
-        if row.expires_at_ns.is_some_and(|expiry| now_ns >= expiry) {
+        if owner_row.expires_at_ns.is_some_and(|expiry| now_ns >= expiry) {
             return Err(PairingError::OwnerAccessExpired);
         }
-        if !row.scope.is_attenuation_of(&pres.device_cert.cert.scope) {
+        if !owner_row.scope.is_attenuation_of(&cert.scope) {
             return Err(PairingError::OwnerCertificateScopeInsufficient);
         }
+        if cert.principal_kind == crate::format::PrincipalKind::Cloud && !self.inner.allow_cloud {
+            return Err(PairingError::CloudAccessDisabled);
+        }
+        let device_row = AccessRow {
+            account: owner,
+            device: Some(*authenticated_peer_key),
+            scope: owner_row.scope,
+            principal_kind: cert.principal_kind,
+            source: PairingSource::CertificatePresentation,
+            name: None,
+            added_at_ns: now_ns,
+            expires_at_ns: owner_row.expires_at_ns,
+            revoked: false,
+        };
+        self.upsert_active_row(device_row);
         self.inner.high_water_ns = now_ns;
         Ok(owner)
     }
@@ -707,6 +884,7 @@ impl TrustStore {
         self.inner.ownership = OwnershipState::Claimed(account);
         self.upsert_active_row(AccessRow {
             account,
+            device: None,
             scope: verified.scope(),
             principal_kind: verified.principal_kind(),
             source: PairingSource::OwnerGrant,
@@ -909,8 +1087,10 @@ impl TrustStore {
                 .any(|r| &r.account == account && r.revoked)
     }
 
-    /// Establish (persist) a verified pairing as an access-list row.
-    /// If the account already has a row, its scope/name/source/expiry are updated
+    /// Establish (persist) a verified pairing as the presenting device's own
+    /// access-list row, keyed by `(account, device)`; other devices' rows of the
+    /// same account, the owner row included, are never touched.
+    /// If that device already has a row, its scope/name/source/expiry are updated
     /// **but a prior owner-revocation sticks** (a re-presented grant does not
     /// silently un-revoke a locally revoked account — call
     /// [`TrustStore::owner_readmit`]).
@@ -939,11 +1119,12 @@ impl TrustStore {
         if !self.is_claimed() {
             return Err(PairingError::RobotUnclaimed);
         }
+        let device = Some(verified.device_key);
         if let Some(row) = self
             .inner
             .access_rows
             .iter_mut()
-            .find(|r| r.account == verified.account)
+            .find(|r| r.account == verified.account && r.device == device)
         {
             row.scope = verified.scope;
             row.principal_kind = verified.principal_kind;
@@ -956,6 +1137,7 @@ impl TrustStore {
         } else {
             self.inner.access_rows.push(AccessRow {
                 account: verified.account,
+                device,
                 scope: verified.scope,
                 principal_kind: verified.principal_kind,
                 source,
@@ -1023,6 +1205,7 @@ impl TrustStore {
         }
         self.upsert_active_row(AccessRow {
             account,
+            device: Some(confirmed.initiator_key()),
             scope,
             principal_kind: confirmed.principal_kind(),
             source: PairingSource::CodePaired,
@@ -1152,14 +1335,18 @@ impl TrustStore {
             // Never let the owner lock itself out.
             return Ok(());
         }
-        if let Some(row) = self
+        let mut revoked = 0usize;
+        for row in self
             .inner
             .access_rows
             .iter_mut()
-            .find(|r| &r.account == target)
+            .filter(|r| &r.account == target)
         {
             row.revoked = true;
-            tracing::info!("owner revoked an account (revoke-now)");
+            revoked += 1;
+        }
+        if revoked > 0 {
+            tracing::info!(rows = revoked, "owner revoked an account (revoke-now)");
         }
         Ok(())
     }
@@ -1172,11 +1359,11 @@ impl TrustStore {
         target: &AccountId,
     ) -> Result<(), PairingError> {
         self.assert_owner(requesting_owner)?;
-        if let Some(row) = self
+        for row in self
             .inner
             .access_rows
             .iter_mut()
-            .find(|r| &r.account == target)
+            .filter(|r| &r.account == target)
         {
             row.revoked = false;
         }
@@ -1191,7 +1378,7 @@ impl TrustStore {
         }
     }
 
-    /// Insert a row, or update an existing row for the same account. A prior
+    /// Insert a row, or update the existing row for the same `(account, device)`. A prior
     /// **owner-revocation sticks** — a re-pairing (code pairing or claim) must NOT
     /// silently readmit a revoked account; only [`TrustStore::owner_readmit`]
     /// clears it. (After a factory reset the list is empty, so the owner claim is
@@ -1201,7 +1388,7 @@ impl TrustStore {
             .inner
             .access_rows
             .iter_mut()
-            .find(|r| r.account == new_row.account)
+            .find(|r| r.account == new_row.account && r.device == new_row.device)
         {
             let was_revoked = row.revoked;
             *row = new_row;
@@ -1878,17 +2065,22 @@ mod owner_certificate_state_tests {
     use crate::format::{DeviceCert, IntermediateCert, PrincipalKind, Validity, FORMAT_VERSION};
     use ed25519_dalek::SigningKey;
 
-    fn fixture() -> (TrustStore, OwnerCertificatePresentationWire) {
+    const OWNER: AccountId = AccountId([4; 32]);
+
+    fn key(seed: u8) -> PublicKey {
+        PublicKey(SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes())
+    }
+
+    /// A roots-verified chain for the owner account's device `seed`.
+    fn proof(seed: u8, principal_kind: PrincipalKind) -> OwnerCertificatePresentationWire {
         let root = SigningKey::from_bytes(&[1; 32]);
         let issuer = SigningKey::from_bytes(&[2; 32]);
         let issuer_key = PublicKey(issuer.verifying_key().to_bytes());
-        let device = SigningKey::from_bytes(&[3; 32]);
-        let device_key = PublicKey(device.verifying_key().to_bytes());
         let validity = Validity {
             not_before_ns: 0,
             not_after_ns: 100,
         };
-        let proof = OwnerCertificatePresentationWire::new(
+        OwnerCertificatePresentationWire::new(
             IntermediateCert {
                 version: FORMAT_VERSION,
                 intermediate_key: issuer_key,
@@ -1899,33 +2091,32 @@ mod owner_certificate_state_tests {
             .sign_by_roots(&[&root]),
             DeviceCert {
                 version: FORMAT_VERSION,
-                device_key,
-                account: AccountId([4; 32]),
-                principal_kind: PrincipalKind::Human,
+                device_key: key(seed),
+                account: OWNER,
+                principal_kind,
                 scope: Scope::OWNER_FULL,
                 validity,
                 issued_at_ns: 0,
                 issuer_key,
             }
             .sign(&issuer),
-        );
+        )
+    }
+
+    fn fixture() -> (TrustStore, OwnerCertificatePresentationWire) {
+        let root = SigningKey::from_bytes(&[1; 32]);
         let mut store = TrustStore::provision(
             RobotId([5; 32]),
-            device_key,
+            key(3),
             RootSet::new(vec![PublicKey(root.verifying_key().to_bytes())], 1).unwrap(),
             b"unit recovery",
             1,
         )
         .unwrap();
         store
-            .claim(
-                AccountId([4; 32]),
-                b"unit recovery",
-                PrincipalKind::Human,
-                1,
-            )
+            .claim(OWNER, b"unit recovery", PrincipalKind::Human, 1)
             .unwrap();
-        (store, proof)
+        (store, proof(3, PrincipalKind::Human))
     }
 
     #[test]
@@ -1938,6 +2129,7 @@ mod owner_certificate_state_tests {
             store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2),
             Err(PairingError::RevokedByOwner)
         ));
+        assert_eq!(store.access_rows().len(), 1);
         assert!(store.access_rows()[0].revoked);
         assert_eq!(store.high_water_ns(), 1);
     }
@@ -1957,19 +2149,233 @@ mod owner_certificate_state_tests {
     }
 
     #[test]
-    fn owner_certificate_preserves_finite_row_and_refuses_its_expiry_boundary() {
+    fn owner_certificate_adds_a_device_row_and_never_rewrites_the_owner_row() {
         let (mut store, proof) = fixture();
         store.inner.access_rows[0].expires_at_ns = Some(3);
-        let original = store.access_rows().to_vec();
+        let owner_row = store.access_rows()[0].clone();
         store
-            .verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 2)
+            .verify_owner_certificate(&proof, &key(3), 2)
             .unwrap();
-        assert_eq!(store.access_rows(), original);
+        assert_eq!(store.access_rows()[0], owner_row);
+        assert_eq!(
+            store.access_rows()[1],
+            AccessRow {
+                account: OWNER,
+                device: Some(key(3)),
+                scope: Scope::OWNER_FULL,
+                principal_kind: PrincipalKind::Human,
+                source: PairingSource::CertificatePresentation,
+                name: None,
+                added_at_ns: 2,
+                expires_at_ns: Some(3),
+                revoked: false,
+            }
+        );
         assert!(matches!(
-            store.verify_owner_certificate(&proof, &proof.device_cert.cert.device_key, 3),
+            store.verify_owner_certificate(&proof, &key(3), 3),
             Err(PairingError::OwnerAccessExpired)
         ));
-        assert_eq!(store.access_rows(), original);
+        assert_eq!(store.access_rows().len(), 2);
         assert_eq!(store.high_water_ns(), 2);
+    }
+
+    #[test]
+    fn a_cloud_certificate_gets_its_own_cloud_row_beside_the_owner_rows() {
+        let (mut store, desk) = fixture();
+        store.verify_owner_certificate(&desk, &key(3), 2).unwrap();
+        let before: Vec<AccessRow> = store.access_rows().to_vec();
+        let cloud = proof(9, PrincipalKind::Cloud);
+        store.verify_owner_certificate(&cloud, &key(9), 3).unwrap();
+        // The owner row and the desk row are byte-for-byte unchanged.
+        assert_eq!(&store.access_rows()[..2], before.as_slice());
+        let row = store.is_allowed(&OWNER, &key(9), 3).unwrap();
+        assert_eq!(row.device, Some(key(9)));
+        assert_eq!(row.principal_kind, PrincipalKind::Cloud);
+        assert_eq!(
+            store.is_allowed(&OWNER, &key(3), 3).unwrap().principal_kind,
+            PrincipalKind::Human
+        );
+        // A device with no row of its own falls back to the owner row.
+        assert_eq!(store.is_allowed(&OWNER, &key(7), 3).unwrap().device, None);
+    }
+
+    #[test]
+    fn the_switch_off_refuses_cloud_rows_and_new_cloud_certificates_only() {
+        let (mut store, desk) = fixture();
+        store.verify_owner_certificate(&desk, &key(3), 2).unwrap();
+        store
+            .verify_owner_certificate(&proof(9, PrincipalKind::Cloud), &key(9), 3)
+            .unwrap();
+        assert!(store.allow_cloud());
+        let cloud_row = store.is_allowed(&OWNER, &key(9), 3).unwrap().clone();
+        assert!(store.cloud_allowed(&cloud_row));
+        assert!(matches!(
+            store.set_allow_cloud(&AccountId([6; 32]), false),
+            Err(PairingError::NotOwner)
+        ));
+        store.set_allow_cloud(&OWNER, false).unwrap();
+        assert!(!store.cloud_allowed(&cloud_row));
+        let desk_row = store.is_allowed(&OWNER, &key(3), 3).unwrap().clone();
+        assert!(store.cloud_allowed(&desk_row));
+        let rows = store.access_rows().to_vec();
+        assert!(matches!(
+            store.verify_owner_certificate(&proof(8, PrincipalKind::Cloud), &key(8), 4),
+            Err(PairingError::CloudAccessDisabled)
+        ));
+        assert_eq!(store.access_rows(), rows.as_slice());
+        store.set_allow_cloud(&OWNER, true).unwrap();
+        assert!(store.cloud_allowed(&cloud_row));
+    }
+
+    #[test]
+    fn a_revoked_device_row_never_falls_back_and_account_revoke_covers_every_row() {
+        let (mut store, desk) = fixture();
+        let guest = AccountId([6; 32]);
+        store.verify_owner_certificate(&desk, &key(3), 2).unwrap();
+        store.inner.access_rows.push(AccessRow {
+            account: guest,
+            device: Some(key(10)),
+            scope: Scope::CODE_PAIR_DEFAULT,
+            principal_kind: PrincipalKind::Human,
+            source: PairingSource::CodePaired,
+            name: None,
+            added_at_ns: 2,
+            expires_at_ns: None,
+            revoked: false,
+        });
+        let guest_row = store.inner.access_rows[2].clone();
+        store.inner.access_rows.push(AccessRow {
+            device: Some(key(11)),
+            ..guest_row
+        });
+        store.inner.access_rows[1].revoked = true;
+        assert!(store.is_allowed(&OWNER, &key(3), 3).is_none());
+        assert!(store.is_allowed(&OWNER, &key(7), 3).is_some());
+        store.owner_revoke(&OWNER, &guest).unwrap();
+        assert!(store.is_allowed(&guest, &key(10), 3).is_none());
+        assert!(store.is_allowed(&guest, &key(11), 3).is_none());
+        store.owner_readmit(&OWNER, &guest).unwrap();
+        assert!(store.is_allowed(&guest, &key(10), 3).is_some());
+        assert!(store.is_allowed(&guest, &key(11), 3).is_some());
+    }
+
+    /// The v3 body as a v3 writer laid it out (field order is the wire).
+    #[derive(Serialize)]
+    struct V3Body {
+        store_version: u16,
+        robot: RobotId,
+        robot_transport_key: PublicKey,
+        root_set: RootSet,
+        ownership: OwnershipState,
+        chassis_secret_hash: [u8; 32],
+        access_rows: Vec<V3Row>,
+        current_epoch: u64,
+        revoked_accounts: Vec<AccountId>,
+        revoked_devices: Vec<PublicKey>,
+        high_water_ns: u64,
+    }
+
+    #[derive(Serialize)]
+    struct V3Row {
+        account: AccountId,
+        scope: Scope,
+        principal_kind: PrincipalKind,
+        source: PairingSource,
+        name: Option<String>,
+        added_at_ns: u64,
+        expires_at_ns: Option<u64>,
+        revoked: bool,
+    }
+
+    fn v3_file(mac_key: &[u8], version_in_body: u16) -> Vec<u8> {
+        let root = SigningKey::from_bytes(&[1; 32]);
+        let row = |account: [u8; 32], scope, source, revoked| V3Row {
+            account: AccountId(account),
+            scope,
+            principal_kind: PrincipalKind::Human,
+            source,
+            name: Some("v3".into()),
+            added_at_ns: 7,
+            expires_at_ns: None,
+            revoked,
+        };
+        let body = postcard::to_stdvec(&V3Body {
+            store_version: version_in_body,
+            robot: RobotId([5; 32]),
+            robot_transport_key: key(3),
+            root_set: RootSet::new(vec![PublicKey(root.verifying_key().to_bytes())], 1).unwrap(),
+            ownership: OwnershipState::Claimed(OWNER),
+            chassis_secret_hash: [0x5a; 32],
+            access_rows: vec![
+                row([4; 32], Scope::OWNER_FULL, PairingSource::Claim, false),
+                row([6; 32], Scope::CODE_PAIR_DEFAULT, PairingSource::CodePaired, true),
+            ],
+            current_epoch: 2,
+            revoked_accounts: vec![AccountId([8; 32])],
+            revoked_devices: vec![key(12)],
+            high_water_ns: 40,
+        })
+        .unwrap();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"CERPAIR\x01");
+        framed.extend_from_slice(&3u16.to_le_bytes());
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&body);
+        let tag = crypto::hmac_sha256(mac_key, &framed);
+        framed.extend_from_slice(&tag);
+        framed
+    }
+
+    #[test]
+    fn a_v3_store_migrates_every_row_account_wide_in_order_and_saves_as_v4() {
+        let mac = [0x33; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::write(&path, v3_file(&mac, 3)).unwrap();
+        let store = TrustStore::load(&path, &mac).unwrap();
+        assert_eq!(store.owner(), Some(OWNER));
+        assert_eq!(store.current_epoch(), 2);
+        assert_eq!(store.high_water_ns(), 40);
+        assert_eq!(store.revoked_devices(), &[key(12)]);
+        assert!(store.allow_cloud());
+        let rows: Vec<(AccountId, Option<PublicKey>, Scope, bool)> = store
+            .access_rows()
+            .iter()
+            .map(|r| (r.account, r.device, r.scope, r.revoked))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (OWNER, None, Scope::OWNER_FULL, false),
+                (AccountId([6; 32]), None, Scope::CODE_PAIR_DEFAULT, true),
+            ]
+        );
+        store.save(&mac).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(&saved[8..10], &4u16.to_le_bytes());
+        let reloaded = TrustStore::load(&path, &mac).unwrap();
+        assert_eq!(reloaded.access_rows(), store.access_rows());
+        // The migration is deterministic: two loads of the same v3 file agree.
+        std::fs::write(&path, v3_file(&mac, 3)).unwrap();
+        assert_eq!(
+            TrustStore::load(&path, &mac).unwrap().encode(&mac).unwrap(),
+            store.encode(&mac).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_v3_store_with_a_bad_mac_or_mismatched_body_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::write(&path, v3_file(&[0x33; 32], 3)).unwrap();
+        assert!(matches!(
+            TrustStore::load(&path, &[0x34; 32]),
+            Err(PairingError::TamperDetected)
+        ));
+        std::fs::write(&path, v3_file(&[0x33; 32], 4)).unwrap();
+        assert!(matches!(
+            TrustStore::load(&path, &[0x33; 32]),
+            Err(PairingError::StoreCorrupt("format version mismatch"))
+        ));
     }
 }
