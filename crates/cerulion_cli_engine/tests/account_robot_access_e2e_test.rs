@@ -424,3 +424,54 @@ fn a_machine_that_never_signed_in_lists_no_account_line_and_creates_nothing() {
     assert!(err.is_empty());
     assert!(!config.exists(), "no config directory is created");
 }
+
+#[test]
+#[serial]
+fn a_listing_refreshes_the_listed_robots_revocation_epoch_into_the_dialed_routes_cache() {
+    use cerulion_cli_engine::account_cmd::{revoke_robot_access, RevokeTarget};
+    use cerulion_netd::account_access::robot_route;
+    let fixture = Fixture::new();
+    let spy = Arc::new(AccessSpy::default());
+    let mut daemon = cerulion_netd::start(
+        fixture.socket(),
+        spy.clone(),
+        cerulion_netd::NetdConfig::default(),
+    )
+    .unwrap();
+    // The owner revokes one desk device at the account service.
+    let revoked = [0x5a_u8; 32];
+    revoke_robot_access(
+        "account-access-session-fixture",
+        &URL_SAFE_NO_PAD.encode(fixture.robot_id),
+        &RevokeTarget::Device(URL_SAFE_NO_PAD.encode(revoked)),
+    )
+    .unwrap();
+    // The cache netd pushes for this route: <config>/epochs/<route with ':' as '_'>.epoch.
+    let route = robot_route(&fixture.robot_id);
+    let cache = fixture
+        .home
+        .path()
+        .join("epochs")
+        .join(format!("{}.epoch", route.replace(':', "_")));
+    assert!(!cache.exists());
+
+    let listing = account_robot_access::list().unwrap();
+    assert!(listing.diagnostic.is_none(), "{:?}", listing.diagnostic);
+
+    let artifact = std::fs::read_to_string(&cache).expect("the listed robot's epoch is cached");
+    let wire: cerulion_pairing::verify::EpochSyncWire =
+        postcard::from_bytes(&URL_SAFE_NO_PAD.decode(artifact.trim()).unwrap()).unwrap();
+    let epoch = &wire.signed_epoch.epoch_data;
+    assert_eq!(epoch.robot.0, fixture.robot_id);
+    assert_eq!(
+        epoch.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+    // No cache is written for any other name.
+    let names: Vec<_> = std::fs::read_dir(fixture.home.path().join("epochs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    daemon.shutdown();
+}

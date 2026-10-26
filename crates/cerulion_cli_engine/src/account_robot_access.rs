@@ -24,6 +24,13 @@ const PROBE_REPLY_ALLOWANCE: Duration = Duration::from_millis(50);
 // enough that the common case (the identity write finishing in well under a
 // second) costs nothing visible, long enough not to spin on the socket.
 const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// The bound on refreshing one robot's revocation epoch into the desk's epoch
+/// cache before that robot is dialed: one HTTPS request. A listing refreshes all
+/// the robots it will probe in parallel under this one bound.
+pub const EPOCH_SYNC_BUDGET: Duration = Duration::from_secs(1);
+/// The most robots one listing probes: the listing budget over the per-robot one.
+const MAX_PROBED_ROBOTS: usize =
+    (LIST_PROBE_BUDGET.as_millis() / ROBOT_PROBE_BUDGET.as_millis()) as usize;
 
 /// An account directory entry plus independently obtained reachability evidence.
 #[derive(Debug, Clone)]
@@ -191,8 +198,8 @@ pub fn list() -> CliResult<AccountListing> {
             });
         }
     };
+    let mut diagnostic = sync_epochs(&directory, &rows);
     let deadline = Instant::now() + LIST_PROBE_BUDGET;
-    let mut diagnostic = None;
     for row in &mut rows {
         if matches!(row.robot.endpoint, RobotEndpoint::Unknown { .. }) {
             continue;
@@ -211,20 +218,66 @@ pub fn list() -> CliResult<AccountListing> {
         match client.account_access_until(request, attempt_deadline) {
             Ok(AccountAccessReply::Presence { presence, .. }) => row.presence = presence,
             Ok(_) => {
-                diagnostic = Some("account presence response did not match its request".into());
+                diagnostic = join_diagnostic(
+                    diagnostic,
+                    "account presence response did not match its request".into(),
+                );
                 break;
             }
             Err(error) => {
                 row.presence = RobotPresence::Unknown {
                     reason: "presence query could not be completed".into(),
                 };
-                diagnostic = Some(access_error(error).to_string());
+                diagnostic = join_diagnostic(diagnostic, access_error(error).to_string());
                 break;
             }
         }
     }
     directory.validate_current_login()?;
     Ok(AccountListing { rows, diagnostic })
+}
+
+/// Refresh the revocation epoch of every robot this listing will probe (the
+/// first [`MAX_PROBED_ROBOTS`] with a known endpoint), in parallel, each within
+/// [`EPOCH_SYNC_BUDGET`]. A failure never blocks the probe; it becomes one
+/// diagnostic naming how many robots were not refreshed and the first reason.
+fn sync_epochs(
+    directory: &account_robots::AccountRobotDirectory,
+    rows: &[AccountRobotStatus],
+) -> Option<String> {
+    let robots: Vec<&AccountRobot> = rows
+        .iter()
+        .filter(|row| matches!(row.robot.endpoint, RobotEndpoint::Known(_)))
+        .take(MAX_PROBED_ROBOTS)
+        .map(|row| &row.robot)
+        .collect();
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = robots
+            .iter()
+            .map(|robot| scope.spawn(|| directory.sync_robot_epoch(robot, EPOCH_SYNC_BUDGET)))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| match handle.join() {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(display_text(&error.to_string())),
+                Err(_) => Some("the revocation sync stopped unexpectedly".into()),
+            })
+            .collect()
+    });
+    let first = failures.first()?;
+    Some(format!(
+        "revocations not refreshed for {} of {} robots: {first}",
+        failures.len(),
+        robots.len()
+    ))
+}
+
+fn join_diagnostic(previous: Option<String>, next: String) -> Option<String> {
+    Some(match previous {
+        Some(previous) => format!("{previous}; {next}"),
+        None => next,
+    })
 }
 
 fn probe_budget(deadline: Instant, now: Instant) -> Option<Duration> {
@@ -365,6 +418,11 @@ pub fn prepare_viz_target(
     let route = match selected {
         Some(robot) => {
             let route = robot_route(&robot.robot_id.0);
+            // Refresh this robot's revocations before the dial; a failure is a
+            // diagnostic and never blocks the viewer.
+            if let Err(error) = directory.sync_robot_epoch(robot, EPOCH_SYNC_BUDGET) {
+                diagnostics.push(display_text(&error.to_string()));
+            }
             daemon_hold = Some(install_directory(&directory)?);
             route
         }

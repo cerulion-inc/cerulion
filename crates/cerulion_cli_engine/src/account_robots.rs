@@ -157,6 +157,51 @@ impl AccountRobotDirectory {
         }
         Ok(())
     }
+    /// Fetch `robot`'s current revocation epoch from the account service and
+    /// write it to the desk's epoch cache under the robot's account route name
+    /// (`account:<robot id>`), the file `cerulion-netd` pushes on its next dial
+    /// of that route. Uses the stored session as is (a stale one is an error)
+    /// and writes no other robot's cache. Bounded by `budget`: the request runs
+    /// on its own thread, which past the budget ends on its own request deadline
+    /// and may still replace the cache atomically.
+    ///
+    /// `Ok(None)`: the robot has no epoch yet (the cache is left as it is).
+    #[cfg(unix)]
+    pub fn sync_robot_epoch(
+        &self,
+        robot: &AccountRobot,
+        budget: Duration,
+    ) -> CliResult<Option<u64>> {
+        if !self.login.state.session_is_valid(auth::now_unix_ns()) {
+            return Err(invalid(
+                "the session is stale, so revocations were not refreshed",
+            ));
+        }
+        let route = cerulion_netd::account_access::robot_route(&robot.robot_id.0);
+        let cache = account_cmd::resolve_epoch_cache_path(&route)
+            .ok_or_else(|| invalid("no epoch cache directory resolves on this desk"))?;
+        let session = self.login.state.session_token.clone();
+        let robot_id = URL_SAFE_NO_PAD.encode(robot.robot_id.0);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("account-epoch-sync".into())
+            .spawn(move || {
+                let _ = sender.send(account_cmd::sync_robot_epoch_to_cache_at(
+                    &session, &robot_id, &cache,
+                ));
+            })
+            .map_err(|_| invalid("the revocation sync could not be started"))?;
+        match receiver.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(invalid(&format!(
+                "revocations were not refreshed: the account service did not answer within {} ms",
+                budget.as_millis()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(invalid("the revocation sync ended without a result"))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
