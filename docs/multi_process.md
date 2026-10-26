@@ -81,8 +81,10 @@ recording's per-edge read log offline).
   fail-loud (`--peer-loss fail`).
 - Unix (Linux + macOS): the lockstep barrier is a portable POSIX
   `shm_open` `MAP_SHARED` primitive. The wake shape is per-OS (Linux: a
-  process-shared futex; macOS: a bounded boundary spin then chunked
-  ~100µs sleep-rechecks, never a busy-spin). On non-Unix hosts the SAME
+  process-shared futex; macOS 14.4 and later: a bounded boundary spin then
+  an `os_sync_wait_on_address` kernel wake, with chunked ~100 µs
+  sleep-rechecks as the fallback on older macOS and under
+  `CERULION_BARRIER_OS_SYNC=0`; never a busy-spin). On non-Unix hosts the SAME
   graph runs single-process (monolith fallback) with a loud notice: you lose
   process isolation. Under the `lockstep` opt-out the fallback's results match
   the split's. Under the free-run default they need not: a split's cross-rank
@@ -461,26 +463,32 @@ Two consequences to know:
 (A property of the `lockstep` opt-out, the mode that has a barrier to wait on;
 a free-run worker never reaches this wait.)
 
-At every level boundary each worker waits on the shared barrier (a
-process-shared futex on Linux; on macOS a chunked ~100µs sleep-recheck).
-By default that wait first **spins for a bounded,
-per-OS budget: 20µs on Linux, 150µs on macOS** (the chunked sleep-recheck
-observes arrivals with up to ~100µs skew, which a 20µs spin would miss),
-a bounded spin-then-block that rides through the lockstep rendezvous
-instead of paying the kernel sleep/wake round-trip at every boundary, then
-falls back to the kernel wait (futex block / sleep-recheck).
+At every level boundary each worker waits on the shared barrier. The
+blocking tier is a process-shared futex on Linux and, on macOS 14.4 and
+later, an `os_sync_wait_on_address` kernel wake; a chunked ~100 µs
+sleep-recheck is the fallback on older macOS and under
+`CERULION_BARRIER_OS_SYNC=0`. By default that wait first **spins for a
+bounded budget: 20 µs on the kernel-wake tiers, 150 µs on the macOS
+sleep-recheck fallback** (that fallback observes arrivals with up to
+~100 µs skew, which a 20 µs spin would miss), a bounded spin-then-block
+that rides through the lockstep rendezvous instead of paying a kernel
+sleep/wake round-trip at every boundary, then falls back to the blocking
+tier.
 
-`CERULION_BARRIER_SPIN_US` overrides the
-budget; `=0` is the kill switch: it restores the legacy 50-iteration
-pre-block spin + futex path (a hard-bounded read loop with no `Instant`
-reads, then the unchanged kernel block), **not** a pure futex wait, for
-power-sensitive deployments. Values above **100ms** are clamped to 100ms
+`CERULION_BARRIER_OS_SYNC=0` selects the sleep-recheck tier on macOS, and
+with it the 150 µs spin default. `CERULION_BARRIER_SPIN_US` overrides the
+budget on every tier; `=0` is the kill switch, for power-sensitive
+deployments. On Linux it restores the legacy 50-iteration pre-block spin +
+futex path (a hard-bounded read loop with no `Instant` reads, then the
+unchanged kernel block), **not** a pure futex wait; on macOS it goes
+straight to the blocking tier, since no pre-block iteration loop exists on
+the macOS paths. Values above **100ms** are clamped to 100ms
 with a loud warning (still far below the ~5s barrier
 boundary timeout), so a fat-fingered budget can never turn the bounded
 spin-then-block into a busy-spin for the whole boundary window. (Even at
 the 100ms ceiling every cycle still reaches a real kernel block within
 ~110ms, but during a stalled-peer teardown window such a misconfigured
-budget spends most of its wait spinning; the 20µs default spends almost none.) Determinism
+budget spends most of its wait spinning; the default budget spends almost none.) Determinism
 firewall: the bounded spin-then-block changes only WHEN a waiter proceeds,
 never the fire set/order.
 
@@ -834,7 +842,7 @@ process model in each row applies to it.
 | Host | `process_groups:` graph |
 |---|---|
 | Linux | Multi-process (supervisor + workers); under the `lockstep` opt-out, futex-woken barrier + CPU-park primitives |
-| macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then chunked ~100µs sleep-rechecks (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
+| macOS | Multi-process (supervisor + workers). Under the `lockstep` opt-out, the same POSIX `shm_open` `MAP_SHARED` barrier; the wait is a bounded boundary spin then an `os_sync_wait_on_address` kernel wake on macOS 14.4 and later, or chunked ~100 µs sleep-rechecks below that and under `CERULION_BARRIER_OS_SYNC=0` (no futex/UMWAIT/WFE on this OS, and never a busy-spin). Linux-only tunings (C-state cap, CPU pinning) degrade gracefully. |
 | other (non-Unix) | **Monolith fallback**: the graph runs single-process with a loud notice; you lose process isolation. Under the `lockstep` opt-out its results match the split's (determinism firewall). Under the free-run default a split's cross-rank pairings are decided by OS scheduling, so what reproduces such a run is its recorded bag, not a second live run. |
 
 `--single-process` forces the monolith path on ANY host (useful for
@@ -844,8 +852,10 @@ externally-clocked run; see below).
 **macOS wake-latency tier:** any host without a CPU monitor-wait
 primitive (macOS included, whether running the real multi-process split
 or a `--single-process` monolith) gets a live-loop park via the
-**degraded sleep-recheck tier**, on by default for live runs. The park
-falls back to a chunked ~100 µs bounded sleep loop (never a busy-spin).
+**degraded sleep-recheck tier**, on by default for live runs. The park is a
+bounded ~100 µs recheck nap (never a busy-spin): on macOS 14.4 and later each
+nap is an `os_sync_wait_on_address` timed wait; below 14.4, or under
+`CERULION_PARK_OS_SYNC=0`, it is a plain sleep.
 Measured on macOS: a stable and lower median wake latency than the
 plain blocking wait, whose median was unstable from run to run.
 On macOS 14.4 and later the park also kernel-blocks on the data doorbell's wake

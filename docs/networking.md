@@ -887,7 +887,7 @@ desk: cerulion-netd                    ONE subscription on the session it
 | Versioning | Every notification carries a monotonic `version`; `subscribe_*` answers with the current one plus the announcing-robot set. A MISSED notification is harmless: the next carries a newer version and the correct response to any of them is a full refresh. |
 | Slow consumer | The per-connection slot is capacity ONE with a lossless merge: a lagging consumer gets one line describing everything it missed. The watch/forwarder threads never do I/O, so a consumer that stopped reading stalls only itself. |
 | Manual refresh | Unchanged, and still the escape hatch for everything. |
-| Skew | `subscribe_catalog` needs netd control protocol **v6** or later (the daemon now speaks 8); a new client against a daemon older than v6 is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a newer daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
+| Skew | The push subscription arrived in netd control protocol **v6** (the banner's `protocol` field reports the version a daemon speaks); a new client against a daemon older than v6 is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a v6 or later daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
 
 **What is NOT event-driven:** the LOCAL half. The push above covers REMOTE
 topics; a LOCAL iceoryx2 service appearing or disappearing on the desk carries
@@ -896,7 +896,8 @@ produced topic's arrival is still picked up by whatever refresh the
 consumer already does. Building a local watcher would mean polling
 `list_topics` on a timer, which is the very thing this removes.
 
-Turn it off by pointing the desk at a `cerulion-netd` older than v6, or by
+Turn it off by pointing the desk at a `cerulion-netd` that predates control
+protocol v6 (the version that added the push subscription), or by
 running with no network (`CERULION_NETD_NETWORK=off`); in both cases the
 subscribe still succeeds and reports `watching`/`connected: false`, so a
 consumer is told plainly that no push can arrive rather than waiting on one
