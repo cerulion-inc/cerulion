@@ -453,9 +453,9 @@ pub enum Commands {
         /// ceremony window, and it authorizes durable enrollment.
         #[arg(long, value_name = "CODE")]
         code: Option<String>,
-        /// The account (64-char hex) this pairing is FOR. When omitted, a
-        /// self-account is derived from the desk device key (a desk with a
-        /// keypair and no Cerulion account).
+        /// The account (64-char hex) a code pairing binds. It must be the desk's
+        /// self-account (the public half of its device key), the value used when
+        /// omitted; any other value is refused.
         #[arg(long, value_name = "HEX")]
         account: Option<String>,
         /// The access-list label the robot stores on its pairing row (so the

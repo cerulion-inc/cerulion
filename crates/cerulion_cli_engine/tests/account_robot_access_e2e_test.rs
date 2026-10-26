@@ -352,3 +352,75 @@ fn a_blackholed_account_service_bounds_the_listing_and_names_the_gap() {
         "the request reached the blackholed service"
     );
 }
+
+#[test]
+#[serial]
+fn a_listing_with_a_stale_session_refreshes_nothing_and_says_so() {
+    use std::time::{Duration, Instant};
+    // Counts every connection; a refresh or a catalog request would arrive here.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let holder = Arc::clone(&held);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            holder.lock().unwrap().push(stream);
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.path());
+    let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", format!("http://{address}"));
+    let auth_path = home.path().join("auth.json");
+    auth::write_to(
+        &auth_path,
+        &auth::AuthState {
+            account_id: "00112233-4455-4677-8899-aabbccddeeff".into(),
+            session_token: "stale-session".into(),
+            refresh_token: "single-use-refresh".into(),
+            expires_at_ns: 1,
+            logged_in_ever: true,
+            role: None,
+        },
+    )
+    .unwrap();
+    std::fs::write(home.path().join("desk.key"), [0x75; 32]).unwrap();
+    let auth_before = std::fs::read(&auth_path).unwrap();
+
+    let started = Instant::now();
+    let mut err = Vec::new();
+    let rows = account_robot_access::listing_rows("cerulion topic list", &mut err).unwrap();
+
+    assert_eq!(rows, "");
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "cerulion topic list: account robots not listed: account robot catalog unavailable: \
+         the session is stale; any account command (or `cerulion login`) renews it\n"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        held.lock().unwrap().is_empty(),
+        "nothing reached the account service"
+    );
+    assert_eq!(
+        std::fs::read(&auth_path).unwrap(),
+        auth_before,
+        "tokens untouched"
+    );
+}
+
+#[test]
+#[serial]
+fn a_machine_that_never_signed_in_lists_no_account_line_and_creates_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("never-signed-in");
+    let _home = EnvGuard::set("CERULION_HOME", &config);
+    let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1");
+    let mut err = Vec::new();
+    assert_eq!(
+        account_robot_access::listing_rows("cerulion topic list", &mut err).unwrap(),
+        ""
+    );
+    assert!(err.is_empty());
+    assert!(!config.exists(), "no config directory is created");
+}

@@ -414,8 +414,9 @@ standing gateway starts `robot_supervisor`. netd is spawn-once, so the variable
 must be in netd's OWN environment before the first command that spawns it; a
 netd already running without it must be stopped. A failed registration, or a
 `cerulion-remoted` that exits, is retried with a backoff that doubles from 5 s
-to a 300 s cap, at most 30 attempts per netd lifetime; each failure is a
-warning naming the reason and the next wait.
+to a 300 s cap, at most 30 consecutive attempts; a sequence that stayed up for
+10 minutes starts the count again. Each failure is a warning naming the reason
+and the next wait.
 
 The supervisor resolves two SIBLINGS of the running netd binary and runs them in
 turn: `cerulion bootstrap-robot --state-root <root>`, a hidden login-gated

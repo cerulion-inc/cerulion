@@ -23,6 +23,19 @@ const MAX_RESULT_BYTES: u64 = 16 * 1024;
 /// stops retrying for the life of this daemon.
 const MAX_ATTEMPTS: u32 = 30;
 const FIRST_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// A sequence that stayed up this long counts as healthy: its failure starts
+/// the attempt count again from 1.
+const HEALTHY_RUN: Duration = Duration::from_secs(600);
+
+/// The attempt number of a failure: `attempt` (1-based) unless the failed
+/// sequence ran for at least [`HEALTHY_RUN`], which makes it attempt 1.
+fn counted_attempt(attempt: u32, ran_for: Duration) -> u32 {
+    if ran_for >= HEALTHY_RUN {
+        1
+    } else {
+        attempt
+    }
+}
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 /// The wait before attempt `attempt + 1` after attempt `attempt` (1-based)
@@ -71,12 +84,14 @@ impl RobotSupervisor {
                 let mut attempt = 0u32;
                 while worker_running.load(Ordering::SeqCst) {
                     attempt += 1;
+                    let started = Instant::now();
                     let result = run(&worker_running, |eid| {
                         gateway
                             .refresh_robot_beacon(eid)
                             .map_err(|error| error.to_string())
                     });
                     let Err(error) = result else { return };
+                    attempt = counted_attempt(attempt, started.elapsed());
                     if !worker_running.load(Ordering::SeqCst) {
                         return;
                     }

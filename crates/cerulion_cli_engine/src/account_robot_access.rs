@@ -11,6 +11,7 @@ use cerulion_netd::account_access::{
 use cerulion_netd::NetdClient;
 
 use crate::account_robots::{self, AccountRobot, AccountRobotDirectory, RobotEndpoint};
+use crate::auth;
 use crate::error::{CliError, CliResult};
 
 // A directory can contain thousands of robots: per-robot timeouts alone would
@@ -238,6 +239,14 @@ fn probe_budget(deadline: Instant, now: Instant) -> Option<Duration> {
 /// `<verb>: account robots not listed: <reason>` line and returns no rows, so
 /// the LAN half of the listing still prints and the gap is never silent.
 pub fn listing_rows(verb: &str, err: &mut dyn std::io::Write) -> std::io::Result<String> {
+    // A machine that never signed in has no account directory to list: no
+    // line, and nothing is created under the config directory.
+    if !auth::load()
+        .state()
+        .is_some_and(|state| state.logged_in_ever)
+    {
+        return Ok(String::new());
+    }
     match list() {
         Ok(listing) => {
             if let Some(diagnostic) = &listing.diagnostic {
@@ -313,6 +322,9 @@ pub fn prepare_viz_target(
     let explicit = parse_robot_route(selector)
         .map_err(CliError::Validation)?
         .is_some();
+    // An explicit selection waits on the full request deadline and may refresh
+    // the session (it is the one thing the command was asked to do); a listing
+    // uses `fetch_within` instead.
     let directory = match account_robots::fetch() {
         Ok(directory) => directory,
         Err(error) if explicit => return Err(error),

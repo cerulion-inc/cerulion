@@ -166,3 +166,11 @@ fn a_cleared_running_flag_ends_the_retry_wait_early() {
     let running = AtomicBool::new(true);
     assert!(wait_while_running(&running, Duration::from_millis(1)));
 }
+
+#[test]
+fn a_failure_after_a_healthy_run_counts_as_the_first_attempt() {
+    assert_eq!(counted_attempt(29, Duration::from_secs(599)), 29);
+    assert_eq!(counted_attempt(29, Duration::from_secs(600)), 1);
+    assert_eq!(counted_attempt(3, Duration::from_secs(86_400)), 1);
+    assert_eq!(counted_attempt(1, Duration::ZERO), 1);
+}

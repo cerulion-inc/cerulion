@@ -193,12 +193,36 @@ struct LoginSnapshot {
 /// seconds and one MiB. A changed login or key discards the response. This must not
 /// run from shell completion. An unsupported endpoint is an error, not an empty list.
 pub fn fetch() -> CliResult<AccountRobotDirectory> {
+    fetch_with(SessionRefresh::Allowed)
+}
+
+/// Whether a fetch may refresh a stale session first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionRefresh {
+    /// Refresh a stale session through the login flow before the request.
+    Allowed,
+    /// Use the stored session as is; a stale one is an error. A refresh spends
+    /// a single-use refresh token, so it never runs where the caller may stop
+    /// waiting before the replacement tokens are saved.
+    Refused,
+}
+
+fn fetch_with(refresh: SessionRefresh) -> CliResult<AccountRobotDirectory> {
     let auth_path =
         auth::auth_json_path().ok_or_else(|| invalid("no account directory is configured"))?;
     let initial = snapshot(&auth_path)?;
     let endpoint = service_url(&login_cmd::account_service_base())?;
-    let session = account_cmd::require_session()
-        .map_err(|_| invalid("a current session is required; run `cerulion login`"))?;
+    let session = match refresh {
+        SessionRefresh::Allowed => account_cmd::require_session()
+            .map_err(|_| invalid("a current session is required; run `cerulion login`"))?,
+        SessionRefresh::Refused => initial
+            .state
+            .session_is_valid(auth::now_unix_ns())
+            .then(|| initial.state.session_token.clone())
+            .ok_or_else(|| {
+                invalid("the session is stale; any account command (or `cerulion login`) renews it")
+            })?,
+    };
     let before = snapshot(&auth_path)?;
     if initial.account != before.account
         || initial.key != before.key
@@ -231,15 +255,17 @@ pub fn fetch() -> CliResult<AccountRobotDirectory> {
     finish(before, &read_body(response)?)
 }
 
-/// [`fetch`] bounded by `budget`. The fetch runs on its own thread; on timeout
-/// this returns an error naming the budget and the thread is left to end on its
-/// own request deadline, its result discarded.
+/// [`fetch`] bounded by `budget`, without refreshing the session: a stale
+/// session is an error, so the worker only reads local state and sends the
+/// catalog GET. The fetch runs on its own thread; on timeout this returns an
+/// error naming the budget and the thread is left to end on its own request
+/// deadline, its result discarded. It writes nothing.
 pub fn fetch_within(budget: Duration) -> CliResult<AccountRobotDirectory> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("account-directory-fetch".into())
         .spawn(move || {
-            let _ = sender.send(fetch());
+            let _ = sender.send(fetch_with(SessionRefresh::Refused));
         })
         .map_err(|_| invalid("the account directory fetch could not be started"))?;
     match receiver.recv_timeout(budget) {
