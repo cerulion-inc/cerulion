@@ -192,6 +192,7 @@ fn build_graph_config() -> GraphConfig {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -201,6 +202,7 @@ fn build_graph_config() -> GraphConfig {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -210,6 +212,7 @@ fn build_graph_config() -> GraphConfig {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

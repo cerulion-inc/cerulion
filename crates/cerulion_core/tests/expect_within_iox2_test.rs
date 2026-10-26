@@ -264,6 +264,7 @@ impl NodeEntry for DrainExpectConsumer {
 fn producer_def(id: &str, node_type: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -282,6 +283,7 @@ fn producer_def(id: &str, node_type: &str) -> NodeDef {
 fn consumer_def(id: &str, node_type: &str) -> NodeDef {
     NodeDef {
         fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),

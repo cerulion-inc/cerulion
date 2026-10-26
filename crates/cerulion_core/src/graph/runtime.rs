@@ -19502,6 +19502,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: id.to_string(),
@@ -19775,6 +19776,7 @@ mod tests {
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "me".to_string(),
@@ -20143,6 +20145,7 @@ mod tests {
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "looper".to_string(),
@@ -20201,6 +20204,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
@@ -20223,6 +20227,7 @@ mod tests {
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),

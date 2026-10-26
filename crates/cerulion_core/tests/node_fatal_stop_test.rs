@@ -223,6 +223,7 @@ fn node(id: &str, node_type: &str, source: Option<String>, output: bool) -> Node
     NodeDef {
         params: Default::default(),
         fuse: None,
+        isolate: None,
         ros2: None,
         id: id.to_string(),
         node_type: node_type.to_string(),

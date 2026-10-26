@@ -101,6 +101,7 @@ fn live_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn N
         prefix: "wsl".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),

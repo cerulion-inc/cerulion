@@ -55,6 +55,7 @@ const CROSS_NS: u64 = 6_800;
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
         fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -221,6 +222,7 @@ fn chain(
             // leak-free owned strings via a small local vec
             let ndef = NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.clone(),
@@ -728,6 +730,7 @@ fn gen_dag(
         };
         nodes.push(NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: ids[i].clone(),

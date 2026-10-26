@@ -1916,6 +1916,10 @@ fn run(cli: Cli) -> CliResult<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Plan { name } => {
+                    print!("{}", graph_cmd::graph_plan(&ws.root, &name)?);
+                    Ok(())
+                }
                 GraphAction::Levels { name } => {
                     // Levelization inspection. The engine
                     // returns the fully-rendered report; print it verbatim,
@@ -2115,7 +2119,7 @@ fn run(cli: Cli) -> CliResult<()> {
                     // way `graph run` does. `running` forwards Ctrl+C so the
                     // worker's live loop stops cleanly on SIGINT.
                     let running = setup_ctrlc_handler()?;
-                    graph_cmd::graph_run_worker(&ws.root, &plan, running)
+                    graph_cmd::graph_run_worker_host(&ws.root, &plan, running)
                 }
                 GraphAction::RunGateway { handoff } => {
                     // Hidden verb: the network GATEWAY process of a
@@ -4039,7 +4043,7 @@ mod login_gate_exemption_tests {
     fn internal_subprocess_verbs_are_exempt() {
         assert!(!command_needs_identity(&Commands::Graph {
             action: GraphAction::RunWorker {
-                plan: PathBuf::from("plan.json"),
+                plan: vec![PathBuf::from("plan.json")],
             },
         }));
         assert!(!command_needs_identity(&Commands::Graph {

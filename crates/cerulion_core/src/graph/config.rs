@@ -749,6 +749,19 @@ pub struct NodeDef {
     /// execution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse: Option<bool>,
+    /// OPTIONAL per-node executor override, read when a process hosts more
+    /// than one node.
+    ///
+    /// Inside a process, nodes run in executor units: a linear chain of
+    /// trigger edges shares one thread and one level loop, and a new unit
+    /// starts at a source, a fan-out, a fan-in, and a node the profile shows
+    /// ticking long against its period. `isolate: true` gives this node a unit
+    /// of its own, so its ticks never hold another node's fire. `isolate:
+    /// false` keeps it in the unit of the nodes that trigger it whatever the
+    /// automatic rules say. Absent leaves the choice to those rules.
+    /// `cerulion graph plan` shows the units and why each one starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolate: Option<bool>,
     /// OPTIONAL per-instance values for the node type's `#[param]` fields:
     /// a flat map of param name to scalar (`params: {gain: 2.5, frame_id:
     /// left}`). Absent names keep the macro default. Resolved ONCE at graph

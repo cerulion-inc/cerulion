@@ -221,6 +221,7 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         .iter()
         .map(|id| NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: id.clone(),
@@ -237,6 +238,7 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         .collect();
     nodes.push(NodeDef {
         fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "zsink".to_string(),

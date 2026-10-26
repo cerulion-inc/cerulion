@@ -236,6 +236,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -245,6 +246,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "qos".to_string(),
@@ -257,6 +259,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -485,6 +488,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -494,6 +498,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),

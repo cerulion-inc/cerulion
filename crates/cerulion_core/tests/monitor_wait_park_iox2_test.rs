@@ -217,6 +217,7 @@ fn ticker_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "ticker".to_string(),
@@ -265,6 +266,7 @@ fn in_process_chain_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -280,6 +282,7 @@ fn in_process_chain_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -328,6 +331,7 @@ fn consumer_graph(
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "consumer".to_string(),
@@ -632,6 +636,7 @@ fn mixed_rank_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -647,6 +652,7 @@ fn mixed_rank_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "local_consumer".to_string(),
@@ -659,6 +665,7 @@ fn mixed_rank_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ext_consumer".to_string(),
@@ -831,6 +838,7 @@ fn sync_input_rank_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -846,6 +854,7 @@ fn sync_input_rank_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "local_consumer".to_string(),
@@ -858,6 +867,7 @@ fn sync_input_rank_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "pairer".to_string(),
@@ -945,6 +955,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "feeder".to_string(),
@@ -1009,6 +1020,7 @@ fn a_graph_no_plan_paired_rings_the_line_a_second_graphs_consumer_watches() {
         prefix: "mwp".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "watcher".to_string(),
@@ -1339,6 +1351,7 @@ fn a_publisher_arms_every_topic_it_publishes_and_reports_the_planned_set() {
             .into_iter()
             .map(|id| NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
@@ -2733,6 +2746,7 @@ mod box_same_core {
             prefix: "samecoreg".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ponger".to_string(),

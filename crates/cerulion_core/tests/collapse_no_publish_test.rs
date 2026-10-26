@@ -194,6 +194,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -203,6 +204,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -215,6 +217,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -268,6 +271,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -277,6 +281,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -289,6 +294,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -587,6 +593,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer_a".to_string(),
@@ -596,6 +603,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer_b".to_string(),
@@ -605,6 +613,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -623,6 +632,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

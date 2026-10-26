@@ -130,6 +130,7 @@ fn fusion_parts(
         nodes: vec![NodeDef {
             params: Default::default(),
             fuse: None,
+            isolate: None,
             ros2: None,
             id: "fuse".to_string(),
             node_type: "capture_fuse".to_string(),

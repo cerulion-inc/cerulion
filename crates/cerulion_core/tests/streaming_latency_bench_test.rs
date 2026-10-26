@@ -264,6 +264,7 @@ fn chain_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -276,6 +277,7 @@ fn chain_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

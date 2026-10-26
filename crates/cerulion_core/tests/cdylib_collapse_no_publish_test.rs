@@ -149,6 +149,7 @@ fn build_cdylib_collapse_graph(
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -158,6 +159,7 @@ fn build_cdylib_collapse_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -170,6 +172,7 @@ fn build_cdylib_collapse_graph(
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),

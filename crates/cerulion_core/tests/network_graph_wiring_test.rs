@@ -139,6 +139,7 @@ fn mixed_graph(
     if !egress_topic.is_empty() {
         nodes.push(NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "src".to_string(),
@@ -157,6 +158,7 @@ fn mixed_graph(
     if !ingress_topic.is_empty() {
         nodes.push(NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),

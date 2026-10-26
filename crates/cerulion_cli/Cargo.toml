@@ -83,6 +83,8 @@ default = ["telemetry"]
 # a no-op, `cerulion telemetry status` reports "not compiled", and no network
 # dependency is linked.
 telemetry = ["cerulion_telemetry/posthog"]
+# Oracle mutant seams for the box oracles (`--features oracle-mutants`).
+oracle-mutants = ["cerulion_cli_engine/oracle-mutants"]
 
 # bagd is folded into this binary as the
 # `cerulion bagd` subcommand (`BagdArgs` + `bagd_cli_main`). Unix-gated —

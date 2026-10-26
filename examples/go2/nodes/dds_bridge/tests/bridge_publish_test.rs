@@ -215,6 +215,7 @@ fn build_rig_capped(prefix: &str, cloud_max_slice_len: Option<usize>) -> Rig {
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "bridge".to_string(),

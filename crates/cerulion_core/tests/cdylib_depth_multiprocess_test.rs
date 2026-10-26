@@ -116,6 +116,7 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -125,6 +126,7 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),

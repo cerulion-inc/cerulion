@@ -2114,6 +2114,7 @@ pub fn build_node_def(
 
     NodeDef {
         fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id,
@@ -5355,6 +5356,7 @@ mod open_file_limit_verdict_tests {
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id,
@@ -6045,6 +6047,12 @@ pub fn graph_run(
     // (b) An INVALID deployment is a pre-run rejection, and a rejected run must
     //     not first create a directory and announce itself LIVE. Resolving
     //     before the descriptor keeps that arm ahead of any side effect.
+    // `--single-process` on the real clock keeps every node in one process,
+    // and that process runs its nodes in executor units: when they split, the
+    // run goes through the supervisor with ONE process group holding every
+    // node, so one worker process hosts all the units.
+    let single_process = single_process
+        && !single_process_hosts_units(workspace_root, &mut config, time_source)?;
     let deployment = resolve_deployment(
         config.has_process_groups(),
         single_process,
@@ -7065,6 +7073,93 @@ pub fn graph_run(
     // Both monolith arms end here: stop the `ros2:` children gracefully and
     // fold a `--peer-loss fail` death and any fatal node into the verdict.
     ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
+}
+
+/// Run the worker plans of one process: one plan runs on this thread exactly
+/// as [`graph_run_worker`]; several plans (the executor units one process
+/// group was split into) run one per thread.
+///
+/// Each thread builds and runs its own runtime from its own plan: its own
+/// transport node, step counter, gating clock, trace ring and READY sentinel,
+/// so the supervisor sees each unit as it sees a worker process. The units of
+/// one process share its fate: the first one to return, with an error or
+/// without, clears `running`, which stops the others at their next step
+/// boundary, and the process reports the worst outcome — an error, then a
+/// node-fatal verdict, then success.
+pub fn graph_run_worker_host(
+    workspace_root: &Path,
+    plan_paths: &[std::path::PathBuf],
+    running: Arc<AtomicBool>,
+) -> CliResult<()> {
+    match plan_paths {
+        [] => {
+            return Err(CliError::Validation(
+                "graph run-worker: no `--plan` given".to_string(),
+            ))
+        }
+        [one] => return graph_run_worker(workspace_root, one, running),
+        _ => {}
+    }
+    tracing::info!(
+        units = plan_paths.len(),
+        "worker process hosts several executor units, one thread each"
+    );
+    let outcomes: Vec<CliResult<()>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan_paths.len());
+        for (i, path) in plan_paths.iter().enumerate() {
+            let unit_running = Arc::clone(&running);
+            let spawned = std::thread::Builder::new()
+                .name(format!("cerulion-unit-{i}"))
+                .spawn_scoped(scope, move || {
+                    let outcome =
+                        graph_run_worker(workspace_root, path, Arc::clone(&unit_running));
+                    unit_running.store(false, Ordering::Relaxed);
+                    outcome
+                });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(e) => {
+                    running.store(false, Ordering::Relaxed);
+                    handles.push(scope.spawn(move || {
+                        Err(CliError::Validation(format!(
+                            "graph run-worker: cannot start the thread for plan `{}`: {e}",
+                            path.display()
+                        )))
+                    }));
+                }
+            }
+        }
+        handles
+            .into_iter()
+            .zip(plan_paths)
+            .map(|(handle, path)| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(CliError::Validation(format!(
+                        "graph run-worker: the executor thread for plan `{}` panicked",
+                        path.display()
+                    )))
+                })
+            })
+            .collect()
+    });
+    let mut node_fatal: Vec<(String, String)> = Vec::new();
+    let mut first_error: Option<CliError> = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(()) => {}
+            Err(CliError::NodeFatal { nodes }) => node_fatal.extend(nodes),
+            Err(e) => {
+                tracing::error!(error = %e, "an executor unit of this worker process failed");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => crate::error::node_fatal_verdict(node_fatal),
+    }
 }
 
 /// Run ONE worker process of a multi-process deployment from
@@ -9274,7 +9369,7 @@ fn kill_stragglers(guards: &mut [ChildGuard]) -> Vec<String> {
     for g in guards.iter_mut() {
         if let Some(status) = g.kill_and_reap_status() {
             if classify_worker_exit(&status) == WorkerExit::NodeFatal {
-                node_fatal_groups.push(g.group.clone());
+                node_fatal_groups.extend(g.units());
             }
         }
     }
@@ -9302,7 +9397,7 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
             ChildPoll::Running => {}
             ChildPoll::Exited(status) if classify_worker_exit(&status).is_clean() => {
                 if classify_worker_exit(&status) == WorkerExit::NodeFatal {
-                    node_fatal_groups.push(g.group.clone());
+                    node_fatal_groups.extend(g.units());
                 }
                 // Consumed a clean-exit event mid-sweep — surface it so the caller
                 // runs the Draining transition (at most one is possible per pass in
@@ -9314,10 +9409,14 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
                 }
             }
             ChildPoll::Exited(status) => {
-                deaths.push((g.group.clone(), format!("exited {status}")));
+                deaths.extend(g.units().into_iter().map(|u| (u, format!("exited {status}"))));
             }
             ChildPoll::Lost => {
-                deaths.push((g.group.clone(), "unpollable (Lost)".to_string()));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, "unpollable (Lost)".to_string())),
+                );
             }
         }
     }
@@ -9470,9 +9569,29 @@ pub(crate) struct ChildGuard {
     /// and the grace loop, and one loud line plus `debug!` repeats is the
     /// flood discipline every latch in this repo follows.
     peek_warned: bool,
+    /// The executor units this process runs when it runs more than one (a
+    /// worker host); empty for a process that is one unit, named `group`.
+    hosted: Vec<String>,
 }
 
 impl ChildGuard {
+    /// Record the executor units this worker process runs, so its exit is
+    /// reported as the departure of each of them.
+    pub(crate) fn hosting(mut self, units: Vec<String>) -> Self {
+        self.hosted = units;
+        self
+    }
+
+    /// The units this process's exit takes down: its hosted units, or its own
+    /// group.
+    pub(crate) fn units(&self) -> Vec<String> {
+        if self.hosted.is_empty() {
+            vec![self.group.clone()]
+        } else {
+            self.hosted.clone()
+        }
+    }
+
     /// A guard that makes no group promise (the multi-process workers; the
     /// recorders, which are group leaders that never need the group
     /// family). The group-kill methods are not for this guard.
@@ -9483,6 +9602,7 @@ impl ChildGuard {
             group,
             leads_group: false,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -9496,6 +9616,7 @@ impl ChildGuard {
             group,
             leads_group: true,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -10441,6 +10562,137 @@ fn supervisor_precreate_error(
 // suppression rationale: bundling buys no swap-safety here. (`cpu_dma_lock` is the
 // 9th.)
 #[allow(clippy::too_many_arguments)]
+/// For `--single-process`: put every native node in one process group when
+/// that process splits into more than one executor unit, and say so. Returns
+/// whether it did. A non-real time source, the lockstep execution mode, a
+/// non-Unix host or a graph that is one unit keeps the single-process
+/// monolith (one level loop).
+fn single_process_hosts_units(
+    workspace_root: &Path,
+    config: &mut GraphConfig,
+    time_source: TimeSource,
+) -> CliResult<bool> {
+    let lockstep = matches!(
+        resolve_execution_mode_request(
+            std::env::var_os(EXECUTION_MODE_ENV)
+                .map(|v| v.to_string_lossy().into_owned())
+                .as_deref()
+        ),
+        Some(crate::multiprocess::ExecutionMode::Lockstep)
+    );
+    if time_source != TimeSource::Real || lockstep || !cfg!(unix) {
+        return Ok(false);
+    }
+    let mut one = config.clone();
+    let host = config.identity().to_string();
+    one.process_groups = [(host.clone(), one.native_nodes().map(|n| n.id.clone()).collect())]
+        .into_iter()
+        .collect();
+    one.process_group_order = Vec::new();
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &one,
+        "--single-process splits the process into executor units by each node's declared \
+         trigger policy",
+    )?;
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = crate::multiprocess::plan_executor_units(
+        &one,
+        &entry_infos,
+        crate::multiprocess::ExecutionMode::FreeRun,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    if !units.plan.splits_any() {
+        return Ok(false);
+    }
+    tracing::info!(
+        graph = %config.identity(),
+        units = units.plan.units.get(&host).map_or(0, Vec::len),
+        "--single-process: every node runs in one worker process, on its executor units"
+    );
+    *config = one;
+    Ok(true)
+}
+
+/// The graph's profile for the executor tick budget: the cost snapshot at
+/// [`default_artifact_path`], when one is present and usable.
+fn load_unit_profile(
+    workspace_root: &Path,
+    graph_name: &str,
+) -> Option<(cerulion_core::graph::PartitionCosts, String)> {
+    let path = default_artifact_path(workspace_root, graph_name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match parse_profile_artifact(&text).and_then(|a| a.to_costs()) {
+        Ok((costs, _isolated)) => Some((costs, path.display().to_string())),
+        Err(e) => {
+            tracing::warn!(
+                graph = %graph_name,
+                profile = %path.display(),
+                error = %e,
+                "the graph's profile is present but unusable; executor units are split \
+                 from the graph's structure alone"
+            );
+            None
+        }
+    }
+}
+
+/// Derive the deployment's executor units and log them: one line per unit of
+/// a process that hosts more than one, naming its nodes and why it starts.
+fn plan_supervisor_units(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    loaded_entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    execution_mode: crate::multiprocess::ExecutionMode,
+) -> CliResult<crate::multiprocess::DeploymentUnits> {
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = crate::multiprocess::plan_executor_units(
+        config,
+        loaded_entry_infos,
+        execution_mode,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    for (host, reason) in &units.kept_whole {
+        tracing::info!(
+            graph = %config.identity(),
+            host = %host,
+            reason = %reason,
+            "executor units: this process group runs as one unit (one level loop)"
+        );
+    }
+    for (host, host_units) in units.plan.split_hosts() {
+        for unit in host_units {
+            let starts: Vec<String> = unit
+                .boundaries
+                .iter()
+                .map(|(node, b)| format!("{node}: {}", b.describe()))
+                .collect();
+            tracing::info!(
+                graph = %config.identity(),
+                host = %host,
+                unit = %unit.name,
+                nodes = ?unit.nodes,
+                starts = ?starts,
+                block_topics = ?unit.block_topics,
+                "executor unit: these nodes share one thread; the unit runs on its own executor"
+            );
+        }
+    }
+    Ok(units)
+}
+
 fn graph_run_supervisor(
     workspace_root: &Path,
     graphs_dir: &Path,
@@ -10729,8 +10981,14 @@ fn graph_run_supervisor(
 
     // (5) PURE PLAN — one WorkerPlan per group (rank order): participant maps,
     // handed quantum, barrier/ready identifiers, subgraphs.
+    // Executor units: split every process group into units (chains on one
+    // thread each) before planning, so each unit gets its own worker plan and
+    // every edge between units the wiring of an edge between processes.
+    let units = plan_supervisor_units(workspace_root, &config, &loaded_entry_infos, execution_mode)?;
+    let config = units.config.clone();
     let mut plan = crate::multiprocess::plan_deployment(&config, &levels, tightest, &nonce)
         .map_err(CliError::from)?;
+    crate::multiprocess::stamp_hosts(&mut plan, &units.plan.hosts);
 
     // Run the FULL partition validator (contiguity + BRIDGE) at PLAN
     // time — PRE-SPAWN — so every surface (`graph partition`, `graph levels`,
@@ -11152,6 +11410,22 @@ fn graph_run_supervisor(
     let mut _capture_plane: Option<std::sync::Arc<cerulion_core::state_arm::MappedStateArm>> = None;
     #[cfg(unix)]
     let armed_tag: Option<String> = {
+        // An anchor forks the rank's process; a fork copies only the forking
+        // thread and every lock another thread holds at that instant, so a
+        // process running several units cannot be anchored by a fork.
+        let state_arm_tag = match (state_arm_tag.as_deref(), units.plan.splits_any()) {
+            (Some(_), true) => {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    hosts = ?units.plan.split_hosts().map(|(h, _)| h).collect::<Vec<_>>(),
+                    "flashback checkpoints are OFF for this run: at least one process hosts \
+                     more than one executor unit, and a checkpoint forks its process, which \
+                     copies one thread, so this run takes none"
+                );
+                None
+            }
+            (tag, _) => tag.map(str::to_string),
+        };
         let armed = state_arm_tag.as_deref().and_then(|tag| {
             // Every worker plan carries the SAME `handed_quantum_ns` by
             // construction (multiprocess.rs: it is the min over the full graph),
@@ -11713,52 +11987,61 @@ fn graph_run_supervisor(
     // — which is what made `deferred_producer_groups` render a constant.
     let rank_groups: std::collections::HashMap<u32, String> =
         group_ranks.iter().map(|(g, r)| (*r, g.clone())).collect();
-    for idx in crate::multiprocess::spawn_order(&plan) {
-        let w = &plan.workers[idx];
-        let plan_path = &plan_paths[idx];
-        let child = std::process::Command::new(&self_exe)
-            .args(["graph", "run-worker", "--plan"])
-            .arg(plan_path)
-            .current_dir(workspace_root)
-            .spawn()
-            .map_err(|e| {
-                CliError::Validation(format!(
-                    "graph run (multi-process): failed to spawn worker process for group '{}': {e}",
-                    w.group
-                ))
-            })?;
+    // One process per host: a plan without a host is its own process, and the
+    // plans of one host run as threads of one `graph run-worker` process.
+    'spawn: for (host, idxs) in crate::multiprocess::host_spawn_order(&plan) {
+        let mut command = std::process::Command::new(&self_exe);
+        command.args(["graph", "run-worker"]);
+        for &idx in &idxs {
+            command.arg("--plan").arg(&plan_paths[idx]);
+        }
+        let child = command.current_dir(workspace_root).spawn().map_err(|e| {
+            CliError::Validation(format!(
+                "graph run (multi-process): failed to spawn worker process for group '{host}': {e}"
+            ))
+        })?;
         let pid = child.id();
         tracing::info!(
-            group = %w.group,
+            group = %host,
             pid,
-            nodes = w.subgraph.nodes.len(),
+            nodes = idxs
+                .iter()
+                .map(|&i| plan.workers[i].subgraph.nodes.len())
+                .sum::<usize>(),
+            units = idxs.len(),
             "spawned worker process"
         );
-        let mut guard = ChildGuard::new(child, w.group.clone());
-        // Block until READY / Ctrl-C, the child dies first, or the deadline
-        // elapses. On an `Err`, `guards` (already-spawned siblings) + `guard`
-        // drop → all children SIGKILLed + reaped.
-        match wait_for_ready_or_exit(
-            &mut guard,
-            Path::new(&w.ready_path),
-            &w.group,
-            &running,
-            READY_DEADLINE,
-        )? {
-            ReadyWait::Ready => guards.push(guard),
-            ReadyWait::CtrlC => {
-                // Stop spawning further workers; drain the ones already up (NOT
-                // a fail-loud — user-initiated). The JOIN loop below flips to
-                // Draining on its first pass (`running` is false) and
-                // SIGINTs every spawned worker, flipping each one's own
-                // `running` so its `wait_for_go` returns early and `run_live`
-                // exits at once (a directed kill to the supervisor pid never
-                // reached them; the process-group SIGINT covers only a real
-                // terminal Ctrl-C).
-                guards.push(guard);
-                break;
+        let mut guard = ChildGuard::new(child, host.clone());
+        if idxs.len() > 1 {
+            guard = guard.hosting(idxs.iter().map(|&i| plan.workers[i].group.clone()).collect());
+        }
+        // Block until every plan of this process is READY, Ctrl-C, the child
+        // dies first, or the deadline elapses. On an `Err`, `guards`
+        // (already-spawned siblings) + `guard` drop → all children SIGKILLed +
+        // reaped.
+        for &idx in &idxs {
+            let w = &plan.workers[idx];
+            match wait_for_ready_or_exit(
+                &mut guard,
+                Path::new(&w.ready_path),
+                &w.group,
+                &running,
+                READY_DEADLINE,
+            )? {
+                ReadyWait::Ready => {}
+                ReadyWait::CtrlC => {
+                    // Stop spawning further workers; drain the ones already up
+                    // (NOT a fail-loud — user-initiated). The JOIN loop below
+                    // flips to Draining on its first pass (`running` is false)
+                    // and SIGINTs every spawned worker, flipping each one's own
+                    // `running` so its `wait_for_go` returns early and
+                    // `run_live` exits at once.
+                    guards.push(guard);
+                    break 'spawn;
+                }
             }
         }
+        guards.push(guard);
     }
 
     // (10.35) **DECLARE what this run's trace plane really is** —
@@ -12211,7 +12494,7 @@ fn graph_run_supervisor(
     // `crashed_groups` is the degraded-run ledger — the groups lost under
     // peer-loss=continue (used for the all-crashed→Err edge + the degraded summary).
     let drop_stall_grace = drop_stall_grace_from_env();
-    let total_workers = guards.len();
+    let total_workers: usize = guards.iter().map(|g| g.units().len()).sum();
     let mut crashed_groups: Vec<String> = Vec::new();
     // The groups whose worker exited `EXIT_NODE_FATAL`: a clean exit after a
     // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
@@ -12260,13 +12543,16 @@ fn graph_run_supervisor(
 
         if let Some((i, poll)) = event {
             let group = guards[i].group.clone();
+            let units = guards[i].units();
             // Wedge alarm: this rank's worker is gone (exited, died, or became
             // unpollable) — stop watching its page. A dead worker's seq pairs
             // freeze by definition, so without this the alarm would fire on every
             // normal shutdown, naming nodes whose process no longer exists as
             // wedged. The departure itself is already reported by the arms below.
             #[cfg(unix)]
-            wedge_observer.retire(&group);
+            for unit in &units {
+                wedge_observer.retire(unit);
+            }
             let normal = state == JoinState::Normal && running.load(Ordering::Relaxed);
             match poll {
                 // Never stored as an event — the poll loop counts Running as alive.
@@ -12274,7 +12560,7 @@ fn graph_run_supervisor(
                 ChildPoll::Exited(status) if normal => {
                     let exit = classify_worker_exit(&status);
                     if exit == WorkerExit::NodeFatal {
-                        node_fatal_groups.push(group.clone());
+                        node_fatal_groups.extend(units.iter().cloned());
                     }
                     if exit.is_clean() {
                         // A CLEAN worker exit = graph shutdown. Flip to Draining AND
@@ -12332,7 +12618,10 @@ fn graph_run_supervisor(
                                 // publish on a detached thread).
                                 publish_process_faults(
                                     config.identity(),
-                                    &[(group.clone(), format!("worker process died ({status})"))],
+                                    &units
+                                        .iter()
+                                        .map(|u| (u.clone(), format!("worker process died ({status})")))
+                                        .collect::<Vec<_>>(),
                                     worker_iox2_config.as_ref(),
                                 );
                                 // Write the DEPARTURE record FIRST, then
@@ -12343,7 +12632,9 @@ fn graph_run_supervisor(
                                 // bagd outcome is logged inside `finalize`.
                                 #[cfg(unix)]
                                 if let Some(plane) = trace_plane.as_mut() {
-                                    plane.record_departure(&group);
+                                    for unit in &units {
+                                    plane.record_departure(unit);
+                                }
                                 }
                                 #[cfg(unix)]
                                 if let Some(rec) = recording.take() {
@@ -12362,7 +12653,8 @@ fn graph_run_supervisor(
                                 // (serial per-death graces would exceed the
                                 // survivors' ~5s boundary timeout at k >= 5 deaths
                                 // and cascade a partial loss into all-crashed).
-                                let mut batch = vec![(group.clone(), format!("exited {status}"))];
+                                let mut batch: Vec<(String, String)> =
+                                    units.iter().map(|u| (u.clone(), format!("exited {status}"))).collect();
                                 let sweep = sweep_additional_deaths(&mut guards);
                                 batch.extend(sweep.deaths);
                                 // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12440,7 +12732,7 @@ fn graph_run_supervisor(
                 ChildPoll::Exited(status) => {
                     let exit = classify_worker_exit(&status);
                     if exit == WorkerExit::NodeFatal {
-                        node_fatal_groups.push(group.clone());
+                        node_fatal_groups.extend(units.iter().cloned());
                     }
                     if exit.is_clean() {
                         tracing::debug!(group = %group, "worker drained (clean exit)");
@@ -12488,10 +12780,10 @@ fn graph_run_supervisor(
                             // for.
                             publish_process_faults(
                                 config.identity(),
-                                &[(
-                                    group.clone(),
-                                    "worker process became unpollable (Lost)".to_string(),
-                                )],
+                                &units
+                                    .iter()
+                                    .map(|u| (u.clone(), "worker process became unpollable (Lost)".to_string()))
+                                    .collect::<Vec<_>>(),
                                 worker_iox2_config.as_ref(),
                             );
                             // Departure record FIRST, then finalize the
@@ -12500,7 +12792,9 @@ fn graph_run_supervisor(
                             // stays diagnosable; the deployment Err wins).
                             #[cfg(unix)]
                             if let Some(plane) = trace_plane.as_mut() {
-                                plane.record_departure(&group);
+                                for unit in &units {
+                                    plane.record_departure(unit);
+                                }
                             }
                             #[cfg(unix)]
                             if let Some(rec) = recording.take() {
@@ -12515,7 +12809,8 @@ fn graph_run_supervisor(
                         PeerLossPolicy::Continue => {
                             // The same batched sweep as the Exited(nonzero)
                             // arm — see the comment there.
-                            let mut batch = vec![(group.clone(), "unpollable (Lost)".to_string())];
+                            let mut batch: Vec<(String, String)> =
+                                units.iter().map(|u| (u.clone(), "unpollable (Lost)".to_string())).collect();
                             let sweep = sweep_additional_deaths(&mut guards);
                             batch.extend(sweep.deaths);
                             // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12944,6 +13239,121 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
         .rendered
         .push_str(&render_chains_block(&config, &census));
     Ok(report)
+}
+
+/// `cerulion graph plan <name>`: the processes a free run of the graph starts
+/// and the executor units inside each, with the reason every unit starts.
+///
+/// The groups are the graph's `process_groups:`, or, when it declares none,
+/// the partition `graph run` derives in memory (process per node, or the
+/// cost-fused groups when the graph has a profile). Each group is split into
+/// units by the same derivation the run uses, with the graph's profile (its
+/// `graphs/<name>.costs.yaml`) for the tick budget when one is present.
+/// `--single-process` and the lockstep execution mode are not modelled: the
+/// view is the default free run.
+pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
+    let graphs_dir = workspace_root.join("graphs");
+    let (mut config, raw) = graph_read_raw(&graphs_dir, graph_name)?;
+    if config.prefix.is_empty() {
+        config.prefix = cerulion_core::graph::default_prefix(config.identity());
+    }
+    validate_graph(&config)?;
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &config,
+        "graph plan splits the graph by each node's declared trigger policy",
+    )?;
+    let derived = !config.has_process_groups();
+    let config = if derived {
+        crate::partition_emit::run_auto_partition_preflight(
+            workspace_root,
+            graph_name,
+            config,
+            &raw,
+            &crate::partition_emit::PreflightOptions {
+                lenient_costs: true,
+                assume_yes: false,
+            },
+        )?
+        .config
+    } else {
+        config
+    };
+    let profile = load_unit_profile(workspace_root, graph_name);
+    let units = crate::multiprocess::plan_executor_units(
+        &config,
+        &entry_infos,
+        crate::multiprocess::ExecutionMode::FreeRun,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    Ok(render_unit_plan(
+        graph_name,
+        derived,
+        profile.as_ref().map(|(_, label)| label.as_str()),
+        &units,
+    ))
+}
+
+/// The text of [`graph_plan`].
+pub(crate) fn render_unit_plan(
+    graph_name: &str,
+    derived: bool,
+    profile: Option<&str>,
+    units: &crate::multiprocess::DeploymentUnits,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let unit_count: usize = units.plan.units.values().map(Vec::len).sum();
+    let _ = writeln!(
+        out,
+        "graph {graph_name}: {} process(es), {unit_count} executor unit(s)",
+        units.plan.units.len()
+    );
+    let _ = writeln!(
+        out,
+        "  groups: {}",
+        if derived {
+            "derived by graph run (no process_groups: in the graph)"
+        } else {
+            "the graph's process_groups:"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  tick budget: {}",
+        match profile {
+            Some(label) => format!("from profile {label}"),
+            None => "no profile; structure only".to_string(),
+        }
+    );
+    let whole: indexmap::IndexMap<&str, &str> = units
+        .kept_whole
+        .iter()
+        .map(|(h, r)| (h.as_str(), r.as_str()))
+        .collect();
+    for (host, host_units) in &units.plan.units {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "process {host}: {} unit(s)", host_units.len());
+        if let Some(reason) = whole.get(host.as_str()) {
+            let _ = writeln!(out, "  one unit: {reason}");
+        }
+        for unit in host_units {
+            let _ = writeln!(out, "  unit {}: {}", unit.name, unit.nodes.join(", "));
+            for (node, boundary) in &unit.boundaries {
+                let _ = writeln!(out, "    starts at {node}: {}", boundary.describe());
+            }
+            for topic in &unit.block_topics {
+                let _ = writeln!(out, "    kept together by the block edge on {topic}");
+            }
+        }
+    }
+    out
 }
 
 /// Derive per-INSTANCE `NodeInfo` from each node TYPE's
@@ -25068,6 +25478,7 @@ nodes:
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
@@ -25099,6 +25510,7 @@ nodes:
                 },
                 NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
@@ -25422,6 +25834,7 @@ nodes:
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25500,6 +25913,7 @@ nodes:
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25583,6 +25997,7 @@ nodes:
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -28666,6 +29081,7 @@ nodes:
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
@@ -28735,6 +29151,7 @@ nodes:
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -33110,6 +33527,7 @@ network:
             nodes: (0..n)
                 .map(|i| NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
@@ -37292,6 +37710,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -37351,6 +37770,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             nodes: vec![
                 NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
@@ -37366,6 +37786,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                 },
                 NodeDef {
                     fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
@@ -40179,6 +40600,7 @@ mod worker_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         }
     }
 
@@ -40413,6 +40835,7 @@ mod worker_tests {
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
@@ -40656,6 +41079,77 @@ mod worker_tests {
             err.to_string().contains("unparseable `ix_config_json`"),
             "expected the unparseable-config rejection, got: {err}"
         );
+    }
+
+    /// The plans of one host are one spawn entry, in spawn order; a plan
+    /// without a host is its own.
+    #[test]
+    fn host_spawn_order_puts_the_plans_of_one_host_in_one_process() {
+        let mut plan = crate::multiprocess::DeploymentPlan {
+            workers: Vec::new(),
+            barrier_ns: "ns".to_string(),
+            barrier_id: "id".to_string(),
+            expected: 3,
+        };
+        for (rank, (group, host)) in [("cam", None), ("work.pace", Some("work")), ("work.fast", Some("work"))]
+            .into_iter()
+            .enumerate()
+        {
+            let mut w = minimal_plan("{}");
+            w.group = group.to_string();
+            w.rank = rank;
+            w.host = host.map(str::to_string);
+            plan.workers.push(w);
+        }
+        let order = crate::multiprocess::host_spawn_order(&plan);
+        let mut flat: Vec<(String, Vec<String>)> = order
+            .iter()
+            .map(|(host, idxs)| {
+                (
+                    host.clone(),
+                    idxs.iter().map(|&i| plan.workers[i].group.clone()).collect(),
+                )
+            })
+            .collect();
+        flat.sort();
+        assert_eq!(
+            flat,
+            vec![
+                ("cam".to_string(), vec!["cam".to_string()]),
+                (
+                    "work".to_string(),
+                    vec!["work.pace".to_string(), "work.fast".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// A host with several plans runs each one, and the first to stop clears
+    /// `running` for the others; an empty plan list is refused.
+    #[test]
+    fn a_worker_host_runs_every_plan_and_stops_them_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let mut w = minimal_plan("");
+            w.group = name.to_string();
+            let path = dir.join(format!("plan_{name}.json"));
+            std::fs::write(&path, serde_json::to_string(&w).expect("json")).expect("write");
+            paths.push(path);
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        let err = graph_run_worker_host(&dir, &paths, Arc::clone(&running))
+            .expect_err("a plan with no iceoryx2 config must fail");
+        assert!(
+            err.to_string().contains("empty `ix_config_json`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "a unit that stopped must clear `running` for its siblings"
+        );
+        assert!(graph_run_worker_host(&dir, &[], Arc::new(AtomicBool::new(true))).is_err());
     }
 }
 
@@ -41330,6 +41824,7 @@ mod supervisor_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         };
         DeploymentPlan {
             workers: vec![worker("a", 0), worker("b", 1)],
@@ -42144,6 +42639,7 @@ mod supervisor_tests {
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),

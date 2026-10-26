@@ -72,6 +72,7 @@ fn one_node_graph(
         prefix: "wt".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: node_id.to_string(),

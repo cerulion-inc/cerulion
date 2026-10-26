@@ -78,6 +78,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -93,6 +94,7 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -418,6 +420,7 @@ fn default_opener_attaches_to_low_depth_topic() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -433,6 +436,7 @@ fn default_opener_attaches_to_low_depth_topic() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -613,6 +617,7 @@ fn history_above_input_depth_warns_at_build() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -628,6 +633,7 @@ fn history_above_input_depth_warns_at_build() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -640,6 +646,7 @@ fn history_above_input_depth_warns_at_build() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "exact_fit".to_string(),
@@ -907,6 +914,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -922,6 +930,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -934,6 +943,7 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "plain".to_string(),
@@ -1094,6 +1104,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -1109,6 +1120,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "unified".to_string(),
@@ -1121,6 +1133,7 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "blocked".to_string(),

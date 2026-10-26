@@ -131,6 +131,7 @@ fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
         nodes: vec![
             NodeDef {
                 fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "cam".to_string(),
@@ -140,6 +141,7 @@ fn graph(fd: RawFd, fires: Arc<AtomicU64>) -> GraphRuntime {
             },
             NodeDef {
                 fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "viewer".to_string(),

@@ -172,6 +172,7 @@ fn pair_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -206,6 +207,7 @@ fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
         prefix: "psstri".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -929,6 +931,7 @@ fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
         prefix: "pssctx".to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -1316,6 +1319,7 @@ fn closure_sync_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -1553,6 +1557,7 @@ fn degraded_sync_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
