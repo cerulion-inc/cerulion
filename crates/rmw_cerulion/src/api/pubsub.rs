@@ -2644,11 +2644,11 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
-        // Deterministic gid: entity counter + schema hash (never random):
-        // mirrors the publisher; the endpoint id reported by
-        // rmw_get_subscriptions_info_by_topic and the registry deregister
-        // key. Minted before the port: a buffer-aware subscription's port
-        // name carries the entity number.
+        // The entity number the rmw gid is built from (pid namespace, pid,
+        // entity; `crate::gid::host_gid`), mirroring the publisher. The gid
+        // is the endpoint id rmw_get_subscriptions_info_by_topic reports and
+        // the registry deregister key. Minted before the port: a buffer-aware
+        // subscription's port name carries the entity number.
         let entity = runtime::next_entity_id();
         let type_name = ros_graph_type_name(bridge.qualified_name());
         // A buffer-aware subscription (`crate::buffer_backends`) announces
@@ -4352,9 +4352,11 @@ unsafe fn take_loaned_impl(
     }
     *taken = false;
     let data = &*((*subscription).data as *const SubscriptionData);
-    if !data.bridge.can_loan_take() {
-        // Neither served shape: the copying take stays (rclcpp falls back —
-        // can_loan_messages was false at create, loudly logged).
+    if !data.bridge.can_loan_take() || data.buffer.is_some() {
+        // Neither served shape, or a buffer-aware subscription (its frames
+        // are addressed CDR, decoded only by the copying take): the copying
+        // take stays (rclcpp falls back: can_loan_messages was false at
+        // create, loudly logged).
         return RMW_RET_UNSUPPORTED;
     }
     // A FIXED type hands out the SHM payload pointer itself;

@@ -473,6 +473,28 @@ unsafe fn take(
     None
 }
 
+/// [`take`] through `rmw_take_with_info`, returning the message info too.
+unsafe fn take_with_info(
+    s: *const ffi::rmw_subscription_t,
+    ts: *const rosidl_message_type_support_t,
+) -> Option<(Image, ffi::rmw_message_info_t)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let mut img = Image::new(ts);
+        let mut taken = false;
+        let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_take_with_info(s, img.ptr(), &mut taken, &mut info, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
+        if taken {
+            return Some((img, info));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    None
+}
+
 unsafe fn publish_device(
     p: *const ffi::rmw_publisher_t,
     ts: *const rosidl_message_type_support_t,
@@ -532,7 +554,24 @@ fn descriptors_reach_accepting_subscribers_and_cpu_ones_get_bytes() {
         );
         let bytes = pattern(4096, 1);
         publish_device(publisher, ts, &bytes, 101);
-        let mut got = take(gpu, ts).expect("descriptor frame delivered");
+        let (mut got, info) = take_with_info(gpu, ts).expect("descriptor frame delivered");
+        // A descriptor take reports the sending publisher, so rclcpp can drop
+        // its intra-process duplicate, and the frame's own sequence number.
+        let mut pub_gid: ffi::rmw_gid_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_gid_for_publisher(publisher, &mut pub_gid),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            info.publisher_gid.data[..16],
+            pub_gid.data[..16],
+            "the descriptor take reports the publisher's gid"
+        );
+        assert_ne!(info.publisher_gid.data[..16], [0u8; 16]);
+        assert!(
+            info.source_timestamp > 0,
+            "the frame's timestamp reaches info"
+        );
         let (backend, size, dev, uid) = got.data();
         assert_eq!((backend.as_str(), size, uid), ("cuda", 4096, 101));
         assert_eq!(
