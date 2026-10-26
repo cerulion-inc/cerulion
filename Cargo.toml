@@ -602,8 +602,8 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # A FORK of iceoryx2 0.10.0 with three fixes: it removes the process umask from
 # `UnixDatagramSocket::bind` (iceoryx2-bb-posix), fixes the macOS shm descriptor
 # table (iceoryx2-pal-posix, below) and initializes the node counter of the
-# global management segment (iceoryx2, below). It also adds the Android support
-# named at the end of this block. The revision is held by the tag
+# global management segment (iceoryx2, below). It also adds Android support
+# (below). The revision is held by the tag
 # `cerulion-pin-282f479b` on the fork, so it does not depend on a branch.
 #
 # `bind` installed a process global umask of `!permission` for the duration of
@@ -648,6 +648,10 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # started from whatever bytes the newly created segment held. The fork writes
 # the default state, a zero counter, when it creates the segment.
 #
+# The same revision also adds Android support: filesystem paths, file-backed
+# named shared memory with private-directory checks, abstract-namespace Unix
+# datagram sockets and POSIX timers for the watchdog.
+#
 # SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
 # follow our published crates, so anyone depending on a released `cerulion_core`
 # resolves the unpatched upstream until the fixes merge there. Node cdylibs
@@ -655,13 +659,12 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # recovers on its own.
 #
 # EXIT CONDITION: drop this entry when an iceoryx2 release carries every change
-# this fork revision adds: the three fixes above and the Android support below.
+# this fork revision adds: the three fixes and the Android support above.
+#
 # THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
 # build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
 # crates.io members keep theirs, and the same types then exist twice. Every
 # member the graph carries is listed so exactly one copy of each is resolved.
-# This pin also provides Android filesystem paths, file-backed named shared
-# memory with private-directory checks, and abstract-namespace Unix datagram sockets.
 iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
 iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
 iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }

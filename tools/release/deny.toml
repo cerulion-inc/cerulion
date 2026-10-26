@@ -359,9 +359,10 @@ unknown-git = "deny"
 # `shm_open` of that number. It also writes a zero node counter when it creates
 # the global management segment, where 0.10.0 left the counter that goes into
 # every node id as whatever bytes the new segment held.
-# The revision also adds Android filesystem paths, file-backed named shared
-# memory and abstract-namespace Unix datagram sockets. PRUNE this the moment an
-# iceoryx2 release carries every change this fork revision adds.
+# The revision also adds Android support: filesystem paths, file-backed named
+# shared memory with private-directory checks, abstract-namespace Unix datagram
+# sockets and POSIX timers for the watchdog. PRUNE this the moment an iceoryx2
+# release carries every change this fork revision adds.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",
