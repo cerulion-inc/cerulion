@@ -672,6 +672,14 @@ mod tests {
             .map(|suffix| base.with_extension(suffix.to_string()))
             .find(|path| std::fs::create_dir(path).is_ok())
             .expect("could not create a unique temporary directory");
+        // Removes the scratch directory however the test ends, panics included.
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _parent_guard = RemoveDirOnDrop(parent.clone());
         let root = workspace::workspace_create(&parent, "workspace")
             .unwrap()
             .root;
@@ -731,6 +739,5 @@ mod tests {
             .await
             .unwrap();
         let (_listener, _replacement_guard) = hygiene::acquire_socket(socket).unwrap();
-        let _ = std::fs::remove_dir_all(parent);
     }
 }
