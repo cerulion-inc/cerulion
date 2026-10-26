@@ -52,6 +52,9 @@ Cargo.lock
 # The Python wheel is an isolated workspace; its lock keeps the iceoryx2
 # family identical to the root pin.
 !/crates/cerulion_py/Cargo.lock
+# The Android sample's app runtime crate is an isolated workspace too; its
+# lock was seeded from the root lock, so it carries the same versions.
+!/crates/cerulion_android/android/runtime/Cargo.lock
 
 # Python
 __pycache__/

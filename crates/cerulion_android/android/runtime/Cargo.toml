@@ -1,0 +1,51 @@
+# The sample app's runtime library: the ONE native library the app loads.
+# It links cerulion_android and the graph's node crates, so the app holds one
+# copy of Cerulion and every node runs on its in-process transport.
+#
+# This is its own workspace, outside the node workspace: one cargo build
+# unifies a crate's features, so building it with the node workspace would
+# turn the nodes' `cdylib` feature back on.
+[workspace]
+resolver = "2"
+
+[package]
+name = "cerulion_sample_runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_android = { path = "../.." }
+# `default-features = false` leaves each node's C exports out of this library.
+timer = { path = "../../../../examples/basic_timer/nodes/timer", default-features = false }
+printer = { path = "../../../../examples/basic_timer/nodes/printer", default-features = false }
+relay = { path = "nodes/relay" }
+
+# A patch applies only in the workspace that declares it, so this workspace
+# pins the same iceoryx2 fork as the Cerulion workspace.
+[patch.crates-io]
+iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
+iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "8657bc53bd0b544dd40fc9ce27e6cdb90c312b51" }
