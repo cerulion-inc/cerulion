@@ -224,7 +224,7 @@ pub fn write_snapshot(
             VerbError::Internal(format!("the robot's result has no integer `{key}`"))
         })
     };
-    let jpeg = base64_decode(result_str(&result, "jpeg_base64")?)
+    let jpeg = base64_decode(result_str(result, "jpeg_base64")?)
         .ok_or_else(|| VerbError::Internal("the robot's JPEG is not base64".to_string()))?;
     let stamp_ns = field("stamp_ns")?;
     let path = match req.output {
@@ -242,7 +242,7 @@ pub fn write_snapshot(
         path,
         width: dimension("width")?,
         height: dimension("height")?,
-        encoding: escaped_bounded(result_str(&result, "encoding")?),
+        encoding: escaped_bounded(result_str(result, "encoding")?),
         stamp_ns,
         bytes: jpeg.len(),
     }
