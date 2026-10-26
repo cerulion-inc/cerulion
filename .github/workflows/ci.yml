@@ -871,8 +871,8 @@ jobs:
       # the same failure mode (`a hand list goes stale`) this workflow keeps
       # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
       #
-      # SCOPE: the walk names the three top-level TREES that exist today
-      # (`benches`, `examples`, `crates/cerulion_core/fuzz`). A brand-new
+      # SCOPE: the walk names the four TREES that exist today (`benches`,
+      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
       # top-level excluded tree would need a line here, visible in review,
       # unlike a missing file inside a directory already swept.
       - name: Check formatting (the workspaces the root does not cover)
@@ -896,13 +896,14 @@ jobs:
             cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
             echo "::endgroup::"
             checked=$((checked + 1))
-          done < <(find benches examples crates/cerulion_core/fuzz \
+          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
                         -type f -name Cargo.toml -not -path '*/target/*' | sort)
           # A walk that matched nothing would be a silent green. The floor is
           # the exact number of roots in the tree (two under benches/latency,
-          # five examples, the fuzz crate), so losing any one of them trips it.
+          # five examples, the fuzz crate, the Android sample's runtime
+          # crate), so losing any one of them trips it.
           # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 8 ]; then
+          if [ "$checked" -lt 9 ]; then
             echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
             exit 1
           fi
@@ -1406,6 +1407,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            crates/cerulion_android/android/runtime/target
           key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
@@ -1436,8 +1438,33 @@ jobs:
       - name: Check local-transport on Android
         run: cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core --features local-transport
 
-      - name: Build cerulion_android on Android
-        run: cargo ndk -t arm64-v8a --platform 30 build -p cerulion_android
+      # An app ships one native library: its runtime crate links
+      # cerulion_android and the graph's nodes. Build the sample app's runtime
+      # library the way an app does, copy exactly that one file into a
+      # jniLibs tree, and gate it (one library per ABI, 16 KB aligned LOAD
+      # segments, the JNI exports and no node exports). The self-test first
+      # proves the gate refuses each defect.
+      - name: Build the sample app runtime library on Android
+        working-directory: crates/cerulion_android/android/runtime
+        run: cargo ndk -t arm64-v8a --platform 30 build --release -p cerulion_sample_runtime
+
+      - name: Gate the sample app's jniLibs
+        run: |
+          jnilibs="$RUNNER_TEMP/jniLibs"
+          mkdir -p "$jnilibs/arm64-v8a"
+          cp crates/cerulion_android/android/runtime/target/aarch64-linux-android/release/libcerulion_sample_runtime.so "$jnilibs/arm64-v8a/"
+          bash tools/scripts/android_jnilibs_gate.sh --self-test "$jnilibs" cerulion_sample_runtime
+
+      # The Java facade against a host build of the same runtime library:
+      # load it by name, see the linked node types and run the sample graph.
+      - name: Build the sample app runtime library on the host
+        working-directory: crates/cerulion_android/android/runtime
+        run: cargo build -p cerulion_sample_runtime
+
+      - name: Java JNI smoke test against the sample runtime library
+        run: |
+          CERULION_APP_RUNTIME_LIB="$PWD/crates/cerulion_android/android/runtime/target/debug/libcerulion_sample_runtime.so" \
+            cargo test -p cerulion_android --test jni_java_test -- --ignored --test-threads=1
 
       - name: Cache cargo (prune the namespace to the current key)
         id: cache-prune
@@ -1461,6 +1488,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            crates/cerulion_android/android/runtime/target
           key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
 
   local-transport:
@@ -2653,6 +2681,9 @@ jobs:
       - name: cerulion_android linked node integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
+      - name: cerulion_android sample graph asset tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test sample_graph_asset_test
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:
