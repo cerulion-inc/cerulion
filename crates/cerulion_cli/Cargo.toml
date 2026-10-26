@@ -125,6 +125,9 @@ iceoryx2 = "=0.10.0"
 native_ros2_messages = { path = "../native_ros2_messages" }
 # Scaffold workspace + per-run plan/trace directories.
 tempfile = "3"
+# `tests/scaffold_dir_test.rs` parses the `.cargo/config.toml` a box scaffold
+# is pinned to its target directory with. Same pin as `cerulion_cli_engine`.
+toml = "0.9"
 # Deserialize the workers' `trace_{group}.json` dumps into a local `FlatEntry`
 # (`serde_json` is a regular dependency above).
 serde = { version = "1", features = ["derive"] }
