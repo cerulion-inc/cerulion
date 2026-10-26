@@ -89,7 +89,6 @@ impl CdylibFeederProducer {
 
 fn producer_def(id: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -178,7 +177,6 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
     // The cdylib period node, declared LAST → ticks after the macros in
     // decision order; routed serial by serial_fire_node_ids (set A).
     nodes.push(NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,

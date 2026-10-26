@@ -197,7 +197,6 @@ fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -213,7 +212,6 @@ fn run_chain(prefix: &str) -> (usize, Vec<u64>) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -278,7 +276,6 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
         .collect();
 
     let mut nodes = vec![NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -295,7 +292,6 @@ fn run_fanout(prefix: &str) -> (usize, Vec<Vec<u64>>) {
     }];
     for i in 0..FANOUT_CONSUMERS {
         nodes.push(NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -713,7 +709,6 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -729,7 +724,6 @@ fn run_closure_chain(prefix: &str, unified_capability: bool) -> (usize, Vec<u64>
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -928,7 +922,6 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -944,7 +937,6 @@ fn run_closure_receive_chain(prefix: &str, unified_capability: bool) -> (usize, 
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1180,7 +1172,6 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
         prefix: "ddw_one".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1196,7 +1187,6 @@ fn unified_try_receive_one_warns_once_and_latch_is_shared_across_methods() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1354,7 +1344,6 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
         prefix: "ddw_wait".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1370,7 +1359,6 @@ fn unified_wait_for_message_warns_once_named_and_latch_covers_try_receive() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

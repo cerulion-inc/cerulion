@@ -24,7 +24,12 @@ use indexmap::IndexMap;
 use cerulion_core::graph::chain::{census_chains, ChainCensus, Colocation, MAX_FUSED_CHAIN_NODES};
 use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
 use cerulion_core::graph::topology::{GraphTopology, Levels, TriggerEdges};
-use cerulion_core::graph::{build_trigger_edges, parse_graph, GraphConfig};
+use cerulion_core::graph::{
+    build_trigger_edges, expand_process_groups, parse_graph, GraphConfig, HopCosts,
+    PartitionCosts, UnitGraph, UnitPlan, UnitProfile,
+};
+use indexmap::IndexSet;
+use std::collections::BTreeMap;
 
 // ==========================================================================
 // Harness
@@ -919,51 +924,83 @@ fn a_throttled_consumer_keeps_the_queued_path() {
 }
 
 // ==========================================================================
-// Rule: the consumer does not declare `fuse: false`
+// One chain analysis: every fused chain lies inside one executor unit
 // ==========================================================================
 
-/// A node that declares `fuse: false` ends the chain at itself, and the census
-/// SAYS so rather than silently honouring it.
-///
-/// The one bar a graph author chooses rather than a rule deriving. A census
-/// that honoured the declaration without reporting it would leave the author
-/// unable to check that it took, which is the whole reason the report exists.
+/// The census judged against the executor units of one process: the graph's
+/// nodes in one group, split into units by the shared derivation.
+fn unit_census(h: &Harness, profile: Option<&PartitionCosts>) -> (ChainCensus, UnitPlan) {
+    let mut one = h.config.clone();
+    one.process_groups = [(
+        "g".to_string(),
+        one.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+    )]
+    .into_iter()
+    .collect();
+    let graph = UnitGraph::from_graph(&one, &h.infos, &h.topology, &h.trigger_edges);
+    let plan = expand_process_groups(
+        &one,
+        &graph,
+        profile.map(|costs| UnitProfile {
+            costs,
+            label: "costs",
+        }),
+        &IndexSet::new(),
+    );
+    let census = census_chains(
+        &one,
+        &h.infos,
+        &h.topology,
+        &h.trigger_edges,
+        &h.levels,
+        Colocation::ProcessGroups(&plan.groups),
+    );
+    (census, plan)
+}
+
+fn assert_chains_inside_units(census: &ChainCensus, plan: &UnitPlan) {
+    for chain in census.chains() {
+        let unit = plan
+            .groups
+            .iter()
+            .find(|(_, members)| members.contains(&chain.nodes[0]))
+            .map(|(name, _)| name.clone())
+            .expect("the head is in a unit");
+        assert!(
+            chain.nodes.iter().all(|n| plan.groups[&unit].contains(n)),
+            "fused chain {:?} leaves unit {unit}",
+            chain.nodes
+        );
+    }
+}
+
+/// Without a profile every data-triggered node is a unit of its own, so the
+/// census judged against the units fuses nothing; with a profile that makes
+/// the merge safe, the whole chain is one unit and the chain fuses inside it.
 #[test]
-fn a_node_that_declares_fuse_false_ends_the_chain_at_itself() {
-    let opted = CHAIN_YAML.replace(
-        "  - id: relay\n    type: relay\n",
-        "  - id: relay\n    type: relay\n    fuse: false\n",
-    );
-    assert!(
-        opted.contains("fuse: false"),
-        "the fixture must carry the key"
-    );
-    let h = Harness::new(&opted, &chain_specs());
-    let census = h.monolith();
+fn every_fused_chain_lies_inside_one_executor_unit() {
+    let h = Harness::new(CHAIN_YAML, &chain_specs());
 
-    // The hop INTO the opted-out node is refused; the hop OUT of it is not,
-    // because the key ends a chain at the node rather than forbidding it to
-    // head one.
-    assert_eq!(chains(&census), vec!["relay->sink"]);
-    assert_eq!(
-        verdicts(&census),
-        vec!["relay.inp <- src : opted-out", "sink.inp <- relay : FUSED"]
-    );
-    assert_eq!(
-        sentence(&census, "opted-out"),
-        "the consumer declares `fuse: false`, so a chain ends at it"
-    );
-    assert_total(&census);
+    let (census, plan) = unit_census(&h, None);
+    assert_eq!(plan.groups.len(), 3, "no profile: one unit per node");
+    assert!(chains(&census).is_empty());
+    assert_chains_inside_units(&census, &plan);
 
-    // ANTI-TAUTOLOGY: `fuse: true` reads as the key being absent, so the arm
-    // above cannot pass against an analysis that refuses any node carrying the
-    // key at all.
-    let stated = opted.replace("fuse: false", "fuse: true");
-    let h = Harness::new(&stated, &chain_specs());
-    let census = h.monolith();
+    let costs = PartitionCosts {
+        node_p50_ns: [("src", 1_000u64), ("relay", 1_000), ("sink", 1_000)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        edge_rate_mhz: BTreeMap::new(),
+        hop: HopCosts {
+            cross_ns: 0,
+            intra_ns: 0,
+        },
+    };
+    let (census, plan) = unit_census(&h, Some(&costs));
+    assert_eq!(plan.groups.len(), 1, "a profiled chain under budget is one unit");
     assert_eq!(chains(&census), vec!["src->relay->sink"]);
-    assert_eq!(census.bars(), Vec::new());
-    assert_total(&census);
+    assert_chains_inside_units(&census, &plan);
 }
 
 // ==========================================================================

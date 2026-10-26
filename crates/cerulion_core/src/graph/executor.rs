@@ -13,48 +13,40 @@
 //! words. A slow tick delays its own unit and, by data, the units that read from
 //! it; it never holds another unit's fire.
 //!
-//! # The unit is a linear chain
+//! # Every node starts alone; a profile merges links
 //!
-//! A node joins its producer's unit when the edge between them is a linear
-//! hand-off. [`derive_units`] starts a new unit at a node for each of these
-//! reasons ([`Boundary`]):
+//! A node may join its producer's unit only across a LINK: an edge the shared
+//! chain predicates ([`crate::graph::chain::linear_links`]) find to be a linear
+//! hand-off, one producer handing each frame to one consumer that fires on it.
+//! The same predicates serve the fusion census and the partitioner, so the three
+//! agree on what a chain is.
 //!
-//! | boundary | the node |
-//! |---|---|
-//! | [`Boundary::Source`] | has no trigger input fed by a node of the same process (a period, external or sync-free source, or a consumer of another process's or an outside topic) |
-//! | [`Boundary::FanIn`] | has two or more trigger inputs (a join or a sync set) |
-//! | [`Boundary::FanOut`] | is fed by a producer that triggers more than one node of the process |
-//! | [`Boundary::Isolated`] | declares `isolate: true` |
-//! | [`Boundary::AfterIsolated`] | is fed by a node that declares `isolate: true` |
-//! | [`Boundary::OverBudget`] | ticks long against its period or a deadline in its chain, by the profile |
-//! | [`Boundary::AfterOverBudget`] | is fed by a node over budget |
+//! A link merges only when the graph's profile ([`PartitionCosts`], the cost
+//! snapshot `graph profile` writes) shows the merge is safe: the unit's summed
+//! p50 tick, the new node included, stays under [`BUDGET_DIVISOR`]⁻¹ of the
+//! period the unit is fed at, and under the same share of the node's own
+//! `tick_within_ms`. Without a profile, or without a profiled tick for every node
+//! involved, nothing merges: every data-triggered node is a unit of its own, so a
+//! slow node never holds a fast one from the first run.
 //!
-//! Latest-value (non-trigger) edges never join units: the consumer is not woken
-//! by them.
+//! Each node that starts a unit carries the reason ([`Boundary`]): a source, an
+//! edge that is no link (latest-value, fan-out, join, a period or sync
+//! consumer...), `isolate: true`, an isolated producer, an unprofiled merge, or
+//! a merge over budget.
 //!
 //! # Overrides
 //!
 //! `isolate: true` puts the node in a unit of its own. `isolate: false` joins
 //! the node to the unit of every same-process node that triggers it, whatever
 //! the automatic rules say: a fan-in node merges its producers' units, a
-//! fan-out consumer shares the producer's unit, and the tick budget is not
-//! applied to it. When a producer declares `isolate: true` and its consumer
-//! `isolate: false`, the producer's declaration wins.
+//! fan-out consumer shares the producer's unit, and no profile is needed. When a
+//! producer declares `isolate: true` and its consumer `isolate: false`, the
+//! producer's declaration wins.
 //!
 //! A [`Coupling`] (every producer and consumer of a topic with a `block`
 //! consumer) merges its nodes into one unit after every other rule: the
 //! producer's deferral reads an outstanding count kept by the consumers' drains
 //! inside one level loop.
-//!
-//! # The tick budget
-//!
-//! With a profile ([`PartitionCosts`], the cost snapshot `graph profile`
-//! writes), a node is over budget when its p50 tick is at least
-//! [`BUDGET_DIVISOR`]⁻¹ of the period it is fed at, or of the tightest
-//! `tick_within_ms` of a node downstream of it in the same process. The period
-//! a node is fed at is the profiled rate of its trigger edge, else its own
-//! period, else its producer's. Without a profile no node is over budget and
-//! the split is structural.
 //!
 //! # Fixed at load
 //!
@@ -68,17 +60,17 @@
 //! nothing to split plans byte-identically to one planned before units
 //! existed. A host that splits names each unit `<host>.<first node>`.
 
-use std::collections::BTreeSet;
-
 use indexmap::{IndexMap, IndexSet};
 
+use crate::graph::chain::{linear_links, ChainBar, ConsumerEdgeVerdict};
 use crate::graph::config::GraphConfig;
 use crate::graph::node::{MacroPolicy, NodeInfo};
 use crate::graph::partition::{block_colocation_seeds, PartitionCosts};
 use crate::graph::topology::{GraphTopology, TriggerEdges};
 
-/// A node is over budget when its p50 tick times this divisor reaches the
-/// period it is fed at or a downstream deadline: a quarter of the period.
+/// A link merges when the unit's summed p50 tick times this divisor stays
+/// below the period it is fed at (and below a member's `tick_within_ms`): a
+/// quarter of the period.
 pub const BUDGET_DIVISOR: u64 = 4;
 
 /// Nodes that must share one executor whatever the chain rules say.
@@ -96,17 +88,13 @@ pub struct Coupling {
 pub enum Boundary {
     /// No trigger input is fed by a node of the same process.
     Source,
-    /// Two or more trigger inputs.
-    FanIn {
-        /// The number of trigger inputs.
-        inputs: usize,
-    },
-    /// Fed by a producer that triggers more than one node of the process.
-    FanOut {
-        /// The fanning producer.
+    /// The node's trigger edge from this process is no link; the shared chain
+    /// predicate's verdict says why (latest-value, fan-out, join, ...).
+    NotALink {
+        /// The producer of the edge.
         producer: String,
-        /// How many nodes of the process it triggers.
-        consumers: usize,
+        /// The chain predicate that refused the edge.
+        bar: ChainBar,
     },
     /// The node declares `isolate: true`.
     Isolated,
@@ -115,13 +103,13 @@ pub enum Boundary {
         /// The isolated producer.
         producer: String,
     },
-    /// The node ticks long against its budget.
-    OverBudget(BudgetVerdict),
-    /// Fed by a node over budget.
-    AfterOverBudget {
-        /// The producer over budget.
+    /// A link whose merge no profile shows to be safe.
+    Unprofiled {
+        /// The producer across the link.
         producer: String,
     },
+    /// A link whose merge would put the unit over its tick budget.
+    OverBudget(BudgetVerdict),
 }
 
 impl Boundary {
@@ -129,63 +117,63 @@ impl Boundary {
     pub fn describe(&self) -> String {
         match self {
             Self::Source => "source (no trigger input from this process)".to_string(),
-            Self::FanIn { inputs } => format!("fan-in ({inputs} trigger inputs)"),
-            Self::FanOut {
-                producer,
-                consumers,
-            } => format!("fan-out ({producer} triggers {consumers} nodes)"),
+            Self::NotALink { producer, bar } => {
+                format!("not a chain link from {producer}: {} ({bar})", bar.label())
+            }
             Self::Isolated => "isolate: true".to_string(),
             Self::AfterIsolated { producer } => {
                 format!("after an isolated node ({producer} declares isolate: true)")
             }
+            Self::Unprofiled { producer } => format!(
+                "no profile shows that joining {producer}'s unit is safe (run `cerulion graph \
+                 profile` to let a chain merge)"
+            ),
             Self::OverBudget(v) => v.describe(),
-            Self::AfterOverBudget { producer } => {
-                format!("after a node over its tick budget ({producer})")
-            }
         }
     }
 }
 
-/// What the tick budget measured for a node over it.
+/// What the tick budget measured for a merge it refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetVerdict {
-    /// The node's profiled p50 tick.
-    pub p50_ns: u64,
+    /// The node that would have joined.
+    pub node: String,
+    /// The unit's summed p50 tick with the node included.
+    pub unit_ns: u64,
     /// The budget it reached: the limit divided by [`BUDGET_DIVISOR`].
     pub budget_ns: u64,
     /// What the budget was derived from.
     pub against: BudgetAgainst,
-    /// The profile's label (its file, or "costs").
+    /// The profile's label (its file).
     pub profile: String,
 }
 
 impl BudgetVerdict {
     fn describe(&self) -> String {
         let against = match &self.against {
-            BudgetAgainst::Period { period_ns } => format!("its {period_ns} ns period"),
-            BudgetAgainst::Deadline { node, deadline_ns } => {
-                format!("the {deadline_ns} ns tick_within of {node}")
+            BudgetAgainst::Period { period_ns } => format!("the unit's {period_ns} ns period"),
+            BudgetAgainst::Deadline { deadline_ns } => {
+                format!("{}'s {deadline_ns} ns tick_within", self.node)
             }
         };
         format!(
-            "tick budget: p50 {} ns >= {} ns, 1/{BUDGET_DIVISOR} of {against} (profile {})",
-            self.p50_ns, self.budget_ns, self.profile
+            "tick budget: the unit's p50 ticks would sum to {} ns >= {} ns, 1/{BUDGET_DIVISOR} \
+             of {against} (profile {})",
+            self.unit_ns, self.budget_ns, self.profile
         )
     }
 }
 
-/// The limit a [`BudgetVerdict`] measured a node against.
+/// The limit a [`BudgetVerdict`] measured a merge against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetAgainst {
-    /// The period the node is fed at.
+    /// The period the unit is fed at.
     Period {
         /// That period.
         period_ns: u64,
     },
-    /// The tightest `tick_within_ms` of a node downstream of it.
+    /// The joining node's own `tick_within_ms`.
     Deadline {
-        /// The node declaring it.
-        node: String,
         /// The deadline.
         deadline_ns: u64,
     },
@@ -199,7 +187,6 @@ pub struct ExecutorUnit {
     /// The member node ids, in the host's member order.
     pub nodes: Vec<String>,
     /// Every member that does not share its producer's unit, with why.
-    /// The first entry is the unit's own start.
     pub boundaries: Vec<(String, Boundary)>,
     /// The `block` topics that merged nodes into this unit.
     pub block_topics: Vec<String>,
@@ -212,8 +199,9 @@ pub struct UnitGraph {
     /// Every trigger edge whose producer is a graph node: `(producer, consumer)`,
     /// once per consumer input.
     pub trigger_edges: Vec<(String, String)>,
-    /// Each node's trigger-input count, outside producers included.
-    pub trigger_inputs: IndexMap<String, usize>,
+    /// The shared chain predicate's verdict on every consumer edge
+    /// ([`linear_links`]); an edge with no bar is a link.
+    pub links: Vec<ConsumerEdgeVerdict>,
     /// Each node's `isolate:` declaration.
     pub isolate: IndexMap<String, bool>,
     /// Each period node's period.
@@ -232,15 +220,15 @@ impl UnitGraph {
         topology: &GraphTopology,
         trigger_edges: &TriggerEdges,
     ) -> Self {
-        let mut out = Self::default();
+        let mut out = Self {
+            links: linear_links(entry_infos, topology, trigger_edges),
+            ..Self::default()
+        };
         for flow in topology.topics() {
             for consumer in &flow.consumers {
                 if !trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
                     continue;
                 }
-                *out.trigger_inputs
-                    .entry(consumer.node_id.clone())
-                    .or_insert(0) += 1;
                 for producer in &flow.producers {
                     out.trigger_edges
                         .push((producer.clone(), consumer.node_id.clone()));
@@ -285,118 +273,40 @@ pub struct UnitProfile<'a> {
     pub label: &'a str,
 }
 
-/// Whether the tick-budget rule is applied (the oracle's mutant seam ignores
-/// it under the `oracle-mutants` feature).
-fn budget_rule_on() -> bool {
-    #[cfg(feature = "oracle-mutants")]
-    {
-        if std::env::var_os(BUDGET_MUTANT_ENV).is_some() {
-            return false;
-        }
-    }
-    true
-}
+/// Under the `oracle-mutants` feature, setting this variable makes
+/// [`derive_units`] merge a link that no profile shows to be safe.
+#[cfg(feature = "oracle-mutants")]
+pub const MERGE_MUTANT_ENV: &str = "CERULION_UNIT_MERGE_MUTANT";
 
-/// Setting this variable in a build with the `oracle-mutants` feature makes
-/// [`derive_units`] ignore the tick budget.
+/// Under the `oracle-mutants` feature, setting this variable makes
+/// [`derive_units`] ignore the tick budget of a profiled merge.
 #[cfg(feature = "oracle-mutants")]
 pub const BUDGET_MUTANT_ENV: &str = "CERULION_UNIT_BUDGET_MUTANT";
 
-/// The period `node` is fed at: its trigger edge's profiled rate, else its own
-/// period, else its first in-host trigger producer's, without revisiting a node.
-fn fed_period_ns(
-    node: &str,
-    graph: &UnitGraph,
-    host: &IndexSet<&str>,
-    costs: Option<&PartitionCosts>,
-    seen: &mut BTreeSet<String>,
-) -> Option<u64> {
-    if !seen.insert(node.to_string()) {
-        return None;
+/// Whether the merge mutant is armed (never, outside the `oracle-mutants`
+/// feature).
+fn merge_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(MERGE_MUTANT_ENV).is_some()
     }
-    if let Some(costs) = costs {
-        let rate = graph
-            .trigger_edges
-            .iter()
-            .filter(|(_, c)| c == node)
-            .filter_map(|(p, c)| costs.edge_rate_mhz.get(&(p.clone(), c.clone())))
-            .copied()
-            .max();
-        if let Some(mhz) = rate.filter(|r| *r > 0) {
-            return Some(1_000_000_000_000 / mhz);
-        }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
     }
-    if let Some(p) = graph.period_ns.get(node) {
-        return Some(*p);
-    }
-    let producer = graph
-        .trigger_edges
-        .iter()
-        .find(|(p, c)| c == node && host.contains(p.as_str()))
-        .map(|(p, _)| p.clone())?;
-    fed_period_ns(&producer, graph, host, costs, seen)
 }
 
-/// The tightest `tick_within` among the in-host nodes downstream of `node` by
-/// trigger edges, with the node declaring it.
-fn tightest_downstream_deadline(
-    node: &str,
-    graph: &UnitGraph,
-    host: &IndexSet<&str>,
-) -> Option<(String, u64)> {
-    let mut stack = vec![node.to_string()];
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut best: Option<(String, u64)> = None;
-    while let Some(n) = stack.pop() {
-        for (_, c) in graph.trigger_edges.iter().filter(|(p, _)| *p == n) {
-            if !host.contains(c.as_str()) || !seen.insert(c.clone()) {
-                continue;
-            }
-            if let Some(d) = graph.tick_within_ns.get(c) {
-                if best.as_ref().is_none_or(|(_, b)| d < b) {
-                    best = Some((c.clone(), *d));
-                }
-            }
-            stack.push(c.clone());
-        }
+/// Whether the budget mutant is armed (never, outside the `oracle-mutants`
+/// feature).
+fn budget_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(BUDGET_MUTANT_ENV).is_some()
     }
-    best
-}
-
-fn budget_verdict(
-    node: &str,
-    graph: &UnitGraph,
-    host: &IndexSet<&str>,
-    profile: Option<UnitProfile<'_>>,
-) -> Option<BudgetVerdict> {
-    let profile = profile?;
-    let p50 = *profile.costs.node_p50_ns.get(node)?;
-    let reached = |limit: u64| p50.saturating_mul(BUDGET_DIVISOR) >= limit;
-    let mut seen = BTreeSet::new();
-    if let Some(period_ns) = fed_period_ns(node, graph, host, Some(profile.costs), &mut seen) {
-        if reached(period_ns) {
-            return Some(BudgetVerdict {
-                p50_ns: p50,
-                budget_ns: period_ns / BUDGET_DIVISOR,
-                against: BudgetAgainst::Period { period_ns },
-                profile: profile.label.to_string(),
-            });
-        }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
     }
-    if let Some((by, deadline_ns)) = tightest_downstream_deadline(node, graph, host) {
-        if reached(deadline_ns) {
-            return Some(BudgetVerdict {
-                p50_ns: p50,
-                budget_ns: deadline_ns / BUDGET_DIVISOR,
-                against: BudgetAgainst::Deadline {
-                    node: by,
-                    deadline_ns,
-                },
-                profile: profile.label.to_string(),
-            });
-        }
-    }
-    None
 }
 
 fn root(parent: &mut [usize], mut i: usize) -> usize {
@@ -415,6 +325,87 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
+/// The period a unit headed by `head` is fed at: the head's own period, else
+/// the fastest profiled rate of its trigger edges.
+fn head_period_ns(head: &str, graph: &UnitGraph, costs: Option<&PartitionCosts>) -> Option<u64> {
+    if let Some(p) = graph.period_ns.get(head) {
+        return Some(*p);
+    }
+    let costs = costs?;
+    graph
+        .trigger_edges
+        .iter()
+        .filter(|(_, c)| c == head)
+        .filter_map(|(p, c)| costs.edge_rate_mhz.get(&(p.clone(), c.clone())))
+        .copied()
+        .filter(|r| *r > 0)
+        .max()
+        .map(|mhz| 1_000_000_000_000 / mhz)
+}
+
+/// A unit being grown along one chain.
+struct Growing {
+    /// The summed p50 tick of its members, when every one is profiled.
+    sum_ns: Option<u64>,
+    /// The period it is fed at, when known.
+    period_ns: Option<u64>,
+}
+
+/// Decide whether `node` may join the unit `unit` across the link from
+/// `producer`. `Ok(sum)` = merge, with the unit's new sum.
+fn merge_verdict(
+    node: &str,
+    producer: &str,
+    unit: &Growing,
+    graph: &UnitGraph,
+    profile: Option<UnitProfile<'_>>,
+) -> Result<Option<u64>, Boundary> {
+    let unprofiled = || Boundary::Unprofiled {
+        producer: producer.to_string(),
+    };
+    let Some(profile) = profile else {
+        return if merge_mutant() {
+            Ok(None)
+        } else {
+            Err(unprofiled())
+        };
+    };
+    let (Some(sum), Some(p50), Some(period_ns)) = (
+        unit.sum_ns,
+        profile.costs.node_p50_ns.get(node).copied(),
+        unit.period_ns,
+    ) else {
+        return if merge_mutant() {
+            Ok(None)
+        } else {
+            Err(unprofiled())
+        };
+    };
+    let unit_ns = sum.saturating_add(p50);
+    if budget_mutant() {
+        return Ok(Some(unit_ns));
+    }
+    let over = |limit: u64| unit_ns.saturating_mul(BUDGET_DIVISOR) >= limit;
+    let verdict = |against: BudgetAgainst, limit: u64| {
+        Boundary::OverBudget(BudgetVerdict {
+            node: node.to_string(),
+            unit_ns,
+            budget_ns: limit / BUDGET_DIVISOR,
+            against,
+            profile: profile.label.to_string(),
+        })
+    };
+    if over(period_ns) {
+        return Err(verdict(BudgetAgainst::Period { period_ns }, period_ns));
+    }
+    if let Some(&deadline_ns) = graph.tick_within_ns.get(node) {
+        if over(deadline_ns) {
+            return Err(verdict(BudgetAgainst::Deadline { deadline_ns }, deadline_ns));
+        }
+    }
+    Ok(Some(unit_ns))
+}
+
 /// Split one host's members into executor units.
 ///
 /// Units are ordered by their first member and list their members in
@@ -428,81 +419,77 @@ pub fn derive_units(
     let in_host: IndexSet<&str> = members.iter().map(String::as_str).collect();
     let index = |n: &str| in_host.get_index_of(n);
     let declared = |n: &str| graph.isolate.get(n).copied();
+    let costs = profile.map(|p| p.costs);
 
-    // In-host trigger producers of each member, and in-host trigger consumer
-    // nodes of each member.
+    // In-host trigger producers of each member.
     let mut producers: IndexMap<&str, IndexSet<&str>> = IndexMap::new();
-    let mut consumers: IndexMap<&str, IndexSet<&str>> = IndexMap::new();
     for (p, c) in &graph.trigger_edges {
         if in_host.contains(p.as_str()) && in_host.contains(c.as_str()) {
             producers.entry(c.as_str()).or_default().insert(p.as_str());
-            consumers.entry(p.as_str()).or_default().insert(c.as_str());
+        }
+    }
+    // The in-host link into each member, and the in-host links out of it.
+    let mut link_in: IndexMap<&str, &str> = IndexMap::new();
+    let mut link_out: IndexMap<&str, &str> = IndexMap::new();
+    for edge in graph.links.iter().filter(|e| e.is_fused()) {
+        let Some(p) = edge.producer.as_deref() else {
+            continue;
+        };
+        if in_host.contains(p) && in_host.contains(edge.consumer.as_str()) {
+            link_in.insert(edge.consumer.as_str(), p);
+            link_out.insert(p, edge.consumer.as_str());
         }
     }
 
-    let budget_on = budget_rule_on();
-    let over: IndexMap<&str, BudgetVerdict> = members
-        .iter()
-        .filter(|n| declared(n) != Some(false) && budget_on)
-        .filter_map(|n| budget_verdict(n, graph, &in_host, profile).map(|v| (n.as_str(), v)))
-        .collect();
-
     let mut parent: Vec<usize> = (0..members.len()).collect();
     let mut starts: IndexMap<&str, Boundary> = IndexMap::new();
+    // Members whose merge is decided by walking their chain.
+    let mut candidates: IndexSet<&str> = IndexSet::new();
     for node in members {
         let n = node.as_str();
-        let own = producers.get(n);
-        let inputs = graph.trigger_inputs.get(n).copied().unwrap_or(0);
         if declared(n) == Some(true) {
             starts.insert(n, Boundary::Isolated);
             continue;
         }
-        let Some(own) = own.filter(|p| !p.is_empty()) else {
+        let own = producers.get(n).filter(|p| !p.is_empty());
+        let Some(own) = own else {
             starts.insert(n, Boundary::Source);
             continue;
         };
         if declared(n) == Some(false) {
-            // Join every in-host producer that does not itself declare
-            // isolate: true.
             let joinable: Vec<&str> = own
                 .iter()
                 .copied()
                 .filter(|p| declared(p) != Some(true))
                 .collect();
-            match joinable.first() {
-                Some(_) => {
-                    for p in joinable {
-                        if let (Some(a), Some(b)) = (index(n), index(p)) {
-                            union(&mut parent, a, b);
-                        }
-                    }
-                }
-                None => {
-                    let producer = own.first().map(|p| p.to_string()).unwrap_or_default();
-                    starts.insert(n, Boundary::AfterIsolated { producer });
+            if joinable.is_empty() {
+                let producer = own.first().map(|p| p.to_string()).unwrap_or_default();
+                starts.insert(n, Boundary::AfterIsolated { producer });
+            }
+            for p in joinable {
+                if let (Some(a), Some(b)) = (index(n), index(p)) {
+                    union(&mut parent, a, b);
                 }
             }
             continue;
         }
-        if let Some(v) = over.get(n) {
-            starts.insert(n, Boundary::OverBudget(v.clone()));
-            continue;
-        }
-        if inputs >= 2 || own.len() >= 2 {
-            starts.insert(
-                n,
-                Boundary::FanIn {
-                    inputs: inputs.max(own.len()),
-                },
-            );
-            continue;
-        }
-        if inputs == 0 {
-            starts.insert(n, Boundary::Source);
-            continue;
-        }
-        let Some(&p) = own.first() else {
-            starts.insert(n, Boundary::Source);
+        let Some(&p) = link_in.get(n) else {
+            // An in-host trigger edge that is no link: name the first one.
+            let fallback = own.first().map(|p| p.to_string()).unwrap_or_default();
+            let (producer, bar) = graph
+                .links
+                .iter()
+                .filter(|e| e.consumer == n)
+                .find_map(|e| {
+                    let bar = e.bar.clone()?;
+                    match e.producer.as_deref() {
+                        Some(p) if in_host.contains(p) => Some((p.to_string(), bar)),
+                        Some(_) => None,
+                        None => Some((fallback.clone(), bar)),
+                    }
+                })
+                .unwrap_or((fallback, ChainBar::NoInGraphProducer));
+            starts.insert(n, Boundary::NotALink { producer, bar });
             continue;
         };
         if declared(p) == Some(true) {
@@ -514,28 +501,52 @@ pub fn derive_units(
             );
             continue;
         }
-        if over.contains_key(p) {
-            starts.insert(
-                n,
-                Boundary::AfterOverBudget {
-                    producer: p.to_string(),
-                },
-            );
+        candidates.insert(n);
+    }
+
+    // Walk each chain of candidate links from the node that heads it, growing
+    // one unit at a time.
+    for node in members {
+        let head = node.as_str();
+        if candidates.contains(head) {
             continue;
         }
-        let fan = consumers.get(p).map_or(0, IndexSet::len);
-        if fan >= 2 {
-            starts.insert(
-                n,
-                Boundary::FanOut {
-                    producer: p.to_string(),
-                    consumers: fan,
-                },
-            );
+        let Some(&first) = link_out.get(head) else {
+            continue;
+        };
+        if !candidates.contains(first) {
             continue;
         }
-        if let (Some(a), Some(b)) = (index(n), index(p)) {
-            union(&mut parent, a, b);
+        let mut unit = Growing {
+            sum_ns: costs.and_then(|c| c.node_p50_ns.get(head).copied()),
+            period_ns: head_period_ns(head, graph, costs),
+        };
+        let mut at = head;
+        while let Some(&next) = link_out.get(at) {
+            if !candidates.contains(next) {
+                break;
+            }
+            match merge_verdict(next, at, &unit, graph, profile) {
+                Ok(sum) => {
+                    if let (Some(a), Some(b)) = (index(next), index(at)) {
+                        union(&mut parent, a, b);
+                    }
+                    unit.sum_ns = sum;
+                }
+                Err(boundary) => {
+                    starts.insert(next, boundary);
+                    unit = Growing {
+                        sum_ns: costs.and_then(|c| c.node_p50_ns.get(next).copied()),
+                        period_ns: costs
+                            .and_then(|c| c.edge_rate_mhz.get(&(at.to_string(), next.to_string())))
+                            .copied()
+                            .filter(|r| *r > 0)
+                            .map(|mhz| 1_000_000_000_000 / mhz)
+                            .or(unit.period_ns),
+                    };
+                }
+            }
+            at = next;
         }
     }
 
@@ -549,12 +560,8 @@ pub fn derive_units(
             union(&mut parent, pair[0], pair[1]);
         }
         let r = root(&mut parent, local[0]);
-        block_topics
-            .entry(r)
-            .or_default()
-            .push(coupling.topic.clone());
+        block_topics.entry(r).or_default().push(coupling.topic.clone());
     }
-    // Re-key the topics by final roots (a later coupling may have merged them).
     let mut topics_by_root: IndexMap<usize, Vec<String>> = IndexMap::new();
     for (r, topics) in block_topics {
         let fr = root(&mut parent, r);
@@ -678,6 +685,7 @@ pub fn expand_process_groups(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,17 +696,32 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    /// A hand-built graph: `edges` are trigger edges `producer -> consumer`,
-    /// each consumer's trigger-input count is its in-edge count plus
-    /// `outside` inputs, and `periods` are period sources.
-    fn graph(edges: &[(&str, &str)], periods: &[(&str, u64)], outside: &[&str]) -> UnitGraph {
-        let mut g = UnitGraph::default();
-        for (p, c) in edges {
-            g.trigger_edges.push((p.to_string(), c.to_string()));
-            *g.trigger_inputs.entry(c.to_string()).or_insert(0) += 1;
+    fn verdict(p: &str, c: &str, bar: Option<ChainBar>) -> ConsumerEdgeVerdict {
+        ConsumerEdgeVerdict {
+            topic: format!("/t/{p}/out"),
+            producer: Some(p.to_string()),
+            consumer: c.to_string(),
+            input: "inp".to_string(),
+            bar,
         }
-        for n in outside {
-            *g.trigger_inputs.entry(n.to_string()).or_insert(0) += 1;
+    }
+
+    /// A hand-built graph: `links` are trigger edges the chain predicates
+    /// accept, `barred` trigger edges they refuse (with the bar), `periods`
+    /// the period sources in ms.
+    fn graph(
+        links: &[(&str, &str)],
+        barred: &[(&str, &str, ChainBar)],
+        periods: &[(&str, u64)],
+    ) -> UnitGraph {
+        let mut g = UnitGraph::default();
+        for (p, c) in links {
+            g.trigger_edges.push((p.to_string(), c.to_string()));
+            g.links.push(verdict(p, c, None));
+        }
+        for (p, c, bar) in barred {
+            g.trigger_edges.push((p.to_string(), c.to_string()));
+            g.links.push(verdict(p, c, Some(bar.clone())));
         }
         for (n, ms) in periods {
             g.period_ns.insert(n.to_string(), ms * 1_000_000);
@@ -720,7 +743,14 @@ mod tests {
         }
     }
 
-    fn names(units: &[ExecutorUnit]) -> Vec<Vec<String>> {
+    fn profile(c: &PartitionCosts) -> Option<UnitProfile<'_>> {
+        Some(UnitProfile {
+            costs: c,
+            label: "costs.yaml",
+        })
+    }
+
+    fn nodes(units: &[ExecutorUnit]) -> Vec<Vec<String>> {
         units.iter().map(|u| u.nodes.clone()).collect()
     }
 
@@ -732,138 +762,61 @@ mod tests {
             .map(|(_, b)| b)
     }
 
+    fn chain3() -> UnitGraph {
+        graph(&[("cam", "det"), ("det", "track")], &[], &[("cam", 1)])
+    }
+
+    // ---- K-3: without a profile, every data-triggered node is its own unit.
+
     #[test]
-    fn a_linear_chain_is_one_unit_and_keeps_the_host_name() {
-        let g = graph(&[("cam", "det"), ("det", "track")], &[("cam", 10)], &[]);
-        let units = derive_units("g", &s(&["cam", "det", "track"]), &g, None);
-        assert_eq!(names(&units), [s(&["cam", "det", "track"])]);
+    fn without_a_profile_every_data_triggered_node_is_its_own_unit() {
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &chain3(), None);
+        assert_eq!(nodes(&units), [s(&["cam"]), s(&["det"]), s(&["track"])]);
+        assert_eq!(start_of(&units, "cam"), Some(&Boundary::Source));
+        assert_eq!(
+            start_of(&units, "det"),
+            Some(&Boundary::Unprofiled {
+                producer: "cam".into()
+            })
+        );
+        assert_eq!(
+            start_of(&units, "track"),
+            Some(&Boundary::Unprofiled {
+                producer: "det".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_profiled_chain_under_budget_merges_into_one_unit_named_for_its_host() {
+        let c = costs(&[("cam", 2_000), ("det", 20_000), ("track", 5_000)], &[]);
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &chain3(), profile(&c));
+        assert_eq!(nodes(&units), [s(&["cam", "det", "track"])]);
         assert_eq!(units[0].name, "g");
         assert_eq!(units[0].boundaries, [("cam".to_string(), Boundary::Source)]);
     }
 
     #[test]
-    fn a_fan_out_starts_a_unit_at_every_consumer() {
-        let g = graph(&[("pace", "fast"), ("pace", "slow")], &[("pace", 1)], &[]);
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
-        assert_eq!(names(&units), [s(&["pace"]), s(&["fast"]), s(&["slow"])]);
+    fn a_node_the_profile_does_not_cover_does_not_merge() {
+        let c = costs(&[("cam", 2_000), ("track", 5_000)], &[]);
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &chain3(), profile(&c));
+        assert_eq!(nodes(&units), [s(&["cam"]), s(&["det"]), s(&["track"])]);
         assert_eq!(
-            units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
-            ["g.pace", "g.fast", "g.slow"]
-        );
-        assert_eq!(
-            start_of(&units, "fast"),
-            Some(&Boundary::FanOut {
-                producer: "pace".into(),
-                consumers: 2
+            start_of(&units, "det"),
+            Some(&Boundary::Unprofiled {
+                producer: "cam".into()
             })
         );
-    }
-
-    #[test]
-    fn a_fan_in_starts_a_unit() {
-        let g = graph(
-            &[("a", "b"), ("c", "join"), ("b", "join")],
-            &[("a", 10), ("c", 10)],
-            &[],
-        );
-        let units = derive_units("g", &s(&["a", "b", "c", "join"]), &g, None);
-        assert_eq!(names(&units), [s(&["a", "b"]), s(&["c"]), s(&["join"])]);
-        assert_eq!(
-            start_of(&units, "join"),
-            Some(&Boundary::FanIn { inputs: 2 })
-        );
-    }
-
-    #[test]
-    fn a_consumer_of_another_process_is_a_source() {
-        let g = graph(&[("x", "b"), ("b", "c")], &[], &[]);
-        let units = derive_units("g", &s(&["b", "c"]), &g, None);
-        assert_eq!(names(&units), [s(&["b", "c"])]);
-        assert_eq!(start_of(&units, "b"), Some(&Boundary::Source));
-    }
-
-    #[test]
-    fn an_outside_trigger_beside_an_in_host_one_is_a_fan_in() {
-        let g = graph(&[("a", "b")], &[("a", 10)], &["b"]);
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
-        assert_eq!(names(&units), [s(&["a"]), s(&["b"])]);
-        assert_eq!(start_of(&units, "b"), Some(&Boundary::FanIn { inputs: 2 }));
-    }
-
-    #[test]
-    fn latest_value_edges_never_join_units() {
-        // `b` reads `a` only as a latest-value input: no trigger edge.
-        let g = graph(&[], &[("a", 10), ("b", 10)], &[]);
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
-        assert_eq!(names(&units), [s(&["a"]), s(&["b"])]);
-    }
-
-    #[test]
-    fn isolate_true_gives_a_node_its_own_unit_and_ends_the_chain_after_it() {
-        let mut g = graph(&[("a", "b"), ("b", "c")], &[("a", 10)], &[]);
-        g.isolate.insert("b".into(), true);
-        let units = derive_units("g", &s(&["a", "b", "c"]), &g, None);
-        assert_eq!(names(&units), [s(&["a"]), s(&["b"]), s(&["c"])]);
-        assert_eq!(start_of(&units, "b"), Some(&Boundary::Isolated));
-        assert_eq!(
-            start_of(&units, "c"),
-            Some(&Boundary::AfterIsolated {
-                producer: "b".into()
-            })
-        );
-    }
-
-    #[test]
-    fn isolate_false_joins_a_fan_out_consumer_and_merges_a_fan_in() {
-        let mut g = graph(&[("pace", "fast"), ("pace", "slow")], &[("pace", 1)], &[]);
-        g.isolate.insert("fast".into(), false);
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
-        assert_eq!(names(&units), [s(&["pace", "fast"]), s(&["slow"])]);
-
-        let mut j = graph(
-            &[("a", "join"), ("c", "join")],
-            &[("a", 10), ("c", 10)],
-            &[],
-        );
-        j.isolate.insert("join".into(), false);
-        let units = derive_units("g", &s(&["a", "c", "join"]), &j, None);
-        assert_eq!(names(&units), [s(&["a", "c", "join"])]);
-    }
-
-    #[test]
-    fn a_producer_isolate_true_wins_over_its_consumer_isolate_false() {
-        let mut g = graph(&[("a", "b")], &[("a", 10)], &[]);
-        g.isolate.insert("a".into(), true);
-        g.isolate.insert("b".into(), false);
-        let units = derive_units("g", &s(&["a", "b"]), &g, None);
-        assert_eq!(names(&units), [s(&["a"]), s(&["b"])]);
-        assert_eq!(
-            start_of(&units, "b"),
-            Some(&Boundary::AfterIsolated {
-                producer: "a".into()
-            })
-        );
-    }
-
-    #[test]
-    fn a_block_flow_stays_one_unit_across_a_fan_out() {
-        let mut g = graph(&[("pace", "fast"), ("pace", "slow")], &[("pace", 1)], &[]);
-        g.couplings.push(Coupling {
-            topic: "t".into(),
-            nodes: s(&["pace", "slow"]),
-        });
-        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
-        assert_eq!(names(&units), [s(&["pace", "slow"]), s(&["fast"])]);
-        assert_eq!(units[0].block_topics, s(&["t"]));
     }
 
     /// The budget oracle: a 1 kHz chain `pace -> filt -> slow -> sink` whose
     /// `slow` ticks 50 ms. The expected split is fixed by hand.
-    fn budget_case() -> (UnitGraph, PartitionCosts) {
+    #[test]
+    fn a_merge_over_the_tick_budget_starts_a_unit() {
         let g = graph(
             &[("pace", "filt"), ("filt", "slow"), ("slow", "sink")],
-            &[("pace", 1)],
             &[],
+            &[("pace", 1)],
         );
         let c = costs(
             &[
@@ -878,30 +831,15 @@ mod tests {
                 ("slow", "sink", 20_000),
             ],
         );
-        (g, c)
-    }
-
-    #[test]
-    fn a_node_over_its_tick_budget_is_split_out_with_the_chain_after_it() {
-        let (g, c) = budget_case();
-        let profile = UnitProfile {
-            costs: &c,
-            label: "costs.yaml",
-        };
-        let units = derive_units(
-            "g",
-            &s(&["pace", "filt", "slow", "sink"]),
-            &g,
-            Some(profile),
-        );
+        let units = derive_units("g", &s(&["pace", "filt", "slow", "sink"]), &g, profile(&c));
         assert_eq!(
-            names(&units),
+            nodes(&units),
             [s(&["pace", "filt"]), s(&["slow"]), s(&["sink"])]
         );
         let Some(Boundary::OverBudget(v)) = start_of(&units, "slow") else {
             panic!("slow must start a unit over budget: {units:?}");
         };
-        assert_eq!(v.p50_ns, 50_000_000);
+        assert_eq!(v.unit_ns, 50_022_000);
         assert_eq!(
             v.against,
             BudgetAgainst::Period {
@@ -910,91 +848,172 @@ mod tests {
         );
         assert_eq!(v.budget_ns, 250_000);
         assert_eq!(v.profile, "costs.yaml");
-        assert_eq!(
+        assert!(matches!(
             start_of(&units, "sink"),
-            Some(&Boundary::AfterOverBudget {
-                producer: "slow".into()
-            })
-        );
+            Some(Boundary::OverBudget(_))
+        ));
     }
 
     #[test]
-    fn without_a_profile_the_same_chain_stays_one_unit() {
-        let (g, _) = budget_case();
-        let units = derive_units("g", &s(&["pace", "filt", "slow", "sink"]), &g, None);
-        assert_eq!(names(&units), [s(&["pace", "filt", "slow", "sink"])]);
+    fn the_budget_is_a_quarter_of_the_period_exactly() {
+        let g = graph(&[("src", "mid")], &[], &[("src", 10)]);
+        let under = costs(&[("src", 0), ("mid", 2_499_999)], &[]);
+        let units = derive_units("g", &s(&["src", "mid"]), &g, profile(&under));
+        assert_eq!(nodes(&units), [s(&["src", "mid"])]);
+        let at = costs(&[("src", 0), ("mid", 2_500_000)], &[]);
+        let units = derive_units("g", &s(&["src", "mid"]), &g, profile(&at));
+        assert_eq!(nodes(&units), [s(&["src"]), s(&["mid"])]);
     }
 
     #[test]
-    fn isolate_false_keeps_a_node_over_budget_in_its_chain() {
-        let (mut g, c) = budget_case();
-        g.isolate.insert("slow".into(), false);
-        let profile = UnitProfile {
-            costs: &c,
-            label: "costs.yaml",
-        };
-        let units = derive_units(
-            "g",
-            &s(&["pace", "filt", "slow", "sink"]),
-            &g,
-            Some(profile),
-        );
-        // `slow` is not over budget once it declares isolate: false, so the
-        // chain after it stays whole too.
-        assert_eq!(names(&units), [s(&["pace", "filt", "slow", "sink"])]);
-    }
-
-    #[test]
-    fn a_tight_downstream_deadline_splits_an_upstream_node() {
-        // 10 Hz chain; `mid` ticks 3 ms, under a quarter of 100 ms, but `out`
-        // declares tick_within 10 ms and 3 ms reaches a quarter of that.
-        let mut g = graph(&[("src", "mid"), ("mid", "out")], &[("src", 100)], &[]);
+    fn a_tick_within_deadline_refuses_a_merge_the_period_allows() {
+        // 10 Hz; src + mid + out tick 3.002 ms, under a quarter of 100 ms, but
+        // `out` declares tick_within 10 ms and 3.002 ms reaches a quarter of it.
+        let mut g = graph(&[("src", "mid"), ("mid", "out")], &[], &[("src", 100)]);
         g.tick_within_ns.insert("out".into(), 10_000_000);
         let c = costs(&[("src", 1_000), ("mid", 3_000_000), ("out", 1_000)], &[]);
-        let profile = UnitProfile {
-            costs: &c,
-            label: "p",
-        };
-        let units = derive_units("g", &s(&["src", "mid", "out"]), &g, Some(profile));
-        assert_eq!(names(&units), [s(&["src"]), s(&["mid"]), s(&["out"])]);
-        let Some(Boundary::OverBudget(v)) = start_of(&units, "mid") else {
-            panic!("mid must be over budget: {units:?}");
+        let units = derive_units("g", &s(&["src", "mid", "out"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["src", "mid"]), s(&["out"])]);
+        let Some(Boundary::OverBudget(v)) = start_of(&units, "out") else {
+            panic!("out must be over budget: {units:?}");
         };
         assert_eq!(
             v.against,
             BudgetAgainst::Deadline {
-                node: "out".into(),
                 deadline_ns: 10_000_000
             }
         );
     }
 
+    // ---- Structure: the shared chain predicate's bars.
+
     #[test]
-    fn a_node_under_budget_stays_in_its_chain() {
-        let g = graph(&[("src", "mid")], &[("src", 10)], &[]);
-        // 2.4 ms against a 10 ms period: under a quarter.
-        let c = costs(&[("src", 1_000), ("mid", 2_400_000)], &[]);
-        let profile = UnitProfile {
-            costs: &c,
-            label: "p",
-        };
-        let units = derive_units("g", &s(&["src", "mid"]), &g, Some(profile));
-        assert_eq!(names(&units), [s(&["src", "mid"])]);
-        // 2.5 ms reaches exactly a quarter: split.
-        let c = costs(&[("src", 1_000), ("mid", 2_500_000)], &[]);
-        let profile = UnitProfile {
-            costs: &c,
-            label: "p",
-        };
-        let units = derive_units("g", &s(&["src", "mid"]), &g, Some(profile));
-        assert_eq!(names(&units), [s(&["src"]), s(&["mid"])]);
+    fn an_edge_the_chain_predicate_refuses_starts_a_unit_with_its_bar() {
+        let g = graph(
+            &[],
+            &[
+                ("pace", "fast", ChainBar::FanOut { consumers: 2 }),
+                ("pace", "slow", ChainBar::FanOut { consumers: 2 }),
+            ],
+            &[("pace", 1)],
+        );
+        let c = costs(&[("pace", 1), ("fast", 1), ("slow", 1)], &[]);
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["pace"]), s(&["fast"]), s(&["slow"])]);
+        assert_eq!(
+            units.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            ["g.pace", "g.fast", "g.slow"]
+        );
+        assert_eq!(
+            start_of(&units, "fast"),
+            Some(&Boundary::NotALink {
+                producer: "pace".into(),
+                bar: ChainBar::FanOut { consumers: 2 }
+            })
+        );
+    }
+
+    #[test]
+    fn a_consumer_of_another_process_is_a_source() {
+        let g = graph(&[("x", "b"), ("b", "c")], &[], &[]);
+        let c = costs(&[("b", 1), ("c", 1)], &[("x", "b", 1_000_000)]);
+        let units = derive_units("g", &s(&["b", "c"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["b", "c"])]);
+        assert_eq!(start_of(&units, "b"), Some(&Boundary::Source));
+    }
+
+    #[test]
+    fn a_unit_fed_at_an_unknown_rate_does_not_merge() {
+        // `b` is fed by another process at a rate the profile does not hold.
+        let g = graph(&[("x", "b"), ("b", "c")], &[], &[]);
+        let c = costs(&[("b", 1), ("c", 1)], &[]);
+        let units = derive_units("g", &s(&["b", "c"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["b"]), s(&["c"])]);
+    }
+
+    // ---- Overrides.
+
+    #[test]
+    fn isolate_true_gives_a_node_its_own_unit_and_ends_the_chain_after_it() {
+        let mut g = chain3();
+        g.isolate.insert("det".into(), true);
+        let c = costs(&[("cam", 1), ("det", 1), ("track", 1)], &[]);
+        let units = derive_units("g", &s(&["cam", "det", "track"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["cam"]), s(&["det"]), s(&["track"])]);
+        assert_eq!(start_of(&units, "det"), Some(&Boundary::Isolated));
+        assert_eq!(
+            start_of(&units, "track"),
+            Some(&Boundary::AfterIsolated {
+                producer: "det".into()
+            })
+        );
+    }
+
+    #[test]
+    fn isolate_false_merges_without_a_profile_across_a_fan_out_and_a_fan_in() {
+        let mut g = graph(
+            &[],
+            &[
+                ("pace", "fast", ChainBar::FanOut { consumers: 2 }),
+                ("pace", "slow", ChainBar::FanOut { consumers: 2 }),
+            ],
+            &[("pace", 1)],
+        );
+        g.isolate.insert("fast".into(), false);
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["pace", "fast"]), s(&["slow"])]);
+
+        let join = ChainBar::ConsumerJoin { trigger_edges: 2 };
+        let mut j = graph(
+            &[],
+            &[("a", "join", join.clone()), ("c", "join", join)],
+            &[("a", 10), ("c", 10)],
+        );
+        j.isolate.insert("join".into(), false);
+        let units = derive_units("g", &s(&["a", "c", "join"]), &j, None);
+        assert_eq!(nodes(&units), [s(&["a", "c", "join"])]);
+    }
+
+    #[test]
+    fn a_producer_isolate_true_wins_over_its_consumer_isolate_false() {
+        let mut g = graph(&[("a", "b")], &[], &[("a", 10)]);
+        g.isolate.insert("a".into(), true);
+        g.isolate.insert("b".into(), false);
+        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a"]), s(&["b"])]);
+        assert_eq!(
+            start_of(&units, "b"),
+            Some(&Boundary::AfterIsolated {
+                producer: "a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_block_flow_stays_one_unit() {
+        let mut g = graph(
+            &[],
+            &[
+                ("pace", "fast", ChainBar::FanOut { consumers: 2 }),
+                ("pace", "slow", ChainBar::FanOut { consumers: 2 }),
+            ],
+            &[("pace", 1)],
+        );
+        g.couplings.push(Coupling {
+            topic: "t".into(),
+            nodes: s(&["pace", "slow"]),
+        });
+        let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["pace", "slow"]), s(&["fast"])]);
+        assert_eq!(units[0].block_topics, s(&["t"]));
     }
 
     #[test]
     fn units_keep_member_order() {
-        let g = graph(&[("c", "a")], &[("c", 10)], &[]);
-        let units = derive_units("g", &s(&["a", "b", "c"]), &g, None);
-        assert_eq!(names(&units), [s(&["a", "c"]), s(&["b"])]);
+        let g = graph(&[("c", "a")], &[], &[("c", 10)]);
+        let c = costs(&[("a", 1), ("c", 1)], &[]);
+        let units = derive_units("g", &s(&["a", "b", "c"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["a", "c"]), s(&["b"])]);
     }
 
     fn config_with_groups(groups: &[(&str, &[&str])], order: &[&str]) -> GraphConfig {
@@ -1018,22 +1037,15 @@ mod tests {
 
     #[test]
     fn expansion_replaces_each_group_by_its_units_in_place() {
-        let config = config_with_groups(
-            &[("cam", &["cam"]), ("work", &["pace", "fast", "slow"])],
-            &[],
-        );
-        let g = graph(&[("pace", "fast"), ("pace", "slow")], &[("pace", 1)], &[]);
+        let config = config_with_groups(&[("cam", &["cam"]), ("work", &["cam2", "det"])], &[]);
+        let g = graph(&[("cam2", "det")], &[], &[("cam2", 1)]);
         let plan = expand_process_groups(&config, &g, None, &IndexSet::new());
         let keys: Vec<&str> = plan.groups.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["cam", "work.pace", "work.fast", "work.slow"]);
-        assert_eq!(
-            plan.hosts.get("work.fast").map(String::as_str),
-            Some("work")
-        );
+        assert_eq!(keys, ["cam", "work.cam2", "work.det"]);
+        assert_eq!(plan.hosts.get("work.det").map(String::as_str), Some("work"));
         assert!(!plan.hosts.contains_key("cam"));
         assert!(plan.splits_any());
-        let applied = plan.apply(&config);
-        assert_eq!(applied.process_groups, plan.groups);
+        assert_eq!(plan.apply(&config).process_groups, plan.groups);
     }
 
     #[test]
@@ -1057,7 +1069,7 @@ mod tests {
     #[test]
     fn a_process_per_node_graph_plans_unchanged() {
         let config = config_with_groups(&[("grp_a", &["a"]), ("grp_b", &["b"])], &[]);
-        let g = graph(&[("a", "b")], &[("a", 10)], &[]);
+        let g = graph(&[("a", "b")], &[], &[("a", 10)]);
         let plan = expand_process_groups(&config, &g, None, &IndexSet::new());
         assert_eq!(plan.groups, config.process_groups);
         assert!(plan.hosts.is_empty());

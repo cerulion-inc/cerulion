@@ -130,7 +130,6 @@ fn owned_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -146,7 +145,6 @@ fn owned_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -188,7 +186,6 @@ fn deep_owned_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -204,7 +201,6 @@ fn deep_owned_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -246,7 +242,6 @@ fn very_deep_owned_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -262,7 +257,6 @@ fn very_deep_owned_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

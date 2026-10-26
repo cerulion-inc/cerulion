@@ -249,7 +249,6 @@ fn producer_consumer_parts(
         prefix: "extlf".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -265,7 +264,6 @@ fn producer_consumer_parts(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -322,7 +320,6 @@ fn producer_consumer_graph_with_policy(
 /// A producer-only NodeDef (an `ExtProducer` with output `out`, no consumer).
 fn producer_only_node(id: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -1075,7 +1072,6 @@ fn zero_external_bindings_zero_cost() {
         identity: "ext_zero".to_string(),
         prefix: "extz".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -2889,7 +2885,6 @@ mod eventfd_arm {
             nodes: vec![
                 producer_only_node("producer"),
                 NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,

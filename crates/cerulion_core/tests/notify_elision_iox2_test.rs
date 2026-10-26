@@ -154,7 +154,6 @@ fn build_chain(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -170,7 +169,6 @@ fn build_chain(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, String) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

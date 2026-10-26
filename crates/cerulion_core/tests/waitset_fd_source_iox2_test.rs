@@ -140,7 +140,6 @@ fn fd_ws_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "waitset_fd_source_test".to_string(),
         prefix: "wsfd".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

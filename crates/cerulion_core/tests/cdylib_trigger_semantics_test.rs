@@ -94,7 +94,6 @@ fn build_single(
         identity: format!("cts_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -233,7 +232,6 @@ fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
         identity: format!("cts_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -391,7 +389,6 @@ fn raw_ffi_cdylib_no_policy_emits_default_policy_warn() {
         identity: "cts_warn".to_string(),
         prefix: "ctsw".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -441,7 +438,6 @@ fn run_live_refuses_loaded_host_driven_cdylib() {
         identity: "cts_refuse".to_string(),
         prefix: "ctsr".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

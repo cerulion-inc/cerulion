@@ -109,7 +109,6 @@ fn producer_graph(
         identity: "pump_history_e2e_test".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

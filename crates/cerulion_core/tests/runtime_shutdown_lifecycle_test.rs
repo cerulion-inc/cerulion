@@ -66,7 +66,6 @@ fn build_runtime_with_counters(counters: Arc<LifecycleCounters>, period_ms: u64)
         identity: "shutdown_lifecycle_test".to_string(),
         prefix: "sl_test".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -216,7 +215,6 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
         prefix: "ift".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -232,7 +230,6 @@ fn init_failure_midway_shuts_down_already_initd_nodes() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

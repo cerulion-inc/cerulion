@@ -76,7 +76,6 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("key_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

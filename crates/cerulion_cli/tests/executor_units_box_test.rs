@@ -27,6 +27,11 @@
 //!   leg with `CERULION_UNIT_COLLAPSE_MUTANT` set, which runs the process as
 //!   one level loop again. The SLOW bound must fail: at most half the baseline
 //!   rate.
+//! * `without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it`:
+//!   `pace -> fast -> slow` as one linear chain in one process, no profile.
+//!   Every data-triggered node is a unit of its own, so the SLOW bound holds;
+//!   `the_unprofiled_merge_mutant_is_caught` (`oracle-mutants`) merges the
+//!   chain without a profile and must fail it.
 //! * `a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes`:
 //!   the fan-out and three-rank fixtures recorded with every node in one
 //!   process group, re-executed with `bag play --resim all`, and judged with the
@@ -286,6 +291,89 @@ fn the_unit_collapse_mutant_is_caught() {
         mutant.rate_hz <= base.rate_hz * 0.5,
         "the collapsed process held the fast node less than expected: {:.1} Hz against a {:.1} Hz \
          baseline",
+        mutant.rate_hz,
+        base.rate_hz
+    );
+}
+
+/// Run one leg of the CHAIN shape, all three nodes in one process group and
+/// no profile: `pace -> fast -> slow` is one linear chain, so only the
+/// no-profile rule keeps `slow` off `fast`'s thread.
+fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
+    let ws = read_identity::workspace();
+    let (graph, prefix) = unique_names("units_chain");
+    let nodes = vec![
+        node_def("pace", "ri_pace", &[], &["out", "side"], &[]),
+        node_def("fast", "ri_fast_relay", &[("inp", "pace/out")], &["out"], &[]),
+        node_def(
+            "slow",
+            "ri_sink",
+            &[("inp", "fast/out")],
+            &[],
+            &[
+                ("ri_id", ParamValue::Str("slow".into())),
+                ("ri_sleep_us", ParamValue::UInt(SLOW_SLEEP_US)),
+            ],
+        ),
+    ];
+    let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
+    write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
+    let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+    let samples = dir.path().join("samples");
+    std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
+    let start = Instant::now();
+    let ready = move || start.elapsed() >= BRING_UP;
+    let mut vars: Vec<(&str, &Path)> = vec![(SAMPLES_DIR_ENV, &samples)];
+    vars.extend_from_slice(env);
+    read_identity::run_live(ws, &graph, &[], &vars, dir.path(), &ready, WINDOW);
+    let n = leg_numbers(&samples);
+    eprintln!(
+        "UNITS_NB leg={leg} fires={} rate_hz={:.1} p50_us={} p99_us={}",
+        n.fires,
+        n.rate_hz,
+        n.p50_ns / 1000,
+        n.p99_ns / 1000
+    );
+    n
+}
+
+/// Without a profile every data-triggered node is a unit of its own, so a
+/// slow tail of a linear chain does not hold the fast node at its head.
+#[test]
+#[ignore = "box-only: timing on a quiet Linux host"]
+#[serial]
+fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
+    let base = baseline();
+    let chain = run_chain_leg("chain_slow", &[]);
+    assert!(
+        chain.fires >= MIN_SLOW_SAMPLES,
+        "RI_HARNESS: the chain leg's fast node fired only {} times",
+        chain.fires
+    );
+    if let Err(e) = slow_within_bound(&base, &chain) {
+        panic!("{e}");
+    }
+}
+
+/// The merge mutant joins a link no profile proves safe: the chain is one
+/// unit again, and the bound must fail.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[ignore = "box-only: timing on a quiet Linux host"]
+#[serial]
+fn the_unprofiled_merge_mutant_is_caught() {
+    let base = baseline();
+    let mutant = run_chain_leg(
+        "merge_mutant",
+        &[(
+            cerulion_core::graph::executor::MERGE_MUTANT_ENV,
+            Path::new("1"),
+        )],
+    );
+    assert!(
+        slow_within_bound(&base, &mutant).is_err(),
+        "the oracle passed with an unprofiled chain merged into one unit ({:.1} Hz against \
+         {:.1} Hz)",
         mutant.rate_hz,
         base.rate_hz
     );

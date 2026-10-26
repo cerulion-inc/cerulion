@@ -62,7 +62,6 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
         identity: "ingress_preflight".to_string(),
         prefix: "ingress_preflight".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

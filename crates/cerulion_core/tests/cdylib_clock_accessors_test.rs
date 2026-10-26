@@ -137,7 +137,6 @@ fn clockprobe_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -153,7 +152,6 @@ fn clockprobe_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

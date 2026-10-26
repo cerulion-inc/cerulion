@@ -149,7 +149,6 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
         prefix: format!("roc{}", std::process::id()),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -165,7 +164,6 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

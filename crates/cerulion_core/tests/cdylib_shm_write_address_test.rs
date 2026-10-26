@@ -489,7 +489,6 @@ fn run_probe_graph(probe: Box<dyn NodeEntry>, prefix: &str, steps: usize) -> Run
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -505,7 +504,6 @@ fn run_probe_graph(probe: Box<dyn NodeEntry>, prefix: &str, steps: usize) -> Run
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

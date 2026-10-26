@@ -132,7 +132,6 @@ fn shim_now_ns_tracks_active_clock_and_dispatches_once() {
         identity: "now_shim".to_string(),
         prefix: "now_shim".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -258,7 +257,6 @@ fn shim_now_ns_is_virtual_while_real_ns_is_wall() {
         identity: "realnow".to_string(),
         prefix: "realnow".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -368,7 +366,6 @@ fn ext_sink_config() -> GraphConfig {
         identity: "ext_shim".to_string(),
         prefix: "ext_shim".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

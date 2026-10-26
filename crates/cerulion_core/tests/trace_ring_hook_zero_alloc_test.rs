@@ -220,7 +220,6 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
     let mut nodes: Vec<NodeDef> = src_ids
         .iter()
         .map(|id| NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -237,7 +236,6 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         })
         .collect();
     nodes.push(NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,

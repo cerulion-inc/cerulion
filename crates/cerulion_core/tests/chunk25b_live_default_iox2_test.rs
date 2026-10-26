@@ -136,7 +136,6 @@ fn period_only_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         identity: "c25b_period_only".to_string(),
         prefix: "c25bp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -169,7 +168,6 @@ fn data_only_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<
         identity: "c25b_data_only".to_string(),
         prefix: "c25bd".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

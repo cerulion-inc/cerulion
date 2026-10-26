@@ -161,7 +161,6 @@ fn fusion_graph(
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
             params: Default::default(),
-            fuse: None,
             isolate: None,
             ros2: None,
             id: "fuse".to_string(),

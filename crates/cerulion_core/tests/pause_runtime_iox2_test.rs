@@ -73,7 +73,6 @@ fn ticker_graph(
         identity: format!("{prefix}_ticker"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -138,7 +137,6 @@ fn consumer_graph(
         identity: format!("{prefix}_consumer"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

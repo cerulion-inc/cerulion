@@ -53,7 +53,9 @@ pub mod validation;
 pub(crate) mod waitset;
 
 pub use chain::{
-    census_chains, log_fusion_decision, resolve_fusion, ChainBar, ChainCensus, Colocation,
+    census_chains, consumer_link_bar, linear_chains, linear_links, log_fusion_decision,
+    refuse_branching_producers, resolve_fusion, topic_link_bar, trigger_edge_counts, ChainBar,
+    ChainCensus, Colocation,
     ConsumerEdgeVerdict, ConsumerFireClass, FusedChain, FusionDecision, FusionSource,
     FUSE_CHAINS_ENV, MAX_FUSED_CHAIN_NODES,
 };
@@ -79,7 +81,7 @@ pub use params::{
     ParamType, ParamValue, ParamValues,
 };
 pub use partition::{
-    auto_partition, baseline_process_per_node, block_colocation_seeds,
+    auto_partition, baseline_process_per_node, block_colocation_seeds, chain_colocation_seeds,
     compress_group_level_assignments, creditable_split_block_edges, derive_default_budget_ns,
     derive_fire_targets, derive_fire_targets_from_observations, derive_process_groups,
     harvest_costs, validate_partition, validate_process_groups, AutoPartition, BlockColocationSeed,
@@ -152,6 +154,7 @@ pub fn parse_graph_raw_with_launch_args(
     overrides: &[launch_args::LaunchOverride],
 ) -> TransportResult<(GraphConfig, launch_args::ArgProvenance)> {
     warn_on_legacy_policy_block(yaml);
+    refuse_retired_fuse_key(yaml)?;
     let (mut config, provenance) =
         launch_args::parse_graph_with_launch_args_traced(yaml, overrides)?;
     // The file stem is the graph name, but a string has no
@@ -241,6 +244,43 @@ pub fn adopt_file_stem_identity(config: &mut GraphConfig, stem: &str) {
 /// indentation). Emits a `tracing::warn!` for each occurrence so a graph
 /// written against the old format is told WHERE its trigger policy went — the
 /// parse that follows then refuses the file (`deny_unknown_fields`).
+/// Refuse a node entry that carries the retired `fuse:` key, naming the node
+/// and the key that replaces it.
+///
+/// `fuse: false` ended a fused chain at a node. Nodes in one process now run in
+/// executor units, and `isolate: true` is the key that keeps a node out of its
+/// producer's unit. The document is read as plain YAML first so the refusal can
+/// name the node; a document that is not YAML is left to the typed parse,
+/// which reports it.
+fn refuse_retired_fuse_key(yaml: &str) -> TransportResult<()> {
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Ok(());
+    };
+    let Some(nodes) = doc.get("nodes").and_then(serde_yaml::Value::as_sequence) else {
+        return Ok(());
+    };
+    for node in nodes {
+        let Some(value) = node.get("fuse") else {
+            continue;
+        };
+        let id = node
+            .get("id")
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or("<no id>");
+        let shown = serde_yaml::to_string(value).unwrap_or_default();
+        return Err(crate::error::TransportError::GraphError {
+            reason: format!(
+                "node '{id}' declares `fuse: {}`, a retired key that is refused. Nodes \
+                 that share a process now run in executor units; to keep this node from \
+                 holding the nodes that feed it, write `isolate: true` in its place, or \
+                 delete the key (see `cerulion graph plan`)",
+                shown.trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn warn_on_legacy_policy_block(yaml: &str) {
     for (lineno, raw_line) in yaml.lines().enumerate() {
         let line = raw_line.trim_end();

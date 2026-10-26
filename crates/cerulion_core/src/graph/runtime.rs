@@ -5270,7 +5270,7 @@ impl GraphRuntime {
         // same shape `cerulion graph levels` reports and every run records, so
         // one graph reads the same way from all three.
         {
-            let decision = super::chain::resolve_fusion(&config);
+            let decision = super::chain::resolve_fusion();
             let colocation = if config.has_process_groups() {
                 super::chain::Colocation::ProcessGroups(&config.process_groups)
             } else {
@@ -19501,7 +19501,6 @@ mod tests {
             nodes: nodes
                 .into_iter()
                 .map(|(id, inputs)| NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -19775,7 +19774,6 @@ mod tests {
             topic: None,
         };
         let node = |inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -20144,7 +20142,6 @@ mod tests {
     /// topics match and the infinite-loop backstop fires.
     fn self_loop_node_def() -> crate::graph::config::NodeDef {
         crate::graph::config::NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -20203,7 +20200,6 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_non_self_source_returns_ok() {
         let node_def = crate::graph::config::NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -20226,7 +20222,6 @@ mod tests {
     #[test]
     fn resolve_macro_data_trigger_input_missing_input_errors() {
         let node_def = crate::graph::config::NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

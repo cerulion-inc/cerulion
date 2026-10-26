@@ -248,7 +248,6 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
         prefix: GRAPH_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 ros2: None,
                 params: Default::default(),
@@ -258,7 +257,6 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 ros2: None,
                 params: Default::default(),
@@ -268,7 +266,6 @@ fn build_graph_config(shape: &Shape) -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 ros2: None,
                 params: Default::default(),

@@ -89,7 +89,6 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -99,7 +98,6 @@ fn two_node_config(fuse_inputs: Vec<InputDef>) -> GraphConfig {
                 outputs: vec![out_def("out_a"), out_def("out_b")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

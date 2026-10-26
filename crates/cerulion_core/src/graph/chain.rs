@@ -37,7 +37,6 @@
 //! | the topic has exactly one consumer edge | [`ChainBar::FanOut`] | the second consumer would wait for the first consumer's whole chain, which is a scheduling decision the level structure already makes |
 //! | the producer feeds exactly one fusable edge | [`ChainBar::ProducerBranches`] | the same wait, one level up: a node publishing two single-consumer topics is a fan-out across topics, and a chain ends at a fan-out |
 //! | producer and consumer run in one process | [`ChainBar::SeparateProcesses`] | another address space has no slot to hand over |
-//! | the consumer does not declare `fuse: false` | [`ChainBar::NodeOptedOut`] | the author asked for a chain to end there, which is how a best-effort tail keeps its producer's period out of its own lateness |
 //! | the edge is neither `block` nor `sample(N)` | [`ChainBar::BlockEdge`], [`ChainBar::SampleEdge`] | `block` means "defer the producer while the consumer is at threshold", and a consumer that runs inside the producer's own fire can never reach the threshold, so the declared contract could not be honoured; `sample(N)` states that the consumer reads less often than the producer publishes, and a synchronous call reads in lockstep with it |
 //! | the consumer fires on this frame | [`ChainBar::ConsumerPolicy`] | a period is a clock decision, a sync window is an alignment decision across several edges, and an external node fires from outside the graph |
 //! | this edge is the consumer's only trigger | [`ChainBar::ConsumerJoin`] | a join fires on a set of frames, not on one; the chain ends at it and its inbound edges stay queued |
@@ -234,12 +233,6 @@ pub enum ChainBar {
     ConsumerJoin { trigger_edges: usize },
     /// The consumer declares a producer-side rate cap.
     ConsumerThrottled { throttle_ms: u64 },
-    /// The consumer declares `fuse: false`, so a chain ends at it.
-    ///
-    /// The one bar a graph AUTHOR chooses rather than a rule deriving. It is
-    /// reported like every other, because a census that silently honoured a
-    /// declaration would leave an author unable to check that it took.
-    NodeOptedOut,
     /// One end is involved in a `block` topic and is already fired serially
     /// against the shared outstanding count.
     BlockInvolved { producer: bool, consumer: bool },
@@ -312,7 +305,6 @@ impl ChainBar {
             Self::ConsumerPolicy { .. } => "consumer-policy",
             Self::ConsumerJoin { .. } => "join",
             Self::ConsumerThrottled { .. } => "throttle",
-            Self::NodeOptedOut => "opted-out",
             Self::BlockInvolved { .. } => "block-involved",
             Self::LateContextInput { .. } => "late-context-input",
             Self::LengthCeiling { .. } => "length-ceiling",
@@ -380,10 +372,6 @@ impl std::fmt::Display for ChainBar {
             Self::ConsumerThrottled { throttle_ms } => write!(
                 f,
                 "the consumer declares `throttle_ms = {throttle_ms}`, and a direct call has nowhere to defer to"
-            ),
-            Self::NodeOptedOut => write!(
-                f,
-                "the consumer declares `fuse: false`, so a chain ends at it"
             ),
             Self::BlockInvolved { producer, consumer } => {
                 let who = match (*producer, *consumer) {
@@ -536,6 +524,151 @@ impl ChainCensus {
 /// [`GraphTopology::build`] and
 /// [`build_trigger_edges`](crate::graph::build_trigger_edges) are given.
 /// `levels` must be the levelization the run will execute.
+// ==========================================================================
+// The shared link predicates.
+// ==========================================================================
+//
+// ONE chain analysis serves every reader of chain structure: the fusion
+// census below, the executor-unit derivation (`graph::executor`) and the
+// cost-aware partitioner (`graph::partition`). Each asks these predicates,
+// in its own order and with its own further rules, so the three cannot
+// disagree about what a linear hand-off is.
+
+/// How many trigger edges each node has. A consumer with more than one fires
+/// on a set of frames, which is the join rule.
+pub fn trigger_edge_counts(
+    topology: &GraphTopology,
+    trigger_edges: &TriggerEdges,
+) -> IndexMap<String, usize> {
+    let mut counts: IndexMap<String, usize> = IndexMap::new();
+    for flow in topology.topics() {
+        for consumer in &flow.consumers {
+            if trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
+                *counts.entry(consumer.node_id.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// The TOPIC half of the link predicate: the edge is a trigger edge, its topic
+/// has exactly one in-graph producer and this edge is the topic's only
+/// consumer edge. `None` = the topic is a linear hand-off.
+pub fn topic_link_bar(
+    flow: &TopicFlow,
+    consumer: &ConsumerEdge,
+    trigger_edges: &TriggerEdges,
+) -> Option<ChainBar> {
+    if !trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
+        return Some(ChainBar::LatestValueRead);
+    }
+    match flow.producers.len() {
+        0 => return Some(ChainBar::NoInGraphProducer),
+        1 => {}
+        n => return Some(ChainBar::MultipleProducers { producers: n }),
+    }
+    if flow.sole_consumer().is_none() {
+        return Some(ChainBar::FanOut {
+            consumers: flow.consumers.len(),
+        });
+    }
+    None
+}
+
+/// The CONSUMER half of the link predicate: the consumer fires on the frame
+/// (not on a period, a sync window or an external source) and this is its
+/// only trigger edge. `triggers` is the consumer's count from
+/// [`trigger_edge_counts`]. `None` = the consumer is a linear hand-off.
+pub fn consumer_link_bar(info: Option<&NodeInfo>, triggers: usize) -> Option<ChainBar> {
+    // An absent macro policy is the runtime's Data fallback: the node fires on
+    // any input arrival, which IS "the producer committed a frame" when the
+    // node has exactly one trigger edge. The join rule below is what judges it,
+    // so the fallback is not a separate bar.
+    if let Some(policy) = info.and_then(NodeInfo::policy) {
+        let class = match policy {
+            MacroPolicy::Period { .. } => Some(ConsumerFireClass::Period),
+            MacroPolicy::Sync { .. } => Some(ConsumerFireClass::Sync),
+            MacroPolicy::UnboundedSync => Some(ConsumerFireClass::UnboundedSync),
+            MacroPolicy::External => Some(ConsumerFireClass::External),
+            MacroPolicy::DataTrigger { .. } => None,
+        };
+        if let Some(policy) = class {
+            return Some(ChainBar::ConsumerPolicy { policy });
+        }
+    }
+    if triggers > 1 {
+        return Some(ChainBar::ConsumerJoin {
+            trigger_edges: triggers,
+        });
+    }
+    None
+}
+
+/// Every consumer edge of the graph judged by the shared link predicates
+/// alone: [`topic_link_bar`], [`consumer_link_bar`], then
+/// [`refuse_branching_producers`] over the edges that survive. An edge with no
+/// bar is a LINK: one producer hands each frame to one consumer that fires on
+/// it. Links form disjoint paths, the graph's linear chains, whatever process
+/// their nodes run in.
+pub fn linear_links(
+    entry_infos: &IndexMap<String, NodeInfo>,
+    topology: &GraphTopology,
+    trigger_edges: &TriggerEdges,
+) -> Vec<ConsumerEdgeVerdict> {
+    let counts = trigger_edge_counts(topology, trigger_edges);
+    let mut edges: Vec<ConsumerEdgeVerdict> = Vec::new();
+    for flow in topology.topics() {
+        let sole_producer = flow.sole_producer().map(str::to_string);
+        for consumer in &flow.consumers {
+            let bar = topic_link_bar(flow, consumer, trigger_edges).or_else(|| {
+                consumer_link_bar(
+                    entry_infos.get(&consumer.node_id),
+                    counts.get(consumer.node_id.as_str()).copied().unwrap_or(0),
+                )
+            });
+            edges.push(ConsumerEdgeVerdict {
+                topic: flow.topic.clone(),
+                producer: sole_producer.clone(),
+                consumer: consumer.node_id.clone(),
+                input: consumer.input.clone(),
+                bar,
+            });
+        }
+    }
+    refuse_branching_producers(&mut edges);
+    edges
+}
+
+/// The graph's linear chains: the paths [`linear_links`] forms, each as its
+/// node ids from head to tail, in graph order of their heads. A node on no
+/// link is in no chain.
+pub fn linear_chains(links: &[ConsumerEdgeVerdict]) -> Vec<Vec<String>> {
+    let mut next: IndexMap<&str, &str> = IndexMap::new();
+    let mut fed: IndexSet<&str> = IndexSet::new();
+    for edge in links.iter().filter(|e| e.is_fused()) {
+        if let Some(p) = edge.producer.as_deref() {
+            next.insert(p, edge.consumer.as_str());
+            fed.insert(edge.consumer.as_str());
+        }
+    }
+    let mut chains = Vec::new();
+    for head in next.keys().copied().filter(|p| !fed.contains(p)) {
+        let mut chain = vec![head.to_string()];
+        let mut seen: IndexSet<&str> = IndexSet::new();
+        seen.insert(head);
+        let mut at = head;
+        while let Some(&c) = next.get(at) {
+            if !seen.insert(c) {
+                break;
+            }
+            chain.push(c.to_string());
+            at = c;
+        }
+        chains.push(chain);
+    }
+    chains
+}
+
 pub fn census_chains(
     config: &GraphConfig,
     entry_infos: &IndexMap<String, NodeInfo>,
@@ -567,22 +700,10 @@ pub fn census_chains(
         }
     }
 
-    // How many trigger edges each node has. A consumer with more than one fires
-    // on a set of frames, which is the join rule.
-    let mut trigger_edge_count: IndexMap<String, usize> = IndexMap::new();
-    for flow in topology.topics() {
-        for consumer in &flow.consumers {
-            if trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
-                *trigger_edge_count
-                    .entry(consumer.node_id.clone())
-                    .or_insert(0) += 1;
-            }
-        }
-    }
+    let trigger_edge_count = trigger_edge_counts(topology, trigger_edges);
 
     let cx = EdgeContext {
         entry_infos,
-        node_defs: &node_defs,
         trigger_edges,
         levels,
         colocation,
@@ -623,9 +744,6 @@ pub fn census_chains(
 #[derive(Clone, Copy)]
 struct EdgeContext<'a, 'g> {
     entry_infos: &'a IndexMap<String, NodeInfo>,
-    /// Each native node's graph entry, for the declarations that live in the
-    /// graph rather than in node source.
-    node_defs: &'a IndexMap<&'a str, &'a NodeDef>,
     trigger_edges: &'a TriggerEdges,
     levels: &'a Levels,
     colocation: Colocation<'g>,
@@ -652,26 +770,18 @@ fn per_edge_bar(
 ) -> Option<ChainBar> {
     let EdgeContext {
         entry_infos,
-        node_defs,
         trigger_edges,
         levels,
         colocation,
         block_involved,
         trigger_edge_count,
     } = *cx;
-    if !trigger_edges.is_triggering(&consumer.node_id, &flow.topic) {
-        return Some(ChainBar::LatestValueRead);
+    if let Some(bar) = topic_link_bar(flow, consumer, trigger_edges) {
+        return Some(bar);
     }
-    let producer = match (flow.producers.len(), sole_producer) {
-        (0, _) => return Some(ChainBar::NoInGraphProducer),
-        (1, Some(p)) => p,
-        (n, _) => return Some(ChainBar::MultipleProducers { producers: n }),
+    let Some(producer) = sole_producer else {
+        return Some(ChainBar::NoInGraphProducer);
     };
-    if flow.sole_consumer().is_none() {
-        return Some(ChainBar::FanOut {
-            consumers: flow.consumers.len(),
-        });
-    }
     let Some(producer_level) = levels.level_of(producer) else {
         return Some(ChainBar::LevelUnknown {
             node: producer.to_string(),
@@ -695,44 +805,18 @@ fn per_edge_bar(
             consumer_group: colocation.group_name(&consumer.node_id),
         });
     }
-    // The AUTHOR's own instruction, asked before every rule that derives one:
-    // an author who wrote `fuse: false` wants to be told that is why, not a
-    // reason the edge would have failed anyway. It is reported rather than
-    // silently honoured, because a declaration a census does not echo is one
-    // an author cannot check took effect.
-    if node_defs.get(consumer.node_id.as_str()).map(|n| n.fuse) == Some(Some(false)) {
-        return Some(ChainBar::NodeOptedOut);
-    }
     match consumer.policy {
         BackpressurePolicy::Block => return Some(ChainBar::BlockEdge),
         BackpressurePolicy::Sample(window_ms) => return Some(ChainBar::SampleEdge { window_ms }),
         BackpressurePolicy::DropOldest => {}
     }
     let info = entry_infos.get(&consumer.node_id);
-    // An absent macro policy is the runtime's Data fallback: the node fires on
-    // any input arrival, which IS "the producer committed a frame" when the
-    // node has exactly one trigger edge. The join rule below is what judges it,
-    // so the fallback is not a separate bar.
-    if let Some(policy) = info.and_then(NodeInfo::policy) {
-        let class = match policy {
-            MacroPolicy::Period { .. } => Some(ConsumerFireClass::Period),
-            MacroPolicy::Sync { .. } => Some(ConsumerFireClass::Sync),
-            MacroPolicy::UnboundedSync => Some(ConsumerFireClass::UnboundedSync),
-            MacroPolicy::External => Some(ConsumerFireClass::External),
-            MacroPolicy::DataTrigger { .. } => None,
-        };
-        if let Some(policy) = class {
-            return Some(ChainBar::ConsumerPolicy { policy });
-        }
-    }
     let triggers = trigger_edge_count
         .get(consumer.node_id.as_str())
         .copied()
         .unwrap_or(0);
-    if triggers > 1 {
-        return Some(ChainBar::ConsumerJoin {
-            trigger_edges: triggers,
-        });
+    if let Some(bar) = consumer_link_bar(info, triggers) {
+        return Some(bar);
     }
     // EXACTLY one level, not merely a later one. Asked AFTER the join rule
     // because a derived levelization puts a fan-in consumer below its DEEPEST
@@ -778,7 +862,7 @@ fn per_edge_bar(
 /// Both branches are refused rather than one being picked, because picking one
 /// would need a rule for which, and a chain ending at a fan-out is the rule
 /// already applied one level down.
-fn refuse_branching_producers(edges: &mut [ConsumerEdgeVerdict]) {
+pub fn refuse_branching_producers(edges: &mut [ConsumerEdgeVerdict]) {
     // Counted over the SURVIVING edges only: a second output whose consumer
     // reads it as a latest value, or across a process boundary, is no branch,
     // and counting it would cost a chain for nothing.
@@ -1005,7 +1089,7 @@ impl FusionSource {
     }
 }
 
-/// Whether this graph asks for fused chains, and which nodes opted out.
+/// Whether this graph asks for fused chains.
 ///
 /// Resolved ONCE per graph build and threaded to every consumer, so the
 /// analysis pass and any later wiring pass cannot drift: two reads of the
@@ -1017,7 +1101,6 @@ impl FusionSource {
 pub struct FusionDecision {
     enabled: bool,
     source: FusionSource,
-    opted_out: IndexSet<String>,
 }
 
 impl FusionDecision {
@@ -1031,22 +1114,6 @@ impl FusionDecision {
         self.source
     }
 
-    /// The nodes that declared `fuse: false`, in graph order.
-    ///
-    /// A chain ENDS at such a node: it is never a fused consumer, and it may
-    /// still head a chain of its own, exactly like a node the census refuses
-    /// for any other reason.
-    pub fn opted_out(&self) -> &IndexSet<String> {
-        &self.opted_out
-    }
-
-    /// Whether this node may be a fused consumer.
-    ///
-    /// False when the graph asks for no fusion at all, and false for a node
-    /// that opted out.
-    pub fn may_fuse(&self, node_id: &str) -> bool {
-        self.enabled && !self.opted_out.contains(node_id)
-    }
 }
 
 /// Resolve the fusion decision for one graph build.
@@ -1061,16 +1128,15 @@ impl FusionDecision {
 ///    that is neither, which also warns once so a typo cannot quietly select
 ///    an arm nobody chose.
 ///
-/// What a GRAPH declares is narrower and per node: `fuse: false` on a node
-/// entry ends a chain there, whatever arm is in force. That is a statement
-/// about one node's role in one deployment, which is a topology fact and
-/// belongs in the graph; a graph-wide fusion switch would not be.
+/// What a GRAPH declares is narrower and per node: `isolate: true` on a node
+/// entry gives it an executor unit of its own, and a fused chain never leaves
+/// a unit. A graph-wide fusion switch is not a graph's to declare.
 ///
 /// Read FRESH once per build, with no static cache, matching the
 /// drain-discipline and notify-elision seams: one read, one value, threaded to
 /// every consumer, and a test may A/B the two paths under an environment
 /// guard. It costs nothing after the build, because nothing reads it again.
-pub fn resolve_fusion(config: &GraphConfig) -> FusionDecision {
+pub fn resolve_fusion() -> FusionDecision {
     let (enabled, source) = match std::env::var(FUSE_CHAINS_ENV).as_deref() {
         Ok("0") => (false, FusionSource::EnvironmentOff),
         Ok("1") => (true, FusionSource::EnvironmentOn),
@@ -1085,21 +1151,7 @@ pub fn resolve_fusion(config: &GraphConfig) -> FusionDecision {
         }
     };
 
-    // Collected whatever the decision is, so the build log can name a node
-    // that opted out of something nothing was asking for anyway: an opt-out
-    // that reads as having no effect is how a graph ends up with one nobody
-    // notices when the default changes.
-    let opted_out: IndexSet<String> = config
-        .native_nodes()
-        .filter(|n| n.fuse == Some(false))
-        .map(|n| n.id.clone())
-        .collect();
-
-    FusionDecision {
-        enabled,
-        source,
-        opted_out,
-    }
+    FusionDecision { enabled, source }
 }
 
 /// The behaviour an unset seam gets.
@@ -1127,7 +1179,6 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
     tracing::info!(
         enabled = decision.enabled(),
         decided_by = decision.source().label(),
-        opted_out = decision.opted_out().len(),
         "chain fusion: the decision is resolved; no execution path consumes it yet"
     );
     tracing::info!(
@@ -1143,14 +1194,6 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
             reason = label,
             edges = count,
             "chain fusion: consumer edges that keep the queued path"
-        );
-    }
-    for node in decision.opted_out() {
-        tracing::info!(
-            node = %node,
-            "chain fusion: this node declares `fuse: false`, so a chain ends at it; its \
-             inbound edge is counted above, under `opted-out` unless an earlier rule \
-             already refused it"
         );
     }
 }
@@ -1171,14 +1214,40 @@ mod fusion_resolution_tests {
         }
     }
 
-    /// A two-node graph whose node keys the arms vary.
-    fn graph(node_keys: &str) -> GraphConfig {
+    /// A two-node graph whose sink carries `node_keys`.
+    fn graph(node_keys: &str) -> crate::error::TransportResult<GraphConfig> {
         let yaml = format!(
             "prefix: t\nnodes:\n  - id: src\n    type: src\n    outputs:\n      \
              - name: out\n        schema: std_msgs/Int32\n  - id: sink\n    type: sink\n\
              {node_keys}    inputs:\n      - name: inp\n        source: src/out\n"
         );
-        parse_graph_raw(&yaml).expect("the fixture graph must parse")
+        parse_graph_raw(&yaml)
+    }
+
+    /// The retired `fuse:` key is refused at load whatever its value, by name,
+    /// naming the node and the `isolate:` key that replaces it; the same graph
+    /// with `isolate: true` in its place parses.
+    #[test]
+    fn the_retired_fuse_key_is_refused_by_name_and_points_to_isolate() {
+        for value in ["false", "true"] {
+            let err = graph(&format!("    fuse: {value}\n"))
+                .expect_err("a node carrying `fuse:` must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("`fuse: {value}`"))
+                    && text.contains("'sink'")
+                    && text.contains("isolate: true"),
+                "the refusal must name the key, its value, the node and the replacement; got: {text}"
+            );
+        }
+        let config = graph("    isolate: true\n").expect("`isolate: true` parses");
+        assert_eq!(
+            config.nodes.iter().find(|n| n.id == "sink").and_then(|n| n.isolate),
+            Some(true)
+        );
+        // Anti-tautology: the same graph without the key parses, so the
+        // refusal above is the key's and not the fixture's.
+        graph("").expect("the fixture graph parses without the key");
     }
 
     /// The seam selects the arm, and an unset variable is the built-in
@@ -1187,22 +1256,21 @@ mod fusion_resolution_tests {
     #[serial]
     fn the_seam_selects_the_arm_and_unset_is_the_built_in_behaviour() {
         let _g = FuseEnvGuard;
-        let g = graph("");
 
         std::env::remove_var(FUSE_CHAINS_ENV);
-        let unset = resolve_fusion(&g);
+        let unset = resolve_fusion();
         assert_eq!(unset.enabled(), FUSE_CHAINS_DEFAULT);
         assert_eq!(unset.source(), FusionSource::BuiltInDefault);
 
         std::env::set_var(FUSE_CHAINS_ENV, "1");
-        let on = resolve_fusion(&g);
+        let on = resolve_fusion();
         assert!(on.enabled(), "\"1\" asks for fusion");
         assert_eq!(on.source(), FusionSource::EnvironmentOn);
 
         // ANTI-TAUTOLOGY: the other arm, so the one above cannot pass against
         // a resolver that always answers true.
         std::env::set_var(FUSE_CHAINS_ENV, "0");
-        let off = resolve_fusion(&g);
+        let off = resolve_fusion();
         assert!(!off.enabled(), "\"0\" refuses fusion");
         assert_eq!(off.source(), FusionSource::EnvironmentOff);
     }
@@ -1217,12 +1285,11 @@ mod fusion_resolution_tests {
     #[serial]
     fn an_unrecognized_value_leaves_the_built_in_behaviour_in_force() {
         let _g = FuseEnvGuard;
-        let g = graph("");
         for value in [
             "", "yes", "true", "on", "off", "0 ", " 0", "00", "01", "O", "2", "-1",
         ] {
             std::env::set_var(FUSE_CHAINS_ENV, value);
-            let d = resolve_fusion(&g);
+            let d = resolve_fusion();
             assert_eq!(
                 d.enabled(),
                 FUSE_CHAINS_DEFAULT,
@@ -1230,46 +1297,6 @@ mod fusion_resolution_tests {
             );
             assert_eq!(d.source(), FusionSource::BuiltInDefault, "value {value:?}");
         }
-    }
-
-    /// `fuse: false` names the node in the decision whatever arm is in force,
-    /// and `may_fuse` refuses it.
-    ///
-    /// Collected even when fusion is off so a build log can name an opt-out
-    /// that currently changes nothing: an opt-out nobody can see is one nobody
-    /// notices when the behaviour changes.
-    #[test]
-    #[serial]
-    fn a_node_opt_out_is_recorded_whatever_arm_is_in_force() {
-        let _g = FuseEnvGuard;
-
-        std::env::set_var(FUSE_CHAINS_ENV, "1");
-        let on = resolve_fusion(&graph("    fuse: false\n"));
-        assert!(on.enabled());
-        assert_eq!(
-            on.opted_out().iter().cloned().collect::<Vec<_>>(),
-            vec!["sink".to_string()]
-        );
-        assert!(!on.may_fuse("sink"), "an opted-out node may not be fused");
-        assert!(on.may_fuse("src"), "every other node may");
-
-        // `true` means the same as absent: a graph may state the default
-        // without that reading as a request for something different.
-        let stated = resolve_fusion(&graph("    fuse: true\n"));
-        assert!(stated.opted_out().is_empty());
-        assert!(stated.may_fuse("sink"));
-
-        // With fusion off, the opt-out is still RECORDED and `may_fuse` is
-        // false for every node, including ones that never opted out.
-        std::env::set_var(FUSE_CHAINS_ENV, "0");
-        let off = resolve_fusion(&graph("    fuse: false\n"));
-        assert!(!off.enabled());
-        assert_eq!(
-            off.opted_out().iter().cloned().collect::<Vec<_>>(),
-            vec!["sink".to_string()]
-        );
-        assert!(!off.may_fuse("sink"));
-        assert!(!off.may_fuse("src"));
     }
 
     /// A misspelled node key is a loud parse error, never a silently dropped

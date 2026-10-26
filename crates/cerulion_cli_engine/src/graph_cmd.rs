@@ -2113,7 +2113,6 @@ pub fn build_node_def(
         .collect();
 
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -5355,7 +5354,6 @@ mod open_file_limit_verdict_tests {
     /// per chain.
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -6215,6 +6213,13 @@ pub fn graph_run(
     let state_arm = crate::state_arm_attach::state_arm_tag_for_process(Some(run_id));
     #[cfg(not(unix))]
     let state_arm: Option<(String, crate::state_arm_attach::ArmTagSource)> = None;
+    // The executor units this run's processes split into, so the recorded
+    // census judges every edge against the threads it will run on: a fused
+    // chain never leaves a unit.
+    #[cfg(unix)]
+    let unit_groups: Option<indexmap::IndexMap<String, Vec<String>>> = executes_process_groups
+        .then(|| run_unit_groups(workspace_root, &config, execution_mode))
+        .flatten();
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
@@ -6230,10 +6235,14 @@ pub fn graph_run(
                     chains: run_chain_summary(
                         workspace_root,
                         &config,
-                        if executes_process_groups {
-                            cerulion_core::graph::Colocation::ProcessGroups(&config.process_groups)
-                        } else {
-                            cerulion_core::graph::Colocation::SingleProcess
+                        match (executes_process_groups, unit_groups.as_ref()) {
+                            (true, Some(units)) => {
+                                cerulion_core::graph::Colocation::ProcessGroups(units)
+                            }
+                            (true, None) => cerulion_core::graph::Colocation::ProcessGroups(
+                                &config.process_groups,
+                            ),
+                            (false, _) => cerulion_core::graph::Colocation::SingleProcess,
                         },
                     ),
                     run_id,
@@ -10620,6 +10629,45 @@ fn single_process_hosts_units(
     Ok(true)
 }
 
+/// The executor-unit groups a run of `config` executes, from the nodes' source
+/// declarations and the graph's profile; `None` (with a warn) when the source
+/// cannot be read, which the census reports on its own.
+fn run_unit_groups(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    execution_mode: crate::multiprocess::ExecutionMode,
+) -> Option<indexmap::IndexMap<String, Vec<String>>> {
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        config,
+        "a run records the chain census of its executor units",
+    )
+    .ok()?;
+    let profile = load_unit_profile(workspace_root, config.identity());
+    match crate::multiprocess::plan_executor_units(
+        config,
+        &entry_infos,
+        execution_mode,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    ) {
+        Ok(units) => Some(units.plan.groups),
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "this run's executor units could not be derived for its recorded chain census; \
+                 the census is judged against the process groups instead"
+            );
+            None
+        }
+    }
+}
+
 /// The graph's profile for the executor tick budget: the cost snapshot at
 /// [`default_artifact_path`], when one is present and usable.
 fn load_unit_profile(
@@ -13329,7 +13377,7 @@ pub(crate) fn render_unit_plan(
         "  tick budget: {}",
         match profile {
             Some(label) => format!("from profile {label}"),
-            None => "no profile; structure only".to_string(),
+            None => "no profile, so no chain merges: every data-triggered node is a unit of its own".to_string(),
         }
     );
     let whole: indexmap::IndexMap<&str, &str> = units
@@ -25477,7 +25525,6 @@ nodes:
             prefix: "rr".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -25509,7 +25556,6 @@ nodes:
                     ],
                 },
                 NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -25833,7 +25879,6 @@ nodes:
             identity: "rec_cfg_pin".to_string(),
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -25912,7 +25957,6 @@ nodes:
             identity: "rec_cfg_mp_pin".to_string(),
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -25996,7 +26040,6 @@ nodes:
             identity: "rec_cfg_fr_pin".to_string(),
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -29080,7 +29123,6 @@ nodes:
             identity: "vext".to_string(),
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -29150,7 +29192,6 @@ nodes:
             identity: "vok".to_string(),
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -33526,7 +33567,6 @@ network:
             prefix: "p".to_string(),
             nodes: (0..n)
                 .map(|i| NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -37709,7 +37749,6 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             identity: "period".to_string(),
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -37769,7 +37808,6 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_multi_test".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -37785,7 +37823,6 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                     }],
                 },
                 NodeDef {
-                    fuse: None,
                     isolate: None,
                     params: Default::default(),
                     ros2: None,
@@ -40834,7 +40871,6 @@ mod worker_tests {
         }
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -42638,7 +42674,6 @@ mod supervisor_tests {
         cfg.nodes = ids
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

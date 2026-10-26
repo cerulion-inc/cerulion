@@ -145,7 +145,6 @@ fn recon_graph(prefix: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -161,7 +160,6 @@ fn recon_graph(prefix: &str) -> GraphConfig {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

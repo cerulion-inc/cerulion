@@ -69,7 +69,6 @@ fn graph_config(node_id: &str) -> GraphConfig {
         identity: format!("b_{node_id}"),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -331,7 +330,6 @@ fn validator_inert_when_macro_emits_data_trigger() {
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -347,7 +345,6 @@ fn validator_inert_when_macro_emits_data_trigger() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

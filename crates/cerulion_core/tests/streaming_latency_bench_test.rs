@@ -263,7 +263,6 @@ fn chain_graph(
         prefix: "sb".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -276,7 +275,6 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

@@ -192,7 +192,6 @@ fn build_three_axis_graph() -> GraphRuntime {
         prefix: "precreate".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -202,7 +201,6 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![out("a"), out("b"), out("c")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -212,7 +210,6 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -222,7 +219,6 @@ fn build_three_axis_graph() -> GraphRuntime {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

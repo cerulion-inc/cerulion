@@ -77,7 +77,6 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "tbs".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -93,7 +92,6 @@ fn depth32_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -419,7 +417,6 @@ fn default_opener_attaches_to_low_depth_topic() {
         prefix: "tbsl".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -435,7 +432,6 @@ fn default_opener_attaches_to_low_depth_topic() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -616,7 +612,6 @@ fn history_above_input_depth_warns_at_build() {
         prefix: "tbsh".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -632,7 +627,6 @@ fn history_above_input_depth_warns_at_build() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -645,7 +639,6 @@ fn history_above_input_depth_warns_at_build() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -913,7 +906,6 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
         prefix: "tbst".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -929,7 +921,6 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -942,7 +933,6 @@ fn trigger_drain_counts_toward_subscriber_provisioning() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1103,7 +1093,6 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
         prefix: "mxt".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1119,7 +1108,6 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1132,7 +1120,6 @@ fn mixed_eligibility_topic_provisions_both_subscriber_and_listener_budgets() {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

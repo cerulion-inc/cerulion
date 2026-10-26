@@ -92,7 +92,6 @@ fn graph_config(node_id: &str) -> GraphConfig {
         identity: format!("warn_{node_id}"),
         prefix: TEST_PREFIX.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

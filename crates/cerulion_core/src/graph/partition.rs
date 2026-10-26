@@ -1437,6 +1437,21 @@ pub fn auto_partition(
         );
     }
 
+    // Keep every linear chain in one group, after the `block` seeds and
+    // before the greedy loop, so a chain the loop would split is already one
+    // group the loop treats as asking for nothing.
+    seed_linear_chains(
+        &mut uf,
+        &chain_colocation_seeds(entry_infos, &topo, trigger_edges),
+        &node_ids,
+        &id_to_idx,
+        config,
+        entry_infos,
+        trigger_edges,
+        &topo,
+        &global_levels,
+    )?;
+
     let mut fusions: Vec<FusionRecord> = Vec::new();
     let mut rejections: Vec<FusionRejection> = Vec::new();
     let reject = |rejections: &mut Vec<FusionRejection>,
@@ -1556,6 +1571,82 @@ pub fn auto_partition(
         fusions,
         rejections,
     })
+}
+
+/// The linear chains the cost-aware partitioner keeps in one group: every path
+/// of chain links ([`crate::graph::chain::linear_links`], the predicates the
+/// fusion census and the executor units share), head first, each with at least
+/// two nodes.
+pub fn chain_colocation_seeds(
+    entry_infos: &IndexMap<String, NodeInfo>,
+    topo: &GraphTopology,
+    trigger_edges: &TriggerEdges,
+) -> Vec<Vec<String>> {
+    crate::graph::chain::linear_chains(&crate::graph::chain::linear_links(
+        entry_infos,
+        topo,
+        trigger_edges,
+    ))
+}
+
+/// Union every chain's members into one group when the merged group is one a
+/// worker can run (the same re-levelization and contiguity check every
+/// candidate fusion passes); a chain whose group would not pass stays split,
+/// with a warn naming it. A chain is kept whole whatever the compute budget:
+/// inside the process the executor units split it again where the profile
+/// says a merge is unsafe, so the budget is the units' to apply.
+#[allow(clippy::too_many_arguments)]
+fn seed_linear_chains(
+    uf: &mut UnionFind,
+    chains: &[Vec<String>],
+    node_ids: &[&str],
+    id_to_idx: &HashMap<&str, usize>,
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, NodeInfo>,
+    trigger_edges: &TriggerEdges,
+    topo: &GraphTopology,
+    global_levels: &Levels,
+) -> TransportResult<()> {
+    let n = node_ids.len();
+    for chain in chains {
+        let members: Vec<usize> = chain
+            .iter()
+            .filter_map(|id| id_to_idx.get(id.as_str()).copied())
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        let roots: HashSet<usize> = members.iter().map(|&i| uf.find(i)).collect();
+        if roots.len() == 1 {
+            continue;
+        }
+        let merged: Vec<usize> = (0..n).filter(|&i| roots.contains(&uf.find(i))).collect();
+        let member_ids: Vec<&str> = merged.iter().map(|&i| node_ids[i]).collect();
+        match check_group(
+            &member_ids,
+            config,
+            entry_infos,
+            trigger_edges,
+            topo,
+            global_levels,
+        )? {
+            GroupCheck::Valid => {
+                for pair in members.windows(2) {
+                    uf.union(pair[0], pair[1]);
+                }
+            }
+            GroupCheck::Bridged { .. } | GroupCheck::NonContiguous { .. } => {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    chain = %chain.join(" -> "),
+                    "a linear chain cannot share one process group: the merged group would not \
+                     re-levelize to the levels it owns, so the chain stays split across \
+                     processes"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The process-per-node BASELINE grouping — every node in its
@@ -3242,7 +3333,6 @@ mod block_colocation_tests {
 
     fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
         NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -3413,6 +3503,65 @@ mod block_colocation_tests {
                 ("grp_c".to_string(), vec!["c".to_string()]),
             ]
         );
+    }
+
+    /// The partitioner never splits a linear chain across groups: a chain
+    /// whose edges the greedy loop would refuse (rate 0, over budget) is one
+    /// group, and a fan-out sibling off the chain keeps its own.
+    #[test]
+    fn a_linear_chain_is_never_split_across_groups() {
+        let config = config_of(vec![
+            node("src", vec![], vec![out("a"), out("b")]),
+            node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
+            node("tail", vec![inp("inp", "mid/m")], vec![]),
+            node("side", vec![inp("inp", "src/b")], vec![]),
+        ]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["mid", "tail", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![meta("inp", true, BackpressurePolicy::DropOldest)], vec![]),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("mid", "/p/src/a");
+        edges.insert("tail", "/p/mid/m");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "mid", "tail", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            // Rate 0 on every edge: the greedy loop fuses nothing on its own.
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let out = auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1)
+            .expect("derive");
+        let group_of = |id: &str| {
+            out.groups
+                .iter()
+                .find(|(_, members)| members.iter().any(|m| m == id))
+                .map(|(g, _)| g.clone())
+                .expect("every node is in a group")
+        };
+        // `src` fans out to `mid` and `side`, so the chain is `mid -> tail`.
+        let chains = chain_colocation_seeds(&infos, &GraphTopology::build(&config, &infos).unwrap(), &edges);
+        assert_eq!(chains, vec![vec!["mid".to_string(), "tail".to_string()]]);
+        assert_eq!(group_of("mid"), group_of("tail"), "the chain must share a group");
+        assert_ne!(group_of("mid"), group_of("side"), "the fan-out sibling is no chain member");
+        assert_ne!(group_of("src"), group_of("mid"), "a fan-out edge is no link");
+        assert!(
+            out.fusions.is_empty() && out.rejections.iter().all(|r| r.producer != "mid"),
+            "the chain is a seed, never a candidate: {:?}",
+            out.rejections
+        );
+        // Every chain the shared analysis finds lies inside one group.
+        for chain in &chains {
+            let g = group_of(&chain[0]);
+            assert!(chain.iter().all(|n| group_of(n) == g), "chain {chain:?} split");
+        }
     }
 
     /// The budget gate guards CANDIDATE fusions, and a seed is not a candidate

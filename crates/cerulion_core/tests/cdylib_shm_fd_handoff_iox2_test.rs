@@ -102,7 +102,6 @@ fn run_and_shut_down_cdylib_graph(prefix: &str) -> Arc<cerulion_core::TransportM
         );
         nodes.push(NodeDef {
             params: Default::default(),
-            fuse: None,
             isolate: None,
             ros2: None,
             id,

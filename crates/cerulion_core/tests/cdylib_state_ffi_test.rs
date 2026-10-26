@@ -271,7 +271,6 @@ fn probe_graph(prefix: &str) -> GraphConfig {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -287,7 +286,6 @@ fn probe_graph(prefix: &str) -> GraphConfig {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1544,7 +1542,6 @@ fn uncovered_graph(prefix: &str) -> GraphConfig {
         identity: "d6_uncovered".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

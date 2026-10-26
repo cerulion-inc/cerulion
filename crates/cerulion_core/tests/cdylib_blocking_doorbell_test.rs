@@ -212,7 +212,6 @@ fn build_blocking_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Atom
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -222,7 +221,6 @@ fn build_blocking_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Atom
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

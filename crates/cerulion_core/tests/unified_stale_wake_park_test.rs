@@ -183,7 +183,6 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
         prefix: "usw".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -199,7 +198,6 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

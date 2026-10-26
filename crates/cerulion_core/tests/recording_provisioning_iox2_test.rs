@@ -81,7 +81,6 @@ fn producer_graph(
         identity: format!("rec_prov_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -511,7 +510,6 @@ fn discard_arm(prefix: &str, steps: usize) -> Vec<(u32, f64)> {
         identity: format!("rec_prov_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

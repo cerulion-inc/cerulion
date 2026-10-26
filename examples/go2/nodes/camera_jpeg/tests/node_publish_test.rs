@@ -196,7 +196,6 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
         identity: format!("cam_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

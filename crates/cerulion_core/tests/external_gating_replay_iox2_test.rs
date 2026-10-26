@@ -249,7 +249,6 @@ impl SeqRecvConsumer {
 /// A producer-only NodeDef (`out`, no consumer).
 fn producer_only_node(id: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -286,7 +285,6 @@ fn producer_consumer_graph(
         nodes: vec![
             producer_only_node("producer"),
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

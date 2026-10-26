@@ -80,7 +80,6 @@ fn ext_time_config() -> GraphConfig {
         identity: "ext_time".to_string(),
         prefix: "ext_time".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -203,7 +202,6 @@ fn publish_stamp_follows_active_virtual_clock_not_wall() {
         identity: "stamp".to_string(),
         prefix: "stamp".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

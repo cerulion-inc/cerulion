@@ -115,7 +115,6 @@ impl Sink {
 
 fn writer_def(id: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,
@@ -147,7 +146,6 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
             writer_def("writer_a"),
             writer_def("writer_b"),
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -166,7 +164,6 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

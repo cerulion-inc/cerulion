@@ -313,7 +313,6 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
         prefix: "p".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -329,7 +328,6 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -342,7 +340,6 @@ fn demo_graph() -> (GraphConfig, IndexMap<String, NodeInfo>, TriggerEdges) {
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1505,7 +1502,6 @@ fn inp(name: &str, source: &str) -> InputDef {
 
 fn node(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
-        fuse: None,
         isolate: None,
         params: Default::default(),
         ros2: None,

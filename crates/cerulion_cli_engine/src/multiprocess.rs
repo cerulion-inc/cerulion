@@ -2943,7 +2943,6 @@ mod tests {
     /// One node: id, (input_name, source) pairs, output names.
     fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
         NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -4643,7 +4642,6 @@ mod tests {
             identity: "abs".to_string(),
             prefix: PREFIX.to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -5764,7 +5762,6 @@ mod tests {
     /// publish the SAME topic).
     fn abs_node(id: &str, inputs: &[(&str, &str)], out_topic: Option<&str>) -> NodeDef {
         NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

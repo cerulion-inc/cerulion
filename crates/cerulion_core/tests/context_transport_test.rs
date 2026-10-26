@@ -68,7 +68,6 @@ fn test_runtime_built_context_carries_the_build_manager() {
         identity: "ctx726_carry".to_string(),
         prefix: "ctx726".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

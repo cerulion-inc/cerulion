@@ -171,7 +171,6 @@ fn context_a_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         "mlb_a",
         "mlba",
         vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,
@@ -195,7 +194,6 @@ fn context_b_graph(
         "mlb_b",
         "mlbb",
         vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

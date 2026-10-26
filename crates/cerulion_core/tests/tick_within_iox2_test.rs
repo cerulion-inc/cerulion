@@ -79,7 +79,6 @@ fn tick_graph(node_type: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
         identity: "tick_within_test".to_string(),
         prefix: "tw".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

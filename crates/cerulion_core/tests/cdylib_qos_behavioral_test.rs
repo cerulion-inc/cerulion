@@ -235,7 +235,6 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         prefix: "cqbq".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -245,7 +244,6 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -258,7 +256,6 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("cmd_out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -487,7 +484,6 @@ fn run_sample(steps: usize) -> (u64, u64) {
         prefix: "cqbs".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -497,7 +493,6 @@ fn run_sample(steps: usize) -> (u64, u64) {
                 outputs: vec![out_def("out"), out_def("aux_out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

@@ -159,7 +159,6 @@ fn snap_graph(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -175,7 +174,6 @@ fn snap_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -344,7 +342,6 @@ fn fire_gating_skips_snapshot_on_non_fire_steps() {
         prefix: "snapfg".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -360,7 +357,6 @@ fn fire_gating_skips_snapshot_on_non_fire_steps() {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -547,7 +543,6 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -563,7 +558,6 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
                 }],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -580,7 +574,6 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
             },
             // Consumer declared LAST → ticks after both producers within level 0.
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -793,7 +786,6 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
         nodes: vec![
             // level 0
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -804,7 +796,6 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
             },
             // level 1
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -817,7 +808,6 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -831,7 +821,6 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
             },
             // level 2: qsib declared BEFORE cons → qsib ticks first within level 2
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -844,7 +833,6 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1020,7 +1008,6 @@ fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1030,7 +1017,6 @@ fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1153,7 +1139,6 @@ fn flat_and_level_executors_produce_byte_identical_traces() {
         let nodes: Vec<NodeDef> = IDS
             .iter()
             .map(|id| NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1305,7 +1290,6 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
         nodes: vec![
             // level 0
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1316,7 +1300,6 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
             },
             // level 1
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1329,7 +1312,6 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1343,7 +1325,6 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
             },
             // level 2: qsib declared BEFORE scons → qsib ticks first within level 2
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -1356,7 +1337,6 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

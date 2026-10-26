@@ -555,7 +555,6 @@ mod runtime_corners {
             identity: "adv".to_string(),
             prefix: "adv".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,

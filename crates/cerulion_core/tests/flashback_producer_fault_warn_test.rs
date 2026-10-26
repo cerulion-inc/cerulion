@@ -180,7 +180,6 @@ fn build_panicking_runtime(prefix: &str, panic_from: u64) -> GraphRuntime {
         identity: "flashback_fault".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
             isolate: None,
             params: Default::default(),
             ros2: None,

@@ -413,7 +413,6 @@ fn run_split_pins(barrier_tag: &str, park_on: bool) {
             "sink_ctx",
             "bpws",
             vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -447,7 +446,6 @@ fn run_split_pins(barrier_tag: &str, park_on: bool) {
             "relay_ctx",
             "bpwr",
             vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -477,7 +475,6 @@ fn run_split_pins(barrier_tag: &str, park_on: bool) {
             "ticker_ctx",
             "bpwt",
             vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -652,7 +649,6 @@ fn solo_context_park_reports_zero_barrier_wakes() {
             "solo_ctx",
             "bpwsolo",
             vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
@@ -753,7 +749,6 @@ fn solo_context_park_takes_wake_word_kernel_block() {
             "wword_ctx",
             "bpwword",
             vec![NodeDef {
-                fuse: None,
                 isolate: None,
                 params: Default::default(),
                 ros2: None,
