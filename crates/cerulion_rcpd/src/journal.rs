@@ -14,8 +14,9 @@
 //! pending call is dropped.
 //!
 //! Requests arrive on two queues. The urgent queue carries the e-stop and is
-//! read before the normal queue on every pass of the loop, so an e-stop frame
-//! is published within one pass (about a millisecond) whatever else is
+//! read before the normal queue on every pass of the loop, and drained again
+//! after a normal request is taken and before it is published, so an e-stop
+//! frame is published within one pass (about a millisecond) whatever else is
 //! pending. A latch-gated call (every mutating tool) is published only while
 //! the shared e-stop latch is clear; the check runs immediately before the
 //! publish. A latch-gated call whose caller stopped waiting is never
@@ -374,6 +375,12 @@ impl Ports {
             if !busy {
                 match normal.try_recv() {
                     Ok(request) => {
+                        // An urgent request queued before this one was taken
+                        // (an estop queued inside the latch lock ahead of a
+                        // clear) is published first.
+                        while let Ok(first) = urgent.try_recv() {
+                            self.publish(first);
+                        }
                         self.publish(request);
                         busy = true;
                     }

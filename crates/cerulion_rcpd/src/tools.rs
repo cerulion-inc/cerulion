@@ -809,6 +809,33 @@ mod tests {
         handle
     }
 
+    #[test]
+    fn a_clear_refuses_when_an_estop_was_called_after_it_was_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let receipts = dir.path().join("log.jsonl");
+        let (host, latch) = host("overtaken", &receipts);
+        let seen = host.engages.load(Ordering::SeqCst);
+        // The estop's lock-free half lands while the clear waits.
+        host.engages.fetch_add(1, Ordering::SeqCst);
+        latch.store(true, Ordering::SeqCst);
+        std::fs::write(latch_path(&receipts), "stop\n").expect("latch file");
+        let Err(refused) = host.open_latch("d", seen) else {
+            panic!("the clear must be refused");
+        };
+        let text = refused.content[0].as_text().expect("text").text.clone();
+        let body: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(body["error"]["code"], "estop_overtaken");
+        assert!(host.estopped(), "the latch stays closed");
+        assert!(latch_path(&receipts).exists(), "the file is untouched");
+        let outcomes: Vec<String> = cerud::receipt::read_all(&receipts)
+            .expect("receipts")
+            .iter()
+            .map(|r| format!("{}:{:?}", r.verb, r.outcome))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "one receipt, no intent: {outcomes:?}");
+        assert!(outcomes[0].contains("estop_overtaken"), "{outcomes:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_estop_frame_is_queued_before_a_clear_that_follows_it_can_publish() {
         let dir = tempfile::tempdir().expect("tempdir");
