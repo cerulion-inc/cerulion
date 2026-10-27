@@ -48,7 +48,9 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
    a message takes the marker's name (`service_marker_conflict`), or when the workspace
    replaces a part, or any message a part embeds at any depth, with a definition whose
    fields or constants differ from the vendored one (`service_part_replaced`, checked
-   before nested resolution). An override of `rcl_interfaces/ParameterValue` so drops
+   before nested resolution; each reference binds over the vendored corpus through the
+   resolver's own ladder, `NestedIndex::bind`, so the check and the layout agree on
+   which message a part embeds). An override of `rcl_interfaces/ParameterValue` so drops
    the `GetParameters`, `SetParameters` and `SetParametersAtomically` markers.
 7. **Module assembly**: one file per package plus `ros2_msgs.rs` re-exports.
 
@@ -217,7 +219,7 @@ pin catches the CONSEQUENCE on the measured set.
 | `roundtrip_test.rs` | Every schema round-trips `<Name>Snapshot` → SHM publish → `try_view` snapshot, over an isolated iceoryx2 `TestTransport` per test | no | none |
 | `schema_hash_pin_test.rs` | Generated `SCHEMA_HASH`/`WIRE_FIXED_SIZE` == values recomputed through the same parse→resolve pipeline (whole-corpus resolve is required: a recursively-fixed nested field folds the target's hash into the parent); plus the wire-capture hash pin (never re-bless) | no | none |
 | `upstream_drift_test.rs` | Corpus-vs-manifest adjudication (a pure `adjudicate` function driven by synthetic-input oracles), provenance cross-check, waiver scoping, the bare-ref zero-tolerance gate, and fail-closed behavior | no | none |
-| `service_types_test.rs` | Acceptance for the vendored services (`std_srvs`, the `rcl_interfaces` parameter services): each marker names its own request and response, part hashes pairwise distinct, constants and defaults on the generated types, each `std_srvs` part hashed like the part `rmw_cerulion` announces for a ROS 2 peer, a real `Trigger_Response` frame decoded by the `FrameWalker`, a serde round trip, and the markers a workspace override of an embedded message drops over the real corpus | no | none |
+| `service_types_test.rs` | Acceptance for the vendored services (`std_srvs`, the `rcl_interfaces` parameter services): each marker names its own request and response, part hashes pairwise distinct, constants and defaults on the generated types, a real `Trigger_Response` frame decoded by the `FrameWalker`, a serde round trip, and the markers a workspace override of an embedded message drops over the real corpus (the check that each `std_srvs` part hashes like the part `rmw_cerulion` announces for a ROS 2 peer is `crates/rmw_cerulion/tests/service_part_hash_test.rs`) | no | none |
 | `vendored_types_test.rs` | Acceptance for later-vendored packages (vision/radar/grid_map + the UUID dep): real loan/fill round-trips over `TestTransport`, pairwise-distinct hashes including bare-name twins across packages | no | none |
 | `generated_bindings_test.rs` | Package-qualified schema-hash linkage, rosidl scalar-default parity, and bool-array wire semantics, against the real generated bindings | no | none |
 | `max_slice_len_test.rs` | `MAX_SLICE_LEN` lands on the expected tier for representative schemas (NOT exhaustive; see checklist step 5) | no | none |

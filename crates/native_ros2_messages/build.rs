@@ -152,13 +152,12 @@ fn main() {
     // response whose wire type is no longer the standard one.
     let mut replaced_services: BTreeSet<(String, String)> = BTreeSet::new();
     if let Some(root) = &workspace {
-        let vendored = all_schemas.clone();
+        let vendored: Vec<MessageSchema> = all_schemas.values().flatten().cloned().collect();
         all_schemas = workspace_message_set(root, all_schemas);
         for (package, defs) in &services {
             for service in defs {
-                let declared = |pkg: &str, name: &str| find_schema(&vendored, pkg, name);
                 let in_set = |pkg: &str, name: &str| find_schema(&all_schemas, pkg, name);
-                if let Some(why) = service_part_replaced(service, declared, in_set) {
+                if let Some(why) = service_part_replaced(service, &vendored, in_set) {
                     println!("cargo:warning=workspace messages: {why}");
                     replaced_services.insert((package.clone(), service.name.clone()));
                 }

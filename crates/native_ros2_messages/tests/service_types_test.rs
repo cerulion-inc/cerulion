@@ -401,12 +401,8 @@ fn services_dropped_by(pkg: &str, name: &str, override_text: &str) -> Vec<String
         .iter()
         .filter_map(|&(p, n, text)| {
             let srv = parse_rossrv(text, n, Some(p), &format!("{p}/{n}.srv")).expect("srv parses");
-            service_part_replaced(
-                &srv,
-                |p, n| find(&vendored, p, n).map(|i| &vendored[i]),
-                |p, n| find(&held, p, n).map(|i| &held[i]),
-            )
-            .map(|_| format!("{p}/{n}"))
+            service_part_replaced(&srv, &vendored, |p, n| find(&held, p, n).map(|i| &held[i]))
+                .map(|_| format!("{p}/{n}"))
         })
         .collect()
 }

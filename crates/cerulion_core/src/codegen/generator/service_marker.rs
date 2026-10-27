@@ -4,6 +4,7 @@
 //! when `cerulion_core`'s `unstable-services` feature is on. The two parts are ordinary schemas that
 //! [`super::generate_schema`] emits.
 
+use crate::codegen::nested_index::NestedIndex;
 use crate::codegen::rossrv_parser::ServiceDefinition;
 use crate::codegen::schema::{FieldType, MessageSchema};
 
@@ -78,9 +79,9 @@ pub fn service_marker_conflict(
 /// replaced, itself or through a message it embeds, or `None` when the set
 /// holds every part, and every message a part reaches, as vendored.
 ///
+/// `vendored` is the corpus the parts were written against, and
 /// `in_set(package, name)` returns the message the set holds under that
-/// name, before nested resolution, and `vendored(package, name)` the corpus
-/// definition the parts were written against. A workspace schema of the same
+/// name, before nested resolution. A workspace schema of the same
 /// qualified name (a YAML file or a `.msg` in the workspace store) replaces
 /// the vendored one; its schema hash stays the same, since the hash covers
 /// the name, but its fields can differ, and then `ServiceType` would name
@@ -91,9 +92,18 @@ pub fn service_marker_conflict(
 /// message counts as replaced when its fields (name, type, default) or
 /// constants differ from the vendored definition; descriptions do not count.
 /// A part missing from the set is left to [`service_marker_conflict`].
+///
+/// Each reference made by a part, or by a message a part reaches, binds over
+/// `vendored` through the resolver's own ladder (`NestedIndex::bind`: a
+/// qualified name exactly, then the containing message's package, then a
+/// bare `Header` to `std_msgs/Header`, then a bare name exactly one vendored
+/// message carries), so this check and the layout never disagree on which
+/// message a part embeds. A reference that binds nowhere (an unknown name,
+/// or a bare name two packages carry) reaches no message here; the resolver
+/// reports it.
 pub fn service_part_replaced<'a>(
     service: &ServiceDefinition,
-    vendored: impl Fn(&str, &str) -> Option<&'a MessageSchema>,
+    vendored: &[MessageSchema],
     in_set: impl Fn(&str, &str) -> Option<&'a MessageSchema>,
 ) -> Option<String> {
     let package = service.package.as_deref().unwrap_or_default();
@@ -113,22 +123,21 @@ pub fn service_part_replaced<'a>(
 
     // Every message the parts reach, walked over the vendored definitions,
     // each visited once (in first-reached order, so the report is stable).
-    let mut reached: Vec<(String, String)> = Vec::new();
+    let index = NestedIndex::from_schemas(vendored);
+    let mut reached: Vec<usize> = Vec::new();
     for part in parts {
-        push_nested(part, package, &vendored, &mut reached);
+        push_nested(part, &index, &mut reached);
     }
     let mut embedded: Vec<String> = Vec::new();
     let mut next = 0;
     while next < reached.len() {
-        let (pkg, name) = reached[next].clone();
+        let declared = &vendored[reached[next]];
         next += 1;
-        let Some(declared) = vendored(&pkg, &name) else {
-            continue;
-        };
-        if in_set(&pkg, &name).is_some_and(|held| !same_definition(declared, held)) {
-            embedded.push(qualified(&pkg, &name));
+        let pkg = declared.package.as_deref().unwrap_or_default();
+        if in_set(pkg, &declared.name).is_some_and(|held| !same_definition(declared, held)) {
+            embedded.push(qualified(pkg, &declared.name));
         }
-        push_nested(declared, &pkg, &vendored, &mut reached);
+        push_nested(declared, &index, &mut reached);
     }
     if embedded.is_empty() {
         return None;
@@ -140,29 +149,20 @@ pub fn service_part_replaced<'a>(
     ))
 }
 
-/// Append each message `schema` (of `package`) references to `reached`,
-/// unless it is there already.
-fn push_nested<'a>(
-    schema: &MessageSchema,
-    package: &str,
-    vendored: &impl Fn(&str, &str) -> Option<&'a MessageSchema>,
-    reached: &mut Vec<(String, String)>,
-) {
+/// Append the index of each vendored message `schema` references to
+/// `reached`, unless it is there already. Each reference binds through
+/// `index` with `schema`'s own package as the parent, exactly as the layout
+/// resolver binds it; one that binds nowhere is skipped.
+fn push_nested(schema: &MessageSchema, index: &NestedIndex, reached: &mut Vec<usize>) {
     for field in &schema.fields {
         let Some((pkg, name)) = nested_target(&field.field_type) else {
             continue;
         };
-        let key = match pkg {
-            Some(pkg) => (pkg.to_string(), name.to_string()),
-            // A bare reference names a message of the same package; rosidl
-            // binds a bare `Header` to `std_msgs/Header` otherwise.
-            None if vendored(package, name).is_none() && name == "Header" => {
-                ("std_msgs".to_string(), name.to_string())
-            }
-            None => (package.to_string(), name.to_string()),
+        let Ok(bound) = index.bind(pkg, name, schema.package.as_deref()) else {
+            continue;
         };
-        if !reached.contains(&key) {
-            reached.push(key);
+        if !reached.contains(&bound.idx) {
+            reached.push(bound.idx);
         }
     }
 }
@@ -276,10 +276,7 @@ mod tests {
         let srv = trigger();
         let parts = [srv.request.clone(), srv.response.clone()];
         let lookup = |n: &str| parts.iter().find(|p| p.name == n);
-        assert_eq!(
-            service_part_replaced(&srv, |_, _| None, |_, n| lookup(n)),
-            None
-        );
+        assert_eq!(service_part_replaced(&srv, &[], |_, n| lookup(n)), None);
     }
 
     /// A workspace part of the same name with other fields is named, and only
@@ -293,7 +290,7 @@ mod tests {
         let parts = [srv.request.clone(), other];
         let lookup = |n: &str| parts.iter().find(|p| p.name == n);
         assert_eq!(
-            service_part_replaced(&srv, |_, _| None, |_, n| lookup(n)).as_deref(),
+            service_part_replaced(&srv, &[], |_, n| lookup(n)).as_deref(),
             Some("service 'std_srvs/Trigger' is not generated: the workspace replaces its part(s) Trigger_Response with a different definition")
         );
     }
@@ -310,41 +307,36 @@ mod tests {
         .unwrap();
         let parts = [srv.request.clone(), commented];
         let lookup = |n: &str| parts.iter().find(|p| p.name == n);
-        assert_eq!(
-            service_part_replaced(&srv, |_, _| None, |_, n| lookup(n)),
-            None
-        );
+        assert_eq!(service_part_replaced(&srv, &[], |_, n| lookup(n)), None);
     }
 
     fn msg(text: &str, name: &str, package: &str) -> MessageSchema {
         crate::codegen::parse_rosmsg(text, name, Some(package)).unwrap()
     }
 
-    /// `demo/Set`: the request embeds `demo/Value` (bare) and a bare
-    /// `Header`, and `demo/Value` embeds `other/Inner` (qualified).
-    fn set_service() -> (ServiceDefinition, Vec<(&'static str, MessageSchema)>) {
-        let srv = crate::codegen::parse_rossrv(
-            "Header header\nValue[] values\n---\nbool ok\n",
-            "Set",
-            Some("demo"),
-            "demo/Set.srv",
-        )
-        .unwrap();
-        let corpus = vec![
-            ("demo", msg("other/Inner inner\n", "Value", "demo")),
-            ("other", msg("int32 a\n", "Inner", "other")),
-            ("std_msgs", msg("uint32 seq\n", "Header", "std_msgs")),
-        ];
-        (srv, corpus)
+    fn srv(text: &str, name: &str) -> ServiceDefinition {
+        crate::codegen::parse_rossrv(text, name, Some("demo"), &format!("demo/{name}.srv")).unwrap()
     }
 
-    fn find<'a>(
-        set: &'a [(&'static str, MessageSchema)],
-    ) -> impl Fn(&str, &str) -> Option<&'a MessageSchema> {
+    /// `demo/Set`: the request embeds `demo/Value` (bare) and a bare
+    /// `Header`, and `demo/Value` embeds `other/Inner` (qualified).
+    fn set_service() -> (ServiceDefinition, Vec<MessageSchema>) {
+        let corpus = vec![
+            msg("other/Inner inner\n", "Value", "demo"),
+            msg("int32 a\n", "Inner", "other"),
+            msg("uint32 seq\n", "Header", "std_msgs"),
+        ];
+        (
+            srv("Header header\nValue[] values\n---\nbool ok\n", "Set"),
+            corpus,
+        )
+    }
+
+    /// A set lookup by a schema's own package and name.
+    fn find<'a>(set: &'a [MessageSchema]) -> impl Fn(&str, &str) -> Option<&'a MessageSchema> {
         move |pkg, name| {
             set.iter()
-                .find(|(p, s)| *p == pkg && s.name == name)
-                .map(|(_, s)| s)
+                .find(|s| s.package.as_deref() == Some(pkg) && s.name == name)
         }
     }
 
@@ -353,10 +345,7 @@ mod tests {
     #[test]
     fn unchanged_embedded_messages_are_not_replacements() {
         let (srv, corpus) = set_service();
-        assert_eq!(
-            service_part_replaced(&srv, find(&corpus), find(&corpus)),
-            None
-        );
+        assert_eq!(service_part_replaced(&srv, &corpus, find(&corpus)), None);
     }
 
     /// An override two levels below a part (`demo/Value` keeps its fields,
@@ -366,9 +355,9 @@ mod tests {
     fn a_transitive_override_of_an_embedded_message_is_a_replacement() {
         let (srv, corpus) = set_service();
         let mut held = corpus.clone();
-        held[1].1 = msg("float64 a\n", "Inner", "other");
+        held[1] = msg("float64 a\n", "Inner", "other");
         assert_eq!(
-            service_part_replaced(&srv, find(&corpus), find(&held)).as_deref(),
+            service_part_replaced(&srv, &corpus, find(&held)).as_deref(),
             Some("service 'demo/Set' is not generated: its parts embed other/Inner, which the workspace replaces with a different definition")
         );
     }
@@ -379,9 +368,9 @@ mod tests {
     fn a_bare_header_resolves_to_std_msgs() {
         let (srv, corpus) = set_service();
         let mut held = corpus.clone();
-        held[2].1 = msg("uint64 seq\n", "Header", "std_msgs");
+        held[2] = msg("uint64 seq\n", "Header", "std_msgs");
         assert_eq!(
-            service_part_replaced(&srv, find(&corpus), find(&held)).as_deref(),
+            service_part_replaced(&srv, &corpus, find(&held)).as_deref(),
             Some("service 'demo/Set' is not generated: its parts embed std_msgs/Header, which the workspace replaces with a different definition")
         );
     }
@@ -390,20 +379,13 @@ mod tests {
     /// change to either is found.
     #[test]
     fn a_reference_cycle_terminates() {
-        let srv = crate::codegen::parse_rossrv("A a\n---\n", "Loop", Some("demo"), "demo/Loop.srv")
-            .unwrap();
-        let corpus = vec![
-            ("demo", msg("B[] b\n", "A", "demo")),
-            ("demo", msg("A[] a\n", "B", "demo")),
-        ];
-        assert_eq!(
-            service_part_replaced(&srv, find(&corpus), find(&corpus)),
-            None
-        );
+        let srv = srv("A a\n---\n", "Loop");
+        let corpus = vec![msg("B[] b\n", "A", "demo"), msg("A[] a\n", "B", "demo")];
+        assert_eq!(service_part_replaced(&srv, &corpus, find(&corpus)), None);
         let mut held = corpus.clone();
-        held[1].1 = msg("A[] a\nint8 x\n", "B", "demo");
+        held[1] = msg("A[] a\nint8 x\n", "B", "demo");
         assert_eq!(
-            service_part_replaced(&srv, find(&corpus), find(&held)).as_deref(),
+            service_part_replaced(&srv, &corpus, find(&held)).as_deref(),
             Some("service 'demo/Loop' is not generated: its parts embed demo/B, which the workspace replaces with a different definition")
         );
     }
@@ -412,9 +394,59 @@ mod tests {
     /// reports it.
     #[test]
     fn a_missing_part_is_not_a_replacement() {
+        assert_eq!(service_part_replaced(&trigger(), &[], |_, _| None), None);
+    }
+
+    /// A bare name no same-package message carries, that exactly one other
+    /// package does (the resolver's last step): the part embeds that one, so
+    /// an override of it is seen.
+    #[test]
+    fn a_unique_bare_name_binds_to_the_one_package_that_carries_it() {
+        let srv = srv("Leaf leaf\n---\n", "Use");
+        let corpus = vec![msg("int32 a\n", "Leaf", "other")];
+        assert_eq!(service_part_replaced(&srv, &corpus, find(&corpus)), None);
+        let mut held = corpus.clone();
+        held[0] = msg("float64 a\n", "Leaf", "other");
         assert_eq!(
-            service_part_replaced(&trigger(), |_, _| None, |_, _| None),
-            None
+            service_part_replaced(&srv, &corpus, find(&held)).as_deref(),
+            Some("service 'demo/Use' is not generated: its parts embed other/Leaf, which the workspace replaces with a different definition")
         );
+    }
+
+    /// A same-package message wins over a bare-name twin in another package,
+    /// and over `std_msgs/Header` for a bare `Header`: the part embeds the
+    /// same-package ones, so only their overrides are seen, in field order.
+    #[test]
+    fn a_same_package_message_wins_over_a_bare_twin_elsewhere() {
+        let srv = srv("Header header\nLeaf leaf\n---\n", "Use");
+        let corpus = vec![
+            msg("int32 a\n", "Leaf", "demo"),
+            msg("int32 a\n", "Leaf", "other"),
+            msg("uint32 seq\n", "Header", "demo"),
+            msg("uint32 seq\n", "Header", "std_msgs"),
+        ];
+        let mut elsewhere = corpus.clone();
+        elsewhere[1] = msg("float64 a\n", "Leaf", "other");
+        elsewhere[3] = msg("uint64 seq\n", "Header", "std_msgs");
+        assert_eq!(service_part_replaced(&srv, &corpus, find(&elsewhere)), None);
+        let mut same = corpus.clone();
+        same[0] = msg("float64 a\n", "Leaf", "demo");
+        same[2] = msg("uint64 seq\n", "Header", "demo");
+        assert_eq!(
+            service_part_replaced(&srv, &corpus, find(&same)).as_deref(),
+            Some("service 'demo/Use' is not generated: its parts embed demo/Header, demo/Leaf, which the workspace replaces with a different definition")
+        );
+    }
+
+    /// A bare name two other packages carry binds nowhere, as it does for
+    /// the resolver: the check reaches no message through it, so an override
+    /// of either twin is not this check's to report.
+    #[test]
+    fn an_ambiguous_bare_name_reaches_no_message() {
+        let srv = srv("Leaf leaf\n---\n", "Use");
+        let corpus = vec![msg("int32 a\n", "Leaf", "a"), msg("int32 a\n", "Leaf", "b")];
+        let mut held = corpus.clone();
+        held[0] = msg("float64 a\n", "Leaf", "a");
+        assert_eq!(service_part_replaced(&srv, &corpus, find(&held)), None);
     }
 }
