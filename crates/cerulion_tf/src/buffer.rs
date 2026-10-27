@@ -176,8 +176,8 @@ pub struct EdgeInfo<'a> {
     /// ([`TfBufferConfig::ring_capacity`]), so its history is shorter than
     /// the retention.
     pub overflows: u64,
-    /// Every dynamic insert refused on this static edge. The first one
-    /// returned [`TfError::EdgeIsStatic`]; the rest returned `Ok(())`.
+    /// Every dynamic insert refused on this static edge with
+    /// [`TfError::EdgeIsStatic`].
     pub static_refusals: u64,
     /// Every insert refused on this edge with
     /// [`TfError::StampBeforeWindow`]. A count that keeps rising is an edge
@@ -248,10 +248,17 @@ pub struct StaticEdge<'a> {
 /// [`EdgeInfo::overflows`].
 ///
 /// A static edge ([`Self::insert_static`]) holds one transform that never
-/// expires and wins at every time. A dynamic insert on it is refused: the
-/// first time with [`TfError::EdgeIsStatic`], after that by counting it in
-/// [`EdgeInfo::static_refusals`] and returning `Ok(())`, so a node that
-/// logs each insert error reports the conflict once with a running total.
+/// expires and wins at every time. A dynamic insert on it is refused with
+/// [`TfError::EdgeIsStatic`] and counted in [`EdgeInfo::static_refusals`].
+///
+/// # Refusals
+///
+/// A refused insert returns its error every time: a sample the buffer did
+/// not keep is never an `Ok(())`, so a caller never loses data silently.
+/// The edge counts each kind of refusal as well ([`EdgeInfo::static_refusals`],
+/// [`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]), so a node
+/// that would log every error on a 100 Hz edge can log the first and read
+/// the running total from [`Self::edge`] instead.
 ///
 /// # Epochs
 ///
@@ -487,8 +494,8 @@ impl TfBuffer {
     /// [`TfError::EmptyFrameId`], [`TfError::SelfEdge`],
     /// [`TfError::SecondParent`], [`TfError::Cycle`],
     /// [`TfError::FrameTableFull`], [`TfError::NameBudgetFull`],
-    /// [`TfError::StampBeforeWindow`] and [`TfError::StampTooFarAhead`];
-    /// [`TfError::EdgeIsStatic`] the first time on an edge. A refusal
+    /// [`TfError::EdgeIsStatic`], [`TfError::StampBeforeWindow`] and
+    /// [`TfError::StampTooFarAhead`], each returned every time. A refusal
     /// changes nothing but the edge's refusal counters, and a
     /// [`TfError::StampTooFarAhead`] refusal also records its stamp for the
     /// next insert to confirm.
@@ -499,9 +506,7 @@ impl TfBuffer {
         stamp_ns: u64,
         transform: Transform,
     ) -> Result<(), TfError> {
-        let Some((p, c)) = self.admit(parent, child, Admit::Dynamic)? else {
-            return Ok(());
-        };
+        let (p, c) = self.admit(parent, child, Admit::Dynamic)?;
         let (parent, child) = (self.id(p), self.id(c));
         let retention_ns = self.retention_ns;
         let jump_limit_ns = self.jump_limit_ns;
@@ -594,9 +599,7 @@ impl TfBuffer {
         child: &str,
         transform: Transform,
     ) -> Result<(), TfError> {
-        let Some((_, c)) = self.admit(parent, child, Admit::Static)? else {
-            return Ok(());
-        };
+        let (_, c) = self.admit(parent, child, Admit::Static)?;
         let frame = &mut self.frames[c];
         if frame.is_static && frame.static_transform != transform {
             self.replacements += 1;
@@ -628,9 +631,8 @@ impl TfBuffer {
         child: &str,
         policy: EdgePolicy,
     ) -> Result<(), TfError> {
-        if let Some((_, c)) = self.admit(parent, child, Admit::Policy)? {
-            self.frames[c].policy = policy;
-        }
+        let (_, c) = self.admit(parent, child, Admit::Policy)?;
+        self.frames[c].policy = policy;
         Ok(())
     }
 
@@ -765,15 +767,9 @@ impl TfBuffer {
     }
 
     /// Validates an edge write in full, then registers any new frame and
-    /// the parent link. Returns `(parent, child)` slots, or `None` for a
-    /// repeat refusal that was counted on the edge. Every refusal happens
-    /// before the first write to the tree.
-    fn admit(
-        &mut self,
-        parent: &str,
-        child: &str,
-        kind: Admit,
-    ) -> Result<Option<(usize, usize)>, TfError> {
+    /// the parent link. Returns the `(parent, child)` slots. Every refusal
+    /// happens before the first write to the tree.
+    fn admit(&mut self, parent: &str, child: &str, kind: Admit) -> Result<(usize, usize), TfError> {
         let parent_name = normalize(parent);
         let child_name = normalize(child);
         if parent_name.is_empty() || child_name.is_empty() {
@@ -810,7 +806,7 @@ impl TfBuffer {
             }
             if let Some(p) = p {
                 if let Some(refusal) = self.refusal(p, c, kind) {
-                    return refusal.map(|()| None);
+                    return Err(refusal);
                 }
             }
         }
@@ -861,22 +857,22 @@ impl TfBuffer {
         let p = p.unwrap_or_else(|| self.register(parent_name));
         let c = c.unwrap_or_else(|| self.register(child_name));
         self.frames[c].parent = Some(p);
-        Ok(Some((p, c)))
+        Ok((p, c))
     }
 
-    /// The static check of an existing edge `p` to `c`: `Some(Err)` for a
-    /// first refusal, `Some(Ok)` for a counted repeat, `None` when the
-    /// write may go ahead.
-    fn refusal(&mut self, p: usize, c: usize, kind: Admit) -> Option<Result<(), TfError>> {
+    /// The static check of an existing edge `p` to `c`: the refusal, or
+    /// `None` when the write may go ahead.
+    fn refusal(&mut self, p: usize, c: usize, kind: Admit) -> Option<TfError> {
         let (parent, child) = (self.id(p), self.id(c));
         let frame = &mut self.frames[c];
         match kind {
             // A policy has no place on a static edge; setting one is a
-            // configuration call, refused every time.
-            Admit::Policy if frame.is_static => Some(Err(TfError::EdgeIsStatic { parent, child })),
+            // configuration call, not a dropped sample, so it is not
+            // counted.
+            Admit::Policy if frame.is_static => Some(TfError::EdgeIsStatic { parent, child }),
             Admit::Dynamic if frame.is_static => {
-                let err = TfError::EdgeIsStatic { parent, child };
-                Some(first_then_count(&mut frame.static_refusals, err))
+                frame.static_refusals += 1;
+                Some(TfError::EdgeIsStatic { parent, child })
             }
             Admit::Policy | Admit::Dynamic | Admit::Static => None,
         }
@@ -1121,17 +1117,6 @@ fn next_tag() -> u64 {
 /// `duration` in nanoseconds, `u64::MAX` when it is longer.
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Counts a refusal on `count` and returns `err` for the first one only;
-/// every later one is `Ok(())`, read back through the counter.
-fn first_then_count(count: &mut u64, err: TfError) -> Result<(), TfError> {
-    *count += 1;
-    if *count == 1 {
-        Err(err)
-    } else {
-        Ok(())
-    }
 }
 
 /// What an edge write is, for the checks in [`TfBuffer::admit`].

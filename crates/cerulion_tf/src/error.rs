@@ -90,8 +90,8 @@ pub enum TfError {
     /// The edge is static (it came in through [`TfBuffer::insert_static`])
     /// and a dynamic transform was inserted for it, or an edge policy was
     /// set on it. A static transform wins at every time, so the dynamic one
-    /// is refused rather than ignored. Returned for the first such insert
-    /// on an edge; the edge counts every one.
+    /// is refused rather than ignored. Returned for every such insert; the
+    /// edge counts every one.
     EdgeIsStatic {
         /// The parent of the static edge.
         parent: FrameId,

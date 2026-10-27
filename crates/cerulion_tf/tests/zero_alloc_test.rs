@@ -13,8 +13,8 @@
 //! place it allocates. The first pass on a fresh buffer is measured, so frame
 //! registration and name interning, ring growth, expiry and overflow are
 //! inside a window; the repeat pass on the same buffer, which begins a new
-//! epoch and meets a full frame table and counted repeat refusals, is
-//! measured on its own. A static insert that clears a dynamic edge's
+//! epoch and meets a full frame table and repeat refusals, is measured on
+//! its own. A static insert that clears a dynamic edge's
 //! history has its own window too, and so do the two refusals this buffer
 //! cannot reach: a name past the byte budget (its full frame table refuses
 //! first) and a handle from another buffer.
@@ -164,9 +164,10 @@ fn small_buffer() -> TfBuffer {
 /// window of 1000 ns: inserts that add, replace, expire and overflow, a
 /// static edge, edge policies, an epoch, lookups of every shape, and every
 /// refusal but `NameBudgetFull` and `UnknownFrameId`, which the test body
-/// measures on a buffer of its own. The first pass on a fresh buffer registers frames and grows
-/// rings; run again on the same buffer, the repeat meets full rings, a full
-/// frame table and counted repeat refusals, so all are measured.
+/// measures on a buffer of its own. The first pass on a fresh buffer
+/// registers frames and grows rings; run again on the same buffer, the
+/// repeat meets full rings, a full frame table and repeat refusals, so all
+/// are measured.
 fn every_buffer_operation(b: &mut TfBuffer) {
     let shift = |x: f64| Transform::new([x, 0.0, 0.0], UnitQuaternion::IDENTITY).unwrap();
     let turn = Transform::new(
@@ -262,10 +263,10 @@ fn every_buffer_operation(b: &mut TfBuffer) {
     let ahead = b.insert("odom", "base", 10_000, shift(0.0));
     assert!(matches!(ahead, Err(TfError::StampTooFarAhead { .. })));
     write!(sink, "{}", b.describe(ahead.as_ref().unwrap_err())).unwrap();
-    // A first refusal, or a counted repeat when the operations run again.
+    // Refused every time, on the first pass and on the repeat.
     assert!(matches!(
         b.insert("base", "lidar", 0, shift(0.0)),
-        Err(TfError::EdgeIsStatic { .. }) | Ok(())
+        Err(TfError::EdgeIsStatic { .. })
     ));
     assert!(matches!(
         b.insert("z", "w", 0, shift(0.0)),
@@ -343,7 +344,7 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     assert_eq!(buffer.replacements(), 1, "300 replaced once");
 
     // The repeat pass clears the rings with an epoch, refills them and
-    // meets a full frame table and counted repeat refusals.
+    // meets a full frame table and repeat refusals.
     ALLOC.open();
     every_buffer_operation(&mut buffer);
     let during_repeat_pass = ALLOC.close();

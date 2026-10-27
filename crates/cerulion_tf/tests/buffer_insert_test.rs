@@ -404,19 +404,21 @@ fn begin_epoch_clears_the_rings_and_keeps_the_tree_and_the_statics() {
 // ----------------------------------------------------------- static edges
 
 #[test]
-fn a_dynamic_transform_on_a_static_edge_is_refused_once_then_counted() {
+fn a_dynamic_transform_on_a_static_edge_is_refused_every_time_and_counted() {
     let mut b = TfBuffer::new();
     b.insert_static("base", "lidar", tf(0.17)).unwrap();
     let (base, lidar) = (id(&b, "base"), id(&b, "lidar"));
-    assert_eq!(
-        b.insert("base", "lidar", 1, tf(1.0)),
-        Err(TfError::EdgeIsStatic {
-            parent: base,
-            child: lidar
-        })
-    );
-    for stamp in 2..=100u64 {
-        assert_eq!(b.insert("base", "lidar", stamp, tf(1.0)), Ok(()));
+    // The 100th refusal comes back like the first: a dropped sample is
+    // never an `Ok(())`.
+    for stamp in 1..=100u64 {
+        assert_eq!(
+            b.insert("base", "lidar", stamp, tf(1.0)),
+            Err(TfError::EdgeIsStatic {
+                parent: base,
+                child: lidar
+            }),
+            "refusal {stamp}"
+        );
     }
     let e = edge(&b, "lidar");
     assert_eq!((e.samples, e.static_refusals), (0, 100));

@@ -176,11 +176,12 @@ The rules:
 - **Static wins.** A static edge holds at every time. A dynamic transform
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
-- **Loud once, counted after.** `EdgeIsStatic` comes back the first time on
-  an edge. Every later refusal on that edge returns `Ok(())` and counts in
-  the edge's `static_refusals`, so a node that logs each insert error
-  reports the conflict once, and the running total stays readable from
-  `edge()`.
+- **Every refusal comes back.** A refused insert returns its error every
+  time: a sample the buffer did not keep is never an `Ok(())`, so no data is
+  lost silently. The edge counts each kind of refusal as well
+  (`static_refusals`, `window_refusals`, `jump_refusals`, read through
+  `edge()`), so a node that would log every error on a 100 Hz edge can log
+  the first and report the running total instead.
 - **Frame ids** have no length limit of their own. The buffer interns each
   id once, in a name table sized at construction (64 bytes per frame on
   average, 4096 bytes for the default 64 frames), and names a frame by its
