@@ -201,7 +201,7 @@ LAN posture. Oracle tests:
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
 
 The LAN posture is a whole-plane switch: a LAN source address proves no
-identity, so per-peer LAN authorization is not supported. Per-peer, per-topic
+identity, so per-peer LAN authorization is not supported yet. Per-peer, per-topic
 and per-direction (observe or command) access with revocation is what the
 paired remote plane provides, binding each session to its pairing key over an
 authenticated transport.
