@@ -385,6 +385,11 @@ pub trait ClockSource {
 /// node fires once, at the latest deadline the jump passed, and its next
 /// deadline is one period after that. The live and replay clocks keep their
 /// catch-up bursts; only a sim-time run sets this ceiling.
+///
+/// Hidden from the documented surface: the ceiling is how a sim-time run
+/// behaves today, not part of its contract. A run that sub-steps to the
+/// nodes' own deadlines between two samples needs no ceiling.
+#[doc(hidden)]
 pub const SIM_TIME_PERIOD_FIRES_PER_SAMPLE: u32 = 1;
 
 /// How many `/clock` samples the run's tap can hold between two polls.
@@ -1107,6 +1112,34 @@ mod tests {
         assert!(
             guide.contains(&format!("a queue of {CLOCK_TAP_DEPTH} samples")),
             "docs/time.md must state CLOCK_TAP_DEPTH"
+        );
+    }
+
+    /// One fire per accepted sample is how the run behaves today, not part of
+    /// the sim time contract: both user pages say so next to the rule, so a
+    /// reader does not build on it.
+    #[test]
+    fn the_docs_state_the_fire_ceiling_as_current_behaviour_not_a_contract() {
+        // The sentence wraps across indented list lines: one space per gap.
+        let guide = include_str!("../../../docs/time.md")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            guide.contains("This is how the run behaves today, not a rule to build on"),
+            "docs/time.md rule 3 must mark the one fire per sample as current behaviour"
+        );
+        let api = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/user-api.md"),
+        )
+        .expect("docs/user-api.md is readable from the crate root");
+        let row = api
+            .lines()
+            .find(|line| line.starts_with("| `sim_time:` |"))
+            .expect("docs/user-api.md carries the sim_time row");
+        assert!(
+            row.contains("current behaviour, not a contract"),
+            "the sim_time row must mark the one fire per sample as current behaviour: {row}"
         );
     }
 

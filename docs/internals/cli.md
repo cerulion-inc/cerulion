@@ -1325,7 +1325,9 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
   seam: the feeder's events for the scripted schedule are a hand-written list,
   and a bare applier fed that list fires at the same stamps as the loop.
 - A period fires at most once per sample: a jump fires the latest passed deadline,
-  never a catch-up burst.
+  never a catch-up burst. This ceiling (`SIM_TIME_PERIOD_FIRES_PER_SAMPLE`,
+  `GraphRuntime::set_period_fire_ceiling`) is current behaviour, not contract:
+  the items are `#[doc(hidden)]`, and the user pages say "today".
 - A frame is decoded only after its wire framing is checked.
 - `ros2:` entries are put on `/clock` by `spawn_argv` (`put_ros2_entry_on_sim_time`).
   The spawn log prints the argv as spawned (`ros2_graph::command_line`), and a

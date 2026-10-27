@@ -77,14 +77,17 @@ What happens when the graph starts:
 3. **One step per accepted sample.** A sample ahead of the last accepted one steps the
    graph by the difference. A sample equal to it steps the graph by zero, so
    data triggers still drain while a paused simulator republishes the same
-   time. A period node fires at most once per accepted sample, however many
-   of its deadlines the jump between two samples passed: it fires once, when
-   that sample is accepted, at the latest deadline the jump passed, and its
-   next deadline is one period after that. The missed deadlines are
-   not fired later. A 10 ms node whose clock jumps from 1.000 s to 1.100 s
-   fires once, at 1.100 s. So a node with a period shorter than the gap
-   between samples fires at the clock rate, not at its own. Publish `/clock`
-   at least as fast as the fastest period node in the graph.
+   time. Today a period node fires at most once per accepted sample, however
+   many of its deadlines the jump between two samples passed: it fires once,
+   when that sample is accepted, at the latest deadline the jump passed, and
+   its next deadline is one period after that; the missed deadlines are not
+   fired later. A 10 ms node whose clock jumps from 1.000 s to 1.100 s fires
+   once, at 1.100 s. This is how the run behaves today, not a rule to build
+   on: sub-stepping (steps at the nodes' own deadlines between two samples)
+   is not supported yet, and a run that makes those steps fires such a node
+   at its own rate. Until then a node with a period shorter than the gap
+   between samples fires at the clock rate, so publish `/clock` at least as
+   fast as the fastest period node in the graph.
 4. **Time never goes backwards.** A sample behind the last accepted one is
    refused with a warning and is never stored; the graph clock stands at the
    last accepted sample. A simulator that restarts its clock needs the graph
@@ -144,8 +147,9 @@ output on `/clock` is refused at load, as is one that lists `/clock` in
   on the real clock.
 - **Sub-stepping.** A period node fires at most once per accepted sample, so
   the `/clock` publish rate caps every period node's rate. Steps at the
-  nodes' own deadlines between two samples are not made. Publish `/clock` at
-  least as fast as the fastest period node in the graph.
+  nodes' own deadlines between two samples are not made. The one fire per
+  sample is the run's behaviour today, not a contract to build on. Publish
+  `/clock` at least as fast as the fastest period node in the graph.
 - **Recording.** `--record` requires the live clock. A sim-time run is not
   recordable yet.
 - **Networking.** A sim-time run opens no gateway, like every controlled-clock

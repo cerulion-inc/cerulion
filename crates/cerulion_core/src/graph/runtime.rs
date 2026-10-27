@@ -9853,12 +9853,17 @@ impl GraphRuntime {
     /// bound. A sim-time run sets one, so a `/clock` sample that jumps across
     /// several periods fires each period node once. See
     /// [`crate::scheduler::period_ceiling`].
+    ///
+    /// Hidden from the documented surface: the ceiling is how a sim-time run
+    /// behaves today, not part of its contract.
+    #[doc(hidden)]
     pub fn set_period_fire_ceiling(&mut self, ceiling: Option<u32>) {
         self.scheduler.set_period_fire_ceiling(ceiling);
     }
 
     /// The `Period` fire ceiling this runtime runs under, `None` when
-    /// unbounded.
+    /// unbounded. Hidden with [`Self::set_period_fire_ceiling`].
+    #[doc(hidden)]
     pub fn period_fire_ceiling(&self) -> Option<u32> {
         self.scheduler.period_fire_ceiling()
     }

@@ -4917,11 +4917,17 @@ impl Scheduler {
     /// Bound every `Period` node to at most `ceiling` fires per step, the
     /// latest deadlines the step passes (see [`period_ceiling`]). `None`
     /// removes the bound. Set once, before the first step.
+    ///
+    /// Hidden from the documented surface: the ceiling is how a sim-time run
+    /// behaves today, not part of its contract.
+    #[doc(hidden)]
     pub fn set_period_fire_ceiling(&mut self, ceiling: Option<u32>) {
         self.period_fire_ceiling = ceiling;
     }
 
-    /// The run-wide `Period` fire ceiling, `None` when unbounded.
+    /// The run-wide `Period` fire ceiling, `None` when unbounded. Hidden
+    /// with [`Self::set_period_fire_ceiling`].
+    #[doc(hidden)]
     pub fn period_fire_ceiling(&self) -> Option<u32> {
         self.period_fire_ceiling
     }
