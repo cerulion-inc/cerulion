@@ -2711,6 +2711,7 @@ fn start_hosted_issuer(issue: HostedIssue) -> (u16, std::thread::JoinHandle<()>)
                     }
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

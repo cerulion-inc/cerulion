@@ -170,12 +170,18 @@ fn unsupported_catalog_is_distinct_from_empty_and_errors_do_not_depend_on_body()
     }
 }
 
-struct EnvGuard(Option<std::ffi::OsString>);
+/// Sets `CERULION_HOME` while holding the crate-wide env lock; `Drop` restores
+/// the prior value before the lock field is released.
+struct EnvGuard(
+    Option<std::ffi::OsString>,
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
 impl EnvGuard {
     fn home(path: &Path) -> Self {
+        let lock = crate::test_env::env_lock();
         let old = std::env::var_os("CERULION_HOME");
         std::env::set_var("CERULION_HOME", path);
-        Self(old)
+        Self(old, lock)
     }
 }
 impl Drop for EnvGuard {

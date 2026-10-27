@@ -151,8 +151,8 @@ fn authorize_via_magic_link(port: u16, email: &CapturingEmailSender, user_code: 
 }
 
 /// Log in for real against the running service and return the session-bearing
-/// [`AuthState`] (writes `~/.cerulion/{auth.json, desk.key, device.cert}` under the
-/// current `CERULION_HOME`).
+/// [`AuthState`] (writes `auth.json`, `identity/device.key` and `device.cert` under
+/// the current `CERULION_HOME`).
 fn login(port: u16, email: &Arc<CapturingEmailSender>) -> AuthState {
     let buf = SharedBuf::new();
     let worker = std::thread::spawn({
@@ -296,7 +296,11 @@ fn first_serve_registration_survives_offline_restart_and_rejects_account_switch(
     );
     assert_eq!(
         bundle["device_key_file"],
-        home_path.join("desk.key").to_str().unwrap()
+        home_path
+            .join("identity")
+            .join("device.key")
+            .to_str()
+            .unwrap()
     );
     let decode = |field: &str| hex::decode(bundle[field].as_str().unwrap()).unwrap();
     let roots: RootSet = postcard::from_bytes(&decode("root_set_postcard")).unwrap();
@@ -433,6 +437,7 @@ fn real_background_worker_refuses_missing_login_without_interactive_flow() {
     );
     assert!(!home.join("auth.json").exists());
     assert!(!home.join("desk.key").exists());
+    assert!(!home.join("identity").join("device.key").exists());
     assert!(!home.join("robot-state").exists());
     let help = bounded_output(
         Command::new(built_binary("cerulion"))
