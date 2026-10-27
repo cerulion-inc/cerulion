@@ -121,13 +121,10 @@ async fn run(args: Args) -> Result<(), RcpdError> {
         loaded.state.clone(),
         latch.clone(),
     )?;
-    let host = Arc::new(ToolHost::open(
-        loaded.tools,
-        journal,
-        latch,
-        &receipts,
-        lock,
-    )?);
+    let host = Arc::new(
+        ToolHost::open(loaded.tools, journal, latch, &receipts, lock)?
+            .with_estop_clear(loaded.limits.estop_clear),
+    );
     tracing::info!(
         receipts = %receipts.display(),
         calls = %loaded.journal.calls_topic,
