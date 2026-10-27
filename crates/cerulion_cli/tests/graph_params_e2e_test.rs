@@ -355,10 +355,14 @@ fn stamped_vector3_frames(bag: &Path, topic: &str) -> Vec<(u64, (f64, f64, f64))
 /// The recording runs `cam0` at `gain: 2.0`, and a `cerulion flashback`
 /// capture of it begins mid-run, so its resim restores `cam0` from an anchor.
 /// A resim applies the RECORDED params, so no edit to the graph file can make
-/// a resumed `cam0` run `gain` on anything but 2.0. What the rule judges is a
-/// value in force that the recording does not hold, so the node is rebuilt
-/// with one more param, `scale`, default 3.0, which the recording names no
-/// value for. The recorded `gain` still applies to the rebuilt node.
+/// a resumed `cam0` run `gain` on anything but 2.0. The arm edits the graph
+/// file to `gain: 4.0` after the capture, so every 2.0 below is the recorded
+/// value winning over the file, not the file agreeing with the recording, and
+/// the refusal's count of one shows the edit is not a difference the rule
+/// judges. What the rule judges is a value in force that the recording does
+/// not hold, so the node is rebuilt with one more param, `scale`, default 3.0,
+/// which the recording names no value for. The recorded `gain` still applies
+/// to the rebuilt node.
 ///
 /// 1. The unchanged build resumes without the opt-in, on the recorded 2.0, so
 ///    the rule does not refuse every resume.
@@ -480,6 +484,18 @@ fn a_capture_resumed_on_a_build_that_added_a_param_is_refused_unless_allowed() {
             captured.iter().all(|(_, f)| *f == (2.0, 0.0, 9.0)),
             "the anchor's run published gain 2.0: {captured:?}"
         );
+
+        // The graph file now names another gain. The capture supplies the
+        // graph, so every resim below must still run `cam0` on the recorded 2.0.
+        let graph_file = root.join("graphs/demo.yaml");
+        let edited = std::fs::read_to_string(&graph_file)
+            .expect("read the graph file")
+            .replace("gain: 2.0", "gain: 4.0");
+        assert!(
+            edited.contains("gain: 4.0") && !edited.contains("gain: 2.0"),
+            "the edit must move the file off the recorded gain:\n{edited}"
+        );
+        std::fs::write(&graph_file, edited).unwrap();
 
         // 1. The unchanged build resumes on the recorded value, no opt-in.
         let unchanged = root.join("unchanged.mcap");
