@@ -34,9 +34,11 @@ on:
       - 'crates/cerud/**'
       - 'crates/native_ros2_messages/**'
       - 'crates/rmw_cerulion/**'
+      - 'crates/test_fixtures/android_e2e_demand_probe/**'
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   pull_request:
@@ -66,9 +68,11 @@ on:
       - 'crates/cerud/**'
       - 'crates/native_ros2_messages/**'
       - 'crates/rmw_cerulion/**'
+      - 'crates/test_fixtures/android_e2e_demand_probe/**'
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   # A `merge_group` run is treated like a `pull_request` run. The queue's
