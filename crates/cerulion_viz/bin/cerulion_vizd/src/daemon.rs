@@ -4114,6 +4114,16 @@ impl Ctx {
             match self
                 .check_model_route(&st, &topic, &route_key)
                 .and_then(|()| {
+                    // Refused before the tap is touched, so the surviving
+                    // attach keeps its tap, its demand and its resolution.
+                    let pinned = st
+                        .stats
+                        .get(&topic)
+                        .filter(|_| st.taps.contains(&topic))
+                        .and_then(|s| s.pinned_schema.as_deref());
+                    refuse_changed_schema_pin(&topic, pinned, &schema_name)
+                })
+                .and_then(|()| {
                     st.taps
                         .attach(
                             &self.manager,
@@ -6755,6 +6765,29 @@ fn undecodable_report(diagnosis: &UnknownHashDiagnosis) -> UndecodableReport {
         schema: diagnosis.schema_name().map(str::to_string),
         local_schema_hash: diagnosis.local_hash().map(|h| format!("0x{h:016X}")),
         detail: diagnosis.detail(),
+    }
+}
+
+/// The remote attach path's check that a re-attach names the type the tap
+/// already carries. `pinned` is the schema the topic's live remote tap was
+/// attached with (`None` when the topic has no remote tap). The mirror was
+/// demanded at that type's hash and its frames are that type, so a different
+/// pin is refused: answering it would report the new name for frames that are
+/// still the old type, and once a frame has decoded the reply would pair that
+/// name with the frames' archetype while `status` and `list` keep the old
+/// schema. The same name, or no earlier pin, passes.
+fn refuse_changed_schema_pin(
+    topic: &str,
+    pinned: Option<&str>,
+    requested: &str,
+) -> Result<(), String> {
+    match pinned {
+        Some(pinned) if pinned != requested => Err(format!(
+            "topic '{topic}' is already attached with schema '{pinned}', so it cannot be \
+             re-attached with schema '{requested}'; detach '{topic}' first to attach it with a \
+             different schema"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -9578,6 +9611,22 @@ mod tests {
         .write_to_buf(&mut frame);
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    /// A remote re-attach must name the schema the live tap was attached with:
+    /// the same name passes, a topic with no remote pin passes, and a different
+    /// name is refused with an error naming the topic and both schemas.
+    #[test]
+    fn a_remote_reattach_with_a_changed_schema_pin_is_refused() {
+        let topic = "/go2/camera";
+        let image = "sensor_msgs/CompressedImage";
+        assert_eq!(refuse_changed_schema_pin(topic, Some(image), image), Ok(()));
+        assert_eq!(refuse_changed_schema_pin(topic, None, image), Ok(()));
+        let err = refuse_changed_schema_pin(topic, Some(image), "sensor_msgs/Image")
+            .expect_err("a changed pin is refused");
+        for needle in [topic, image, "'sensor_msgs/Image'", "detach"] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
     }
 
     /// A remote RE-attach (`AlreadyAttached`) of a tap whose first frame already

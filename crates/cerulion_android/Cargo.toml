@@ -1,9 +1,20 @@
 [package]
 name = "cerulion_android"
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Embedded Cerulion runtime for Android apps: Java facade, JNI bindings and graph nodes linked into the app library"
+readme = "README.md"
+keywords = ["robotics", "android", "jni", "embedded", "cerulion"]
+categories = ["science::robotics", "os::android-apis"]
+# A crates.io download carries this crate's sources, the Java facade an app
+# compiles against, its README, the text of its license and this manifest.
+# The sample Gradle project and the integration tests serve work inside this
+# repository, so they stay out of the package.
+include = ["src/*.rs", "java/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -30,6 +41,9 @@ cerulion_core = { workspace = true, features = ["local-transport"] }
 # Test seams for this crate's own integration tests (the dev-dependency on
 # itself below turns it on); never enabled by an app build.
 test-helpers = ["cerulion_core/test-helpers"]
+# Run the host build on the in-process transport an Android app uses, so the
+# host tests cover the app's transport. Android builds turn it on already.
+local-transport = ["cerulion_core/local-transport"]
 
 [dev-dependencies]
 cerulion_android = { path = ".", features = ["test-helpers"] }
@@ -37,6 +51,10 @@ cerulion_android = { path = ".", features = ["test-helpers"] }
 # used to seed a TopicServiceConfig for the pure provisioning helpers).
 cerulion_core = { path = "../cerulion_core", features = ["test-helpers"] }
 tempfile = "3"
+# Node crates linked as plain libraries, the way an app runtime library links
+# its nodes: `default-features = false` leaves the C exports out.
+test_node_macro_period_cdylib = { path = "../test_fixtures/test_node_macro_period_cdylib", default-features = false }
+test_node_macro_relay_rlib = { path = "../test_fixtures/test_node_macro_relay_rlib" }
 zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
 
 [lints]
