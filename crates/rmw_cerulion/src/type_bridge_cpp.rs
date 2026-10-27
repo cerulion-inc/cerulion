@@ -48,11 +48,12 @@ use crate::ffi::introspection_cpp::{
 };
 use crate::type_bridge::{
     add_var_size, adopted_offset, align_up, check_out_cap, check_seq_bound, cursor_align_var,
-    cursor_append_var, cursor_write_var_entry, forge_placement, frame_head_len, is_primitive_type,
-    mask_bit, mask_has, padding_ranges, plan_seal, primitive_size, read_u32_prefix, read_var_entry,
-    ros_type, shadow_layout, warn_bad_entry, BorrowSeal, BorrowSlotGeometry, BridgeError,
-    ForgeOutcome, ForgePlacement, FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch,
-    WindowExtent, BORROW_TAIL_ALIGN, MAX_FRAME_BYTES,
+    cursor_append_var, cursor_write_var_entry, forge_placement, frame_head_len,
+    is_idl_empty_struct_placeholder, is_primitive_type, mask_bit, mask_has, padding_ranges,
+    plan_seal, primitive_size, read_u32_prefix, read_var_entry, ros_type, shadow_layout,
+    warn_bad_entry, BorrowSeal, BorrowSlotGeometry, BridgeError, ForgeOutcome, ForgePlacement,
+    FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch, WindowExtent,
+    BORROW_TAIL_ALIGN, MAX_FRAME_BYTES,
 };
 
 /// Why a `bool` sequence is unreachable when its member carries no `fetch`
@@ -237,7 +238,7 @@ impl CppBridgedMessage {
         // 3. Per-field plan with verified offsets/sizes.
         let m = &*members;
         let c_size = m.size_of_;
-        let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+        let member_slice = declared_members_cpp(m);
         // (Layout-drift plausibility is enforced in collect_schemas_cpp,
         // which already visited the root AND every nested type in step 1.)
 
@@ -952,10 +953,9 @@ impl CppBridgedMessage {
     }
 
     fn member(&self, idx: usize) -> &CppMessageMember {
-        unsafe {
-            let m = &*self.members;
-            &*(m.members_.add(idx))
-        }
+        // SAFETY: idx was minted from the same declared-members slice at
+        // registration; rosidl data is static.
+        unsafe { &declared_members_cpp(&*self.members)[idx] }
     }
 
     /// Size pre-pass: exact wire-frame byte count for this C++ message
@@ -1389,6 +1389,27 @@ unsafe fn nested_members_of_cpp(member: &CppMessageMember) -> *const CppMessageM
     (*member.members_).data as *const CppMessageMembers
 }
 
+/// The members a C++ struct DECLARES: the twin of
+/// [`crate::type_bridge::declared_members`]. rosidl's empty-struct
+/// placeholder is the same member in both introspection languages
+/// ([`is_idl_empty_struct_placeholder`]), and every member walk in this
+/// bridge goes through here so it stays invisible to all of them.
+unsafe fn declared_members_cpp(m: &CppMessageMembers) -> &'static [CppMessageMember] {
+    let all = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    match all {
+        [only]
+            if is_idl_empty_struct_placeholder(
+                ffi::cstr(only.name_),
+                only.type_id_,
+                only.is_array_,
+            ) =>
+        {
+            &[]
+        }
+        _ => all,
+    }
+}
+
 /// Verify a NESTED C++ type's introspection walk agrees with its
 /// `WireLayout` — the twin of
 /// [`crate::type_bridge::verify_nested_lockstep`]. See that function for why
@@ -1399,7 +1420,7 @@ unsafe fn verify_nested_lockstep_cpp(
     layout: &WireLayout,
 ) -> Result<(), BridgeError> {
     let m = &*members;
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
     let mut fixed_idx = 0usize;
     let mut var_idx = 0usize;
     for member in member_slice {
@@ -1485,15 +1506,11 @@ unsafe fn collect_schemas_cpp(
         return Ok(());
     }
     if out.contains_key(&qualified) {
-        return collect_nested_schemas_cpp(
-            std::slice::from_raw_parts(m.members_, m.member_count_ as usize),
-            out,
-            ptrs,
-        );
+        return collect_nested_schemas_cpp(declared_members_cpp(m), out, ptrs);
     }
 
     let mut schema = MessageSchema::new_in_package(name, &package);
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
     for member in member_slice {
         // Layout-drift plausibility guard, applied to EVERY visited
         // type (root + transitively nested): the
@@ -1619,7 +1636,7 @@ unsafe fn nested_is_fixed_cpp(members: *const CppMessageMembers) -> bool {
         return false;
     }
     let m = &*members;
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
     for member in member_slice {
         if member.type_id_ == ros_type::STRING || member.type_id_ == ros_type::WSTRING {
             return false;
@@ -1675,7 +1692,7 @@ unsafe fn member_data_runs_cpp(
     } else {
         1
     };
-    let nested_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let nested_slice = declared_members_cpp(m);
     for i in 0..count {
         for nm in nested_slice {
             member_data_runs_cpp(nm, base + i * stride + nm.offset_ as usize, runs);
@@ -1818,7 +1835,7 @@ unsafe fn unwritable_bool_seq_below_cpp(
         return None;
     }
     let nm = &*nested;
-    let nested_slice = std::slice::from_raw_parts(nm.members_, nm.member_count_ as usize);
+    let nested_slice = declared_members_cpp(nm);
     for nested_member in nested_slice {
         if unwritable_bool_seq_member_cpp(nested_member) {
             return Some(member_name_cpp(nested_member));
@@ -2163,7 +2180,7 @@ unsafe fn encode_message_payload_cpp(
     }
 
     let m = &*members;
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
 
     let layout = layouts
         .get_cpp(members)
@@ -2266,7 +2283,7 @@ unsafe fn encode_message_payload_cpp(
 
 unsafe fn zero_struct_padding_cpp(members: *const CppMessageMembers, buf: &mut [u8]) {
     let m = &*members;
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
     let mut runs = Vec::new();
     for nm in member_slice {
         member_data_runs_cpp(nm, nm.offset_ as usize, &mut runs);
@@ -2415,7 +2432,7 @@ unsafe fn decode_message_payload_cpp(
     }
 
     let m = &*members;
-    let member_slice = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+    let member_slice = declared_members_cpp(m);
     let Some(layout) = layouts.get_cpp(members) else {
         return false;
     };
