@@ -85,12 +85,15 @@
 //! cargo test -p cerulion_cli --test mp_supervisor_box_test -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! ### ~8 min scaffold cost
+//! ### Scaffold cost and cleanup
 //!
-//! The shared [`scaffold`] compiles a 3-node cdylib workspace ONCE per test
-//! process (cold `cargo build` of three node crates — the dominant cost, ~8 min).
-//! It is memoized in a `OnceLock`, and its `TempDir` is intentionally kept alive
-//! for the whole process so both `#[serial]` tests reuse the one build.
+//! Each test calls [`scaffold`], which scaffolds and builds a 3-node cdylib
+//! workspace in a [`ScaffoldDir`] the test holds, so the workspace is removed
+//! when the test ends, passing or failing (`CERULION_KEEP_TEST_WS=1` keeps a
+//! failed test's). Every scaffold of this binary builds into one target
+//! directory ([`scaffold_dir::scaffold_target_dir`]), so the dependencies
+//! compile once (about 8 min on a cold cache) and later tests rebuild only the
+//! node crates and what depends on the workspace's schemas.
 //!
 //! ### Execution mode: this suite pins the `lockstep` OPT-OUT
 //!
@@ -112,10 +115,12 @@
 // selects this file, and the coverage this costs are stated once in
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 
+mod scaffold_dir;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::node_cmd::NodeCreateOptions;
@@ -126,6 +131,7 @@ use cerulion_core::{
     merge_partition_traces, DylibNodeEntry, GraphRuntime, MacroPolicy, NodeEntry, ProcessTrace,
     TraceEntry, TransportConfig, TransportManager, VirtualClock,
 };
+use scaffold_dir::{pin_target_dir, scaffold_target_dir, ScaffoldDir};
 use serde::Deserialize;
 use serial_test::serial;
 
@@ -144,25 +150,21 @@ const SCHEMA: &str = "geometry_msgs/Vector3";
 // the pre-GO startup first-sample race).
 
 // ===========================================================================
-// Shared scaffold — built ONCE per test process (the ~8 min cost), memoized.
+// The scaffold: one per test, removed when the test's `Scaffold` drops.
 // ===========================================================================
 
-/// The one-per-process scaffolded workspace + the graph the supervisor runs. The
-/// `TempDir` is stored (not dropped) so the built cdylibs + graph YAML survive for
-/// the whole process; both `#[serial]` tests reuse the single build.
+/// The scaffolded workspace + the graph the supervisor runs.
 struct Scaffold {
-    /// Kept alive for the process lifetime so `ws_root` stays valid.
-    _tmp: tempfile::TempDir,
+    /// Owns the directory `ws_root` lives in and removes it on drop.
+    _dir: ScaffoldDir,
     ws_root: PathBuf,
+    /// Where the node cdylibs are built; handed to the supervisor child as
+    /// `CARGO_TARGET_DIR` and read by the monolith leg.
+    target_dir: PathBuf,
     /// The constructed graph config — reused as the MONOLITH oracle leg's config
     /// (the supervisor's own planning build feeds the SAME shape to
     /// `build_with_schema_hashes`, so a process-groups-carrying config is valid).
     config: GraphConfig,
-}
-
-fn scaffold() -> &'static Scaffold {
-    static SCAFFOLD: OnceLock<Scaffold> = OnceLock::new();
-    SCAFFOLD.get_or_init(build_scaffold)
 }
 
 /// Construct the graph config: `ticker`(L0) → `relay`(L1) → `sink`(L2) split into
@@ -233,9 +235,11 @@ fn build_graph_config() -> GraphConfig {
     }
 }
 
-fn build_scaffold() -> Scaffold {
-    let tmp = tempfile::tempdir().expect("temp dir for scaffold workspace");
-    let ws = workspace::workspace_create(tmp.path(), "sup_ws").expect("workspace_create");
+fn scaffold() -> Scaffold {
+    let dir = ScaffoldDir::new("sup_ws");
+    let ws = workspace::workspace_create(dir.path(), "sup_ws").expect("workspace_create");
+    let target_dir = scaffold_target_dir(&ws.root, "mp_supervisor_box_test");
+    pin_target_dir(&ws.root, &target_dir);
     let cargo_toml = ws.root.join("Cargo.toml");
 
     // ticker: pure Period 1ms source (no inputs, one output).
@@ -303,8 +307,9 @@ fn build_scaffold() -> Scaffold {
         .expect("write graph YAML");
 
     Scaffold {
-        _tmp: tmp,
+        _dir: dir,
         ws_root: ws.root,
+        target_dir,
         config,
     }
 }
@@ -402,22 +407,6 @@ fn group_by_step(entries: &[TraceEntry], lo: u64, hi: u64) -> Vec<(u64, Vec<(Str
 // the non-self-compare anchor for the cross-process merged trace.
 // ===========================================================================
 
-/// Mirror of `graph_cmd::cdylib_target_base`: honor `CARGO_TARGET_DIR` (abs or
-/// ws-relative) exactly as cargo + `node_build` do, else `<ws>/target`.
-fn cdylib_target_base(ws_root: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(v) if !v.is_empty() => {
-            let dir = PathBuf::from(v);
-            if dir.is_absolute() {
-                dir
-            } else {
-                ws_root.join(dir)
-            }
-        }
-        _ => ws_root.join("target"),
-    }
-}
-
 /// Build the monolith on an ISOLATED per-test transport (`init_for_test` +
 /// `iceoryx_test_config` — a distinct SHM root from the DEFAULT data-plane
 /// namespace the worker child processes used), load the three debug
@@ -437,7 +426,7 @@ fn run_monolith(sc: &Scaffold, steps: u64) -> Vec<TraceEntry> {
 
     // Debug artifacts (`node_build ... false`): `<base>/debug/lib<type>.so`. This
     // leg only RUNS on Linux (body-guarded), so the `.so` suffix is correct.
-    let debug_dir = cdylib_target_base(&sc.ws_root).join("debug");
+    let debug_dir = sc.target_dir.join("debug");
     let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> = indexmap::IndexMap::new();
     for id in ["ticker", "relay", "sink"] {
         let path = debug_dir.join(format!("lib{id}.so"));
@@ -642,6 +631,8 @@ fn spawn_supervisor(
     cmd.args(["graph", "run", GRAPH_NAME])
         .args(extra_args)
         .current_dir(&sc.ws_root)
+        // The workers load the node cdylibs from this target directory.
+        .env("CARGO_TARGET_DIR", &sc.target_dir)
         // Hermetic — no scouting session/gateway in CI (a real-clock
         // run is permissive-by-default; the kill-switch env keeps it LOCAL-ONLY).
         .env("CERULION_NETWORK", "off")
@@ -736,7 +727,7 @@ fn box_two_group_split_matches_monolith_oracle() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
     let trace_tmp = tempfile::tempdir().expect("temp dir for worker trace dumps");
     let trace_dir = trace_tmp.path();
 
@@ -884,7 +875,7 @@ fn box_worker_crash_fails_loud_no_orphans() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
 
     // (1) spawn the supervisor under the OPT-IN fail-loud policy
     // (`CERULION_MP_PEER_LOSS=fail` — the fail-loud behavior, non-default);
@@ -986,7 +977,7 @@ fn box_clean_worker_exit_drains_deployment() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
 
     // (1) spawn the production supervisor (process-group leader). Pipe BOTH streams
     // (the tracing fmt layer writes to STDERR, as does CliError) so we can
@@ -1113,7 +1104,7 @@ fn box_drain_deadline_kills_stopped_straggler() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
 
     // (1) spawn the supervisor with an 8s drain window + BOTH output streams
     // piped. 8s (not 5s): the SURVIVOR's ~5s barrier-poison exit-2 must be
@@ -1255,7 +1246,7 @@ fn box_worker_crash_continue_survivors_keep_firing() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
     let trace_tmp = tempfile::tempdir().expect("temp dir for worker trace dumps");
     let trace_dir = trace_tmp.path();
 
@@ -1404,7 +1395,7 @@ fn box_all_workers_crash_exits_nonzero_all_crashed() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
 
     // (1) spawn the supervisor under the DEFAULT policy (no CERULION_MP_PEER_LOSS).
     // Pipe BOTH streams: the all-crashed `tracing::error!` lands on stderr
@@ -1511,7 +1502,7 @@ fn box_peer_loss_fail_flag_reproduces_fail_loud() {
         return;
     }
 
-    let sc = scaffold();
+    let sc = &scaffold();
 
     // (1) spawn with the REAL flag; stderr piped for the fail-loud marker
     // (main()'s `eprintln!("Error: {e}")` CliError render). No peer-loss env.

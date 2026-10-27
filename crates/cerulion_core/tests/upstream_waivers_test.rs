@@ -279,6 +279,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
         "spawns `graph run --single-process` (plain and `--record`); its 3 macOS arms passed",
     ),
     (
+        "crates/cerulion_cli/tests/graph_open_file_limit_e2e_test.rs",
+        "spawns `graph run --single-process` and `graph profile` under a 1024 open-file \
+         limit: two arms are refused by the open-file check and the override arm fails \
+         on node types with no library, so no node plugin loads; its 3 macOS arms passed",
+    ),
+    (
         "crates/cerulion_cli/tests/telemetry_verb_e2e_test.rs",
         "spawns `graph run no_such_graph` in a workspace with no graphs: the run is \
          rejected before any node plugin loads, so no process asks for a second \

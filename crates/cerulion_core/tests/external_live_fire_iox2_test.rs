@@ -152,6 +152,7 @@ impl ExtProducer {
     /// Report the returned `Fd` as a DRAINED DOORBELL read end (the
     /// `#[doc(hidden)]` cdylib-only marker) so collect binds/refuses it via the
     /// `is_doorbell` sub-arm — the ONLY arm that CLOSES a refused live fd.
+    #[cfg_attr(target_os = "linux", allow(dead_code))] // its one caller is not on Linux
     fn with_doorbell_marker(mut self) -> Self {
         self.is_doorbell = true;
         self
@@ -2282,7 +2283,9 @@ fn wake_storm_stays_live_one_fire_per_step_no_lost_tail() {
 //
 // An external `ExternalSource::Fd` whose value is >= FD_SETSIZE (1024) is
 // out-of-bounds UB in the select-backed WaitSet's `FD_SET`, so a park-OFF run
-// REFUSES it (reason FdAboveSelectLimit) with two workarounds. But the
+// on macOS and the other non-Linux targets REFUSES it (reason
+// FdAboveSelectLimit) with two workarounds. On Linux the WaitSet waits with
+// epoll, so a park-OFF run there binds the same fd and fires the node. But the
 // monitor-wait park polls each external fd via poll(2) (no fd-number ceiling), so
 // a park-ON run ACCEPTS a live high fd and fires the node. These tests pin both
 // sides + the exact FD_SETSIZE boundary. No `#[cfg(unix)]` gate — the whole file
@@ -2361,6 +2364,7 @@ impl HighFdPipe {
     /// Relinquish the high READ-end fd so `Drop` won't close it:
     /// used when the runtime OWNS and closes it (a refused DOORBELL read end), so
     /// the test must not double-close a fd number the process may have reused.
+    #[cfg_attr(target_os = "linux", allow(dead_code))] // the doorbell arm is not on Linux
     fn take_high(&mut self) -> RawFd {
         let h = self.high;
         self.high = -1;
@@ -2371,6 +2375,7 @@ impl HighFdPipe {
     /// `(rc, errno)`. Unlike [`Self::write_byte`] this does NOT assert success —
     /// once the sole read reference is closed, the write fails `-1`/`EPIPE`, which
     /// is the observable oracle that a refused doorbell read end was closed.
+    #[cfg_attr(target_os = "linux", allow(dead_code))] // the doorbell arm is not on Linux
     fn try_write_byte(&self) -> (isize, i32) {
         let b: u8 = 1;
         // SAFETY: `self.pipe.write` is a valid open fd; one byte from a live buffer.
@@ -2456,6 +2461,7 @@ fn park_on_high_fd_runs_and_fires_via_poll() {
 /// (FdAboveSelectLimit) and rendering BOTH workarounds. Nothing binds; the node
 /// never fires. The refusal returns BEFORE any reactor is built, so the boundary
 /// fd is never actually `select`ed on.
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[serial]
 fn park_off_high_fd_refused_with_two_workarounds() {
@@ -2500,10 +2506,64 @@ fn park_off_high_fd_refused_with_two_workarounds() {
     );
 }
 
+/// On Linux the park-OFF WaitSet waits with epoll, which has no fd-number
+/// ceiling: a live fd `>= FD_SETSIZE` binds at collect, a byte written to it
+/// fires the external node on the live seam, and the value reaches the
+/// downstream consumer. The fd is the one
+/// `park_off_high_fd_refused_with_two_workarounds` refuses on the other targets.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn park_off_high_fd_binds_and_fires_on_linux() {
+    let _spin = SpinDisabledGuard::new();
+    let hpipe = HighFdPipe::new(libc::FD_SETSIZE as RawFd + 76); // 1100 >= FD_SETSIZE
+    let p_fires = Arc::new(AtomicU64::new(0));
+    let c_last = Arc::new(AtomicU64::new(0));
+    let c_fires = Arc::new(AtomicU64::new(0));
+    let producer = ExtProducer::new(
+        ExternalSource::Fd(hpipe.high),
+        Arc::clone(&p_fires),
+        Some(hpipe.high), // drain in tick
+    );
+    // Park OFF (default `build_for_test`) → the WaitSet path.
+    let mut runtime = producer_consumer_graph(producer, Arc::clone(&c_last), Arc::clone(&c_fires));
+
+    runtime
+        .try_collect_external_sources_for_test()
+        .expect("a live fd >= FD_SETSIZE binds on the Linux epoll WaitSet");
+    assert_eq!(
+        runtime.external_binding_count(),
+        1,
+        "park-OFF on Linux: the high fd binds"
+    );
+
+    hpipe.write_byte();
+    runtime.run_live_step_once_for_test(Duration::from_millis(500));
+
+    assert_eq!(
+        p_fires.load(Ordering::Relaxed),
+        1,
+        "the high fd fires the external node exactly once"
+    );
+    assert_eq!(
+        c_fires.load(Ordering::Relaxed),
+        1,
+        "the downstream data-trigger consumer fires once"
+    );
+    assert_eq!(
+        c_last.load(Ordering::Relaxed),
+        1,
+        "delivery oracle: the consumer received the producer's published value (1)"
+    );
+}
+
 /// The EXACT FD_SETSIZE boundary on the select (park-OFF) path. `1023`
 /// (FD_SETSIZE-1) is below the ceiling → ACCEPTED (binds); `1024` (== FD_SETSIZE)
 /// is at the ceiling → FdAboveSelectLimit. Two sub-arms in one body. Neither arm
 /// drives the live seam, so the boundary fds are never actually `select`ed on.
+/// Not on Linux, whose epoll WaitSet has no ceiling
+/// (`park_off_high_fd_binds_and_fires_on_linux`).
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[serial]
 fn fd_setsize_boundary_park_off() {
@@ -2573,6 +2633,9 @@ fn fd_setsize_boundary_park_off() {
 /// `collect_external_sources_for_test()` PANICS (the whole test fails). Verified
 /// locally (revert → fail → restore).
 ///
+/// On Linux the fd binds with or without the barrier (the WaitSet waits with
+/// epoll there), so the mutation kill holds on the other targets only.
+///
 /// Collect-ONLY: a barrier participant makes `step()` rendezvous on the barrier,
 /// but collect never touches it, so no step is driven (and no peer is needed).
 /// `expected == 1` makes the barrier self-opening regardless.
@@ -2622,6 +2685,7 @@ fn barrier_participant_lifts_select_ceiling_for_high_fd() {
 /// self-compare): once the sole read reference is closed, a `write(2)` returns
 /// `-1`/`EPIPE`. SIGPIPE is masked (the Rust runtime ignores it by default, but
 /// this is belt-and-suspenders) so the write reports the error instead of raising.
+#[cfg(not(target_os = "linux"))]
 #[test]
 #[serial]
 fn park_off_high_fd_doorbell_is_refused_and_read_end_closed() {
