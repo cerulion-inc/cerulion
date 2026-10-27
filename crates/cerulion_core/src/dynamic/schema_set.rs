@@ -401,7 +401,7 @@ impl SchemaSet {
             return Err(DynamicError::SchemaNotWireRepresentable {
                 schema: schemas[i].qualified_name(),
                 detail: format!(
-                    "frame prefix (32-byte header + {}-byte fixed section + {}-entry offset table) exceeds the u32 wire total_size",
+                    "frame prefix (40-byte header + {}-byte fixed section + {}-entry offset table) exceeds the u32 wire total_size",
                     layout.fixed_size,
                     layout.variable_fields.len()
                 ),

@@ -2744,6 +2744,7 @@ jobs:
       # Runs the netd lib/bin unit tests + the daemon/mirror/client integration tests +
       # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
       # roots + per-test iroh identities ⇒ parallel-safe).
+      # doc-pin: cerulion_netd::networking_doc_banner_test reads docs
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: cargo test -p cerulion_netd --features wan

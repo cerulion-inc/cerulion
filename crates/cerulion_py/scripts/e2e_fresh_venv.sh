@@ -69,10 +69,10 @@ fi
 
 cd /tmp
 OUT="$("$TEST_VENV/bin/python" "$REPO/crates/cerulion_py/scripts/e2e_roundtrip.py")"
-EXPECTED='frame seq=0 schema_hash=305419896 timestamp_ns=1000 total_size=96 payload_len=64 fnv1a64=dc73a7cb467baca5
-frame seq=1 schema_hash=305419896 timestamp_ns=1000 total_size=96 payload_len=64 fnv1a64=d4f6e5f13c429765
-frame seq=2 schema_hash=305419896 timestamp_ns=1000 total_size=96 payload_len=64 fnv1a64=9f8afc9eacf610a5
-fixture: frame seq=0 schema_hash=305419896 timestamp_ns=77 total_size=96 body_len=64 fnv1a64=dc73a7cb467baca5'
+EXPECTED='frame seq=0 schema_hash=305419896 timestamp_ns=1000 total_size=104 payload_len=64 fnv1a64=dc73a7cb467baca5
+frame seq=1 schema_hash=305419896 timestamp_ns=1000 total_size=104 payload_len=64 fnv1a64=d4f6e5f13c429765
+frame seq=2 schema_hash=305419896 timestamp_ns=1000 total_size=104 payload_len=64 fnv1a64=9f8afc9eacf610a5
+fixture: frame seq=0 schema_hash=305419896 timestamp_ns=77 total_size=104 body_len=64 fnv1a64=dc73a7cb467baca5'
 if [ "$OUT" != "$EXPECTED" ]; then
     echo "E2E MISMATCH" >&2
     diff <(echo "$EXPECTED") <(echo "$OUT") >&2

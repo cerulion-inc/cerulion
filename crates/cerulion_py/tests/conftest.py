@@ -97,8 +97,9 @@ def shm_mappings():
 
 
 def expected_header_bytes(schema_hash, total_size, sequence, timestamp_ns):
-    """32-byte wire header: <QIIIIQ. Offset table offset/count are zero for raw frames."""
-    return struct.pack("<QIIIIQ", schema_hash, total_size, 0, 0, sequence, timestamp_ns)
+    """40-byte wire header: <QIIIIQQ. Offset table offset/count are zero for raw frames,
+    and the step tag (the last eight bytes) is zero: untagged."""
+    return struct.pack("<QIIIIQQ", schema_hash, total_size, 0, 0, sequence, timestamp_ns, 0)
 
 
 def spawn_fixture(fixture_bin, args, stdin=None):

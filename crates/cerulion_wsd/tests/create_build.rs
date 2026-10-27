@@ -23,20 +23,37 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 type Reader = BufReader<OwnedReadHalf>;
 
+/// Removes a test's scratch path (a directory or a file) when dropped, so an
+/// arm that panics before [`Fixture::stop`] leaves nothing behind either.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        // NotFound is the normal case for a socket the daemon already removed.
+        let _ = if self.0.is_dir() {
+            std::fs::remove_dir_all(&self.0)
+        } else {
+            std::fs::remove_file(&self.0)
+        };
+    }
+}
+
+/// Fields drop in declaration order, so `running` drops before the scratch
+/// paths are removed.
 struct Fixture {
-    parent: PathBuf,
     root: PathBuf,
     socket: PathBuf,
     running: RunningWsd,
     /// The node crate `build_fixture` wrote (empty for `workspace_fixture`).
     node: String,
+    parent: RemoveOnDrop,
+    _socket: RemoveOnDrop,
 }
 
 impl Fixture {
+    /// Shut the daemon down; dropping `self` then removes the scratch paths.
     async fn stop(mut self) {
         self.running.shutdown().await;
-        let _ = std::fs::remove_dir_all(&self.parent);
-        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -48,8 +65,9 @@ fn unique_path(prefix: &str) -> PathBuf {
     ))
 }
 
-async fn start(parent: PathBuf, root: PathBuf) -> Fixture {
+async fn start(parent: RemoveOnDrop, root: PathBuf) -> Fixture {
     let socket = unique_path("socket");
+    let socket_guard = RemoveOnDrop(socket.clone());
     let running = daemon::start(WsdConfig {
         socket_path: socket.clone(),
         ..WsdConfig::default()
@@ -57,19 +75,20 @@ async fn start(parent: PathBuf, root: PathBuf) -> Fixture {
     .await
     .expect("daemon start");
     Fixture {
-        parent,
         root,
         socket,
         running,
         node: String::new(),
+        parent,
+        _socket: socket_guard,
     }
 }
 
 /// A scaffolded workspace, as `cerulion workspace create` makes one.
 async fn workspace_fixture() -> Fixture {
-    let parent = unique_path("parent");
-    std::fs::create_dir_all(&parent).expect("parent");
-    let root = workspace::workspace_create(&parent, "test")
+    let parent = RemoveOnDrop(unique_path("parent"));
+    std::fs::create_dir_all(&parent.0).expect("parent");
+    let root = workspace::workspace_create(&parent.0, "test")
         .expect("workspace")
         .root;
     start(parent, root).await
@@ -78,8 +97,8 @@ async fn workspace_fixture() -> Fixture {
 /// The smallest workspace `node.build` accepts, with one node crate that has
 /// NO dependencies, so cargo needs neither the network nor a runtime build.
 async fn build_fixture(lib_rs: &str, build_rs: Option<&str>) -> Fixture {
-    let parent = unique_path("parent");
-    let root = parent.join("ws");
+    let parent = RemoveOnDrop(unique_path("parent"));
+    let root = parent.0.join("ws");
     // A name of its own: cargo keys a workspace member's artifacts by name
     // and workspace-relative path, so two fixtures sharing one `target`
     // directory (a developer's `CARGO_TARGET_DIR`) must not share a name.
@@ -218,7 +237,7 @@ async fn graph_create_returns_the_version_of_the_new_file() {
     )
     .await;
     assert_eq!(error_code(&escaping), "bad_request", "{escaping}");
-    assert!(!fixture.parent.join("escape.yaml").exists());
+    assert!(!fixture.parent.0.join("escape.yaml").exists());
     fixture.stop().await;
 }
 

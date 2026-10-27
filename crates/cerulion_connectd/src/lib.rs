@@ -5,7 +5,7 @@
 //! REMOTE robot's topics appear as LOCAL desk SHM topics ("remote = local"). It
 //! owns the desk's iroh half:
 //!
-//! - **Dial** the robot's `cerulion/wire/1` ALPN by [`EndpointId`](cerulion_link::EndpointId)
+//! - **Dial** the robot's `cerulion/wire/2` ALPN by [`EndpointId`](cerulion_link::EndpointId)
 //!   (+ optional direct LAN socket addresses) with a persisted or ephemeral desk
 //!   device key.
 //! - **Speak** the shared `cerulion_q` catalog / demand / schema / status
@@ -24,7 +24,7 @@
 //!
 //! - [`config`]: the resolved dial parameters ([`ConnectConfig`]) + the pure
 //!   input parsers (eid / addrs / desk key / account).
-//! - [`protocol`]: the desk-side MIRROR of the robot's `cerulion/wire/1` control
+//! - [`protocol`]: the desk-side MIRROR of the robot's `cerulion/wire/2` control
 //!   protocol (a dev-dep parity test pins it against the robot's serve types).
 //! - [`schema`]: materialize a robot-served schema closure into the desk store.
 //! - [`worker`]: [`run_connect`], the dial, demand and per-topic re-inject engine.

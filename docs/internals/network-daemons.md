@@ -318,7 +318,7 @@ wrong.
   dependency graph rather than a comment (it also keeps every write on the one
   atomic-secret-write path). Dependency policy: std + serde + dirs + tracing
   ONLY (no transport crates), so it is safe in `default-members`.
-- **`cerulion_wireclient`**: the desk-side `cerulion/wire/1` client substrate
+- **`cerulion_wireclient`**: the desk-side `cerulion/wire/2` client substrate
   (control vocabulary, dial-config parsers, the per-topic re-inject reader). It is
   a crate of its own so that `cerulion_netd` reuses the vocabulary and parsers
   with no netd→connectd cyclic edge: both daemons depend on the substrate rather
@@ -410,6 +410,7 @@ rung itself.
 | `crates/cerulion_netd/tests/catalog_events_live_test.rs` | Real zenoh liveliness tokens reach the announce watch (Alive→Lost), so the announce key-space wiring is not inert | no | none |
 | `crates/cerulion_netd/tests/discovery_fold_test.rs` | The boot-time peer-cache fold: real cache document, real TTL reader, real TCP pre-filter, the exact `NetworkConfig` mutation main performs | no | none |
 | `crates/cerulion_netd/tests/mdns_suppression_confinement_test.rs` | Source walk: suppressed-advertiser test constructors are referenced by no shipped code path | no | none |
+| `crates/cerulion_netd/tests/networking_doc_banner_test.rs` | The `docs/networking.md` banner example is the exact line `Hello::new()` writes (protocol and wire header versions, field order) | no | none |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The iroh WAN plane over loopback iroh: byte-identical re-inject, release frees the slot, pairing gate, reader-death teardown, dual-plane routing (compiles by default; absent under `--no-default-features`) | no | none |
 | `cerulion_dds` inline unit tests (`wire.rs`, `discovery.rs`, `wire_acquirer.rs`) | The pure wire decision engine, discovery mapping, feature/GID pins, skew-warn emit sites, all DDS-free oracles | no | none |
 | `crates/cerulion_dds/tests/live_discovery_box_test.rs` | Live SPDP/SEDP + spinner against a real CycloneDDS peer; precondition-panics with the bring-up recipe | `#[ignore]`, hardware only | `DDS_IFACE` env + a DDS talker |

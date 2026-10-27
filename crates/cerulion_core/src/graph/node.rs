@@ -262,7 +262,7 @@ pub struct OutputMeta {
     /// more. The `MaxSliceLen` newtype encodes
     /// BOTH the upper bound (`u32::MAX`, the wire format's
     /// `WireHeader::total_size` ceiling) AND the lower bound
-    /// (`>= WireHeader::SIZE = 32`). Construction is fallible (via
+    /// (`>= WireHeader::SIZE`, 40 bytes). Construction is fallible (via
     /// `MaxSliceLen::try_new`), so the field stays `pub` safely:
     /// `meta.max_slice_len_default = MaxSliceLen::try_new(8)` returns
     /// `None` — no pathological state ever stored, even on direct
@@ -5307,8 +5307,8 @@ impl DylibNodeEntry {
                     // `MaxSliceLen::try_new` enforces BOTH bounds:
                     // values `> u32::MAX` (theoretically possible
                     // from an older cdylib) become `None`;
-                    // values `< WireHeader::SIZE` (i.e., 0-31)
-                    // become `None`. `n == WireHeader::SIZE` (32) IS
+                    // values `< WireHeader::SIZE` (i.e., 0 to 39)
+                    // become `None`. `n == WireHeader::SIZE` (40) IS
                     // valid (header-only payload). `n == 0` is
                     // dropped silently (interpreted as "unset");
                     // `n in [1, 31]` and `n > u32::MAX` fire a
@@ -8859,8 +8859,8 @@ mod tests {
     // `max_slice_len_default: Option<usize>` to `Option<MaxSliceLen>`.
     // These tests pin the four-bucket decision:
     //   n == 0                 → drop silently (interpreted as "unset")
-    //   1 <= n < 32            → drop with `tracing::warn!`
-    //   32 <= n <= u32::MAX    → accept as `Some(MaxSliceLen(n))`
+    //   1 <= n < 40            → drop with `tracing::warn!`
+    //   40 <= n <= u32::MAX    → accept as `Some(MaxSliceLen(n))`
     //   n > u32::MAX           → drop with `tracing::warn!`
     // Without these, a future flip of `<` to `<=` (or removal of the
     // warn branch) ships silently.
@@ -8884,8 +8884,8 @@ mod tests {
 
     #[test]
     fn parse_info_json_max_slice_len_default_below_floor_drops() {
-        // 1, 31: positive but `< WireHeader::SIZE` — dropped with warn.
-        for n in [1u64, 16, 31] {
+        // 1, 39: positive but `< WireHeader::SIZE`, dropped with warn.
+        for n in [1u64, 16, 39] {
             let info = parse_info_with_msl(serde_json::json!(n));
             assert_eq!(
                 info.output_meta[0].max_slice_len_default, None,
@@ -8896,12 +8896,12 @@ mod tests {
 
     #[test]
     fn parse_info_json_max_slice_len_default_at_floor_accepted() {
-        // 32 = WireHeader::SIZE — smallest legal MaxSliceLen.
-        let info = parse_info_with_msl(serde_json::json!(32u64));
+        // 40 = WireHeader::SIZE, the smallest legal MaxSliceLen.
+        let info = parse_info_with_msl(serde_json::json!(40u64));
         let msl = info.output_meta[0]
             .max_slice_len_default
-            .expect("32 must be accepted");
-        assert_eq!(msl.get(), 32);
+            .expect("40 must be accepted");
+        assert_eq!(msl.get(), 40);
     }
 
     #[test]

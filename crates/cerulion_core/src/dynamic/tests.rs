@@ -44,7 +44,7 @@ fn output_meta_matches_fixed_and_variable_wire_defaults() {
     let fixed = set.output_meta("Fixed").expect("fixed schema present");
     assert_eq!(fixed.0, set.schema_hash("Fixed").unwrap());
     assert_eq!(fixed.1, 24);
-    assert_eq!(fixed.2, Some(56));
+    assert_eq!(fixed.2, Some(64));
 
     set.add_yaml_str(PROBE_YAML).unwrap();
     let variable = set.output_meta("Probe").expect("variable schema present");
@@ -58,12 +58,13 @@ fn output_meta_matches_fixed_and_variable_wire_defaults() {
 fn probe_oracle_frame(schema_hash: u64) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&schema_hash.to_le_bytes());
-    f.extend_from_slice(&[0x50, 0, 0, 0]); // total_size 80
-    f.extend_from_slice(&[0x28, 0, 0, 0]); // offset_table_offset 32 + 8
+    f.extend_from_slice(&[0x58, 0, 0, 0]); // total_size 88
+    f.extend_from_slice(&[0x30, 0, 0, 0]); // offset_table_offset 40 + 8
     f.extend_from_slice(&[0x02, 0, 0, 0]); // offset_table_count
     f.extend_from_slice(&[0, 0, 0, 0]); // sequence
     f.extend_from_slice(&[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]); // ts
-                                                                            // fixed section
+    f.extend_from_slice(&[0; 8]); // step_tag: untagged
+                                  // fixed section
     f.extend_from_slice(&[0x04, 0x03, 0x02, 0x01, 0x07, 0, 0, 0]);
     // offset table: name @24 len 2, samples @32 len 16
     f.extend_from_slice(&[0x18, 0, 0, 0, 0x02, 0, 0, 0]);
@@ -73,7 +74,7 @@ fn probe_oracle_frame(schema_hash: u64) -> Vec<u8> {
     // samples 1.0, 2.0 (f64 LE)
     f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0xF0, 0x3F]);
     f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x40]);
-    assert_eq!(f.len(), 80);
+    assert_eq!(f.len(), 88);
     f
 }
 
@@ -93,9 +94,9 @@ fn encode_probe(set: &SchemaSet) -> Vec<u8> {
     s[..8].copy_from_slice(&1.0f64.to_le_bytes());
     s[8..].copy_from_slice(&2.0f64.to_le_bytes());
     let n = cur.finish();
-    assert_eq!(n, 80);
+    assert_eq!(n, 88);
     assert!(
-        buf[80..].iter().all(|&b| b == 0xAA),
+        buf[88..].iter().all(|&b| b == 0xAA),
         "bytes past the frame untouched"
     );
     buf.truncate(n);
@@ -663,7 +664,7 @@ fn empty_variable_field_out_of_range_offset_clamps_instead_of_panicking() {
     buf.truncate(n);
     // Corrupt the `samples` entry's offset while len stays 0: construction
     // skips bounds checks for empty entries, so the accessor must clamp.
-    let entry = 32 + layout.fixed_size + 8;
+    let entry = crate::wire::WireHeader::SIZE + layout.fixed_size + 8;
     buf[entry..entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     let view =
         FrameView::new(set.walker(), &buf).expect("empty entries skip construction bounds checks");
@@ -803,12 +804,13 @@ fn encoder_required_len_and_placement_rules() {
     let layout = set.layout("Probe").expect("Probe");
     let enc = FrameEncoder::new(layout).expect("valid layout");
     assert_eq!(enc.layout(), layout);
-    // header 32 + floor 24 + "ab" 2 → 58, align to 8 → 64 (payload 32), +16.
-    assert_eq!(enc.required_len(&[2, 16]), Ok(80));
+    // header 40 + floor 24 + "ab" 2 = 66, the payload (26) aligns to 32 → 72,
+    // +16.
+    assert_eq!(enc.required_len(&[2, 16]), Ok(88));
     // Empty variable fields: nothing after the floor except alignment.
-    assert_eq!(enc.required_len(&[0, 0]), Ok(56));
+    assert_eq!(enc.required_len(&[0, 0]), Ok(64));
     // Name of 8 bytes lands the cursor already aligned: no padding.
-    assert_eq!(enc.required_len(&[8, 8]), Ok(72));
+    assert_eq!(enc.required_len(&[8, 8]), Ok(80));
     assert_eq!(
         enc.required_len(&[2]),
         Err(DynamicError::VariableCountMismatch {
@@ -826,7 +828,7 @@ fn encoder_required_len_and_placement_rules() {
     );
     // Max slice length: the largest frame the u32 total_size admits, and
     // one element past it.
-    let max_samples = (u32::MAX as usize - 32 - 24) / 8 * 8;
+    let max_samples = (u32::MAX as usize - 40 - 24) / 8 * 8;
     assert_eq!(
         enc.required_len(&[0, max_samples]),
         Ok(u32::MAX as usize - 7)
@@ -849,10 +851,10 @@ fn encoder_required_len_and_placement_rules() {
         Err(DynamicError::FrameTooLarge { .. })
     ));
 
-    let mut small = [0u8; 79];
+    let mut small = [0u8; 87];
     assert_eq!(
         enc.begin(&mut small, &[2, 16], TS).map(|c| c.finish()),
-        Err(DynamicError::BufferTooSmall { need: 80, have: 79 })
+        Err(DynamicError::BufferTooSmall { need: 88, have: 87 })
     );
 }
 
@@ -861,7 +863,7 @@ fn encoder_empty_variable_fields_frame_is_all_zero_payload_after_table() {
     let set = probe_set();
     let layout = set.layout("Probe").expect("Probe");
     let enc = FrameEncoder::new(layout).expect("valid layout");
-    let mut buf = [0xFFu8; 56];
+    let mut buf = [0xFFu8; 64];
     let mut cur = enc.begin(&mut buf, &[0, 0], 0).expect("begin");
     assert!(cur.variable_field_mut("name").expect("name").is_empty());
     assert!(cur
@@ -870,11 +872,12 @@ fn encoder_empty_variable_fields_frame_is_all_zero_payload_after_table() {
         .is_empty());
     assert_eq!(cur.fixed_section_mut(), &[0u8; 8]);
     cur.set_sequence(0x0A0B_0C0D);
-    assert_eq!(cur.finish(), 56);
+    assert_eq!(cur.finish(), 64);
     let mut oracle = Vec::new();
     oracle.extend_from_slice(&layout.schema_hash.to_le_bytes());
-    oracle.extend_from_slice(&[56, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0, 0x0D, 0x0C, 0x0B, 0x0A]);
+    oracle.extend_from_slice(&[64, 0, 0, 0, 48, 0, 0, 0, 2, 0, 0, 0, 0x0D, 0x0C, 0x0B, 0x0A]);
     oracle.extend_from_slice(&[0; 8]); // timestamp 0
+    oracle.extend_from_slice(&[0; 8]); // step_tag: untagged
     oracle.extend_from_slice(&[0; 8]); // fixed
     oracle.extend_from_slice(&[24, 0, 0, 0, 0, 0, 0, 0]); // name @24 len 0
     oracle.extend_from_slice(&[24, 0, 0, 0, 0, 0, 0, 0]); // samples @24 len 0
@@ -897,8 +900,8 @@ fn encoder_fixed_only_and_fixed_size_zero_schemas() {
     let fixed = set.layout("Fixed").expect("Fixed");
     assert_eq!((fixed.fixed_size, fixed.data_floor()), (4, 4));
     let enc = FrameEncoder::new(fixed).expect("valid layout");
-    assert_eq!(enc.required_len(&[]), Ok(36));
-    let mut buf = [0u8; 36];
+    assert_eq!(enc.required_len(&[]), Ok(44));
+    let mut buf = [0u8; 44];
     let mut cur = enc.begin(&mut buf, &[], 9).expect("begin");
     cur.fixed_field_mut("a")
         .expect("a")
@@ -912,12 +915,13 @@ fn encoder_fixed_only_and_fixed_size_zero_schemas() {
         cur.variable_field_mut("a"),
         Err(DynamicError::UnknownVariableField("a".into()))
     );
-    assert_eq!(cur.frame().len(), 36);
-    assert_eq!(cur.finish(), 36);
+    assert_eq!(cur.frame().len(), 44);
+    assert_eq!(cur.finish(), 44);
     let mut oracle = fixed.schema_hash.to_le_bytes().to_vec();
     oracle.extend_from_slice(&[
-        36, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
+        44, 0, 0, 0, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
     ]);
+    oracle.extend_from_slice(&[0; 8]); // step_tag: untagged
     oracle.extend_from_slice(&[0x34, 0x12, 0x56, 0]);
     assert_eq!(&buf[..], &oracle[..]);
     let view = FrameView::new(set.walker(), &buf).expect("valid");
@@ -928,17 +932,18 @@ fn encoder_fixed_only_and_fixed_size_zero_schemas() {
     let var = set.layout("Var").expect("Var");
     assert_eq!((var.fixed_size, var.data_floor()), (0, 8));
     let enc = FrameEncoder::new(var).expect("valid layout");
-    let mut buf = [0u8; 43];
+    let mut buf = [0u8; 51];
     let mut cur = enc.begin(&mut buf, &[3], 0).expect("begin");
     assert!(cur.fixed_section_mut().is_empty());
     cur.variable_field_mut_at(0)
         .expect("s")
         .copy_from_slice(b"hey");
-    assert_eq!(cur.finish(), 43);
+    assert_eq!(cur.finish(), 51);
     let mut oracle = var.schema_hash.to_le_bytes().to_vec();
     oracle.extend_from_slice(&[
-        43, 0, 0, 0, 32, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        51, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ]);
+    oracle.extend_from_slice(&[0; 8]); // step_tag: untagged
     oracle.extend_from_slice(&[8, 0, 0, 0, 3, 0, 0, 0]);
     oracle.extend_from_slice(b"hey");
     assert_eq!(&buf[..], &oracle[..]);
@@ -959,8 +964,8 @@ fn view_reads_every_field_of_the_oracle_frame() {
     assert_eq!(view.schema_hash(), hash);
     assert_eq!(view.timestamp_ns(), TS);
     assert_eq!(view.sequence(), 0);
-    assert_eq!(view.total_size(), 80);
-    assert_eq!(view.frame().len(), 80);
+    assert_eq!(view.total_size(), 88);
+    assert_eq!(view.frame().len(), 88);
     assert_eq!(view.payload().len(), 48);
     assert_eq!(view.header().offset_table_count, 2);
     assert_eq!(view.layout(), set.layout("Probe").expect("Probe"));
@@ -974,7 +979,7 @@ fn view_reads_every_field_of_the_oracle_frame() {
     assert_eq!((arr.elem, arr.count), (PrimType::F64, 2));
     assert_eq!(
         arr.bytes,
-        &frame[64..80],
+        &frame[72..88],
         "the array slice is the entry's own 16 bytes"
     );
     let (chunks, rest) = arr.bytes.as_chunks::<8>();
@@ -983,7 +988,7 @@ fn view_reads_every_field_of_the_oracle_frame() {
     assert_eq!(samples, [1.0, 2.0]);
     assert_eq!(
         arr.bytes.as_ptr() as usize % 8,
-        frame[32..].as_ptr() as usize % 8
+        frame[crate::wire::WireHeader::SIZE..].as_ptr() as usize % 8
     );
 
     assert_eq!(
@@ -1040,8 +1045,8 @@ fn view_err(set: &SchemaSet, frame: &[u8]) -> DynamicError {
 fn view_rejects_short_frame_and_unknown_hash() {
     let (frame, set) = probe_frame_and_walker();
     assert_eq!(
-        view_err(&set, &frame[..31]),
-        DynamicError::FrameTooShort { have: 31, need: 32 }
+        view_err(&set, &frame[..39]),
+        DynamicError::FrameTooShort { have: 39, need: 40 }
     );
     let mut bad = frame.clone();
     bad[0] ^= 0xFF;
@@ -1063,22 +1068,22 @@ fn view_rejects_short_frame_and_unknown_hash() {
 fn view_rejects_total_size_out_of_range() {
     let (frame, set) = probe_frame_and_walker();
     let mut big = frame.clone();
-    big[8..12].copy_from_slice(&81u32.to_le_bytes());
+    big[8..12].copy_from_slice(&89u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &big),
         DynamicError::TotalSizeExceedsBuffer {
-            total_size: 81,
-            have: 80
+            total_size: 89,
+            have: 88
         }
     );
     let mut tiny = frame.clone();
-    tiny[8..12].copy_from_slice(&55u32.to_le_bytes());
+    tiny[8..12].copy_from_slice(&63u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &tiny),
         DynamicError::TotalSizeBelowPrefix {
             schema: "Probe".into(),
-            total_size: 55,
-            need: 56,
+            total_size: 63,
+            need: 64,
         }
     );
 }
@@ -1087,12 +1092,12 @@ fn view_rejects_total_size_out_of_range() {
 fn view_rejects_header_offset_table_mismatch() {
     let (frame, set) = probe_frame_and_walker();
     let mut bad = frame.clone();
-    bad[12..16].copy_from_slice(&41u32.to_le_bytes());
+    bad[12..16].copy_from_slice(&49u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &bad),
         DynamicError::OffsetTableMismatch {
-            expected_offset: 40,
-            offset: 41,
+            expected_offset: 48,
+            offset: 49,
             expected_count: 2,
             count: 2,
         }
@@ -1109,7 +1114,7 @@ fn view_rejects_header_offset_table_mismatch() {
 fn view_rejects_offset_below_data_floor() {
     let (mut frame, set) = probe_frame_and_walker();
     // name entry (payload [8..16)) → offset 23, one below the floor.
-    frame[40..44].copy_from_slice(&23u32.to_le_bytes());
+    frame[48..52].copy_from_slice(&23u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &frame),
         DynamicError::OffsetBelowDataFloor {
@@ -1124,7 +1129,7 @@ fn view_rejects_offset_below_data_floor() {
 fn view_rejects_entry_past_total_size() {
     let (mut frame, set) = probe_frame_and_walker();
     // samples entry (payload [16..24)) → len 24 runs past payload_len 48.
-    frame[52..56].copy_from_slice(&24u32.to_le_bytes());
+    frame[60..64].copy_from_slice(&24u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &frame),
         DynamicError::VariableFieldOutOfBounds {
@@ -1135,8 +1140,8 @@ fn view_rejects_entry_past_total_size() {
         }
     );
     // Overflowing offset+len must not wrap.
-    frame[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
-    frame[52..56].copy_from_slice(&8u32.to_le_bytes());
+    frame[56..60].copy_from_slice(&u32::MAX.to_le_bytes());
+    frame[60..64].copy_from_slice(&8u32.to_le_bytes());
     assert!(matches!(
         view_err(&set, &frame),
         DynamicError::VariableFieldOutOfBounds {
@@ -1150,7 +1155,7 @@ fn view_rejects_entry_past_total_size() {
 fn view_rejects_misaligned_and_partial_elements() {
     let (frame, set) = probe_frame_and_walker();
     let mut bad = frame.clone();
-    bad[48..52].copy_from_slice(&28u32.to_le_bytes()); // samples @28 (4-aligned only)
+    bad[56..60].copy_from_slice(&28u32.to_le_bytes()); // samples @28 (4-aligned only)
     assert_eq!(
         view_err(&set, &bad),
         DynamicError::MisalignedElements {
@@ -1161,7 +1166,7 @@ fn view_rejects_misaligned_and_partial_elements() {
         }
     );
     let mut bad = frame;
-    bad[52..56].copy_from_slice(&12u32.to_le_bytes()); // 1.5 elements
+    bad[60..64].copy_from_slice(&12u32.to_le_bytes()); // 1.5 elements
     assert!(matches!(
         view_err(&set, &bad),
         DynamicError::MisalignedElements { length: 12, .. }
@@ -1172,7 +1177,7 @@ fn view_rejects_misaligned_and_partial_elements() {
 fn view_rejects_overlapping_entries() {
     let (mut frame, set) = probe_frame_and_walker();
     // name @24 len 10 reaches into samples @32.
-    frame[44..48].copy_from_slice(&10u32.to_le_bytes());
+    frame[52..56].copy_from_slice(&10u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &frame),
         DynamicError::OverlappingEntries {
@@ -1181,8 +1186,8 @@ fn view_rejects_overlapping_entries() {
         }
     );
     // Empty entries never overlap, wherever they point.
-    frame[44..48].copy_from_slice(&0u32.to_le_bytes());
-    frame[40..44].copy_from_slice(&40u32.to_le_bytes());
+    frame[52..56].copy_from_slice(&0u32.to_le_bytes());
+    frame[48..52].copy_from_slice(&40u32.to_le_bytes());
     assert!(FrameView::new(set.walker(), &frame).is_ok());
 }
 
@@ -1191,12 +1196,12 @@ fn view_checks_out_of_order_entries_for_overlap() {
     let (frame, set) = probe_frame_and_walker();
     // name @40 len 2 sits after samples @24..40: disjoint, out of field order.
     let mut swapped = frame.clone();
-    swapped[40..44].copy_from_slice(&40u32.to_le_bytes());
-    swapped[48..52].copy_from_slice(&24u32.to_le_bytes());
+    swapped[48..52].copy_from_slice(&40u32.to_le_bytes());
+    swapped[56..60].copy_from_slice(&24u32.to_le_bytes());
     assert!(FrameView::new(set.walker(), &swapped).is_ok());
     // name @40 len 2 lies inside samples @32..48.
     let mut inside = frame;
-    inside[40..44].copy_from_slice(&40u32.to_le_bytes());
+    inside[48..52].copy_from_slice(&40u32.to_le_bytes());
     assert_eq!(
         view_err(&set, &inside),
         DynamicError::OverlappingEntries {
@@ -1210,25 +1215,25 @@ fn view_checks_out_of_order_entries_for_overlap() {
 fn view_accepts_zero_length_and_unwritten_entries() {
     let (frame, set) = probe_frame_and_walker();
     let mut empty_samples = frame.clone();
-    empty_samples[8..12].copy_from_slice(&58u32.to_le_bytes());
-    empty_samples[52..56].copy_from_slice(&[0; 4]);
-    empty_samples.truncate(58);
+    empty_samples[8..12].copy_from_slice(&66u32.to_le_bytes());
+    empty_samples[60..64].copy_from_slice(&[0; 4]);
+    empty_samples.truncate(66);
     let view = FrameView::new(set.walker(), &empty_samples).expect("empty samples");
-    assert_eq!(view.total_size(), 58);
+    assert_eq!(view.total_size(), 66);
     assert_eq!(view.str_field("name"), Ok("ab"));
     assert_eq!(view.variable_field("samples"), Ok(&[][..]));
     assert_eq!(view.prim_array_field("samples").expect("array").count, 0);
 
     let mut unwritten_samples = frame.clone();
-    unwritten_samples[8..12].copy_from_slice(&58u32.to_le_bytes());
-    unwritten_samples[48..56].copy_from_slice(&[0; 8]);
-    unwritten_samples.truncate(58);
+    unwritten_samples[8..12].copy_from_slice(&66u32.to_le_bytes());
+    unwritten_samples[56..64].copy_from_slice(&[0; 8]);
+    unwritten_samples.truncate(66);
     let view = FrameView::new(set.walker(), &unwritten_samples).expect("unwritten samples");
     assert_eq!(view.variable_field("samples"), Ok(&[][..]));
     assert_eq!(view.prim_array_field("samples").expect("array").count, 0);
 
     let mut empty_name = frame;
-    empty_name[40..48].copy_from_slice(&[0; 8]);
+    empty_name[48..56].copy_from_slice(&[0; 8]);
     let view = FrameView::new(set.walker(), &empty_name).expect("empty name");
     assert_eq!(view.variable_field("name"), Ok(&[][..]));
     assert_eq!(view.prim_array_field("samples").expect("array").count, 2);
@@ -1256,9 +1261,9 @@ fn view_rejects_misaligned_buffer_but_accepts_aligned() {
     );
 
     let mut empty_samples = frame;
-    empty_samples[8..12].copy_from_slice(&58u32.to_le_bytes());
-    empty_samples[48..56].copy_from_slice(&[0; 8]);
-    empty_samples.truncate(58);
+    empty_samples[8..12].copy_from_slice(&66u32.to_le_bytes());
+    empty_samples[56..64].copy_from_slice(&[0; 8]);
+    empty_samples.truncate(66);
     shifted.0[1..][..empty_samples.len()].copy_from_slice(&empty_samples);
     assert!(FrameView::new(set.walker(), &shifted.0[1..1 + empty_samples.len()]).is_ok());
 }
@@ -1315,7 +1320,7 @@ fn invalid_supplied_layout_is_refused_not_panicked() {
 #[test]
 fn view_reports_invalid_utf8_where_the_walker_degrades_to_bytes() {
     let (mut frame, set) = probe_frame_and_walker();
-    frame[56] = 0xFF; // first byte of "ab"
+    frame[64] = 0xFF; // first byte of "ab"
     let view = FrameView::new(set.walker(), &frame).expect("structurally valid");
     assert_eq!(view.variable_field("name"), Ok(&[0xFF, 0x62][..]));
     assert_eq!(
@@ -1336,7 +1341,7 @@ fn view_decode_surfaces_walker_error_as_walk_variant() {
         .expect("parses");
     let layout = set.layout("Nest").expect("Nest");
     let enc = FrameEncoder::new(layout).expect("valid layout");
-    let mut buf = [0u8; 40];
+    let mut buf = [0u8; 48];
     enc.begin(&mut buf, &[0], 0).expect("begin").finish();
     let view = FrameView::new(set.walker(), &buf).expect("structurally valid");
     assert!(matches!(

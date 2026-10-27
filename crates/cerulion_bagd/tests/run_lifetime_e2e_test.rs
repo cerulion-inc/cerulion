@@ -198,14 +198,17 @@ fn recorded_by_marker(summary: &BagdSummary, topic: &str) -> std::collections::B
     );
     let mut by_marker = std::collections::BTreeMap::new();
     for m in msgs.into_iter().filter(|m| m.topic == topic) {
-        // The body follows the 32-byte wire header; every frame this file
+        // The body follows the wire header; every frame this file
         // publishes carries eight identical marker bytes.
-        let marker = *m.data.get(32).unwrap_or_else(|| {
-            panic!(
-                "a recorded frame must carry its body: {} bytes",
-                m.data.len()
-            )
-        });
+        let marker = *m
+            .data
+            .get(cerulion_core::wire::WireHeader::SIZE)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a recorded frame must carry its body: {} bytes",
+                    m.data.len()
+                )
+            });
         *by_marker.entry(marker).or_insert(0) += 1;
     }
     by_marker

@@ -1115,7 +1115,7 @@ mod tests {
         lying.truncate(lying.len() - 1);
         assert_eq!(
             buf.insert("/tf", &lying).unwrap_err().to_string(),
-            "Deserialization error on topic '/tf': accumulate frame of 33 bytes has no valid wire header"
+            "Deserialization error on topic '/tf': accumulate frame of 41 bytes has no valid wire header"
         );
         buf.finish_collect();
         assert!(buf.is_empty());

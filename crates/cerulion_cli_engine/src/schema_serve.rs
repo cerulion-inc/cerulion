@@ -1404,7 +1404,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let msg_dir = tmp.path().join("hostile").join("msg");
         std::fs::create_dir_all(&msg_dir).unwrap();
-        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870907] v\n").unwrap();
+        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870906] v\n").unwrap();
         std::fs::write(msg_dir.join("Outer.msg"), "Inner[8589934592] arr\n").unwrap();
         std::fs::write(msg_dir.join("Wrapper.msg"), "Outer o\nfloat64 w\n").unwrap();
         std::fs::write(msg_dir.join("Sane.msg"), "float64 x\nfloat64 y\n").unwrap();

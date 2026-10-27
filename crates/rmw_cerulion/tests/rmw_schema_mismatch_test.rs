@@ -563,7 +563,7 @@ unsafe fn cerulion_topic(subscription: *const ffi::rmw_subscription_t) -> String
     data.topic.clone()
 }
 
-/// A hand-built wire frame: 32-byte header + `payload_len` zero bytes.
+/// A hand-built wire frame: 40-byte header + `payload_len` zero bytes.
 ///
 /// `total_size` must equal the published slice length exactly, or the
 /// subscriber's own bounds check drops the frame BEFORE the hash gate and
@@ -578,6 +578,7 @@ fn raw_frame(schema_hash: u64, sequence: u32, payload_len: usize) -> Vec<u8> {
         offset_table_count: 0,
         sequence,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; total];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

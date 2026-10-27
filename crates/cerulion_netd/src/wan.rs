@@ -128,7 +128,7 @@ pub enum Plane {
     /// The zenoh LAN plane (`register_ingress_topic`) — the default for any robot
     /// with no configured WAN endpoint.
     Zenoh,
-    /// The iroh WAN plane (dial `cerulion/wire/1` + re-inject) — for a robot present
+    /// The iroh WAN plane (dial `cerulion/wire/2` + re-inject), for a robot present
     /// in the [`WanRegistry`].
     Iroh,
 }

@@ -416,7 +416,7 @@ fn networked_mp_delivers_to_external_ingress_and_announces_topic() {
     // exactly (0.0, 0.0, 0.0) — asserted via `to_bits() == 0` (exact +0.0,
     // not an epsilon and not -0.0). Header sanity cribs the byte-identity
     // discipline of `network_ingress_e2e_test::oracle_frame`: a fixed
-    // Vector3 frame is 32-byte header + 24 payload bytes, offset table
+    // Vector3 frame is 40-byte header + 24 payload bytes, offset table
     // empty and sitting at total_size.
     let expected_total = (WireHeader::SIZE + 24) as u32;
     for f in &delivered {

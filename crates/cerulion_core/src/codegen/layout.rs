@@ -86,7 +86,7 @@ pub struct FieldLayout {
 /// Complete wire layout for one schema:
 ///
 /// ```text
-/// [WireHeader (32 B)]
+/// [WireHeader (40 B)]
 /// [fixed section  (fixed_size bytes, fields at fixed_fields[i].offset)]
 /// [offset table   (8 × variable_fields.len() bytes)]
 /// [variable payload …]
@@ -157,7 +157,7 @@ impl WireLayout {
     }
 
     /// True when no frame of this layout fits the wire: its prefix — the
-    /// 32-byte header, the fixed section and the offset table, i.e.
+    /// 40-byte header, the fixed section and the offset table, i.e.
     /// `WireHeader::SIZE + data_floor()` — exceeds the `u32` `total_size`
     /// ([`crate::wire::frame_prefix_exceeds_wire`], read off this layout's
     /// own fixed size and offset-table length so the two cannot be paired

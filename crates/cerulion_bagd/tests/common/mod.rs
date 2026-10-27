@@ -150,7 +150,7 @@ pub fn publisher(mgr: &TransportManager, topic: &str, max_slice_len: u32) -> Cer
         .expect("create_publisher")
 }
 
-/// Hand-build a wire frame: a valid 32-byte [`WireHeader`] (`total_size` = full
+/// Hand-build a wire frame: a valid 40-byte [`WireHeader`] (`total_size` = full
 /// frame length) followed by `body`.
 pub fn build_frame(schema_hash: u64, sequence: u32, timestamp_ns: u64, body: &[u8]) -> Vec<u8> {
     let total = WireHeader::SIZE + body.len();

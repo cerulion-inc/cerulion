@@ -470,7 +470,7 @@ fn a_capture_bounded_by_its_byte_ceiling_reports_what_it_carries() {
     let ready = unique_ready_file("short");
     cfg.ready_file = Some(ready.clone());
 
-    // The slot must hold a frame (payload + the 32-byte wire header) — these
+    // The slot must hold a frame (payload + the 40-byte wire header), these
     // payloads are deliberately fat, so the ceiling is reached in a few frames
     // rather than in thousands.
     let mut pub_ = publisher(&mgr, &topic, PAYLOAD as u32 + 64);

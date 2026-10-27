@@ -391,7 +391,7 @@ keeps access paired while it builds the gateway and opens the configured posture
 only once every component is ready; an `open` start announces its topics at that
 moment. A LAN peer
 carries no paired identity, and an app does not host the paired remote plane (see
-[Remote plane](remote_plane.md)), so under `paired` the app's topic data stays
+[remote access](remote_plane.md)), so under `paired` the app's topic data stays
 on the device. For local development on
 a trusted network, set `"lan_access": "open"`; the sample app honors the
 `lan_access` launch intent extra only in debuggable builds:

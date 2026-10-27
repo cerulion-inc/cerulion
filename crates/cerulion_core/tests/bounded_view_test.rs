@@ -39,7 +39,7 @@ const SEQUENCE: u32 = 0x0BAD_F00D;
 const TIMESTAMP_NS: u64 = 1_700_000_000_123_456_789;
 
 /// Hand-build the wire frame a producer's commit leaves in the slot for a
-/// `Vector3`: a 32-byte header followed by three little-endian `f64`s.
+/// `Vector3`: a 40-byte header followed by three little-endian `f64`s.
 ///
 /// `Vector3` is FIXED-size (no variable fields), so there is no offset table
 /// and the payload IS the fixed section. The header is written through the

@@ -1,46 +1,61 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The open-file limit (`RLIMIT_NOFILE`) of a process that hosts nodes.
+//! The open-file limit (`RLIMIT_NOFILE`) of a process that builds a transport.
 //!
 //! iceoryx2 keeps a file open for every port it creates (the port's lifetime
 //! tag) next to the files behind each service, so the number of files a graph
 //! opens while it starts grows with its ports. The process that starts a graph
 //! holds every topic of the graph while it starts, so the soft limit of 1024
-//! that most Linux logins hand out stops a graph of about 40 chained nodes.
-//! iceoryx2 reports the exhausted limit as a port or service creation error
-//! (`UnableToCreatePortTag`, `ResourceCreationFailed`, `InternalFailure`),
-//! never as `EMFILE`.
+//! that most Linux logins hand out stops a graph of 40 nodes with one output
+//! each and an input on half of them. iceoryx2 reports the exhausted limit as
+//! a port or service creation error (`UnableToCreatePortTag`,
+//! `ResourceCreationFailed`, `InternalFailure`), never as `EMFILE`.
 //!
 //! [`raise_open_file_limit`] raises the soft limit once per process. Every
-//! transport constructor calls it before it creates the iceoryx2 node, so each
-//! process that hosts nodes runs on the raised limit, and the processes it
-//! starts afterwards inherit it. The soft limit goes up to the hard limit on
-//! Linux, at most to [`LINUX_RAISE_CAP`]. Elsewhere iceoryx2 waits with
-//! `select()`, which cannot watch a descriptor numbered `FD_SETSIZE` or
-//! higher, so the soft limit stops at `FD_SETSIZE`, and on macOS also at
-//! `kern.maxfilesperproc`, above which `setrlimit` fails with `EINVAL`. A
-//! limit is never lowered.
+//! `TransportManager` constructor calls it before it creates its iceoryx2
+//! node, so each process that builds a transport runs on the raised limit, and
+//! the processes it starts afterwards inherit it. Other iceoryx2 node builders
+//! (the IPC cleanup, the run and mirror registries, the flashback channels) do
+//! not call it. The soft limit goes up to the hard limit on Linux, at most to
+//! [`LINUX_RAISE_CAP`]. Elsewhere iceoryx2 waits with `select()`, which cannot
+//! watch a descriptor numbered `FD_SETSIZE` or higher, so the soft limit stops
+//! at `FD_SETSIZE`, and on macOS also at `kern.maxfilesperproc`, above which
+//! `setrlimit` fails with `EINVAL`. A limit is never lowered.
 //!
-//! [`open_file_shortfall`] is the check `graph run` makes before it starts
-//! anything: a graph whose estimated need is above the limit in force (and,
-//! where iceoryx2 waits with `select()`, above `FD_SETSIZE`) is refused with
-//! a message that names the limit and the fix.
+//! A process Cerulion is loaded into (an rclcpp process through
+//! `rmw_cerulion`, a Python interpreter through `cerulion_py`) runs code that
+//! may wait with `select()` on every platform, and `select()` on a descriptor
+//! numbered `FD_SETSIZE` or higher fails (Python's `select.select` raises
+//! `ValueError`) or aborts (fortified glibc `FD_SET`). Such a host calls
+//! [`raise_open_file_limit_for_embedding_host`] before its first transport,
+//! which raises the soft limit at most to `FD_SETSIZE` on every platform. The
+//! first of the two calls in a process sets the ceiling; every later call of
+//! either returns its outcome.
+//!
+//! [`open_file_shortfall`] is the check `graph run` and `graph profile` make
+//! before they start anything: a graph whose estimated need is above the limit
+//! in force (and, where iceoryx2 waits with `select()`, above `FD_SETSIZE`)
+//! is refused with a message that names the limit and the fix.
 
 use std::fmt;
 
 /// Files the process that starts a graph holds open per output port at the
-/// peak of the start burst (the topic's services and its ports' tags), rounded
-/// up from the 14 that iceoryx2 0.10 opens.
-pub const OPEN_FILES_PER_OUTPUT: u64 = 15;
+/// peak of the start burst (the topic's services and its ports' tags): the 14
+/// that iceoryx2 0.10 opens.
+pub const OPEN_FILES_PER_OUTPUT: u64 = 14;
 
 /// Files the starting process holds open per input port at the peak of the
-/// start burst (the subscriber's port tags and its trigger listener), rounded
-/// up from the 22 that iceoryx2 0.10 opens.
-pub const OPEN_FILES_PER_INPUT: u64 = 23;
+/// start burst (the subscriber's port tags and its trigger listener): the 22
+/// that iceoryx2 0.10 opens.
+pub const OPEN_FILES_PER_INPUT: u64 = 22;
 
 /// Files the starting process holds before any port (the iceoryx2 node, the
-/// runtime's own services, logs and sockets), rounded up from the 22 that
-/// iceoryx2 0.10 opens.
-pub const OPEN_FILES_BASE: u64 = 64;
+/// runtime's own services, logs and sockets): the 22 that iceoryx2 0.10 opens
+/// plus a margin of 18. With the margin the estimate is at or above the
+/// passing limit of each measured shape: 40 nodes with 40 outputs and 20
+/// inputs (fail at 1024, pass at 1028), 80 nodes with 80 outputs and 40
+/// inputs (fail at 2027, pass at 2033), and 80 outputs with no inputs (fail at
+/// 1144, pass at 1148).
+pub const OPEN_FILES_BASE: u64 = 40;
 
 /// The highest soft limit the raise sets on Linux. A hard limit above it
 /// (container runtimes set up to 2^30) is left unused, so the processes this
@@ -130,6 +145,32 @@ pub fn open_files_needed(ports: GraphPorts) -> u64 {
         .saturating_add(OPEN_FILES_PER_INPUT.saturating_mul(count(ports.inputs)))
 }
 
+/// The platform a refusal names its remedy for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemedyPlatform {
+    /// Linux: `ulimit`, systemd, `limits.conf` and container limits.
+    Linux,
+    /// macOS: `ulimit`, `launchctl limit maxfiles` and
+    /// `kern.maxfilesperproc`.
+    MacOs,
+    /// Every other unix target (the BSDs, Android): `ulimit`.
+    OtherUnix,
+}
+
+impl RemedyPlatform {
+    /// The platform of this build.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::OtherUnix
+        }
+    }
+}
+
 /// A graph that needs more open files than this process may hold.
 /// Its `Display` is the refusal the user reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +184,8 @@ pub struct OpenFileShortfall {
     /// The `select()` ceiling on platforms where iceoryx2 waits with
     /// `select()`; `None` on Linux.
     pub select_ceiling: Option<u64>,
+    /// The platform the remedy is written for.
+    pub platform: RemedyPlatform,
 }
 
 /// `Some` when a graph with `ports` needs more open files than `limit.soft`,
@@ -154,6 +197,7 @@ pub fn open_file_shortfall(
     ports: GraphPorts,
     limit: OpenFileLimit,
     select_ceiling: Option<u64>,
+    platform: RemedyPlatform,
 ) -> Option<OpenFileShortfall> {
     let needed = open_files_needed(ports);
     let usable = select_ceiling.map_or(limit.soft, |cap| cap.min(limit.soft));
@@ -162,6 +206,7 @@ pub fn open_file_shortfall(
         needed,
         limit,
         select_ceiling,
+        platform,
     })
 }
 
@@ -185,42 +230,64 @@ impl fmt::Display for OpenFileShortfall {
             needed,
             limit,
             select_ceiling,
+            platform,
         } = *self;
         write!(
             f,
             "this graph has {nodes} nodes with {outputs} output and {inputs} input ports, and \
-             starting it opens about {needed} files in this process (iceoryx2 keeps a file open \
-             for every port), but the open-file limit (RLIMIT_NOFILE) is {soft} with a hard \
-             limit of {hard}. ",
+             starting it is estimated to open about {needed} files in this process (iceoryx2 \
+             keeps a file open for every port), but the open-file limit (RLIMIT_NOFILE) is \
+             {soft} with a hard limit of {hard}. ",
             nodes = ports.nodes,
             outputs = ports.outputs,
             inputs = ports.inputs,
             soft = ShownLimit(limit.soft),
             hard = ShownLimit(limit.hard),
         )?;
-        match select_ceiling {
-            Some(cap) if needed > cap => write!(
+        if let Some(cap) = select_ceiling.filter(|&cap| needed > cap) {
+            return write!(
                 f,
                 "On this platform iceoryx2 waits with select(), which cannot watch a file \
-                 descriptor numbered {cap} or higher, so a graph that needs more than {cap} \
-                 files does not start here, whatever the limit. Run this graph on Linux."
-            ),
-            Some(_) if needed > limit.hard => write!(
-                f,
-                "Raise the hard limit to at least {needed} before the run: `ulimit -Hn {needed}` \
-                 in a root shell, or `sudo launchctl limit maxfiles {needed} unlimited` on macOS."
-            ),
-            None if needed > limit.hard => write!(
+                 descriptor numbered {cap} or higher, so a graph estimated to need more than \
+                 {cap} files does not start here, whatever the limit. Run this graph on Linux."
+            );
+        }
+        match platform {
+            RemedyPlatform::Linux if needed > limit.hard => write!(
                 f,
                 "Raise the hard limit to at least {needed} before the run: `ulimit -Hn {needed}` \
                  in a root shell, `LimitNOFILE={needed}` in a systemd unit, a `nofile` line in \
                  /etc/security/limits.conf, or `--ulimit nofile={needed}:{needed}` for a \
                  container."
             ),
-            _ => write!(
+            RemedyPlatform::MacOs if needed > limit.hard => write!(
                 f,
-                "The hard limit allows it but the soft limit was not raised that far; run \
-                 `ulimit -Sn {needed}` in the shell that starts the graph."
+                "Raise the hard limit to at least {needed} before the run: `ulimit -Hn {needed}` \
+                 in a root shell, or `sudo launchctl limit maxfiles {needed} unlimited`."
+            ),
+            RemedyPlatform::OtherUnix if needed > limit.hard => write!(
+                f,
+                "Raise the hard limit to at least {needed} before the run: `ulimit -Hn {needed}` \
+                 in a root shell."
+            ),
+            RemedyPlatform::MacOs => write!(
+                f,
+                "The hard limit allows it but the soft limit was not raised that far: macOS \
+                 caps the soft limit at `kern.maxfilesperproc`, which \
+                 `sudo sysctl -w kern.maxfilesperproc={needed}` raises, and a refused raise is \
+                 logged at start with the errno setrlimit returned."
+            ),
+            RemedyPlatform::Linux => write!(
+                f,
+                "The hard limit allows it but the soft limit was not raised that far: the raise \
+                 stops at {LINUX_RAISE_CAP}, which `ulimit -Sn {needed}` in the shell that \
+                 starts the graph lifts, and a refused raise is logged at start with the errno \
+                 setrlimit returned."
+            ),
+            RemedyPlatform::OtherUnix => write!(
+                f,
+                "The hard limit allows it but the soft limit was not raised that far; the \
+                 warning logged at start names the errno setrlimit returned."
             ),
         }
     }
@@ -242,8 +309,9 @@ pub fn select_ceiling() -> Option<u64> {
     }
 }
 
-/// The cap below the hard limit on this build: [`LINUX_RAISE_CAP`] on Linux,
-/// [`select_ceiling`] elsewhere, lowered on macOS to `kern.maxfilesperproc`.
+/// The cap below the hard limit for a process Cerulion owns on this build:
+/// [`LINUX_RAISE_CAP`] on Linux, [`select_ceiling`] elsewhere, lowered on
+/// macOS to `kern.maxfilesperproc`.
 #[cfg(unix)]
 fn platform_cap() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -332,27 +400,72 @@ fn u64_to_rlim(value: u64) -> libc::rlim_t {
     }
 }
 
+/// The ceiling a raise uses: [`platform_cap`] for a process Cerulion owns,
+/// [`platform_cap`] lowered to `FD_SETSIZE` for an embedding host.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaiseScope {
+    OwnProcess,
+    EmbeddingHost,
+}
+
+#[cfg(unix)]
+static OUTCOME: std::sync::OnceLock<RaiseOutcome> = std::sync::OnceLock::new();
+
 /// Raises this process's soft `RLIMIT_NOFILE` to the ceiling described in the
-/// module docs. The first call does the work and logs the outcome once (debug
-/// on success, warn when the raise is refused or the limit is unreadable);
-/// every later call returns the first call's outcome. Thread-safe.
+/// module docs. The first raise in the process does the work and logs the
+/// outcome once (debug on success, warn when the raise is refused or the limit
+/// is unreadable); every later call, of this function or of
+/// [`raise_open_file_limit_for_embedding_host`], returns the first call's
+/// outcome. Thread-safe.
 #[cfg(unix)]
 pub fn raise_open_file_limit() -> RaiseOutcome {
-    static OUTCOME: std::sync::OnceLock<RaiseOutcome> = std::sync::OnceLock::new();
+    raise_in_scope(RaiseScope::OwnProcess)
+}
+
+/// [`raise_open_file_limit`] for a process Cerulion is loaded into: the soft
+/// limit goes at most to `FD_SETSIZE` on every platform, so a descriptor the
+/// host opens stays below the `select()` ceiling. A soft limit already above
+/// it is left as it is. Call it before the process's first transport; when it
+/// is the first raise in the process, the `TransportManager` constructors
+/// then keep its ceiling.
+#[cfg(unix)]
+pub fn raise_open_file_limit_for_embedding_host() -> RaiseOutcome {
+    raise_in_scope(RaiseScope::EmbeddingHost)
+}
+
+#[cfg(unix)]
+fn raise_in_scope(scope: RaiseScope) -> RaiseOutcome {
     *OUTCOME.get_or_init(|| {
-        let outcome = raise_once();
-        log_outcome(&outcome);
+        let outcome = raise_once(scope_cap(scope));
+        log_outcome(&outcome, scope);
         outcome
     })
 }
 
+/// The cap below the hard limit for `scope` on this build.
 #[cfg(unix)]
-fn raise_once() -> RaiseOutcome {
+fn scope_cap(scope: RaiseScope) -> Option<u64> {
+    let cap = platform_cap();
+    match scope {
+        RaiseScope::OwnProcess => cap,
+        RaiseScope::EmbeddingHost => {
+            let fd_setsize = u64::try_from(libc::FD_SETSIZE).ok();
+            match (cap, fd_setsize) {
+                (Some(c), Some(f)) => Some(c.min(f)),
+                (c, f) => c.or(f),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn raise_once(cap: Option<u64>) -> RaiseOutcome {
     let limit = match current_open_file_limit() {
         Ok(limit) => limit,
         Err(errno) => return RaiseOutcome::Unreadable { errno },
     };
-    let Some(target) = raise_target(limit, platform_cap()) else {
+    let Some(target) = raise_target(limit, cap) else {
         return RaiseOutcome::AlreadyAtCeiling(limit);
     };
     let rl = libc::rlimit {
@@ -377,18 +490,35 @@ fn raise_once() -> RaiseOutcome {
     }
 }
 
+/// What a refused raise asks the operator to change on this build.
 #[cfg(unix)]
-fn log_outcome(outcome: &RaiseOutcome) {
+const REFUSED_RAISE_FIX: &str = if cfg!(target_os = "macos") {
+    "macOS refuses a soft limit above `kern.maxfilesperproc` or the hard limit; raise \
+     `kern.maxfilesperproc` (`sudo sysctl -w kern.maxfilesperproc=<n>`) or the hard limit \
+     (`sudo launchctl limit maxfiles <n> unlimited`) before the run"
+} else if cfg!(target_os = "linux") {
+    "Linux refuses a soft limit above the hard limit or `fs.nr_open`; raise the hard limit \
+     (`LimitNOFILE=` in a systemd unit, a `nofile` line in /etc/security/limits.conf) or \
+     `fs.nr_open` before the run"
+} else {
+    "setrlimit refuses a soft limit above the hard limit; raise the hard limit before the run"
+};
+
+#[cfg(unix)]
+fn log_outcome(outcome: &RaiseOutcome, scope: RaiseScope) {
+    let host = scope == RaiseScope::EmbeddingHost;
     match *outcome {
         RaiseOutcome::Raised { from, now } => tracing::debug!(
             from,
             soft = now.soft,
             hard = now.hard,
+            embedding_host = host,
             "raised the open-file soft limit (RLIMIT_NOFILE)"
         ),
         RaiseOutcome::AlreadyAtCeiling(limit) => tracing::debug!(
             soft = limit.soft,
             hard = limit.hard,
+            embedding_host = host,
             "open-file soft limit (RLIMIT_NOFILE) already at its ceiling"
         ),
         RaiseOutcome::Refused {
@@ -400,11 +530,14 @@ fn log_outcome(outcome: &RaiseOutcome) {
             hard = limit.hard,
             target,
             errno,
+            error = %std::io::Error::from_raw_os_error(errno),
+            embedding_host = host,
             "setrlimit refused to raise the open-file soft limit (RLIMIT_NOFILE); a large \
-             graph may fail to create its ports. Fix: raise it with `ulimit -Sn` before the run"
+             graph may fail to create its ports. {REFUSED_RAISE_FIX}"
         ),
         RaiseOutcome::Unreadable { errno } => tracing::warn!(
             errno,
+            error = %std::io::Error::from_raw_os_error(errno),
             "getrlimit could not read the open-file limit (RLIMIT_NOFILE); it was not raised"
         ),
     }
@@ -455,90 +588,221 @@ mod tests {
         assert_eq!(raise_target(lim(1024, 1024), Some(10_240)), None);
     }
 
-    #[test]
-    fn needed_files_are_sixty_four_plus_fifteen_per_output_and_twenty_three_per_input() {
-        let ports = |outputs, inputs| GraphPorts {
-            nodes: 0,
+    fn shape(nodes: usize, outputs: usize, inputs: usize) -> GraphPorts {
+        GraphPorts {
+            nodes,
             outputs,
             inputs,
-        };
-        assert_eq!(open_files_needed(ports(0, 0)), 64);
-        assert_eq!(open_files_needed(ports(1, 0)), 79);
-        assert_eq!(open_files_needed(ports(0, 1)), 87);
-        assert_eq!(open_files_needed(ports(80, 0)), 1264);
-        assert_eq!(open_files_needed(chains(10)), 1124);
-        assert_eq!(open_files_needed(chains(20)), 2184);
-        assert_eq!(open_files_needed(ports(usize::MAX, 1)), u64::MAX);
+        }
     }
 
     #[test]
-    fn a_graph_within_the_soft_limit_has_no_shortfall() {
-        assert_eq!(open_file_shortfall(chains(5), lim(1024, 1024), None), None);
-        assert_eq!(
-            open_file_shortfall(chains(20), lim(524_288, 524_288), None),
-            None
-        );
-        // Exactly at the limit is enough.
-        assert_eq!(open_file_shortfall(chains(10), lim(1124, 1124), None), None);
+    fn needed_files_are_forty_plus_fourteen_per_output_and_twenty_two_per_input() {
+        assert_eq!(open_files_needed(shape(0, 0, 0)), 40);
+        assert_eq!(open_files_needed(shape(0, 1, 0)), 54);
+        assert_eq!(open_files_needed(shape(0, 0, 1)), 62);
+        assert_eq!(open_files_needed(shape(0, 80, 0)), 1160);
+        assert_eq!(open_files_needed(chains(10)), 1040);
+        assert_eq!(open_files_needed(chains(20)), 2040);
+        assert_eq!(open_files_needed(shape(0, usize::MAX, 1)), u64::MAX);
     }
 
-    #[test]
-    fn a_hard_limit_below_the_need_names_both_limits_and_the_hard_limit_fixes() {
-        let s = open_file_shortfall(chains(20), lim(1024, 1024), None).expect("shortfall");
-        assert_eq!(s.needed, 2184);
-        assert_eq!(
-            s.to_string(),
-            "this graph has 80 nodes with 80 output and 40 input ports, and starting it opens \
-             about 2184 files in this process (iceoryx2 keeps a file open for every port), but \
-             the open-file limit (RLIMIT_NOFILE) is 1024 with a hard limit of 1024. Raise the \
-             hard limit to at least 2184 before the run: `ulimit -Hn 2184` in a root shell, \
-             `LimitNOFILE=2184` in a systemd unit, a `nofile` line in /etc/security/limits.conf, \
-             or `--ulimit nofile=2184:2184` for a container."
-        );
-    }
+    /// The `graph run` thresholds measured on Linux with iceoryx2 0.10: per
+    /// shape, the highest hard limit it failed under and the lowest it started
+    /// under.
+    const MEASURED: [(GraphPorts, u64, u64); 3] = [
+        (
+            GraphPorts {
+                nodes: 40,
+                outputs: 40,
+                inputs: 20,
+            },
+            1024,
+            1028,
+        ),
+        (
+            GraphPorts {
+                nodes: 80,
+                outputs: 80,
+                inputs: 40,
+            },
+            2027,
+            2033,
+        ),
+        (
+            GraphPorts {
+                nodes: 80,
+                outputs: 80,
+                inputs: 0,
+            },
+            1144,
+            1148,
+        ),
+    ];
 
     #[test]
-    fn a_soft_limit_left_below_a_sufficient_hard_limit_names_the_soft_fix() {
-        let s = open_file_shortfall(chains(10), lim(1024, 524_288), None).expect("shortfall");
-        assert_eq!(
-            s.to_string(),
-            "this graph has 40 nodes with 40 output and 20 input ports, and starting it opens \
-             about 1124 files in this process (iceoryx2 keeps a file open for every port), but \
-             the open-file limit (RLIMIT_NOFILE) is 1024 with a hard limit of 524288. The hard \
-             limit allows it but the soft limit was not raised that far; run `ulimit -Sn 1124` \
-             in the shell that starts the graph."
-        );
-    }
-
-    #[test]
-    fn a_need_above_the_select_ceiling_is_refused_even_under_a_high_soft_limit() {
-        let need_1124 = chains(10);
-        for soft in [1024, 10_240] {
-            let s = open_file_shortfall(need_1124, lim(soft, u64::MAX), Some(1024))
-                .expect("above the select() ceiling");
+    fn the_estimate_covers_every_measured_passing_limit_within_two_percent() {
+        for (ports, failed_at, passed_at) in MEASURED {
+            let needed = open_files_needed(ports);
+            assert!(needed > failed_at, "{ports:?}: {needed} <= {failed_at}");
+            assert!(needed >= passed_at, "{ports:?}: {needed} < {passed_at}");
             assert!(
-                s.to_string().ends_with(
-                    "with a hard limit of unlimited. On this platform iceoryx2 waits with \
-                     select(), which cannot watch a file descriptor numbered 1024 or higher, so \
-                     a graph that needs more than 1024 files does not start here, whatever the \
-                     limit. Run this graph on Linux."
-                ),
-                "{s}"
+                needed * 100 <= passed_at * 102,
+                "{ports:?}: {needed} is more than 2% above {passed_at}"
             );
         }
     }
 
     #[test]
-    fn a_need_under_the_select_ceiling_but_above_a_low_hard_limit_names_the_macos_fix() {
-        let s = open_file_shortfall(chains(5), lim(256, 256), Some(1024)).expect("shortfall");
-        assert_eq!(s.needed, 594);
-        assert!(
-            s.to_string().ends_with(
-                "Raise the hard limit to at least 594 before the run: `ulimit -Hn 594` in a root \
-                 shell, or `sudo launchctl limit maxfiles 594 unlimited` on macOS."
-            ),
-            "{s}"
+    fn a_thirty_eight_node_graph_fits_under_a_1024_ceiling() {
+        // 38 nodes with one output each and an input on half of them: the
+        // shape that started at 1024 before the check and was refused by the
+        // earlier estimate of 1071.
+        let ports = shape(38, 38, 19);
+        assert_eq!(open_files_needed(ports), 990);
+        assert_eq!(
+            open_file_shortfall(ports, lim(1024, 1024), Some(1024), RemedyPlatform::MacOs),
+            None
         );
+    }
+
+    #[test]
+    fn a_graph_within_the_soft_limit_has_no_shortfall() {
+        let linux = RemedyPlatform::Linux;
+        assert_eq!(
+            open_file_shortfall(chains(5), lim(1024, 1024), None, linux),
+            None
+        );
+        assert_eq!(
+            open_file_shortfall(chains(20), lim(524_288, 524_288), None, linux),
+            None
+        );
+        // Exactly at the limit is enough.
+        assert_eq!(
+            open_file_shortfall(chains(10), lim(1040, 1040), None, linux),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hard_limit_below_the_need_names_both_limits_and_the_hard_limit_fixes() {
+        let s = open_file_shortfall(chains(20), lim(1024, 1024), None, RemedyPlatform::Linux)
+            .expect("shortfall");
+        assert_eq!(s.needed, 2040);
+        assert_eq!(
+            s.to_string(),
+            "this graph has 80 nodes with 80 output and 40 input ports, and starting it is \
+             estimated to open about 2040 files in this process (iceoryx2 keeps a file open for \
+             every port), but the open-file limit (RLIMIT_NOFILE) is 1024 with a hard limit of \
+             1024. Raise the hard limit to at least 2040 before the run: `ulimit -Hn 2040` in a \
+             root shell, `LimitNOFILE=2040` in a systemd unit, a `nofile` line in \
+             /etc/security/limits.conf, or `--ulimit nofile=2040:2040` for a container."
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_left_below_a_sufficient_hard_limit_names_the_soft_fix() {
+        let s = open_file_shortfall(chains(10), lim(1024, 524_288), None, RemedyPlatform::Linux)
+            .expect("shortfall");
+        assert_eq!(
+            s.to_string(),
+            "this graph has 40 nodes with 40 output and 20 input ports, and starting it is \
+             estimated to open about 1040 files in this process (iceoryx2 keeps a file open for \
+             every port), but the open-file limit (RLIMIT_NOFILE) is 1024 with a hard limit of \
+             524288. The hard limit allows it but the soft limit was not raised that far: the \
+             raise stops at 1048576, which `ulimit -Sn 1040` in the shell that starts the graph \
+             lifts, and a refused raise is logged at start with the errno setrlimit returned."
+        );
+    }
+
+    #[test]
+    fn a_need_above_the_select_ceiling_is_refused_even_under_a_high_soft_limit() {
+        for platform in [RemedyPlatform::MacOs, RemedyPlatform::OtherUnix] {
+            for soft in [1024, 10_240] {
+                let s = open_file_shortfall(chains(10), lim(soft, u64::MAX), Some(1024), platform)
+                    .expect("above the select() ceiling");
+                assert!(
+                    s.to_string().ends_with(
+                        "with a hard limit of unlimited. On this platform iceoryx2 waits with \
+                         select(), which cannot watch a file descriptor numbered 1024 or \
+                         higher, so a graph estimated to need more than 1024 files does not \
+                         start here, whatever the limit. Run this graph on Linux."
+                    ),
+                    "{s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_low_hard_limit_under_the_select_ceiling_names_the_remedy_of_its_platform() {
+        let macos =
+            open_file_shortfall(chains(5), lim(256, 256), Some(1024), RemedyPlatform::MacOs)
+                .expect("shortfall");
+        assert_eq!(macos.needed, 540);
+        assert!(
+            macos.to_string().ends_with(
+                "Raise the hard limit to at least 540 before the run: `ulimit -Hn 540` in a root \
+                 shell, or `sudo launchctl limit maxfiles 540 unlimited`."
+            ),
+            "{macos}"
+        );
+        let other = open_file_shortfall(
+            chains(5),
+            lim(256, 256),
+            Some(1024),
+            RemedyPlatform::OtherUnix,
+        )
+        .expect("shortfall");
+        let other = other.to_string();
+        assert!(
+            other.ends_with(
+                "Raise the hard limit to at least 540 before the run: `ulimit -Hn 540` in a root \
+                 shell."
+            ),
+            "{other}"
+        );
+        assert!(!other.contains("launchctl"), "{other}");
+    }
+
+    #[test]
+    fn a_soft_limit_stopped_below_a_sufficient_hard_limit_on_macos_names_maxfilesperproc() {
+        let s = open_file_shortfall(
+            chains(5),
+            lim(256, 10_240),
+            Some(1024),
+            RemedyPlatform::MacOs,
+        )
+        .expect("shortfall");
+        let text = s.to_string();
+        assert!(
+            text.ends_with(
+                "The hard limit allows it but the soft limit was not raised that far: macOS caps \
+                 the soft limit at `kern.maxfilesperproc`, which \
+                 `sudo sysctl -w kern.maxfilesperproc=540` raises, and a refused raise is logged \
+                 at start with the errno setrlimit returned."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("ulimit -Sn"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_embedding_host_caps_the_raise_at_fd_setsize() {
+        let fd_setsize = u64::try_from(libc::FD_SETSIZE).expect("FD_SETSIZE fits u64");
+        let host = scope_cap(RaiseScope::EmbeddingHost).expect("a host cap on unix");
+        assert!(host <= fd_setsize, "{host} > {fd_setsize}");
+        assert_eq!(
+            raise_target(lim(256, 524_288), Some(host)),
+            Some(host.min(524_288))
+        );
+        // A soft limit the host already set above FD_SETSIZE is kept.
+        assert_eq!(raise_target(lim(4096, 524_288), Some(host)), None);
+        if cfg!(target_os = "linux") {
+            assert_eq!(host, fd_setsize);
+            assert_eq!(scope_cap(RaiseScope::OwnProcess), Some(LINUX_RAISE_CAP));
+        }
     }
 
     #[test]

@@ -557,8 +557,8 @@ pub fn validate_graph_with(
     // Validate max_slice_len is within the wire-format-representable range.
     //
     // Lower bound: `>= WireHeader::SIZE` (the wire frame requires at least the
-    // 32-byte header — a header-only payload like `std_msgs::Empty` whose
-    // `WIRE_FIXED_SIZE = 0` is valid at exactly 32 bytes). Upper bound:
+    // 40-byte header; a header-only payload like `std_msgs::Empty` whose
+    // `WIRE_FIXED_SIZE = 0` is valid at exactly 40 bytes). Upper bound:
     // `<= u32::MAX` (the wire format's `WireHeader::total_size`
     // field is `u32`, so slot sizes above 4 GiB cannot be represented).
     // Failing graph-load surfaces the misconfig with an actionable error
@@ -851,9 +851,12 @@ fn validate_ros2_entries(config: &GraphConfig) -> TransportResult<()> {
 /// 4. **No egress∩ingress** (rule 1): a topic cannot be both exported and
 ///    imported, which would loop it back to itself (the loop-safety
 ///    contract).
-/// 5. **Egress is graph-owned** (rule 2): every `egress` topic must be
-///    produced by an in-graph node (resolution is override-aware — a
-///    `topic:` override or an absolute derived name both count).
+/// 5. **Egress origin matches the graph** (rule 2): every `egress` entry
+///    without `external: true` must be produced by an in-graph node
+///    (resolution is override-aware: a `topic:` override or an absolute
+///    derived name both count), and every entry with `external: true` must
+///    have NO in-graph producer (the flag names a publisher outside the
+///    graph, such as a ROS 2 program on `rmw_cerulion`).
 /// 6. **Ingress is external** (rule 3): every `ingress` topic must NOT have
 ///    an in-graph producer — ingress topics are external sources.
 /// 7. **Carriers** (rules 7-10): locators, certificate files and per-topic
@@ -910,17 +913,34 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
         }
     }
 
-    // Rule 2: egress topics must be produced by an in-graph node.
-    for t in &egress {
-        if !produced.contains_key(t) {
-            return Err(TransportError::GraphError {
-                reason: format!(
-                    "network egress topic '{t}' is not produced by any node in this graph — \
-                     egress topics must be produced by a node in this graph (the name must \
-                     match the publisher's resolved topic, e.g. '/{{prefix}}/{{node}}/{{output}}' \
-                     or an output's `topic:` override)"
-                ),
-            });
+    // Rule 2: an entry's `external` flag must match whether an in-graph node
+    // produces the topic.
+    for entry in &net.egress {
+        let t = &entry.topic;
+        match (entry.external, produced.get(t)) {
+            (false, None) => {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "network egress topic '{t}' is not produced by any node in this graph; \
+                         egress topics must be produced by a node in this graph (the name must \
+                         match the publisher's resolved topic, e.g. \
+                         '/{{prefix}}/{{node}}/{{output}}' or an output's `topic:` override); a \
+                         topic published by a process outside this graph (e.g. a ROS 2 program \
+                         on rmw_cerulion) is listed as `- topic: {t}` with `external: true`"
+                    ),
+                });
+            }
+            (true, Some(producer)) => {
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "network egress topic '{t}' is marked `external: true` but node \
+                         '{producer}' in this graph produces it; `external: true` is for a \
+                         topic published by a process outside this graph, so remove \
+                         `external: true` from the entry"
+                    ),
+                });
+            }
+            (false, Some(_)) | (true, None) => {}
         }
     }
 
@@ -1395,13 +1415,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 31
+        max_slice_len: 39
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_err(),
-            "max_slice_len: 31 (< WireHeader::SIZE) must fail graph-load"
+            "max_slice_len: 39 (< WireHeader::SIZE) must fail graph-load"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1411,7 +1431,7 @@ nodes:
     }
 
     /// Pin the exact
-    /// floor — `max_slice_len: 32` (exactly `WireHeader::SIZE`) is
+    /// floor: `max_slice_len: 40` (exactly `WireHeader::SIZE`) is
     /// accepted. Mirror of `try_new_accepts_exactly_wire_header_size`
     /// in `max_slice_len_newtype_test.rs`. This is the boundary
     /// (`<`, not `<=`); a future
@@ -1428,13 +1448,13 @@ nodes:
     outputs:
       - name: data
         schema: test/Data
-        max_slice_len: 32
+        max_slice_len: 40
 "#;
         let config = parse_graph(yaml).unwrap();
         let result = validate_graph(&config);
         assert!(
             result.is_ok(),
-            "max_slice_len: 32 (== WireHeader::SIZE) must be accepted (header-only payload). \
+            "max_slice_len: 40 (== WireHeader::SIZE) must be accepted (header-only payload). \
              Error was: {:?}",
             result.err()
         );
@@ -1907,6 +1927,50 @@ nodes:
             err.contains("/robo/cam/ghost")
                 && err.contains("must be produced by a node in this graph"),
             "rule 2 must name the topic and the fix; got: {err}"
+        );
+    }
+
+    /// Rule 2, the outside-publisher arm: an `external: true` egress topic
+    /// with no in-graph producer is accepted, and the unmarked spelling of the
+    /// same topic is refused with a message naming `external: true`.
+    #[test]
+    fn test_network_external_egress_without_producer_accepted() {
+        let marked = graph_with_network(
+            "network:\n  mode: peer\n  egress:\n    - topic: /chatter\n      external: true\n",
+        );
+        let config = parse_graph(&marked).unwrap();
+        assert!(
+            validate_graph(&config).is_ok(),
+            "an external egress topic needs no in-graph producer: {:?}",
+            validate_graph(&config).err()
+        );
+        let unmarked = graph_with_network("network:\n  mode: peer\n  egress:\n    - /chatter\n");
+        let err = validate_graph(&parse_graph(&unmarked).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'/chatter' is not produced by any node")
+                && err.contains("- topic: /chatter")
+                && err.contains("external: true"),
+            "rule 2 must point an outside publisher's topic at `external: true`; got: {err}"
+        );
+    }
+
+    /// Rule 2, the inverse arm: `external: true` on a topic an in-graph node
+    /// produces is refused, naming the producer and the fix.
+    #[test]
+    fn test_network_external_egress_with_in_graph_producer_rejected() {
+        let yaml = graph_with_network(
+            "network:\n  mode: peer\n  egress:\n    - topic: /robo/cam/cloud\n      external: true\n",
+        );
+        let err = validate_graph(&parse_graph(&yaml).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'/robo/cam/cloud' is marked `external: true`")
+                && err.contains("node 'cam'")
+                && err.contains("remove `external: true`"),
+            "the inverse arm must name the topic, the producer and the fix; got: {err}"
         );
     }
 
