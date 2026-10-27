@@ -1,7 +1,7 @@
 """The policy replay helper shipped in examples/policy_replay/.
 
-Records here are built in the test (synthetic frames, labeled by their
-topic names) or come from the fixture's oracle bag.
+Records here are built in the test (synthetic frames on made-up topics, or typed sensor_msgs messages encoded in the test) or come from
+the fixture's oracle bag.
 """
 
 import struct
@@ -149,3 +149,141 @@ def test_replay_reads_a_bag(fixture_bin, tmp_path):
     with cerulion.open_bag(path) as bag:
         with pytest.raises(ValueError):
             list(recorded_steps(bag, "/py_bag/missing", "/py_bag/b"))
+
+
+def test_recorded_steps_takes_any_iterable_of_topics(fixture_bin, tmp_path):
+    path = tmp_path / "bag.mcap"
+    write_bag(fixture_bin, path)
+    with cerulion.open_bag(path) as bag:
+        steps = recorded_steps(bag, (t for t in ["/py_bag/a"]), "/py_bag/b")
+        assert steps.observation_topics == ["/py_bag/a"]
+        assert len(list(steps)) == 3
+
+
+def test_a_topic_named_twice_is_refused():
+    with pytest.raises(ValueError, match="names a topic twice"):
+        RecordedSteps([], ["/a", "/a"], "/b")
+
+
+def test_equal_infinities_match_under_a_tolerance():
+    inf = np.array([np.inf, -np.inf], np.float32)
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, inf))]
+    result = assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: inf.copy(), decode, atol=1e-3)
+    assert result.steps == 1
+
+
+def test_a_tolerance_accepts_another_dtype():
+    result = assert_replay_matches(steps(), lambda s: summed(s).astype(np.float64), decode, atol=1e-6)
+    assert result.steps == 2
+
+
+def test_the_report_names_at_most_max_report_steps():
+    log = [("/o", synthetic_record(0, [0.0]))]
+    log += [("/act", synthetic_record(i, [1.0])) for i in range(7)]
+    with pytest.raises(AssertionError) as failure:
+        assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: np.float32([2.0]), decode, max_report=3)
+    lines = str(failure.value).splitlines()
+    assert lines[0].startswith("7 of 7 replayed actions differ")
+    assert [line.split(" (")[0].strip() for line in lines[1:]] == ["step 0", "step 1", "step 2"]
+
+
+def load_template():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "policy_replay" / "test_policy_replay.py"
+    spec = importlib.util.spec_from_file_location("policy_replay_template", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HEADER = {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": ""}
+IMAGE_DEFAULTS = {"header": HEADER, "is_bigendian": 0}
+
+
+def encoded_record(message_class, values):
+    from cerulion._typed import _encode_message, _schema_arg
+
+    schemas, name = _schema_arg(message_class, None, "encoded_record")
+    return cerulion.Record(bytes(_encode_message(schemas, name, values, 0)))
+
+
+def test_template_decoders_read_recorded_messages():
+    template = load_template()
+    from cerulion.msgs.sensor_msgs import Image, JointState
+
+    height, width, pad = 2, 3, 4
+    step = width * 3 + pad
+    rows = np.arange(height * step, dtype=np.uint8).reshape(height, step)
+    image = encoded_record(
+        Image,
+        {**IMAGE_DEFAULTS, "height": height, "width": width, "step": step, "encoding": "rgb8", "data": rows.reshape(-1)},
+    )
+    pixels = template.image_array(image)
+    assert pixels.shape == (height, width, 3)
+    assert pixels.flags.owndata and pixels.flags.writeable
+    np.testing.assert_array_equal(pixels.reshape(height, width * 3), rows[:, : width * 3])
+
+    mono = encoded_record(
+        Image,
+        {**IMAGE_DEFAULTS, "height": 1, "width": 1, "step": 1, "encoding": "mono8", "data": np.zeros(1, np.uint8)},
+    )
+    with pytest.raises(AssertionError, match="decodes rgb8, the bag has mono8"):
+        template.image_array(mono)
+
+    action = encoded_record(
+        JointState, {"header": HEADER, "name": b"", "position": [0.5, -1.25], "velocity": [], "effort": []}
+    )
+    decoded = template.recorded_action(action)
+    assert decoded.dtype == np.float64
+    np.testing.assert_array_equal(decoded, [0.5, -1.25])
+
+
+def test_an_infinity_matches_only_an_equal_infinity():
+    inf = np.array([np.inf, np.inf], np.float32)
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, inf))]
+    with pytest.raises(AssertionError, match=r"(?s)1 of 1 .*max abs error inf"):
+        assert_replay_matches(
+            RecordedSteps(log, "/o", "/act"), lambda s: np.float32([0.0, -np.inf]), decode, rtol=1e-3
+        )
+
+
+def test_max_abs_error_ignores_matched_infinities():
+    recorded = np.array([np.inf, 1.0], np.float32)
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, recorded))]
+    result = assert_replay_matches(
+        RecordedSteps(log, "/o", "/act"), lambda s: np.float32([np.inf, 1.5]), decode, atol=1.0
+    )
+    assert result.max_abs_error == 0.5
+
+
+def test_rtol_is_relative_to_the_recorded_action():
+    # recorded 1.0, replayed 2.0: rtol 0.6 of the recorded value bounds the
+    # error at 0.6 (a mismatch); the same rtol of the replayed value would be 1.2.
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, [1.0]))]
+    with pytest.raises(AssertionError, match="1 of 1"):
+        assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: np.float32([2.0]), decode, rtol=0.6)
+
+
+def test_a_mismatch_report_ignores_matched_infinities():
+    recorded = np.array([np.inf, 1.0], np.float32)
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, recorded))]
+    with pytest.raises(AssertionError, match="max abs error 2$"):
+        assert_replay_matches(
+            RecordedSteps(log, "/o", "/act"), lambda s: np.float32([np.inf, 3.0]), decode, atol=1.0
+        )
+
+
+def test_nan_on_both_sides_is_a_mismatch_under_a_tolerance_only():
+    nan = np.array([np.nan], np.float32)
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, nan))]
+    with pytest.raises(AssertionError, match="1 of 1"):
+        assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: nan.copy(), decode, atol=1.0)
+    result = assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: nan.copy(), decode)
+    assert (result.steps, result.max_abs_error) == (1, 0.0)
+
+
+def test_an_exact_mismatch_of_zero_magnitude_says_the_bytes_differ():
+    log = [("/o", synthetic_record(0, [0.0])), ("/act", synthetic_record(0, [0.0]))]
+    with pytest.raises(AssertionError, match=r"bytes differ \(max abs error 0\)"):
+        assert_replay_matches(RecordedSteps(log, "/o", "/act"), lambda s: np.float32([-0.0]), decode)

@@ -18,14 +18,18 @@ once and then every recorded step in order.
 
 Exact or within tolerance:
 
-* Byte-exact replay holds when the replay runs the same weights, the same
-  library versions and the same device type as the recording, on CPU, with
-  deterministic algorithms on. Leave ``REPLAY_ATOL`` unset for that check.
+* Byte-exact replay holds on CPU with deterministic algorithms on, when the
+  replay runs the same weights, library versions, CPU model and ``torch``
+  thread count as the recording. Set ``REPLAY_THREADS`` to the
+  ``torch.get_num_threads()`` the recording ran with (default 1, for a
+  recording made after ``torch.set_num_threads(1)``). Leave ``REPLAY_ATOL``
+  and ``REPLAY_RTOL`` unset for that check.
 * A GPU or MPS replay, or a recording made on a different device type, gives
   actions within a tolerance, not equal bytes. Set ``REPLAY_ATOL`` (and
   ``REPLAY_RTOL``) to the bound you accept.
 * A policy that samples noise when it acts (flow matching, diffusion) repeats
-  its actions only if the recording seeded the same generator the same way;
+  its actions only if the recording seeded the same generator the same way
+  (this template seeds 0 before loading the checkpoint);
   otherwise compare within a tolerance wide enough for the sampling spread.
 """
 
@@ -53,6 +57,7 @@ CHECKPOINT = os.environ.get("REPLAY_POLICY")
 DEVICE = os.environ.get("REPLAY_DEVICE", "cpu")
 ATOL = float(os.environ.get("REPLAY_ATOL", "0"))
 RTOL = float(os.environ.get("REPLAY_RTOL", "0"))
+THREADS = int(os.environ.get("REPLAY_THREADS", "1"))
 
 pytestmark = pytest.mark.skipif(
     not (BAG and CHECKPOINT), reason="set REPLAY_BAG and REPLAY_POLICY to run the replay test"
@@ -73,14 +78,16 @@ def recorded_action(record):
 
 @pytest.fixture(scope="module")
 def policy():
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("lerobot")
+    # Plain imports: with REPLAY_BAG and REPLAY_POLICY set, a missing torch or
+    # LeRobot fails the test instead of skipping it.
+    import torch
+    import lerobot.processor
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.configs.policies import PreTrainedConfig
 
     if DEVICE == "cpu":
         torch.use_deterministic_algorithms(True)
-        torch.set_num_threads(1)
+        torch.set_num_threads(THREADS)
     torch.manual_seed(0)
 
     config = PreTrainedConfig.from_pretrained(CHECKPOINT)
@@ -93,6 +100,12 @@ def policy():
         pretrained_path=CHECKPOINT,
         preprocessor_overrides={"device_processor": {"device": DEVICE}},
     )
+    # A relative-action processor step anchors each chunk to the state it was
+    # predicted from only when bound to the policy's action queue, as LeRobot's
+    # own rollout binds it. Releases without that step have no binding to make.
+    bind = getattr(lerobot.processor, "bind_relative_anchor", None)
+    if bind is not None:
+        bind(model, preprocess)
 
     def act(step):
         observation = {
@@ -104,8 +117,9 @@ def policy():
         observation["task"] = TASK
         with torch.inference_mode():
             action = postprocess(model.select_action(preprocess(observation)))
-        # The robot widened the float32 action into JointState's float64
-        # positions; float32 to float64 is exact, so the bytes stay comparable.
+        # This template assumes the robot widened the float32 action into
+        # JointState's float64 positions; float32 to float64 is exact, so the
+        # bytes stay comparable.
         return action.squeeze(0).cpu().numpy().astype(np.float64)
 
     return act

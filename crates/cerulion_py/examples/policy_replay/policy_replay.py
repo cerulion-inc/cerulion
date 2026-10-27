@@ -2,7 +2,12 @@
 
 ``recorded_steps()`` walks a bag written by ``cerulion bag record`` and pairs each
 action record with the newest record on every observation topic logged before it,
-in log order: the observation the robot held when that action was recorded.
+in log order. That is the observation the policy acted on when the robot logs a
+new observation only after publishing the action for the previous one, and the
+recorder logged frames in the order the policy received them. A frame logged
+while the policy was still computing pairs a newer observation with that action,
+and the replayed action can then differ from the recorded one (for a policy that
+keeps state, so can the steps after it).
 ``assert_replay_matches()`` feeds those observations to a policy in order and
 compares each returned action with the recorded one, exactly (the default) or
 within a tolerance.
@@ -29,10 +34,23 @@ class Step:
     action: cerulion.Record
 
 
+def _checked_topics(observation_topics, action_topic):
+    if isinstance(observation_topics, str):
+        observation_topics = [observation_topics]
+    topics = list(observation_topics)
+    if not topics:
+        raise ValueError("observation_topics is empty")
+    if len(set(topics)) != len(topics):
+        raise ValueError(f"observation_topics names a topic twice: {topics}")
+    if action_topic in topics:
+        raise ValueError(f"{action_topic!r} is both an observation topic and the action topic")
+    return topics
+
+
 class RecordedSteps:
     """Iterator of ``Step`` over ``(topic, Record)`` pairs in log order.
 
-    ``skipped`` counts the action records yielded no step because some
+    ``skipped`` counts the action records that yielded no step because some
     observation topic had no record before them (the start of a recording).
     It is final once the iterator is exhausted.
     """
@@ -43,13 +61,7 @@ class RecordedSteps:
         observation_topics: Sequence[str],
         action_topic: str,
     ):
-        if isinstance(observation_topics, str):
-            observation_topics = [observation_topics]
-        self.observation_topics = list(observation_topics)
-        if not self.observation_topics:
-            raise ValueError("observation_topics is empty")
-        if action_topic in self.observation_topics:
-            raise ValueError(f"{action_topic!r} is both an observation topic and the action topic")
+        self.observation_topics = _checked_topics(observation_topics, action_topic)
         self.action_topic = action_topic
         self.skipped = 0
         self._records = iter(records)
@@ -79,9 +91,8 @@ def recorded_steps(bag, observation_topics: Sequence[str], action_topic: str) ->
     Reads only the named topics; an unknown topic raises ``ValueError`` from
     ``Bag.messages()``.
     """
-    if isinstance(observation_topics, str):
-        observation_topics = [observation_topics]
-    topics = list(observation_topics) + [action_topic]
+    observation_topics = _checked_topics(observation_topics, action_topic)
+    topics = observation_topics + [action_topic]
     return RecordedSteps(bag.messages(topics), observation_topics, action_topic)
 
 
@@ -107,12 +118,15 @@ def assert_replay_matches(
     ``policy(step)`` returns the action for that step's observation;
     ``recorded_action(record)`` decodes the recorded action record. With
     ``atol == rtol == 0`` (the default) the two must have the same dtype and
-    shape and equal bytes. Otherwise they must have the same shape and satisfy
-    ``abs(replayed - recorded) <= atol + rtol * abs(recorded)`` elementwise.
-    A NaN in either array is a mismatch.
+    shape and equal bytes. Otherwise they must have the same shape and each
+    element must equal the recorded one or satisfy
+    ``abs(replayed - recorded) <= atol + rtol * abs(recorded)``; under a
+    tolerance a NaN in either array is a mismatch and an infinity matches only
+    an equal infinity.
 
     Raises ``AssertionError`` naming the first ``max_report`` mismatching
-    steps (index, sequence, timestamp, largest error) and the mismatch count,
+    steps (index, sequence, timestamp, and the shape, dtype or largest error)
+    and the mismatch count,
     or when fewer than ``min_steps`` steps were replayed.
     """
     exact = atol == 0.0 and rtol == 0.0
@@ -129,17 +143,25 @@ def assert_replay_matches(
         if exact and replayed.dtype != recorded.dtype:
             mismatches.append((step, f"dtype {replayed.dtype} != recorded {recorded.dtype}"))
             continue
-        error = np.abs(replayed.astype(np.float64) - recorded.astype(np.float64))
+        with np.errstate(invalid="ignore", over="ignore"):
+            error = np.abs(replayed.astype(np.float64) - recorded.astype(np.float64))
+            bound = atol + rtol * np.abs(recorded.astype(np.float64))
+        equal = replayed == recorded
+        if exact:
+            equal |= np.isnan(replayed) & np.isnan(recorded)
+        error = np.where(equal, 0.0, error)
         largest = float(np.max(error)) if error.size else 0.0
-        if not np.isnan(largest):
-            worst = max(worst, largest)
+        finite_error = error[np.isfinite(error)]
+        if finite_error.size:
+            worst = max(worst, float(np.max(finite_error)))
         if exact:
             ok = replayed.tobytes() == recorded.tobytes()
         else:
-            bound = atol + rtol * np.abs(recorded.astype(np.float64))
-            ok = bool(np.all(error <= bound))
+            finite = np.isfinite(replayed) & np.isfinite(recorded)
+            ok = bool(np.all(equal | (finite & (error <= bound))))
         if not ok:
-            mismatches.append((step, f"max abs error {largest:.6g}"))
+            why = "bytes differ (max abs error 0)" if largest == 0 else f"max abs error {largest:.6g}"
+            mismatches.append((step, why))
     if mismatches:
         rule = "byte-exact" if exact else f"atol={atol:g} rtol={rtol:g}"
         lines = [f"{len(mismatches)} of {count} replayed actions differ from the recording ({rule}):"]

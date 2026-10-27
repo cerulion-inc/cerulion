@@ -435,19 +435,24 @@ holds a helper and a pytest template that replay a recorded bag through a
 policy and assert its actions against the recorded ones. Copy both files next
 to your tests. `recorded_steps(bag, observation_topics, action_topic)` pairs
 each record on the action topic with the newest record on every observation
-topic logged before it, in log order: the observation the robot held when it
-recorded that action. Action records logged before every observation topic
-has a record are counted in `skipped`, not replayed.
-`assert_replay_matches(steps, policy, recorded_action, atol=0.0, rtol=0.0)`
-calls `policy(step)` on every step in order and compares the result with
-`recorded_action(step.action)`. With both tolerances zero the arrays must
-match in dtype, shape and bytes. Otherwise the check is
-`abs(replayed - recorded) <= atol + rtol * abs(recorded)`, and a NaN is a
-mismatch. A failure names the first mismatching steps by index, sequence and
-timestamp. A policy that keeps state between calls (an action chunk queue,
-temporal ensembling) reproduces the recording only from the same starting
-state: start the recorder before the policy acts, reset the policy once, and
-replay every step in order.
+topic logged before it, in log order. That is the observation the policy acted
+on when the robot logs a new observation only after publishing the action for
+the previous one, and the recorder logged frames in the order the policy
+received them. A frame logged while the policy was still computing pairs a
+newer observation with that action, and the replayed action can then differ
+from the recorded one (for a policy that keeps state, so can the steps after
+it). Action records logged before every observation topic has a record are
+counted in `skipped`, not replayed. `assert_replay_matches(steps, policy,
+recorded_action, atol=0.0, rtol=0.0)` calls `policy(step)` on every step in
+order and compares the result with `recorded_action(step.action)`. With both
+tolerances zero the arrays must match in dtype, shape and bytes. Otherwise
+each element must equal the recorded one or satisfy `abs(replayed - recorded)
+<= atol + rtol * abs(recorded)`; under a tolerance, a NaN in either array is a
+mismatch and an infinity matches only an equal infinity. A failure names the
+first mismatching steps by index, sequence and timestamp. A policy that keeps
+state between calls (an action chunk queue, temporal ensembling) reproduces
+the recording only from the same starting state: start the recorder before the
+policy acts, reset the policy once, and replay every step in order.
 
 ```python-source
 from policy_replay import assert_replay_matches, recorded_steps
@@ -459,12 +464,14 @@ with cerulion.open_bag("session.mcap") as bag:
 
 `test_policy_replay.py` loads a LeRobot checkpoint with its saved pre- and
 postprocessors and runs the check when `REPLAY_BAG` and `REPLAY_POLICY` are
-set. Byte-exact replay holds on CPU with deterministic algorithms on, when
-the replay runs the same weights, library versions and device type as the
-recording. A GPU replay, or a recording made on another device type, matches
+set. Byte-exact replay holds on CPU with deterministic algorithms on, when the
+replay runs the same weights, library versions, CPU model and `torch` thread
+count as the recording: set `REPLAY_THREADS` to the `torch.get_num_threads()`
+the recording ran with (default 1), and leave `REPLAY_ATOL` and `REPLAY_RTOL`
+unset. A GPU replay, or a recording made on another device type, matches
 within a tolerance (`REPLAY_ATOL`, `REPLAY_RTOL`). A policy that samples noise
 when it acts repeats its actions only if the recording seeded the same
-generator the same way.
+generator the same way (the template seeds 0 before loading the checkpoint).
 
 ## Errors
 
