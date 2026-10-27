@@ -63,8 +63,8 @@ pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
         }
         _ => {
             tracing::warn!(
-                value,
-                "{KEY_RECHECK_ENV} must be whole seconds from {} to {}; using {} s",
+                "{KEY_RECHECK_ENV}={value:?} is not whole seconds from {} to {}; using the \
+                 default {} s",
                 MIN_KEY_RECHECK_INTERVAL.as_secs(),
                 MAX_KEY_RECHECK_INTERVAL.as_secs(),
                 KEY_RECHECK_INTERVAL.as_secs()
@@ -72,6 +72,11 @@ pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
             KEY_RECHECK_INTERVAL
         }
     }
+}
+
+/// The recheck interval this process's environment sets ([`KEY_RECHECK_ENV`]).
+pub fn key_recheck_from_env() -> Duration {
+    resolve_key_recheck(std::env::var(KEY_RECHECK_ENV).ok().as_deref())
 }
 /// The largest pending artifact read (far above a real epoch); a larger file is
 /// discarded unread.
@@ -201,13 +206,17 @@ impl EpochPull {
     /// cut) and it has not been seen within the recheck interval. Returns
     /// whether a request was written.
     pub fn note_accept(&self, key: &[u8; 32]) -> bool {
+        self.note_accept_at(key, Instant::now())
+    }
+
+    /// [`EpochPull::note_accept`] at `now`.
+    pub fn note_accept_at(&self, key: &[u8; 32], now: Instant) -> bool {
         if !matches!(
             self.shared.snapshot_for_key(key).1,
             crate::trust::KeyAccess::Allowed(_)
         ) {
             return false;
         }
-        let now = Instant::now();
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         if seen
             .get(key)

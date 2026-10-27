@@ -166,11 +166,7 @@ pub async fn serve_endpoint(
     // The robot's own revocation fetch: the supervisor's sync worker leaves
     // fetched epochs in the state directory, applied here on a poll.
     let pull = config.store_file.parent().map(|dir| {
-        let recheck = crate::epoch_pull::resolve_key_recheck(
-            std::env::var(crate::epoch_pull::KEY_RECHECK_ENV)
-                .ok()
-                .as_deref(),
-        );
+        let recheck = crate::epoch_pull::key_recheck_from_env();
         Arc::new(EpochPull::new(dir, shared.clone(), access_clock.clone()).with_recheck(recheck))
     });
     let poller = pull.clone().map(|pull| tokio::spawn(pull.run()));

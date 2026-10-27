@@ -179,9 +179,24 @@ fn a_failure_after_a_healthy_run_counts_as_the_first_attempt() {
 fn epoch_sync_delays_double_from_five_seconds_to_a_five_minute_cap_without_stopping() {
     let secs: Vec<u64> = [1, 2, 3, 4, 5, 6, 7, 100]
         .iter()
-        .map(|failures| epoch_sync_delay(*failures).as_secs())
+        .map(|failures| epoch_sync_delay(*failures, DEFAULT_EPOCH_SYNC_PERIOD).as_secs())
         .collect();
     assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300]);
+    // Never longer than a shorter configured period.
+    let short: Vec<u64> = [1, 3, 4, 100]
+        .iter()
+        .map(|failures| epoch_sync_delay(*failures, Duration::from_secs(30)).as_secs())
+        .collect();
+    assert_eq!(short, vec![5, 20, 30, 30]);
+}
+
+#[test]
+fn the_epoch_sync_period_is_read_from_the_environment() {
+    std::env::set_var(EPOCH_SYNC_PERIOD_ENV, "75");
+    let configured = epoch_sync_period_from_env();
+    std::env::remove_var(EPOCH_SYNC_PERIOD_ENV);
+    assert_eq!(configured, Duration::from_secs(75));
+    assert_eq!(epoch_sync_period_from_env(), DEFAULT_EPOCH_SYNC_PERIOD);
 }
 
 /// A stand-in worker: appends one line to `log` per run, exits with `code`.

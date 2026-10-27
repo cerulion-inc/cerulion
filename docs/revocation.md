@@ -86,7 +86,7 @@ The worker runs at start, every `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300
 5 s, when an admitted key that has not connected in the last `CERULION_REMOTED_EPOCH_RECHECK_S`
 (default 60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
 and the sweep below evicts live sessions. A failed fetch backs off from 5 s doubling
-to 300 s and changes nothing: only a verified, strictly newer epoch removes a key, so
+to 300 s (never past the period) and changes nothing: only a verified, strictly newer epoch removes a key, so
 a robot never strands.
 
 Worst-case lag from the owner's revoke to enforcement, on a robot whose login is
@@ -104,7 +104,7 @@ fetches are succeeding.
 | `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (30 to 86400) | 300 | The revocation lag for a key that stays away, at one HTTPS request per robot per period to the account service (288 a day). 300 s keeps that load negligible while a stolen desk that holds a connection open is cut within minutes. |
 | `CERULION_REMOTED_EPOCH_RECHECK_S` (5 to 3600) | 60 | How soon a key that reconnects asks for another early fetch. Shorter cuts a quickly reconnecting revoked key sooner, at up to one extra request per key per interval. |
 | Fetch deadline | 120 s | Above the worker's own worst case (a 30 s refresh-lock wait, a 30 s session refresh, a 30 s access request), so it never stops a session refresh midway. |
-| Failure backoff | 5 s doubling to 300 s | A short outage costs one short delay; a long one stops hammering the service. Fetching never stops. |
+| Failure backoff | 5 s doubling to 300 s, never past the period | A short outage costs one short delay; a long one stops hammering the service. Fetching never stops, and recovery is no slower than the period. |
 | Apply poll | 2 s | The time from a fetched epoch to enforcement, at one file check per poll. |
 | Desk refresh bound (`EPOCH_SYNC_BUDGET`) | 1 s | The most a listing or `viz --robot` waits on the account service before dialing. |
 

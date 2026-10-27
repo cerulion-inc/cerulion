@@ -247,7 +247,7 @@ fn run(
             .map_err(|error| format!("starting robot server: {error}"))?,
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
-    let period = resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref());
+    let period = epoch_sync_period_from_env();
     let mut epoch_sync = EpochSync::new(cli, root.clone(), period, Instant::now());
     let result = supervise_server(
         &mut child,
@@ -320,8 +320,8 @@ pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
         Ok(period) if (MIN_EPOCH_SYNC_PERIOD..=MAX_EPOCH_SYNC_PERIOD).contains(&period) => period,
         _ => {
             tracing::warn!(
-                value,
-                "{EPOCH_SYNC_PERIOD_ENV} must be whole seconds from {} to {}; using {} s",
+                "{EPOCH_SYNC_PERIOD_ENV}={value:?} is not whole seconds from {} to {}; using \
+                 the default {} s",
                 MIN_EPOCH_SYNC_PERIOD.as_secs(),
                 MAX_EPOCH_SYNC_PERIOD.as_secs(),
                 DEFAULT_EPOCH_SYNC_PERIOD.as_secs()
@@ -329,6 +329,11 @@ pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
             DEFAULT_EPOCH_SYNC_PERIOD
         }
     }
+}
+
+/// The fetch period this process's environment sets ([`EPOCH_SYNC_PERIOD_ENV`]).
+fn epoch_sync_period_from_env() -> Duration {
+    resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref())
 }
 /// The bound on one revocation fetch: above the worker's own worst case (a
 /// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
@@ -350,11 +355,14 @@ const EPOCH_SYNC_MAX_RETRY: Duration = Duration::from_secs(300);
 const EPOCH_REQUEST_FILE: &str = "epoch.request";
 const REMOTED_SUBDIR: &str = "remoted";
 
-/// The wait after `failures` consecutive failed fetches (at least 1).
-fn epoch_sync_delay(failures: u32) -> Duration {
+/// The wait after `failures` consecutive failed fetches (at least 1), never
+/// longer than the configured `period`, so recovery after an outage is no
+/// slower than the period.
+fn epoch_sync_delay(failures: u32, period: Duration) -> Duration {
     EPOCH_SYNC_FIRST_RETRY
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
         .min(EPOCH_SYNC_MAX_RETRY)
+        .min(period)
 }
 
 /// The robot's revocation sync: runs the hidden `robot-sync-epoch` worker at
@@ -456,7 +464,7 @@ impl EpochSync {
             self.next = now + self.period;
         } else {
             self.failures = self.failures.saturating_add(1);
-            let delay = epoch_sync_delay(self.failures);
+            let delay = epoch_sync_delay(self.failures, self.period);
             tracing::warn!(
                 failures = self.failures,
                 retry_in_s = delay.as_secs(),

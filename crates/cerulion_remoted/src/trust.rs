@@ -1077,15 +1077,23 @@ mod tests {
         shared
             .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
             .unwrap();
-        // A zero interval: every accept of an admitted key requests a fetch.
+        // An in-range 5 s interval: a second accept within it asks for nothing, one
+        // at the interval asks again.
         let pull = EpochPull::new(dir.path(), shared, RemotedClock::fixed(T_NOW))
-            .with_recheck(std::time::Duration::ZERO);
-        assert!(pull.note_accept(&[1u8; 32]));
-        std::fs::remove_file(dir.path().join(EPOCH_REQUEST_FILE)).unwrap();
-        assert!(
-            pull.note_accept(&[1u8; 32]),
-            "the configured interval applies"
-        );
+            .with_recheck(std::time::Duration::from_secs(5));
+        let t0 = std::time::Instant::now();
+        let request = dir.path().join(EPOCH_REQUEST_FILE);
+        assert!(pull.note_accept_at(&[1u8; 32], t0));
+        std::fs::remove_file(&request).unwrap();
+        assert!(!pull.note_accept_at(&[1u8; 32], t0 + std::time::Duration::from_secs(4)));
+        assert!(!request.exists());
+        assert!(pull.note_accept_at(&[1u8; 32], t0 + std::time::Duration::from_secs(5)));
+        assert!(request.exists());
+        // The setting is read from the environment remoted inherits.
+        std::env::set_var(crate::epoch_pull::KEY_RECHECK_ENV, "7");
+        let configured = crate::epoch_pull::key_recheck_from_env();
+        std::env::remove_var(crate::epoch_pull::KEY_RECHECK_ENV);
+        assert_eq!(configured, std::time::Duration::from_secs(7));
     }
 
     // ── SharedTrust::apply_epoch device revocation ───────────────────────────
