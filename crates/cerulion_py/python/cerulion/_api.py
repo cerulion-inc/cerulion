@@ -50,7 +50,10 @@ _session_lock = threading.Lock()
 def connect() -> "Session":
     """Initialise the process-wide transport and return THE ``Session``.
 
-    Idempotent - every call returns the same object.
+    Idempotent - every call returns the same object. The first call raises
+    the soft open-file limit (``RLIMIT_NOFILE``) at most to 1024
+    (``FD_SETSIZE``), so every descriptor stays below the number
+    ``select.select`` refuses; a soft limit already above 1024 is kept.
     """
     global _session
     with _session_lock:
@@ -436,6 +439,11 @@ class Frame:
     @property
     def timestamp_ns(self):
         return self._native.timestamp_ns
+
+    @property
+    def step_tag(self):
+        """The wire header's step tag as an int (0 means untagged)."""
+        return self._native.step_tag
 
     @property
     def total_size(self):

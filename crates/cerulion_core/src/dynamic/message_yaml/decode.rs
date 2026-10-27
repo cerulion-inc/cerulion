@@ -14,7 +14,7 @@ use crate::codegen::element_codec::{CanonicalBodyBuilder, MAX_BODY_BYTES};
 use crate::codegen::layout::WireLayout;
 use crate::codegen::{FieldBounds, FieldDef, FieldType, FrameWalker, MessageSchema};
 use crate::dynamic::DynamicError;
-use crate::wire::WireHeader;
+use crate::wire::{StepTag, WireHeader};
 
 /// Parse `yaml` as one message of the schema `schema` (a qualified name
 /// the walker knows) and build its wire frame, header included.
@@ -109,6 +109,7 @@ pub(super) fn yaml_to_message_capped(
         offset_table_count: layout.variable_fields.len() as u32,
         sequence: 0,
         timestamp_ns,
+        step_tag: StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

@@ -87,7 +87,7 @@ fn setup_with_network(base: &str) -> (Arc<TransportManager>, String) {
     (transport, format!("/ingress/{base}/{id}"))
 }
 
-/// Hand-build a raw wire frame (32-byte little-endian header + payload).
+/// Hand-build a raw wire frame (40-byte little-endian header + payload).
 fn make_wire_frame(schema_hash: u64, seq: u32, timestamp_ns: u64, payload: &[u8]) -> Vec<u8> {
     let header = WireHeader {
         schema_hash,
@@ -96,6 +96,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, timestamp_ns: u64, payload: &[u8]
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

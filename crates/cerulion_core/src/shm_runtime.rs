@@ -11,7 +11,7 @@
 //! # Wire layout
 //!
 //! ```text
-//! [WireHeader (32 bytes)][fixed_section][offset_table][variable_payload]
+//! [WireHeader (40 bytes)][fixed_section][offset_table][variable_payload]
 //! ```
 //!
 //! `<Name>Shm<'a>` borrows the bytes *after* the WireHeader as

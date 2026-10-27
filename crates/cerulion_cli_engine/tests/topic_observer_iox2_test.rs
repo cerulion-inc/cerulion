@@ -54,7 +54,7 @@ fn unique_topic(tag: &str) -> String {
 /// Build a wire frame for a `std_msgs/String`-shaped payload that
 /// `topic_echo` prints as the YAML line `data: "<s>"`.
 ///
-/// Layout: 32-byte [`WireHeader`] (schema hash = the pinned
+/// Layout: 40-byte [`WireHeader`] (schema hash = the pinned
 /// `std_msgs/String` hash so echo recognizes it), then the payload — an
 /// 8-byte offset table (`offset = 8`, `len = s.len()`) followed by the
 /// UTF-8 bytes. `total_size` is the full frame length.
@@ -75,7 +75,7 @@ fn build_string_frame(seq: u32, ts_ns: u64, s: &str) -> Vec<u8> {
     frame
 }
 
-/// Build a bare 32-byte frame (header only, empty payload) carrying an
+/// Build a bare 40-byte frame (header only, empty payload) carrying an
 /// arbitrary `schema_hash` — `topic_info` reads only the header, so this drives
 /// the unknown-hash resolution arm without a decodable payload.
 fn build_frame_with_hash(hash: u64, seq: u32, ts_ns: u64) -> Vec<u8> {
@@ -142,7 +142,10 @@ impl RawTopicWriter {
             .publish_subscribe::<[u8]>()
             // Room for several frames between the observer's drains.
             .subscriber_max_buffer_size(16)
-            .create()
+            .create_with_attributes(
+                &cerulion_core::transport::wire_header_attribute::data_service_specifier()
+                    .expect("attribute"),
+            )
             .expect("raw data service");
         let publisher = data_service
             .publisher_builder()

@@ -178,7 +178,7 @@ pub enum DynamicError {
     },
 
     // ---- decoding: header -----------------------------------------------
-    /// The buffer is shorter than the 32-byte `WireHeader`.
+    /// The buffer is shorter than the 40-byte `WireHeader`.
     #[error("frame too short: have {have} bytes, need at least {need} for the WireHeader")]
     FrameTooShort {
         /// Bytes the buffer holds.

@@ -429,6 +429,7 @@ fn marker_array_frame_from_blob(blob: &[u8], timestamp_ns: u64) -> Vec<u8> {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

@@ -833,9 +833,22 @@ a frame by its `WireHeader.schema_hash`; a bag's schema NAME never reaches it.
 
 ### What a bag carries about its own types
 
-A Cerulion MCAP schema record carries an 18-byte descriptor (recipe +
-`schema_hash` + fixed size) plus the qualified schema name. That is per-CHANNEL
-and cannot hold a schema CLOSURE: `unitree_go/LowState` needs
+A Cerulion MCAP schema record carries a 20-byte descriptor (recipe +
+`schema_hash` + fixed size + the wire header version its frames were recorded
+with) plus the qualified schema name. A bag recorded before the header grew to
+40 bytes carries the older 18-byte descriptor, which means 32-byte headers:
+every reader (`bag play`, `bag play --resim`, `bag migrate`, the Python
+`open_bag`) upgrades those frames to the current layout as it reads them, with
+an untagged step tag, so its frames reach every consumer in the layout a current
+recording has. A message stream (`bag migrate`, `messages()`) upgrades one
+message at a time. A frame walk (`bag play`, `--resim`, the Python frame
+iterator) builds one upgraded copy of the bag's user frames on its first walk,
+reserved at its exact size and held for as long as the bag is open, and refuses
+a bag whose copy would pass 2 GiB, naming `cerulion bag migrate`, which writes a
+current copy of any size. `bag info` reads the recorded bytes and builds no
+copy; it reports how much a walk would hold.
+
+The descriptor is per-CHANNEL and cannot hold a schema CLOSURE: `unitree_go/LowState` needs
 `unitree_go/BmsState` and friends, which are not channels of the bag at all. So
 the definitions ride ONE bag-level attachment, `__cerulion/schemas.json`,
 alongside `__cerulion/recorder.json` and `__cerulion/record_health.json`:

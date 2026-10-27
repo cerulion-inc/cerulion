@@ -8,6 +8,7 @@ import os
 import sys
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 
+from cerulion._native import WIRE_HEADER_SIZE
 from cerulion._typed import (
     Message,
     SchemaSet,
@@ -357,9 +358,9 @@ def output(schema, *, promise_within_ms=None, max_slice_len_default=None):
     if max_slice_len_default is not None and (
         isinstance(max_slice_len_default, bool)
         or not isinstance(max_slice_len_default, int)
-        or max_slice_len_default < 32
+        or max_slice_len_default < WIRE_HEADER_SIZE
     ):
-        raise ValueError("max_slice_len_default must be at least 32")
+        raise ValueError(f"max_slice_len_default must be at least {WIRE_HEADER_SIZE}")
     return Output(
         schema,
         input_port=False,
@@ -605,7 +606,7 @@ class _Runtime:
             raw = memoryview(frame)
             self.instance._cer_input_views[port.name] = raw
             resolved = self.schemas._native.resolve_frame_buffer(raw, port.schema)
-            payload = raw[32:]
+            payload = raw[WIRE_HEADER_SIZE:]
             layout = self.schemas.layout(port.schema)
             inputs[port.name] = _view(
                 payload,

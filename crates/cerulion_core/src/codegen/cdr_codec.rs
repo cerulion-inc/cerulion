@@ -17,7 +17,7 @@
 //! # Two directions
 //!
 //! - [`CdrCodec::decode`] — ingress (sensor direction): a CDR body →
-//!   a complete Cerulion wire frame (32-byte [`WireHeader`] + payload),
+//!   a complete Cerulion wire frame (40-byte [`WireHeader`] + payload),
 //!   ready for `publish_raw`.
 //! - [`CdrCodec::encode`] — egress/actuator direction: a Cerulion wire
 //!   frame → a CDR body, ready to prepend a DDS encapsulation header and
@@ -648,7 +648,7 @@ impl CdrCodec {
         })
     }
 
-    /// Decode a CDR body into a complete Cerulion wire frame (32-byte
+    /// Decode a CDR body into a complete Cerulion wire frame (40-byte
     /// [`WireHeader`] + payload). `sequence` / `timestamp_ns` stamp the header
     /// (the publisher's counters/clock — deterministic under replay).
     pub fn decode(
@@ -712,6 +712,7 @@ impl CdrCodec {
             offset_table_count: layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: crate::wire::StepTag::UNTAGGED,
         };
         let mut frame = vec![0u8; WireHeader::SIZE];
         header.write_to_buf(&mut frame);
@@ -732,7 +733,7 @@ impl CdrCodec {
         self.decode(qualified_name, endian, body, sequence, timestamp_ns)
     }
 
-    /// Encode a complete Cerulion wire frame (32-byte header + payload) into a
+    /// Encode a complete Cerulion wire frame (40-byte header + payload) into a
     /// CDR body (the egress/actuator direction). The header is stripped and
     /// ignored — only the schema (`qualified_name`) + the payload drive the
     /// encoding, so `encode(decode(cdr)) == cdr`.
@@ -1750,7 +1751,7 @@ mod tests {
         c
     }
 
-    /// A Cerulion frame whose 32-byte header is a placeholder (all zeros) —
+    /// A Cerulion frame whose 40-byte header is a placeholder (all zeros),
     /// [`CdrCodec::encode`] strips and ignores the header, so this is a
     /// sufficient encode input built purely from a hand payload.
     fn headerless_input(payload: &[u8]) -> Vec<u8> {
@@ -1886,11 +1887,11 @@ mod tests {
             .unwrap();
         assert_eq!(&frame[WireHeader::SIZE..], &payload[..]);
         // Header fields are stamped from the layout. offset_table_offset is
-        // FRAME-relative (32-byte header + the 8-byte fixed section = 40) —
+        // FRAME-relative (40-byte header + the 8-byte fixed section = 48),
         // the wire.rs "byte offset from message start" contract the native
         // publisher stamps.
         let hdr = WireHeader::read_from_buf(&frame).unwrap();
-        assert_eq!(hdr.offset_table_offset, 40);
+        assert_eq!(hdr.offset_table_offset, 48);
         assert_eq!(hdr.offset_table_count, 2);
 
         // Independent cross-check via the walker.

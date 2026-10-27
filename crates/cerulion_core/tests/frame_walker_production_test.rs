@@ -100,7 +100,7 @@ fn builtin_walker() -> FrameWalker {
 }
 
 /// Drain the subscriber and return the LAST delivered frame re-assembled as
-/// full wire bytes (32-byte header + payload). `write_to_buf` is
+/// full wire bytes (40-byte header + payload). `write_to_buf` is
 /// `read_from_buf`'s exact inverse, so the reassembled bytes equal the bytes
 /// the publisher committed.
 fn capture_last_frame(sub: &CerulionSubscriber) -> Vec<u8> {

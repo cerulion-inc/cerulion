@@ -34,7 +34,8 @@ class Record:
             _offset_table_count,
             self._sequence,
             self._timestamp_ns,
-        ) = struct.unpack_from("<QIIIIQ", self._raw)
+            self._step_tag,
+        ) = struct.unpack_from("<QIIIIQQ", self._raw)
         if self._total_size != len(self._raw):
             raise BagError(
                 f"bag record total_size={self._total_size} does not match "
@@ -59,6 +60,11 @@ class Record:
     @property
     def timestamp_ns(self):
         return self._timestamp_ns
+
+    @property
+    def step_tag(self):
+        """The wire header's step tag as an int (0 means untagged)."""
+        return self._step_tag
 
     @property
     def raw(self):

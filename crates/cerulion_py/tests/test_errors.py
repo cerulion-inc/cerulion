@@ -47,7 +47,7 @@ def test_writable_request_on_frame_raises_buffer_error(session):
     with pytest.raises(BufferError, match="not writable"):
         frame._native.__buffer__(inspect.BufferFlags.WRITABLE)
 
-    assert bytes(frame.raw)[32:] == b"x"
+    assert bytes(frame.raw)[40:] == b"x"
     frame.release()
     assert frame.is_released is True
     # Reclamation proof: a counted-but-never-released export would defer

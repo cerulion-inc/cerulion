@@ -20,7 +20,7 @@ ONE 32-byte SECRET seeds both the iroh endpoint and the pairing
 `DeviceIdentity` (`client.rs::from_seed` consumes it), and its PUBLIC half
 doubles as the iroh `EndpointId` and the pairing transport public key; the
 seed is never the public half. iroh multiplexes both ALPNs on that endpoint
-(`cerulion_link::alpn`: `cerulion/wire/1` = raw topic frames, `cerulion/ops/1` =
+(`cerulion_link::alpn`: `cerulion/wire/2` = raw topic frames, `cerulion/ops/1` =
 ops verbs; the trailing `/1` is each plane's protocol-version boundary). Exactly
 one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accept
 (`daemon::handle_accepted`; pinned over real loopback endpoints by
@@ -49,7 +49,7 @@ one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accep
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust |
-| `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/1` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
+| `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
 | `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`pair` worker binary (session driver + CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
 
@@ -61,7 +61,7 @@ Load-bearing boundary contracts:
   `cerulion_cli_engine::connect_cmd`; the `cerulion` CLI stays iroh-free).
   *License placement itself has no enforcing test; verified against the SPDX
   headers + `Cargo.toml` license fields.*
-- **`cerulion-wire` deliberately duplicates the wire structs** (32-byte header,
+- **`cerulion-wire` deliberately duplicates the wire structs** (40-byte header,
   8-byte offset entry) so the permissive decode seam stands alone. Byte
   compatibility is pinned by `crates/cerulion_core/tests/wire_lockstep_test.rs` (the
   real writer encodes, this crate re-parses) plus in-crate `const` size asserts.
@@ -264,7 +264,7 @@ authenticated transport.
 
 ## 6. The wire plane (robot side)
 
-A `cerulion/wire/1` connection (admitted only for a paired `CAP_OBSERVE`
+A `cerulion/wire/2` connection (admitted only for a paired `CAP_OBSERVE`
 account) carries ONE bidi control stream (length-prefixed JSON:
 `catalog`/`demand`/`undemand`/`schema`/`status`/`sync_epoch`, the same
 `cerulion_q` vocabulary the LAN uses, imported not mirrored) and ONE uni data

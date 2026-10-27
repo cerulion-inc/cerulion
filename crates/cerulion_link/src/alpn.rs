@@ -12,7 +12,12 @@
 /// gateway — zenoh on the LAN, iroh across the internet).
 ///
 /// [`WireHeader`]: https://docs.rs/cerulion-wire
-pub const WIRE: &[u8] = b"cerulion/wire/1";
+///
+/// Version 2 of the plane carries the 40-byte wire header (wire header
+/// version 2). A peer still dialing `cerulion/wire/1` sends 32-byte headers;
+/// it shares no ALPN with this endpoint, so its QUIC handshake fails and no
+/// frame of it is ever read.
+pub const WIRE: &[u8] = b"cerulion/wire/2";
 
 /// The ops plane (cerud — the Cerulion control daemon).
 pub const OPS: &[u8] = b"cerulion/ops/1";

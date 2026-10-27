@@ -2245,6 +2245,63 @@ fn frame_y(frame: &[u8]) -> f64 {
 // 1. Happy path
 // ===========================================================================
 
+/// A recording made by the release with the 32-byte wire header resims:
+/// its frames are upgraded as they are read, the re-executed graph's
+/// untagged 40-byte frames match them byte for byte, and the run passes. A
+/// payload byte flipped in the legacy file still fails it, so the verdict
+/// compares the upgraded bytes rather than skipping them.
+#[test]
+#[serial]
+fn a_recording_from_the_32_byte_release_resims_byte_exact() {
+    let steps = 4;
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.mcap");
+    write_bag(&rec, &current, None);
+    let legacy_bytes =
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(&std::fs::read(&current).unwrap());
+    let legacy = dir.path().join("legacy.mcap");
+    std::fs::write(&legacy, &legacy_bytes).unwrap();
+    let topics = cerulion_bag::BagReader::open(&legacy)
+        .unwrap()
+        .legacy_wire_header_topics()
+        .unwrap();
+    assert_eq!(
+        topics,
+        vec!["/sr/relay/out".to_string(), "/sr/source/out".to_string()]
+    );
+
+    let outcome = replay(&legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        outcome.passed,
+        "a legacy recording must resim byte-exact: {:?}",
+        outcome.violations
+    );
+    assert_eq!(outcome.ticks_replayed, steps);
+
+    // Flip the first payload byte of the last relay frame in the legacy
+    // recording (payload starts at byte 32 in the old layout).
+    let mut flipped = rec.clone();
+    let rel = flipped.messages.get_mut("/sr/relay/out").unwrap();
+    let last = rel.len() - 1;
+    rel[last][cerulion_core::wire::WireHeader::SIZE] ^= 0x01;
+    let flipped_current = dir.path().join("flipped_current.mcap");
+    write_bag(&flipped, &flipped_current, None);
+    let flipped_legacy = dir.path().join("flipped_legacy.mcap");
+    std::fs::write(
+        &flipped_legacy,
+        cerulion_bag::legacy_fixture::downgrade_bag_to_v1(
+            &std::fs::read(&flipped_current).unwrap(),
+        ),
+    )
+    .unwrap();
+    let outcome = replay(&flipped_legacy, source_relay_factories, None, None).expect("replay runs");
+    assert!(
+        !outcome.passed,
+        "a flipped payload byte in a legacy recording must fail"
+    );
+}
+
 #[test]
 #[serial]
 fn happy_path_replays_byte_exact_and_passes() {
@@ -2357,8 +2414,8 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
         outcome.violations
     );
     // EXACT diff coordinates: the flipped byte is the FIRST payload byte, so
-    // the first divergence is at exactly WireHeader::SIZE (32); a Vector3 frame
-    // is 32-byte header + 24-byte payload = 56 bytes on both sides.
+    // the first divergence is at exactly WireHeader::SIZE (40); a Vector3 frame
+    // is 40-byte header + 24-byte payload = 64 bytes on both sides.
     match relay_violations[0].class {
         ViolationClass::ByteMismatch {
             index,
@@ -2372,7 +2429,7 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
                 WireHeader::SIZE,
                 "the flip was at the first payload byte"
             );
-            assert_eq!((recorded_len, replayed_len), (56, 56));
+            assert_eq!((recorded_len, replayed_len), (64, 64));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
@@ -2409,7 +2466,7 @@ fn nondet_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 /// The assertions prove the divergence is DATA, not schedule:
 ///   * ≥1 `ByteMismatch` violation on the node's topic (the diff caught it);
 ///   * the first differing byte is in the PAYLOAD region (≥ `WireHeader::SIZE`)
-///     — the 32-byte header (sequence + timestamp) reproduced byte-identically
+///     the 40-byte header (sequence + timestamp) reproduced byte-identically
 ///     via the recorded-clock re-advance, so the schedule/clock was retraced;
 ///   * `trace_divergence` is `None` (NOT an exit-6 structural divergence —
 ///     the node fired identically, only the data differs);
@@ -2534,7 +2591,7 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
         } => {
             assert_eq!(index, 1, "the flipped common-prefix frame is named");
             assert_eq!(first_diff_byte_offset, WireHeader::SIZE);
-            assert_eq!((recorded_len, replayed_len), (56, 56));
+            assert_eq!((recorded_len, replayed_len), (64, 64));
         }
         ref other => panic!("expected ByteMismatch second, got {other:?}"),
     }
@@ -4270,7 +4327,7 @@ fn fire_bearing_trace_without_boundaries_is_bag_no_step_boundaries_exit_2() {
 // 18. Defensive branches
 // ===========================================================================
 
-/// An external frame too short for a wire header (< 32 bytes) injects
+/// An external frame too short for a wire header (< 40 bytes) injects
 /// UNCONDITIONALLY (it cannot be time-windowed) and must not strand later
 /// frames behind it. Placed FIRST in file order: it is injected alongside the
 /// first real frame; the data-trigger consumer reads the LATEST queued frame
@@ -4312,8 +4369,8 @@ fn tiny_unparseable_external_frame_injects_without_stranding() {
 #[serial]
 fn extended_recorded_frame_reports_diff_at_common_length() {
     let mut rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
-    // Append 4 trailing bytes to the LAST source frame (56 → 60 bytes). The
-    // wire header (total_size 56, timestamp) is untouched, so the cross-checks
+    // Append 4 trailing bytes to the LAST source frame (64 → 68 bytes). The
+    // wire header (total_size 64, timestamp) is untouched, so the cross-checks
     // pass; only the byte diff sees the tail.
     let frames = rec.messages.get_mut("/sr/source/out").unwrap();
     let last = frames.len() - 1;
@@ -4340,10 +4397,10 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
         } => {
             assert_eq!(index, 3, "the extended frame is the last of 4");
             assert_eq!(
-                first_diff_byte_offset, 56,
+                first_diff_byte_offset, 64,
                 "matching prefix → first diff at the common length"
             );
-            assert_eq!((recorded_len, replayed_len), (60, 56));
+            assert_eq!((recorded_len, replayed_len), (68, 64));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
@@ -4722,7 +4779,7 @@ fn swapped_frames_violate_monotonicity_recording_inconsistent_exit_2() {
 
 /// A PRODUCED-topic frame too short for a wire header hits the
 /// "no parseable wire header" cross-check arm (graph publishers always stamp a
-/// 32-byte header, so this is corruption — unlike the EXTERNAL tiny-frame
+/// 40-byte header, so this is corruption, unlike the EXTERNAL tiny-frame
 /// exemption pinned by `tiny_unparseable_external_frame_injects_without_stranding`).
 #[test]
 #[serial]
@@ -26438,7 +26495,7 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
 
     // (2) FRAME CONTENT — one flipped payload byte, schedule untouched.
     let mut flipped = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     let bag_flip = dir.path().join("dc_flip.mcap");
     write_bag(&flipped, &bag_flip, None);
 
@@ -26469,7 +26526,7 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
 
     // (5) BOTH structural and content — the ordering pin on a real outcome.
     let mut both = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    both.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    both.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     both.trace.remove(fire_index_at(&both, "relay", 1));
     let bag_both = dir.path().join("dc_both.mcap");
     write_bag(&both, &bag_both, None);
@@ -26714,7 +26771,7 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
 
     // (2) a BYTE-MISMATCH bag (exit-1 shape) — one flipped payload byte.
     let mut flipped = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
-    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][32] ^= 0x01;
+    flipped.messages.get_mut("/sr/relay/out").unwrap()[2][40] ^= 0x01;
     let bag_flip = dir.path().join("corpus_flip.mcap");
     write_bag(&flipped, &bag_flip, None);
 
@@ -30105,7 +30162,7 @@ fn a_duration_bounded_steered_pass_reports_no_injection_residue() {
 /// produces the topic:
 ///
 /// * a topic the graph PRODUCES cannot legally carry one — a graph publisher
-///   always stamps a 32-byte header — so it is a corrupt recording and the
+///   always stamps a 40-byte header, so it is a corrupt recording and the
 ///   pre-flight refuses the whole replay with `RecordingInconsistent` (exit 2).
 ///   That gate had no test at all; this is it.
 /// * a topic the graph only CONSUMES (an absolute external `source:`) may carry

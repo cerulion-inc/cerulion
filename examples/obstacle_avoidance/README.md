@@ -63,9 +63,9 @@ cerulion graph run obstacle_avoidance --release --record
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+minutes; later builds take seconds. The graph declares no `process_groups:`,
+so `graph run` runs one process per node without asking and leaves the graph
+file unchanged; add `--yes` to save that layout in the graph YAML.
 
 In a second terminal, watch the velocity command flow:
 

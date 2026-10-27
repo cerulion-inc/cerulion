@@ -929,7 +929,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { x: 3.5, y: -7.25 } — a fixed-only frame is the
-    // 32-byte header (carrying the recipe-3 hash) + [x_le][y_le]. Compute the hash
+    // 40-byte header (carrying the recipe-3 hash) + [x_le][y_le]. Compute the hash
     // the SAME way the walker does, so `walk_by_hash` resolves it.
     let widget_schema = parse_rosmsg(widget_text, "Widget", Some("probe_msgs")).expect("parse");
     let widget_hash = widget_schema.schema_hash();
@@ -1762,7 +1762,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
         .expect("declare query surface");
 
     // Hand oracle: the recipe-3 wire hash the walker + robot both compute; a real
-    // Widget frame = 32-byte header (carrying the hash) + [x_le][y_le].
+    // Widget frame = 40-byte header (carrying the hash) + [x_le][y_le].
     let widget_hash = parse_rosmsg(widget_text, "Widget", Some("absent_probe_msgs"))
         .expect("parse widget")
         .schema_hash();
@@ -2171,6 +2171,7 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
         offset_table_count: 1,
         sequence: 0,
         timestamp_ns: 0,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
     let fv = target

@@ -641,7 +641,7 @@ fn multi_schema_file_lists_all_and_info_finds_each_by_entry_name() {
 /// alone would print a hash for it. `Small` is the control row.
 #[test]
 fn list_workspace_row_composed_over_the_ceiling_lists_unhashed() {
-    const AT: usize = u32::MAX as usize - 32;
+    const AT: usize = u32::MAX as usize - 40;
     let tmp = tempfile::tempdir().unwrap();
     let schemas_dir = tmp.path().join("schemas");
     let msg_dir = schemas_dir.join("big_pkg").join("msg");
@@ -698,7 +698,7 @@ fn list_over_ceiling_yaml_row_never_borrows_a_lower_tiers_layout() {
     std::fs::create_dir_all(&msg_dir).unwrap();
     std::fs::write(msg_dir.join("Twin.msg"), "uint32 a\n").unwrap();
     // 520 × float64[1_048_576] parses (each dimension at the YAML cap) and
-    // declares a fixed section past `u32::MAX − 32`.
+    // declares a fixed section past `u32::MAX - 40`.
     let over = |name: &str| {
         let mut out = format!("schemas:\n  {name}:\n    fields:\n");
         for i in 0..520 {
@@ -805,7 +805,7 @@ fn store_parent_of_an_over_ceiling_target_is_refused_with_it() {
 /// control: hashed and resolved.
 #[test]
 fn info_withholds_the_hash_of_an_entry_composed_over_the_ceiling() {
-    const AT: usize = u32::MAX as usize - 32;
+    const AT: usize = u32::MAX as usize - 40;
     let tmp = tempfile::tempdir().unwrap();
     let schemas_dir = tmp.path().join("schemas");
     let msg_dir = schemas_dir.join("big_pkg").join("msg");
@@ -1391,7 +1391,7 @@ fn r39_info_withholds_the_hash_of_a_root_the_preflight_removed() {
     let schemas_dir = tmp.path().join("schemas");
     let msg_dir = schemas_dir.join("big_pkg").join("msg");
     std::fs::create_dir_all(&msg_dir).unwrap();
-    std::fs::write(msg_dir.join("Filler.msg"), "float64[536870907] v\n").unwrap();
+    std::fs::write(msg_dir.join("Filler.msg"), "float64[536870906] v\n").unwrap();
     // The YAML parser caps a single fixed array, so the composed overflow
     // rides 4096 capped `Filler[1048576]` fields (the composed-overflow shape): each
     // fits usize alone; their sum does not — the preflight REMOVES Outer.

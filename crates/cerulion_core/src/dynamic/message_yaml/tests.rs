@@ -103,13 +103,15 @@ fn header(hash: u64, total: u32, table_offset: u32, count: u32) -> Vec<u8> {
         f.extend_from_slice(&v.to_le_bytes());
     }
     f.extend_from_slice(&TS.to_le_bytes());
+    // `step_tag`, untagged: the codec writes every frame untagged.
+    f.extend_from_slice(&0u64.to_le_bytes());
     f
 }
 
 /// The `Probe` frame for id=0x01020304, flag=7, name="ab", samples=[1.0,
 /// 2.0]: the worked byte example of the dynamic dossier, by hand.
 fn probe_frame(hash: u64) -> Vec<u8> {
-    let mut f = header(hash, 80, 40, 2);
+    let mut f = header(hash, 88, 48, 2);
     f.extend_from_slice(&[0x04, 0x03, 0x02, 0x01, 0x07, 0, 0, 0]);
     f.extend_from_slice(&[0x18, 0, 0, 0, 0x02, 0, 0, 0, 0x20, 0, 0, 0, 0x10, 0, 0, 0]);
     f.extend_from_slice(&[0x61, 0x62, 0, 0, 0, 0, 0, 0]);
@@ -119,7 +121,7 @@ fn probe_frame(hash: u64) -> Vec<u8> {
 
 /// The `Shapes` frame of [`SHAPES_TEXT`], by hand.
 fn shapes_frame(hash: u64, more: [u8; 3]) -> Vec<u8> {
-    let mut f = header(hash, 98, 68, 3);
+    let mut f = header(hash, 106, 76, 3);
     f.extend_from_slice(&[0, 0, 0x80, 0x3F, 0, 0, 0, 0xC0, 0, 0, 0, 0x3F]); // v
     f.extend_from_slice(&[1, 0]); // flags
     f.extend_from_slice(&[0x61, 0x62, 0, 0]); // tag
@@ -133,7 +135,7 @@ fn shapes_frame(hash: u64, more: [u8; 3]) -> Vec<u8> {
     f.extend_from_slice(&[0xFF, 0x02]);
     f.extend_from_slice(&more);
     f.push(7);
-    assert_eq!(f.len(), 98);
+    assert_eq!(f.len(), 106);
     f
 }
 
@@ -338,11 +340,11 @@ fn shapes_frame_empty_more(hash: u64) -> Vec<u8> {
     let full = shapes_frame(hash, [0, 1, 1]);
     // Header, fixed section and the `signed` entry are unchanged but for
     // the total size.
-    let mut f = header(hash, 95, 68, 3);
-    f.extend_from_slice(&full[32..76]);
+    let mut f = header(hash, 103, 76, 3);
+    f.extend_from_slice(&full[40..84]);
     f.extend_from_slice(&[62, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0, 1, 0, 0, 0]);
     f.extend_from_slice(&[0xFF, 0x02, 7]);
-    assert_eq!(f.len(), 95);
+    assert_eq!(f.len(), 103);
     f
 }
 
@@ -407,7 +409,7 @@ fn unset_variable_nested_field_prints_zero_values() {
         "schemas:\n  Inner:\n    fields:\n      string s: {}\n      uint16 n: {}\n      float32[2] f: {}\n      int8[] d: {}\n  Wrap:\n    fields:\n      Inner inner: {}\n      uint8 k: {}\n",
     );
     // fixed: k @0 (size 1, align 1); table: inner #0 at [1, 9).
-    let mut frame = header(set.schema_hash("Wrap").unwrap(), 41, 33, 1);
+    let mut frame = header(set.schema_hash("Wrap").unwrap(), 49, 41, 1);
     frame.push(3);
     frame.extend_from_slice(&[9, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
@@ -435,7 +437,7 @@ fn zero_default_of_an_unsupported_array_is_refused() {
         );
         let (set, _) = SchemaSet::from_schemas(vec![inner, outer]).unwrap();
         // fixed 0; table: inner #0 at [0, 8), empty.
-        let mut frame = header(set.schema_hash(name).unwrap(), 40, 32, 1);
+        let mut frame = header(set.schema_hash(name).unwrap(), 48, 40, 1);
         frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
         match message_to_yaml(set.walker(), &frame) {
             Err(e) => e.to_string(),
@@ -477,7 +479,7 @@ const HUGE_ZERO_YAML: &str = "schemas:\n  Leaf:\n    fields:\n      uint8 v: {}\
 /// A frame that leaves its one variable nested field unset.
 fn unset_nested_frame(set: &SchemaSet, name: &str) -> Vec<u8> {
     // fixed 0; table: inner #0 at [0, 8), empty.
-    let mut frame = header(set.schema_hash(name).unwrap(), 40, 32, 1);
+    let mut frame = header(set.schema_hash(name).unwrap(), 48, 40, 1);
     frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
     frame
 }
@@ -565,12 +567,12 @@ fn bodies_held_together_past_the_cap_are_refused_before_the_next_is_built() {
 const PATH_YAML: &str = "schemas:\n  Pt:\n    fields:\n      float32 x: {}\n  Path:\n    fields:\n      Pt[] pts: {}\n      string[] names: {}\n";
 
 fn path_frame(hash: u64, third_name_len: u8) -> Vec<u8> {
-    let mut f = header(hash, 79, 32, 2);
+    let mut f = header(hash, 87, 40, 2);
     f.extend_from_slice(&[16, 0, 0, 0, 12, 0, 0, 0, 28, 0, 0, 0, 19, 0, 0, 0]);
     f.extend_from_slice(&[0, 0, 0x80, 0x3F, 0, 0, 0, 0x40, 0, 0, 0x40, 0x40]);
     f.extend_from_slice(&[3, 0, 0, 0, 1, 0, 0, 0, b'a', 1, 0, 0, 0, b'b']);
     f.extend_from_slice(&[third_name_len, 0, 0, 0, b'c']);
-    assert_eq!(f.len(), 79);
+    assert_eq!(f.len(), 87);
     f
 }
 
@@ -653,9 +655,9 @@ fn a_string_is_refused_at_the_cap_before_its_escapes_are_built() {
 fn a_primitive_array_with_a_partial_element_is_refused() {
     let set = set_from_yaml(PROBE_YAML);
     let mut frame = probe_frame(set.schema_hash("Probe").unwrap());
-    // `samples`' table length, byte 52: 16 -> 15 (1 whole f64 + 7 bytes).
-    assert_eq!(frame[52], 0x10);
-    frame[52] = 15;
+    // `samples`' table length, byte 60: 16 -> 15 (1 whole f64 + 7 bytes).
+    assert_eq!(frame[60], 0x10);
+    frame[60] = 15;
     assert_eq!(
         message_to_yaml(set.walker(), &frame)
             .unwrap_err()
@@ -691,8 +693,8 @@ fn a_frame_nested_past_the_walk_bound_is_refused() {
         let body = node(depth);
         let mut f = header(
             set.schema_hash("Node").unwrap(),
-            32 + body.len() as u32,
-            32,
+            40 + body.len() as u32,
+            40,
             2,
         );
         f.extend(body);
@@ -972,7 +974,7 @@ fn every_nan_writes_dot_nan_and_reads_back_as_the_quiet_nan() {
     // fixed: d @0..8, f @8..12, 4 B pad (fixed_size 16), no table.
     assert_eq!(w.layout_for_name("F").unwrap().fixed_size, 16);
     let frame = |d: u64, f: u32| {
-        let mut out = header(set.schema_hash("F").unwrap(), 48, 48, 0);
+        let mut out = header(set.schema_hash("F").unwrap(), 56, 56, 0);
         out.extend_from_slice(&d.to_le_bytes());
         out.extend_from_slice(&f.to_le_bytes());
         out.extend_from_slice(&[0; 4]);
@@ -1294,7 +1296,7 @@ fn fixed_array_of_fixed_strings_from_the_ir() {
     let (set, _) = SchemaSet::from_schemas(vec![schema]).unwrap();
     let text = "codes: [\"ab\", \"xyz\"]\n";
     let frame = yaml_to_message(set.walker(), "Codes", text.as_bytes(), TS).unwrap();
-    assert_eq!(&frame[32..], b"ab\0xyz");
+    assert_eq!(&frame[40..], b"ab\0xyz");
     assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
 }
 
@@ -1487,7 +1489,7 @@ fn nesting_past_the_depth_bound_is_refused_both_ways() {
         decode_err(set.walker(), "L0", &text),
         format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels")
     );
-    let mut frame = header(set.schema_hash("L0").unwrap(), 33, 33, 0);
+    let mut frame = header(set.schema_hash("L0").unwrap(), 41, 41, 0);
     frame.push(1);
     match message_to_yaml(set.walker(), &frame) {
         Err(e) => assert_eq!(
@@ -1540,7 +1542,7 @@ fn an_empty_message_past_the_depth_bound_is_refused_both_ways() {
             "{root}"
         );
         // Every message in the chain is zero bytes: the frame is a header.
-        let frame = header(set.schema_hash(root).unwrap(), 32, 32, 0);
+        let frame = header(set.schema_hash(root).unwrap(), 40, 40, 0);
         match message_to_yaml(set.walker(), &frame) {
             Err(e) => assert_eq!(e.to_string(), too_deep(path), "{root}"),
             Ok(t) => panic!("{root} must be refused, got {t}"),
@@ -1704,9 +1706,9 @@ fn an_integer_past_64_bits_is_refused_at_its_field() {
     );
     // The bounds themselves still read.
     let max = yaml_to_message(w, "U", b"v: 18446744073709551615", TS).unwrap();
-    assert_eq!(&max[32..], &u64::MAX.to_le_bytes());
+    assert_eq!(&max[40..], &u64::MAX.to_le_bytes());
     let min = yaml_to_message(w, "I", b"v: -9223372036854775808", TS).unwrap();
-    assert_eq!(&min[32..], &i64::MIN.to_le_bytes());
+    assert_eq!(&min[40..], &i64::MIN.to_le_bytes());
 }
 
 /// An integer is accepted for a float field however wide it is.
@@ -1719,7 +1721,7 @@ fn an_integer_past_64_bits_reads_into_a_float_field() {
     );
     let frame = yaml_to_message(set.walker(), "Probe", text.as_bytes(), TS).unwrap();
     // 2^64 is exact in float64: 0x43F0000000000000.
-    assert_eq!(&frame[72..80], &[0, 0, 0, 0, 0, 0, 0xF0, 0x43]);
+    assert_eq!(&frame[80..88], &[0, 0, 0, 0, 0, 0, 0xF0, 0x43]);
     assert_eq!(
         message_to_yaml(set.walker(), &frame).unwrap(),
         "id: 16909060\nflag: 7\nname: \"ab\"\nsamples: [1.0, 1.8446744073709552e19]\n"
@@ -1822,13 +1824,13 @@ fn unknown_schema_unresolved_nested_and_unsupported_types_are_named() {
         decode_err(square.walker(), "Square", "m: [[1, 2], [3, 4]]"),
         "m: field type uint8[2][2] has no YAML form"
     );
-    let mut fixed2d = header(square.schema_hash("Square").unwrap(), 36, 36, 0);
+    let mut fixed2d = header(square.schema_hash("Square").unwrap(), 44, 44, 0);
     fixed2d.extend_from_slice(&[1, 2, 3, 4]);
     match message_to_yaml(square.walker(), &fixed2d) {
         Err(e) => assert_eq!(e.to_string(), "m: field type uint8[2][2] has no YAML form"),
         Ok(t) => panic!("must be refused, got {t}"),
     }
-    let mut frame = header(grid.schema_hash("Grid").unwrap(), 40, 32, 1);
+    let mut frame = header(grid.schema_hash("Grid").unwrap(), 48, 40, 1);
     frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
     match message_to_yaml(grid.walker(), &frame) {
         Err(e) => assert_eq!(e.to_string(), "rows: field type uint8[][] has no YAML form"),
@@ -1840,7 +1842,7 @@ fn unknown_schema_unresolved_nested_and_unsupported_types_are_named() {
 fn frames_without_a_yaml_form_are_refused_by_field() {
     let set = set_from_yaml(PROBE_YAML);
     let mut bad_name = probe_frame(set.schema_hash("Probe").unwrap());
-    bad_name[56] = 0xFF;
+    bad_name[64] = 0xFF;
     let err = |set: &SchemaSet, frame: &[u8]| match message_to_yaml(set.walker(), frame) {
         Err(e) => e.to_string(),
         Ok(t) => panic!("must be refused, got {t}"),
@@ -1864,7 +1866,7 @@ fn frames_without_a_yaml_form_are_refused_by_field() {
         "schemas:\n  Flag:\n    fields:\n      bool b: {}\n  Holder:\n    fields:\n      bool on: {}\n      Flag inner: {}\n",
     );
     let holder = |on: u8, b: u8| {
-        let mut f = header(flags.schema_hash("Holder").unwrap(), 34, 34, 0);
+        let mut f = header(flags.schema_hash("Holder").unwrap(), 42, 42, 0);
         f.extend_from_slice(&[on, b]);
         f
     };
@@ -1885,7 +1887,7 @@ fn frames_without_a_yaml_form_are_refused_by_field() {
     assert_eq!(walked.field("on"), Some(&FrameValueKind::Bool(true)));
 
     let names = set_from_yaml("schemas:\n  Names:\n    fields:\n      string[] n: {}\n");
-    let mut opaque = header(names.schema_hash("Names").unwrap(), 44, 32, 1);
+    let mut opaque = header(names.schema_hash("Names").unwrap(), 52, 40, 1);
     opaque.extend_from_slice(&[8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0]);
     assert_eq!(
         err(&names, &opaque),
@@ -2194,16 +2196,16 @@ fn corpus_digest(walker: &FrameWalker, codec: &CdrCodec) -> String {
 }
 
 /// Zero-size messages: `Row` is 2^20 empty messages and `Big` is 2^20
-/// rows, so `Big` declares 2^40 elements in a 32-byte frame.
+/// rows, so `Big` declares 2^40 elements in a 40-byte frame.
 const ZERO_SIZE_YAML: &str = "schemas:\n  Nothing:\n    fields: {}\n  Holder:\n    fields:\n      Nothing[3] e: {}\n  Row:\n    fields:\n      Nothing[1048576] e: {}\n  Big:\n    fields:\n      Row[1048576] r: {}\n  One:\n    fields:\n      Row row: {}\n";
 
 /// A frame of `name` with no fixed bytes and no variable fields.
 fn empty_frame(set: &SchemaSet, name: &str) -> Vec<u8> {
-    header(set.schema_hash(name).unwrap(), 32, 32, 0)
+    header(set.schema_hash(name).unwrap(), 40, 40, 0)
 }
 
 /// A set frame of zero-size messages is shown from the schema: the walker
-/// builds no value per declared element, so 2^40 of them in a 32-byte
+/// builds no value per declared element, so 2^40 of them in a 40-byte
 /// frame stop at the cut or the cap, not at the memory limit.
 #[test]
 fn zero_size_fixed_arrays_are_shown_without_building_their_elements() {
@@ -2364,7 +2366,7 @@ fn twin_schemas() -> Vec<MessageSchema> {
 /// `0x4004_0000_0000_0000`, then the tag and 7 pad bytes; no variable
 /// fields, so the table offset is the end of the 16-byte fixed section.
 fn twin_root_frame(hash: u64) -> Vec<u8> {
-    let mut f = header(hash, 48, 48, 0);
+    let mut f = header(hash, 56, 56, 0);
     f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40, 7, 0, 0, 0, 0, 0, 0, 0]);
     f
 }
@@ -2405,7 +2407,7 @@ fn encode_prints_a_frame_with_the_schema_of_its_own_hash() {
     let packaged = resolver.layout_at(0).unwrap().schema_hash;
     let owner = walker.schema_hash_for("pkg2/Leaf").unwrap();
     assert_ne!(packaged, owner, "the twins must carry distinct hashes");
-    let mut frame = header(packaged, 40, 40, 0);
+    let mut frame = header(packaged, 48, 48, 0);
     frame.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x04, 0x40]);
     let yaml = message_to_yaml_with(&walker, &frame, YamlEncodeOptions::default()).unwrap();
     assert_eq!(yaml, "v: 2.5\n");
@@ -2444,7 +2446,7 @@ fn fixed_chain_text(n: usize) -> String {
 #[test]
 fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
     let set = fixed_chain_set(32);
-    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    let mut frame = header(set.schema_hash("C0").unwrap(), 41, 41, 0);
     frame.push(7);
     let text = fixed_chain_text(32);
     assert_eq!(message_to_yaml(set.walker(), &frame).unwrap(), text);
@@ -2456,7 +2458,7 @@ fn arrays_of_messages_count_toward_the_depth_bound_both_ways() {
     let set = fixed_chain_set(33);
     let deep_path = vec!["next[0]"; 33].join(".");
     let want = format!("{deep_path}: messages and arrays of messages nest deeper than 64 levels");
-    let mut frame = header(set.schema_hash("C0").unwrap(), 33, 33, 0);
+    let mut frame = header(set.schema_hash("C0").unwrap(), 41, 41, 0);
     frame.push(7);
     match message_to_yaml(set.walker(), &frame) {
         Err(e) => assert_eq!(e.to_string(), want),

@@ -9,7 +9,7 @@
 /// A structural error decoding a Cerulion wire frame.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    /// The buffer is shorter than the 32-byte [`crate::WireHeader`].
+    /// The buffer is shorter than the 40-byte [`crate::WireHeader`].
     #[error("buffer too short: have {have} bytes, need at least {need} for the WireHeader")]
     FrameTooShort {
         /// Bytes actually present.
@@ -19,7 +19,7 @@ pub enum WireError {
     },
 
     /// The header's `total_size` is smaller than the header itself — a frame
-    /// must be at least 32 bytes.
+    /// must be at least 40 bytes.
     #[error("invalid total_size {total_size}: must be >= {min} (the WireHeader size)")]
     InvalidTotalSize {
         /// The declared `total_size`.

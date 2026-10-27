@@ -292,7 +292,7 @@ pub struct CerulionPublisher {
     ///   bug).
     /// - Small buffer at overflow drop: `original_bytes.len() <
     ///   WireHeader::SIZE` (would indicate `loan_proxy` failed to stamp
-    ///   the 32-byte header).
+    ///   the 40-byte header).
     /// - Small buffer at steady-state drop: loaned `buf.len() < 12`
     ///   (would indicate a publisher returned an undersized sample).
     ///
@@ -1379,7 +1379,7 @@ impl CerulionPublisher {
         //    tail is `MaybeUninit<u8>` but never observed.
         let mut sample = unsafe { sample.assume_init() };
 
-        // 4. Stamp the WireHeader at bytes [0..32]. `total_size` is set
+        // 4. Stamp the WireHeader at bytes [0..WireHeader::SIZE]. `total_size` is set
         //    provisionally to the worst case (max_slice_len); Drop will
         //    rewrite it once the writer cursor is final. Timestamp is
         //    captured at loan time so all subscribers see the
@@ -1423,6 +1423,7 @@ impl CerulionPublisher {
             offset_table_count: T::VARIABLE_FIELD_COUNT as u32,
             sequence: seq,
             timestamp_ns: self.clock.now_ns(),
+            step_tag: crate::wire::StepTag::UNTAGGED,
         };
         let payload = sample.payload_mut();
         header.write_to_buf(&mut payload[..WireHeader::SIZE]);
@@ -2693,7 +2694,7 @@ impl Drop for CerulionPublisher {
 /// Regime A: parse the `WireHeader` fields needed for a
 /// `PublishTraceEntry` (schema_hash, sequence, timestamp_ns) from the
 /// publish-bytes prefix. Returns `None` if the slice is shorter than
-/// `WireHeader::SIZE` (32 B) — defensive against malformed publishes.
+/// `WireHeader::SIZE` (40 B), defensive against malformed publishes.
 ///
 /// Alignment-safe: reads field bytes via `to_le_bytes`-style extraction,
 /// no `unsafe` and no alignment requirement on the input slice. (A loaned
@@ -2714,6 +2715,7 @@ pub(crate) fn parse_trace_entry_from_wire(topic: &str, data: &[u8]) -> Option<Pu
     //   offset_table_count: [16..20]
     //   sequence:          [20..24] u32 LE
     //   timestamp_ns:      [24..32] u64 LE
+    //   step_tag:          [32..40] u64 LE (not traced)
     let schema_hash = u64::from_le_bytes(data[0..8].try_into().ok()?);
     let sequence = u32::from_le_bytes(data[20..24].try_into().ok()?);
     let timestamp_ns = u64::from_le_bytes(data[24..32].try_into().ok()?);
@@ -2816,7 +2818,7 @@ impl RawShmLoanUninit {
     ///   `MaybeUninit` typing on this API is the DISCIPLINE layer that
     ///   forces callers to state which case they are.
     /// - The caller must have written a parseable [`WireHeader`] at
-    ///   `[0, 32)` whose `total_size` is at most the loan length, and every
+    ///   `[0, WireHeader::SIZE)` whose `total_size` is at most the loan length, and every
     ///   byte range a READER interprets (the wire head and every
     ///   offset-table-referenced range) must have been written — either by
     ///   the caller or by the in-slot fill it is adopting. Consumers slice

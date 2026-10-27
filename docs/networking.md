@@ -385,7 +385,11 @@ serialized plan + the run's iceoryx2 namespace.
   dispatches inbound GETs by verb. The `demand` verb: the DEMANDER (dialer) runs
   a ~2 s demand-GET loop that GETs `cerulion_q/{robot_or_*}/demand{topic}` (a
   dialer query: reaches the accepter), which pulls that topic's egress ON with a
-  synchronous `enabled`/`refused` ack. The `catalog` verb answers a
+  synchronous `enabled/w2`/`refused` ack. The GET carries the demander's wire
+  header version (two bytes); a producer at another version (or a demander that
+  sends none, a release before the version existed) answers
+  `refused:wire-header`, enables nothing, and both sides log the mismatch once
+  per run of refusals. The `catalog` verb answers a
   `cerulion_q/{robot}/catalog` GET with the robot's full topic catalog (every
   produced/announced topic + its schema hash **when the gateway knows it**
   (the field is `Option<u64>`, absent for a boot-announced topic whose hash the
@@ -498,7 +502,7 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node; only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
 | `tls` | Certificate files for `quic/` locators (see below). |
 
@@ -640,7 +644,8 @@ Strict block, which topics cross the machine boundary is declared in YAML.
 
 - **Egress = a per-graph export SCOPE.** An `egress` topic must be
   graph-OWNED: produced by an in-graph node, under its derived name
-  (`/{prefix}/{node}/{output}`) or a `topic:` override. The gateway
+  (`/{prefix}/{node}/{output}`) or a `topic:` override, unless the entry is
+  marked `external: true` (below). The gateway
   announces exactly the declared list and taps only a declared topic a
   remote actually demands. A remote demand for an UNdeclared produced topic
   is refused at the bridge scoping filter (its flag structurally never
@@ -660,6 +665,34 @@ Strict block, which topics cross the machine boundary is declared in YAML.
   gateway booted still sees the announces: every declared egress topic
   carries a standing announce token, so discovery is not a race.
 
+### Topics published outside the graph
+
+A process outside the graph file can publish on this machine's shared
+memory: a ROS 2 program running on `rmw_cerulion`, for example. Under a
+Strict block its topic leaves the machine only when `egress:` lists it, and
+the entry says it has no in-graph producer:
+
+```yaml
+network:
+  mode: peer
+  listen:
+    - tcp/0.0.0.0:7447
+  egress:
+    - /robot/odom              # produced by a node in this graph
+    - topic: /chatter
+      external: true           # published by a ROS 2 program on rmw_cerulion
+```
+
+The gateway announces `/chatter` from boot and taps it when a remote demands
+it. Until the outside program has created the topic, the tap attach fails,
+is counted, logs once at warn, and is retried on every gateway pass. An
+outside topic that `egress:` does not list is still announced when its
+publisher registers it, and a remote demand for it is refused at the bridge
+scoping filter, so none of its frames leave the machine.
+`external: true` on a topic an in-graph node produces is a graph-load error,
+and so is an unmarked entry with no in-graph producer; that error names the
+`external: true` spelling.
+
 ### Loop-safety rules (graph-load validation)
 
 Every rejection names the offending topic or setting and states the fix:
@@ -667,7 +700,8 @@ Every rejection names the offending topic or setting and states the fix:
 1. **No topic in both lists** (it would loop back to itself): remove it
    from one list. The gateway ALSO refuses a plan whose announce and ingress
    sets intersect, as a structural backstop.
-2. **Egress must be produced in-graph.**
+2. **Egress must be produced in-graph**, unless the entry is `external:
+   true`; an `external: true` entry must NOT be produced in-graph.
 3. **Ingress must NOT be produced in-graph.**
 4. **Canonical absolute names only** (bare names rejected with the expected
    `/`-prefixed form; malformed shapes rejected like any topic name).
@@ -853,7 +887,7 @@ desk: cerulion-netd                    ONE subscription on the session it
 | Versioning | Every notification carries a monotonic `version`; `subscribe_*` answers with the current one plus the announcing-robot set. A MISSED notification is harmless: the next carries a newer version and the correct response to any of them is a full refresh. |
 | Slow consumer | The per-connection slot is capacity ONE with a lossless merge: a lagging consumer gets one line describing everything it missed. The watch/forwarder threads never do I/O, so a consumer that stopped reading stalls only itself. |
 | Manual refresh | Unchanged, and still the escape hatch for everything. |
-| Skew | netd bumped its control protocol to **v6**; a new client against an older daemon is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a v6 daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
+| Skew | `subscribe_catalog` needs netd control protocol **v6** or later (the daemon now speaks 8); a new client against a daemon older than v6 is refused by the per-verb gate and degrades loudly to its own refresh path, and an older client against a newer daemon is simply never subscribed. vizd's protocol version is deliberately UNCHANGED (a new verb is additive, and its controllers compare the banner for exact equality); capability there is negotiated by verb. |
 
 **What is NOT event-driven:** the LOCAL half. The push above covers REMOTE
 topics; a LOCAL iceoryx2 service appearing or disappearing on the desk carries
@@ -987,7 +1021,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":6}
+{"hello":"cerulion-netd","protocol":8,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
 
@@ -1088,9 +1122,9 @@ Then `cerulion graph run go2_driver` on the robot and
 ## What crosses the wire
 
 Local delivery stays zero-copy shared memory; only egress topics pay the
-network. An exported frame travels as the SAME unified wire format (32-byte
+network. An exported frame travels as the SAME unified wire format (40-byte
 `WireHeader` + payload) VERBATIM as the zenoh payload on the key
-`cerulion{topic}`: no envelope, no per-hop translation, so the receiving
+`cerulion_w2{topic}`: no envelope, no per-hop translation, so the receiving
 side feeds the bytes straight into its subscriber path and schema hashes
 validate end-to-end. Discovery rides the separate liveliness key-spaces: the
 demand space `cerulion_lv{topic}` (a remote subscriber asking for a topic,
@@ -1166,7 +1200,7 @@ Notes:
 - **`/tf` and `/tf_static` are symmetric**: same schema and wire path; the
   only difference is publishing cadence (dynamic vs latched-once), a node
   concern.
-- **Byte-identity.** The `TFMessage` frame (32-byte `WireHeader` + offset
+- **Byte-identity.** The `TFMessage` frame (40-byte `WireHeader` + offset
   table + opaque `transforms` bytes) is re-injected verbatim (sequence,
   timestamp, nested transform bytes intact), pinned end-to-end by
   `crates/cerulion_core/tests/network_tf_e2e_test.rs`.

@@ -6,7 +6,7 @@
 //! default), then dispatched by plane:
 //! - `cerulion/ops/1` → the real `cerud::OpsServer` over a `QuicOpsStream` adapter
 //!   ([`crate::ops`]) — deploy/inventory/pair/claim/e-stop;
-//! - `cerulion/wire/1` (WireAdmit) → the demand-driven SHM tap plane
+//! - `cerulion/wire/2` (WireAdmit) → the demand-driven SHM tap plane
 //!   ([`crate::wire`]);
 //! - everything else (Refuse / unknown ALPN, or a plane not wired) → a
 //!   deadline-bounded skeleton control-frame report that surfaces the
@@ -266,7 +266,7 @@ pub async fn serve(
 /// handler, until `shutdown` resolves or the endpoint closes.
 ///
 /// Dispatch by plane: an ops connection → the real `cerud` ops server via `ops`;
-/// when `wire` is `Some`, an admitted `cerulion/wire/1` connection is served the
+/// when `wire` is `Some`, an admitted `cerulion/wire/2` connection is served the
 /// demand-driven SHM tap plane ([`crate::wire`]); every other ALPN/decision (and a
 /// `None` plane) gets the deadline-bounded skeleton report.
 pub async fn serve_with_wire(
@@ -344,7 +344,7 @@ pub async fn handle_accepted(
 ///   point (an `OpsBootstrapOnly` key reaches ONLY the self-gating bootstrap
 ///   verbs; a paired key its capabilities). When `ops` is `None` the ops arm falls
 ///   back to the skeleton decision frame.
-/// - **Wire plane** (`cerulion/wire/1`, `WireAdmit` — the accept gate already
+/// - **Wire plane** (`cerulion/wire/2`, `WireAdmit`, the accept gate already
 ///   required a paired `CAP_OBSERVE` account): handed to
 ///   [`crate::wire::serve_wire_connection`] as a LONG-LIVED session (NOT bounded by
 ///   the handshake deadline, which exists only for the tiny skeleton hello) when

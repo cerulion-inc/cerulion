@@ -681,6 +681,7 @@ fn one_runs_reply(robot: &str, run_id: &str, graph: &str) -> RunsReply {
 /// catalog — NOT fake data, a DI test fixture).
 fn one_catalog(robot: &str, topic: &str, schema_name: &str) -> CatalogReply {
     CatalogReply {
+        wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
         version: 1,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {

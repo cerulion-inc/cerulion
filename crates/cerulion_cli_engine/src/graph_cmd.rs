@@ -5245,22 +5245,51 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     Ok(())
 }
 
+/// Env var that turns the open-file refusal of `graph run` and `graph profile`
+/// into a warning: `"0"` starts the graph anyway, `"1"` or unset refuses.
+/// Exact match only; any other non-empty value warns and keeps the refusal.
+const OPEN_FILE_CHECK_ENV: &str = "CERULION_OPEN_FILE_CHECK";
+
 /// Raises this process's open-file soft limit and refuses `config` when its
-/// estimated start-up need is above the limit in force afterwards. An
-/// unreadable limit refuses nothing (the raise has already warned).
+/// estimated start-up need is above the limit in force afterwards, unless
+/// [`OPEN_FILE_CHECK_ENV`] is `0`. An unreadable limit refuses nothing (the
+/// raise has already warned).
 #[cfg(unix)]
 fn refuse_if_open_file_limit_too_low(config: &GraphConfig) -> CliResult<()> {
     let limit = cerulion_core::fd_limit::raise_open_file_limit().limit();
-    open_file_limit_verdict(config, limit, cerulion_core::fd_limit::select_ceiling())
+    let check = std::env::var(OPEN_FILE_CHECK_ENV).ok();
+    open_file_limit_verdict(
+        config,
+        limit,
+        cerulion_core::fd_limit::select_ceiling(),
+        cerulion_core::fd_limit::RemedyPlatform::current(),
+        check.as_deref(),
+    )
 }
 
-/// The pure half of [`refuse_if_open_file_limit_too_low`].
+/// The pure half of [`refuse_if_open_file_limit_too_low`]; `check` is the raw
+/// [`OPEN_FILE_CHECK_ENV`] value.
 #[cfg(unix)]
 fn open_file_limit_verdict(
     config: &GraphConfig,
     limit: Option<cerulion_core::fd_limit::OpenFileLimit>,
     select_ceiling: Option<u64>,
+    platform: cerulion_core::fd_limit::RemedyPlatform,
+    check: Option<&str>,
 ) -> CliResult<()> {
+    let enforce = match check {
+        None | Some("" | "1") => true,
+        Some("0") => false,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "{OPEN_FILE_CHECK_ENV} accepts `0` (start a graph the open-file check would \
+                 refuse) or `1` (refuse it, the default); this value is ignored and the check \
+                 refuses"
+            );
+            true
+        }
+    };
     let Some(limit) = limit else {
         return Ok(());
     };
@@ -5269,19 +5298,30 @@ fn open_file_limit_verdict(
         outputs: config.nodes.iter().map(|n| n.outputs.len()).sum(),
         inputs: config.nodes.iter().map(|n| n.inputs.len()).sum(),
     };
-    match cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling) {
-        Some(shortfall) => Err(CliError::Validation(format!(
-            "graph '{}': {shortfall}",
+    let Some(shortfall) =
+        cerulion_core::fd_limit::open_file_shortfall(ports, limit, select_ceiling, platform)
+    else {
+        return Ok(());
+    };
+    if enforce {
+        return Err(CliError::Validation(format!(
+            "graph '{}': {shortfall} To start it anyway, set {OPEN_FILE_CHECK_ENV}=0.",
             config.identity()
-        ))),
-        None => Ok(()),
+        )));
     }
+    tracing::warn!(
+        graph = %config.identity(),
+        shortfall = %shortfall,
+        "{OPEN_FILE_CHECK_ENV}=0: starting a graph the open-file check refuses; past the limit \
+         iceoryx2 fails to create ports with errors that do not name it"
+    );
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
 mod open_file_limit_verdict_tests {
     use super::*;
-    use cerulion_core::fd_limit::OpenFileLimit;
+    use cerulion_core::fd_limit::{OpenFileLimit, RemedyPlatform};
     use cerulion_core::graph::config::InputDef;
 
     /// `chains` source -> sink pairs: two nodes, one output and one input
@@ -5331,22 +5371,29 @@ mod open_file_limit_verdict_tests {
         }
     }
 
-    #[test]
-    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
-        let limit = OpenFileLimit {
-            soft: 1024,
-            hard: 1024,
-        };
-        // 64 + 40 x 15 + 40 x 23 = 1584 files.
-        let err = open_file_limit_verdict(&graph_of(40), Some(limit), None)
-            .expect_err("40 chains need about 1584 files");
+    const LINUX: RemedyPlatform = RemedyPlatform::Linux;
+    const LOW: OpenFileLimit = OpenFileLimit {
+        soft: 1024,
+        hard: 1024,
+    };
+
+    fn refusal(check: Option<&str>) -> String {
+        let err = open_file_limit_verdict(&graph_of(40), Some(LOW), None, LINUX, check)
+            .expect_err("40 chains need about 1480 files");
         let CliError::Validation(text) = err else {
             panic!("expected a Validation refusal, got {err:?}");
         };
+        text
+    }
+
+    #[test]
+    fn a_graph_needing_more_than_a_1024_hard_limit_is_refused_by_name() {
+        // 40 + 40 x 14 + 40 x 22 = 1480 files.
+        let text = refusal(None);
         assert!(
             text.starts_with(
                 "graph 'fd_budget': this graph has 80 nodes with 40 output and 40 input ports, \
-                 and starting it opens about 1584 files in this process"
+                 and starting it is estimated to open about 1480 files in this process"
             ),
             "{text}"
         );
@@ -5354,7 +5401,32 @@ mod open_file_limit_verdict_tests {
             text.contains("RLIMIT_NOFILE) is 1024 with a hard limit of 1024"),
             "{text}"
         );
-        assert!(text.contains("`ulimit -Hn 1584`"), "{text}");
+        assert!(text.contains("`ulimit -Hn 1480`"), "{text}");
+        assert!(
+            text.ends_with(" To start it anyway, set CERULION_OPEN_FILE_CHECK=0."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_check_refuses_when_its_env_var_is_one_empty_or_unrecognised() {
+        let unset = refusal(None);
+        for value in ["1", "", "off", "false", " 0"] {
+            assert_eq!(refusal(Some(value)), unset, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn the_check_set_to_zero_starts_a_graph_it_would_refuse() {
+        assert!(open_file_limit_verdict(&graph_of(40), Some(LOW), None, LINUX, Some("0")).is_ok());
+        assert!(open_file_limit_verdict(
+            &graph_of(40),
+            Some(LOW),
+            Some(1024),
+            RemedyPlatform::MacOs,
+            Some("0")
+        )
+        .is_ok());
     }
 
     #[test]
@@ -5363,12 +5435,12 @@ mod open_file_limit_verdict_tests {
             soft: 524_288,
             hard: 524_288,
         };
-        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None).is_ok());
+        assert!(open_file_limit_verdict(&graph_of(40), Some(limit), None, LINUX, None).is_ok());
     }
 
     #[test]
     fn an_unreadable_limit_refuses_nothing() {
-        assert!(open_file_limit_verdict(&graph_of(10_000), None, None).is_ok());
+        assert!(open_file_limit_verdict(&graph_of(10_000), None, None, LINUX, None).is_ok());
     }
 }
 
@@ -5836,9 +5908,9 @@ pub fn graph_run(
     // This process holds every topic of the graph while it starts, a set of
     // open files per port (`cerulion_core::fd_limit`). Raise the soft limit
     // now (the transport constructors would on their own, later) and refuse,
-    // before any side effect, a graph that needs more than this process may
-    // hold; past the limit iceoryx2 fails with port-creation errors that never
-    // name it.
+    // before the graph file or run directory is touched, a graph estimated to
+    // need more than this process may hold; past the limit iceoryx2 fails with
+    // port-creation errors that never name it.
     #[cfg(unix)]
     refuse_if_open_file_limit_too_low(&config)?;
 
@@ -14186,6 +14258,10 @@ pub fn graph_profile(
             "ros2 entries are not profiled (spawned processes, not scheduled nodes) — the cost snapshot covers the native nodes only"
         );
     }
+    // The profile runs the graph live in this process, which holds every topic
+    // while it starts: the same open-file check as `graph run`.
+    #[cfg(unix)]
+    refuse_if_open_file_limit_too_low(&config)?;
 
     // Source-derived entry infos (policy per node) — feeds the SAME
     // trigger-edge derivation the harvest consumes (the graph_levels
@@ -21916,7 +21992,7 @@ fn build_workspace_schema_wire_sizes(
         // bit. It is deliberately the ONE net: a second,
         // conversion-time arm would mask the retain (removing the retain would change
         // nothing observable), whereas its removal TRUNCATES a
-        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967216 — an
+        // composed-past-u32 survivor (`Outer` = Inner[2] → 4294967200, an
         // affirmatively wrong descriptor), which is exactly what the
         // unrepresentable-fixed-section test fails on.
         let size = schema.wire_fixed_size() as u32;
@@ -27578,7 +27654,7 @@ nodes:
     #[test]
     fn r29_an_over_ceiling_declaration_is_omitted_by_the_composing_folds_and_influences_no_survivor(
     ) {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         let hostile = tempfile::tempdir().unwrap();
         let control = tempfile::tempdir().unwrap();
         for root in [hostile.path(), control.path()] {
@@ -27658,15 +27734,15 @@ nodes:
     }
     /// Wire-size validation: a
     /// ceiling judging the fixed section alone (`<= u32::MAX`) is wrong, because the frame
-    /// also carries the 32-byte header and one 8-byte offset entry per
+    /// also carries the 40-byte header and one 8-byte offset entry per
     /// variable field, so a fixed section of `u32::MAX` bytes would be recorded
     /// as a descriptor no publisher can emit. Both sides of the boundary on
-    /// the RESOLVED fold: a fixed section exactly at `u32::MAX − 32`
-    /// (`At`) and at `u32::MAX − 40` beside one string (`VarAt`) record
+    /// the RESOLVED fold: a fixed section exactly at `u32::MAX - 40`
+    /// (`At`) and at `u32::MAX - 48` beside one string (`VarAt`) record
     /// their exact sizes; one byte past each (`Over`, `VarOver`) and the
     /// extreme (`Max`, exactly `u32::MAX`) are omitted. Nested
     /// inlining is judged at the resolved moment: `WrapAt` (a `uint8` run
-    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX − 39`)
+    /// plus an inlined 8-byte `Small`, padded, lands at `u32::MAX - 47`)
     /// records, `WrapOver` (one byte more of run, so padding + inlining
     /// land one past the ceiling) is omitted; `Tight` pins that a reference
     /// resolution INLINES is counted as fixed bytes and never as an offset
@@ -27675,11 +27751,11 @@ nodes:
     /// `msg_store_parity_test`); and `VarNestAt` / `VarNestOver` pin the
     /// RESOLVED moment's EXACT count: `Blob` has a string, so `Blob b` stays
     /// a real offset entry after resolution, which the declared floor would
-    /// not count — at `u32::MAX − 40` it records, one byte more is omitted.
+    /// not count, at `u32::MAX - 48` it records, one byte more is omitted.
     #[cfg(unix)]
     #[test]
     fn r26_the_fold_ceiling_counts_the_header_and_the_offset_table_on_both_sides() {
-        const AT: usize = u32::MAX as usize - 32;
+        const AT: usize = u32::MAX as usize - 40;
         const VAR_AT: usize = AT - 8;
         let tmp = tempfile::tempdir().unwrap();
         write_store_msg(tmp.path(), "p26", "At", &format!("uint8[{AT}] a\n"));
@@ -27741,9 +27817,9 @@ nodes:
         for (name, size) in [
             ("p26/At", AT),
             ("p26/VarAt", VAR_AT),
-            // AT − 16 = …247, the u64 lands at …248 (align 8), ends …256.
+            // AT - 16 = ...239, the u64 lands at ...240 (align 8), ends ...248.
             ("p26/WrapAt", AT - 7),
-            // AT − 7 = …256, the u32 lands there (align 4), ends …260.
+            // AT - 7 = ...248, the u32 lands there (align 4), ends ...252.
             ("p26/Tight", AT - 3),
             // The still-variable `Blob b` is one entry: the run is the whole
             // fixed section (the reference adds no bytes and no alignment).
@@ -27784,10 +27860,10 @@ nodes:
     fn r12_a_retain_thinned_ambiguity_does_not_resurrect_a_bare_alias() {
         let tmp = tempfile::tempdir().unwrap();
         // `Filler` is representable (~4 GiB, seven bytes under the wire
-        // ceiling `u32::MAX − 32` — a declared-past-u32
+        // ceiling `u32::MAX - 40`, a declared-past-u32
         // ingredient is rejected on every
         // surface); `a9/Type` composes an ARITHMETIC overflow through it.
-        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "a9", "Filler", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "a9", "Type", "Filler[8589934592] arr\n");
         write_store_msg(tmp.path(), "b9", "Type", "uint32 a\n");
         std::fs::write(
@@ -28339,7 +28415,7 @@ nodes:
             "Huge",
             "float64[2305843009213693951] v\n",
         );
-        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870907] v\n");
+        write_store_msg(tmp.path(), "nav14", "Inner", "float64[536870906] v\n");
         write_store_msg(tmp.path(), "nav14", "Outer", "Inner[2] arr\n");
         write_store_msg(tmp.path(), "nav14", "VarOuter", "Inner[2] arr\nstring s\n");
         write_store_msg(tmp.path(), "nav14", "Goal", "float64 x\n");
@@ -28357,7 +28433,7 @@ nodes:
             "schemas:\n  VarY:\n    fields:\n      nav14/Inner[2] arr:\n      string s:\n",
         )
         .unwrap();
-        const INNER_BYTES: u32 = 536_870_907 * 8; // 4_294_967_256 — 7 under u32::MAX − 32
+        const INNER_BYTES: u32 = 536_870_906 * 8; // 4_294_967_248, 7 under u32::MAX - 40
 
         let sizes = build_workspace_schema_wire_sizes(tmp.path());
         for name in ["nav14/Huge", "nav14/Outer", "nav14/VarOuter", "VarY"] {

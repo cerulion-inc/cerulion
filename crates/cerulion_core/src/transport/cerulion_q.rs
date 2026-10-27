@@ -396,6 +396,29 @@ pub struct CatalogReply {
     /// JSON — the anti-regression contract. An old desk ignores the unknown field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The [`WireHeader`](crate::wire::WireHeader) version the answering robot
+    /// reads and writes ([`WIRE_HEADER_VERSION`](crate::wire::WIRE_HEADER_VERSION)
+    /// on the robot). A robot older than this field omits it, and an absent
+    /// field decodes as version 1, the header those robots carry. Version 1 is
+    /// also omitted when serializing, so a version 1 robot's catalog is
+    /// byte-identical to the older wire. A desk compares it with its own
+    /// version through [`Self::wire_header_matches`]: a robot at another
+    /// version cannot exchange frames with it.
+    #[serde(
+        default = "catalog_wire_header_version_absent",
+        skip_serializing_if = "catalog_wire_header_version_is_v1"
+    )]
+    pub wire_header_version: u16,
+}
+
+/// The wire header version a catalog without the field states: 1.
+fn catalog_wire_header_version_absent() -> u16 {
+    1
+}
+
+/// Version 1 is the absent default, so it is left off the wire.
+fn catalog_wire_header_version_is_v1(v: &u16) -> bool {
+    *v == 1
 }
 
 /// Assemble a [`CatalogReply`] from raw entries — pure (oracle-testable). Sorts +
@@ -410,6 +433,7 @@ pub fn build_catalog_reply(
     entries.sort_by(|a, b| a.topic.cmp(&b.topic));
     entries.dedup_by(|a, b| a.topic == b.topic);
     CatalogReply {
+        wire_header_version: crate::wire::WIRE_HEADER_VERSION,
         version: CATALOG_WIRE_VERSION,
         // hot-path-alloc-ok: cold — catalog reply construction, built once per
         // remote catalog GET on the control plane, never per frame.
@@ -421,6 +445,12 @@ pub fn build_catalog_reply(
 }
 
 impl CatalogReply {
+    /// True when the answering robot reads and writes the same wire header
+    /// version as this build, so its frames can be exchanged with it.
+    pub fn wire_header_matches(&self) -> bool {
+        self.wire_header_version == crate::wire::WIRE_HEADER_VERSION
+    }
+
     /// An explicit REFUSAL reply — the robot's
     /// [`DemandAuthorizer`](crate::transport::demand_authorizer::DemandAuthorizer)
     /// gate denied this party's catalog GET (an account/pairing miss). Carries NO
@@ -429,6 +459,7 @@ impl CatalogReply {
     /// the current wire version.
     pub fn refused(robot: &str, reason: impl Into<String>) -> Self {
         CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION,
             // hot-path-alloc-ok: cold — one refusal reply per denied catalog GET on
             // the control plane, never per frame.
@@ -1912,6 +1943,7 @@ mod tests {
     #[test]
     fn catalog_reply_encode_decode_round_trip() {
         let reply = CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION,
             robot: "go2".to_string(),
             entries: vec![
@@ -1968,6 +2000,37 @@ mod tests {
         assert_eq!(decode_catalog_reply(json.as_bytes()), Ok(served));
     }
 
+    /// The catalog's wire header version, both directions, against literal
+    /// JSON: a reply without the key (every robot older than the field) decodes
+    /// as version 1; version 1 serializes with no key; any other version
+    /// serializes the key and round-trips; `wire_header_matches` compares it
+    /// with this build's own version.
+    #[test]
+    fn the_catalog_states_its_wire_header_version_and_absence_means_version_1() {
+        let old = br#"{"version":1,"robot":"go2","entries":[]}"#;
+        let decoded = decode_catalog_reply(old).expect("an old robot's reply decodes");
+        assert_eq!(decoded.wire_header_version, 1);
+
+        let mut reply = build_catalog_reply("go2", []);
+        reply.wire_header_version = 1;
+        let json = String::from_utf8(encode_catalog_reply(&reply)).expect("utf8");
+        assert_eq!(json, r#"{"version":1,"robot":"go2","entries":[]}"#);
+
+        reply.wire_header_version = 7;
+        let json = String::from_utf8(encode_catalog_reply(&reply)).expect("utf8");
+        assert_eq!(
+            json,
+            r#"{"version":1,"robot":"go2","entries":[],"wire_header_version":7}"#
+        );
+        let back = decode_catalog_reply(json.as_bytes()).expect("decodes");
+        assert_eq!(back.wire_header_version, 7);
+        assert!(!back.wire_header_matches());
+
+        let ours = build_catalog_reply("go2", []);
+        assert_eq!(ours.wire_header_version, crate::wire::WIRE_HEADER_VERSION);
+        assert!(ours.wire_header_matches());
+    }
+
     /// The ADDITIVE contract for `liveness`, both directions, against
     /// literal-JSON hand oracles (never a self-compare).
     ///
@@ -2002,8 +2065,8 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"version":1,"robot":"go2","entries":[{"topic":"/imu","schema_hash":7,"schema_name":null,"provenance":"runtime","producer_count":1}]}"#,
-            "the no-liveness wire must be byte-identical to the pre-liveness document"
+            r#"{"version":1,"robot":"go2","entries":[{"topic":"/imu","schema_hash":7,"schema_name":null,"provenance":"runtime","producer_count":1}],"wire_header_version":2}"#,
+            "the no-liveness wire must carry no liveness key and nothing else new"
         );
 
         // (2) an OLD robot's literal document decodes with liveness UNKNOWN.
@@ -2013,7 +2076,12 @@ mod tests {
             decoded.entries[0].liveness, None,
             "an old robot's entry must read UNKNOWN, never a fabricated liveness"
         );
-        assert_eq!(decoded, bare, "old wire == the no-liveness reply");
+        // An old robot states no wire header version: version 1, unlike this build.
+        assert_eq!(decoded.wire_header_version, 1);
+        assert_eq!(
+            decoded.entries, bare.entries,
+            "old wire == the no-liveness reply"
+        );
 
         // (3) a liveness-carrying entry serializes + round-trips.
         let observed = build_catalog_reply(
@@ -2153,6 +2221,7 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_version() {
         let mut reply = CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION + 1,
             robot: "go2".to_string(),
             entries: vec![],
@@ -2215,6 +2284,7 @@ mod tests {
     #[test]
     fn producer_count_liveness_round_trips_all_three_states() {
         let reply = CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION,
             robot: "go2".to_string(),
             entries: vec![
@@ -2265,6 +2335,7 @@ mod tests {
     #[test]
     fn gather_catalog_outcome_oracle() {
         let good = encode_catalog_reply(&CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
@@ -2278,6 +2349,7 @@ mod tests {
             error: None,
         });
         let unknown = encode_catalog_reply(&CatalogReply {
+            wire_header_version: crate::wire::WIRE_HEADER_VERSION,
             version: CATALOG_WIRE_VERSION + 1,
             robot: "go2".to_string(),
             entries: vec![],
