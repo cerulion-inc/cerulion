@@ -33,6 +33,10 @@ use serial_test::serial;
 
 use support::{BOUND, DESK_SEED, TOPIC, TYPE};
 
+const HEADER_LEN: usize = 40;
+const FRAME_LEN: usize = HEADER_LEN + 16;
+const _: () = assert!(HEADER_LEN == cerulion_core::wire::WireHeader::SIZE);
+
 // Literal little-endian payload oracles: (1.5, -2.5), (3.5, 4.5), (-5.5, 6.5).
 const PAYLOADS: [[u8; 16]; 3] = [
     [0, 0, 0, 0, 0, 0, 0xf8, 0x3f, 0, 0, 0, 0, 0, 0, 0x04, 0xc0],
@@ -40,14 +44,16 @@ const PAYLOADS: [[u8; 16]; 3] = [
     [0, 0, 0, 0, 0, 0, 0x16, 0xc0, 0, 0, 0, 0, 0, 0, 0x1a, 0x40],
 ];
 
-fn frame(hash: u64, index: usize) -> [u8; 48] {
-    let mut bytes = [0_u8; 48];
+/// A literal version 2 frame: the 40-byte header (step tag at 32..40 left
+/// untagged), then the 16-byte payload.
+fn frame(hash: u64, index: usize) -> [u8; FRAME_LEN] {
+    let mut bytes = [0_u8; FRAME_LEN];
     bytes[..8].copy_from_slice(&hash.to_le_bytes());
-    bytes[8] = 48; // total_size
-    bytes[12] = 48; // offset table follows the fixed fields, zero entries
+    bytes[8] = FRAME_LEN as u8; // total_size
+    bytes[12] = FRAME_LEN as u8; // offset table follows the payload, zero entries
     bytes[20] = index as u8; // sequence
     bytes[24..32].copy_from_slice(&((index as u64 + 1) * 1_000_000_000).to_le_bytes());
-    bytes[32..].copy_from_slice(&PAYLOADS[index]);
+    bytes[HEADER_LEN..].copy_from_slice(&PAYLOADS[index]);
     bytes
 }
 
@@ -92,7 +98,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
     let robot = robot::Robot::start(&account, &state, &robot_shm, directory.0.join("robot.sock"));
     let mut publisher = robot
         .manager
-        .create_publisher_simple(TOPIC, MaxSliceLen::const_new(48))
+        .create_publisher_simple(TOPIC, MaxSliceLen::const_new(FRAME_LEN as u32))
         .unwrap();
 
     let desk = support::manager(&desk_shm, "account_viz_desk");
