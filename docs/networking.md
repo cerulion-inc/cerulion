@@ -522,6 +522,7 @@ locator string is the whole choice. TCP stays the default.
 | `tcp/<host>:<port>` | TCP | nothing |
 | `quic/<host>:<port>` | QUIC over TLS 1.3, one stream per priority | `tls` files |
 | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
+| `tls/<host>:<port>` | TLS 1.3 over TCP, for a path where UDP does not get through | the same `tls` files as `quic/` |
 | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
 
 Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
@@ -708,13 +709,15 @@ Every rejection names the offending topic or setting and states the fix:
 5. **No lists under `disabled`.**
 6. **No duplicates within a list** (a bare name and a map naming the same
    topic are duplicates).
-7. **Known carrier**: `tcp/`, `quic/` or `udp/`, with `rel` / `mixed_rel`
-   values zenoh accepts. `tls/` is refused: this build does not compile it.
-8. **`quic/` has its files**: `certificate` + `private_key` for a `quic/`
-   listener, `root_ca` for a `quic/` connect; absolute paths only.
-9. **No inert `tls` setting**: `root_ca` without a `quic/` connect locator,
-   or `certificate` / `private_key` without a `quic/` listen locator, is
-   refused (each is read only by that side).
+7. **Known carrier**: `tcp/`, `quic/`, `tls/` or `udp/`, with `rel` /
+   `mixed_rel` values zenoh accepts (`mixed_rel` only on `quic/` and
+   `udp/...?rel=1`).
+8. **`quic/` and `tls/` have their files**: `certificate` + `private_key` for
+   a `quic/` or `tls/` listener, `root_ca` for a `quic/` or `tls/` connect;
+   absolute paths only.
+9. **No inert `tls` setting**: `root_ca` without a `quic/` or `tls/` connect
+   locator, or `certificate` / `private_key` without a `quic/` or `tls/`
+   listen locator, is refused (each is read only by that side).
 10. **Best effort needs a datagram link**: a `best_effort` topic, and a
     `default_reliability: best_effort`, each need a `mixed_rel=1` QUIC
     locator (not `auto`) in `listen` or `connect`; without one the topics

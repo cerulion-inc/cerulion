@@ -4054,6 +4054,8 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         // The permissive default listens on tcp/ only and puts every topic
         // reliable.
         tls: None,
+        // The permissive default opens no team session.
+        auth: None,
         egress_qos: Vec::new(),
     })
 }
@@ -4156,6 +4158,8 @@ impl From<&GatewayNetworkParams> for cerulion_core::NetworkConfig {
             // this rebuild — the handoff carries identity exactly once.
             robot_identity: None,
             tls: p.tls.clone(),
+            // The handoff carries no team credentials.
+            auth: None,
             egress_qos: p.egress_qos.clone(),
         }
     }

@@ -2151,7 +2151,8 @@ network:
   connect also checks the certificate names the host or IP dialled, and zenoh
   trusts the public Web PKI roots beside `root_ca`). The carrier is the
   locator's first segment:
-  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, or
+  `tcp/` (default), `quic/<host>:<port>?mixed_rel=1`, `tls/<host>:<port>`
+  (TLS 1.3 over TCP, reading the same `tls` files as `quic/`), or
   `udp/<host>:<port>?rel=1;mixed_rel=1` (QUIC without encryption or peer
   authentication, for a WireGuard overlay only). See `docs/networking.md`
   "Carriers and per-topic reliability".
@@ -2172,8 +2173,8 @@ rejection names the offending topic or setting and the fix:
 | Canonical names | A bare (non-`/`) topic in either list: rejected with the expected `/`-prefixed form, never silently canonicalized. Malformed absolute shapes (trailing `/`, `//`, zenoh-reserved chars) are rejected like every other topic name. |
 | Disabled-with-lists | `mode: disabled` (or omitted) with a non-empty `egress`/`ingress`; enable the network (`mode: peer\|client`) or remove the lists. |
 | Duplicates | The same topic twice in one list. |
-| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`tls/`, `ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
-| Certificate files | A `quic/` listener without `tls.certificate` + `tls.private_key`, a `quic/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` connect, or `certificate`/`private_key` with no `quic/` listen. |
+| Carrier | A `listen`/`connect` locator whose carrier this build does not compile (`ws/`, no `<carrier>/`), or a `rel`/`mixed_rel` value zenoh refuses. |
+| Certificate files | A `quic/` or `tls/` listener without `tls.certificate` + `tls.private_key`, a `quic/` or `tls/` connect without `tls.root_ca`, a relative `tls` path, `root_ca` with no `quic/` or `tls/` connect, or `certificate`/`private_key` with no `quic/` or `tls/` listen. |
 | Best effort | A `reliability: best_effort` topic, or `default_reliability: best_effort`, with no `mixed_rel=1` QUIC locator in `listen` or `connect` (`mixed_rel=auto` does not count). |
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an

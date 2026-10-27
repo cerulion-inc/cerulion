@@ -1415,13 +1415,16 @@ dependencies = [
 name = "cerulion_core"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bytemuck",
  "cerulion-wire",
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "cerulion_pairing",
  "codegen_fixture_msgs",
  "dirs",
+ "ed25519-dalek 2.2.0",
  "iceoryx2",
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-container",
@@ -1456,6 +1459,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -1466,6 +1470,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "x509-parser",
  "zenoh",
+ "zeroize",
 ]
 
 [[package]]
@@ -9624,6 +9629,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tls-listener"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1461056cc1ef47003f7ee16e4cef3741068d4c7f6b627bfce49b7c00c120a530"
+dependencies = [
+ "futures-util",
+ "pin-project-lite",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "token-cell"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11214,6 +11232,7 @@ dependencies = [
  "zenoh-link-quic",
  "zenoh-link-quic_datagram",
  "zenoh-link-tcp",
+ "zenoh-link-tls",
  "zenoh-link-udp",
  "zenoh-protocol",
  "zenoh-result",
@@ -11306,6 +11325,36 @@ dependencies = [
  "zenoh-link-commons",
  "zenoh-protocol",
  "zenoh-result",
+]
+
+[[package]]
+name = "zenoh-link-tls"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cce65fd71b4631821a85058542e28faac0151af6c53cd61f2dfafc7e16c4d6c4"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "secrecy",
+ "socket2 0.5.10",
+ "time",
+ "tls-listener",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "webpki-roots",
+ "x509-parser",
+ "zenoh-config",
+ "zenoh-core",
+ "zenoh-link-commons",
+ "zenoh-protocol",
+ "zenoh-result",
+ "zenoh-runtime",
 ]
 
 [[package]]

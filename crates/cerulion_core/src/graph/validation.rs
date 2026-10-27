@@ -966,11 +966,11 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 /// whatever the mode):
 ///
 /// 7. **Known carrier**: every `listen` / `connect` locator classifies under
-///    [`classify_locator`] (`tcp/`, `quic/`, `udp/`, with zenoh-valid `rel` and
-///    `mixed_rel` values).
-/// 8. **`quic/` has its certificate files**: a `quic/` LISTEN locator needs
-///    `tls.certificate` and `tls.private_key`; a `quic/` CONNECT locator needs
-///    `tls.root_ca`. A certificate without its key (or a key without its
+///    [`classify_locator`] (`tcp/`, `quic/`, `tls/`, `udp/`, with zenoh-valid
+///    `rel` and `mixed_rel` values).
+/// 8. **`quic/` and `tls/` have their certificate files**: a `quic/` or `tls/`
+///    LISTEN locator needs `tls.certificate` and `tls.private_key`; a `quic/` or
+///    `tls/` CONNECT locator needs `tls.root_ca`. A certificate without its key (or a key without its
 ///    certificate) is refused, and every `tls` path must be absolute.
 /// 9. **No inert `tls` setting**: `root_ca` is read only by a `quic/` connect
 ///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
@@ -995,7 +995,7 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
         for loc in locators {
             let carrier =
                 classify_locator(loc).map_err(|reason| err(format!("network {list}: {reason}")))?;
-            if matches!(carrier, Carrier::Quic { .. }) {
+            if matches!(carrier, Carrier::Quic { .. } | Carrier::Tls) {
                 if list == "listen" {
                     quic_listen = true;
                 } else {
@@ -1010,17 +1010,17 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
     if let Some(tls) = tls {
         if tls.root_ca.is_some() && !quic_connect {
             return Err(err(
-                "network tls.root_ca is set but no connect locator is quic/, so it would \
-                 change nothing (a quic/ listener asks a connecting peer for no certificate); \
-                 remove it or add a quic/ connect locator"
+                "network tls.root_ca is set but no connect locator is quic/ or tls/, so \
+                 it would change nothing (a quic/ or tls/ listener asks a connecting peer for \
+                 no certificate); remove it or add a quic/ or tls/ connect locator"
                     .to_string(),
             ));
         }
         if (tls.certificate.is_some() || tls.private_key.is_some()) && !quic_listen {
             return Err(err(
                 "network tls.certificate / tls.private_key are set but no listen locator is \
-                 quic/, so they would change nothing (only a quic/ listener presents them); \
-                 remove them or add a quic/ listen locator"
+                 quic/ or tls/, so they would change nothing (only such a listener presents \
+                 them); remove them or add a quic/ or tls/ listen locator"
                     .to_string(),
             ));
         }
@@ -1049,15 +1049,15 @@ fn validate_network_carriers(net: &crate::graph::config::NetworkBlock) -> Transp
     }
     if quic_listen && tls.is_none_or(|t| t.certificate.is_none()) {
         return Err(err(
-            "network listen has a quic/ locator but no tls.certificate / tls.private_key; a \
-             quic/ listener must present a certificate (or use tcp/, or \
+            "network listen has a quic/ or tls/ locator but no tls.certificate / \
+             tls.private_key; that listener must present a certificate (or use tcp/, or \
              udp/<ip>:<port>?rel=1;mixed_rel=1 on a WireGuard overlay)"
                 .to_string(),
         ));
     }
     if quic_connect && tls.is_none_or(|t| t.root_ca.is_none()) {
         return Err(err(
-            "network connect has a quic/ locator but no tls.root_ca; set it to the PEM \
+            "network connect has a quic/ or tls/ locator but no tls.root_ca; set it to the PEM \
              certificate(s) the peer's certificate chains to (a self-signed peer certificate is \
              its own root)"
                 .to_string(),
@@ -1801,7 +1801,11 @@ nodes:
         for (block, needles) in [
             (
                 "network:\n  mode: peer\n  listen:\n    - tls/0.0.0.0:7447\n",
-                &["network listen", "tls/ carrier"][..],
+                &["tls/ locator but no tls.certificate"][..],
+            ),
+            (
+                "network:\n  mode: peer\n  listen:\n    - ws/0.0.0.0:7447\n",
+                &["network listen", "'ws' carrier"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - 10.0.0.2:7447\n",
@@ -1809,7 +1813,7 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n",
-                &["quic/ locator but no tls.certificate"][..],
+                &["tls/ locator but no tls.certificate"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n",
