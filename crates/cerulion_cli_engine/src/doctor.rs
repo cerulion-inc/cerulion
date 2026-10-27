@@ -42,6 +42,7 @@ mod mdns;
 mod mtu;
 mod ros;
 mod shm;
+mod tcp_idle;
 pub mod udp_probe;
 
 /// The version of the `--json` report shape. It changes only when a field is
@@ -207,6 +208,7 @@ pub static CATALOGUE: &[Check] = &[
     daemons::REMOTED,
     mdns::MDNS,
     udp_probe::UDP,
+    tcp_idle::SLOW_START,
 ];
 
 /// The ids of every check, in catalogue order (for `--check` completion).
