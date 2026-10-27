@@ -1517,7 +1517,7 @@ mod tests {
 
     #[test]
     fn requirement_table_is_the_ruled_policy() {
-        // Hand oracle: the founder's ruling (no new cap bit).
+        // Hand oracle: the class table, using only the existing capability bits.
         assert_eq!(
             requirement(RcpClass::Act),
             RcpRequirement {
