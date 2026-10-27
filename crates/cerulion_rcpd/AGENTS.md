@@ -17,8 +17,10 @@ User reference: docs/rcp.md.
   `<receipts>.estop`; a daemon that finds the file starts latched.
 - `estop` closes the latch before anything that can await and publishes on the
   journal's urgent queue; it never waits on `call_lock`.
-- `estop_clear` takes `call_lock`; inside `latch_io` (a std mutex never held
-  across an await) it writes `intent`, deletes the file and opens the latch;
+- `estop_clear` reads the `engages` counter, then takes `call_lock`; inside
+  `latch_io` (a std mutex never held across an await) it refuses
+  (`estop_overtaken`) if an `estop` bumped the counter since, else writes
+  `intent`, deletes the file and opens the latch;
   then it journals a LATCH-GATED frame, so an `estop` that lands first stays
   the graph's last frame (`estop_overtaken`). `estop` re-closes the latch and
   writes its file and `intent` inside `latch_io`, so the receipt log orders

@@ -152,6 +152,9 @@ pub struct ToolHost {
     estop_clear: EstopClear,
     /// Held while the latch and its file change together.
     latch_io: Mutex<()>,
+    /// How many times `estop` has been called; a clear refuses when it moved
+    /// between the clear's request and the clear taking effect.
+    engages: AtomicU64,
     /// The high bits of every `call_id`: the start time's low 20 bits of
     /// milliseconds, so an answer meant for an earlier daemon does not match a
     /// call of this one unless the two started a multiple of about 17 minutes
@@ -294,6 +297,7 @@ impl ToolHost {
             call_lock: tokio::sync::Mutex::new(()),
             estop_clear: EstopClear::Agent,
             latch_io: Mutex::new(()),
+            engages: AtomicU64::new(0),
             call_epoch,
             next_call: AtomicU64::new(1),
             _log_lock: lock,
@@ -494,7 +498,9 @@ impl ToolHost {
     }
 
     async fn estop(&self, args: &JsonObject) -> CallToolResult {
-        // Close the latch before anything that can fail or wait.
+        // Count the engage, then close the latch, before anything that can
+        // fail or wait.
+        self.engages.fetch_add(1, Ordering::SeqCst);
         self.latch.store(true, Ordering::SeqCst);
         let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
@@ -551,11 +557,26 @@ impl ToolHost {
         self.record(ESTOP_TOOL, digest, ReceiptOutcome::Intent)
     }
 
-    /// The locked half of `estop_clear`: inside `latch_io`, write the
-    /// `intent` receipt, delete the file and open the latch. Returns the
-    /// intent and whether the latch was closed, or the refusal to return.
-    fn open_latch(&self, digest: &str) -> Result<(Receipt, bool), CallToolResult> {
+    /// The locked half of `estop_clear`: inside `latch_io`, refuse when an
+    /// `estop` was called since `seen` was read from `engages` (receipted
+    /// `error:estop_overtaken`, nothing changed); otherwise write the `intent`
+    /// receipt, delete the file and open the latch. Returns the intent and
+    /// whether the latch was closed, or the refusal to return.
+    fn open_latch(&self, digest: &str, seen: u64) -> Result<(Receipt, bool), CallToolResult> {
         let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.engages.load(Ordering::SeqCst) != seen {
+            let receipt = self.record(
+                ESTOP_CLEAR_TOOL,
+                digest,
+                ReceiptOutcome::Error(String::from("estop_overtaken")),
+            );
+            return Err(refusal(
+                "estop_overtaken",
+                "an estop engaged after the clear was requested; the e-stop is engaged",
+                receipt.as_ref(),
+                json!({ "estopped": self.estopped() }),
+            ));
+        }
         let Some(intent) = self.record(ESTOP_CLEAR_TOOL, digest, ReceiptOutcome::Intent) else {
             return Err(refusal(
                 "receipt_failed",
@@ -616,8 +637,11 @@ impl ToolHost {
         }
         let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
+        // Read before waiting behind a call in flight: an estop engaged while
+        // this clear waits is not cleared by it.
+        let seen = self.engages.load(Ordering::SeqCst);
         let _serial = self.call_lock.lock().await;
-        let (intent, was_estopped) = match self.open_latch(&digest) {
+        let (intent, was_estopped) = match self.open_latch(&digest, seen) {
             Ok(opened) => opened,
             Err(refused) => return refused,
         };
@@ -734,7 +758,8 @@ mod tests {
         let (host, latch) = host("reclose", &receipts);
         // `estop` has done its lock-free close; a clear takes the lock first.
         latch.store(true, Ordering::SeqCst);
-        let (_, was) = host.open_latch("d").expect("clear");
+        let seen = host.engages.load(Ordering::SeqCst);
+        let (_, was) = host.open_latch("d", seen).expect("clear");
         assert!(was);
         assert!(!host.estopped());
         // Then `estop` takes the lock.

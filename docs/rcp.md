@@ -147,7 +147,9 @@ that cannot tell whether the file exists).
 other argument is refused as `invalid_args`). It waits behind a call in
 flight, then:
 
-1. appends an `intent` receipt and syncs it to disk;
+1. refuses with `estop_overtaken`, receipted `error:estop_overtaken` with
+   nothing changed, when an `estop` was called after the clear was
+   requested; otherwise appends an `intent` receipt and syncs it to disk;
 2. deletes `<receipts>.estop` and opens the latch (a file that cannot be
    deleted leaves the latch closed and returns `clear_failed`, receipted
    `error:clear_failed`);
@@ -156,8 +158,8 @@ flight, then:
    calls topic, latch-gated like a motion call, and waits up to 2 s for the
    graph's answer; when it was open, publishes nothing;
 4. appends `ok`; `error:graph_unacknowledged` when no answer came; or
-   `error:estop_overtaken` when an `estop` closed the latch before the frame
-   was published, which returns the `estop_overtaken` error and leaves the
+   `error:estop_overtaken` when an `estop` closed the latch after step 2 and
+   before the frame was published, which returns the `estop_overtaken` error and leaves the
    `estop` frame as the graph's last.
 
 It returns `estopped` (the latch after the clear), `was_estopped`, and
@@ -170,8 +172,9 @@ orders engages and clears as they took effect. An `estop` that lands while
 a clear holds that lock closes the latch at once and publishes its frame
 after the clear's receipt write.
 
-A cancelled MCP request for a latch-gated call (a motion call or
-`estop_clear`) that has not been published yet is never published. A
+A latch-gated call (a motion call or `estop_clear`) whose MCP request was
+already cancelled when the journal takes it from its queue is dropped, not
+published. A
 cancelled `estop_clear` that already opened the latch leaves it open without
 an `estop_clear` frame on the calls topic.
 Deleting the file and restarting the daemon clears the e-stop under either

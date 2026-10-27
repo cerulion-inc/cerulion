@@ -1021,3 +1021,47 @@ async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreein
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_estop_while_a_clear_waits_behind_a_call_is_not_cleared_by_it() {
+    let mut f = Fixture::new("clear_queued", true).await;
+    let client = Arc::clone(&f.client);
+    // The graph answers arm.slow after 1.5 s; the clear queues behind it.
+    let slow =
+        tokio::spawn(async move { call(&client, "arm.slow", json!({ "q": [0.0, 0.0] })).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let client = Arc::clone(&f.client);
+    let clear = tokio::spawn(async move { call(&client, ESTOP_CLEAR_TOOL, json!({})).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "late" })).await;
+    assert!(!is_error);
+    let (clear_error, body) = clear.await.expect("clear task");
+    assert!(clear_error, "{body}");
+    assert_eq!(body["error"]["code"], json!("estop_overtaken"));
+    assert_eq!(body["estopped"], json!(true));
+    let (slow_error, _) = slow.await.expect("slow task");
+    assert!(!slow_error);
+    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("estopped"),
+        "the later estop holds"
+    );
+    assert!(latch_path(&f.receipts).exists());
+    let seen = f.stop_graph();
+    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
+    assert_eq!(
+        tools,
+        ["arm.slow", ESTOP_TOOL],
+        "the refused clear was never journaled"
+    );
+    let clears: Vec<(String, String)> = f
+        .receipts()
+        .into_iter()
+        .filter(|(verb, _)| verb == ESTOP_CLEAR_TOOL)
+        .collect();
+    assert_eq!(
+        clears,
+        pairs(&[(ESTOP_CLEAR_TOOL, "error:estop_overtaken")])
+    );
+}
