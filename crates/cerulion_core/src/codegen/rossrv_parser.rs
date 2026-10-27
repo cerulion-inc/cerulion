@@ -234,28 +234,30 @@ mod tests {
         assert_ne!(srv.request.schema_hash(), srv.response.schema_hash());
     }
 
-    /// The qualified name `rmw_cerulion` gives a message from its rosidl
-    /// introspection: the package is the namespace up to the first `__`
-    /// (`std_srvs__srv` gives `std_srvs`), then `/`, then `message_name_`.
-    /// rosidl names the two parts of service `SetBool` `SetBool_Request`
-    /// and `SetBool_Response`.
-    fn rmw_side_schema(body: &str, namespace: &str, message_name: &str) -> MessageSchema {
-        let package = namespace.split("__").next().unwrap();
-        parse_rosmsg(body, message_name, Some(package)).unwrap()
+    /// One side of a `.srv`, parsed as a `.msg` under the name ROS 2 gives
+    /// the part (`SetBool_Request`, `SetBool_Response`) in the service's
+    /// package. This is the `.msg` parser on the same text, not a ROS 2
+    /// peer: the check against the hash `rmw_cerulion` derives from rosidl
+    /// introspection is `crates/rmw_cerulion/tests/service_part_hash_test.rs`.
+    fn part_text_as_msg(body: &str, package: &str, part_name: &str) -> MessageSchema {
+        parse_rosmsg(body, part_name, Some(package)).unwrap()
     }
 
+    /// A real service's parts carry the qualified names ROS 2 gives them, and
+    /// each hashes like its text parsed as that message.
     #[test]
-    fn each_part_hashes_like_the_rmw_cerulion_peer_of_the_same_service() {
+    fn a_std_srvs_part_carries_the_name_ros_2_gives_it() {
         let request = "bool data\n";
         let response = "bool success\nstring message\n";
         let text = format!("{request}---\n{response}");
         let srv = parse_rossrv(&text, "SetBool", Some("std_srvs"), FILE).unwrap();
 
-        let rmw_req = rmw_side_schema(request, "std_srvs__srv", "SetBool_Request");
-        let rmw_resp = rmw_side_schema(response, "std_srvs__srv", "SetBool_Response");
-        assert_eq!(rmw_req.qualified_name(), "std_srvs/SetBool_Request");
-        assert_eq!(srv.request.schema_hash(), rmw_req.schema_hash());
-        assert_eq!(srv.response.schema_hash(), rmw_resp.schema_hash());
+        let req = part_text_as_msg(request, "std_srvs", "SetBool_Request");
+        let resp = part_text_as_msg(response, "std_srvs", "SetBool_Response");
+        assert_eq!(srv.request.qualified_name(), "std_srvs/SetBool_Request");
+        assert_eq!(srv.response.qualified_name(), "std_srvs/SetBool_Response");
+        assert_eq!(srv.request.schema_hash(), req.schema_hash());
+        assert_eq!(srv.response.schema_hash(), resp.schema_hash());
     }
 
     #[test]

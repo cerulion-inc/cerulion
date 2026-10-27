@@ -234,13 +234,14 @@ fn service_part_hashes_are_pinned() {
     );
 }
 
-/// The schema `rmw_cerulion` builds for a service part on a ROS 2 peer: the
-/// part's own lines, named `<pkg>/<Name>_Request` or `<pkg>/<Name>_Response`
-/// from the rosidl introspection (namespace `std_srvs__srv` gives package
-/// `std_srvs`). `body` is one side of the vendored `.srv`, split at its `---`.
-fn rmw_peer_hash(body: &str, rosidl_message_name: &str) -> u64 {
-    parse_rosmsg(body, rosidl_message_name, Some("std_srvs"))
-        .unwrap_or_else(|e| panic!("{rosidl_message_name} must parse: {e}"))
+/// One side of a vendored `.srv`, parsed on its own as a `std_srvs` message
+/// under the name ROS 2 gives the part (`<Name>_Request` or
+/// `<Name>_Response`). This is the `.msg` parser, not a ROS 2 peer: the
+/// check against the hash `rmw_cerulion` derives from rosidl introspection is
+/// `crates/rmw_cerulion/tests/service_part_hash_test.rs`.
+fn part_text_as_msg_hash(body: &str, part_name: &str) -> u64 {
+    parse_rosmsg(body, part_name, Some("std_srvs"))
+        .unwrap_or_else(|e| panic!("{part_name} must parse: {e}"))
         .schema_hash()
 }
 
@@ -255,11 +256,12 @@ fn srv_sides(text: &str) -> (String, String) {
     (join(&lines[..sep]), join(&lines[sep + 1..]))
 }
 
-/// Each native `std_srvs` part hashes like the part a ROS 2 peer on
-/// `rmw_cerulion` announces for the same service, so the two can match on the
-/// wire.
+/// Each generated `std_srvs` part hashes like its side of the vendored `.srv`
+/// parsed as a message named as ROS 2 names the part: the `.srv` split in
+/// the build and a plain `.msg` parse of the same text agree, so the generated
+/// code came from these files and nothing else.
 #[test]
-fn each_std_srvs_part_hashes_like_the_rmw_cerulion_peer_part() {
+fn each_std_srvs_part_hashes_like_its_vendored_text_parsed_as_a_named_msg() {
     let cases: [(&str, &str, u64, u64); 3] = [
         (
             "Empty",
@@ -284,12 +286,12 @@ fn each_std_srvs_part_hashes_like_the_rmw_cerulion_peer_part() {
         let (request, response) = srv_sides(text);
         assert_eq!(
             native_request,
-            rmw_peer_hash(&request, &format!("{name}_Request")),
+            part_text_as_msg_hash(&request, &format!("{name}_Request")),
             "std_srvs/{name}_Request"
         );
         assert_eq!(
             native_response,
-            rmw_peer_hash(&response, &format!("{name}_Response")),
+            part_text_as_msg_hash(&response, &format!("{name}_Response")),
             "std_srvs/{name}_Response"
         );
     }
