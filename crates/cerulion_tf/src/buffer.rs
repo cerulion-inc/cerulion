@@ -199,6 +199,20 @@ pub struct StaticEdge<'a> {
     pub transform: Transform,
 }
 
+/// What [`TfBuffer::lookup_latest`] resolved: the transform and the time
+/// it was resolved at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatestTransform {
+    /// `T_parent_child` at `stamp_ns`.
+    pub transform: Transform,
+    /// The time the chain was resolved at, in nanoseconds: the latest time
+    /// every edge on it answers, so [`TfBuffer::lookup`] at this stamp gives
+    /// the same transform. A caller judges staleness against it. `None` for
+    /// a chain of static edges only, or a frame to itself: that holds at
+    /// every time and has no stamp.
+    pub stamp_ns: Option<u64>,
+}
+
 /// A buffer of stamped transforms, queried by `lookup(parent, child, time)`.
 ///
 /// # The tree
@@ -664,7 +678,7 @@ impl TfBuffer {
     /// [`TfError::ChainMath`] when composing the chain overflows.
     pub fn lookup(&self, parent: &str, child: &str, stamp_ns: u64) -> Result<Transform, TfError> {
         let (p, c) = (self.slot_of(parent)?, self.slot_of(child)?);
-        self.lookup_slots(p, c, Some(stamp_ns))
+        self.lookup_slots(p, c, stamp_ns)
     }
 
     /// [`Self::lookup`] by handle, with no string work: resolve the frame
@@ -682,26 +696,29 @@ impl TfBuffer {
         stamp_ns: u64,
     ) -> Result<Transform, TfError> {
         let (p, c) = (self.slot_of_id(parent)?, self.slot_of_id(child)?);
-        self.lookup_slots(p, c, Some(stamp_ns))
+        self.lookup_slots(p, c, stamp_ns)
     }
 
-    /// `T_parent_child` at the latest time the chain answers, through the
-    /// same code path as [`Self::lookup`]. Each dynamic edge reaches its
-    /// newest stamp, plus the bound of its [`EdgePolicy`] past it (an
-    /// extrapolating edge with one sample reaches only that sample); the
-    /// chain resolves at the earliest of those reaches, and never later
-    /// than the newest stamp on the chain. With the default policy on every
-    /// edge that is the oldest of the newest stamps, so every edge has a
-    /// sample there; a held slow edge does not hold a fast chain back. A
-    /// chain of static edges only has no time and resolves directly.
+    /// `T_parent_child` at the latest time the chain answers, with that
+    /// time, through the same code path as [`Self::lookup`]. Each dynamic
+    /// edge reaches its newest stamp, plus the bound of its [`EdgePolicy`]
+    /// past it (an extrapolating edge with one sample reaches only that
+    /// sample); the chain resolves at the earliest of those reaches, and
+    /// never later than the newest stamp on the chain. With the default
+    /// policy on every edge that is the oldest of the newest stamps, so
+    /// every edge has a sample there; a held slow edge does not hold a fast
+    /// chain back. The resolved time comes back as
+    /// [`LatestTransform::stamp_ns`], so a caller judges staleness without
+    /// a second query. A chain of static edges only has no time and
+    /// resolves directly, with no stamp.
     ///
     /// # Errors
     ///
     /// The same as [`Self::lookup`]; [`TfError::OutOfRange`] when the
     /// chain's edges hold no common time yet.
-    pub fn lookup_latest(&self, parent: &str, child: &str) -> Result<Transform, TfError> {
+    pub fn lookup_latest(&self, parent: &str, child: &str) -> Result<LatestTransform, TfError> {
         let (p, c) = (self.slot_of(parent)?, self.slot_of(child)?);
-        self.lookup_slots(p, c, None)
+        self.lookup_latest_slots(p, c)
     }
 
     /// [`Self::lookup_latest`] by handle.
@@ -710,9 +727,13 @@ impl TfBuffer {
     ///
     /// The same as [`Self::lookup_latest`], with
     /// [`TfError::UnknownFrameId`] for a handle this buffer never issued.
-    pub fn lookup_latest_ids(&self, parent: FrameId, child: FrameId) -> Result<Transform, TfError> {
+    pub fn lookup_latest_ids(
+        &self,
+        parent: FrameId,
+        child: FrameId,
+    ) -> Result<LatestTransform, TfError> {
         let (p, c) = (self.slot_of_id(parent)?, self.slot_of_id(child)?);
-        self.lookup_slots(p, c, None)
+        self.lookup_latest_slots(p, c)
     }
 
     // ----------------------------------------------------------- internals
@@ -892,28 +913,36 @@ impl TfBuffer {
         i
     }
 
-    /// The lookup behind every public form: at `stamp_ns`, or at the
-    /// chain's latest time when it is `None`.
-    fn lookup_slots(
-        &self,
-        p: usize,
-        c: usize,
-        stamp_ns: Option<u64>,
-    ) -> Result<Transform, TfError> {
-        let anc = self.common_ancestor(p, c).ok_or(TfError::NoPath {
+    /// The lookup behind [`Self::lookup`] and [`Self::lookup_ids`]: at
+    /// `stamp_ns`.
+    fn lookup_slots(&self, p: usize, c: usize, stamp_ns: u64) -> Result<Transform, TfError> {
+        let anc = self.ancestor(p, c)?;
+        self.resolve(p, c, anc, stamp_ns)
+    }
+
+    /// The lookup behind [`Self::lookup_latest`] and
+    /// [`Self::lookup_latest_ids`]: at the chain's latest time, which comes
+    /// back with the transform. A chain with no dynamic edge has no time
+    /// and resolves at 0 ns, where every static edge answers.
+    fn lookup_latest_slots(&self, p: usize, c: usize) -> Result<LatestTransform, TfError> {
+        let anc = self.ancestor(p, c)?;
+        let mut reach = ChainReach::default();
+        self.chain_latest(c, anc, &mut reach);
+        self.chain_latest(p, anc, &mut reach);
+        let stamp_ns = reach.stamp_ns();
+        let transform = self.resolve(p, c, anc, stamp_ns.unwrap_or(0))?;
+        Ok(LatestTransform {
+            transform,
+            stamp_ns,
+        })
+    }
+
+    /// The nearest common ancestor of `p` and `c`, or [`TfError::NoPath`].
+    fn ancestor(&self, p: usize, c: usize) -> Result<usize, TfError> {
+        self.common_ancestor(p, c).ok_or(TfError::NoPath {
             parent: self.id(p),
             child: self.id(c),
-        })?;
-        let stamp_ns = match stamp_ns {
-            Some(stamp_ns) => stamp_ns,
-            None => {
-                let mut latest = Latest::default();
-                self.chain_latest(c, anc, &mut latest);
-                self.chain_latest(p, anc, &mut latest);
-                latest.stamp_ns()
-            }
-        };
-        self.resolve(p, c, anc, stamp_ns)
+        })
     }
 
     fn depth(&self, mut i: usize) -> usize {
@@ -1009,7 +1038,7 @@ impl TfBuffer {
 
     /// Folds the newest stamps of the dynamic edges on the chain from
     /// `from` up to `anc` into `latest`.
-    fn chain_latest(&self, from: usize, anc: usize, latest: &mut Latest) {
+    fn chain_latest(&self, from: usize, anc: usize, latest: &mut ChainReach) {
         let mut cur = from;
         while cur != anc {
             let frame = &self.frames[cur];
@@ -1132,25 +1161,26 @@ enum Admit {
 /// what each dynamic edge reaches (its newest stamp, plus how far past it
 /// the edge answers), never later than the newest stamp on the chain.
 #[derive(Debug, Default)]
-struct Latest {
+struct ChainReach {
     /// The earliest reach of the dynamic edges.
     reach: Option<u64>,
     /// The newest stamp of the dynamic edges.
     newest: Option<u64>,
 }
 
-impl Latest {
+impl ChainReach {
     fn fold(&mut self, newest_ns: u64, reach_ns: u64) {
         let reach = newest_ns.saturating_add(reach_ns);
         self.reach = Some(self.reach.map_or(reach, |r| r.min(reach)));
         self.newest = Some(self.newest.map_or(newest_ns, |n| n.max(newest_ns)));
     }
 
-    fn stamp_ns(&self) -> u64 {
+    /// The time the chain resolves at; `None` with no dynamic edge, where
+    /// every time is as good as any other.
+    fn stamp_ns(&self) -> Option<u64> {
         match (self.reach, self.newest) {
-            (Some(reach), Some(newest)) => reach.min(newest),
-            // Static edges only: every time is as good as any other.
-            _ => 0,
+            (Some(reach), Some(newest)) => Some(reach.min(newest)),
+            _ => None,
         }
     }
 }

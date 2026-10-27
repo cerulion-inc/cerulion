@@ -10,7 +10,8 @@ frames, and the tf buffer that answers `lookup(parent, child, time)`.
   edge (10 s by default, whatever the publish rate) and static edges that
   never expire. `lookup` walks the chain between two frames through their
   common ancestor and interpolates on every dynamic edge; `lookup_latest`
-  does the same at the newest time the whole chain answers.
+  does the same at the newest time the whole chain answers, and returns
+  that time with the transform.
   `static_edges` lists the static set, one edge per child frame, for a node
   that publishes it on `/tf_static`.
 - Frame ids are interned into `FrameId` handles with no length limit of

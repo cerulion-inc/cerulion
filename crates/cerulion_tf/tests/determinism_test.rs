@@ -169,7 +169,7 @@ fn buffer_program() -> [f64; M] {
         buf.lookup("map", "odom", 370).unwrap(),
         buf.lookup("map", "lidar", 370).unwrap(),
         buf.lookup("camera", "lidar", 123).unwrap(),
-        buf.lookup_latest("lidar", "map").unwrap(),
+        buf.lookup_latest("lidar", "map").unwrap().transform,
     ];
     let mut out = [0.0; M];
     let mut k = 0;
@@ -234,7 +234,7 @@ fn policy_program() -> [u64; 21] {
     let reads = [
         buf.lookup("odom", "base", 437).unwrap(),
         buf.lookup("odom", "base", 2_000).unwrap(),
-        buf.lookup_latest("map", "base").unwrap(),
+        buf.lookup_latest("map", "base").unwrap().transform,
     ];
     let mut out = [0u64; 21];
     let mut k = 0;

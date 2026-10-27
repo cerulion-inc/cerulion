@@ -156,7 +156,10 @@ fn a_rebroadcast_static_with_the_same_value_changes_nothing() {
     b.insert_static("base", "lidar", tf(0.25)).unwrap();
     assert_eq!(b.replacements(), 1);
     assert_eq!(edge(&b, "lidar").samples, 0);
-    assert_eq!(b.lookup_latest("base", "lidar").unwrap(), tf(0.25));
+    assert_eq!(
+        b.lookup_latest("base", "lidar").unwrap().transform,
+        tf(0.25)
+    );
 }
 
 #[test]

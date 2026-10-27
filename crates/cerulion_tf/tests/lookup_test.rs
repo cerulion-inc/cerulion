@@ -9,7 +9,8 @@
 //! buffer. Stamps are nanoseconds.
 
 use cerulion_tf::{
-    EdgePolicy, FrameId, FrameLabel, TfBuffer, TfBufferConfig, TfError, Transform, UnitQuaternion,
+    EdgePolicy, FrameId, FrameLabel, LatestTransform, TfBuffer, TfBufferConfig, TfError, Transform,
+    UnitQuaternion,
 };
 use std::f64::consts::FRAC_1_SQRT_2;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -225,9 +226,13 @@ fn a_frame_to_itself_is_the_identity() {
     let b = turning_edge();
     assert_eq!(b.lookup("odom", "odom", 500).unwrap(), Transform::IDENTITY);
     assert_eq!(b.lookup("base", "base", 500).unwrap(), Transform::IDENTITY);
+    // A frame to itself crosses no edge, so the chain has no time.
     assert_eq!(
         b.lookup_latest("base", "base").unwrap(),
-        Transform::IDENTITY
+        LatestTransform {
+            transform: Transform::IDENTITY,
+            stamp_ns: None,
+        }
     );
 }
 
@@ -317,13 +322,19 @@ fn lookup_latest_resolves_at_the_newest_time_the_whole_chain_has() {
     b.insert("odom", "base", 0, shift(0.0)).unwrap();
     b.insert("odom", "base", 1_000, shift(10.0)).unwrap();
     let latest = b.lookup_latest("map", "base").unwrap();
-    assert_eq!(latest, b.lookup("map", "base", 900).unwrap());
+    // The oldest of the newest stamps is map -> odom's 900 ns, and the
+    // transform is the one `lookup` gives there.
+    assert_eq!(latest.stamp_ns, Some(900));
+    assert_eq!(latest.transform, b.lookup("map", "base", 900).unwrap());
     // At 900 ns: map -> odom is 9 m; odom -> base is 9 m (0.9 of 10 m).
-    assert_close3(latest.translation(), [18.0, 0.0, 0.0], 1e-14);
+    assert_close3(latest.transform.translation(), [18.0, 0.0, 0.0], 1e-14);
     // The inverse direction picks the same time.
     assert_eq!(
         b.lookup_latest("base", "map").unwrap(),
-        b.lookup("base", "map", 900).unwrap()
+        LatestTransform {
+            transform: b.lookup("base", "map", 900).unwrap(),
+            stamp_ns: Some(900),
+        }
     );
 }
 
@@ -333,7 +344,8 @@ fn lookup_latest_on_static_edges_only_needs_no_time() {
     b.insert_static("base", "lidar", shift(0.17)).unwrap();
     b.insert_static("base", "camera", shift(0.27)).unwrap();
     let got = b.lookup_latest("lidar", "camera").unwrap();
-    assert_close3(got.translation(), [0.10, 0.0, 0.0], 1e-15);
+    assert_eq!(got.stamp_ns, None, "static edges hold at every time");
+    assert_close3(got.transform.translation(), [0.10, 0.0, 0.0], 1e-15);
 }
 
 #[test]
@@ -341,7 +353,10 @@ fn lookup_latest_uses_the_single_dynamic_edges_newest_sample() {
     let b = turning_edge();
     assert_eq!(
         b.lookup_latest("odom", "base").unwrap(),
-        tf([2.0, 0.0, 0.0], z90())
+        LatestTransform {
+            transform: tf([2.0, 0.0, 0.0], z90()),
+            stamp_ns: Some(1_000),
+        }
     );
 }
 
@@ -665,7 +680,8 @@ fn a_1_hz_map_edge_and_a_100_hz_odom_edge_resolve_at_the_slow_edges_newest_stamp
     // The slow edge's newest is 19 s, inside the fast edge's 10 s window
     // (9.99 s to 19.99 s). At 19 s: y = 19, and n = 1900.
     let latest = b.lookup_latest("map", "base").unwrap();
-    assert_eq!(latest.translation(), [1_900.0, 19.0, 0.0]);
+    assert_eq!(latest.stamp_ns, Some(19_000_000_000));
+    assert_eq!(latest.transform.translation(), [1_900.0, 19.0, 0.0]);
     let e = b.edge("base").unwrap();
     assert_eq!(
         (e.samples, e.oldest_ns, e.newest_ns, e.overflows),
@@ -684,7 +700,8 @@ fn a_1_hz_map_edge_and_a_1_khz_odom_edge_resolve_in_a_buffer_sized_for_1_khz() {
     nav_chain(&mut b, 1);
     // At 19 s: y = 19, and n = 19 000.
     let latest = b.lookup_latest("map", "base").unwrap();
-    assert_eq!(latest.translation(), [19_000.0, 19.0, 0.0]);
+    assert_eq!(latest.stamp_ns, Some(19_000_000_000));
+    assert_eq!(latest.transform.translation(), [19_000.0, 19.0, 0.0]);
     let e = b.edge("base").unwrap();
     assert_eq!(
         (e.samples, e.oldest_ns, e.overflows),
@@ -710,7 +727,8 @@ fn a_1_khz_edge_in_a_buffer_sized_for_100_hz_counts_every_overflow() {
     );
     // The short window still covers 19 s.
     let latest = b.lookup_latest("map", "base").unwrap();
-    assert_eq!(latest.translation(), [19_000.0, 19.0, 0.0]);
+    assert_eq!(latest.stamp_ns, Some(19_000_000_000));
+    assert_eq!(latest.transform.translation(), [19_000.0, 19.0, 0.0]);
 }
 
 #[test]
@@ -725,10 +743,15 @@ fn hold_last_on_the_slow_edge_lets_the_chain_resolve_at_the_fast_edges_newest_st
     )
     .unwrap();
     nav_chain(&mut b, 10);
-    // At 19.99 s: map -> odom holds y = 19, and n = 1999.
+    // At 19.99 s: map -> odom holds y = 19, and n = 1999. The stamp is
+    // the fast edge's newest, 990 ms into the slow edge's hold.
     let latest = b.lookup_latest("map", "base").unwrap();
-    assert_eq!(latest.translation(), [1_999.0, 19.0, 0.0]);
-    assert_eq!(latest, b.lookup("map", "base", 19_990_000_000).unwrap());
+    assert_eq!(latest.stamp_ns, Some(19_990_000_000));
+    assert_eq!(latest.transform.translation(), [1_999.0, 19.0, 0.0]);
+    assert_eq!(
+        latest.transform,
+        b.lookup("map", "base", 19_990_000_000).unwrap()
+    );
     // The hold reaches exactly 1 s past 19 s, and not one nanosecond more.
     assert_eq!(
         b.lookup("map", "odom", 20_000_000_000)
@@ -766,10 +789,9 @@ fn hold_last_on_the_slow_edge_lets_the_chain_resolve_at_the_fast_edges_newest_st
             .insert("odom", "base", n * 10_000_000, shift(n as f64))
             .unwrap();
     }
-    assert_eq!(
-        stale.lookup_latest("map", "base").unwrap().translation(),
-        [1_500.0, 14.0, 0.0]
-    );
+    let held = stale.lookup_latest("map", "base").unwrap();
+    assert_eq!(held.stamp_ns, Some(15_000_000_000));
+    assert_eq!(held.transform.translation(), [1_500.0, 14.0, 0.0]);
     // The fast edge keeps the default: nothing past its newest.
     assert!(matches!(
         b.lookup("map", "base", 19_990_000_001),
@@ -790,7 +812,13 @@ fn lookup_latest_on_held_edges_only_resolves_at_their_newest_stamp() {
     b.insert("odom", "base", 0, shift(0.0)).unwrap();
     b.insert("odom", "base", 400, shift(4.0)).unwrap();
     // The newest stamp among them is 400; map -> odom holds 1 m there.
-    assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(5.0));
+    assert_eq!(
+        b.lookup_latest("map", "base").unwrap(),
+        LatestTransform {
+            transform: shift(5.0),
+            stamp_ns: Some(400),
+        }
+    );
 }
 
 // ---------------------------------------------------------- extrapolation
@@ -936,11 +964,23 @@ fn latest_counts_a_one_sample_extrapolating_edge_only_to_its_sample() {
     b.insert("map", "odom", 100, shift(1.0)).unwrap();
     b.insert("odom", "base", 0, shift(0.0)).unwrap();
     b.insert("odom", "base", 200, shift(2.0)).unwrap();
-    assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(2.0));
+    assert_eq!(
+        b.lookup_latest("map", "base").unwrap(),
+        LatestTransform {
+            transform: shift(2.0),
+            stamp_ns: Some(100),
+        }
+    );
     // With a second sample the edge has motion and reaches past it: the
     // chain resolves at 200 ns, map -> odom one 50 ns step past 150 ns.
     b.insert("map", "odom", 150, shift(1.5)).unwrap();
-    assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(4.0));
+    assert_eq!(
+        b.lookup_latest("map", "base").unwrap(),
+        LatestTransform {
+            transform: shift(4.0),
+            stamp_ns: Some(200),
+        }
+    );
 }
 
 #[test]

@@ -84,8 +84,9 @@ mod quaternion;
 mod transform;
 
 pub use buffer::{
-    EdgeInfo, StaticEdge, TfBuffer, TfBufferConfig, DEFAULT_FRAME_CAPACITY, DEFAULT_JUMP_LIMIT,
-    DEFAULT_MAX_RATE_HZ, DEFAULT_NAME_BYTES, DEFAULT_RETENTION, NAME_BYTES_PER_FRAME,
+    EdgeInfo, LatestTransform, StaticEdge, TfBuffer, TfBufferConfig, DEFAULT_FRAME_CAPACITY,
+    DEFAULT_JUMP_LIMIT, DEFAULT_MAX_RATE_HZ, DEFAULT_NAME_BYTES, DEFAULT_RETENTION,
+    NAME_BYTES_PER_FRAME,
 };
 pub use edge_policy::EdgePolicy;
 #[allow(deprecated)]

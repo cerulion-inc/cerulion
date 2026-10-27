@@ -204,12 +204,14 @@ fn every_buffer_operation(b: &mut TfBuffer) {
     black_box(b.lookup("lidar", "odom", 350)).unwrap();
     black_box(b.lookup("base", "lidar", 7)).unwrap();
     black_box(b.lookup(LONG_ID, "lidar", 7)).unwrap();
-    black_box(b.lookup_latest("odom", "lidar")).unwrap();
+    let latest = black_box(b.lookup_latest("odom", "lidar")).unwrap();
+    black_box((latest.transform, latest.stamp_ns));
     black_box(b.lookup("base", "base", 0)).unwrap();
     black_box(b.lookup("/odom", "/base", 400)).unwrap();
     let (odom, lidar) = (b.frame_id("odom").unwrap(), b.frame_id("lidar").unwrap());
     black_box(b.lookup_ids(odom, lidar, 400)).unwrap();
     black_box(b.lookup_latest_ids(lidar, odom)).unwrap();
+    black_box(b.lookup_latest("base", "lidar")).unwrap();
     black_box(b.frame_name(odom));
     black_box(b.edge("base"));
     for edge in b.static_edges() {

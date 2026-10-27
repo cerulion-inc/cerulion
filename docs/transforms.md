@@ -220,10 +220,23 @@ translation, shortest-arc SLERP in rotation.
 
 `lookup_latest(parent, child)` resolves at the newest time every edge on
 the chain answers, through the same code path: with the default policy, the
-oldest of the edges' newest stamps.
-A chain of static edges only has no time and resolves directly. With the
-default window, a 1 Hz `map` to `odom` edge and a 100 Hz or 1 kHz `odom` to
-`base_link` edge resolve at the slow edge's newest stamp.
+oldest of the edges' newest stamps. It returns a `LatestTransform`, the
+`transform` together with the `stamp_ns` it was resolved at, so a node
+judges how stale the answer is without a second query; `lookup` at that
+stamp gives the same transform. A chain of static edges only has no time
+and resolves directly, with `stamp_ns` of `None`. With the default window,
+a 1 Hz `map` to `odom` edge and a 100 Hz or 1 kHz `odom` to `base_link`
+edge resolve at the slow edge's newest stamp.
+
+```rust
+let latest = self.buffer.lookup_latest("map", "base_link")?;
+if let Some(stamp_ns) = latest.stamp_ns {
+    // How far behind the node's clock the answer is.
+    let age_ns = now_ns.saturating_sub(stamp_ns);
+    // ...
+}
+let p_map = latest.transform.apply_point(p_base);
+```
 
 A node that looks up the same frames on every tick resolves them once with
 `buffer.frame_id("map")` and calls `lookup_ids(map, lidar, time)` and
