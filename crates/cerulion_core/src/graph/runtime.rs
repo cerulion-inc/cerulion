@@ -7585,12 +7585,10 @@ impl GraphRuntime {
                     .find(|m| m.name == *input_name)
                     .is_some_and(|m| m.consume == InputConsume::Latest);
                 if consume_latest {
+                    // No service cursor: a latest input serves no per-frame
+                    // position a resume could place, exactly like a
+                    // latest-value context input.
                     consume_latest_nodes.push(node_def.id.clone());
-                    // No cursor (a latest input serves no per-frame position a
-                    // resume could place), but the node STATES its table, an
-                    // empty one, so a resume reads this input as drain-to-latest
-                    // rather than as a node that states nothing.
-                    service_cursors.entry(node_def.id.clone()).or_default();
                 } else if let Some(body_sub) = subs.get_mut(input_name.as_str()) {
                     body_sub.mark_fifo_consume();
                     // Mint this input's SERVICE CURSOR here, at the
@@ -10705,8 +10703,9 @@ impl GraphRuntime {
                 // input: a data-trigger consumer or a PER-SET Sync
                 // one (whose trigger inputs are FIFO for the same
                 // reason and whose table therefore names EVERY one of them).
-                // Every other node (Period, legacy latest-per-set Sync,
-                // latest-only, no inputs at all) keeps `None`, because a
+                // Every other node (Period, legacy latest-per-set Sync, a
+                // `consume = latest` data trigger, latest-value inputs only, no
+                // inputs at all) keeps `None`, because a
                 // stated table is
                 // WRITTEN (the content-dependent version-2 tail), and stating
                 // an empty one for every node in the repo would grow every

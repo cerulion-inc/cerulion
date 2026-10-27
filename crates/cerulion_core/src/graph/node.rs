@@ -242,8 +242,9 @@ pub struct InputMeta {
     /// (`#[input(trigger)]` and `#[input(expect_within_ms = N)]` are
     /// orthogonal).
     pub expect_within_ms: Option<u64>,
-    /// The declared `consume = fifo | latest` of a trigger input. Always
-    /// [`InputConsume::Fifo`] on a non-trigger input.
+    /// The declared `consume = fifo | latest` of a trigger input. The macro
+    /// and the info-JSON loader carry `Fifo` on every non-trigger input; the
+    /// runtime reads this field only on a `DataTrigger` node's named input.
     pub consume: InputConsume,
 }
 

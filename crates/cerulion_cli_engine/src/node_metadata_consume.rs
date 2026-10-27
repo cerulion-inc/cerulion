@@ -5,7 +5,11 @@
 //! The CLI must not accept a form the macro refuses, nor refuse one it
 //! accepts, so this mirrors `cerulion_macros::parse`: `consume` takes the
 //! single identifier `fifo` or `latest`, may appear once, and needs
-//! `trigger`. The refusal texts are the macro's own, word for word.
+//! `trigger`, and is refused on a Sync node. The refusals for an unknown
+//! mode, a non-identifier value, a duplicate key, a non-trigger input and a
+//! Sync node are the macro's own, word for word; a malformed `consume` token
+//! stream, which the macro refuses with syn's own diagnostic, is refused here
+//! with the accepted values.
 
 use proc_macro2::TokenTree;
 

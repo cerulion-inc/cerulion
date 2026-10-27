@@ -10555,7 +10555,7 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 /// `MacroPolicy::DataTrigger`'s NAMED input is marked `mark_fifo_consume`
 /// unless it declares `consume = latest`, and every other input keeps
 /// drain-to-latest. Restated here because the marker is `pub(crate)` in
-/// `cerulion_core`, with the mirror named — a wrong `Latest` label costs a
+/// `cerulion_core`, with the mirror named: a wrong `Latest` label costs a
 /// spurious stand-down (loud, safe), a wrong `EachFifo` one would let an
 /// infeasible schedule through, so the conservative direction is the default
 /// and the FIFO arm is the narrow one.

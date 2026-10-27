@@ -5347,7 +5347,7 @@ impl CerulionSubscriber {
         }
         if let Some(held) = unserved_latest {
             if matches!(outcome.slot, FrozenSlot::Empty) {
-                // Nothing newer (or the newer frames were all decimated): the
+                // Nothing newer (or the drain's newest frame was decimated): the
                 // held frame is still the newest this input may serve, so it
                 // is RE-OFFERED, one signal and its own stamp, the FIFO
                 // re-offer's shape. The drain's own record above already says

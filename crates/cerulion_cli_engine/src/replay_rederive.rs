@@ -186,7 +186,8 @@ pub enum Decider {
     /// Per-message FIFO: fires per step against the read log's `popped`.
     FifoPop,
     /// A `consume = latest` data trigger: at most one fire per step, and
-    /// exactly one on a step whose trigger drain popped a frame.
+    /// exactly one on a step whose trigger drain popped a frame unless the
+    /// node is throttled.
     LatestFire,
     /// The cross-rank `block` credit edge. **Never re-derived** — it appears
     /// only on [`StandDown`]s and [`ConservationFinding`]s, so a reader of a
