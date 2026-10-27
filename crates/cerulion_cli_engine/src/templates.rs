@@ -27,7 +27,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 cdylib = []
@@ -541,7 +541,7 @@ pub fn generate_macro_lib_rs(metadata: &NodeMetadata, trigger: Option<&str>) -> 
         src.push_str(&format!("#[cerulion_node({})]\n", macro_args));
     }
     src.push_str("#[derive(Default)]\n");
-    src.push_str(&format!("struct {}Node {{\n", pascal));
+    src.push_str(&format!("pub struct {}Node {{\n", pascal));
 
     // Emit input fields with #[input] attrs (mark trigger if matching).
     for input in &metadata.inputs {
@@ -1905,7 +1905,9 @@ mod tests {
     fn test_generate_cargo_toml() {
         let toml = generate_cargo_toml("camera");
         assert!(toml.contains("name = \"camera\""));
-        assert!(toml.contains("crate-type = [\"cdylib\"]"));
+        // A cdylib for `cerulion graph run`, and an rlib so an app can link
+        // the node into its own library with `default-features = false`.
+        assert!(toml.contains("crate-type = [\"cdylib\", \"rlib\"]"));
         assert!(toml.contains("cerulion_core = { workspace = true }"));
         assert!(toml.contains("native_ros2_messages = { workspace = true }"));
         assert!(toml.contains(r#"default = ["cdylib"]"#));
@@ -3032,7 +3034,9 @@ mod tests {
         assert!(src.contains("#[cerulion_node(period_ms = 100)]"));
         assert!(src.contains("#[cerulion_node_impl]"));
         assert!(src.contains("#[derive(Default)]"));
-        assert!(src.contains("struct CameraNode"));
+        // `pub`: the macro gives `CameraNodeEntry` the struct's visibility,
+        // and an app that links the node as a library names that entry.
+        assert!(src.contains("#[derive(Default)]\npub struct CameraNode {"));
         assert!(src.contains("fn tick(&mut self) -> Result<(), NodeError>"));
         // Should NOT contain FFI entry points or legacy macro args.
         assert!(!src.contains("extern \"C\""));

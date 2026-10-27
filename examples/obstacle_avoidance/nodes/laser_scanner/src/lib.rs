@@ -12,7 +12,7 @@ use native_ros2_messages::sensor_msgs::LaserScan;
 // controller alternates between "clear" and "obstacle" states.
 #[cerulion_node(period_ms = 20)]
 #[derive(Default)]
-struct LaserScannerNode {
+pub struct LaserScannerNode {
     // Bare `#[output]`: ports need no field list. Plain assignment writes
     // both fixed and variable-length fields into the loaned shared-memory
     // slot.

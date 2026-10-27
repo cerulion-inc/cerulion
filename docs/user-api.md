@@ -671,6 +671,40 @@ my_robot/
 
 You shouldn't need to hand-edit `Cargo.toml` or `.cargo/config.toml`; the CLI keeps them in sync. Hand-edit `nodes/<type>/src/lib.rs`, `graphs/*.yaml`, and `schemas/*.yaml`. Port and trigger-policy metadata lives entirely in `src/lib.rs` (there is no `.cerulion.yaml` sidecar, and graph YAML carries no `policy:` block; the macro on the node is the single source of truth, and `cerulion node info` / `cerulion node list` parse the source directly).
 
+### A node crate is a cdylib and an rlib
+
+`cerulion node create` writes a node crate with two library targets and a `pub` node struct:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+```
+
+```rust
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+pub struct TimerNode {
+    // ...
+}
+```
+
+The `cdylib` is what `cerulion node build` and `cerulion graph run` load. The `rlib` lets another Rust crate, such as an app's own native library, link the node as a plain dependency. That crate depends on the node with `default-features = false`, which turns off the `cdylib` feature and with it the node's C exports (`cerulion_node_info` and the rest), so two linked nodes never clash on one symbol name:
+
+```toml
+[dependencies]
+timer = { path = "../nodes/timer", default-features = false }
+```
+
+Keep that crate out of the node workspace: give it its own `[workspace]` table and build it from its own directory. Cargo merges a package's features across everything one build selects, so a build that also selects the node packages (a plain `cargo build` at the node workspace root, for example) turns their default `cdylib` feature back on, compiles the C exports into the linking crate, and two linked nodes then fail to link on the shared `cerulion_node_info` name.
+
+The items the macro generates for a node take the struct's visibility, so the struct must be `pub` for another crate to reach the node.
+
+A node crate made before this layout needs two edits to link this way: change `crate-type = ["cdylib"]` to `crate-type = ["cdylib", "rlib"]` in its `Cargo.toml`, and change `struct <Name>` to `pub struct <Name>` on the `#[cerulion_node]` struct in `src/lib.rs`. Nothing else changes: the node still builds and runs with `cerulion node build` and `cerulion graph run` as before.
+
 ---
 
 ## Node author API (the macros)
