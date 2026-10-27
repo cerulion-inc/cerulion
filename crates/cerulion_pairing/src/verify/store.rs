@@ -148,9 +148,10 @@ impl TrustStore {
     }
 
     /// Load and verify a store from disk. Fails with [`PairingError::TamperDetected`]
-    /// if the MAC does not verify.
+    /// if the MAC does not verify. On Unix, the group and other permission bits of
+    /// a regular store file are cleared before it is read.
     pub fn load(path: impl AsRef<Path>, mac_key: &[u8]) -> Result<Self, PairingError> {
-        let bytes = std::fs::read(path.as_ref())?;
+        let bytes = read_private(path.as_ref())?;
         let inner = Self::decode(&bytes, mac_key)?;
         Ok(TrustStore {
             inner,
@@ -159,10 +160,20 @@ impl TrustStore {
     }
 
     /// Atomically and durably write the store to its backing path,
-    /// authenticated with `mac_key`: write a sibling `.tmp`, fsync it, rename it
-    /// over the store, then fsync the directory. A failure up to and including
-    /// the rename leaves the old store in place and is returned; a failed directory fsync
-    /// after the rename is logged, since the new store is already in place.
+    /// authenticated with `mac_key`: create a fresh sibling temporary file
+    /// (exclusively, mode 0600 on Unix), write and fsync it, rename it over the
+    /// store, then fsync the directory. The store takes the temporary file's mode
+    /// at the rename: 0600, less any bits the umask clears.
+    ///
+    /// A failure up to and including the rename leaves the old store in place and
+    /// is returned. A failed directory fsync after the rename is logged at `warn`
+    /// and the save returns `Ok`, since the new store is already in place; if that
+    /// save recorded a revocation, a power loss can then bring back the previous
+    /// store, in which the revoked device still has access, and the `warn` line is
+    /// the only trace of it.
+    ///
+    /// Each save uses its own temporary file, so concurrent saves never share one
+    /// and the last rename wins.
     pub fn save(&self, mac_key: &[u8]) -> Result<(), PairingError> {
         self.save_with(mac_key, &mut StdSaveFs)
     }
@@ -171,7 +182,7 @@ impl TrustStore {
     fn save_with(&self, mac_key: &[u8], fs: &mut impl SaveFs) -> Result<(), PairingError> {
         let path = self.path.as_ref().ok_or(PairingError::NoStorePath)?;
         let bytes = self.encode(mac_key)?;
-        replace_durably(fs, &tmp_path(path), path, &bytes)?;
+        replace_durably(fs, &unique_tmp_path(path), path, &bytes)?;
         Ok(())
     }
 
@@ -1147,17 +1158,81 @@ fn access_row_expiry(not_after_ns: u64) -> Option<u64> {
     (not_after_ns != u64::MAX).then_some(not_after_ns)
 }
 
-/// Sibling temp path for atomic writes: append `.tmp` to the file name.
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
+/// A fresh sibling name for one save's temporary file, `.<name>.<16 hex>.tmp` in
+/// the store's directory. The hex hashes the process id and a per-process
+/// counter under std's OS-seeded `RandomState`, so two saves (in one process or
+/// two) and a crashed save's leftover do not share a name. The name is unique,
+/// not secret: the exclusive create in [`StdSaveFs`] is what refuses a path that
+/// is already there.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".{:016x}.tmp", hasher.finish()));
     path.with_file_name(name)
+}
+
+/// Read the store file at `path`. On Unix, when the file is a regular file that
+/// group or other users can access, its group and other permission bits are
+/// cleared through the open handle before it is read, logged at `warn`. When
+/// clearing them fails, that is logged at `warn` and the read goes on.
+fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    narrow_to_owner(&file, path);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Clear the group and other permission bits of the open store `file`, when it
+/// is a regular file.
+#[cfg(unix)]
+fn narrow_to_owner(file: &std::fs::File, path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = match file.metadata() {
+        Ok(meta) if meta.is_file() => meta.permissions().mode() & 0o7777,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read the trust store's mode"
+            );
+            return;
+        }
+    };
+    if mode & 0o077 == 0 {
+        return;
+    }
+    let narrowed = mode & !0o077;
+    match file.set_permissions(std::fs::Permissions::from_mode(narrowed)) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            mode = format_args!("{mode:o}"),
+            narrowed = format_args!("{narrowed:o}"),
+            "the trust store was accessible to other users; cleared its group and other bits"
+        ),
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            mode = format_args!("{mode:o}"),
+            error = %e,
+            "the trust store is accessible to other users and its group and other bits \
+             could not be cleared"
+        ),
+    }
 }
 
 /// The file-system steps [`replace_durably`] runs, one method per step, so a
 /// test can record their order. [`StdSaveFs`] is the production implementation.
 trait SaveFs {
-    /// Create (or truncate) `path` for writing.
+    /// Create `path` for writing; it must not exist.
     fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File>;
     /// Write all of `bytes` to `file`, which was created at `path`.
     fn write(&mut self, file: &mut std::fs::File, path: &Path, bytes: &[u8])
@@ -1174,8 +1249,20 @@ trait SaveFs {
 struct StdSaveFs;
 
 impl SaveFs for StdSaveFs {
+    /// An exclusive create (`O_CREAT|O_EXCL`): it fails with `AlreadyExists` on
+    /// any existing path, a symbolic link included, without following it (POSIX
+    /// `open()` specifies `EEXIST` when `O_CREAT|O_EXCL` names a symbolic link,
+    /// dangling or not; Linux and macOS do so). On Unix the file is created with
+    /// mode 0600.
     fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
-        std::fs::File::create(path)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(path)
     }
     fn write(
         &mut self,
@@ -1211,20 +1298,24 @@ impl SaveFs for StdSaveFs {
 /// bare file name). Without the first fsync the rename can reach the disk
 /// before the data does; without the second the rename itself can be lost.
 ///
-/// A failure up to and including the rename removes `tmp` and is returned, with
-/// `path` unchanged. The rename is the commit point: a failed directory fsync
-/// after it is logged at `warn` and the replace returns `Ok`, because the new
-/// file is in place and a power loss can only bring back the old one.
+/// A failure up to and including the rename is returned with `path` unchanged;
+/// `tmp` is removed when this call created it. The rename is the commit point: a
+/// failed directory fsync after it is logged at `warn` and the replace returns
+/// `Ok`, because the new file is in place and a power loss can only bring back the
+/// old one.
 fn replace_durably(
     fs: &mut impl SaveFs,
     tmp: &Path,
     path: &Path,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    let staged = fs.create(tmp).and_then(|mut file| {
-        fs.write(&mut file, tmp, bytes)?;
-        fs.sync_file(&file, tmp)
-    });
+    // A failed create made nothing, so whatever is at `tmp` is not this save's
+    // and is left alone.
+    let mut file = fs.create(tmp)?;
+    let staged = fs
+        .write(&mut file, tmp, bytes)
+        .and_then(|()| fs.sync_file(&file, tmp));
+    drop(file);
     if let Err(e) = staged.and_then(|()| fs.rename(tmp, path)) {
         let _ = std::fs::remove_file(tmp);
         return Err(e);
@@ -1294,7 +1385,7 @@ mod tests {
     fn a_durable_replace_syncs_the_file_before_the_rename_and_the_directory_after() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("trust.store");
-        let tmp = tmp_path(&path);
+        let tmp = unique_tmp_path(&path);
         std::fs::write(&path, b"old").unwrap();
         let mut fs = Recorder::default();
         replace_durably(&mut fs, &tmp, &path, b"new bytes").unwrap();
@@ -1363,7 +1454,7 @@ mod tests {
         }
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("trust.store");
-        replace_durably(&mut DirSyncFails, &tmp_path(&path), &path, b"new").unwrap();
+        replace_durably(&mut DirSyncFails, &unique_tmp_path(&path), &path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -1390,7 +1481,7 @@ mod tests {
         }
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join("trust.store");
-        let tmp = tmp_path(&path);
+        let tmp = unique_tmp_path(&path);
         std::fs::write(&path, b"old").unwrap();
         let err = replace_durably(&mut FileSyncFails, &tmp, &path, b"new").unwrap_err();
         assert_eq!(err.to_string(), "injected");
@@ -1410,7 +1501,10 @@ mod tests {
         store
             .save_with(b"0123456789abcdef0123456789abcdef", &mut fs)
             .unwrap();
-        let tmp = tmp_path(&path);
+        let Some(Step::Create(tmp)) = fs.0.first().cloned() else {
+            panic!("the first step is the create: {:?}", fs.0);
+        };
+        assert_tmp_name(&tmp, &path);
         assert_eq!(
             fs.0,
             vec![
@@ -1421,7 +1515,147 @@ mod tests {
                 Step::SyncDir(tmp_dir.path().to_path_buf()),
             ]
         );
-        TrustStore::load(&path, b"0123456789abcdef0123456789abcdef")
-            .expect("the saved store loads");
+        TrustStore::load(&path, KEY).expect("the saved store loads");
+    }
+
+    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn test_store(path: &Path) -> TrustStore {
+        let roots = RootSet::new(vec![PublicKey([1; 32]), PublicKey([2; 32])], 2).unwrap();
+        TrustStore::provision(RobotId([0xB0; 32]), PublicKey([3; 32]), roots, b"c", 0)
+            .unwrap()
+            .with_path(path)
+    }
+
+    /// `tmp` is `.<store name>.<16 lowercase hex>.tmp` beside `store`.
+    fn assert_tmp_name(tmp: &Path, store: &Path) {
+        assert_eq!(tmp.parent(), store.parent(), "{}", tmp.display());
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        let prefix = format!(".{}.", store.file_name().unwrap().to_str().unwrap());
+        let hex = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .unwrap_or_else(|| panic!("unexpected tmp name {name}"));
+        assert_eq!(hex.len(), 16, "{name}");
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn each_save_gets_its_own_temporary_name() {
+        let path = Path::new("/r/trust.store");
+        let a = unique_tmp_path(path);
+        let b = unique_tmp_path(path);
+        assert_tmp_name(&a, path);
+        assert_tmp_name(&b, path);
+        assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_over_a_0644_store_leaves_it_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Control: a file created without an explicit mode keeps group or other
+        // bits under this umask, so the 0600 below comes from the save.
+        let probe = dir.path().join("probe");
+        std::fs::File::create(&probe).unwrap();
+        assert_ne!(
+            mode_of(&probe) & 0o077,
+            0,
+            "the umask clears group and other bits, which would hide a dropped mode"
+        );
+        std::fs::remove_file(&probe).unwrap();
+        test_store(&path).save(KEY).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_a_0644_store_narrows_it_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        test_store(&path).save(KEY).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        TrustStore::load(&path, KEY).expect("a narrowed store still loads");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_a_temporary_name_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        // The fixed name saves used before, and a name shaped like a fresh one.
+        let fixed = dir.path().join("trust.store.tmp");
+        let shaped = dir.path().join(".trust.store.0123456789abcdef.tmp");
+        for link in [&fixed, &shaped] {
+            std::os::unix::fs::symlink(&victim, link).unwrap();
+            let err = StdSaveFs
+                .create(link)
+                .expect_err("an existing path is refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            let err = replace_durably(&mut StdSaveFs, link, &path, b"new").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "the planted path is left in place"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep",
+            "the target is unchanged"
+        );
+        assert!(!path.exists(), "nothing was renamed into place");
+        // A save beside the planted links goes through its own fresh name.
+        test_store(&path).save(KEY).unwrap();
+        TrustStore::load(&path, KEY).expect("the saved store loads");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn concurrent_saves_both_succeed_and_leave_a_valid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let store = test_store(&path);
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        store.save(KEY).expect("a concurrent save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        TrustStore::load(&path, KEY).expect("the final store has a valid MAC");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "trust.store")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temporary file is left: {leftovers:?}"
+        );
     }
 }
