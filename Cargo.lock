@@ -1707,6 +1707,7 @@ dependencies = [
  "cerud",
  "cerulion_core",
  "cerulion_link",
+ "cerulion_msgio",
  "cerulion_netd",
  "cerulion_pairing",
  "cerulion_remoted",
