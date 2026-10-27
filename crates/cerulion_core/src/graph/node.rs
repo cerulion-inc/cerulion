@@ -7356,7 +7356,10 @@ mod tests {
     fn test_parse_info_json_accumulate_key_absent_reads_false() {
         let without = r#"{"inputs":[{"name":"tf","depth":32}],"outputs":[]}"#;
         let info = DylibNodeEntry::parse_info_json(without).unwrap();
-        assert!(!info.input_meta[0].accumulate, "absent key = not accumulate");
+        assert!(
+            !info.input_meta[0].accumulate,
+            "absent key = not accumulate"
+        );
         let with = r#"{"inputs":[{"name":"tf","depth":32,"accumulate":true}],"outputs":[]}"#;
         let info = DylibNodeEntry::parse_info_json(with).unwrap();
         assert!(info.input_meta[0].accumulate, "the key is read");

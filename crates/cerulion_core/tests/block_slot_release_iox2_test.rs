@@ -578,7 +578,8 @@ fn the_graph_cannot_make_an_accumulate_input_block() {
         .expect("block on an accumulate input must be refused");
     assert!(
         err.contains("acc.inp")
-            && err.contains("`#[input(accumulate)]` cannot be combined with `backpressure = block`"),
+            && err
+                .contains("`#[input(accumulate)]` cannot be combined with `backpressure = block`"),
         "the refusal names the input and carries the macro's wording: {err}"
     );
     let mut depth = input("producer/out");
