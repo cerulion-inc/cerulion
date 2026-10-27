@@ -524,6 +524,27 @@ locator string is the whole choice. TCP stays the default.
 | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
 | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
 
+**TCP after idle on Linux.** With `net.ipv4.tcp_slow_start_after_idle`
+nonzero, the Linux default, a TCP connection that sends nothing for longer than
+one retransmission timeout restarts from its initial congestion window, so each
+large message sent at a low rate pays a few extra round trips. The cost grows
+with the path's round-trip time: small on a LAN, large across a wide-area link.
+The window belongs to the sending host, and the `quic/` carrier's congestion
+controller has no idle reset. Measured 2026-10-26 over a 31 ms wide-area path
+with a 301 KB message: at 1 Hz, `tcp/` 164.8 ms p50 / 257.7 ms p99 and `quic/`
+79.3 / 107.5 ms; at 30 Hz both about 63 ms p50.
+
+A `graph run` that sends topics off the machine logs one warning when that egress goes out over
+`tcp/` from a host where the sysctl is nonzero: through the per-run gateway
+when its locators include `tcp/` (the warning names them), or through the
+shared `cerulion-netd` session, whose links to discovered peers are `tcp/`. The
+fixes are `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the sending host,
+kept in a file under `/etc/sysctl.d/`, or `quic/` on both ends: a `network:`
+block with `quic/` locators, their `tls:` files and an `egress:` list. The
+sysctl is per network namespace; the run reads it in its own. A `cerulion-netd`
+started with only `quic/` locators still gets the warning, because the run
+cannot see netd's locators. Other hosts never log it.
+
 Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
 lets the peer decide, which is why it does not satisfy a `best_effort` topic
 (the connection may come up with streams only).
