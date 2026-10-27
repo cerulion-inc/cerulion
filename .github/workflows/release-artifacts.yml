@@ -185,6 +185,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Release binaries build without the development issuer
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          tools/scripts/check_no_dev_issuer.sh --target "$TARGET"
+
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
@@ -197,9 +203,9 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           fi
-          cargo build --release --locked \
-            -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
-            --target "$TARGET"
+          # The release package list lives in check_no_dev_issuer.sh.
+          read -r -a packages <<< "$(tools/scripts/check_no_dev_issuer.sh --print-packages)"
+          cargo build --release --locked "${packages[@]}" --target "$TARGET"
           case "$TARGET" in
             *-unknown-linux-gnu)
               # The heap hook, an LD_PRELOAD malloc interposer the CLI

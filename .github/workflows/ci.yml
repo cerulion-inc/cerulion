@@ -3904,6 +3904,15 @@ jobs:
       - name: cerulion_pairing tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
         run: cargo test -p cerulion_pairing
+      # Lints and tests cerulion_pairing with the `dev-issuer` feature on, and
+      # checks the release package set (check_no_dev_issuer.sh) for it.
+      - name: cerulion_pairing tests, development issuer
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing')
+        run: |
+          cargo clippy -p cerulion_pairing --all-targets --features dev-issuer -- -D warnings
+          cargo test -p cerulion_pairing --features dev-issuer
+      - name: release binaries build without the development issuer
+        run: tools/scripts/check_no_dev_issuer.sh
       - name: selection marker, cerulion_pairing
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_pairing') }}
         env:

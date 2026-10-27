@@ -373,6 +373,14 @@ pub enum PairingError {
          machine); delete it only if this machine's clock and team state are known good"
     )]
     HighWaterTampered,
+    /// A team credential file is missing, does not decode or fails its check.
+    #[error("team credentials {path}: {reason}")]
+    TeamCredentials {
+        /// The file.
+        path: std::path::PathBuf,
+        /// What is wrong with it and what to do.
+        reason: String,
+    },
     /// The high-water file has the wrong length or magic after its MAC verified,
     /// or before a MAC could be checked.
     #[error("the identity high-water file is malformed: {0}")]
