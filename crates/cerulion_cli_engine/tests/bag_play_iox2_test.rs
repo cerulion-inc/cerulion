@@ -761,7 +761,6 @@ fn a_two_clock_bag_plays_each_channel_at_its_own_recorded_rate() {
     );
 
     let mgr = manager("domains");
-    let started = Instant::now();
     let summary = play_once(
         &mgr,
         &bag,
@@ -770,26 +769,28 @@ fn a_two_clock_bag_plays_each_channel_at_its_own_recorded_rate() {
             ..Default::default()
         },
     );
-    let wall = started.elapsed();
 
     assert_eq!(
         summary.total_injected(),
         10,
         "every frame must be published"
     );
-    // THE discriminator. Recorded span per domain is 200 ms; one file-wide
-    // schedule takes ~20 s on this bag (four interleave points x a 5 s capped
-    // gap, both directions).
-    assert!(
-        wall < Duration::from_secs(3),
-        "a 200ms two-domain recording must play in ~200ms, took {wall:?} — that is the \
-         cross-domain clock offset leaking into the schedule"
-    );
-    // And the ideal duration the player computed is per-domain, not summed.
+    // THE discriminator, read off the schedule the player built rather than the
+    // wall. Recorded span per domain is 200 ms; one file-wide schedule climbs
+    // ~20 s on this bag (four interleave points x a 5 s capped gap, both
+    // directions). The run origin is the schedule's only wall term, so a loaded
+    // host cannot move the rest of it.
     assert!(
         summary.scheduled_span_ns <= 300_000_000,
-        "the run's ideal duration must be the longest DOMAIN's span (200ms), got {}ns",
+        "the run's ideal duration must be the longest DOMAIN's span (200ms), got {}ns — that \
+         is the cross-domain clock offset leaking into the schedule",
         summary.scheduled_span_ns
+    );
+    // Comparing stamps ACROSS the two clocks reads every interleave point back
+    // to the earlier clock as a backwards stamp, which re-anchors.
+    assert_eq!(
+        summary.timeline_restarts, 0,
+        "two clocks interleaved in one file are not a timeline restart"
     );
 }
 
@@ -833,9 +834,20 @@ fn a_single_channel_bag_paces_at_its_recorded_rate() {
         summary.scheduled_span_ns
     );
     assert_scheduled_span_is_not_inflated(&summary);
+    // The upper side is read off the schedule, not the wall: a loaded host
+    // stretches the wall, but only the run origin (the walk to the first frame)
+    // reaches the schedule, while an over-advancing schedule (a mis-scaled
+    // delta, a unit slip) multiplies the recorded 400 ms.
     assert!(
-        wall >= Duration::from_millis(380) && wall < Duration::from_secs(3),
-        "a 400ms single-domain recording must play in ~400ms, took {wall:?}"
+        summary.scheduled_span_ns < 600_000_000,
+        "a 400ms single-domain recording must schedule ~400ms, scheduled {}ns",
+        summary.scheduled_span_ns
+    );
+    // The lower side stays on the wall: contention can only make it more true.
+    assert!(
+        wall >= Duration::from_millis(380),
+        "a 400ms single-domain recording must take ~400ms, took only {wall:?} — the frames \
+         were DUMPED, not paced"
     );
 }
 
@@ -1195,8 +1207,13 @@ fn write_tap_grouped_bag(
 /// within-batch span, so a K-tap domain played ~K times slower than recorded.
 ///
 /// 3 topics x 60 frames at 10 ms = a 590 ms recording. The phantom-domain mechanism
-/// stretches it by roughly the tap multiplicity; the assertion below is
-/// deliberately generous so it fails on the defect and not on jitter.
+/// stretches it by roughly the tap multiplicity, and it does so in the SCHEDULE:
+/// every tap boundary re-anchors (counted in `timeline_restarts`) and the next
+/// tap re-climbs its batch. So the upper side is asserted on the schedule the
+/// player built, whose only wall term is the run origin. The wall itself is held
+/// only from below, which contention can only make more true; a loaded host
+/// overruns this bag for real (1.036 s on a hosted runner) and the summary is
+/// right to say so.
 #[test]
 fn a_tap_grouped_bag_plays_at_its_recorded_duration() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1243,39 +1260,38 @@ fn a_tap_grouped_bag_plays_at_its_recorded_duration() {
         "a {recorded_span:?} recording must take about that long, took only {wall:?} — the \
          frames were DUMPED, not paced"
     );
-    assert!(
-        wall < recorded_span.mul_f64(1.5),
-        "a {recorded_span:?} recording written the way bagd writes one must play in about \
-         {recorded_span:?}, took {wall:?} — that is tap-grouped write batching being read as a \
-         clock break"
+    // The upper side, on the schedule. Reading a tap boundary as a clock break
+    // re-anchors there, so a single-clock bag counts exactly 0 restarts at any
+    // load ...
+    assert_eq!(
+        summary.timeline_restarts, 0,
+        "write batching is not a timeline restart; {} re-anchors means tap boundaries were \
+         read as clock breaks",
+        summary.timeline_restarts
     );
-    // And a healthy single-clock bag must not accuse the MACHINE of lag. Raw
-    // slip IS expected here and is structural: a tap-grouped bag is not in
+    // ... and the schedule is the shared run origin plus each channel's own
+    // 590 ms of deltas. Re-climbing a tap's batch multiplies the 590 ms.
+    assert!(
+        u128::from(summary.scheduled_span_ns) < recorded_span.mul_f64(1.5).as_nanos(),
+        "a {recorded_span:?} recording written the way bagd writes one must schedule about \
+         {recorded_span:?}, scheduled {}ns (wall {wall:?}) — that is tap-grouped write batching \
+         being read as a clock break",
+        summary.scheduled_span_ns
+    );
+    // Raw slip IS expected here and is structural: a tap-grouped bag is not in
     // global arrival order, so a later topic's frames are reached after the
     // earlier topics' have been paced — bounded by the recorder's flush window.
-    // The discriminator is the wall OVERRUN, which must be absent.
-    assert_eq!(
-        summary.wall_overrun_ns(),
-        None,
-        "a tap-grouped single-clock bag must not overrun; scheduled {}ms vs wall {:?}",
-        summary.scheduled_span_ns / 1_000_000,
-        summary.elapsed
-    );
+    // Whether the run OVERRAN is this host's verdict: a loaded host genuinely
+    // does, and then "Lower --rate" is the right advice. When it kept up, the
+    // slip must be reported as structural and the host must not be accused.
     let text = bag_cmd::render_play_summary(&summary);
-    if summary.slipped_frames > 0 {
+    let kept_up = summary.wall_overrun_ns().is_none();
+    if kept_up && summary.slipped_frames > 0 {
         assert!(
             text.contains("STRUCTURAL, not lag on this machine"),
             "structural slip must NOT be reported as machine lag: {text}"
         );
-        assert!(
-            !text.contains("Lower --rate"),
-            "and must not advise lowering --rate: {text}"
-        );
     }
-    assert_eq!(
-        summary.timeline_restarts, 0,
-        "write batching is not a timeline restart"
-    );
     // MEASURED: the rate bound DOES bite here — the
     // later taps start behind and catch up — so demanding no fast-forward would
     // be wrong. What must hold is that the report never accuses the RECORDING:
@@ -1291,8 +1307,10 @@ fn a_tap_grouped_bag_plays_at_its_recorded_duration() {
             "and must name write batching as a cause, not only a handover: {text}"
         );
     }
-    // Whatever it reports, a healthy bag must not be told to lower --rate.
-    assert!(!text.contains("Lower --rate"), "{text}");
+    // A host that kept up must not be told to lower --rate.
+    if kept_up {
+        assert!(!text.contains("Lower --rate"), "{text}");
+    }
 }
 
 /// Pins `bag info`: its damage-classification branch and its not-found /
@@ -1486,6 +1504,12 @@ fn a_channel_that_starts_late_plays_at_its_rate_rather_than_dumping() {
 ///
 /// The existing loop arm is single-topic and therefore structurally blind: with
 /// one channel there are no deficits to destroy.
+///
+/// That mechanism leaves an exact count behind: re-anchoring each channel at
+/// the wrap counts one restart PER CHANNEL, where a wrap that rebuilds the
+/// clocks counts the wrap once. So the upper side is pinned on
+/// `timeline_restarts`, which no host load can move, and the wall is held only
+/// from below.
 #[test]
 fn a_multi_topic_loop_wrap_keeps_every_pass_the_same_length() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1506,6 +1530,9 @@ fn a_multi_topic_loop_wrap_keeps_every_pass_the_same_length() {
     let recorded_span = Duration::from_nanos((FRAMES as u64 - 1) * PERIOD_NS);
 
     let mgr = manager("loopwrap");
+    let sub = mgr
+        .create_subscriber(&a)
+        .expect("pre-create the topic so the subscriber is attached before playback");
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
     let mgr2 = Arc::clone(&mgr);
@@ -1524,20 +1551,23 @@ fn a_multi_topic_loop_wrap_keeps_every_pass_the_same_length() {
         )
     });
 
-    // Let it run several passes, then stop and check the per-pass wall.
-    std::thread::sleep(recorded_span * 4);
+    // Run until channel `a` has delivered more than two passes' worth of
+    // frames, so at least two passes completed however slowly this host plays
+    // them (a fixed sleep let a loaded host stop the run inside pass 2). Frames
+    // lost to transport warm-up only delay the count; the budget is a cap on a
+    // hung player, not a pacing claim.
+    let got = collect(&sub, 2 * FRAMES + 1, Duration::from_secs(20));
     running.store(false, Ordering::Relaxed);
     let summary = player.join().expect("player").expect("play");
 
     assert!(
         summary.passes >= 2,
-        "need at least two passes to compare; got {}",
-        summary.passes
+        "need at least two passes to compare; got {} after {} frame(s) of {a}",
+        summary.passes,
+        got.len()
     );
     let per_pass = summary.elapsed.as_secs_f64() / summary.passes as f64;
     let recorded = recorded_span.as_secs_f64();
-    // THE pin: every pass must cost about one recorded span. Collapsing the
-    // per-channel deficits at the wrap makes pass 2+ cost about K times that.
     assert!(
         per_pass >= recorded * 0.9,
         "each --loop pass must cost about the recorded {recorded:.3}s, but {} pass(es) took \
@@ -1545,18 +1575,19 @@ fn a_multi_topic_loop_wrap_keeps_every_pass_the_same_length() {
         summary.passes,
         summary.elapsed.as_secs_f64()
     );
+    // THE pin: one restart per wrap the run reached. A wrap is counted when the
+    // next pass reaches its first frame, so a run stopped between a wrap and
+    // that frame counts one fewer. Re-anchoring each channel at the wrap counts
+    // one more per channel, on every wrap.
     assert!(
-        per_pass < recorded * 1.6,
-        "each --loop pass must cost about the recorded {recorded:.3}s, but {} pass(es) took \
-         {:.3}s = {per_pass:.3}s each — the wrap destroyed the pacing structure",
+        summary.timeline_restarts + 1 >= summary.passes
+            && summary.timeline_restarts <= summary.passes,
+        "{} pass(es) must count one restart per wrap ({} or {}), got {} — the wrap \
+         re-anchored each channel and destroyed the pacing structure",
         summary.passes,
-        summary.elapsed.as_secs_f64()
-    );
-    // And the run must not accumulate a phantom overrun across wraps.
-    assert_eq!(
-        summary.wall_overrun_ns(),
-        None,
-        "a looping healthy run must never accumulate an overrun"
+        summary.passes - 1,
+        summary.passes,
+        summary.timeline_restarts
     );
     // The fast-forward figure is a CHANNEL count, not an event count —
     // it must not grow with the number of passes. This bag has 3 channels, so
