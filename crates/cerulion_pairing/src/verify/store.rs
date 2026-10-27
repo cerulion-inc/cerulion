@@ -11,7 +11,9 @@
 //!
 //! The HMAC covers the header + body. On load the tag is verified first (in
 //! constant time); a mismatch is [`PairingError::TamperDetected`]. Writes are
-//! atomic (write a sibling `.tmp` then `rename`). The MAC key is supplied by the
+//! atomic and durable: the bytes go to a sibling `.tmp` that is fsynced, renamed
+//! over the store, and then the directory is fsynced, so after a power loss the
+//! store holds either the old bytes or the new ones. The MAC key is supplied by the
 //! caller (firmware secure storage) on every load/save — this crate holds no
 //! key-management policy.
 //!
@@ -156,14 +158,20 @@ impl TrustStore {
         })
     }
 
-    /// Atomically write the store to its backing path (write `.tmp`, then
-    /// `rename`), authenticated with `mac_key`.
+    /// Atomically and durably write the store to its backing path,
+    /// authenticated with `mac_key`: write a sibling `.tmp`, fsync it, rename it
+    /// over the store, then fsync the directory. A failure up to and including
+    /// the rename leaves the old store in place and is returned; a failed directory fsync
+    /// after the rename is logged, since the new store is already in place.
     pub fn save(&self, mac_key: &[u8]) -> Result<(), PairingError> {
+        self.save_with(mac_key, &mut StdSaveFs)
+    }
+
+    /// [`Self::save`] over an injected [`SaveFs`].
+    fn save_with(&self, mac_key: &[u8], fs: &mut impl SaveFs) -> Result<(), PairingError> {
         let path = self.path.as_ref().ok_or(PairingError::NoStorePath)?;
         let bytes = self.encode(mac_key)?;
-        let tmp = tmp_path(path);
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
+        replace_durably(fs, &tmp_path(path), path, &bytes)?;
         Ok(())
     }
 
@@ -1144,4 +1152,276 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+/// The file-system steps [`replace_durably`] runs, one method per step, so a
+/// test can record their order. [`StdSaveFs`] is the production implementation.
+trait SaveFs {
+    /// Create (or truncate) `path` for writing.
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File>;
+    /// Write all of `bytes` to `file`, which was created at `path`.
+    fn write(&mut self, file: &mut std::fs::File, path: &Path, bytes: &[u8])
+        -> std::io::Result<()>;
+    /// Flush `file` (created at `path`) and its metadata to stable storage.
+    fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()>;
+    /// Rename `from` over `to`.
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
+    /// Flush the directory `dir`, so a rename into it is on stable storage.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// [`SaveFs`] over `std::fs`.
+struct StdSaveFs;
+
+impl SaveFs for StdSaveFs {
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::create(path)
+    }
+    fn write(
+        &mut self,
+        file: &mut std::fs::File,
+        _path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        std::io::Write::write_all(file, bytes)
+    }
+    fn sync_file(&mut self, file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    /// Unix opens the directory and fsyncs it. Off Unix this is a no-op.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+}
+
+/// Replace `path` with `bytes` so that a power loss at any point leaves either
+/// the old file or all of the new one: write `tmp`, fsync it, rename it over
+/// `path`, then fsync the directory holding `path` (the current directory for a
+/// bare file name). Without the first fsync the rename can reach the disk
+/// before the data does; without the second the rename itself can be lost.
+///
+/// A failure up to and including the rename removes `tmp` and is returned, with
+/// `path` unchanged. The rename is the commit point: a failed directory fsync
+/// after it is logged at `warn` and the replace returns `Ok`, because the new
+/// file is in place and a power loss can only bring back the old one.
+fn replace_durably(
+    fs: &mut impl SaveFs,
+    tmp: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let staged = fs.create(tmp).and_then(|mut file| {
+        fs.write(&mut file, tmp, bytes)?;
+        fs.sync_file(&file, tmp)
+    });
+    if let Err(e) = staged.and_then(|()| fs.rename(tmp, path)) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    if let Err(e) = fs.sync_dir(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "the trust store's directory could not be flushed after the rename"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One recorded [`SaveFs`] step.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Create(PathBuf),
+        Write(PathBuf),
+        SyncFile(PathBuf),
+        Rename(PathBuf, PathBuf),
+        SyncDir(PathBuf),
+    }
+
+    /// Records each step, then performs it through [`StdSaveFs`].
+    #[derive(Default)]
+    struct Recorder(Vec<Step>);
+
+    impl SaveFs for Recorder {
+        fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+            self.0.push(Step::Create(path.to_path_buf()));
+            StdSaveFs.create(path)
+        }
+        fn write(
+            &mut self,
+            file: &mut std::fs::File,
+            path: &Path,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            self.0.push(Step::Write(path.to_path_buf()));
+            StdSaveFs.write(file, path, bytes)
+        }
+        fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.0.push(Step::SyncFile(path.to_path_buf()));
+            StdSaveFs.sync_file(file, path)
+        }
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.0
+                .push(Step::Rename(from.to_path_buf(), to.to_path_buf()));
+            StdSaveFs.rename(from, to)
+        }
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            self.0.push(Step::SyncDir(dir.to_path_buf()));
+            StdSaveFs.sync_dir(dir)
+        }
+    }
+
+    #[test]
+    fn a_durable_replace_syncs_the_file_before_the_rename_and_the_directory_after() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let tmp = tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let mut fs = Recorder::default();
+        replace_durably(&mut fs, &tmp, &path, b"new bytes").unwrap();
+        assert_eq!(
+            fs.0,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp.clone(), path.clone()),
+                Step::SyncDir(tmp_dir.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_bare_file_name_syncs_the_current_directory() {
+        /// Records only, so the test touches nothing on disk.
+        #[derive(Default)]
+        struct DirOnly(Vec<PathBuf>);
+        impl SaveFs for DirOnly {
+            fn create(&mut self, _: &Path) -> std::io::Result<std::fs::File> {
+                tempfile::tempfile()
+            }
+            fn write(&mut self, _: &mut std::fs::File, _: &Path, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_file(&mut self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn rename(&mut self, _: &Path, _: &Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+                self.0.push(dir.to_path_buf());
+                Ok(())
+            }
+        }
+        let mut fs = DirOnly::default();
+        replace_durably(&mut fs, Path::new("s.tmp"), Path::new("s"), b"x").unwrap();
+        assert_eq!(fs.0, vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn a_failed_directory_sync_after_the_rename_still_saves() {
+        /// Delegates to [`StdSaveFs`] but refuses the directory sync.
+        struct DirSyncFails;
+        impl SaveFs for DirSyncFails {
+            fn create(&mut self, p: &Path) -> std::io::Result<std::fs::File> {
+                StdSaveFs.create(p)
+            }
+            fn write(&mut self, f: &mut std::fs::File, p: &Path, b: &[u8]) -> std::io::Result<()> {
+                StdSaveFs.write(f, p, b)
+            }
+            fn sync_file(&mut self, f: &std::fs::File, p: &Path) -> std::io::Result<()> {
+                StdSaveFs.sync_file(f, p)
+            }
+            fn rename(&mut self, a: &Path, b: &Path) -> std::io::Result<()> {
+                StdSaveFs.rename(a, b)
+            }
+            fn sync_dir(&mut self, _: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected"))
+            }
+        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        replace_durably(&mut DirSyncFails, &tmp_path(&path), &path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_failed_file_sync_keeps_the_old_store_and_removes_the_tmp() {
+        /// Delegates to [`StdSaveFs`] but refuses the file sync.
+        struct FileSyncFails;
+        impl SaveFs for FileSyncFails {
+            fn create(&mut self, p: &Path) -> std::io::Result<std::fs::File> {
+                StdSaveFs.create(p)
+            }
+            fn write(&mut self, f: &mut std::fs::File, p: &Path, b: &[u8]) -> std::io::Result<()> {
+                StdSaveFs.write(f, p, b)
+            }
+            fn sync_file(&mut self, _: &std::fs::File, _: &Path) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected"))
+            }
+            fn rename(&mut self, a: &Path, b: &Path) -> std::io::Result<()> {
+                StdSaveFs.rename(a, b)
+            }
+            fn sync_dir(&mut self, d: &Path) -> std::io::Result<()> {
+                StdSaveFs.sync_dir(d)
+            }
+        }
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let tmp = tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let err = replace_durably(&mut FileSyncFails, &tmp, &path, b"new").unwrap_err();
+        assert_eq!(err.to_string(), "injected");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!tmp.exists(), "the tmp is removed");
+    }
+
+    #[test]
+    fn save_runs_the_durable_replace_on_the_store_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("trust.store");
+        let roots = RootSet::new(vec![PublicKey([1; 32]), PublicKey([2; 32])], 2).unwrap();
+        let store = TrustStore::provision(RobotId([0xB0; 32]), PublicKey([3; 32]), roots, b"c", 0)
+            .unwrap()
+            .with_path(&path);
+        let mut fs = Recorder::default();
+        store
+            .save_with(b"0123456789abcdef0123456789abcdef", &mut fs)
+            .unwrap();
+        let tmp = tmp_path(&path);
+        assert_eq!(
+            fs.0,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp, path.clone()),
+                Step::SyncDir(tmp_dir.path().to_path_buf()),
+            ]
+        );
+        TrustStore::load(&path, b"0123456789abcdef0123456789abcdef")
+            .expect("the saved store loads");
+    }
 }
