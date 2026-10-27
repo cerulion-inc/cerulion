@@ -382,12 +382,13 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 
 ### `cerulion doctor`
 
-`cerulion doctor [--json] [--local] [--check ID]... [--timeout-ms MS]` checks this host for problems that slow or stop Cerulion. Each check reads one fact about the machine and reports `pass`, `info` (a fact with no judgement), `warn` (Cerulion works, slower or less reliably in the way the line says), `fail` (a Cerulion feature does not work here as the machine is) or `skip` (the check does not apply on this platform, or was not run on request). Every `warn` and `fail` prints why it matters and the exact command or edit that fixes it. No check needs root, and none writes a file or changes a sysctl or a network setting; `limits.open-files` raises the verb's own soft open-file limit the way `graph run` does, so it reads the limit a graph gets. The verb runs on a machine that has never signed in: the login gate does not run before it. Like every command it sends one usage event when telemetry is on; no finding is in it.
+`cerulion doctor [--json] [--local] [--check ID]... [--udp-target HOST:PORT]... [--timeout-ms MS]` checks this host for problems that slow or stop Cerulion. Each check reads one fact about the machine and reports `pass`, `info` (a fact with no judgement), `warn` (Cerulion works, slower or less reliably in the way the line says), `fail` (a Cerulion feature does not work here as the machine is) or `skip` (the check does not apply on this platform, or was not run on request). Every `warn` and `fail` prints why it matters and the exact command or edit that fixes it. No check needs root, and none writes a file or changes a sysctl or a network setting; `limits.open-files` raises the verb's own soft open-file limit the way `graph run` does, so it reads the limit a graph gets. The verb runs on a machine that has never signed in: the login gate does not run before it. Like every command it sends one usage event when telemetry is on; no finding is in it.
 
 | Flag | Effect |
 |---|---|
 | `--json` | Print the report as one JSON object on stdout instead of the table. |
-| `--local` | Skip the checks that use the network; no check in this release does. `CERULION_NETWORK=off` does the same. |
+| `--local` | Skip the checks that use the network, `net.mdns` and `net.udp`. `CERULION_NETWORK=off` does the same. |
+| `--udp-target HOST:PORT` | A QUIC endpoint for `net.udp` to probe, beside the `quic/` and `udp/...?rel=1` connect locators of the workspace's graphs; repeatable. A value without a port from 1 to 65535, or an IPv6 address without brackets (`[ADDR]:PORT`), is a usage error. Ignored when `net.udp` does not run. |
 | `--check ID` | Run only this check; repeatable. An unknown id is a usage error (exit 2). |
 | `--timeout-ms MS` | How long to wait for the checks, which run at the same time. A check that has not answered by then is reported as `warn` and nothing it would have read is shown. Default 4000: twice the bounded scan the stale-node check makes. |
 
@@ -412,6 +413,8 @@ The JSON object carries `report_version` (1; it changes only when a field is rem
 | `account.certificates` | `device.cert` in the Cerulion config directory: its validity window and whether it attests this machine's device key (no network, no signature or chain check) | Fails when it is expired, unusable, or issued for another device key, or when this machine's device key cannot be read or `device.key` and `desk.key` disagree; warns when it is not valid yet; `skip` when there is none |
 | `daemon.netd` | The `cerulion-netd` control socket, with one `status` request that registers nothing; no daemon is started, and the connection restarts a desk daemon's idle grace | Warns when the socket cannot be reached or the daemon does not answer its status; `info` when it is not running |
 | `daemon.remoted` | `cerulion-remoted` beside `cerulion`, and on Linux whether one runs | Never: `info` only |
+| `net.mdns` (network) | An mDNS browse of `_cerulion._tcp` for one second, the browse `topic list` makes | Warns when the browse cannot start or its responder stops mid-window; `info` with the machines that answered otherwise. A network that drops multicast, or a host whose mDNS socket could not bind, also shows no machine |
+| `net.udp` (network) | One 1200-byte QUIC datagram with a reserved version to each `quic/` and `udp/...?rel=1` connect locator of the workspace's graphs and each `--udp-target`, at the same time; a QUIC endpoint answers it with Version Negotiation, with no handshake and no certificate | Warns for an endpoint that does not answer within one second per address (one address per IP family), refuses (nothing listens), cannot be sent to, cannot be resolved, or is unfinished within the check's fixed three seconds; `skip` when no endpoint is named, so it never probes a host you did not name |
 
 ### Other
 
