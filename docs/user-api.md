@@ -2096,8 +2096,8 @@ allow-list with verbatim locators) rather than enabling it. Turn networking
 off for a run with `--network off` (or `CERULION_NETWORK=off`). See
 `docs/networking.md` for the full gateway model + a two-machine quickstart.
 On Android, LAN access defaults to `paired`; topic announcements are withheld
-until the posture is opened. When netd serves a graph, it reports its own posture so
-the startup breadcrumb describes the serving process.
+unless the run starts with open access. When netd serves a graph, it reports
+its own posture so the startup breadcrumb describes the serving process.
 
 ```yaml
 network:
