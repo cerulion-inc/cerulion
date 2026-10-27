@@ -206,6 +206,10 @@ members = [
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
     "crates/test_fixtures/heaphook_shim",
+    # The Android emulator e2e's direct data demand probe: an ingress-only
+    # gateway that demands one topic without reading a catalog first, so the
+    # e2e can show a paired app refuses a LAN data demand and sends no frame.
+    "crates/test_fixtures/android_e2e_demand_probe",
     # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
     #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
