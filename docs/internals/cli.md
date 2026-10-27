@@ -1317,6 +1317,13 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
   transport exists.
 - The loop builds the runtime only after the first `/clock` sample and steps once
   per accepted sample, through a data-only `/clock` tap (no listener).
+- The loop is two halves. `ClockFeeder` is the sole reader and judge of the tap:
+  it emits one `ClockEvent::Epoch`, then one numbered `ClockEvent::Step` per
+  accepted sample (zero for an equal one, nothing for a refused one).
+  `ClockApplier` moves the graph from those events alone and judges nothing.
+  `the_feeder_events_replayed_through_a_bare_applier_match_the_run` pins the
+  seam: the feeder's events for the scripted schedule are a hand-written list,
+  and a bare applier fed that list fires at the same stamps as the loop.
 - A period fires at most once per sample: a jump fires the latest passed deadline,
   never a catch-up burst.
 - A frame is decoded only after its wire framing is checked.

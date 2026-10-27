@@ -1623,6 +1623,84 @@ mod tests {
         assert_eq!(a.0, EXPECTED_FIRE_TIMES_NS);
     }
 
+    /// The events a feeder makes of `SCHEDULE` with no graph attached: the
+    /// epoch, then one numbered step per accepted sample. Hand-written from
+    /// the schedule table: the equal sample is a zero step and the refused
+    /// (backward) sample leaves no event and uses no step number.
+    const SCHEDULE_EVENTS: [ClockEvent; 6] = [
+        ClockEvent::Epoch { ns: 1_000_000_000 },
+        ClockEvent::Step {
+            seq: 1,
+            delta_ns: 5_000_000,
+        },
+        ClockEvent::Step {
+            seq: 2,
+            delta_ns: 5_000_000,
+        },
+        ClockEvent::Step {
+            seq: 3,
+            delta_ns: 0,
+        },
+        ClockEvent::Step {
+            seq: 4,
+            delta_ns: 15_000_000,
+        },
+        ClockEvent::Step {
+            seq: 5,
+            delta_ns: 5_000_000,
+        },
+    ];
+
+    /// Collect the feeder's events for `SCHEDULE`, with nothing applying them.
+    fn feed_schedule() -> Vec<ClockEvent> {
+        let reads = SCHEDULE.iter().map(|&ns| ClockRead::Sample(ns)).collect();
+        let mut feeder = ClockFeeder::new("sim", ListedReads(reads), NO_CLOCK_GRACE);
+        (0..SCHEDULE.len())
+            .filter_map(|_| match feeder.poll().expect("poll") {
+                FeederPoll::Event(event) => Some(event),
+                FeederPoll::Skipped | FeederPoll::Idle => None,
+            })
+            .collect()
+    }
+
+    /// Apply `events` to a fresh applier that has no feeder; returns the same
+    /// triple as [`run_schedule`] (fire times from the trace, fire count,
+    /// final graph clock).
+    fn apply_events(events: &[ClockEvent]) -> (Vec<u64>, u64, u64) {
+        let clock = Arc::new(VirtualClock::new());
+        let fires = Arc::new(AtomicU64::new(0));
+        let build_clock = Arc::clone(&clock);
+        let build_fires = Arc::clone(&fires);
+        let mut applier = ClockApplier::new("sim", &clock, move || {
+            build_period_runtime(build_clock, 10, build_fires)
+        });
+        for &event in events {
+            applier.apply(event).expect("the event applies");
+        }
+        let mut runtime = applier.into_runtime().expect("the epoch built the runtime");
+        let fire_times: Vec<u64> = runtime.trace().iter().map(|e| e.fire_time_ns).collect();
+        use cerulion_core::Clock as _;
+        let final_ns = clock.now_ns();
+        runtime.shutdown();
+        (fire_times, fires.load(Ordering::Relaxed), final_ns)
+    }
+
+    /// The feeder/applier seam: the feeder alone turns the schedule into the
+    /// hand-written event list, and a bare applier fed that list (no source,
+    /// no feeder, no loop) fires at the oracle stamps and lands where
+    /// [`run_schedule`] lands. A graph that follows a recorded or relayed
+    /// event stream therefore steps exactly as one reading `/clock` itself.
+    #[test]
+    fn the_feeder_events_replayed_through_a_bare_applier_match_the_run() {
+        let events = feed_schedule();
+        assert_eq!(events, SCHEDULE_EVENTS);
+        let applied = apply_events(&events);
+        assert_eq!(applied.0, EXPECTED_FIRE_TIMES_NS);
+        assert_eq!(applied.1, 3, "three deadlines fall inside the schedule");
+        assert_eq!(applied.2, 1_030_000_000, "the last accepted sample");
+        assert_eq!(applied, run_schedule());
+    }
+
     /// A jump across several periods fires the node ONCE, at the latest
     /// deadline the jump passed, and the next deadline is one period on.
     ///
