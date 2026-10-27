@@ -260,7 +260,7 @@ fn udp_locator_addr(locator: &str) -> Result<SocketAddr, String> {
 
 /// Slack the collector of [`probe_quic_locators`] allows past the bound for
 /// the probe threads to report.
-const COLLECT_SLACK: Duration = Duration::from_millis(200);
+pub const COLLECT_SLACK: Duration = Duration::from_millis(200);
 
 /// Probe every `udp/` locator in parallel, each bounded by `timeout`, and
 /// return within `timeout` plus [`COLLECT_SLACK`] whatever the resolver or the
