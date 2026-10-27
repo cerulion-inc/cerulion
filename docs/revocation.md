@@ -74,7 +74,7 @@ belongs at the mint).
 **The robot fetches; desks also push.** Only the robot's own fetch stops a stolen
 or otherwise hostile desk: such a desk will not deliver its own revocation, so a
 revocation that travelled only through desks would never reach the robot while that
-desk keeps connecting. The desk path speeds delivery through honest desks and covers
+desk keeps connecting. The desk path speeds delivery through every other desk and covers
 robots that are not registered to an account.
 
 **The robot's own fetch** (registered robots, account-first). `cerulion-netd`'s
