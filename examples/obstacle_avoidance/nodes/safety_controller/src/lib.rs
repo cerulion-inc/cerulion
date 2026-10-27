@@ -34,7 +34,7 @@ use native_ros2_messages::sensor_msgs::LaserScan;
 // replaying. See "Scope of the data guarantee" in `docs/multi_process.md`.
 #[cerulion_node]
 #[derive(Default)]
-struct SafetyControllerNode {
+pub struct SafetyControllerNode {
     // `trigger` fires this node once per published scan. `depth = 1` keeps a
     // single-slot queue: if the controller ever falls behind its sensor, the
     // default `drop_oldest` policy evicts the stale scan, so a tick always
