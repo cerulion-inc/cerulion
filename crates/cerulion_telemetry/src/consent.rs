@@ -95,11 +95,22 @@ pub fn resolve(
     }
 }
 
+/// The id an event is sent under: [`anon_id`], or under CI
+/// ([`crate::ci::detected`]) a random id minted once per process and never
+/// written to the consent file, so no later login on the machine can carry
+/// or join a CI run's events.
+pub fn event_anon_id() -> Result<Option<String>, crate::Error> {
+    if crate::ci::detected() {
+        return ci_anon_id();
+    }
+    anon_id()
+}
+
 #[cfg(feature = "posthog")]
 pub use enabled::{
-    anon_id, claim_notice, clear_notice_shown, file_path, mark_notice_shown, notice_shown,
-    rotate_anon_id, set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
-    TelemetryFile,
+    anon_id, ci_anon_id, claim_notice, clear_notice_shown, file_path, mark_notice_shown,
+    notice_shown, rotate_anon_id, set_enabled, show_notice_once, status, try_show_notice_once,
+    while_enabled, TelemetryFile,
 };
 
 #[cfg(feature = "posthog")]
@@ -173,6 +184,15 @@ mod enabled {
         let path = file_path()?;
         let _lock = Lock::acquire(&path)?;
         Ok(Some(load_or_create(&path)?.anon_id))
+    }
+
+    /// A random `anon:` id for this process only, never written to disk.
+    pub fn ci_anon_id() -> Result<Option<String>, Error> {
+        static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        Ok(Some(
+            ID.get_or_init(|| format!("anon:{}", uuid::Uuid::new_v4()))
+                .clone(),
+        ))
     }
 
     /// Replace the anonymous id with a fresh one and return it. Used when a
@@ -463,8 +483,8 @@ mod enabled {
 
 #[cfg(not(feature = "posthog"))]
 pub use disabled::{
-    anon_id, claim_notice, clear_notice_shown, mark_notice_shown, notice_shown, rotate_anon_id,
-    set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
+    anon_id, ci_anon_id, claim_notice, clear_notice_shown, mark_notice_shown, notice_shown,
+    rotate_anon_id, set_enabled, show_notice_once, status, try_show_notice_once, while_enabled,
 };
 
 #[cfg(not(feature = "posthog"))]
@@ -482,6 +502,11 @@ mod disabled {
 
     /// Feature off: there is no id and no file is created.
     pub fn anon_id() -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    /// Feature off: no id.
+    pub fn ci_anon_id() -> Result<Option<String>, Error> {
         Ok(None)
     }
 

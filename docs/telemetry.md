@@ -71,8 +71,8 @@ like a URL, an email address or a path, or is longer than 128 characters, is
 dropped instead of sent.
 
 The id is your Cerulion account id once this machine has signed in, and a
-random `anon:<uuid>` before that; a CI run always uses the random id. The
-random id lives in the consent file.
+random `anon:<uuid>` before that. The random id lives in the consent file.
+A CI run uses neither: it sends under its own random id (see below).
 
 When a machine that has never signed in runs its first login, the login
 request carries the random id so the events from before the login are joined
@@ -127,9 +127,11 @@ A run is under CI when one of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`,
 `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, `CODEBUILD_BUILD_ID`, `DRONE` or
 `APPVEYOR` is set and not empty; `CI` set to `false`, `0`, `no` or `off`
 does not count. A CI run prints no notice, on a terminal or not, and still
-sends. Its events carry `ci: true`, go out under the random id with no
-person profile, and are never joined to an account, so CI traffic can be
-filtered out of user counts. It leaves the notice to the first run on a
+sends. Its events carry `ci: true` and no person profile, and go out under a
+random `anon:<uuid>` minted for that one process and never written to the
+consent file, so no later login on the machine can carry it and a CI run's
+events are never joined to an account. CI traffic can be filtered out of
+user counts by `ci`. It leaves the notice to the first run on a
 terminal outside CI. The settings below turn telemetry off in CI as anywhere else.
 
 ## Turning it off

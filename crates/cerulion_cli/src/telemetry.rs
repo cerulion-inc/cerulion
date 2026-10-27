@@ -77,8 +77,8 @@ fn ci_run() -> bool {
 /// not been merged with yet. Holds no data; its presence is the flag. The
 /// merge joins to the account the events sent under the same consent file's
 /// id before the login: by CLI runs without a terminal, and by another
-/// surface on the machine such as the vizd daemon. CI events under the id
-/// carry no person profile and are never joined.
+/// surface on the machine such as the vizd daemon. CI runs send under their
+/// own per-process id ([`consent::event_anon_id`]), so this never joins them.
 #[cfg(feature = "telemetry")]
 const PENDING_ALIAS_FILE: &str = "telemetry_alias_pending";
 /// Beside `telemetry.json`: the account the anonymous id was last used for.
@@ -276,7 +276,7 @@ pub fn emit(spec: EventSpec, props: Props) {
             consent::while_enabled(|| client.capture(spec, &sub, props));
         }
         None => {
-            if let Ok(Some(anon_id)) = consent::anon_id() {
+            if let Ok(Some(anon_id)) = consent::event_anon_id() {
                 consent::while_enabled(|| client.capture_anonymous(spec, &anon_id, props));
             }
         }

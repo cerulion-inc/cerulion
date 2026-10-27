@@ -451,6 +451,11 @@ fn a_ci_login_carries_no_id_joins_nothing_and_sends_under_the_random_id() {
     let login = the_one(&events, "cli_login_completed");
     let id = login["distinct_id"].as_str().unwrap_or_default();
     assert!(id.starts_with("anon:"), "{events:?}");
+    assert_ne!(
+        id,
+        anon_id_in(home.path()),
+        "a CI run never sends under the stored id a later login could carry"
+    );
     assert_eq!(login["properties"]["ci"], true, "{events:?}");
     assert_eq!(
         login["properties"]["$process_person_profile"], false,

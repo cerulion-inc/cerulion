@@ -153,7 +153,7 @@ impl Telemetry {
     /// Send `vizd_started` and start the heartbeat.
     pub fn start() -> Option<Telemetry> {
         let client = client_after_notice()?;
-        let anon_id = consent::anon_id().ok().flatten()?;
+        let anon_id = consent::event_anon_id().ok().flatten()?;
         Telemetry::begin(client, &anon_id, HEARTBEAT_INTERVAL, None)
     }
 
@@ -161,7 +161,7 @@ impl Telemetry {
     /// the anonymous id and consent still come from the environment (tests).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn start_with(client: Client, interval: Duration) -> Option<Telemetry> {
-        let anon_id = consent::anon_id().ok().flatten()?;
+        let anon_id = consent::event_anon_id().ok().flatten()?;
         Telemetry::begin(client, &anon_id, interval, None)
     }
 
@@ -199,7 +199,7 @@ impl Telemetry {
             if !consent::status().enabled {
                 return;
             }
-            let Some(anon_id) = consent::anon_id().ok().flatten() else {
+            let Some(anon_id) = consent::event_anon_id().ok().flatten() else {
                 return;
             };
             // Queued under the consent lock: an opt-out that has returned is
@@ -331,7 +331,8 @@ impl Starting {
                 // The client and the anonymous id come first: a consent file
                 // held locked by another process blocks here, before anything
                 // is queued and outside the abandon lock.
-                let prepared = client().and_then(|c| Some((c, consent::anon_id().ok().flatten()?)));
+                let prepared =
+                    client().and_then(|c| Some((c, consent::event_anon_id().ok().flatten()?)));
                 if *lock(&flag) {
                     return;
                 }
