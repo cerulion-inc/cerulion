@@ -216,11 +216,13 @@ pub enum SimTimeArgument {
 /// entry gets `-p use_sim_time:=true` in a `--ros-args` block (its own, or a
 /// new one at the end); a `ros2 launch` entry gets the `use_sim_time:=true`
 /// launch argument, which the launch file must declare and pass to its nodes.
-/// A `use_sim_time` the entry already sets (in `params:`, or as an `args:`
-/// word `use_sim_time:=...`) is the entry's own choice and is kept. A
-/// `params_file:` may set it too, and the run cannot read the file: so the
-/// parameter is placed BEFORE `--params-file`, where a later rule wins in
-/// rcl, and a value in the file wins over the run's.
+/// A `use_sim_time` the entry already sets ([`ros2_entry_sets_use_sim_time`]:
+/// in `params:`, as a `-p` parameter inside a `--ros-args` block of a `ros2
+/// run` entry's `args:`, or as a launch argument of a `ros2 launch` entry) is
+/// the entry's own choice and is kept. A `params_file:` may set it too, and
+/// the run cannot read the file: so the parameter is placed BEFORE
+/// `--params-file`, where a later rule wins in rcl, and a value in the file
+/// wins over the run's.
 pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) -> SimTimeArgument {
     if ros2_entry_sets_use_sim_time(def) {
         return SimTimeArgument::KeptEntryValue;
@@ -247,14 +249,55 @@ pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) -> 
     SimTimeArgument::Parameter
 }
 
-/// Whether a `ros2:` entry sets `use_sim_time` itself: in `params:`, or as
-/// an `args:` word `use_sim_time:=...`. Such a value is the entry's own
-/// choice, and a sim-time run keeps it. A value inside a `params_file:` is
-/// not read here; [`put_ros2_entry_on_sim_time`] lets it win by argv order.
+/// Whether a `ros2:` entry sets `use_sim_time` itself. Such a value is the
+/// entry's own choice, and a sim-time run keeps it. It is set in `params:`;
+/// for a `ros2 launch` entry as an `args:` word `use_sim_time:=...`, which is
+/// a launch argument; for a `ros2 run` entry only as a parameter inside a
+/// `--ros-args` block of its `args:` (`-p use_sim_time:=...` or `--param`,
+/// up to a `--` that ends the block). A bare `use_sim_time:=...` word in a
+/// `ros2 run` entry's `args:` is the executable's own argument and sets no
+/// parameter, so it does not count. A value inside a `params_file:` is not
+/// read here; [`put_ros2_entry_on_sim_time`] lets it win by argv order.
 pub fn ros2_entry_sets_use_sim_time(def: &Ros2NodeDef) -> bool {
     let assignment = format!("{ROS2_USE_SIM_TIME}:=");
-    def.params.contains_key(ROS2_USE_SIM_TIME)
-        || def.args.iter().any(|arg| arg.starts_with(&assignment))
+    let sets = |word: &String| word.starts_with(&assignment);
+    if def.params.contains_key(ROS2_USE_SIM_TIME) {
+        return true;
+    }
+    if def.launch.is_some() {
+        return def.args.iter().any(sets);
+    }
+    ros_args_parameter_words(&def.args).any(sets)
+}
+
+/// The parameter assignments (`-p NAME:=VALUE` / `--param NAME:=VALUE`) a
+/// `ros2 run` args list carries inside its `--ros-args` blocks, each of
+/// which runs to the next `--`. Every other word is the executable's own, a
+/// remap rule, or a flag.
+fn ros_args_parameter_words(args: &[String]) -> impl Iterator<Item = &String> {
+    let mut in_block = false;
+    let mut after_param_flag = false;
+    args.iter().filter(move |word| match word.as_str() {
+        "--ros-args" => {
+            in_block = true;
+            after_param_flag = false;
+            false
+        }
+        "--" if in_block => {
+            in_block = false;
+            after_param_flag = false;
+            false
+        }
+        "-p" | "--param" if in_block => {
+            after_param_flag = true;
+            false
+        }
+        _ => {
+            let parameter = in_block && after_param_flag;
+            after_param_flag = false;
+            parameter
+        }
+    })
 }
 
 /// The notice a sim-time run logs when it spawns a `ros2 launch` entry with
@@ -1331,6 +1374,94 @@ mod tests {
         assert_eq!(
             sim_argv(&launch),
             ["launch", "bringup.launch.py", "use_sim_time:=false"]
+        );
+    }
+
+    /// A `ros2 run` entry's `args:` are the executable's own words: a bare
+    /// `use_sim_time:=...` there sets no parameter, so the run still adds
+    /// its own. The entry sets the parameter itself only inside a
+    /// `--ros-args` block, as `-p` or `--param`, and `--` ends that block.
+    #[test]
+    fn a_run_entry_sets_use_sim_time_only_inside_a_ros_args_block() {
+        let run = |args: &[&str]| Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            ..Default::default()
+        };
+        // A bare word is the executable's own argument, not a parameter.
+        assert_eq!(
+            sim_argv(&run(&["use_sim_time:=true"])),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "use_sim_time:=true",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true"
+            ]
+        );
+        // Inside a `--ros-args` block it is the entry's own choice, kept.
+        assert_eq!(
+            sim_argv(&run(&["--ros-args", "-p", "use_sim_time:=false"])),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=false"
+            ]
+        );
+        assert_eq!(
+            sim_argv(&run(&["--ros-args", "--param", "use_sim_time:=false"])),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "--param",
+                "use_sim_time:=false"
+            ]
+        );
+        // `--` ends the block: the word after it is the executable's again.
+        assert_eq!(
+            sim_argv(&run(&[
+                "--ros-args",
+                "-p",
+                "rate:=5",
+                "--",
+                "use_sim_time:=true"
+            ])),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-p",
+                "rate:=5",
+                "--",
+                "use_sim_time:=true",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true"
+            ]
+        );
+        // A remap rule spelling the name is not the parameter.
+        assert_eq!(
+            sim_argv(&run(&["--ros-args", "-r", "use_sim_time:=clock"])),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-r",
+                "use_sim_time:=clock",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true"
+            ]
         );
     }
 

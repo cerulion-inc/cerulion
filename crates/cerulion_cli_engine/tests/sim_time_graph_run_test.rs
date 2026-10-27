@@ -611,10 +611,12 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
     }
 
     // Each poll drains within the tap's borrow budget and keeps only the
-    // stamps, so no pinned sample outlives the poll that read it.
+    // stamps and wire sequence numbers, so no pinned sample outlives the
+    // poll that read it.
     let budget = tap.max_borrowed_samples().max(1);
     let mut frames = Vec::with_capacity(budget);
     let mut stamps = Vec::new();
+    let mut sequences = Vec::new();
     wait_until(
         Duration::from_secs(60),
         "five frames from the ticker",
@@ -624,9 +626,20 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
             for frame in &frames {
                 let header = frame.wire_header().expect("a published frame has a header");
                 stamps.push(header.timestamp_ns);
+                sequences.push(header.sequence);
             }
             stamps.len() >= FORWARD_SAMPLES_NS.len()
         },
+    );
+    // The tap keeps no history, so a frame published between the build and
+    // its attach would be invisible to the stamps below. The wire sequence
+    // says whether one existed: the first frame the tap read is the topic's
+    // first publish, so no fire preceded it, at the epoch or at any time.
+    assert_eq!(
+        sequences.first(),
+        Some(&0),
+        "the first frame the tap read is the topic's first publish: nothing fired before the \
+         tap attached, so no epoch fire hides ahead of the stamps ({sequences:?})"
     );
     assert_eq!(
         stamps, FORWARD_SAMPLES_NS,

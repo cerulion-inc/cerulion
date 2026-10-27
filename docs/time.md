@@ -128,10 +128,14 @@ entry gets `--ros-args -p use_sim_time:=true`; a `ros2 launch` entry gets the
 launch argument `use_sim_time:=true`, which the launch file must declare and
 pass to its nodes. The run says so when it spawns such an entry, and its
 spawn line shows the command as spawned, argument included. An entry that
-sets `use_sim_time` itself (under `params:`, or as an `args:` word
-`use_sim_time:=...`) keeps its own value. A `use_sim_time` inside the
-entry's `params_file:` wins too: the run places its `-p use_sim_time:=true`
-before `--params-file`, and ROS 2 applies the later value.
+sets `use_sim_time` itself keeps its own value: under `params:`, as a
+`-p use_sim_time:=...` parameter inside a `--ros-args` block of a `ros2 run`
+entry's `args:`, or as the launch argument `use_sim_time:=...` of a
+`ros2 launch` entry. A bare `use_sim_time:=...` word in a `ros2 run` entry's
+`args:` is the executable's own argument, not a parameter, so the run still
+adds its own. A `use_sim_time` inside the entry's `params_file:` wins too:
+the run places its `-p use_sim_time:=true` before `--params-file`, and ROS 2
+applies the later value.
 
 ### A clock publisher
 
