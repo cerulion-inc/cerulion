@@ -88,7 +88,7 @@ The release installer places `cerulion-connectd` (the desk side of a remote conn
 
 </details>
 
-Release binaries support Linux x86_64 and ARM64 (glibc 2.35+) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries.
+Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries.
 
 Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and the **same compiler that built your `cerulion` binary**: a node is a shared library loaded into the CLI's own process, so the loader refuses a node built by a different rustc and names both compilers. The install script installs that compiler (Rust 1.93.0 for the 1.0.0 binaries), and `cerulion-install-rust` does on the other routes. A workspace created with `cerulion workspace create` or `cerulion workspace init` records it in its `rust-toolchain.toml` when that compiler is installed. Elsewhere, when your rustup default is a different compiler, name it: `RUSTUP_TOOLCHAIN=1.93.0 cerulion node build <node>`. The [installation details](docs/install.md) cover `CERULION_NO_MODIFY_PATH`, machines without rustup, `CARGO_HOME` and `RUSTUP_HOME`, hand-unpacked archives, workspaces without a `rust-toolchain.toml`, and a CLI built with `cargo install`.
 

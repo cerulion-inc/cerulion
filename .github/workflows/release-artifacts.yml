@@ -134,8 +134,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runs_on: ubuntu-22.04
+          # Native arm64, like the rmw job: the Linux legs build inside an
+          # ubuntu:20.04 container of the runner's own architecture.
           - target: aarch64-unknown-linux-gnu
-            runs_on: ubuntu-22.04
+            runs_on: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
@@ -173,18 +175,13 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
-      # The hosted image ships a packages.microsoft.com apt source; apt-get
-      # update exits 100 when that source refuses or fails its signature check,
-      # even though the package comes from the Ubuntu archives. Deleting its
-      # list first keeps that source out of the update; rm -f exits 0 when the
-      # file is absent.
-      - name: Install aarch64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
+      # The Linux legs build inside ubuntu:20.04 so the programs and the heap
+      # hook link against glibc 2.31 and run on Ubuntu 20.04 and later. Only
+      # this step runs in the container (a `docker run` rather than a job
+      # `container:`), so every other step of the matrix, the macOS legs
+      # included, runs on the runner as before. The container is native to
+      # the runner's architecture. The script installs the pinned toolchain
+      # and writes target/<TARGET>/release/ where the steps below read it.
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
@@ -193,22 +190,22 @@ jobs:
           # secret is unset the artifacts carry no key and send nothing.
           CERULION_POSTHOG_KEY: ${{ secrets.CERULION_POSTHOG_KEY }}
         run: |
-          if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-          fi
-          cargo build --release --locked \
-            -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
-            --target "$TARGET"
           case "$TARGET" in
             *-unknown-linux-gnu)
-              # The heap hook, an LD_PRELOAD malloc interposer the CLI
-              # auto-injects into every ros2 child when it sits beside the
-              # binaries. Linux/GNU only; libc and tracing, no build script,
-              # no ROS headers, so it builds here natively (the aarch64 leg
-              # cross-compiles it with the linker above) and needs no
-              # container, unlike the rmw.
-              cargo build --release --locked -p cerulion_heaphook --target "$TARGET"
+              docker run --rm \
+                -e TARGET \
+                -e CERULION_POSTHOG_KEY \
+                -e CARGO_TERM_COLOR \
+                -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
+                -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
+                -v "$GITHUB_WORKSPACE":/work \
+                ubuntu:20.04 \
+                bash /work/tools/scripts/build_release_linux_container.sh
+              ;;
+            *)
+              cargo build --release --locked \
+                -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
+                --target "$TARGET"
               ;;
           esac
 
@@ -250,19 +247,24 @@ jobs:
       # `librmw_cerulion.so` in its own directory and stages a minimal ament
       # prefix that links it, the same sibling rule `cerulion connect` uses
       # for `cerulion-connectd`.
-      # Every Linux archive must run on glibc 2.35 (Ubuntu 22.04, the Jetson
-      # generation of robots). The runners above are 22.04, and this check keeps
-      # it that way: a binary that needs a newer symbol version fails the build.
+      # Every Linux program and the heap hook must run on glibc 2.31 (Ubuntu
+      # 20.04, the ROS 2 Foxy platform). The build step above links them in an
+      # ubuntu:20.04 container, and this check keeps it that way: an object
+      # that needs a newer symbol version fails the build. The rmw library is
+      # not checked here: it is built inside its distro's own image and needs
+      # that distro's glibc (Jazzy's is Ubuntu 24.04), which is where it runs.
       - name: Verify Linux glibc compatibility
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          python3 tools/scripts/check_release_glibc.py \
+          python3 -B tools/scripts/test_check_release_glibc.py
+          python3 -B tools/scripts/check_release_glibc.py \
             "target/$TARGET/release/cerulion" \
             "target/$TARGET/release/cerulion-netd" \
             "target/$TARGET/release/cerulion-connectd" \
-            "target/$TARGET/release/cerulion-remoted"
+            "target/$TARGET/release/cerulion-remoted" \
+            "target/$TARGET/release/libcerulion_heaphook.so"
 
       - name: Package archive
         env:

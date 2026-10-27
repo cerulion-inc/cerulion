@@ -23,8 +23,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 # The interposition + FFI export layer is Linux + GNU (glibc/libstdc++) ONLY:
-# the platform boundary is dynamically linked glibc >= 2.34 + libstdc++ with the
-# default std::allocator.
+# the platform boundary is dynamically linked glibc >= 2.31 (the release floor)
+# + libstdc++ with the default std::allocator.
 # It is compiled only under `cfg(all(target_os = "linux", target_env = "gnu"))`;
 # elsewhere (this macOS desk included) the crate is the pure-logic core alone,
 # which builds and unit-tests everywhere. See the gating note in src/lib.rs.

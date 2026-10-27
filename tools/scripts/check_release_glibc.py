@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Reject GNU/Linux release binaries requiring a newer glibc than Ubuntu 22.04."""
+"""Reject GNU/Linux release binaries requiring a newer glibc than Ubuntu 20.04 (2.31)."""
 import os
 import re
 import subprocess
 import sys
+
+MAXIMUM = (2, 31, 0)
+MAXIMUM_TEXT = "2.31"
 
 
 def required_glibc(text: str) -> tuple[int, int, int]:
@@ -25,9 +28,9 @@ def main() -> None:
     for binary in sys.argv[1:]:
         output = subprocess.check_output(["readelf", "--version-info", binary], text=True, env={**os.environ, "LC_ALL": "C"})
         version = required_glibc(output)
-        if version > (2, 35, 0):
-            raise SystemExit(f"error: {binary} requires GLIBC_{'.'.join(map(str, version))}; maximum is 2.35")
-        print(f"{binary}: maximum required GLIBC_{'.'.join(map(str, version))} <= 2.35")
+        if version > MAXIMUM:
+            raise SystemExit(f"error: {binary} requires GLIBC_{'.'.join(map(str, version))}; maximum is {MAXIMUM_TEXT}")
+        print(f"{binary}: maximum required GLIBC_{'.'.join(map(str, version))} <= {MAXIMUM_TEXT}")
 
 
 if __name__ == "__main__":
