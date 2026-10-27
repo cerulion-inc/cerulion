@@ -216,7 +216,7 @@ cerulion bag play "$BAG" --resim all --verify --tolerance tolerance.yaml
 |---|---|---|
 | `bit_exact` | none | the bytes are identical (the default) |
 | `max_abs` | `threshold` (`>= 0`) | every element is within `threshold` of its recorded value |
-| `max_rel` | `threshold` (`>= 0`) | every element's difference, divided by its recorded value's magnitude, is within `threshold` |
+| `max_rel` | `threshold` (`>= 0`) | every element's absolute difference, divided by the larger of its recorded value's magnitude and `1e-12`, is within `threshold` |
 | `rmse` | `threshold` (`>= 0`) | the root mean square error over the field is within `threshold` |
 | `bbox_iou` | `min_iou` (in `[0, 1]`) | the boxes (a flattened `[x, y, w, h]` `float64[]`) pair one to one with the recorded boxes, in any order, with every pair at or above `min_iou` intersection over union, and no box has zero or negative width or height |
 | `set_equal` | none | the same set of values, in any order |
