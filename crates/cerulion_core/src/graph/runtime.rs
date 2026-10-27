@@ -5828,21 +5828,28 @@ impl GraphRuntime {
                     .copied()
                     .unwrap_or(0)
             };
-            topic_configs.insert(
-                flow.topic.clone(),
-                TopicServiceConfig::for_topology(
-                    transport.default_topic_config(),
-                    max_depth,
-                    in_graph_subs,
-                    publisher_provisioning,
-                    // The topic's native history size (max
-                    // declared across its producing outputs; 0 if none). The
-                    // creator/precreate open arms iceoryx2 native history with
-                    // it; openers leave it uncalled.
-                    history_by_topic.get(&flow.topic).copied().unwrap_or(0),
-                    extra_event_listeners,
-                ),
+            let mut topic_config = TopicServiceConfig::for_topology(
+                transport.default_topic_config(),
+                max_depth,
+                in_graph_subs,
+                publisher_provisioning,
+                // The topic's native history size (max
+                // declared across its producing outputs; 0 if none). The
+                // creator/precreate open arms iceoryx2 native history with
+                // it; openers leave it uncalled.
+                history_by_topic.get(&flow.topic).copied().unwrap_or(0),
+                extra_event_listeners,
             );
+            // A consumer of `/tf_static` with no in-graph publisher may be the
+            // one that creates the topic (its graph starts first). It creates
+            // it with the latch history, on the create leg only, so a static
+            // publisher that starts later can open it; an owned topic already
+            // carries that history from its outputs.
+            if publisher_provisioning == PublisherProvisioning::External {
+                topic_config.create_history_floor =
+                    super::tf_static::listener_create_history(&flow.topic);
+            }
+            topic_configs.insert(flow.topic.clone(), topic_config);
             for edge in &flow.consumers {
                 depth_by_input.insert((edge.node_id.clone(), edge.input.clone()), edge.depth);
             }

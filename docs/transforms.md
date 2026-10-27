@@ -73,6 +73,14 @@ publishers sets its cap itself: their number times the messages each keeps.
 The topic's publishers share one history, the largest `history_size` any of
 them declares and at least 1, so with no `history_size` that is their number.
 
+Start order does not matter. A listener graph that starts before its static
+publishers creates `/tf_static` with that one message of history, so the
+publishers load after it and a listener that starts after them still receives
+their kept messages. A listener requires no history when the topic already
+exists. A publisher with a `history_size` above 1 that starts after a listener
+created the topic is refused, since the history of an existing topic cannot be
+raised: start that publisher first, or stop the listener and start again.
+
 A `/tf` output can keep `history_size` at 0. A listener that starts late then
 holds no sample older than the first it receives, and a lookup at an earlier
 stamp returns `OutOfRange`. When a listener must answer stamps from before it

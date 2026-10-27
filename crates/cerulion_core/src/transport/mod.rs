@@ -1012,6 +1012,20 @@ pub struct TopicServiceConfig {
     /// to every publisher's pool on the topic; those slots are demand-paged,
     /// so the cost is virtual address space, not resident memory.
     pub create_subscriber_floor: Option<usize>,
+    /// A CREATE-leg-only history floor: the `history_size` a service THIS
+    /// opener creates is raised to, with no open-time requirement
+    /// ([`Self::history_size`] stays the open requirement). A pre-existing
+    /// service with less history is still attached, and warned about once.
+    ///
+    /// Set by the graph runtime for a consumer of `/tf_static` whose
+    /// publishers are outside the graph: a listener that starts before its
+    /// static publishers creates the topic, and a publisher that requires
+    /// the latch history cannot open a topic that keeps less (iceoryx2
+    /// cannot raise the history of a service that exists). The create value
+    /// is `max(floor, history_size)`, see `Self::create_history_size`
+    /// (pub(crate)), so a floor can only raise. `None` (the default
+    /// everywhere) changes nothing.
+    pub create_history_floor: Option<usize>,
     /// Service-level `max_subscribers`. `Some(n)`
     /// provisions the topic for at most `n` subscribers AND requires ≥ `n`
     /// when opening an existing service; `None` leaves the setter uncalled
@@ -1067,6 +1081,8 @@ pub struct TopicServiceConfig {
     /// themselves call `.history_size()`). The runtime sets this to the max
     /// `history_size` declared across the topic's producing outputs (0 =
     /// disabled). Default ([`TransportManager::default_topic_config`]) is 0.
+    /// A consumer that must create a topic with history but require none
+    /// sets [`Self::create_history_floor`] instead.
     pub history_size: usize,
     /// EXTRA event-service listener slots to provision on
     /// top of the live data-service-derived budget (`live_subs + live_pubs`),
@@ -1207,6 +1223,8 @@ struct DataLeg {
     max_publishers: Option<usize>,
     max_subscribers: Option<usize>,
     max_nodes: Option<usize>,
+    /// `0` leaves the setter uncalled.
+    history_size: usize,
 }
 
 /// An RAII handle that keeps a pre-created topic's
@@ -1472,6 +1490,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers,
             max_publishers,
             publisher_provisioning,
@@ -1629,6 +1648,15 @@ impl TopicServiceConfig {
         Some(ports.max(default_nodes))
     }
 
+    /// The `history_size` for the CREATE leg of a data-service acquisition:
+    /// the open requirement [`Self::history_size`] raised to
+    /// [`Self::create_history_floor`] when the floor is larger. Equal to the
+    /// open value when no floor raises it, and `0` leaves the setter uncalled.
+    pub(crate) fn create_history_size(&self) -> usize {
+        self.history_size
+            .max(self.create_history_floor.unwrap_or(0))
+    }
+
     /// Service REQUEST topic provisioning (explicit and
     /// role-derived, never sniffed from the topic
     /// name). A request topic fans N client
@@ -1650,6 +1678,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             max_publishers: Some(MAX_SERVICE_REQUEST_CLIENTS),
             publisher_provisioning: PublisherProvisioning::Multi,
@@ -1679,6 +1708,7 @@ impl TopicServiceConfig {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: Some(1),
             publisher_provisioning: PublisherProvisioning::SingleWriter,
@@ -6117,6 +6147,7 @@ impl TransportManager {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             // A default opener owns nothing — External is the declared
@@ -6426,6 +6457,7 @@ impl TransportManager {
                 max_publishers,
                 max_subscribers,
                 max_nodes,
+                history_size,
             } = legs;
             let mut data_builder = self
                 .node
@@ -6457,9 +6489,13 @@ impl TransportManager {
                 // requirement.
                 data_builder = data_builder.max_nodes(max_nodes);
             }
-            if topic_config.history_size > 0 {
+            if history_size > 0 {
                 // Arm iceoryx2 NATIVE publisher history at the
-                // CREATOR/precreate site. The publisher port iceoryx2 hands back
+                // CREATOR/precreate site, and on the CREATE leg of a consumer
+                // that carries a `create_history_floor` (a `/tf_static`
+                // listener that starts before its publishers creates the topic
+                // with the latch history, and requires none when it opens an
+                // existing one). The publisher port iceoryx2 hands back
                 // on this service automatically gets a history queue of this size
                 // — it retains the last N sent frames by SHM offset (zero-copy)
                 // and auto-delivers them to a late subscriber on
@@ -6474,7 +6510,7 @@ impl TransportManager {
                 // publisher_max_loaned). `enable_safe_overflow` stays at its
                 // default (true), so `history_size > subscriber buffer` is a soft
                 // per-consumer truncation, not a hard open failure.
-                data_builder = data_builder.history_size(topic_config.history_size);
+                data_builder = data_builder.history_size(history_size);
             }
             data_builder
         };
@@ -6524,12 +6560,14 @@ impl TransportManager {
             max_publishers: topic_config.max_publishers,
             max_subscribers: topic_config.max_subscribers,
             max_nodes: None,
+            history_size: topic_config.history_size,
         };
         let create_leg = DataLeg {
             borrowed_samples: topic_config.create_borrowed_samples(),
             max_publishers: create_publishers,
             max_subscribers: create_subscribers,
             max_nodes: topic_config.create_node_cap(default_caps, node_defaults.max_nodes),
+            history_size: topic_config.create_history_size(),
         };
         // The two legs always run apart: iceoryx2's single `open_or_create`
         // cannot define an attribute on create without also REQUIRING it on
@@ -6618,6 +6656,24 @@ impl TransportManager {
                 // one above iceoryx2's default 2); a service already created
                 // with fewer borrowed slots — e.g. by an earlier default
                 // opener — rejects it on open.
+                // The history twin of the same ordering edge: a publisher
+                // that keeps history (a latched `/tf_static` output, or a
+                // declared `history_size`) requires at least that much on
+                // open, and iceoryx2 cannot raise the history of a service
+                // that exists. A Cerulion listener graph creates `/tf_static`
+                // with the latch history (`create_history_floor`), so this
+                // names the creators that do not: a raw subscriber, or a
+                // publisher of a deeper declared history than the creator.
+                PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
+                    PublishSubscribeOpenError::DoesNotSupportRequestedMinHistorySize,
+                ) => {
+                    "; the service already exists with less history than this \
+                     publisher keeps for late listeners (a latched /tf_static \
+                     output keeps 1, a declared history_size keeps that many), \
+                     and the history of an existing service cannot be raised: \
+                     stop the earlier creator and restart this graph, or start \
+                     the publishing graph first"
+                }
                 PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
                     PublishSubscribeOpenError::DoesNotSupportRequestedMinSubscriberBorrowedSamples,
                 ) => {
@@ -6823,6 +6879,29 @@ impl TransportManager {
                      smaller pre-existing value (a subscriber holding that many \
                      loaned takes is refused its next receive); stop the earlier \
                      creator and restart this opener to reclaim the floor"
+                );
+            }
+        }
+        // The create-leg history FLOOR (`TopicServiceConfig::create_history_floor`,
+        // a `/tf_static` listener with no in-graph publisher). Same proof: a
+        // service WE created carries `create_history_size()`, never below the
+        // floor, so `live < requested` means the service pre-existed with less
+        // and the tolerant OPEN leg attached anyway. The consequence: a static
+        // publisher that requires the latch history cannot open this topic
+        // until the earlier creator is gone, and a listener that starts after
+        // the publishers receives no kept message. Loud once per topic.
+        if let Some(requested) = topic_config.create_history_floor {
+            let live = data_service.static_config().history_size();
+            if live < requested && self.mark_degraded_once(topic, "history_floor") {
+                tracing::warn!(
+                    topic = %topic,
+                    requested,
+                    live,
+                    "history floor degraded: the service pre-existed with less \
+                     history than this opener's create floor, so a publisher that \
+                     keeps that history for late listeners cannot open it, and a \
+                     listener that starts after the publishers receives nothing \
+                     kept; stop the earlier creator and restart this graph"
                 );
             }
         }
@@ -8500,6 +8579,7 @@ mod tests {
             create_borrow_floor: Some(66),
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: Some(99),
             max_publishers: Some(99),
             // Deliberately WRONG intent in the seed: for_topology must
@@ -8716,6 +8796,44 @@ mod tests {
         assert_eq!(owned.create_borrowed_samples(), Some(4));
     }
 
+    /// `create_history_floor` raises ONLY the create leg: the open
+    /// requirement (the pub field) is untouched, so a `/tf_static` listener
+    /// that starts before its publishers creates the topic with the latch
+    /// history and still attaches to a pre-existing topic that keeps less.
+    /// Hand oracle per arm.
+    #[test]
+    fn create_history_floor_raises_the_create_leg_only() {
+        // The listener-graph shape: an External config with no declared
+        // history and a floor of 1.
+        let mut cfg = default_seed_cfg();
+        cfg.publisher_provisioning = PublisherProvisioning::External;
+        cfg.create_history_floor = Some(1);
+        assert_eq!(
+            cfg.history_size, 0,
+            "the floor must never arm an open requirement"
+        );
+        assert_eq!(
+            cfg.create_history_size(),
+            1,
+            "a listener-created topic keeps one message"
+        );
+
+        // No floor: the create leg is the open value, including 0 (setter uncalled).
+        cfg.create_history_floor = None;
+        assert_eq!(cfg.create_history_size(), 0);
+        cfg.history_size = 3;
+        assert_eq!(cfg.create_history_size(), 3);
+
+        // The floor composes with a declared history via max: a publisher
+        // that keeps 3 under a floor of 1 creates at 3; a floor above a
+        // declared 1 creates at the floor.
+        cfg.create_history_floor = Some(1);
+        assert_eq!(cfg.create_history_size(), 3);
+        cfg.history_size = 1;
+        cfg.create_history_floor = Some(2);
+        assert_eq!(cfg.create_history_size(), 2);
+    }
+
     /// The create-leg port floors: each axis creates at the open requirement
     /// unless its floor exceeds what the create would otherwise use (the
     /// requirement, or the node default when the requirement is `None`), and
@@ -8810,6 +8928,7 @@ mod tests {
             create_borrow_floor: None,
             create_publisher_floor: None,
             create_subscriber_floor: None,
+            create_history_floor: None,
             max_subscribers: None,
             max_publishers: None,
             publisher_provisioning: PublisherProvisioning::SingleWriter,

@@ -14,6 +14,10 @@
 //! child frame: its second message re-publishes `lidar` at a new offset and
 //! keeps `cam`, so the message it keeps holds both, with `lidar` replaced.
 //!
+//! Start order must not matter: a listener graph that starts before its
+//! static publisher creates `/tf_static`, and the publisher must still load
+//! and keep its message for a listener that starts after it.
+//!
 //! ```bash
 //! cargo test -p cerulion_core --test tf_static_latch_iox2_test -- --test-threads=1
 //! ```
@@ -26,6 +30,7 @@ use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
+use cerulion_core::transport::TransportManager;
 use indexmap::IndexMap;
 use native_ros2_messages::tf2_msgs::TFMessage;
 use serial_test::serial;
@@ -188,12 +193,17 @@ fn publishers(prefix: &str, topic: &str) -> GraphRuntime {
     rt
 }
 
-/// Graph B, built after graph A has published, on A's transport: one
-/// listener on `topic`. Returns every `transforms` payload it received,
-/// sorted so the oracle does not depend on which publisher's history
-/// lands first.
-fn late_listener(a: &mut GraphRuntime, prefix: &str, topic: &str) -> Vec<Vec<u8>> {
-    let mgr = a.test_transport().expect("test transport parked");
+/// A listener graph's config, its factory, and the frames its listener
+/// records.
+type ListenerGraph = (
+    GraphConfig,
+    IndexMap<String, Box<dyn NodeEntry>>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+);
+
+/// The listener graph's config and factory: one `listener` on `topic` that
+/// records into the returned `seen`.
+fn listener_graph(prefix: &str, topic: &str) -> ListenerGraph {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let config = graph(prefix, &[], vec![listener_def("listener", topic)]);
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
@@ -204,6 +214,27 @@ fn late_listener(a: &mut GraphRuntime, prefix: &str, topic: &str) -> Vec<Vec<u8>
             ..Default::default()
         })),
     );
+    (config, factories, seen)
+}
+
+/// Graph B, built after graph A has published, on A's transport: one
+/// listener on `topic`. Returns every `transforms` payload it received,
+/// sorted so the oracle does not depend on which publisher's history
+/// lands first.
+fn late_listener(a: &mut GraphRuntime, prefix: &str, topic: &str) -> Vec<Vec<u8>> {
+    let mgr = Arc::clone(a.test_transport().expect("test transport parked"));
+    late_listener_on(&mgr, a, prefix, topic)
+}
+
+/// [`late_listener`] on an explicit transport `mgr`, for a publisher graph
+/// `a` that was built on another graph's transport.
+fn late_listener_on(
+    mgr: &Arc<TransportManager>,
+    a: &mut GraphRuntime,
+    prefix: &str,
+    topic: &str,
+) -> Vec<Vec<u8>> {
+    let (config, factories, seen) = listener_graph(prefix, topic);
     let mut b = GraphRuntime::build(config, factories, mgr, Arc::new(VirtualClock::new()))
         .expect("build the late listener graph");
     // Graph A sends nothing more: the publishers only hand their kept
@@ -257,6 +288,93 @@ fn two_late_listeners_in_two_runs_receive_the_same_frames() {
     let oracle = sorted(&[MOUNTS_MERGED, ARM]);
     assert_eq!(first, oracle);
     assert_eq!(second, oracle);
+}
+
+#[test]
+#[serial]
+fn a_listener_that_starts_before_its_static_publisher_does_not_block_the_latch() {
+    // Graph B starts first, with no publisher in it: its listener creates
+    // `/tf_static`.
+    let (config, factories, seen_b) = listener_graph("first_b", TF_STATIC);
+    let mut b = GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8)
+        .expect("build the listener graph first");
+    let mgr = Arc::clone(b.test_transport().expect("test transport parked"));
+    // Graph A starts after, on the same transport: one static publisher
+    // with no `history_size`, which keeps one message by default. The topic
+    // B created must admit that.
+    let config = graph("first_a", &[], vec![publisher_def("mounts", TF_STATIC)]);
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "mounts".to_string(),
+        static_pub(vec![MOUNTS_FIRST, MOUNTS_MERGED]),
+    );
+    let mut a = GraphRuntime::build(config, factories, &mgr, Arc::new(VirtualClock::new()))
+        .expect("a static publisher loads after a listener created /tf_static");
+    for _ in 0..2 {
+        a.trigger_external("mounts").expect("trigger mounts");
+        a.step(STEP);
+        b.trigger_external("listener").expect("trigger listener");
+        b.step(STEP);
+    }
+    // B listened from the start, so it received both messages live.
+    let mut live = seen_b.lock().expect("seen lock").clone();
+    live.sort();
+    assert_eq!(live, sorted(&[MOUNTS_FIRST, MOUNTS_MERGED]));
+    // Graph C starts after A has published: the topic B created keeps the
+    // publisher's last message for it.
+    let got = late_listener_on(&mgr, &mut a, "first_c", TF_STATIC);
+    assert_eq!(got, sorted(&[MOUNTS_MERGED]));
+}
+
+#[test]
+#[serial]
+fn a_raw_subscriber_that_created_tf_static_without_history_refuses_the_publisher_and_names_the_remedy(
+) {
+    // A transport to share: a listener graph on `/tf`, which does not touch
+    // `/tf_static`.
+    let (config, factories, _seen) = listener_graph("raw_t", "/tf");
+    let t = GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8)
+        .expect("build the transport holder");
+    let mgr = Arc::clone(t.test_transport().expect("test transport parked"));
+    // A raw opener outside any graph creates `/tf_static` with no history.
+    // It grants the 3 borrowed samples an accumulate listener requires on
+    // open, so the history axis is the only one the graphs below meet.
+    let mut raw_config = mgr.default_topic_config();
+    raw_config.subscriber_max_borrowed_samples = Some(3);
+    let _raw = mgr
+        .create_subscriber_with_buffers(TF_STATIC, raw_config, 8)
+        .expect("a raw subscriber creates /tf_static");
+    // The static publisher requires the latch history, which an existing
+    // topic cannot gain: the refusal says so and names what to do.
+    let config = graph("raw_a", &[], vec![publisher_def("mounts", TF_STATIC)]);
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("mounts".to_string(), static_pub(vec![ARM]));
+    match GraphRuntime::build(config, factories, &mgr, Arc::new(VirtualClock::new())) {
+        Err(TransportError::PublisherCreation { topic, reason }) => {
+            assert_eq!(topic, TF_STATIC);
+            assert!(
+                reason.contains("DoesNotSupportRequestedMinHistorySize"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains(
+                    "the service already exists with less history than this publisher \
+                     keeps for late listeners (a latched /tf_static output keeps 1, a \
+                     declared history_size keeps that many), and the history of an \
+                     existing service cannot be raised: stop the earlier creator and \
+                     restart this graph, or start the publishing graph first"
+                ),
+                "{reason}"
+            );
+        }
+        Err(other) => panic!("expected PublisherCreation, got {other}"),
+        Ok(_) => panic!("a static publisher must not open a /tf_static that keeps no history"),
+    }
+    // A listener graph requires no history: it attaches to the topic as it is.
+    let (config, factories, _seen) = listener_graph("raw_b", TF_STATIC);
+    if let Err(e) = GraphRuntime::build(config, factories, &mgr, Arc::new(VirtualClock::new())) {
+        panic!("a listener attaches to a /tf_static that keeps no history: {e}");
+    }
 }
 
 #[test]

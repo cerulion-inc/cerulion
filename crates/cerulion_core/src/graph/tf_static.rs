@@ -19,9 +19,16 @@
 //!   drop static frames without a word, so the load refuses it with
 //!   [`TransportError::TfStaticCapTooSmall`], which names the publishers and
 //!   the cap.
+//! - **Start order does not matter.** A listener graph that starts before
+//!   its static publishers creates `/tf_static` itself. It creates the topic
+//!   with the latch history ([`listener_create_history`]), because a
+//!   publisher that requires history cannot open a topic that keeps less,
+//!   and the transport cannot raise the history of a topic that exists. The
+//!   listener requires nothing when the topic already exists: it attaches to
+//!   whatever history the creator set.
 //!
-//! Both rules read the graph config and the declared input depths only, so
-//! a replay applies them exactly as the live run did.
+//! All three rules read the graph config and the declared input depths
+//! only, so a replay applies them exactly as the live run did.
 
 use crate::error::TransportError;
 
@@ -46,14 +53,30 @@ pub(crate) fn is_latched_static_output(topic: &str, schema: &str) -> bool {
     topic == TF_STATIC_TOPIC && is_tf_message(schema)
 }
 
+/// The history a latched static transform output keeps for late listeners
+/// when its `history_size` is 0: the one message that holds its whole set.
+pub(crate) const LATCH_HISTORY: usize = 1;
+
 /// The history an output keeps for late listeners: its `history_size`,
-/// and at least 1 for a static transform output.
+/// and at least [`LATCH_HISTORY`] for a static transform output.
 pub(crate) fn effective_history_size(topic: &str, output: &OutputDef) -> usize {
     if is_latched_static_output(topic, &output.schema) {
-        output.history_size.max(1)
+        output.history_size.max(LATCH_HISTORY)
     } else {
         output.history_size
     }
+}
+
+/// The history a listener graph gives `topic` when it creates it: the
+/// latch history for `/tf_static`, nothing for any other topic.
+///
+/// A listener's input names its topic, not the schema it carries, so this
+/// keys on the topic alone where [`is_latched_static_output`] also checks
+/// the schema. The value raises only what the listener creates; it is never
+/// an open requirement, so a listener attaches to a `/tf_static` that
+/// already exists with any history.
+pub(crate) fn listener_create_history(topic: &str) -> Option<usize> {
+    (topic == TF_STATIC_TOPIC).then_some(LATCH_HISTORY)
 }
 
 /// Refuses an in-graph consumer of `/tf_static` whose queue cannot hold
@@ -217,6 +240,21 @@ mod tests {
             effective_history_size("/robot/mounts/tf_static", &relative),
             2
         );
+    }
+
+    #[test]
+    fn a_listener_creates_tf_static_with_the_latch_history_and_other_topics_with_none() {
+        assert_eq!(listener_create_history(TF_STATIC_TOPIC), Some(1));
+        // The history a listener creates is the one a publisher with no
+        // `history_size` requires, so the two cannot drift apart.
+        let latched = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessage", 0);
+        assert_eq!(
+            listener_create_history(TF_STATIC_TOPIC),
+            Some(effective_history_size(TF_STATIC_TOPIC, &latched))
+        );
+        // `/tf` moves, and a prefixed `tf_static` is another topic.
+        assert_eq!(listener_create_history("/tf"), None);
+        assert_eq!(listener_create_history("/robot/tf_static"), None);
     }
 
     #[test]
