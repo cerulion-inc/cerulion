@@ -282,12 +282,24 @@ fn a_sample_older_than_a_full_ring_is_the_one_that_overflows() {
     let mut b = small(8, 2);
     b.insert("odom", "base", 200, tf(2.0)).unwrap();
     b.insert("odom", "base", 300, tf(3.0)).unwrap();
-    b.insert("odom", "base", 100, tf(1.0)).unwrap();
+    // Older than everything on a full ring, it is the sample that would
+    // make room, so it is the one lost. That is an overflow, not a
+    // refusal: the insert is `Ok(())` and the loss counts in `overflows`,
+    // the one `Ok(())` that keeps nothing.
+    assert_eq!(b.insert("odom", "base", 100, tf(1.0)), Ok(()));
     let e = edge(&b, "base");
     assert_eq!(
         (e.samples, e.oldest_ns, e.newest_ns, e.overflows),
         (2, Some(200), Some(300), 1)
     );
+    assert!(matches!(
+        b.lookup("odom", "base", 100),
+        Err(TfError::OutOfRange {
+            oldest_ns: 200,
+            newest_ns: 300,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -411,7 +423,7 @@ fn a_dynamic_transform_on_a_static_edge_is_refused_every_time_and_counted() {
     let mut b = TfBuffer::new();
     b.insert_static("base", "lidar", tf(0.17)).unwrap();
     let (base, lidar) = (id(&b, "base"), id(&b, "lidar"));
-    // The 100th refusal comes back like the first: a dropped sample is
+    // The 100th refusal comes back like the first: a refused sample is
     // never an `Ok(())`.
     for stamp in 1..=100u64 {
         assert_eq!(
@@ -1087,6 +1099,50 @@ fn a_new_epoch_clears_a_pending_jump() {
         b.insert("odom", "base", 50_010, tf(9.0)),
         Err(TfError::StampTooFarAhead { newest_ns: 10, .. })
     ));
+}
+
+#[test]
+fn the_first_sample_on_an_empty_ring_is_the_baseline_and_is_not_checked() {
+    // Both stamp checks compare with the edge's newest sample, so an empty
+    // ring has nothing to check against: its first sample is the baseline,
+    // whatever its stamp. A far-future first stamp then puts every good
+    // stamp before the window, and the edge stays there until a new epoch;
+    // the symptom is a `window_refusals` count that keeps rising.
+    let far = 1u64 << 62;
+    let mut b = windowed(1_000);
+    assert_eq!(b.insert("odom", "base", far, tf(9.0)), Ok(()));
+    for stamp in [100, 200, 300] {
+        assert_eq!(
+            b.insert("odom", "base", stamp, tf(1.0)),
+            Err(TfError::StampBeforeWindow {
+                parent: id(&b, "odom"),
+                child: id(&b, "base"),
+                stamp_ns: stamp,
+                newest_ns: far,
+            }),
+            "stamp {stamp}"
+        );
+    }
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.newest_ns, e.window_refusals, e.jump_refusals),
+        (1, Some(far), 3, 0)
+    );
+    assert_eq!(b.lookup_latest("odom", "base").unwrap().stamp_ns, Some(far));
+    // A new epoch empties the ring: the next sample is the baseline again,
+    // whatever its stamp, and the refusal count stays as the trace.
+    b.begin_epoch();
+    assert_eq!(b.insert("odom", "base", 100, tf(1.0)), Ok(()));
+    let e = edge(&b, "base");
+    assert_eq!(
+        (e.samples, e.newest_ns, e.window_refusals),
+        (1, Some(100), 3)
+    );
+    // An edge declared by a policy has an empty ring too.
+    b.set_edge_policy("map", "odom", EdgePolicy::HoldLast { max_age_ns: 1 })
+        .unwrap();
+    assert_eq!(b.insert("map", "odom", far, tf(9.0)), Ok(()));
+    assert_eq!(edge(&b, "odom").newest_ns, Some(far));
 }
 
 #[test]

@@ -1028,5 +1028,18 @@ fn a_whole_step_extrapolation_is_the_composed_step_bit_for_bit() {
     let step = before.inverse().unwrap().compose(&after).unwrap();
     let want = after.compose(&step).unwrap();
     assert_eq!(want.rotation().w(), 0.280_000_000_000_000_14);
-    assert_eq!(b.lookup("odom", "base", 2_000).unwrap(), want);
+    let got = b.lookup("odom", "base", 2_000).unwrap();
+    assert_eq!(got, want);
+    // The hand value of that step: with q = (0, 0, 0.6, 0.8),
+    // cos(theta) = 0.64 - 0.36 = 0.28 and sin(theta) = 2 * 0.6 * 0.8 = 0.96,
+    // so the second advance is (2, 0, 0) turned by theta, (0.56, 1.92, 0),
+    // on top of the first, and the rotation is q squared, (0, 0, 0.96, 0.28).
+    assert_close3(got.translation(), [2.56, 1.92, 0.0], 1e-15);
+    let rotation = got.rotation().to_array();
+    for (i, want) in [0.0, 0.0, 0.96, 0.28].into_iter().enumerate() {
+        assert!(
+            (rotation[i] - want).abs() <= 1e-15,
+            "rotation component {i}: got {rotation:?}, want (0, 0, 0.96, 0.28)"
+        );
+    }
 }

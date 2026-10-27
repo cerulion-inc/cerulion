@@ -198,8 +198,9 @@ fn two_buffer_runs_give_identical_bits() {
 
 /// The edge policies past the newest sample, after an epoch: a turning
 /// edge extrapolated by a fraction and by whole steps, and a held slow
-/// edge read through the chain at the fast edge's newest stamp.
-fn policy_program() -> [u64; 21] {
+/// edge read through the chain at the fast edge's newest stamp, which
+/// comes back as the resolved stamp and is the last value.
+fn policy_program() -> [u64; 22] {
     let q = |x, y, z, w| UnitQuaternion::new(x, y, z, w).unwrap();
     let mut buf = TfBuffer::new();
     buf.set_edge_policy("map", "odom", EdgePolicy::HoldLast { max_age_ns: 900 })
@@ -231,12 +232,13 @@ fn policy_program() -> [u64; 21] {
         Transform::new([1.25, -0.5, 0.1], q(0.2, 0.1, 0.3, 0.9)).unwrap(),
     )
     .unwrap();
+    let latest = buf.lookup_latest("map", "base").unwrap();
     let reads = [
         buf.lookup("odom", "base", 437).unwrap(),
         buf.lookup("odom", "base", 2_000).unwrap(),
-        buf.lookup_latest("map", "base").unwrap().transform,
+        latest.transform,
     ];
-    let mut out = [0u64; 21];
+    let mut out = [0u64; 22];
     let mut k = 0;
     for t in &reads {
         for x in t.translation().into_iter().chain(t.rotation().to_array()) {
@@ -244,12 +246,23 @@ fn policy_program() -> [u64; 21] {
             k += 1;
         }
     }
+    out[k] = latest
+        .stamp_ns
+        .expect("a chain with a dynamic edge resolves at a stamp");
     out
 }
 
 #[test]
 fn two_policy_runs_give_identical_bits() {
     assert_eq!(policy_program(), policy_program());
+}
+
+#[test]
+fn the_policy_program_resolves_at_the_fast_edge_newest_stamp() {
+    // `map` to `odom` is held for 900 ns past its one sample at 0 ns, and
+    // `odom` to `base` is newest at 300 ns, inside that hold, so the chain
+    // resolves at 300 ns: the hand value of the pinned stamp.
+    assert_eq!(policy_program()[21], 300);
 }
 
 /// The bits `buffer_program` produced, committed as the regression pin.
