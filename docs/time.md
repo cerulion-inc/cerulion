@@ -108,8 +108,10 @@ still reaches the no-clock and stalled-clock warnings above.
 A `ros2:` entry of a sim-time graph is put on `/clock` too. A `ros2 run`
 entry gets `--ros-args -p use_sim_time:=true`; a `ros2 launch` entry gets the
 launch argument `use_sim_time:=true`, which the launch file must declare and
-pass to its nodes. An entry that sets `use_sim_time` itself (under `params:`,
-or as an `args:` word `use_sim_time:=...`) keeps its own value.
+pass to its nodes. The run says so when it spawns such an entry, and its
+spawn line shows the command as spawned, argument included. An entry that
+sets `use_sim_time` itself (under `params:`, or as an `args:` word
+`use_sim_time:=...`) keeps its own value.
 
 ### A clock publisher
 

@@ -78,10 +78,12 @@ pub fn take_ros2_entries(config: &mut GraphConfig) -> Vec<Ros2Entry> {
         .collect()
 }
 
-/// Human-readable one-line rendering of what an entry runs (`ros2 run pkg
-/// exe` / `ros2 launch file`) — for reports and log lines.
-pub fn describe(entry: &Ros2Entry) -> String {
-    format!("ros2 {}", entry.def.argv(None).join(" "))
+/// The one-line command a spawn argv runs (`ros2 run pkg exe ...` /
+/// `ros2 launch file ...`), for the spawn log and the spawn errors. Built
+/// from the argv AS SPAWNED ([`spawn_argv`]), so it shows the resolved paths
+/// and, under sim time, the `use_sim_time:=true` the run added.
+pub fn command_line(argv: &[String]) -> String {
+    format!("ros2 {}", argv.join(" "))
 }
 
 /// The spawn argv (everything after `ros2`), with a RELATIVE `launch:` /
@@ -314,6 +316,19 @@ impl Ros2Children {
         let env = stage_ros2_child_env()?;
         for entry in entries {
             let argv = spawn_argv(entry, workspace_root, time_source)?;
+            let command = command_line(&argv);
+            // A launch argument reaches the launched nodes only through the
+            // launch file: say so once, at spawn, for the entry it concerns.
+            if let Some(notice) =
+                crate::sim_time_run::ros2_launch_sim_time_notice(&entry.def, time_source)
+            {
+                tracing::info!(
+                    graph = %graph,
+                    node_id = %entry.id,
+                    command = %command,
+                    "{notice}"
+                );
+            }
             let mut cmd = std::process::Command::new("ros2");
             cmd.args(&argv).current_dir(workspace_root);
             for (k, v) in &env {
@@ -346,15 +361,13 @@ impl Ros2Children {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     CliError::Validation(format!(
                         "ros2 entry '{}': `ros2` not found on PATH — install ROS 2 (or source \
-                         its setup script) so `graph run` can spawn `{}`",
-                        entry.id,
-                        describe(entry)
+                         its setup script) so `graph run` can spawn `{command}`",
+                        entry.id
                     ))
                 } else {
                     CliError::Validation(format!(
-                        "ros2 entry '{}': failed to spawn `{}`: {e}",
-                        entry.id,
-                        describe(entry)
+                        "ros2 entry '{}': failed to spawn `{command}`: {e}",
+                        entry.id
                     ))
                 }
             })?;
@@ -362,7 +375,7 @@ impl Ros2Children {
                 graph = %graph,
                 node_id = %entry.id,
                 pid = child.id(),
-                command = %describe(entry),
+                command = %command,
                 "ros2 entry spawned on Cerulion transport (RMW_IMPLEMENTATION=rmw_cerulion)"
             );
             lock_children(&set.children).push(Ros2Child {
@@ -738,6 +751,44 @@ mod tests {
                 "--params-file",
                 &params.display().to_string()
             ]
+        );
+    }
+
+    /// The spawn log and the spawn errors name the command AS SPAWNED: the
+    /// resolved paths and, under sim time, the `use_sim_time:=true` the run
+    /// added, which the entry's own `argv` does not carry.
+    #[test]
+    fn the_spawn_command_line_is_the_argv_as_spawned() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("robot.launch.py"), b"#").expect("write");
+        let launch = Ros2Entry {
+            id: "bringup".to_string(),
+            def: Ros2NodeDef {
+                launch: Some("robot.launch.py".to_string()),
+                args: vec!["a:=1".to_string()],
+                ..Default::default()
+            },
+        };
+        let resolved = root.path().join("robot.launch.py").display().to_string();
+        assert_eq!(
+            command_line(&spawn_argv(&launch, root.path(), TimeSource::Real).expect("argv")),
+            format!("ros2 launch {resolved} a:=1")
+        );
+        assert_eq!(
+            command_line(&spawn_argv(&launch, root.path(), TimeSource::External).expect("argv")),
+            format!("ros2 launch {resolved} a:=1 use_sim_time:=true")
+        );
+        let run = Ros2Entry {
+            id: "talker".to_string(),
+            def: Ros2NodeDef {
+                package: Some("demo_nodes_cpp".to_string()),
+                executable: Some("talker".to_string()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            command_line(&spawn_argv(&run, root.path(), TimeSource::External).expect("argv")),
+            "ros2 run demo_nodes_cpp talker --ros-args -p use_sim_time:=true"
         );
     }
 

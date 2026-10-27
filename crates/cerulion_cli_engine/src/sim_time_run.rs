@@ -202,13 +202,10 @@ pub const ROS2_USE_SIM_TIME: &str = "use_sim_time";
 /// A `use_sim_time` the entry already sets (in `params:`, or as an `args:`
 /// word `use_sim_time:=...`) is the entry's own choice and is kept.
 pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) {
-    let assignment = format!("{ROS2_USE_SIM_TIME}:=");
-    let set_by_entry = def.params.contains_key(ROS2_USE_SIM_TIME)
-        || def.args.iter().any(|arg| arg.starts_with(&assignment));
-    if set_by_entry {
+    if ros2_entry_sets_use_sim_time(def) {
         return;
     }
-    let value = format!("{assignment}true");
+    let value = format!("{ROS2_USE_SIM_TIME}:=true");
     if def.launch.is_some() {
         argv.push(value);
         return;
@@ -220,6 +217,40 @@ pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) {
     }
     argv.push("-p".to_string());
     argv.push(value);
+}
+
+/// Whether a `ros2:` entry sets `use_sim_time` itself: in `params:`, or as
+/// an `args:` word `use_sim_time:=...`. Such a value is the entry's own
+/// choice, and a sim-time run keeps it.
+pub fn ros2_entry_sets_use_sim_time(def: &Ros2NodeDef) -> bool {
+    let assignment = format!("{ROS2_USE_SIM_TIME}:=");
+    def.params.contains_key(ROS2_USE_SIM_TIME)
+        || def.args.iter().any(|arg| arg.starts_with(&assignment))
+}
+
+/// The notice a sim-time run logs when it spawns a `ros2 launch` entry with
+/// the `use_sim_time:=true` launch argument. A `-p` parameter on `ros2 run`
+/// always reaches the node; a launch argument reaches the launched nodes
+/// only through the launch file, so the run says so at spawn.
+pub const ROS2_LAUNCH_USE_SIM_TIME_NOTICE: &str = "this `ros2 launch` entry is given the \
+    launch argument `use_sim_time:=true`, which takes effect only if the launch file declares \
+    a `use_sim_time` launch argument and passes it to its nodes; a launch file that does not \
+    declare it leaves its nodes on their own clock";
+
+/// `Some(notice)` when a sim-time run ([`TimeSource::External`]) puts a
+/// `ros2 launch` entry on `/clock` through the launch argument
+/// ([`put_ros2_entry_on_sim_time`]), so the spawn can log
+/// [`ROS2_LAUNCH_USE_SIM_TIME_NOTICE`] once for it. `None` for a `ros2 run`
+/// entry (its parameter always takes effect), for an entry that sets
+/// `use_sim_time` itself, and on every other clock.
+pub fn ros2_launch_sim_time_notice(
+    def: &Ros2NodeDef,
+    time_source: TimeSource,
+) -> Option<&'static str> {
+    let given_the_argument = time_source == TimeSource::External
+        && def.launch.is_some()
+        && !ros2_entry_sets_use_sim_time(def);
+    given_the_argument.then_some(ROS2_LAUNCH_USE_SIM_TIME_NOTICE)
 }
 
 /// Decides, from the wall time elapsed since the run started and whether a
@@ -989,6 +1020,51 @@ mod tests {
         assert_eq!(
             sim_argv(&launch),
             ["launch", "bringup.launch.py", "use_sim_time:=false"]
+        );
+    }
+
+    #[test]
+    fn a_launch_entry_put_on_sim_time_is_told_the_launch_file_must_declare_it() {
+        let launch = Ros2NodeDef {
+            launch: Some("bringup.launch.py".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ros2_launch_sim_time_notice(&launch, TimeSource::External),
+            Some(ROS2_LAUNCH_USE_SIM_TIME_NOTICE),
+            "the launch argument works only if the launch file declares it, so the run says so"
+        );
+        for source in [TimeSource::Real, TimeSource::Virtual] {
+            assert_eq!(
+                ros2_launch_sim_time_notice(&launch, source),
+                None,
+                "{source:?}: the entry was not put on sim time"
+            );
+        }
+        let own_value = Ros2NodeDef {
+            launch: Some("bringup.launch.py".to_string()),
+            args: vec!["use_sim_time:=false".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            ros2_launch_sim_time_notice(&own_value, TimeSource::External),
+            None,
+            "the entry's own value is kept as given, so there is nothing to declare"
+        );
+        let run = Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ros2_launch_sim_time_notice(&run, TimeSource::External),
+            None,
+            "a `-p` parameter on `ros2 run` always reaches the node"
+        );
+        assert!(
+            ROS2_LAUNCH_USE_SIM_TIME_NOTICE.contains("use_sim_time:=true")
+                && ROS2_LAUNCH_USE_SIM_TIME_NOTICE.contains("declares"),
+            "names the argument and what the launch file must do: {ROS2_LAUNCH_USE_SIM_TIME_NOTICE}"
         );
     }
 

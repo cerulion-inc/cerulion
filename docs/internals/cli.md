@@ -1327,4 +1327,8 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
 - A period fires at most once per sample: a jump fires the latest passed deadline,
   never a catch-up burst.
 - A frame is decoded only after its wire framing is checked.
+- `ros2:` entries are put on `/clock` by `spawn_argv` (`put_ros2_entry_on_sim_time`).
+  The spawn log prints the argv as spawned (`ros2_graph::command_line`), and a
+  `ros2 launch` entry that got the launch argument logs
+  `ROS2_LAUNCH_USE_SIM_TIME_NOTICE` once (`ros2_launch_sim_time_notice`).
 - Every warning and refusal text is a pinned constant.
