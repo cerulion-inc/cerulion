@@ -209,8 +209,32 @@ fn run_bursts(prefix: &str, c: Consumer, bursts: &[&[u64]], idle: u32) -> (Vec<u
 #[serial]
 fn a_burst_is_one_fire_on_the_newest_frame() {
     let (observed, n) = run_bursts("latburst", Consumer::latest(), &[&[1, 2, 3, 4, 5]], 6);
-    assert_eq!(observed, vec![5], "one fire, on the newest frame of the burst");
+    assert_eq!(
+        observed,
+        vec![5],
+        "one fire, on the newest frame of the burst"
+    );
     assert_eq!(n, 1, "exactly one fire: the idle steps owe nothing");
+}
+
+/// A latest node carries no between-fires refill hook: a refill would fire
+/// it a second time in one step on a frame that arrived during its tick. The
+/// unified `fifo` control carries one.
+#[test]
+#[serial]
+fn a_latest_node_gets_no_refill_hook_and_the_fifo_control_does() {
+    for (consume, want) in [(InputConsume::Latest, false), (InputConsume::Fifo, true)] {
+        let c = Consumer {
+            consume,
+            ..Consumer::latest()
+        };
+        let (runtime, _ext) = external_runtime("latrefill", c, Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(
+            runtime.has_trigger_refill_for_test("sink"),
+            Some(want),
+            "{consume:?}"
+        );
+    }
 }
 
 /// The `fifo` control in the same harness: the declaration is the only
@@ -256,7 +280,10 @@ fn forced_separate_discipline_gives_the_same_observation() {
         4,
     );
     assert_eq!(observed, vec![5, 7]);
-    assert_eq!(n, 2, "the per-arrival signals collapse to one fire per step");
+    assert_eq!(
+        n, 2,
+        "the per-arrival signals collapse to one fire per step"
+    );
 }
 
 /// Two runs of one schedule observe the same sequence, equal to the oracle.
@@ -459,7 +486,10 @@ fn block_with_latest_serves_the_newest_and_paces_nothing_while_the_queue_fits() 
     let expected: Vec<u64> = (0..observed.len() as u64).map(|k| 1 + 3 * k).collect();
     assert!(observed.len() >= 9, "a real stream: {observed:?}");
     assert_eq!(observed, expected);
-    assert_eq!(deferred, 0, "the queue never fills, so the block gate never defers");
+    assert_eq!(
+        deferred, 0,
+        "the queue never fills, so the block gate never defers"
+    );
     assert_eq!(published, 30, "one publish per step");
 }
 
@@ -476,7 +506,10 @@ fn block_with_latest_paces_the_producer_while_a_deferred_fire_spans_the_depth() 
     assert!(observed.len() >= 4, "a real stream: {observed:?}");
     assert_eq!(observed, expected);
     assert!(deferred > 0, "the full queue defers the producer");
-    assert!(published < 30, "the producer was paced: {published} publishes");
+    assert!(
+        published < 30,
+        "the producer was paced: {published} publishes"
+    );
 }
 
 /// Through a dlopen'd `#[cerulion_node]` cdylib: `consume = latest` reaches
@@ -495,7 +528,11 @@ fn a_cdylib_declaring_latest_forwards_only_the_newest_frame() {
     .expect("load consume-latest fixture cdylib");
     let meta = entry.info().expect("fixture info").input_meta().to_vec();
     assert_eq!(meta.len(), 1);
-    assert_eq!(meta[0].consume, InputConsume::Latest, "the key crossed the FFI");
+    assert_eq!(
+        meta[0].consume,
+        InputConsume::Latest,
+        "the key crossed the FFI"
+    );
 
     let node = NodeDef {
         fuse: None,
@@ -583,8 +620,7 @@ fn the_latest_drain_holds_an_unread_frame_and_never_refills_past_it() {
         p.x = x as f64;
     };
     let read = |sub: &mut cerulion_core::transport::subscriber::CerulionSubscriber| {
-        sub.try_view::<Vector3, _>(|v| v.x as u64)
-            .expect("read")
+        sub.try_view::<Vector3, _>(|v| v.x as u64).expect("read")
     };
 
     send(1);

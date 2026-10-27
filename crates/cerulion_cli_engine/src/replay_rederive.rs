@@ -5340,8 +5340,7 @@ mod tests {
 
         let mut held = step(0, EPOCH, vec![fire("sink", EPOCH), fire("sink", EPOCH)]);
         held.reads.clear();
-        let twice_unpopped =
-            verify_unrestored(&latest_node(), &[held], &[], RoleTrust::Declined);
+        let twice_unpopped = verify_unrestored(&latest_node(), &[held], &[], RoleTrust::Declined);
         assert_eq!(
             twice_unpopped.findings[0].recorded,
             StepFires::count(2),
@@ -5363,7 +5362,10 @@ mod tests {
         }];
         let report = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(
-            report.findings.iter().all(|f| f.decider != Decider::LatestFire),
+            report
+                .findings
+                .iter()
+                .all(|f| f.decider != Decider::LatestFire),
             "{:?}",
             report.findings
         );

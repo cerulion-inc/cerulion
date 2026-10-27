@@ -16859,6 +16859,14 @@ impl GraphRuntime {
         self.scheduler.replay_refill_shortfalls(node_id)
     }
 
+    /// Testing-only: does this node carry a between-fires refill hook? A
+    /// unified `fifo` data-trigger node does; a `consume = latest` one never
+    /// does. `None` for an unknown id.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn has_trigger_refill_for_test(&self, node_id: &str) -> Option<bool> {
+        self.scheduler.has_trigger_refill_for_test(node_id)
+    }
+
     /// Install the engine's INTRA-STEP injection callback — see
     /// [`crate::scheduler::Scheduler::set_replay_injection_hook`] for the
     /// contract and [`crate::scheduler::ReplayInjectionHook`] for what the hook

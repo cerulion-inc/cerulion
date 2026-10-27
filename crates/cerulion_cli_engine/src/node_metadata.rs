@@ -3671,7 +3671,10 @@ struct FusionNode {
     #[test]
     fn parse_macro_node_refuses_every_consume_form_the_macro_refuses() {
         let cases: [(&str, &str); 6] = [
-            ("consume = latest", crate::node_metadata_consume::CONSUME_NEEDS_TRIGGER),
+            (
+                "consume = latest",
+                crate::node_metadata_consume::CONSUME_NEEDS_TRIGGER,
+            ),
             (
                 "trigger, consume = lifo",
                 "unknown consume mode `lifo`, expected `consume = fifo` (the default) or \

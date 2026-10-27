@@ -2808,6 +2808,13 @@ impl Scheduler {
         self.nodes.get(node_id).map(|n| n.replay_refill_shortfalls)
     }
 
+    /// Testing-only: does this node carry a between-fires refill hook
+    /// ([`Self::set_trigger_refill`])? `None` for an unknown id.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn has_trigger_refill_for_test(&self, node_id: &str) -> Option<bool> {
+        self.nodes.get(node_id).map(|n| n.trigger_refill.is_some())
+    }
+
     /// How many times this node's trace-driven burst asked its refill hook for
     /// the next FIFO frame and the REPLAY READ GATE withheld one, see
     /// `ScheduledNode::replay_enforced_empty_refills`. `None` for an unknown id.

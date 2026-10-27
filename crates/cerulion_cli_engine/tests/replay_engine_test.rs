@@ -3157,7 +3157,10 @@ fn throttled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 }
 
 fn sampled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
-    factories(vec![("relay", Box::new(SampledLatestRelayNodeEntry::new()))])
+    factories(vec![(
+        "relay",
+        Box::new(SampledLatestRelayNodeEntry::new()),
+    )])
 }
 
 /// Record `per_step` bursts into a latest relay, anchor the recorded outputs
@@ -3178,9 +3181,16 @@ fn latest_relay_round_trip(
     }];
     let yaml = latest_relay_yaml(node_type);
     let rec = record_uniform_with_read_log(&yaml, make, &externals, steps);
-    let out: Vec<f64> = rec.messages["/lr/relay/out"].iter().map(|f| frame_x(f)).collect();
+    let out: Vec<f64> = rec.messages["/lr/relay/out"]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
     assert_eq!(out, oracle, "{node_type}: the recorded outputs");
-    assert_eq!(rec.messages["/lr/ext/cam"].len(), frames, "every external frame recorded");
+    assert_eq!(
+        rec.messages["/lr/ext/cam"].len(),
+        frames,
+        "every external frame recorded"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("latest.mcap");
