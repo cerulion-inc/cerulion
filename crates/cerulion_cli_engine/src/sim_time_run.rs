@@ -397,12 +397,89 @@ pub const SIM_TIME_PERIOD_FIRES_PER_SAMPLE: u32 = 1;
 /// The tap is a polling reader, so its queue is what absorbs a simulator that
 /// publishes faster than the loop drains (the loop steps the whole graph per
 /// sample). The depth is a fixed, known number rather than the service
-/// ceiling so the tap pins a bounded share of the publisher's pool. A sample
-/// the queue could not hold is dropped by the publisher: the next accepted
-/// sample then steps the graph by the whole gap, so two steps merge into one,
-/// a deadline between them fires once at the later sample, and the graph clock
-/// still lands on the latest published time.
+/// ceiling so the tap pins a bounded share of the publisher's pool. When the
+/// queue is full, the next publish evicts the OLDEST unread sample: the next
+/// accepted sample then steps the graph by the whole gap, so two steps merge
+/// into one, a deadline between them fires once at the later sample, and the
+/// graph clock still lands on the latest published time. The loss shows as a
+/// gap in the wire sequence numbers the tap reads ([`SequenceGapWatch`]).
 pub const CLOCK_TAP_DEPTH: usize = 64;
+
+/// The warning the clock tap prints, loud once and then counted, when two
+/// frames it reads in a row skip wire sequence numbers. A sample the tap's
+/// queue ([`CLOCK_TAP_DEPTH`]) could not hold was evicted, so its step merged
+/// into the next one. A gap is a hint, not proof: a publisher can consume a
+/// sequence number without sending a frame.
+pub const CLOCK_SEQUENCE_GAP_WARNING: &str = "the frames read from `/clock` skipped sequence \
+    numbers: the simulator may be publishing faster than the graph steps, and a sample the \
+    run's clock queue could not hold is lost (it merges into the next step, so this run can \
+    step differently from one that saw every sample). A gap is a hint, not proof: a publisher \
+    can consume a sequence number without sending a frame. If every sample must count, \
+    publish `/clock` no faster than the graph steps.";
+
+/// A skip in the wire sequence numbers of two frames the clock tap read in a
+/// row, as [`SequenceGapWatch`] names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceGap {
+    /// The sequence number of the frame read before this one.
+    pub last_seq: u32,
+    /// This frame's sequence number.
+    pub seq: u32,
+    /// How many sequence numbers lie between the two.
+    pub skipped: u32,
+    /// How to report it: loud for the first gap of the run, counted after.
+    pub decision: RegimeDecision,
+}
+
+/// Tracks the wire sequence numbers of the frames the clock tap reads and
+/// names a gap between two consecutive ones, loud once and then counted
+/// ([`FailureRegimeLatch`]; never re-armed, because every gap after the first
+/// is the same condition again).
+///
+/// A gap is a hint, not proof that a sample was lost: a publisher can
+/// consume a sequence number without sending a frame. The converse holds: a
+/// sample the tap's queue evicted had consumed its number, so a loss always
+/// leaves a gap.
+#[derive(Debug, Default)]
+pub struct SequenceGapWatch {
+    last: Option<u32>,
+    latch: FailureRegimeLatch,
+}
+
+impl SequenceGapWatch {
+    /// A watch that has seen no frame.
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            latch: FailureRegimeLatch::new(),
+        }
+    }
+
+    /// Note the sequence number of the next frame read. `Some` when `seq`
+    /// skips past the last one. `None` for the first frame (the baseline),
+    /// the next number, a repeat, and a number behind the last: a stream
+    /// that starts over is a new publisher's, and the backward SAMPLE it
+    /// carries is the feed's to judge. Behind means more than half the
+    /// 32-bit range away, so the counter wraps without a false gap.
+    pub fn observe(&mut self, seq: u32) -> Option<SequenceGap> {
+        let last_seq = self.last.replace(seq)?;
+        let ahead = seq.wrapping_sub(last_seq);
+        if !(2..=u32::MAX / 2).contains(&ahead) {
+            return None;
+        }
+        Some(SequenceGap {
+            last_seq,
+            seq,
+            skipped: ahead - 1,
+            decision: self.latch.on_failure(),
+        })
+    }
+
+    /// How many gaps the watch has seen over the whole run, printed or not.
+    pub fn gaps(&self) -> u64 {
+        self.latch.total_failures()
+    }
+}
 
 /// The `/clock` topic on this process's transport, opened as soon as a
 /// publisher creates it. Open-only: a sim-time graph never mints a phantom
@@ -415,20 +492,65 @@ pub const CLOCK_TAP_DEPTH: usize = 64;
 /// before it attached are not replayed to it, exactly as a sim bridge that
 /// started first is joined mid-stream.
 pub struct ClockTopicSource {
+    graph_name: String,
     transport: Arc<TransportManager>,
     subscriber: Option<DataOnlySubscriber>,
     /// The one-sample drain buffer, reused across polls so a poll allocates
     /// nothing once the first sample has been read.
     drained: Vec<OwnedInboundSample>,
+    /// The sequence numbers of the frames read, for the gap warning.
+    gaps: SequenceGapWatch,
 }
 
 impl ClockTopicSource {
-    /// A source over `transport`'s `/clock`.
-    pub fn new(transport: Arc<TransportManager>) -> Self {
+    /// A source over `transport`'s `/clock`; `graph_name` is for log fields.
+    pub fn new(graph_name: &str, transport: Arc<TransportManager>) -> Self {
         Self {
+            graph_name: graph_name.to_string(),
             transport,
             subscriber: None,
             drained: Vec::with_capacity(1),
+            gaps: SequenceGapWatch::new(),
+        }
+    }
+
+    /// How many sequence gaps the tap has seen, printed or not.
+    pub fn sequence_gaps(&self) -> u64 {
+        self.gaps.gaps()
+    }
+
+    /// Note a read frame's sequence number and report a gap: loud once,
+    /// then counted ([`CLOCK_SEQUENCE_GAP_WARNING`]).
+    fn note_sequence(&mut self, seq: u32) {
+        let Some(gap) = self.gaps.observe(seq) else {
+            return;
+        };
+        match gap.decision {
+            RegimeDecision::Loud => tracing::warn!(
+                graph = %self.graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                last_seq = gap.last_seq,
+                seq = gap.seq,
+                skipped = gap.skipped,
+                "{CLOCK_SEQUENCE_GAP_WARNING}"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                graph = %self.graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                total_failures = total,
+                suppressed,
+                skipped = gap.skipped,
+                "the frames read from the clock topic are still skipping sequence numbers"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                graph = %self.graph_name,
+                topic = SIM_CLOCK_TOPIC,
+                last_seq = gap.last_seq,
+                seq = gap.seq,
+                skipped = gap.skipped,
+                suppressed,
+                "clock tap sequence gap"
+            ),
         }
     }
 
@@ -470,14 +592,18 @@ impl ClockSource for ClockTopicSource {
         let Some(frame) = self.drained.pop() else {
             return Ok(ClockRead::Empty);
         };
+        // Every frame with a header counts for the sequence, a rejected one
+        // too: the number was consumed whatever the body holds.
+        let header = frame.wire_header();
+        if let Some(header) = header {
+            self.note_sequence(header.sequence);
+        }
         // The framing is judged first: a frame whose header does not bound
         // its body is skipped before any field of it is read.
-        Ok(
-            match clock_frame_body(frame.wire_header(), frame.payload()) {
-                Ok((schema_hash, body)) => decode_clock_frame(schema_hash, body),
-                Err(why) => ClockRead::Rejected(why),
-            },
-        )
+        Ok(match clock_frame_body(header, frame.payload()) {
+            Ok((schema_hash, body)) => decode_clock_frame(schema_hash, body),
+            Err(why) => ClockRead::Rejected(why),
+        })
     }
 }
 
@@ -1113,6 +1239,28 @@ mod tests {
             guide.contains(&format!("a queue of {CLOCK_TAP_DEPTH} samples")),
             "docs/time.md must state CLOCK_TAP_DEPTH"
         );
+    }
+
+    /// The guide says what a sequence gap means and what it does not: a
+    /// sample the queue evicted always leaves one, and a gap alone does not
+    /// prove a loss, so a reader neither ignores the warning nor overreads it.
+    #[test]
+    fn the_clock_guide_says_a_sequence_gap_is_a_hint_not_proof() {
+        let guide = include_str!("../../../docs/time.md")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in [
+            "evicts the oldest unread sample",
+            "skip sequence numbers",
+            "A gap is a hint, not proof of a lost sample",
+            "can consume a sequence number without sending a frame",
+        ] {
+            assert!(
+                guide.contains(phrase),
+                "docs/time.md must say {phrase:?} next to the queue depth"
+            );
+        }
     }
 
     /// One fire per accepted sample is how the run behaves today, not part of
@@ -2275,7 +2423,7 @@ mod tests {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("test transport");
-        let mut source = ClockTopicSource::new(Arc::clone(&transport));
+        let mut source = ClockTopicSource::new("sim", Arc::clone(&transport));
 
         // Nobody publishes yet: the topic does not exist, and that is Empty,
         // not an error (open-only never mints the topic).
@@ -2313,5 +2461,146 @@ mod tests {
             ]
         );
         assert_eq!(source.read().expect("read"), ClockRead::Empty);
+    }
+
+    // -----------------------------------------------------------------
+    // Sequence gaps: a hint that the tap lost a sample, loud once, counted
+    // -----------------------------------------------------------------
+
+    /// Hand-written oracle over one publisher's stream: the first number
+    /// sets the baseline, the next number and a repeat are not gaps, a skip
+    /// names the numbers skipped (loud the first time, counted after), a
+    /// number behind the last is a new stream and not a gap, and the counter
+    /// wraps with the 32-bit sequence.
+    #[test]
+    fn the_sequence_gap_watch_names_skipped_numbers_loud_once_then_counted() {
+        use RegimeDecision::{Loud, Suppressed};
+        let mut watch = SequenceGapWatch::new();
+        let gap = |last_seq, seq, skipped, decision| {
+            Some(SequenceGap {
+                last_seq,
+                seq,
+                skipped,
+                decision,
+            })
+        };
+        assert_eq!(watch.observe(5), None, "the first frame is the baseline");
+        assert_eq!(watch.observe(6), None, "the next number");
+        assert_eq!(watch.observe(6), None, "a repeat skips nothing");
+        assert_eq!(
+            watch.observe(9),
+            gap(6, 9, 2, Loud),
+            "7 and 8 were skipped: the first gap is loud"
+        );
+        assert_eq!(watch.observe(10), None);
+        assert_eq!(
+            watch.observe(12),
+            gap(10, 12, 1, Suppressed { suppressed: 1 }),
+            "a second gap is counted, not printed"
+        );
+        assert_eq!(
+            watch.observe(3),
+            None,
+            "a number behind the last is a new publisher's stream, not a gap"
+        );
+        assert_eq!(watch.observe(4), None, "the new stream continues");
+        assert_eq!(
+            watch.observe(u32::MAX),
+            None,
+            "a jump of more than half the range is a new stream too"
+        );
+        assert_eq!(
+            watch.observe(0),
+            None,
+            "the sequence wraps: 0 follows u32::MAX"
+        );
+        assert_eq!(watch.gaps(), 2, "every gap is counted, printed or not");
+    }
+
+    /// A real `/clock` tap with a simulator that outruns it: a burst deeper
+    /// than the tap's queue loses samples, and the next frame read after the
+    /// loss skips their sequence numbers. The warning prints once; a second
+    /// burst is counted and not printed.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_clock_tap_warns_once_when_its_queue_overflows_and_counts_every_gap() {
+        use cerulion_core::transport::TransportConfig;
+        use cerulion_core::wire::MaxSliceLen;
+
+        let clock = Arc::new(VirtualClock::new());
+        let transport = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: format!("sim_clock_gap_{}", std::process::id()),
+                clock: clock.clone(),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .expect("test transport");
+        let mut source = ClockTopicSource::new("sim", Arc::clone(&transport));
+        let mut publisher = transport
+            .create_publisher(SIM_CLOCK_TOPIC, MaxSliceLen::const_new(256), 0)
+            .expect("clock publisher");
+        // Sample `i` carries `i` whole seconds, so a read names its sample.
+        let mut publish = |i: u32| {
+            let mut proxy = publisher.loan_proxy::<Clock>().expect("loan");
+            proxy.clock.sec = i as i32;
+            proxy.clock.nanosec = 0;
+        };
+        let read_all = |source: &mut ClockTopicSource| -> Vec<u64> {
+            let mut got = Vec::new();
+            loop {
+                match source.read().expect("read") {
+                    ClockRead::Sample(ns) => got.push(ns / 1_000_000_000),
+                    ClockRead::Empty => break got,
+                    ClockRead::Rejected(why) => panic!("a clock frame was rejected: {why:?}"),
+                }
+            }
+        };
+        // Open the tap on the first frame, which sets the sequence baseline.
+        assert_eq!(source.read().expect("read"), ClockRead::Empty);
+        publish(0);
+        assert_eq!(read_all(&mut source), [0]);
+        let depth = source
+            .subscriber
+            .as_ref()
+            .expect("opened on the first read")
+            .buffer_size();
+        assert!(depth >= 2, "the tap holds at least two samples: {depth}");
+        let depth = depth as u32;
+
+        // A burst of depth + 3 samples with nothing reading: three are lost.
+        for i in 1..=depth + 3 {
+            publish(i);
+        }
+        let got = read_all(&mut source);
+        assert_eq!(
+            got.len(),
+            depth as usize,
+            "the tap holds exactly its depth; three samples were lost"
+        );
+        assert_eq!(got[0], 4, "the oldest unread samples (1, 2, 3) were lost");
+        assert_eq!(
+            got.last().copied(),
+            Some(u64::from(depth + 3)),
+            "the latest published sample is kept"
+        );
+        assert_eq!(source.sequence_gaps(), 1, "one gap: 1, 2 and 3 skipped");
+
+        // A second burst: lost again, counted, not printed again.
+        for i in depth + 4..=2 * depth + 7 {
+            publish(i);
+        }
+        assert_eq!(read_all(&mut source).len(), depth as usize);
+        assert_eq!(source.sequence_gaps(), 2);
+        logs_assert(|lines: &[&str]| {
+            let loud = count_lines(lines, "skipped sequence numbers");
+            if loud == 1 {
+                Ok(())
+            } else {
+                Err(format!("expected exactly one gap warning, found {loud}"))
+            }
+        });
     }
 }

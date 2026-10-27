@@ -6741,7 +6741,8 @@ pub fn graph_run(
                 topic = cerulion_core::graph::sim_time::SIM_CLOCK_TOPIC,
                 "graph waiting for sim time: the first clock sample starts the run; press Ctrl+C to stop"
             );
-            let source = crate::sim_time_run::ClockTopicSource::new(Arc::clone(&transport));
+            let source =
+                crate::sim_time_run::ClockTopicSource::new(graph_name, Arc::clone(&transport));
             let build_clock = Arc::clone(&clock);
             let built = crate::sim_time_run::run_sim_time(crate::sim_time_run::SimTimeRun {
                 graph_name,

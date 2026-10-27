@@ -23,9 +23,14 @@ decide how far each step advances it, and nothing else moves it. The
 clock-driven schedule is therefore a pure function of the sequence of
 ACCEPTED samples: two runs that accept the same samples step to the same
 stamps, and fire the same period nodes at them. The run reads `/clock`
-through a queue of 64 samples; a sample published while that queue is full
-is dropped and merges into the next step, so a simulator that outruns the
-graph can make two runs over the same published samples step differently.
+through a queue of 64 samples; when that queue is full, the next publish
+evicts the oldest unread sample, which then merges into the next step, so a
+simulator that outruns the graph can make two runs over the same published
+samples step differently. The run warns once, and counts every repeat, when
+the frames it reads from `/clock` skip sequence numbers. A gap is a hint, not
+proof of a lost sample: a publisher can consume a sequence number without
+sending a frame, while a sample the queue evicted always leaves a gap. If
+every sample must count, publish `/clock` no faster than the graph steps.
 Nodes triggered by input data also depend on
 which frames have arrived by each step, and `/clock` alone does not fix that.
 A sim-time run is not recordable yet (`--record` is refused, see the limits
