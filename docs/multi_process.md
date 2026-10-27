@@ -9,7 +9,7 @@ rank's own boundary stream is what a recording carries and what
 `CERULION_EXECUTION_MODE=lockstep` opts a run out into **barrier lockstep**,
 and only there does the deployment hold the SAME deterministic execution
 contract as the single-process monolith: the merged cross-process fire trace
-is byte-identical to the monolith's (the determinism firewall, Principle #7).
+is byte-identical to the monolith's (the determinism firewall: the barrier changes only when a process advances, never what fires).
 Most of this page describes that lockstep machinery, because the barrier is
 the mechanism the split has to explain; each section that does is marked at
 its head, and the free-run default is described under
@@ -382,7 +382,7 @@ A multi-process run is network-viewable exactly like a monolith. The
 **workers carry NO zenoh session**: they publish into and read from shared
 memory only. The deployment's produced topics reach the network through a
 GATEWAY, which taps them on the deployment's iceoryx2 namespace.
-One robot = one network peer (Principle #8).
+One robot = one network peer: only the gateway process holds a zenoh session.
 
 - **Which gateway you get follows the posture.** A run with NO `network:`
   block is PERMISSIVE (every produced topic is egressable; topic announce tokens
@@ -772,7 +772,7 @@ each driven to its own recorded boundary targets:
   single-writer, so the next pass can only take an injection publisher on a
   cross-rank topic once the producing rank's own publisher is gone. Because the
   passes are sequential there is no second `TransportManager` and therefore no
-  Principle-#8 exemption, and no k-clock multiplexing scheduler.
+  exception to one transport per process, and no k-clock multiplexing scheduler.
 - **Injection is re-keyed per CONSUMING rank.** `inject_up_to(target)` has no
   single "the target" once each rank has its own clock, so each pass opens its
   own injectors (for the external sources THAT rank reads, and for the topics

@@ -671,6 +671,40 @@ my_robot/
 
 You shouldn't need to hand-edit `Cargo.toml` or `.cargo/config.toml`; the CLI keeps them in sync. Hand-edit `nodes/<type>/src/lib.rs`, `graphs/*.yaml`, and `schemas/*.yaml`. Port and trigger-policy metadata lives entirely in `src/lib.rs` (there is no `.cerulion.yaml` sidecar, and graph YAML carries no `policy:` block; the macro on the node is the single source of truth, and `cerulion node info` / `cerulion node list` parse the source directly).
 
+### A node crate is a cdylib and an rlib
+
+`cerulion node create` writes a node crate with two library targets and a `pub` node struct:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+```
+
+```rust
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+pub struct TimerNode {
+    // ...
+}
+```
+
+The `cdylib` is what `cerulion node build` and `cerulion graph run` load. The `rlib` lets another Rust crate, such as an app's own native library, link the node as a plain dependency. That crate depends on the node with `default-features = false`, which turns off the `cdylib` feature and with it the node's C exports (`cerulion_node_info` and the rest), so two linked nodes never clash on one symbol name:
+
+```toml
+[dependencies]
+timer = { path = "../nodes/timer", default-features = false }
+```
+
+Keep that crate out of the node workspace: give it its own `[workspace]` table and build it from its own directory. Cargo merges a package's features across everything one build selects, so a build that also selects the node packages (a plain `cargo build` at the node workspace root, for example) turns their default `cdylib` feature back on, compiles the C exports into the linking crate, and two linked nodes then fail to link on the shared `cerulion_node_info` name.
+
+The items the macro generates for a node take the struct's visibility, so the struct must be `pub` for another crate to reach the node.
+
+A node crate made before this layout needs two edits to link this way: change `crate-type = ["cdylib"]` to `crate-type = ["cdylib", "rlib"]` in its `Cargo.toml`, and change `struct <Name>` to `pub struct <Name>` on the `#[cerulion_node]` struct in `src/lib.rs`. Nothing else changes: the node still builds and runs with `cerulion node build` and `cerulion graph run` as before.
+
 ---
 
 ## Node author API (the macros)
@@ -919,7 +953,7 @@ fire reads its own set's trigger members.
 fn external_source(&mut self) -> ExternalSource { ... }
 ```
 
-`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live (Principle #7). `ExternalSource` (re-exported in the prelude) has three variants:
+`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live. `ExternalSource` (re-exported in the prelude) has three variants:
 
 | Variant | Meaning |
 |---|---|
@@ -976,7 +1010,7 @@ compile error listing these.
 
 #### The determinism lint
 
-Principle #7 says a replay is byte-identical to the live run, and the commonest
+A replay is byte-identical to the live run, and the commonest
 way to break it is one line in a tick body. So `#[cerulion_node_impl]` walks
 your impl block for calls that cannot replay and **refuses to compile** three
 of them:
@@ -2214,7 +2248,7 @@ Runtime controls (`cerulion graph run`, `node run`):
   The ONE exception: `--record` + an explicit block declaring `ingress:` is
   refused (naming both workarounds: recorded ingress re-injection
   is not replay-faithful). Replay is structurally network-inert (the bag
-  is the input, Principle #7).
+  is the input, and a replay must match the live run).
 - `--time-source virtual`/`external` keep the network INERT (replay-class);
   `graph profile` is local-only by design.
 
@@ -2511,7 +2545,7 @@ There are **three input-side policies** (`#[input(backpressure = ...)]`) plus **
 |---|---|
 | `#[input(backpressure = drop_oldest)] image: Image` (default) | iceoryx2-native eviction. When the subscriber's queue is full and a new sample arrives, the oldest unconsumed sample is reclaimed for the new one. "Latest wins": natural for sensor data where stale samples are useless. The data path stays fully iceoryx2-native (no Cerulion buffer/copy), and the subscriber **counts** evictions at drain time via **per-publisher-stream wire-sequence gaps**, keyed by iceoryx2's `sample.origin()` id, so `backpressure_drop_oldest_count` and the `#[on_event(input = "...")]` handler surface the loss **exactly per publisher stream**, with no cap: a consumer lagging by many buffers' worth reports the true loss, multi-publisher topics attribute evictions to the right stream, and a publisher restart simply starts a new stream (its first observation baseline-establishes, uncounted; prior history is unknowable). History replay to late joiners (*backward* sequences within a stream) is recognized as duplicate re-delivery and never counted (re-warned periodically if it persists). Corrupt (undersized) frames and errored drains reset the detector's baselines, and a stream displaced by baseline-capacity eviction under publisher churn re-establishes uncounted for one window; every edge errs toward under-reporting (the conservative direction; never fabricated). This is the default for any input that declares no policy. |
 | `#[input(backpressure = sample(N))] lidar: PointCloud` | Subscriber-side **read-gate** (decimation). On each read (a trigger input pops its next queued sample in FIFO order; a latest-value context input drains to the newest), the sample is accepted only if its **wire `timestamp_ns`** (publish clock, replay-deterministic) is ≥ `N` ms after the last accepted read; otherwise it is **decimated** (dropped and counted, returning no data this tick). Caps the *read* rate without copying or buffering. On a per-set **Sync** trigger input the gate runs BEFORE matching, so only admitted frames are eligible to join a set, and a decimated read caps that step's burst at one set (the backlog is still served in full, one set per boundary). A decimated frame still resets that input's `expect_within_ms` watchdog: the arrival is evidence the producer is alive, and decimation is this consumer's own policy. A gate wider than the node's `sync_window_ms` builds with one `warn!` naming both windows; see [Per-set Sync delivery](#per-set-sync-delivery). |
-| `#[input(backpressure = block)] image: Image` | Scheduler **pre-fire defer**: no data loss (Principle #6). A real-time `outstanding` counter mirrors the consumer's queue depth (incremented at publish, decremented at drain). The moment `outstanding == depth` (the declared `#[input(depth = N)]`, which IS the input's real iceoryx2 queue: the topic's service is provisioned at `max(transport default, largest consumer depth)`, so the declaration is always honored, never silently capped), the producer's tick is **deferred**, *before* the queue overflows, so no sample is ever dropped. On a data-trigger consumer this is lossless **end to end**: per-message FIFO consumption serves every queued sample to its own fire, so the tick observes the complete, contiguous stream (not just the newest at fire time). On a per-set **Sync** trigger input it is lossless end to end too, and the mirror counts a frame the alignment is HOLDING as unserved, so `depth` stays exact rather than becoming `depth` plus the matcher's slots. The cost is that a starved partner holds the producer at `depth` indefinitely; see [Per-set Sync delivery](#per-set-sync-delivery). Only installed when **every** consumer of the topic is `block` (see degradation below). The topic **must have an in-graph producer** (build-time validated; an external publisher can't be deferred). Under multi-process, the producer and every `block` consumer of the topic are put in ONE process group automatically. A hand-written `process_groups:` may SPLIT them, and is accepted when the edge can carry a **cross-process credit word**, a shared-memory cell both workers operate on, minted per edge by the supervisor for a topic with exactly one in-graph producer and no non-`block` consumers. Splitting any other `block` edge is refused at plan time, before any worker starts, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`). |
+| `#[input(backpressure = block)] image: Image` | Scheduler **pre-fire defer**: no data loss. A real-time `outstanding` counter mirrors the consumer's queue depth (incremented at publish, decremented at drain). The moment `outstanding == depth` (the declared `#[input(depth = N)]`, which IS the input's real iceoryx2 queue: the topic's service is provisioned at `max(transport default, largest consumer depth)`, so the declaration is always honored, never silently capped), the producer's tick is **deferred**, *before* the queue overflows, so no sample is ever dropped. On a data-trigger consumer this is lossless **end to end**: per-message FIFO consumption serves every queued sample to its own fire, so the tick observes the complete, contiguous stream (not just the newest at fire time). On a per-set **Sync** trigger input it is lossless end to end too, and the mirror counts a frame the alignment is HOLDING as unserved, so `depth` stays exact rather than becoming `depth` plus the matcher's slots. The cost is that a starved partner holds the producer at `depth` indefinitely; see [Per-set Sync delivery](#per-set-sync-delivery). Only installed when **every** consumer of the topic is `block` (see degradation below). The topic **must have an in-graph producer** (build-time validated; an external publisher can't be deferred). Under multi-process, the producer and every `block` consumer of the topic are put in ONE process group automatically. A hand-written `process_groups:` may SPLIT them, and is accepted when the edge can carry a **cross-process credit word**, a shared-memory cell both workers operate on, minted per edge by the supervisor for a topic with exactly one in-graph producer and no non-`block` consumers. Splitting any other `block` edge is refused at plan time, before any worker starts, naming which bar it hit (two or more in-graph producers, or a MIXED topic whose `block` consumers are degraded to `drop_oldest`). |
 
 **Default is `drop_oldest`.** Inputs that declare no policy get it.
 
@@ -2732,7 +2766,7 @@ Graph topics are provisioned from the topology (no knobs to tune):
 
 Event-service listener/notifier caps are provisioned as subscribers + publishers (each attacher of either kind uses one listener + one notifier), so the spare slots hold for the whole attach (data + events). Declaring `history_size` larger than a consumer's `depth` warns at build: that consumer's queue can only retain the newest `depth` replayed frames.
 
-### Determinism (Principle #7)
+### Determinism: replay matches live
 
 All policies, and their `BackpressureEvent`s, are deterministic under `VirtualClock`:
 - `drop_oldest`: iceoryx2 queue-driven, not clock-driven; deterministic by construction. The eviction *event* is keyed off the **wire `sequence`** gap (publish-side, monotonic per producer), not wall-clock; replay-identical.
@@ -2750,7 +2784,7 @@ Two runs of the same graph with the same input sequence and `VirtualClock` advan
 
 ## Splitting a `block` edge across processes: the credit word
 
-`block` is lossless by declaration (Principle #6): the producer defers its own fire while the
+`block` is lossless by declaration (no data loss): the producer defers its own fire while the
 consumer is at depth, so nothing is evicted. Inside one process the producer reads the
 consumer's `outstanding` counter directly. Across a process boundary it cannot, so
 a `block` edge whose producer and consumer land in different `process_groups:` cannot
@@ -3128,7 +3162,7 @@ sleep-recheck tier.
 Without that poll a park would never watch external fds at all and an
 ingress node would wake only at the ≤250 ms park timeout, throttling a lidar
 to a few Hz. Wake attribution is observable via the `wakes_external_fd` field in
-the live-loop exit telemetry (Principle #3). Note the C-state cap table entry
+the live-loop exit telemetry. Note the C-state cap table entry
 above: the cap is skipped while the park is active, which includes
 external-fd graphs on all tiers.
 

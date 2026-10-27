@@ -11,7 +11,7 @@ use native_ros2_messages::std_msgs::Int32;
 // carries the VALUE of `step` under the node's `params:`.
 #[cerulion_node(period_ms = 100)]
 #[derive(Default)]
-struct TimerNode {
+pub struct TimerNode {
     #[output]
     count: Int32,
 
