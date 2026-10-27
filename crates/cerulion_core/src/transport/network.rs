@@ -3690,15 +3690,22 @@ impl NetworkManager {
     /// [`LanAccess::Paired`] suspends every live ingress entry (see
     /// [`Self::register_ingress`]): it undeclares the entry's zenoh data
     /// subscriber and demand token and keeps its injector and counters. It then
-    /// waits out every in-flight receive callback before it returns (after every
-    /// lock here is released), so once it returns no LAN frame is re-injected
-    /// into local iceoryx2 until access reopens. A receive callback that runs
-    /// after the switch refuses its frame and counts it in
+    /// waits out every receive callback that already passed its posture check
+    /// (each holds the ingress gate through re-injection), after every lock here
+    /// is released. So once it returns, no frame from the zenoh LAN plane is
+    /// re-injected into local iceoryx2 until access reopens. A receive callback
+    /// that checks the posture after the switch, including one still in flight
+    /// when this call returns, refuses its frame and counts it in
     /// [`IngressStats::lan_refused_drops`]. An entry registered while paired
     /// declares neither handle. Reopening declares both handles again for every
     /// suspended entry; a failed declaration logs a warning and the next open
-    /// retries it. The remote plane's re-inject seam does not consult this
-    /// posture.
+    /// retries it.
+    ///
+    /// Two paths do not consult this posture. The demand GET loop
+    /// ([`Self::start_demand_get_loop`]) keeps sending, while paired, a GET that
+    /// names each ingress topic it demands. [`IngressInjector::reinject_raw`]
+    /// re-injects for any caller that holds an injector, the remote plane among
+    /// them.
     pub fn set_lan_access(&self, access: LanAccess) {
         self.apply_lan_access(access);
     }
@@ -6127,6 +6134,44 @@ mod tests {
         assert!(bridges.enable_bridge("/topic").unwrap());
         assert!(bridges.is_enabled("/topic").unwrap());
         assert!(!bridges.is_lan_closed().unwrap());
+    }
+
+    /// Closing LAN access waits out a receive callback that passed its posture
+    /// check: once the paired flag is stored (so a callback that checks it now
+    /// refuses its frame), the switch must NOT return while a callback holds
+    /// the ingress gate's shared guard, and it must return once that drops.
+    #[test]
+    fn paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        manager.set_lan_access(LanAccess::Open);
+        // The held shared guard stands in for a callback mid re-injection.
+        let callback = manager
+            .ingress_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                manager.set_lan_access(LanAccess::Paired);
+                tx.send(()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !manager.lan_paired.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the switch must store the paired flag before it waits"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "the switch must wait while a callback holds the ingress gate"
+            );
+            drop(callback);
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the switch must return once the in-flight callback finishes");
+        });
     }
 
     #[test]
