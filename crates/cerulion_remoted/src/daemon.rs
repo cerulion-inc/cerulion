@@ -165,10 +165,14 @@ pub async fn serve_endpoint(
     let classify = Arc::new(PairingAuthorizer::from_shared(shared.clone()));
     // The robot's own revocation fetch: the supervisor's sync worker leaves
     // fetched epochs in the state directory, applied here on a poll.
-    let pull = config
-        .store_file
-        .parent()
-        .map(|dir| Arc::new(EpochPull::new(dir, shared.clone(), access_clock.clone())));
+    let pull = config.store_file.parent().map(|dir| {
+        let recheck = crate::epoch_pull::resolve_key_recheck(
+            std::env::var(crate::epoch_pull::KEY_RECHECK_ENV)
+                .ok()
+                .as_deref(),
+        );
+        Arc::new(EpochPull::new(dir, shared.clone(), access_clock.clone()).with_recheck(recheck))
+    });
     let poller = pull.clone().map(|pull| tokio::spawn(pull.run()));
     // The wire plane's epoch-sync sink gets the SAME live handle + the SAME
     // trusted clock the accept gate and the access list run on, so a desk-pushed

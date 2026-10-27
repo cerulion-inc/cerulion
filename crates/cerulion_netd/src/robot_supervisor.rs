@@ -247,7 +247,8 @@ fn run(
             .map_err(|error| format!("starting robot server: {error}"))?,
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
-    let mut epoch_sync = EpochSync::new(cli, root.clone(), Instant::now());
+    let period = resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref());
+    let mut epoch_sync = EpochSync::new(cli, root.clone(), period, Instant::now());
     let result = supervise_server(
         &mut child,
         &mut epoch_sync,
@@ -296,20 +297,53 @@ fn supervise_server(
     Ok(())
 }
 
-/// How often a serving robot fetches its own revocation epoch: the longest a
-/// revocation waits when the revoked key never connects.
-const EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(300);
+/// The environment variable setting how often a serving robot fetches its own
+/// revocation epoch, in whole seconds ([`MIN_EPOCH_SYNC_PERIOD`] to
+/// [`MAX_EPOCH_SYNC_PERIOD`]).
+pub const EPOCH_SYNC_PERIOD_ENV: &str = "CERULION_NETD_EPOCH_SYNC_PERIOD_S";
+/// The default fetch period. It bounds the revocation lag for a key that stays
+/// away, at one HTTPS request per robot per period to the account service.
+const DEFAULT_EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(300);
+/// The shortest accepted period: below it the fetch would run about as often as
+/// the early fetch a connecting key already triggers.
+const MIN_EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(30);
+/// The longest accepted period (one day).
+const MAX_EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(86_400);
+
+/// The fetch period from an [`EPOCH_SYNC_PERIOD_ENV`] value: whole seconds
+/// within the accepted range, else [`DEFAULT_EPOCH_SYNC_PERIOD`] with a warning.
+pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
+    let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_EPOCH_SYNC_PERIOD;
+    };
+    match value.parse::<u64>().map(Duration::from_secs) {
+        Ok(period) if (MIN_EPOCH_SYNC_PERIOD..=MAX_EPOCH_SYNC_PERIOD).contains(&period) => period,
+        _ => {
+            tracing::warn!(
+                value,
+                "{EPOCH_SYNC_PERIOD_ENV} must be whole seconds from {} to {}; using {} s",
+                MIN_EPOCH_SYNC_PERIOD.as_secs(),
+                MAX_EPOCH_SYNC_PERIOD.as_secs(),
+                DEFAULT_EPOCH_SYNC_PERIOD.as_secs()
+            );
+            DEFAULT_EPOCH_SYNC_PERIOD
+        }
+    }
+}
 /// The bound on one revocation fetch: above the worker's own worst case (a
 /// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
 /// access request), so the deadline never cuts a refresh in flight.
 const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
 /// How long shutdown waits for a running fetch before stopping it.
 const EPOCH_SYNC_STOP_GRACE: Duration = Duration::from_secs(5);
-/// The shortest gap between two fetches started by connection requests.
+/// The shortest gap between two fetches started by connection requests: caps
+/// the account-service load connecting keys can cause at 12 requests a minute.
 const EPOCH_EARLY_FETCH_GAP: Duration = Duration::from_secs(5);
-/// The first wait after a failed fetch; doubles per consecutive failure.
+/// The first wait after a failed fetch, doubling per consecutive failure, so a
+/// brief outage costs one short delay and a long one backs off.
 const EPOCH_SYNC_FIRST_RETRY: Duration = Duration::from_secs(5);
-/// The longest wait between failed fetches; fetching never stops.
+/// The longest wait between failed fetches (the default period); fetching
+/// never stops.
 const EPOCH_SYNC_MAX_RETRY: Duration = Duration::from_secs(300);
 /// The file remoted writes to ask for an early fetch
 /// (`cerulion_remoted::epoch_pull::EPOCH_REQUEST_FILE`).
@@ -324,12 +358,13 @@ fn epoch_sync_delay(failures: u32) -> Duration {
 }
 
 /// The robot's revocation sync: runs the hidden `robot-sync-epoch` worker at
-/// start, every [`EPOCH_SYNC_PERIOD`], and early (at most every
+/// start, every configured period ([`EPOCH_SYNC_PERIOD_ENV`]), and early (at most every
 /// [`EPOCH_EARLY_FETCH_GAP`]) when remoted asks; backs off on failure. A
 /// failure never stops the robot: remoted applies only a verified epoch.
 struct EpochSync {
     cli: PathBuf,
     root: PathBuf,
+    period: Duration,
     child: Option<(OwnedChild, Instant)>,
     next: Instant,
     last_start: Option<Instant>,
@@ -337,10 +372,11 @@ struct EpochSync {
 }
 
 impl EpochSync {
-    fn new(cli: PathBuf, root: PathBuf, now: Instant) -> Self {
+    fn new(cli: PathBuf, root: PathBuf, period: Duration, now: Instant) -> Self {
         Self {
             cli,
             root,
+            period,
             child: None,
             next: now,
             last_start: None,
@@ -417,7 +453,7 @@ impl EpochSync {
     fn finish(&mut self, ok: bool, now: Instant) {
         if ok {
             self.failures = 0;
-            self.next = now + EPOCH_SYNC_PERIOD;
+            self.next = now + self.period;
         } else {
             self.failures = self.failures.saturating_add(1);
             let delay = epoch_sync_delay(self.failures);

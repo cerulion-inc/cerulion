@@ -1061,6 +1061,33 @@ mod tests {
         assert!(!request.exists());
     }
 
+    #[test]
+    fn the_recheck_interval_comes_from_its_setting_and_is_honoured() {
+        use crate::epoch_pull::{resolve_key_recheck, EpochPull, EPOCH_REQUEST_FILE};
+        let secs = |v: Option<&str>| resolve_key_recheck(v).as_secs();
+        assert_eq!(secs(None), 60);
+        assert_eq!(secs(Some(" 15 ")), 15);
+        assert_eq!(secs(Some("5")), 5);
+        assert_eq!(secs(Some("3600")), 3_600);
+        for bad in ["4", "3601", "0", "1m", "x"] {
+            assert_eq!(secs(Some(bad)), 60, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shared = provision(dir.path());
+        shared
+            .claim(&[1u8; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+            .unwrap();
+        // A zero interval: every accept of an admitted key requests a fetch.
+        let pull = EpochPull::new(dir.path(), shared, RemotedClock::fixed(T_NOW))
+            .with_recheck(std::time::Duration::ZERO);
+        assert!(pull.note_accept(&[1u8; 32]));
+        std::fs::remove_file(dir.path().join(EPOCH_REQUEST_FILE)).unwrap();
+        assert!(
+            pull.note_accept(&[1u8; 32]),
+            "the configured interval applies"
+        );
+    }
+
     // ── SharedTrust::apply_epoch device revocation ───────────────────────────
 
     /// The intermediate cert the store trusts (`int_sk` signed by the single root),

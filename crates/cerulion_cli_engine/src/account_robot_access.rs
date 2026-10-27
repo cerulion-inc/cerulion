@@ -25,8 +25,10 @@ const PROBE_REPLY_ALLOWANCE: Duration = Duration::from_millis(50);
 // second) costs nothing visible, long enough not to spin on the socket.
 const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// The bound on refreshing one robot's revocation epoch into the desk's epoch
-/// cache before that robot is dialed: one HTTPS request. A listing refreshes all
-/// the robots it will probe in parallel under this one bound.
+/// cache before that robot is dialed: one HTTPS request, which a working link
+/// answers well inside it, so a listing waits at most this long on an
+/// unreachable account service. A listing refreshes all the robots it will
+/// probe in parallel under this one bound.
 pub const EPOCH_SYNC_BUDGET: Duration = Duration::from_secs(1);
 /// The most robots one listing probes: the listing budget over the per-robot one.
 const MAX_PROBED_ROBOTS: usize =

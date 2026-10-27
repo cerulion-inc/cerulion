@@ -82,21 +82,36 @@ robot supervisor runs a hidden internal worker, `cerulion robot-sync-epoch`, tha
 fetches `GET /v1/robots/{id}/access` with the robot's own login and leaves the
 signed epoch in `<state>/remoted/epoch.pending`; `cerulion-remoted` applies it
 through `SharedTrust::apply_epoch`, re-verifying it against the robot's own roots.
-The worker runs at start, every `EPOCH_SYNC_PERIOD` (300 s), and early, at most every
-5 s, when an admitted key that has not connected in the last `KEY_RECHECK_INTERVAL`
-(60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
+The worker runs at start, every `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300 s), and early, at most every
+5 s, when an admitted key that has not connected in the last `CERULION_REMOTED_EPOCH_RECHECK_S`
+(default 60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
 and the sweep below evicts live sessions. A failed fetch backs off from 5 s doubling
 to 300 s and changes nothing: only a verified, strictly newer epoch removes a key, so
 a robot never strands.
 
 Worst-case lag from the owner's revoke to enforcement, on a robot whose login is
-valid: one fetch period plus one fetch plus one poll, about
-`EPOCH_SYNC_PERIOD` (300 s) + `EPOCH_SYNC_DEADLINE` (120 s) + 2 s. That bound holds
+valid: one fetch period plus one fetch plus one poll, by default about
+300 s + 120 s + 2 s. That bound holds
 whether or not the revoked key connects, and it is what applies to a desk holding one
-connection open, a key that connected within the last 60 s, and a robot whose
-fetches are backing off. Enforcement comes within seconds (the early fetch plus one
-poll) only when the revoked key opens a new connection after 60 s away while fetches
-are succeeding.
+connection open, a key that connected within the recheck interval, and a robot whose fetches are
+backing off once the account service is reachable again (while it is unreachable, no
+bound holds). Enforcement comes within seconds (the early fetch plus one poll) only
+when the revoked key opens a new connection after the recheck interval away while
+fetches are succeeding.
+
+| Setting | Default | What it bounds and costs |
+|---|---|---|
+| `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (30 to 86400) | 300 | The revocation lag for a key that stays away, at one HTTPS request per robot per period to the account service (288 a day). 300 s keeps that load negligible while a stolen desk that holds a connection open is cut within minutes. |
+| `CERULION_REMOTED_EPOCH_RECHECK_S` (5 to 3600) | 60 | How soon a key that reconnects asks for another early fetch. Shorter cuts a quickly reconnecting revoked key sooner, at up to one extra request per key per interval. |
+| Fetch deadline | 120 s | Above the worker's own worst case (a 30 s refresh-lock wait, a 30 s session refresh, a 30 s access request), so it never stops a session refresh midway. |
+| Failure backoff | 5 s doubling to 300 s | A short outage costs one short delay; a long one stops hammering the service. Fetching never stops. |
+| Apply poll | 2 s | The time from a fetched epoch to enforcement, at one file check per poll. |
+| Desk refresh bound (`EPOCH_SYNC_BUDGET`) | 1 s | The most a listing or `viz --robot` waits on the account service before dialing. |
+
+Polling is the delivery mechanism because nothing can reach a robot from the account
+service today. The planned replacement is a change notification pushed from the
+account service to the robot, which would make the lag a network round trip and drop
+the periodic requests; the periodic fetch would then remain only as the fallback.
 The fetch needs the robot's login to stay valid; a robot whose login lapses keeps
 its last applied epoch.
 

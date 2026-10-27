@@ -501,7 +501,8 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
 - **The robot fetches its own epoch.** On a registered robot, netd's supervisor
   runs the hidden `cerulion robot-sync-epoch --state-root <root>` worker (an
   internal process, never an operator command; it refuses without a robot
-  registration or a provisioned `remoted/` directory) at start, every 300 s,
+  registration or a provisioned `remoted/` directory) at start, every
+  `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300 s),
   early on remoted's `epoch.request`, with 5 s to 300 s backoff and a 120 s
   deadline above its own worst case, so the deadline never cuts a session
   refresh in flight. It fetches `/v1/robots/{id}/access` with the robot's own

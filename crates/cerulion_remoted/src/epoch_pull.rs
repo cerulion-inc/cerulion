@@ -11,7 +11,8 @@
 //! signature, issuer and robot id are checked, and only a strictly newer epoch
 //! changes anything. A missing, unreadable or rejected file changes nothing.
 //!
-//! When a key connects that has not been seen for [`KEY_RECHECK_INTERVAL`],
+//! When a key connects that has not been seen for the recheck interval
+//! ([`KEY_RECHECK_ENV`], default [`KEY_RECHECK_INTERVAL`]),
 //! [`EpochPull::note_accept`] writes [`EPOCH_REQUEST_FILE`], which the
 //! supervisor reads as a request to fetch now rather than at the next period.
 
@@ -33,13 +34,50 @@ const EPOCH_CLAIMED_FILE: &str = "epoch.pending.applying";
 /// The file remoted writes to ask the supervisor for an early fetch.
 pub const EPOCH_REQUEST_FILE: &str = "epoch.request";
 /// How often remoted looks for a fetched epoch: the longest a fetched
-/// revocation waits before it is enforced.
+/// revocation waits before it is enforced; a stat of one file per poll.
 pub const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// A key seen more recently than this does not request another early fetch.
+/// The environment variable setting how long a connecting key that was seen
+/// before goes without requesting another early fetch, in whole seconds
+/// ([`MIN_KEY_RECHECK_INTERVAL`] to [`MAX_KEY_RECHECK_INTERVAL`]).
+pub const KEY_RECHECK_ENV: &str = "CERULION_REMOTED_EPOCH_RECHECK_S";
+/// The default recheck interval. A revoked key reconnecting after this long away
+/// is cut within seconds; one reconnecting sooner waits for the next periodic
+/// fetch. Each recheck costs at most one early fetch per key per interval.
 pub const KEY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
-/// The largest pending artifact read; a larger file is discarded unread.
+/// The shortest accepted recheck interval.
+const MIN_KEY_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// The longest accepted recheck interval (one hour).
+const MAX_KEY_RECHECK_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// The recheck interval from a [`KEY_RECHECK_ENV`] value: whole seconds within
+/// the accepted range, else [`KEY_RECHECK_INTERVAL`] with a warning.
+pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
+    let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return KEY_RECHECK_INTERVAL;
+    };
+    match value.parse::<u64>().map(Duration::from_secs) {
+        Ok(interval)
+            if (MIN_KEY_RECHECK_INTERVAL..=MAX_KEY_RECHECK_INTERVAL).contains(&interval) =>
+        {
+            interval
+        }
+        _ => {
+            tracing::warn!(
+                value,
+                "{KEY_RECHECK_ENV} must be whole seconds from {} to {}; using {} s",
+                MIN_KEY_RECHECK_INTERVAL.as_secs(),
+                MAX_KEY_RECHECK_INTERVAL.as_secs(),
+                KEY_RECHECK_INTERVAL.as_secs()
+            );
+            KEY_RECHECK_INTERVAL
+        }
+    }
+}
+/// The largest pending artifact read (far above a real epoch); a larger file is
+/// discarded unread.
 const MAX_PENDING_BYTES: u64 = 1024 * 1024;
-/// Keys remembered for the recheck interval; past this the oldest are dropped.
+/// Keys remembered for the recheck interval, bounding the map's memory; past
+/// this the expired entries, then all, are dropped.
 const MAX_REMEMBERED_KEYS: usize = 4096;
 
 /// What one look at [`EPOCH_PENDING_FILE`] did.
@@ -66,6 +104,7 @@ pub struct EpochPull {
     dir: PathBuf,
     shared: SharedTrust,
     clock: RemotedClock,
+    recheck: Duration,
     seen: Mutex<HashMap<[u8; 32], Instant>>,
 }
 
@@ -76,8 +115,16 @@ impl EpochPull {
             dir: dir.into(),
             shared,
             clock,
+            recheck: KEY_RECHECK_INTERVAL,
             seen: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Use `recheck` in place of [`KEY_RECHECK_INTERVAL`].
+    #[must_use]
+    pub fn with_recheck(mut self, recheck: Duration) -> Self {
+        self.recheck = recheck;
+        self
     }
 
     /// Apply [`EPOCH_PENDING_FILE`] if present. The file is first claimed by
@@ -151,7 +198,7 @@ impl EpochPull {
 
     /// Note an accepted connection from `key`; write [`EPOCH_REQUEST_FILE`]
     /// when the key is one this robot admits (the only kind a revocation can
-    /// cut) and it has not been seen within [`KEY_RECHECK_INTERVAL`]. Returns
+    /// cut) and it has not been seen within the recheck interval. Returns
     /// whether a request was written.
     pub fn note_accept(&self, key: &[u8; 32]) -> bool {
         if !matches!(
@@ -164,12 +211,12 @@ impl EpochPull {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         if seen
             .get(key)
-            .is_some_and(|last| now.duration_since(*last) < KEY_RECHECK_INTERVAL)
+            .is_some_and(|last| now.duration_since(*last) < self.recheck)
         {
             return false;
         }
         if seen.len() >= MAX_REMEMBERED_KEYS {
-            seen.retain(|_, last| now.duration_since(*last) < KEY_RECHECK_INTERVAL);
+            seen.retain(|_, last| now.duration_since(*last) < self.recheck);
             if seen.len() >= MAX_REMEMBERED_KEYS {
                 seen.clear();
             }
