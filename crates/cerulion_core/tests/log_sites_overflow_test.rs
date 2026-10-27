@@ -5,9 +5,8 @@
 //! Each site keys its state by its own stable id, so this file runs 66
 //! `warn_once!` sites on one probe instance: the first 64 to run take the 64
 //! entries and the 65th and 66th find none. Two sites past the table, not
-//! one, so that a flag shared by every site (one error per process, as the
-//! first version had) fails the oracle: it would report site 64 and stay
-//! silent on site 65. Hand oracle, over two probe instances `a` (run twice)
+//! one, so that a flag shared by every site (one error per process) fails
+//! the oracle: it would report site 64 and stay silent on site 65. Hand oracle, over two probe instances `a` (run twice)
 //! then `b`, each run calling all 66 sites once:
 //!
 //! - the first run on `a` prints all 66 lines;

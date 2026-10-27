@@ -2281,7 +2281,7 @@ jobs:
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
       # Dropping this step while moving the suite to nextest would silently
-      # retire cerulion_core's 23 doctests, nine `compile_fail` pins among them
+      # retire cerulion_core's 23 doctests, eight `compile_fail` pins among them
       # (`DataOnlySubscriber` must be structurally un-attachable to a WaitSet;
       # three `state` misuse pins; three `bounded_view` lifetime pins; a bare
       # number is not a log throttle period), which is exactly the "ran in no
@@ -3372,7 +3372,7 @@ jobs:
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
       # Dropping this step while moving the suite to nextest would silently
-      # retire cerulion_core's 23 doctests, nine `compile_fail` pins among them
+      # retire cerulion_core's 23 doctests, eight `compile_fail` pins among them
       # (`DataOnlySubscriber` must be structurally un-attachable to a WaitSet;
       # three `state` misuse pins; three `bounded_view` lifetime pins; a bare
       # number is not a log throttle period), which is exactly the "ran in no

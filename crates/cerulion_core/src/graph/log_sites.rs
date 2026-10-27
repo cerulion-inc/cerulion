@@ -66,10 +66,11 @@
 //! grows: no map, no allocation.
 //!
 //! An instance keeps state for [`LOG_SITE_SLOTS`] distinct sites. A site past
-//! that has no entry: it keeps no state at all, every call emits, as the
-//! plain macro would, and the first time each such site runs it says so with
-//! an `error` that names its file, line and module. No site ever shares state
-//! with another site or another instance.
+//! that has no entry: it keeps no state at all and every call emits, as the
+//! plain macro would. The first time in the process that a site finds no
+//! entry, it logs one `error` that names its file, line and module; later
+//! calls of that site that find no entry, on any instance, log nothing. No
+//! site ever shares state with another site or another instance.
 //!
 //! A restore keeps the recorded entries apart until their sites run: a
 //! recorded entry counts toward [`LOG_SITE_SLOTS`] only from its site's first
@@ -81,12 +82,12 @@
 //!
 //! # Cost
 //!
-//! A suppressed call is a few relaxed atomic loads (the table lookup and the
-//! state word) and one clock read (throttle only). It does not format or
-//! evaluate its message arguments, and it allocates nothing. A level the
-//! build compiles out (a release build removes `debug` and `trace`) costs
-//! nothing: the call does not read the clock, keeps no state and takes no
-//! entry.
+//! A suppressed call is a few atomic loads (acquire for the table lookup,
+//! relaxed for the state word) and one clock read (throttle only). It does
+//! not format or evaluate its message arguments, and it allocates nothing. A
+//! level the build compiles out (a release build removes `debug` and `trace`)
+//! costs nothing: the call does not read the clock, keeps no state and takes
+//! no entry.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
