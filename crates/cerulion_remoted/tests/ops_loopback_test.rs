@@ -93,10 +93,12 @@ fn sk(seed: u8) -> SigningKey {
 fn pk(k: &SigningKey) -> PublicKey {
     PublicKey(k.verifying_key().to_bytes())
 }
+/// Valid at `T_NOW` (the ops clock) and at the wall clock `SharedTrust::new`
+/// reads for its accept gate, which bounds a cloud row by its certificate.
 fn wide() -> Validity {
     Validity {
         not_before_ns: 0,
-        not_after_ns: 100_000_000_000_000,
+        not_after_ns: 4_000_000_000_000_000_000,
     }
 }
 
