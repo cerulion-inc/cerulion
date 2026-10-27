@@ -225,7 +225,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // afterwards), browse `_cerulion._tcp` once and fold the answers plus the
     // verified `~/.cerulion/peers.json` cache into the connect endpoints, so a
     // desk dials a LAN robot with NO `CERULION_NETD_CONNECT`. Explicit env
-    // locators stay first and verbatim; discovered rows are TCP-probed so a dead
+    // locators stay first and verbatim (except an unanswered udp/...?rel=1 under
+    // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
     let (network, peer_fold) = match net::network_config_from_env() {

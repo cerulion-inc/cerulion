@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A bounded check that a QUIC endpoint answers on a UDP address, run before
-//! netd's session opens so the boot-time fold can put exactly one locator per
-//! peer into zenoh's connect list.
+//! netd's session opens so the boot-time fold can put one locator per peer
+//! address into zenoh's connect list.
 //!
 //! # Why a probe at all
 //!
@@ -55,8 +55,8 @@ pub const DEFAULT_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often an unanswered probe is resent inside the bound (`kInitialRtt`).
 pub const QUIC_PROBE_RESEND: Duration = Duration::from_millis(333);
 
-/// The reserved QUIC version the probe carries, so every server answers it
-/// with Version Negotiation.
+/// The reserved QUIC version the probe carries; a server with no version in
+/// common answers it with Version Negotiation (quinn-proto does).
 const PROBE_VERSION: u32 = 0x1a2a_3a4a;
 
 /// The smallest datagram a QUIC server answers an unknown version in

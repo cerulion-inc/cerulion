@@ -285,13 +285,14 @@ unencrypted QUIC carrier, `udp/<host>:<port>?rel=1`, where both ends allow it:
   are separate.
 - **Advertise.** The mDNS record gains the TXT key `udp_rel=<port>`.
 - **Dial.** At start-up netd checks, over UDP, every discovered peer that
-  advertises `udp_rel` and every `CERULION_NETD_CONNECT` locator written as
+  advertises `udp_rel` and answered the usual TCP reachability check, and every
+  `CERULION_NETD_CONNECT` locator written as
   `udp/<host>:<port>?rel=1`. A peer that answers is dialled over QUIC. One that
   does not is dialled over `tcp/` on the same host and port, and netd logs one
   warning that starts `QUIC FALLBACK:`, naming the QUIC locator, the reason (the
   UDP port is closed, or no QUIC answer within the bound) and the TCP locator.
-  netd lists one locator per peer, so zenoh never dials the same peer over both
-  carriers at once, unless `CERULION_NETD_CONNECT` itself lists both.
+  netd lists one locator per peer address, so zenoh does not dial one address
+  over both carriers at once, unless `CERULION_NETD_CONNECT` itself lists both.
 
 Explicit `tcp/` connect locators are used as written, and peers taken from
 `~/.cerulion/peers.json` stay on `tcp/`. Only the exact value `on` turns the
@@ -300,8 +301,8 @@ setting on; any other value leaves it off and logs a warning naming the value.
 The check waits at most `CERULION_NETD_QUIC_PROBE_TIMEOUT_MS` (default 1000,
 the first loss timeout QUIC itself uses before it has measured a round trip).
 A closed port answers at once, so the full wait is paid only where UDP is
-dropped without an answer, once per peer each time netd starts, with every peer
-checked at the same time. Raise it only for a path whose round trip is above
+dropped without an answer, once per peer address each time netd starts, with every
+address checked at the same time. Raise it only for a path whose round trip is above
 about 300 ms.
 
 **This QUIC is not encrypted and does not authenticate the peer**, the same as
@@ -311,12 +312,16 @@ large message sent about once a second pays several extra round trips, while
 the QUIC stack has no idle reset. On a robot to cloud link over a WireGuard
 overlay (301 KB request, 6.4 KB reply, once a second, 180 s), the round trip
 was 164.8 ms p50 and 257.7 ms p99 over `tcp/` and 69.2 ms p50 and 109.6 ms p99
-over `udp/...?rel=1`.
+over `udp/...?rel=1`, one run each; the difference was not isolated to the
+idle reset alone.
 
 Limits: the check runs once, when netd starts. A peer that appears later, or a
 QUIC link that later stops passing UDP, is not checked again until netd
-restarts. The per-run gateway child and a graph's `network:` block do not read
-the setting; a `network:` block names `udp/<host>:<port>?rel=1` itself when it
+restarts. A peer that answers only over UDP fails the TCP reachability check
+and is not dialled. With `CERULION_MULTICAST_SCOUTING=on`, peers found by
+scouting are dialled by zenoh itself, over whichever locator it picks. The
+per-run gateway child and a graph's `network:` block do not read the setting;
+a `network:` block names `udp/<host>:<port>?rel=1` itself when it
 wants this carrier.
 
 ## The gateway
@@ -663,7 +668,8 @@ network:
   `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
   `CERULION_NETD_LISTEN`.
 - **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
-  port only (a graph listening on `quic/` alone is not advertised), and
+  port (plus `udp_rel=<port>` under `CERULION_UNENCRYPTED_QUIC=on`, below; a
+  graph listening on `quic/` alone is not advertised), and
   `topic list --connect` takes `<carrier>/<host>:<port>` with no `?` metadata
   and probes it over TCP before it uses it, so it cannot reach a QUIC-only
   robot. Reach one through `CERULION_NETD_CONNECT` or a graph's `connect:`.

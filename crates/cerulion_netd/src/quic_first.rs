@@ -16,7 +16,7 @@
 //!    ([`crate::quic_probe`]) in one parallel round. Answered: the QUIC locator
 //!    goes into the connect list. Not answered: the `tcp/` locator for the same
 //!    address does, and ONE `warn!` names the peer's QUIC locator, the reason and
-//!    the TCP locator. The fold puts one locator per peer into zenoh's connect
+//!    the TCP locator. The fold puts one locator per peer address into zenoh's connect
 //!    list, so zenoh does not run a QUIC and a TCP connector for the same peer
 //!    side by side (unless [`crate::net::CONNECT_ENV`] lists both itself).
 //!
