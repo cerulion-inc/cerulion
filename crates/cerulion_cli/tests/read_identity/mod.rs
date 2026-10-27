@@ -684,6 +684,69 @@ fn ri_flush(id: &str, input: &str, reads: &mut Vec<[u64; 3]>) {
     reads.clear();
 }
 
+/// How many of the relay's first ticks [`ri_flush_times`] reports.
+#[allow(dead_code)]
+const RI_TIMED_TICKS: u32 = 4;
+
+/// This thread's `(on-CPU ns, runqueue-wait ns, timeslices)` from
+/// `/proc/thread-self/schedstat`, zeros where the file is absent.
+/// The instant the relay's first timed tick reads first: tick entry offsets
+/// are measured from it.
+#[allow(dead_code)]
+fn ri_base() -> std::time::Instant {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(std::time::Instant::now)
+}
+
+/// The CPU this thread last ran on: field 39 of `/proc/thread-self/stat`,
+/// `u64::MAX` where the file is absent.
+#[allow(dead_code)]
+fn ri_cpu() -> u64 {
+    let text = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
+    // Fields after the parenthesised command name start at field 3.
+    text.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(39 - 3))
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+#[allow(dead_code)]
+fn ri_schedstat() -> [u64; 3] {
+    let text = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+    let mut out = [0u64; 3];
+    for (slot, word) in out.iter_mut().zip(text.split_whitespace()) {
+        *slot = word.parse().unwrap_or(0);
+    }
+    out
+}
+
+/// Write the relay's timed ticks as `<id>_<pid>_<k>.times`, one line per tick:
+/// `tick <index> <entry offset ns> <wall ns> <cpu ns> <runqueue wait ns> <slices>
+/// <cpu at entry> <cpu at exit>`.
+#[allow(dead_code)]
+fn ri_flush_times(id: &str, times: &[[u64; 8]]) {
+    use std::io::Write as _;
+    let Some(dir) = std::env::var_os("CER_RI_READS_DIR") else {
+        return;
+    };
+    if times.is_empty() {
+        return;
+    }
+    let mut out = String::new();
+    for t in times {
+        out.push_str(&format!(
+            "tick {} {} {} {} {} {} {} {}\n",
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]
+        ));
+    }
+    static K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("{id}_{}_{k}.times", std::process::id()));
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
 fn ri_sleep(us: u64) {
     if us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(us));
@@ -747,11 +810,17 @@ struct RiRelayNode {
     ri_sleep_every: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
+    ri_times: Vec<[u64; 8]>,
 }
 
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
+        let timed = ri_on() && self.tick_count < RI_TIMED_TICKS;
+        let base = ri_base();
+        let entry = std::time::Instant::now();
+        let sched_entry = if timed { ri_schedstat() } else { [0; 3] };
+        let cpu_entry = if timed { ri_cpu() } else { 0 };
         if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
             ri_sleep(self.ri_sleep_us);
         }
@@ -763,11 +832,26 @@ impl RiRelayNode {
         self.out.x = self.ri_writer as f64;
         self.out.y = f64::from(self.tick_count);
         self.out.z = ri_fold(r);
+        if timed {
+            let sched_exit = ri_schedstat();
+            let cpu_exit = ri_cpu();
+            self.ri_times.push([
+                u64::from(self.tick_count - 1),
+                entry.duration_since(base).as_nanos() as u64,
+                entry.elapsed().as_nanos() as u64,
+                sched_exit[0].saturating_sub(sched_entry[0]),
+                sched_exit[1].saturating_sub(sched_entry[1]),
+                sched_exit[2].saturating_sub(sched_entry[2]),
+                cpu_entry,
+                cpu_exit,
+            ]);
+        }
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), NodeError> {
         ri_flush(&self.ri_id, "inp", &mut self.ri_reads);
+        ri_flush_times(&self.ri_id, &self.ri_times);
         Ok(())
     }
 }

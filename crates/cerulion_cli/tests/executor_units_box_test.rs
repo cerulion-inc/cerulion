@@ -40,6 +40,11 @@
 //!   same as the same fixture recorded process per node, whose bag has the same
 //!   rank shape (an evicting stream is printed, not compared: a replay through
 //!   a real queue reproduces no eviction under any placement).
+//! * `a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process`:
+//!   the three-rank chain recorded both ways; the relay's first fire co-hosted
+//!   must stay within a bound of its own-process twin. A first fire longer than
+//!   the relay's queue depth in source periods drains frames that arrived
+//!   during it, which the replay can only place by its recorded-clock fallback.
 //!
 //! Each timing leg prints one line:
 //!
@@ -824,4 +829,169 @@ fn a_late_relay_with_one_process_per_node_replay_probe() {
             print_read_window(&run.bag, "late_relay_declared", live.seq);
         }
     }
+}
+
+/// Runs of each placement the first-fire arm records.
+const FIRST_FIRE_REPS: usize = 3;
+/// The floor of the first-fire bound: a co-hosted first fire within this is
+/// within the noise of a quiet host whatever its own-process twin took.
+const FIRST_FIRE_FLOOR_NS: u64 = 2_000_000;
+/// The co-hosted first fire may take at most this many times its own-process
+/// twin, above the floor.
+const FIRST_FIRE_RATIO: u64 = 4;
+
+/// One rank's first fire as the bag records it.
+#[derive(Debug, Clone)]
+struct FirstFire {
+    rank: u32,
+    node: String,
+    /// The FIRE record's duration.
+    dur_ns: u64,
+    /// How many fires the rank's first fired step holds.
+    first_step_fires: usize,
+}
+
+/// Every worker rank's first fire, rank-ascending, from `bag`'s scheduler
+/// trace and its per-rank manifests.
+fn first_fires(bag: &Path) -> Vec<FirstFire> {
+    let reader = cerulion_bag::BagReader::open(bag).expect("RI_HARNESS: open the bag");
+    let mut fires: std::collections::BTreeMap<u32, Vec<(u64, u64)>> = Default::default();
+    for m in reader.messages().expect("RI_HARNESS: walk the bag").flatten() {
+        if m.topic != cerulion_bag::SCHEDULER_TRACE_TOPIC {
+            continue;
+        }
+        for r in m.data.chunks_exact(40) {
+            let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().expect("8 bytes"));
+            let u32_at = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().expect("4 bytes"));
+            if u32_at(32) == 1 {
+                fires
+                    .entry(u32_at(36) & 0xFFFF)
+                    .or_default()
+                    .push((u64_at(0), u64_at(16)));
+            }
+        }
+    }
+    fires
+        .into_iter()
+        .map(|(rank, list)| {
+            let (step, dur_ns) = list[0];
+            let name = format!("__cerulion/trace_manifest_rank{rank}.json");
+            let manifest = reader
+                .attachment(&name)
+                .expect("RI_HARNESS: read attachments")
+                .unwrap_or_else(|| panic!("RI_HARNESS: the bag carries no {name}"));
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest.data)
+                .unwrap_or_else(|e| panic!("RI_HARNESS: {name} does not parse: {e}"));
+            let node = manifest["node_ids"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            FirstFire {
+                rank,
+                node,
+                dur_ns,
+                first_step_fires: list.iter().filter(|f| f.0 == step).count(),
+            }
+        })
+        .collect()
+}
+
+/// Print the relay's timed ticks (`relay_*.times` under `live_dir`).
+fn print_relay_ticks(live_dir: &Path, rep: usize, placement: &str) {
+    let Ok(entries) = std::fs::read_dir(live_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("times") {
+            continue;
+        }
+        for line in mp_support::read_file(&path).lines() {
+            let f: Vec<u64> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|w| w.parse().ok())
+                .collect();
+            if let [tick, at, wall, cpu, wait, slices, cpu_entry, cpu_exit] = f[..] {
+                eprintln!(
+                    "RELAY_TICK rep={rep} placement={placement} tick={tick} at_us={} \
+                     wall_us={} cpu_us={} runqueue_wait_us={} slices={slices} \
+                     cpu_at_entry={cpu_entry} cpu_at_exit={cpu_exit}",
+                    at / 1000,
+                    wall / 1000,
+                    cpu / 1000,
+                    wait / 1000
+                );
+            }
+        }
+    }
+}
+
+/// A node's first fire costs the same whether its unit shares a process or has
+/// one of its own. The three-rank chain is recorded with one process per node
+/// and with every node in one process, `FIRST_FIRE_REPS` times each, and each
+/// rank's first fire is read off the bag. A co-hosted relay's first fire must
+/// take at most `FIRST_FIRE_RATIO` times its own-process twin, or
+/// `FIRST_FIRE_FLOOR_NS`, whichever is more. Each run prints
+///
+/// ```text
+/// FIRST_FIRE rep=<r> placement=<p> rank=<k> node=<id> dur_us=<u> first_step_fires=<n>
+/// RELAY_TICK rep=<r> placement=<p> tick=<i> at_us=<u> wall_us=<u> cpu_us=<u> runqueue_wait_us=<u> slices=<n> cpu_at_entry=<c> cpu_at_exit=<c>
+/// ```
+///
+/// `RELAY_TICK` times the relay's own tick body (its first four) and names the
+/// CPU it entered and left on, so a slow first fire splits into the node's own
+/// code and the framework around it.
+#[test]
+#[ignore = "box-only: timing on a quiet Linux host"]
+#[serial]
+fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
+    let mut failures = Vec::new();
+    for rep in 0..FIRST_FIRE_REPS {
+        let mut relay = std::collections::BTreeMap::new();
+        for placement in [Placement::Declared, Placement::OneGroup] {
+            let run = read_identity::record_live(Fixture::Ranks3, placement);
+            let fires = first_fires(&run.bag);
+            assert_eq!(
+                fires.len(),
+                3,
+                "RI_HARNESS: the three-rank chain recorded fires on {} rank(s)",
+                fires.len()
+            );
+            for f in &fires {
+                eprintln!(
+                    "FIRST_FIRE rep={rep} placement={} rank={} node={} dur_us={} \
+                     first_step_fires={}",
+                    placement.label(),
+                    f.rank,
+                    f.node,
+                    f.dur_ns / 1000,
+                    f.first_step_fires
+                );
+            }
+            print_relay_ticks(&run.live_dir, rep, placement.label());
+            let r = fires
+                .iter()
+                .find(|f| f.node == "relay")
+                .expect("RI_HARNESS: no rank hosts the relay alone");
+            relay.insert(placement.label(), r.dur_ns);
+        }
+        let alone = relay[Placement::Declared.label()];
+        let hosted = relay[Placement::OneGroup.label()];
+        let bound = (alone * FIRST_FIRE_RATIO).max(FIRST_FIRE_FLOOR_NS);
+        if hosted > bound {
+            failures.push(format!(
+                "rep {rep}: co-hosted relay first fire {} us > bound {} us (own process {} us)",
+                hosted / 1000,
+                bound / 1000,
+                alone / 1000
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
