@@ -106,7 +106,8 @@ default + gateway, the discovery ladder, and pairing.
   topics in its demand queries on the LAN. The mDNS beacon remains available
   when the first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
   access after a paired start does not replay topic announcements withheld
-  while paired.
+  while paired; an Android app started with open access announces its
+  registered topics when its start completes.
 
 A refused catalog is not an empty catalog: topic resolution names the robot,
 states that its topics were not searched, and recommends
