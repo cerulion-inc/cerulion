@@ -274,6 +274,51 @@ The alternative is a per-run gateway child, and which child you get matters:
   loudly. It beacons only if one of those locators is a parseable `tcp/` endpoint.
   Your config is the truth, so give it the port you want advertised.
 
+### Unencrypted QUIC first (opt-in)
+
+`CERULION_UNENCRYPTED_QUIC=on` in `cerulion-netd`'s environment, on the robot
+and on the machines that dial it, moves netd's links from `tcp/` to zenoh's
+unencrypted QUIC carrier, `udp/<host>:<port>?rel=1`, where both ends allow it:
+
+- **Listen.** Every `tcp/<host>:<port>` in `CERULION_NETD_LISTEN` also listens
+  on `udp/<host>:<port>?rel=1`. The port number is the same; TCP and UDP ports
+  are separate.
+- **Advertise.** The mDNS record gains the TXT key `udp_rel=<port>`.
+- **Dial.** At start-up netd checks, over UDP, every discovered peer that
+  advertises `udp_rel` and every `CERULION_NETD_CONNECT` locator written as
+  `udp/<host>:<port>?rel=1`. A peer that answers is dialled over QUIC. One that
+  does not is dialled over `tcp/` on the same host and port, and netd logs one
+  warning that starts `QUIC FALLBACK:`, naming the QUIC locator, the reason (the
+  UDP port is closed, or no QUIC answer within the bound) and the TCP locator.
+  netd lists one locator per peer, so zenoh never dials the same peer over both
+  carriers at once, unless `CERULION_NETD_CONNECT` itself lists both.
+
+Explicit `tcp/` connect locators are used as written, and peers taken from
+`~/.cerulion/peers.json` stay on `tcp/`. Only the exact value `on` turns the
+setting on; any other value leaves it off and logs a warning naming the value.
+
+The check waits at most `CERULION_NETD_QUIC_PROBE_TIMEOUT_MS` (default 1000,
+the first loss timeout QUIC itself uses before it has measured a round trip).
+A closed port answers at once, so the full wait is paid only where UDP is
+dropped without an answer, once per peer each time netd starts, with every peer
+checked at the same time. Raise it only for a path whose round trip is above
+about 300 ms.
+
+**This QUIC is not encrypted and does not authenticate the peer**, the same as
+`tcp/`. What it changes is congestion control: a Linux TCP connection that idles
+longer than one retransmission timeout restarts from its initial window, so a
+large message sent about once a second pays several extra round trips, while
+the QUIC stack has no idle reset. On a robot to cloud link over a WireGuard
+overlay (301 KB request, 6.4 KB reply, once a second, 180 s), the round trip
+was 164.8 ms p50 and 257.7 ms p99 over `tcp/` and 69.2 ms p50 and 109.6 ms p99
+over `udp/...?rel=1`.
+
+Limits: the check runs once, when netd starts. A peer that appears later, or a
+QUIC link that later stops passing UDP, is not checked again until netd
+restarts. The per-run gateway child and a graph's `network:` block do not read
+the setting; a `network:` block names `udp/<host>:<port>?rel=1` itself when it
+wants this carrier.
+
 ## The gateway
 
 A per-run gateway process owns one run's whole network plane: the single zenoh
