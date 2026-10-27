@@ -234,69 +234,6 @@ fn service_part_hashes_are_pinned() {
     );
 }
 
-/// One side of a vendored `.srv`, parsed on its own as a `std_srvs` message
-/// under the name ROS 2 gives the part (`<Name>_Request` or
-/// `<Name>_Response`). This is the `.msg` parser, not a ROS 2 peer: the
-/// check against the hash `rmw_cerulion` derives from rosidl introspection is
-/// `crates/rmw_cerulion/tests/service_part_hash_test.rs`.
-fn part_text_as_msg_hash(body: &str, part_name: &str) -> u64 {
-    parse_rosmsg(body, part_name, Some("std_srvs"))
-        .unwrap_or_else(|e| panic!("{part_name} must parse: {e}"))
-        .schema_hash()
-}
-
-/// Split a vendored `.srv` at its one `---` line into request and response.
-fn srv_sides(text: &str) -> (String, String) {
-    let lines: Vec<&str> = text.lines().collect();
-    let sep = lines
-        .iter()
-        .position(|l| l.trim() == "---")
-        .expect("a .srv has a --- line");
-    let join = |part: &[&str]| part.iter().map(|l| format!("{l}\n")).collect::<String>();
-    (join(&lines[..sep]), join(&lines[sep + 1..]))
-}
-
-/// Each generated `std_srvs` part hashes like its side of the vendored `.srv`
-/// parsed as a message named as ROS 2 names the part: the `.srv` split in
-/// the build and a plain `.msg` parse of the same text agree, so the generated
-/// code came from these files and nothing else.
-#[test]
-fn each_std_srvs_part_hashes_like_its_vendored_text_parsed_as_a_named_msg() {
-    let cases: [(&str, &str, u64, u64); 3] = [
-        (
-            "Empty",
-            include_str!("../srv/std_srvs/Empty.srv"),
-            hash_of::<Empty_Request>(),
-            hash_of::<Empty_Response>(),
-        ),
-        (
-            "SetBool",
-            include_str!("../srv/std_srvs/SetBool.srv"),
-            hash_of::<SetBool_Request>(),
-            hash_of::<SetBool_Response>(),
-        ),
-        (
-            "Trigger",
-            include_str!("../srv/std_srvs/Trigger.srv"),
-            hash_of::<Trigger_Request>(),
-            hash_of::<Trigger_Response>(),
-        ),
-    ];
-    for (name, text, native_request, native_response) in cases {
-        let (request, response) = srv_sides(text);
-        assert_eq!(
-            native_request,
-            part_text_as_msg_hash(&request, &format!("{name}_Request")),
-            "std_srvs/{name}_Request"
-        );
-        assert_eq!(
-            native_response,
-            part_text_as_msg_hash(&response, &format!("{name}_Response")),
-            "std_srvs/{name}_Response"
-        );
-    }
-}
-
 /// `ParameterType` is constants only; `ListParameters`' request declares
 /// `DEPTH_RECURSIVE`. Values from the upstream files.
 #[test]

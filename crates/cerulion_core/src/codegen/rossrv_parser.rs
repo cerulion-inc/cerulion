@@ -221,43 +221,18 @@ mod tests {
         assert_eq!(srv.response.fields[1].field_type, FieldType::String);
     }
 
-    #[test]
-    fn each_part_hashes_like_the_same_text_parsed_as_a_msg() {
-        // A service part is an ordinary message: its schema hash is the hash
-        // of the same text parsed as `<Name>_Request.msg` in the package.
-        let text = "string[] names\n---\nuint8[] types\n";
-        let srv = parse_rossrv(text, "GetTypes", Some("p"), FILE).unwrap();
-        let req = parse_rosmsg("string[] names\n", "GetTypes_Request", Some("p")).unwrap();
-        let resp = parse_rosmsg("uint8[] types\n", "GetTypes_Response", Some("p")).unwrap();
-        assert_eq!(srv.request.schema_hash(), req.schema_hash());
-        assert_eq!(srv.response.schema_hash(), resp.schema_hash());
-        assert_ne!(srv.request.schema_hash(), srv.response.schema_hash());
-    }
-
-    /// One side of a `.srv`, parsed as a `.msg` under the name ROS 2 gives
-    /// the part (`SetBool_Request`, `SetBool_Response`) in the service's
-    /// package. This is the `.msg` parser on the same text, not a ROS 2
-    /// peer: the check against the hash `rmw_cerulion` derives from rosidl
-    /// introspection is `crates/rmw_cerulion/tests/service_part_hash_test.rs`.
-    fn part_text_as_msg(body: &str, package: &str, part_name: &str) -> MessageSchema {
-        parse_rosmsg(body, part_name, Some(package)).unwrap()
-    }
-
-    /// A real service's parts carry the qualified names ROS 2 gives them, and
-    /// each hashes like its text parsed as that message.
+    /// A real service's parts carry the qualified names ROS 2 gives them
+    /// (the part name is in the hash, so the two parts never share one).
+    /// The hash a ROS 2 peer announces for a part is checked against the
+    /// generated one in `crates/rmw_cerulion/tests/service_part_hash_test.rs`,
+    /// not here: this module parses both sides with the same `.msg` parser.
     #[test]
     fn a_std_srvs_part_carries_the_name_ros_2_gives_it() {
-        let request = "bool data\n";
-        let response = "bool success\nstring message\n";
-        let text = format!("{request}---\n{response}");
-        let srv = parse_rossrv(&text, "SetBool", Some("std_srvs"), FILE).unwrap();
-
-        let req = part_text_as_msg(request, "std_srvs", "SetBool_Request");
-        let resp = part_text_as_msg(response, "std_srvs", "SetBool_Response");
+        let text = "bool data\n---\nbool success\nstring message\n";
+        let srv = parse_rossrv(text, "SetBool", Some("std_srvs"), FILE).unwrap();
         assert_eq!(srv.request.qualified_name(), "std_srvs/SetBool_Request");
         assert_eq!(srv.response.qualified_name(), "std_srvs/SetBool_Response");
-        assert_eq!(srv.request.schema_hash(), req.schema_hash());
-        assert_eq!(srv.response.schema_hash(), resp.schema_hash());
+        assert_ne!(srv.request.schema_hash(), srv.response.schema_hash());
     }
 
     #[test]
