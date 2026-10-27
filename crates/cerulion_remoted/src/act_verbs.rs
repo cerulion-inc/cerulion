@@ -40,6 +40,18 @@ use cerulion_msgio::text::{frame_to_json, qualified_type_name, InterfaceKind, Ve
 use cerulion_msgio::{publish, service, snapshot};
 use serde_json::{json, Value};
 
+/// Register the four act verbs in `verbs`; `topic-publish` and
+/// `service-call` check the e-stop on `lease`, the robot's one shared control
+/// lease. Every daemon ops constructor registers them through this function;
+/// a library host registers refusals under the same names instead.
+pub fn register(verbs: &mut cerud::verbs::VerbRegistry, lease: Arc<Mutex<ControlLease>>) {
+    verbs
+        .register(Box::new(TopicPublishVerb::new(lease.clone())))
+        .register(Box::new(ServiceCallVerb::new(lease)))
+        .register(Box::new(TopicSnapshotVerb))
+        .register(Box::new(TopicEchoOnceVerb));
+}
+
 /// Publish a message on a topic.
 pub const TOPIC_PUBLISH: &str = "topic-publish";
 /// Call a service once.

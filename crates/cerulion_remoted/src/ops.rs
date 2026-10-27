@@ -373,19 +373,15 @@ fn verb_registry(
         )));
     // The act verbs: publish, service call, snapshot, one message.
     match act_lease {
-        Some(lease) => verbs
-            .register(Box::new(crate::act_verbs::TopicPublishVerb::new(
-                lease.clone(),
-            )))
-            .register(Box::new(crate::act_verbs::ServiceCallVerb::new(lease)))
-            .register(Box::new(crate::act_verbs::TopicSnapshotVerb))
-            .register(Box::new(crate::act_verbs::TopicEchoOnceVerb)),
-        None => verbs
-            .register(Box::new(DaemonOnlyVerb::TOPIC_PUBLISH))
-            .register(Box::new(DaemonOnlyVerb::SERVICE_CALL))
-            .register(Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT))
-            .register(Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE)),
-    };
+        Some(lease) => crate::act_verbs::register(&mut verbs, lease),
+        None => {
+            verbs
+                .register(Box::new(DaemonOnlyVerb::TOPIC_PUBLISH))
+                .register(Box::new(DaemonOnlyVerb::SERVICE_CALL))
+                .register(Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT))
+                .register(Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE));
+        }
+    }
     verbs
 }
 
