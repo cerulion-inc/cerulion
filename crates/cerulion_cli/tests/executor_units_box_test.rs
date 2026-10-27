@@ -538,3 +538,160 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
         "RI_HARNESS: only {compared} gap-free stream(s) were compared; the arm proves nothing"
     );
 }
+
+/// Copy `input` to `output` with its embedded `graph.yaml` replaced by `yaml`:
+/// every channel, frame and other attachment as recorded, through the bag
+/// writer, the same way `bag migrate` writes its copy.
+fn rewrite_embedded_graph(input: &Path, output: &Path, yaml: &str) {
+    use cerulion_bag::{BagReader, BagWriter, BagWriterConfig};
+    let reader = BagReader::open(input).expect("RI_HARNESS: open the recorded bag");
+    let channels = reader.channels().expect("RI_HARNESS: channel table");
+    let topics = cerulion_cli_engine::bag_migrate::user_topic_schemas(&channels)
+        .expect("RI_HARNESS: topic schemas");
+    let config = BagWriterConfig {
+        provisioning: channels
+            .iter()
+            .filter(|c| !c.provisioning.is_empty())
+            .map(|c| (c.topic.clone(), c.provisioning))
+            .collect(),
+        ..Default::default()
+    };
+    let mut writer =
+        BagWriter::create(output, config, &topics).expect("RI_HARNESS: create the rewritten bag");
+    for m in reader.messages().expect("RI_HARNESS: frames") {
+        let m = m.expect("RI_HARNESS: a frame");
+        writer
+            .write_message(&m.topic, m.sequence, m.log_time, m.publish_time, &[&m.data])
+            .expect("RI_HARNESS: write a frame");
+    }
+    let mut replaced = 0;
+    for a in reader.attachments().expect("RI_HARNESS: attachments") {
+        let data: &[u8] = if a.name == "graph.yaml" {
+            replaced += 1;
+            yaml.as_bytes()
+        } else {
+            &a.data
+        };
+        writer
+            .write_attachment(&a.name, &a.media_type, a.log_time, a.create_time, data)
+            .expect("RI_HARNESS: write an attachment");
+    }
+    assert_eq!(
+        replaced, 1,
+        "RI_HARNESS: the bag must embed exactly one graph.yaml"
+    );
+    writer
+        .finalize()
+        .expect("RI_HARNESS: finalize the rewritten bag");
+}
+
+/// The embedded graph of `bag`.
+fn embedded_graph(bag: &Path) -> String {
+    let reader = cerulion_bag::BagReader::open(bag).expect("RI_HARNESS: open the bag");
+    let att = reader
+        .attachments()
+        .expect("RI_HARNESS: attachments")
+        .into_iter()
+        .find(|a| a.name == "graph.yaml")
+        .expect("RI_HARNESS: the bag embeds graph.yaml");
+    String::from_utf8(att.data).expect("RI_HARNESS: graph.yaml is UTF-8")
+}
+
+/// A bag whose embedded graph carries the retired `fuse: false` key replays:
+/// `bag play --resim all` exits 0, warns exactly once naming the key, and
+/// reproduces every read the unrewritten bag reproduces. Under the
+/// `oracle-mutants` feature, `CERULION_RECORDED_FUSE_MUTANT` makes the replay
+/// refuse the key, and this arm must fail.
+#[test]
+#[ignore = "box-only: real runs on a quiet Linux host"]
+#[serial]
+fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
+    let mut run = read_identity::record_live(Fixture::Ranks2, Placement::Declared);
+    let reference = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let read_identity::Replayed::Reads { log: reference, .. } = reference else {
+        panic!("RI_HARNESS: the unrewritten bag's replay refused");
+    };
+
+    // `fuse: false` on the relay, the old spelling of what `isolate: true` says.
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&embedded_graph(&run.bag)).expect("RI_HARNESS: graph.yaml parses");
+    let relay = doc["nodes"]
+        .as_sequence_mut()
+        .expect("RI_HARNESS: nodes")
+        .iter_mut()
+        .find(|n| n["id"].as_str() == Some("relay"))
+        .expect("RI_HARNESS: the fixture has a relay");
+    relay
+        .as_mapping_mut()
+        .expect("RI_HARNESS: a node is a mapping")
+        .insert("fuse".into(), false.into());
+    let yaml = serde_yaml::to_string(&doc).expect("RI_HARNESS: render graph.yaml");
+    let rewritten = run.dir.path().join("fuse_false.mcap");
+    rewrite_embedded_graph(&run.bag, &rewritten, &yaml);
+    assert!(embedded_graph(&rewritten).contains("fuse: false"));
+    run.bag = rewritten;
+
+    let replayed = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let log = match replayed {
+        read_identity::Replayed::Reads { exit, log } => {
+            assert_eq!(
+                exit, 0,
+                "the replay of a bag carrying `fuse: false` must exit 0"
+            );
+            log
+        }
+        read_identity::Replayed::Refused { stderr } => {
+            panic!("the replay refused a bag carrying the retired `fuse:` key:\n{stderr}")
+        }
+    };
+    // The newest stderr file under the run directory is this replay's.
+    let stderr_path = std::fs::read_dir(run.dir.path())
+        .expect("RI_HARNESS: run dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "stderr"))
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .expect("RI_HARNESS: the replay's stderr file");
+    let stderr = std::fs::read_to_string(&stderr_path).expect("RI_HARNESS: read stderr");
+    let warnings = stderr
+        .lines()
+        .filter(|l| l.contains("retired `fuse:` key"))
+        .count();
+    assert_eq!(
+        warnings, 1,
+        "exactly one warning must name the retired key; got {warnings}:\n{stderr}"
+    );
+    assert_eq!(
+        log.streams, reference.streams,
+        "the bag carrying `fuse: false` must replay every read the unrewritten bag replays"
+    );
+    assert!(
+        log.total() >= 50,
+        "RI_HARNESS: the replay read only {} frame(s)",
+        log.total()
+    );
+}
+
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[ignore = "box-only: real runs on a quiet Linux host"]
+#[serial]
+fn the_recorded_fuse_refusal_mutant_is_caught() {
+    // The `bag play` child inherits the variable; `#[serial]` keeps every
+    // other arm of this binary from running while it is set.
+    std::env::set_var(cerulion_core::graph::RECORDED_FUSE_MUTANT_ENV, "1");
+    let caught = std::panic::catch_unwind(a_bag_recorded_with_the_retired_fuse_key_still_replays);
+    std::env::remove_var(cerulion_core::graph::RECORDED_FUSE_MUTANT_ENV);
+    let message = match caught {
+        Ok(()) => panic!("the fuse-on-replay arm passed with the replay refusing the retired key"),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    };
+    assert!(
+        message.contains("refused a bag carrying the retired `fuse:` key"),
+        "the arm failed, but not on the refusal the mutant makes: {message}"
+    );
+}
