@@ -99,8 +99,6 @@ fn each_documented_argument_error_returns_its_code_before_unsupported() {
         let asks_before = ffi::rcl_error_asks();
         let mut valid = ffi::default_allocator();
         let mut invalid: ffi::rcutils_allocator_t = unsafe { std::mem::zeroed() };
-        let mut missing_zero_allocate = ffi::default_allocator();
-        missing_zero_allocate.zero_allocate = None;
         let mut out = zero_array();
         let mut sized = zero_array();
         sized.size = 1;
@@ -122,10 +120,13 @@ fn each_documented_argument_error_returns_its_code_before_unsupported() {
                     call(&ours, &mut invalid, name.as_ptr(), false, &mut out),
                 ),
                 (
-                    "allocator without zero_allocate",
+                    // The argument checks run before the identifier check, so
+                    // a foreign node with a bad argument reads as the bad
+                    // argument.
+                    "another implementation's node with a null allocator",
                     call(
-                        &ours,
-                        &mut missing_zero_allocate,
+                        &foreign,
+                        std::ptr::null_mut(),
                         name.as_ptr(),
                         false,
                         &mut out,
@@ -166,6 +167,24 @@ fn each_documented_argument_error_returns_its_code_before_unsupported() {
                 RMW_RET_INVALID_ARGUMENT
             };
             assert_eq!(ret, want, "{call_name}: {case}");
+        }
+        // `rcutils_allocator_is_valid` requires all four function pointers:
+        // an allocator missing any ONE of them is invalid.
+        type Clear = fn(&mut ffi::rcutils_allocator_t);
+        let clears: [(&str, Clear); 4] = [
+            ("allocate", |a| a.allocate = None),
+            ("deallocate", |a| a.deallocate = None),
+            ("reallocate", |a| a.reallocate = None),
+            ("zero_allocate", |a| a.zero_allocate = None),
+        ];
+        for (field, clear) in clears {
+            let mut allocator = ffi::default_allocator();
+            clear(&mut allocator);
+            let ret = unsafe { call(&ours, &mut allocator, name.as_ptr(), false, &mut out) };
+            assert_eq!(
+                ret, RMW_RET_INVALID_ARGUMENT,
+                "{call_name}: allocator without {field}"
+            );
         }
         assert_eq!(
             ffi::rcl_error_asks(),

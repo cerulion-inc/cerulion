@@ -1308,9 +1308,9 @@ unsafe fn service_endpoint_info_unsupported(
     })
 }
 
-/// Lyrical and later (`rmw/service_endpoint_info_array.h`): compiled away
-/// WHOLE on a build whose headers have no
-/// `rmw_service_endpoint_info_array_t`, never stubbed. Validates its
+/// Lyrical and later (`rmw/service_endpoint_info_array.h`): compiled out
+/// whole on a build whose headers lack
+/// `rmw_service_endpoint_info_array_t`. Validates its
 /// arguments, then answers `RMW_RET_UNSUPPORTED` with an rcutils error
 /// string naming the call: the runtime graph holds one `(type name,
 /// count)` pair per service and no per-client endpoint record.
