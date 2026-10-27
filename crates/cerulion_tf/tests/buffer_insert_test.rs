@@ -870,6 +870,7 @@ fn a_far_future_stamp_is_refused_and_evicts_nothing() {
             child: id(&b, "base"),
             stamp_ns: u64::MAX,
             newest_ns: 200,
+            jump_limit_ns: 1_000,
         })
     );
     let e = edge(&b, "base");
@@ -1210,18 +1211,21 @@ fn every_refusal_names_the_frames_involved() {
                 child: base,
                 stamp_ns: 20_000_000_301,
                 newest_ns: 300,
+                jump_limit_ns: 60_000_000_000,
             },
             "",
-            "transform `odom` to `base` at 20000000301 ns is more than the jump limit past the \
-             newest stamp 300 ns and is refused; a later transform within the jump limit of it \
-             confirms the jump",
+            "transform `odom` to `base` at 20000000301 ns is more than the jump limit of \
+             60000000000 ns past the newest stamp 300 ns and is refused; a later transform \
+             within the jump limit of it confirms the jump, or raise \
+             `TfBufferConfig::jump_limit` to at least the longest gap the edge publishes with",
         ),
         (
             TfError::FrameTableFull {
                 frame: label("imu"),
                 capacity: 64,
             },
-            "frame `imu` does not fit: the buffer holds its capacity of 64 frames",
+            "frame `imu` does not fit: the buffer holds its capacity of 64 frames; build it \
+             with `TfBuffer::with_config` and a larger `TfBufferConfig::frames`",
             "",
         ),
         (
@@ -1232,7 +1236,8 @@ fn every_refusal_names_the_frames_involved() {
                 budget: 4_096,
             },
             "frame `rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr...` does not fit: its 50-byte \
-             id is longer than the 12 bytes left of the name budget of 4096 bytes",
+             id is longer than the 12 bytes left of the name budget of 4096 bytes; build the \
+             buffer with `TfBuffer::with_config` and a larger `TfBufferConfig::name_bytes`",
             "",
         ),
         (
@@ -1312,6 +1317,55 @@ fn every_refusal_names_the_frames_involved() {
             .describe(&TfError::UnknownFrameId { frame: map })
             .to_string(),
         "frame handle #3 was not issued by this buffer"
+    );
+}
+
+#[test]
+fn a_too_far_ahead_refusal_states_the_jump_limit_in_force_and_names_the_setting() {
+    // A 1000 ns window under a 500 ns jump limit: the limit in force is
+    // the window, and the text says so.
+    let mut b = jumpy(1_000, 500);
+    b.insert("odom", "base", 100, tf(1.0)).unwrap();
+    let err = b.insert("odom", "base", 1_101, tf(2.0)).unwrap_err();
+    assert_eq!(
+        err,
+        TfError::StampTooFarAhead {
+            parent: id(&b, "odom"),
+            child: id(&b, "base"),
+            stamp_ns: 1_101,
+            newest_ns: 100,
+            jump_limit_ns: 1_000,
+        }
+    );
+    assert_eq!(
+        b.describe(&err).to_string(),
+        "transform `odom` to `base` at 1101 ns is more than the jump limit of 1000 ns past the \
+         newest stamp 100 ns and is refused; a later transform within the jump limit of it \
+         confirms the jump, or raise `TfBufferConfig::jump_limit` to at least the longest gap \
+         the edge publishes with"
+    );
+    // A 10 000 ns jump limit over the same window: the limit in force is
+    // the setting.
+    let mut b = jumpy(1_000, 10_000);
+    b.insert("odom", "base", 100, tf(1.0)).unwrap();
+    assert!(matches!(
+        b.insert("odom", "base", 10_101, tf(2.0)),
+        Err(TfError::StampTooFarAhead {
+            jump_limit_ns: 10_000,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_full_frame_table_refusal_names_the_capacity_setting_to_raise() {
+    let mut b = small(2, 4);
+    b.insert("odom", "base", 1, tf(1.0)).unwrap();
+    let err = b.insert("base", "lidar", 1, tf(1.0)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "frame `lidar` does not fit: the buffer holds its capacity of 2 frames; build it with \
+         `TfBuffer::with_config` and a larger `TfBufferConfig::frames`"
     );
 }
 

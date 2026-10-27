@@ -119,7 +119,8 @@ pub enum TfError {
     /// the next insert at a later stamp within the jump limit of the
     /// refused one confirms the jump, since two inserts that agree on the
     /// new time are a clock that moved forward. Returned for every such
-    /// insert; the edge counts every one.
+    /// insert; the edge counts every one. An edge whose every gap is longer
+    /// than the limit needs a larger [`crate::TfBufferConfig::jump_limit`].
     StampTooFarAhead {
         /// The parent of the edge.
         parent: FrameId,
@@ -129,9 +130,14 @@ pub enum TfError {
         stamp_ns: u64,
         /// The newest stamp the edge holds, in nanoseconds.
         newest_ns: u64,
+        /// The jump limit in force, in nanoseconds: the larger of
+        /// [`crate::TfBufferConfig::jump_limit`] and the retention.
+        jump_limit_ns: u64,
     },
     /// The buffer holds as many frames as it was built for and the transform
-    /// names a frame it has never seen.
+    /// names a frame it has never seen. A buffer for more frames is built
+    /// with [`TfBuffer::with_config`] and a larger
+    /// [`crate::TfBufferConfig::frames`].
     FrameTableFull {
         /// The new frame that does not fit.
         frame: FrameLabel,
@@ -139,7 +145,8 @@ pub enum TfError {
         capacity: usize,
     },
     /// The new frame's id does not fit in what is left of the buffer's name
-    /// byte budget.
+    /// byte budget. A larger budget is built with [`TfBuffer::with_config`]
+    /// and a larger [`crate::TfBufferConfig::name_bytes`].
     NameBudgetFull {
         /// The new frame that does not fit.
         frame: FrameLabel,
@@ -320,17 +327,20 @@ impl TfError {
                 child,
                 stamp_ns,
                 newest_ns,
+                jump_limit_ns,
             } => write!(
                 f,
-                "transform `{}` to `{}` at {stamp_ns} ns is more than the jump limit past the \
-                 newest stamp {newest_ns} ns and is refused; a later transform within the jump \
-                 limit of it confirms the jump",
+                "transform `{}` to `{}` at {stamp_ns} ns is more than the jump limit of \
+                 {jump_limit_ns} ns past the newest stamp {newest_ns} ns and is refused; a later \
+                 transform within the jump limit of it confirms the jump, or raise \
+                 `TfBufferConfig::jump_limit` to at least the longest gap the edge publishes with",
                 n(parent),
                 n(child)
             ),
             Self::FrameTableFull { frame, capacity } => write!(
                 f,
-                "frame `{frame}` does not fit: the buffer holds its capacity of {capacity} frames"
+                "frame `{frame}` does not fit: the buffer holds its capacity of {capacity} frames; \
+                 build it with `TfBuffer::with_config` and a larger `TfBufferConfig::frames`"
             ),
             Self::NameBudgetFull {
                 frame,
@@ -340,7 +350,8 @@ impl TfError {
             } => write!(
                 f,
                 "frame `{frame}` does not fit: its {len}-byte id is longer than the {left} bytes \
-                 left of the name budget of {budget} bytes"
+                 left of the name budget of {budget} bytes; build the buffer with \
+                 `TfBuffer::with_config` and a larger `TfBufferConfig::name_bytes`"
             ),
             Self::UnknownFrame { frame } => write!(
                 f,

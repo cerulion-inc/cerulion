@@ -160,11 +160,12 @@ The rules:
   nothing. An edge whose every gap is longer than the jump limit never
   updates: each sample is refused and no later one confirms it, so raise
   `jump_limit` to at least the longest gap for such an edge. `Duration::MAX`
-  turns the check off. Both refusals come back every time and count in the edge's `window_refusals` and
-  `jump_refusals`, read through `edge()`, so a stuck edge is observable. A
-  sample at a stamp the ring already holds is a
-  no-op when the transform is the same and replaces it when it differs
-  (counted in `replacements()`).
+  turns the check off. Each refusal states the limit in force and names the
+  setting. Both refusals come back every time and count in the edge's
+  `window_refusals` and `jump_refusals`, read through `edge()`, so a stuck
+  edge is observable. A sample at a stamp the ring already holds is a no-op
+  when the transform is the same and replaces it when it differs (counted
+  in `replacements()`).
 - **Rings sized up front.** Each ring holds enough samples for the window at
   up to 100 Hz (1001 samples). An edge that publishes faster fills its ring
   before its window: the oldest sample makes room and each one counts in the
@@ -301,9 +302,9 @@ alias of `TfError`.
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |
 | `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
 | `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
-| `StampTooFarAhead { parent, child, stamp_ns, newest_ns }` | The stamp is more than the jump limit past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. |
-| `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with a larger frame capacity. |
-| `NameBudgetFull { frame, len, left, budget }` | The new frame's `len`-byte id does not fit in the `left` bytes of the name budget. | Build the buffer with a larger `name_bytes`. |
+| `StampTooFarAhead { parent, child, stamp_ns, newest_ns, jump_limit_ns }` | The stamp is more than the jump limit in force (`jump_limit_ns`) past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. An edge whose every gap is longer than the limit needs a larger `TfBufferConfig::jump_limit`. |
+| `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with `TfBuffer::with_config` and a larger `TfBufferConfig::frames`. |
+| `NameBudgetFull { frame, len, left, budget }` | The new frame's `len`-byte id does not fit in the `left` bytes of the name budget. | Build the buffer with `TfBuffer::with_config` and a larger `TfBufferConfig::name_bytes`. |
 
 Errors are plain `Copy` values: building one allocates nothing, so a lookup
 that fails on every fire costs no more than one that succeeds.

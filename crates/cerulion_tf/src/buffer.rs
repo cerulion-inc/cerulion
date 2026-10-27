@@ -534,6 +534,7 @@ impl TfBuffer {
                         child,
                         stamp_ns,
                         newest_ns,
+                        jump_limit_ns,
                     });
                 }
             }
