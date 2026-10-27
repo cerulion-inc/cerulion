@@ -6161,7 +6161,7 @@ mod tests {
                     Instant::now() < deadline,
                     "the switch must store the paired flag before it waits"
                 );
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             assert_eq!(
                 rx.recv_timeout(Duration::from_millis(200)),
