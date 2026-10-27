@@ -355,9 +355,8 @@ const EPOCH_SYNC_MAX_RETRY: Duration = Duration::from_secs(300);
 const EPOCH_REQUEST_FILE: &str = "epoch.request";
 const REMOTED_SUBDIR: &str = "remoted";
 
-/// The wait after `failures` consecutive failed fetches (at least 1), never
-/// longer than the configured `period`, so recovery after an outage is no
-/// slower than the period.
+/// The wait after `failures` consecutive failed fetches (at least 1), capped
+/// at the configured `period`.
 fn epoch_sync_delay(failures: u32, period: Duration) -> Duration {
     EPOCH_SYNC_FIRST_RETRY
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))

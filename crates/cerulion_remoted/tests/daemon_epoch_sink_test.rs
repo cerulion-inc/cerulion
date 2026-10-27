@@ -558,7 +558,16 @@ async fn a_failed_or_cancelled_serve_leaves_no_epoch_poller_running() {
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let live = install_pending(&remoted);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while live.exists() && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !live.exists(),
+        "the poller claims a pending epoch while the serve runs"
+    );
+    assert!(!serving.is_finished(), "the serve is still running before the abort");
     serving.abort();
     let _ = serving.await;
     let pending = install_pending(&remoted);

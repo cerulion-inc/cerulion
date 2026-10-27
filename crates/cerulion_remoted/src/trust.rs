@@ -1090,9 +1090,13 @@ mod tests {
         assert!(pull.note_accept_at(&[1u8; 32], t0 + std::time::Duration::from_secs(5)));
         assert!(request.exists());
         // The setting is read from the environment remoted inherits.
+        let prior = std::env::var_os(crate::epoch_pull::KEY_RECHECK_ENV);
         std::env::set_var(crate::epoch_pull::KEY_RECHECK_ENV, "7");
         let configured = crate::epoch_pull::key_recheck_from_env();
-        std::env::remove_var(crate::epoch_pull::KEY_RECHECK_ENV);
+        match prior {
+            Some(value) => std::env::set_var(crate::epoch_pull::KEY_RECHECK_ENV, value),
+            None => std::env::remove_var(crate::epoch_pull::KEY_RECHECK_ENV),
+        }
         assert_eq!(configured, std::time::Duration::from_secs(7));
     }
 
