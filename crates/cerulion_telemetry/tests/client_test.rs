@@ -43,6 +43,7 @@ fn common() -> Common {
         env: "test".into(),
         app_version: "0.0.0".into(),
         channel: None,
+        ci: false,
     }
 }
 
