@@ -796,7 +796,9 @@ pub mod wire;
 ///   the drain (the subscriber's `BlockProbe`), both reached through the
 ///   `CreditWord` the host hands it, so the two copies must agree on the
 ///   word's layout. `BackpressureCounters`, held by the same probe, gains
-///   `block_slot_releases_count`.
+///   `block_slot_releases_count`. [`graph::node::InputMeta`] gains
+///   `accumulate`, and a node library's info JSON carries it as an input
+///   key, so the host can refuse a graph key that contradicts the attribute.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 pub const CERULION_ABI_VERSION: u32 = 29;

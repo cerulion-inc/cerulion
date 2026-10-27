@@ -1481,6 +1481,7 @@ fn meta(name: &str, trigger: bool, backpressure: BackpressurePolicy) -> InputMet
         depth: DEFAULT_CONSUMER_DEPTH,
         backpressure,
         expect_within_ms: None,
+        accumulate: false,
     }
 }
 

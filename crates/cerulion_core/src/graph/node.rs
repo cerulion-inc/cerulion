@@ -222,6 +222,10 @@ pub struct InputMeta {
     /// (`#[input(trigger)]` and `#[input(expect_within_ms = N)]` are
     /// orthogonal).
     pub expect_within_ms: Option<u64>,
+    /// The port is `#[input(accumulate)]`: the node buffers every frame up to
+    /// its cap and evicts the oldest itself. The graph may not set `block`
+    /// or `depth` on such an input (the macro refuses both on the attribute).
+    pub accumulate: bool,
 }
 
 /// Metadata describing a declarative output port.
@@ -5030,6 +5034,9 @@ impl DylibNodeEntry {
                 /// `DylibNodeEntry`-loaded consumer.
                 #[serde(default)]
                 schema_hash: u64,
+                /// The `#[input(accumulate)]` mark; absent = not accumulate.
+                #[serde(default)]
+                accumulate: bool,
             },
         }
 
@@ -5136,6 +5143,7 @@ impl DylibNodeEntry {
             "depth",
             "backpressure",
             "expect_within_ms",
+            "accumulate",
             // The per-input port-type layout hash.
             "schema_hash",
         ];
@@ -5244,6 +5252,7 @@ impl DylibNodeEntry {
             // The declared port-type schema hash (0 = legacy /
             // undeclared sentinel).
             schema_hash: u64,
+            accumulate: bool,
         }
         let input_entries: Vec<NormalizedInput> = parsed
             .inputs
@@ -5261,6 +5270,7 @@ impl DylibNodeEntry {
                     trigger: false,
                     // No declared schema on the bare-string form → 0 sentinel.
                     schema_hash: 0,
+                    accumulate: false,
                 },
                 InputJson::Full {
                     name,
@@ -5269,6 +5279,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    accumulate,
                 } => NormalizedInput {
                     name,
                     expect_within_ms,
@@ -5276,6 +5287,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    accumulate,
                 },
             })
             .collect();
@@ -5447,6 +5459,7 @@ impl DylibNodeEntry {
                     .map(BackpressureJson::into_policy)
                     .unwrap_or_default(),
                 expect_within_ms: entry.expect_within_ms,
+                accumulate: entry.accumulate,
             })
             .collect();
         // Names are already proven unique by the explicit `Err`-returning
@@ -8281,6 +8294,7 @@ mod tests {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
         assert!(meta.trigger);
         assert_eq!(meta.depth, 1);
@@ -8324,6 +8338,7 @@ mod tests {
             depth,
             backpressure: bp,
             expect_within_ms: None,
+            accumulate: false,
         };
         let _ = NodeInfo::with_meta(
             vec![
@@ -8346,6 +8361,7 @@ mod tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
         let info = NodeInfo::with_meta(vec![meta("scan"), meta("imu")], Vec::new());
         assert_eq!(info.input_names, vec!["scan", "imu"]);
@@ -8442,6 +8458,7 @@ mod tests {
                 depth: 1,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
             }],
             output_meta: vec![OutputMeta {
                 name: "cmd_vel".to_string(),

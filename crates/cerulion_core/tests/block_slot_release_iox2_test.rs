@@ -10,12 +10,13 @@
 //!   resumes, and the release touches that slot only;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - the graph's `backpressure:` key turns a `drop_oldest` input into `block`;
-//! - a ring of `block` edges, and `block` on a `network.ingress` topic, are
-//!   refused at build.
+//! - a ring of `block` edges, `block` on a `network.ingress` topic, and the
+//!   graph's `backpressure: block` or `depth:` on an `#[input(accumulate)]`
+//!   input, are refused at build.
 //!
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
-//! `block_no_timeout_release`, `block_shared_release` and `block_cycle_off`
-//! each make a row here fail.
+//! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off` and
+//! `block_accumulate_refusal_off` each make a row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -126,6 +127,26 @@ impl FastDropOldest {
     }
 }
 
+/// `#[input(accumulate)]`, ticks only when the test triggers it.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct HostAccumulate {
+    #[input(accumulate)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl HostAccumulate {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.iter().count();
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
 /// `block` input, one output: a ring member. Period-driven, so the ring is
 /// not a ring of triggering edges (which the level derivation refuses on its
 /// own).
@@ -198,6 +219,7 @@ fn entry(ty: &str) -> Box<dyn NodeEntry> {
         "host_drop_oldest" => Box::new(HostDropOldestEntry::new()),
         "fast_drop_oldest" => Box::new(FastDropOldestEntry::new()),
         "relay" => Box::new(RelayEntry::new()),
+        "host_accumulate" => Box::new(HostAccumulateEntry::new()),
         other => panic!("no entry for {other}"),
     }
 }
@@ -536,4 +558,38 @@ fn block_timeout_without_block_is_refused() {
     .err()
     .expect("block_timeout_ms on a drop_oldest input must be refused");
     assert!(err.contains("block_timeout_ms"), "{err}");
+}
+
+#[test]
+fn the_graph_cannot_make_an_accumulate_input_block() {
+    let accumulate_graph = |i: InputDef| {
+        config(
+            "bsr_acc",
+            vec![
+                node("producer", "producer", vec![], vec![output("out")]),
+                node("acc", "host_accumulate", vec![i], vec![]),
+            ],
+        )
+    };
+    let mut block = input("producer/out");
+    block.backpressure = Some(InputBackpressure::Block);
+    let err = build(accumulate_graph(block))
+        .err()
+        .expect("block on an accumulate input must be refused");
+    assert!(
+        err.contains("acc.inp")
+            && err.contains("`#[input(accumulate)]` cannot be combined with `backpressure = block`"),
+        "the refusal names the input and carries the macro's wording: {err}"
+    );
+    let mut depth = input("producer/out");
+    depth.depth = Some(4);
+    let err = build(accumulate_graph(depth))
+        .err()
+        .expect("depth on an accumulate input must be refused");
+    assert!(
+        err.contains("acc.inp") && err.contains("takes `cap = N`, not `depth`"),
+        "{err}"
+    );
+    // Control: the same graph without the keys builds.
+    build(accumulate_graph(input("producer/out"))).expect("a plain accumulate input builds");
 }

@@ -16955,6 +16955,7 @@ mod node_trigger_decl_tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
         let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
             .with_policy(MacroPolicy::Sync { window_ms: 10 });

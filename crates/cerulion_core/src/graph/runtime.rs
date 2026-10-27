@@ -19594,6 +19594,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
 
         // Mixed: exactly the marked pair survives.
@@ -19672,6 +19673,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         }
     }
 
@@ -19831,6 +19833,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
         let wired = |name: &str| InputDef {
             name: name.to_string(),
@@ -19900,6 +19903,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         };
         let wired = |name: &str, source: &str| InputDef {
             name: name.to_string(),

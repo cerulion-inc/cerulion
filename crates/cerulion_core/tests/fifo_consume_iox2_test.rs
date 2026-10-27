@@ -79,6 +79,7 @@ fn burst_consumer_graph(
             depth,
             backpressure,
             expect_within_ms: None,
+            accumulate: false,
         }],
         vec![],
     )
@@ -360,6 +361,7 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         }],
         vec![],
     )
@@ -462,6 +464,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
             depth: DEPTH,
             backpressure: BackpressurePolicy::Block,
             expect_within_ms: None,
+            accumulate: false,
         }],
         vec![],
     )
@@ -675,6 +678,7 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         }],
         vec![],
     )
@@ -767,6 +771,7 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
         }],
         vec![],
     )

@@ -840,6 +840,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let accumulate = i.accumulate.is_some();
             quote! {
                 ::cerulion_core::graph::node::InputMeta {
                     name: #name.to_string(),
@@ -848,6 +849,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    accumulate: #accumulate,
                 }
             }
         })
@@ -1491,6 +1493,11 @@ fn gen_cdylib(
             }
             if let Some(d) = i.depth {
                 suffix.push_str(&format!(r#","depth":{d}"#));
+            }
+            // The `#[input(accumulate)]` mark, so the host can refuse a graph
+            // key that would contradict it. Absent = not accumulate.
+            if i.accumulate.is_some() {
+                suffix.push_str(r#","accumulate":true"#);
             }
             match &i.backpressure {
                 Some(crate::parse::ParsedBackpressurePolicy::DropOldest) => {

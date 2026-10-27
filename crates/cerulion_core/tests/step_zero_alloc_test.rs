@@ -948,6 +948,7 @@ fn gated_plain_input_meta(name: &str) -> InputMeta {
         depth: 8,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
     }
 }
 

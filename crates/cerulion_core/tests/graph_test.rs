@@ -2533,6 +2533,7 @@ nodes:
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
         expect_within_ms: None,
+        accumulate: false,
     };
     let join = ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![sync_meta("l"), sync_meta("r")], vec![])
@@ -2812,6 +2813,7 @@ nodes:
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
         expect_within_ms: None,
+        accumulate: false,
     };
     let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
     infos.insert(

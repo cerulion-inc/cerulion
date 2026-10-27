@@ -105,6 +105,7 @@ fn fusion_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
     };
     let mut info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 10 });

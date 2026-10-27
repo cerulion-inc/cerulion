@@ -2261,6 +2261,30 @@ pub fn apply_input_backpressure_overrides(
                     ),
                 });
             };
+            if meta.accumulate && !crate::oracle_mutant::active("block_accumulate_refusal_off") {
+                if input.backpressure == Some(crate::graph::config::InputBackpressure::Block) {
+                    return Err(TransportError::GraphError {
+                        reason: format!(
+                            "input '{}.{}' sets `backpressure: block` in the graph, but the node \
+                             declares it `#[input(accumulate)]`. `#[input(accumulate)]` cannot \
+                             be combined with `backpressure = block`: an accumulate input drops \
+                             its oldest frames at the cap, while `block` paces the producer \
+                             instead.",
+                            node_def.id, input.name
+                        ),
+                    });
+                }
+                if input.depth.is_some() {
+                    return Err(TransportError::GraphError {
+                        reason: format!(
+                            "input '{}.{}' sets `depth:` in the graph, but the node declares it \
+                             `#[input(accumulate)]`. `#[input(accumulate)]` takes `cap = N`, not \
+                             `depth`: the cap is the input's queue depth.",
+                            node_def.id, input.name
+                        ),
+                    });
+                }
+            }
             let (policy, depth) = effective_input_policy(input, (meta.backpressure, meta.depth));
             meta.backpressure = policy;
             meta.depth = depth;
@@ -2389,6 +2413,7 @@ mod tests {
             depth,
             backpressure: policy,
             expect_within_ms: None,
+            accumulate: false,
         }
     }
 

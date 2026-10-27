@@ -171,6 +171,7 @@ impl NodeEntry for NoReadTriggerConsumer {
                 depth: 10,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                accumulate: false,
             }],
             Vec::new(),
         )
@@ -229,6 +230,7 @@ impl NodeEntry for DrainExpectConsumer {
                 depth: 10,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                accumulate: false,
             }],
             Vec::new(),
         )

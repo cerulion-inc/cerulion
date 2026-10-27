@@ -362,6 +362,7 @@ fn recording_sink(fires: Fires) -> ClosureNodeEntry {
         depth: 16,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
     };
     ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![meta], vec![]).with_policy(MacroPolicy::DataTrigger {

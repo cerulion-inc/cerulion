@@ -522,6 +522,7 @@ fn build_seq_graph(
         depth: 16,
         backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
     };
     let sink = ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![sink_meta], vec![]).with_policy(MacroPolicy::DataTrigger {
