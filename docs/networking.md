@@ -101,8 +101,9 @@ default + gateway, the discovery ladder, and pairing.
   authorizer does not disable it. Choose the posture at startup with
   `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
   mode, the robot identity announcement remains, but topic announce tokens are
-  withheld, so topic
-  names are not exposed on the LAN. The mDNS beacon remains available when the
+  withheld, so the topics this robot publishes are not named on the LAN. A
+  gateway that receives topics from the network still names each of those
+  topics in its demand queries on the LAN. The mDNS beacon remains available when the
   first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
   access after a paired start does not replay topic announcements withheld
   while paired.

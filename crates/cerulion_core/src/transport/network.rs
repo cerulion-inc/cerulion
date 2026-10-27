@@ -3765,11 +3765,11 @@ impl NetworkManager {
     /// suspended entry; a failed declaration logs a warning and the next open
     /// retries it.
     ///
-    /// Two paths do not consult this posture. The demand GET loop
-    /// ([`Self::start_demand_get_loop`]) keeps sending, while paired, a GET that
-    /// names each ingress topic it demands. [`IngressInjector::reinject_raw`]
-    /// re-injects for any caller that holds an injector, the remote plane among
-    /// them.
+    /// On the ingress side, two paths do not consult this posture. The demand
+    /// GET loop ([`Self::start_demand_get_loop`]) keeps sending GETs while
+    /// paired, and each GET's selector names one ingress topic it demands.
+    /// [`IngressInjector::reinject_raw`] re-injects for any caller that holds an
+    /// injector, the remote plane among them.
     pub fn set_lan_access(&self, access: LanAccess) {
         self.apply_lan_access(access);
     }
@@ -6208,13 +6208,16 @@ mod tests {
     fn paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate() {
         let manager = NetworkManager::new(NetworkConfig::default());
         manager.set_lan_access(LanAccess::Open);
-        // The held shared guard stands in for a callback mid re-injection.
-        let callback = manager
-            .ingress_gate
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
+            // The held shared guard stands in for a callback mid re-injection.
+            // It is a local of the scope closure, so a failed assert below
+            // drops it while unwinding: the blocked switch then finishes, the
+            // scope joins it, and the test fails instead of hanging.
+            let callback = manager
+                .ingress_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             scope.spawn(|| {
                 manager.set_lan_access(LanAccess::Paired);
                 tx.send(()).unwrap();

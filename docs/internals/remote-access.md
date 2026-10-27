@@ -193,14 +193,15 @@ out every receive callback that already passed its posture check before it
 returns, so no frame from the zenoh LAN plane is re-injected after the close;
 reopening redeclares both. A callback that checks the posture after the close,
 even one still in flight when the close returns, refuses and counts its frame.
-The demand GET loop does not consult the posture: while paired it keeps
-sending a GET that names each ingress topic it demands. Writes from a paired
-desk travel over the remote plane, whose re-inject seam does not consult the
-LAN posture. Oracle tests:
+The demand GET loop does not consult the posture: it keeps sending GETs while
+paired, and each GET's selector names one ingress topic it demands. Writes
+from a paired desk travel over the remote plane, whose re-inject seam does not
+consult the LAN posture. Oracle tests:
 `demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` and
-`paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` in
-`network.rs`,
+`paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` (the
+switch side of the wait: it stores the paired flag, then blocks while a
+receive callback holds the ingress gate) in `network.rs`,
 `test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery` and
 `test_paired_receive_callback_refuses_and_counts_every_lan_frame` in
 `network_ingress_test.rs`, and
