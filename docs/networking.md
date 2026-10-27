@@ -303,9 +303,9 @@ the first loss timeout QUIC itself uses before it has measured a round trip).
 A closed port answers at once, so the full wait is paid only where UDP is
 dropped without an answer, once per peer address each time netd starts, with every
 address checked at the same time. Raise it only for a path whose round trip is above
-about 300 ms. Values above 8000 are treated as 8000, with a warning: netd opens
-its control socket only after the check, and a command that starts netd waits
-10 seconds for that socket.
+about 300 ms. Values above 6000 are treated as 6000, with a warning: netd opens
+its control socket only after the check and its own start-up, and a command
+that starts netd waits 10 seconds for that socket.
 
 **This QUIC is not encrypted and does not authenticate the peer**, the same as
 `tcp/`. What it changes is congestion control: a Linux TCP connection that idles

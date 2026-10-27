@@ -116,7 +116,7 @@ ENVIRONMENT:
     CERULION_NETD_QUIC_PROBE_TIMEOUT_MS
                                  How long the boot probe waits for a QUIC answer
                                  before falling back, in ms (default 1000;
-                                 values above 8000 are treated as 8000).
+                                 values above 6000 are treated as 6000).
 ";
 
 /// The iroh WAN-plane env docs — appended to [`USAGE`] ONLY in a `--features wan`

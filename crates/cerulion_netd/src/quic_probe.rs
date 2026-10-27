@@ -41,11 +41,11 @@
 //! [`QUIC_PROBE_TIMEOUT_ENV`] only for a path whose measured round trip is above
 //! about 300 ms.
 //!
-//! A larger value is clamped to [`MAX_QUIC_PROBE_TIMEOUT`] (8000 ms) with one
+//! A larger value is clamped to [`MAX_QUIC_PROBE_TIMEOUT`] (6000 ms) with one
 //! warning. The probe runs before netd binds its control socket, and a client
-//! that starts netd waits 10 s for that socket; 8000 ms plus the boot browse, the
-//! TCP probe round and both collectors' slack stays inside that wait (a
-//! compile-time assertion below holds the sum).
+//! that starts netd waits 10 s for that socket; 6000 ms plus the boot browse, the
+//! TCP probe round, both collectors' slack and the transport start-up that follows
+//! the fold stays inside that wait (a compile-time assertion below holds the sum).
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -59,18 +59,26 @@ pub const QUIC_PROBE_TIMEOUT_ENV: &str = "CERULION_NETD_QUIC_PROBE_TIMEOUT_MS";
 pub const DEFAULT_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// The largest probe bound [`resolve_quic_probe_timeout`] returns. See the
-/// module docs for why it is 8000 ms.
-pub const MAX_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(8000);
+/// module docs for why it is 6000 ms.
+pub const MAX_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(6000);
+
+/// The transport start-up netd runs after the fold and before it binds its
+/// control socket (iceoryx2 init plus the start-up dead-node sweep), as measured
+/// once on a desk-class machine (see the calibration note on the client's spawn
+/// wait in `client.rs`).
+const TRANSPORT_INIT_COLD_BOOT: Duration = Duration::from_millis(1100);
 
 // netd's start-up holds the control socket back for the browse, the TCP probe
-// round (bound plus its 200 ms collector slack) and this probe round (bound plus
-// COLLECT_SLACK); the sum must fit the wait of a client that started netd.
+// round (bound plus its 200 ms collector slack), this probe round (bound plus
+// COLLECT_SLACK) and then the transport start-up; the sum must fit the wait of a
+// client that started netd.
 const _: () = assert!(
     crate::discovery_fold::MDNS_FOLD_BUDGET.as_millis()
         + cerulion_discovery::ladder::LADDER_PROBE_TIMEOUT.as_millis()
         + 200
         + MAX_QUIC_PROBE_TIMEOUT.as_millis()
         + COLLECT_SLACK.as_millis()
+        + TRANSPORT_INIT_COLD_BOOT.as_millis()
         < crate::client::SPAWN_READY_TIMEOUT.as_millis()
 );
 
@@ -423,11 +431,11 @@ mod tests {
             Duration::from_millis(2500)
         );
         assert_eq!(
-            resolve_quic_probe_timeout(Some("8000")),
+            resolve_quic_probe_timeout(Some("6000")),
             MAX_QUIC_PROBE_TIMEOUT
         );
         // Above the cap, up to u64::MAX: the cap.
-        for big in ["8001", "60000", "18446744073709551615"] {
+        for big in ["6001", "8000", "60000", "18446744073709551615"] {
             assert_eq!(
                 resolve_quic_probe_timeout(Some(big)),
                 MAX_QUIC_PROBE_TIMEOUT,
