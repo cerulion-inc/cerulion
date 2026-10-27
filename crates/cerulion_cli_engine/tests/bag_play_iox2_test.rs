@@ -782,7 +782,7 @@ fn a_two_clock_bag_plays_each_channel_at_its_own_recorded_rate() {
     // host cannot move the rest of it.
     assert!(
         summary.scheduled_span_ns <= 300_000_000,
-        "the run's ideal duration must be the longest DOMAIN's span (200ms), got {}ns — that \
+        "the run's ideal duration must be the longest DOMAIN's span (200ms), got {}ns. That \
          is the cross-domain clock offset leaking into the schedule",
         summary.scheduled_span_ns
     );
@@ -846,7 +846,7 @@ fn a_single_channel_bag_paces_at_its_recorded_rate() {
     // The lower side stays on the wall: contention can only make it more true.
     assert!(
         wall >= Duration::from_millis(380),
-        "a 400ms single-domain recording must take ~400ms, took only {wall:?} — the frames \
+        "a 400ms single-domain recording must take ~400ms, took only {wall:?}, so the frames \
          were DUMPED, not paced"
     );
 }
@@ -1274,7 +1274,7 @@ fn a_tap_grouped_bag_plays_at_its_recorded_duration() {
     assert!(
         u128::from(summary.scheduled_span_ns) < recorded_span.mul_f64(1.5).as_nanos(),
         "a {recorded_span:?} recording written the way bagd writes one must schedule about \
-         {recorded_span:?}, scheduled {}ns (wall {wall:?}) — that is tap-grouped write batching \
+         {recorded_span:?}, scheduled {}ns (wall {wall:?}), which is tap-grouped write batching \
          being read as a clock break",
         summary.scheduled_span_ns
     );
@@ -1582,7 +1582,7 @@ fn a_multi_topic_loop_wrap_keeps_every_pass_the_same_length() {
     assert!(
         summary.timeline_restarts + 1 >= summary.passes
             && summary.timeline_restarts <= summary.passes,
-        "{} pass(es) must count one restart per wrap ({} or {}), got {} — the wrap \
+        "{} pass(es) must count one restart per wrap ({} or {}), got {}, so the wrap \
          re-anchored each channel and destroyed the pacing structure",
         summary.passes,
         summary.passes - 1,
