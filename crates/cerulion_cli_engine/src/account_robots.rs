@@ -25,8 +25,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// listing such as `topic list` asks for the account's robots. The fetch is one
 /// HTTPS request; the listing must not wait on an unreachable account service
 /// longer than it waits on the LAN, so this is half of the 4 s presence-probe
-/// budget. [`HTTP_TIMEOUT`] still bounds the worker thread that carries the
-/// request.
+/// budget. The 15 s HTTP timeout still bounds the worker thread that carries
+/// the request.
 pub const LISTING_FETCH_BUDGET: Duration = Duration::from_secs(2);
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_ROBOTS: usize = 4096;
