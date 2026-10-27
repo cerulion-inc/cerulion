@@ -3,30 +3,36 @@
 //! a TCP connection's congestion window after idle.
 //!
 //! Mechanism: with `net.ipv4.tcp_slow_start_after_idle` nonzero (the Linux
-//! default), a TCP connection that sends nothing for longer than one
-//! retransmission timeout restarts from its initial congestion window
-//! (`tcp_slow_start_after_idle_check` in the kernel's `include/net/tcp.h`). A
-//! large message sent at a low rate then needs several more round trips each
-//! time, so the cost grows with the path's round-trip time. The window belongs
-//! to the SENDING side, so the check runs only once this run has egress on a
-//! live route. The `quic/` carrier's congestion controller (quinn) has no idle
-//! reset.
+//! default), the congestion window of a TCP connection that sends nothing for
+//! longer than one retransmission timeout decays toward its initial size,
+//! halving once per timeout elapsed (`tcp_cwnd_restart` in the kernel's
+//! `net/ipv4/tcp_output.c`). A large message sent at a low rate then needs
+//! several more round trips each time, so the cost grows with the path's
+//! round-trip time. The window belongs to the SENDING side, so the check runs
+//! only once this run has egress on a live route. The `quic/` carrier's
+//! congestion controller (quinn) has no idle reset.
 //!
 //! `warn_if_tcp_egress_idle_resets` is called from the egress setup in
-//! `graph_cmd` once a route carries this run's egress: the per-run gateway
-//! child (its locators are this run's own, so the warning names the `tcp/`
-//! ones), or the shared `cerulion-netd` session (whose peer links are dialled
-//! by discovery as `tcp/`; a netd started with only `quic/` locators is the
-//! case this check cannot see, and it warns there too). The sysctl is per
-//! network namespace and is read in this process's namespace, which is the one
-//! the per-run gateway child inherits; netd shares it when this run spawned
-//! netd or when both run in the host namespace.
+//! `graph_cmd` once a route carries this run's egress:
+//!
+//! - the per-run gateway child, which a `network:` block (or an unreachable
+//!   netd) starts. Its locators are this run's own, so the line names the
+//!   `tcp/` ones and is a WARN.
+//! - the shared `cerulion-netd` session, which every networked run on the
+//!   machine registers with whether or not any remote peer subscribes. The
+//!   line is an INFO there, so an ordinary run with no remote subscriber is not
+//!   flagged. netd dials discovered peers as `tcp/`; a netd started with only
+//!   `quic/` locators is the case this check cannot see.
+//!
+//! The sysctl is per network namespace and is read in this process's
+//! namespace, which the per-run gateway child inherits; netd shares it when
+//! this run spawned netd or when both run in the host namespace.
 
 /// The sysctl file this check reads.
 pub const SLOW_START_AFTER_IDLE_SYSCTL: &str = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
 
 /// The warning text. `pub` so tests pin the line by identity.
-pub const TCP_SLOW_START_AFTER_IDLE_WARNING: &str = "this run sends over tcp/ from a host where net.ipv4.tcp_slow_start_after_idle is nonzero: Linux restarts a TCP connection that sat idle for longer than one retransmission timeout from its initial congestion window, so each large message sent at a low rate pays a few extra round trips, a cost that grows with the path's round-trip time. Measured 2026-10-26 over a 31 ms wide-area path with a 301 KB message once per second: tcp/ 164.8 ms p50, quic/ 79.3 ms p50 (at 30 Hz both were about 63 ms). Fix: set `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the sending host and keep it in a file under /etc/sysctl.d/, or move both ends to quic/ (a network: block with quic/ locators, their tls: files and an egress: list; see docs/networking.md, Carriers and per-topic reliability).";
+pub const TCP_SLOW_START_AFTER_IDLE_WARNING: &str = "this run sends over tcp/ from a host where net.ipv4.tcp_slow_start_after_idle is nonzero: the congestion window of a TCP connection that sat idle for longer than one retransmission timeout decays toward its initial size, so each large message sent at a low rate pays a few extra round trips, a cost that grows with the path's round-trip time. Measured 2026-10-26 over a 31 ms wide-area path with a 301 KB message once per second: tcp/ 164.8 ms p50, quic/ 79.3 ms p50 (at 30 Hz both were about 63 ms). Fix: set `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the sending host and keep it in a file under /etc/sysctl.d/, or move both ends to quic/ (a network: block with quic/ locators, their tls: files and an egress: list; see docs/networking.md, Carriers and per-topic reliability).";
 
 /// The route that carries this run's egress.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +121,8 @@ fn read_sysctl() -> Option<String> {
 }
 
 /// Log [`TCP_SLOW_START_AFTER_IDLE_WARNING`] once for this run's egress
-/// route when it is due. Returns whether it logged.
+/// route when it is due: WARN on the per-run gateway route, INFO on the
+/// netd route (see the module docs). Returns whether it logged.
 pub(crate) fn warn_if_tcp_egress_idle_resets(
     graph_name: &str,
     route: EgressRoute<'_>,
@@ -140,7 +147,7 @@ pub(crate) fn warn_if_tcp_egress_idle_resets(
             true
         }
         Some(IdleWarning::Netd) => {
-            tracing::warn!(
+            tracing::info!(
                 graph = %graph_name,
                 route = "cerulion-netd",
                 sysctl = SLOW_START_AFTER_IDLE_SYSCTL,

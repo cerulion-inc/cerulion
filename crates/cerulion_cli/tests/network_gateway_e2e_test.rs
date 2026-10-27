@@ -936,6 +936,22 @@ fn run_until_started(tag: &str, network_block: &str, expect_gateway_child: bool)
     out
 }
 
+/// The tracing level of every logged line that carries the tcp/ idle text.
+fn idle_line_levels(out: &str) -> Vec<&'static str> {
+    out.lines()
+        .filter(|l| l.contains(TCP_SLOW_START_AFTER_IDLE_WARNING))
+        .map(|l| {
+            if l.contains(" WARN ") {
+                "WARN"
+            } else if l.contains(" INFO ") {
+                "INFO"
+            } else {
+                "OTHER"
+            }
+        })
+        .collect()
+}
+
 /// A strict block for the single-producer graph: `locator` as its only
 /// listener and the ticker's output as egress.
 fn strict_block(tag: &str, locator: &str) -> String {
@@ -943,8 +959,9 @@ fn strict_block(tag: &str, locator: &str) -> String {
 }
 
 /// The permissive default's egress rides the shared netd session, whose peer
-/// links are tcp/, so a run on a host that resets idle TCP logs the warning
-/// exactly once, naming that route.
+/// links are tcp/, so a run on a host that resets idle TCP logs the line
+/// exactly once, naming that route, at INFO: every networked run registers
+/// with netd whether or not a remote peer subscribes.
 #[test]
 #[serial]
 fn tcp_idle_warning_fires_once_for_permissive_egress_through_netd() {
@@ -958,7 +975,12 @@ fn tcp_idle_warning_fires_once_for_permissive_egress_through_netd() {
     if expected == 1 {
         assert!(
             out.contains("cerulion-netd"),
-            "the warning names the netd route\ncombined:\n{out}"
+            "the line names the netd route\ncombined:\n{out}"
+        );
+        assert_eq!(
+            idle_line_levels(&out),
+            ["INFO"],
+            "the netd-route line is INFO, never WARN\ncombined:\n{out}"
         );
     }
 }
@@ -981,6 +1003,11 @@ fn tcp_idle_warning_fires_once_for_a_strict_tcp_gateway() {
         assert!(
             out.contains(&format!("tcp_locators={locator}")),
             "the warning names the tcp/ locator\ncombined:\n{out}"
+        );
+        assert_eq!(
+            idle_line_levels(&out),
+            ["WARN"],
+            "the per-run gateway line is a WARN\ncombined:\n{out}"
         );
     }
 }
