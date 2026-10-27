@@ -622,8 +622,8 @@ fn build_mirror_plane(
 /// `Starting with no listener endpoints!` at WARN whenever a peer session opens
 /// with no listen endpoint, which is exactly a desk's session (netd connects
 /// out and listens only when `CERULION_NETD_LISTEN` is set). On a desk it is
-/// the expected shape, not a warning, and the daemon inherits the spawning
-/// command's stderr on first use, so unfiltered it lands in every first user's terminal.
+/// the expected shape, not a warning, and unfiltered it is written on every desk
+/// start, into the startup log a failed first-use start quotes.
 /// A filter directive, never a change to the zenoh session config.
 const DEFAULT_FILTER: &str = "info,zenoh::net::runtime::orchestrator=error";
 
@@ -631,9 +631,13 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    // Colour codes only on a terminal: a daemon started on first use writes its
+    // stderr to the startup log, which a failed start quotes back verbatim.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .try_init();
 }
 

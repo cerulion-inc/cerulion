@@ -192,7 +192,7 @@
 6 crates/cerulion_mdns/src/lib.rs
 9 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
-20 crates/cerulion_netd/src/client.rs
+18 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs
 19 crates/cerulion_netd/src/daemon.rs
 2 crates/cerulion_netd/src/discovery_fold.rs
