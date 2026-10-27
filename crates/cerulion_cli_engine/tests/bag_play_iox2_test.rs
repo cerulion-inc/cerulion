@@ -778,13 +778,13 @@ fn a_two_clock_bag_plays_each_channel_at_its_own_recorded_rate() {
     // THE discriminator, read off the schedule the player built rather than the
     // wall. Recorded span per domain is 200 ms; one file-wide schedule climbs
     // ~20 s on this bag (four interleave points x a 5 s capped gap, both
-    // directions). The run origin is the schedule's only wall term, so a loaded
-    // host cannot move the rest of it.
+    // directions). Measured from the first frame, so the wall the host spent
+    // opening the bag is not part of it.
     assert!(
-        summary.scheduled_span_ns <= 300_000_000,
+        summary.scheduled_advance_ns <= 300_000_000,
         "the run's ideal duration must be the longest DOMAIN's span (200ms), got {}ns. That \
          is the cross-domain clock offset leaking into the schedule",
-        summary.scheduled_span_ns
+        summary.scheduled_advance_ns
     );
     // Comparing stamps ACROSS the two clocks reads every interleave point back
     // to the earlier clock as a backwards stamp, which re-anchors.
@@ -834,14 +834,14 @@ fn a_single_channel_bag_paces_at_its_recorded_rate() {
         summary.scheduled_span_ns
     );
     assert_scheduled_span_is_not_inflated(&summary);
-    // The upper side is read off the schedule, not the wall: a loaded host
-    // stretches the wall, but only the run origin (the walk to the first frame)
-    // reaches the schedule, while an over-advancing schedule (a mis-scaled
-    // delta, a unit slip) multiplies the recorded 400 ms.
+    // The upper side is read off the schedule from the first frame, which no
+    // host load reaches, while an over-advancing schedule (a mis-scaled delta,
+    // a unit slip) multiplies the recorded 400 ms.
     assert!(
-        summary.scheduled_span_ns < 600_000_000,
-        "a 400ms single-domain recording must schedule ~400ms, scheduled {}ns",
-        summary.scheduled_span_ns
+        summary.scheduled_advance_ns < 600_000_000,
+        "a 400ms single-domain recording must schedule ~400ms from its first frame, \
+         scheduled {}ns",
+        summary.scheduled_advance_ns
     );
     // The lower side stays on the wall: contention can only make it more true.
     assert!(
@@ -1210,7 +1210,7 @@ fn write_tap_grouped_bag(
 /// stretches it by roughly the tap multiplicity, and it does so in the SCHEDULE:
 /// every tap boundary re-anchors (counted in `timeline_restarts`) and the next
 /// tap re-climbs its batch. So the upper side is asserted on the schedule the
-/// player built, whose only wall term is the run origin. The wall itself is held
+/// player built, measured from the first frame, which has no wall term. The wall itself is held
 /// only from below, which contention can only make more true; a loaded host
 /// overruns this bag for real (1.036 s on a hosted runner) and the summary is
 /// right to say so.
@@ -1269,14 +1269,14 @@ fn a_tap_grouped_bag_plays_at_its_recorded_duration() {
          read as clock breaks",
         summary.timeline_restarts
     );
-    // ... and the schedule is the shared run origin plus each channel's own
-    // 590 ms of deltas. Re-climbing a tap's batch multiplies the 590 ms.
+    // ... and the schedule from the first frame is each channel's own 590 ms of
+    // deltas. Re-climbing a tap's batch multiplies the 590 ms.
     assert!(
-        u128::from(summary.scheduled_span_ns) < recorded_span.mul_f64(1.5).as_nanos(),
+        u128::from(summary.scheduled_advance_ns) < recorded_span.mul_f64(1.5).as_nanos(),
         "a {recorded_span:?} recording written the way bagd writes one must schedule about \
-         {recorded_span:?}, scheduled {}ns (wall {wall:?}), which is tap-grouped write batching \
-         being read as a clock break",
-        summary.scheduled_span_ns
+         {recorded_span:?} from its first frame, scheduled {}ns (wall {wall:?}), which is \
+         tap-grouped write batching being read as a clock break",
+        summary.scheduled_advance_ns
     );
     // Raw slip IS expected here and is structural: a tap-grouped bag is not in
     // global arrival order, so a later topic's frames are reached after the
