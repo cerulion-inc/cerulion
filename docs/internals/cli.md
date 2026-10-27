@@ -1195,7 +1195,8 @@ reaches an account or a robot. The `doctor` verb family returns `false`
 from `needs_identity` on the same ground: it reads this machine's own state,
 the local sign-in file included, refreshes nothing and is the diagnosis a
 machine that never signed in needs; a check marked as a network check is
-skipped under `--local` and `CERULION_NETWORK`. `ensure_login_gate` in
+skipped under `--local` and under any non-empty
+`CERULION_NETWORK` (`off`, or another value, which fails closed). `ensure_login_gate` in
 `crates/cerulion_cli_engine/src/login_cmd.rs` reads local state only: a machine
 that signed in once proceeds with zero network, offline and on an expired
 session. A machine that never signed in runs the device-code flow inline when

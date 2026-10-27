@@ -36,8 +36,8 @@ struct DoctorArgs {
     /// Print the report as one JSON object on stdout instead of the table.
     #[arg(long)]
     json: bool,
-    /// Skip the checks that use the network. `CERULION_NETWORK=off` does the
-    /// same.
+    /// Skip the checks that use the network; no check in this release does.
+    /// `CERULION_NETWORK=off` does the same.
     #[arg(long)]
     local: bool,
     /// Run only this check (repeatable). Default: every check.
