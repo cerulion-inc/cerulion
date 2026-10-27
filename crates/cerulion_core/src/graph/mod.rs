@@ -122,6 +122,72 @@ pub fn parse_graph(yaml: &str) -> TransportResult<GraphConfig> {
     Ok(config)
 }
 
+/// Parse the graph a recording embedded, as [`parse_graph`] does, except that
+/// the retired `fuse:` key is translated rather than refused, so a bag
+/// recorded before the key was retired still replays.
+///
+/// `fuse: false` becomes `isolate: true` on a node that declares no
+/// `isolate:` of its own; `fuse: true` is dropped. One warning names `origin`
+/// (the bag) and the nodes that carried the key. A graph without the key
+/// parses exactly as [`parse_graph`] parses it.
+pub fn parse_recorded_graph(yaml: &str, origin: &str) -> TransportResult<GraphConfig> {
+    match translate_retired_fuse_key(yaml, origin) {
+        Some(translated) => parse_graph(&translated),
+        None => parse_graph(yaml),
+    }
+}
+
+/// The document with every node's `fuse:` key translated, and one warning;
+/// `None` when no node carries the key (or the document is not YAML, which
+/// the typed parse then reports).
+fn translate_retired_fuse_key(yaml: &str, origin: &str) -> Option<String> {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        if std::env::var_os(RECORDED_FUSE_MUTANT_ENV).is_some() {
+            return None;
+        }
+    }
+    let mut doc = serde_yaml::from_str::<serde_yaml::Value>(yaml).ok()?;
+    let nodes = doc.get_mut("nodes")?.as_sequence_mut()?;
+    let fuse = serde_yaml::Value::from("fuse");
+    let isolate = serde_yaml::Value::from("isolate");
+    let mut carried: Vec<String> = Vec::new();
+    for node in nodes.iter_mut() {
+        let Some(map) = node.as_mapping_mut() else {
+            continue;
+        };
+        let Some(value) = map.remove(&fuse) else {
+            continue;
+        };
+        if value.as_bool() == Some(false) && !map.contains_key(&isolate) {
+            map.insert(isolate.clone(), serde_yaml::Value::Bool(true));
+        }
+        let id = map
+            .get(serde_yaml::Value::from("id"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or("<no id>");
+        carried.push(format!(
+            "{id} (fuse: {})",
+            value.as_bool().map_or("?".to_string(), |b| b.to_string())
+        ));
+    }
+    if carried.is_empty() {
+        return None;
+    }
+    tracing::warn!(
+        recording = %origin,
+        nodes = %carried.join(", "),
+        "the recorded graph carries the retired `fuse:` key; it is read as `isolate: true` \
+         where it said `fuse: false`, and dropped where it said `fuse: true`"
+    );
+    serde_yaml::to_string(&doc).ok()
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes
+/// [`parse_recorded_graph`] refuse the retired key as a new graph's load does.
+#[cfg(feature = "oracle-mutants")]
+pub const RECORDED_FUSE_MUTANT_ENV: &str = "CERULION_RECORDED_FUSE_MUTANT";
+
 /// Parse a YAML string into a `GraphConfig` without filling in any
 /// defaults. The returned config is exactly what was authored — empty
 /// `prefix` stays empty so a subsequent `serde_yaml::to_string` does
@@ -452,6 +518,72 @@ pub fn resolve_source(prefix: &str, source: &str) -> String {
 mod tests {
     use super::*;
     use tracing_test::traced_test;
+
+    // ── A recorded graph carrying the retired `fuse:` key ──────
+
+    const RECORDED: &str = "prefix: t\nnodes:\n  - id: src\n    type: src\n    outputs:\n      \
+        - name: out\n        schema: std_msgs/Int32\n  - id: sink\n    type: sink\n    \
+        fuse: false\n    inputs:\n      - name: inp\n        source: src/out\n  - id: tap\n    \
+        type: tap\n    fuse: true\n    inputs:\n      - name: inp\n        source: src/out\n";
+
+    /// A recording made before `fuse:` was retired still parses for replay:
+    /// `fuse: false` reads as `isolate: true`, `fuse: true` is dropped, and
+    /// exactly one warning names the recording. A new graph's load of the same
+    /// text is refused.
+    #[traced_test]
+    #[test]
+    fn a_recorded_graph_with_the_retired_fuse_key_replays_with_one_warning() {
+        let config = parse_recorded_graph(RECORDED, "old.mcap")
+            .expect("a recorded graph carrying `fuse:` must parse for replay");
+        let isolate = |id: &str| {
+            config
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.isolate)
+        };
+        assert_eq!(
+            isolate("sink"),
+            Some(true),
+            "`fuse: false` reads as `isolate: true`"
+        );
+        assert_eq!(isolate("tap"), None, "`fuse: true` is dropped");
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("retired `fuse:` key") && l.contains("old.mcap"))
+                .count();
+            if n == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected one warning naming the recording, got {n}"
+                ))
+            }
+        });
+        assert!(
+            parse_graph(RECORDED).is_err(),
+            "the same text is refused when a new graph loads"
+        );
+    }
+
+    /// A recorded graph without the key parses exactly as a new one does, and
+    /// says nothing.
+    #[traced_test]
+    #[test]
+    fn a_recorded_graph_without_the_key_is_parsed_unchanged() {
+        let plain = RECORDED
+            .replace("    fuse: false\n", "")
+            .replace("    fuse: true\n", "");
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse_recorded_graph(&plain, "new.mcap").expect("parses")
+            ),
+            format!("{:?}", parse_graph(&plain).expect("parses"))
+        );
+        assert!(!logs_contain("retired `fuse:` key"));
+    }
 
     // ── The shared unknown-key reader ──────────────────────────
 
