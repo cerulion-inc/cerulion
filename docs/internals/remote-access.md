@@ -189,22 +189,30 @@ registration declares no zenoh data subscriber and no demand token, and the
 receive callback refuses and counts (`IngressStats::lan_refused_drops`) any
 frame that still reaches it. `set_lan_access(Paired)` suspends every live
 ingress entry (undeclares both, keeps the injector and its counters) and waits
-out in-flight receive callbacks before it returns, so no LAN frame is
-re-injected after the close; reopening redeclares both. Writes from a paired
-desk travel over the remote plane, whose re-inject seam does not consult the
-LAN posture. Oracle tests:
+out every receive callback that already passed its posture check before it
+returns, so no frame from the zenoh LAN plane is re-injected after the close;
+reopening redeclares both. A callback that checks the posture after the close,
+even one still in flight when the close returns, refuses and counts its frame.
+The demand GET loop does not consult the posture: it keeps sending GETs while
+paired, and each GET's selector names one ingress topic it demands. Writes
+from a paired desk travel over the remote plane, whose re-inject seam does not
+consult the LAN posture. Oracle tests:
 `demand_authorizer.rs` unit tests,
-`demand_reconcile_never_enables_a_refused_demand` in `network.rs`,
+`demand_reconcile_never_enables_a_refused_demand` and
+`paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` (the
+switch side of the wait: it stores the paired flag, then blocks while a
+receive callback holds the ingress gate) in `network.rs`,
 `test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery` and
 `test_paired_receive_callback_refuses_and_counts_every_lan_frame` in
 `network_ingress_test.rs`, and
 `crates/cerulion_android/tests/lan_access_test.rs` (a real zenoh peer over TCP).
 
 The LAN posture is a whole-plane switch: a LAN source address proves no
-identity, so per-peer LAN authorization is not supported. Per-peer, per-topic
-and per-direction (observe or command) access with revocation is what the
-paired remote plane provides, binding each session to its pairing key over an
-authenticated transport.
+identity, so per-peer LAN authorization, with each LAN peer's identity bound to
+its pairing key, is not supported yet. Per-peer, per-topic and per-direction
+(observe or command) access with revocation is what the paired remote plane
+provides, binding each session to its pairing key over an authenticated
+transport.
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/

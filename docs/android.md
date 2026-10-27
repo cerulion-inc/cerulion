@@ -21,7 +21,7 @@ and `cerulion_dds`.
 | Recorder | Yes | Yes | App and graph recording use the same recorder. |
 | netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint. |
 | mDNS discovery | Yes | Yes | Android needs a multicast lock and a LAN-dialable nonzero TCP listen port for its beacon. |
-| LAN access default | Open | Paired | The device identity remains discoverable, but topic names are withheld and LAN catalog, schema, and data requests are refused. |
+| LAN access default | Open | Paired | The device identity remains discoverable, but topic announcements are withheld and LAN catalog, schema, and data requests are refused. |
 | wsd | Yes | Yes | Android control sockets use the abstract namespace. |
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
@@ -485,8 +485,8 @@ lock.acquire();
 The gateway is not open by default. Under `"lan_access": "paired"` every LAN
 request (topic demand, catalog and schema) is refused, and LAN ingress is
 refused too: no host on the network can publish into the app's topics. The robot identity can
-still appear in discovery, but topic announce tokens are withheld so the LAN
-does not learn topic names; `topic list` warns that the robot refused to serve
+still appear in discovery, but topic announce tokens are withheld, so the topics
+the app publishes are not named on the LAN; `topic list` warns that the robot refused to serve
 its catalog. The posture stays in front of every installed demand authorizer.
 Choose the posture at runtime startup with the app's `lan_access` key. A start
 keeps access paired while it builds the gateway and opens the configured posture
