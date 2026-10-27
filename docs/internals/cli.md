@@ -1324,11 +1324,17 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
   `the_feeder_events_replayed_through_a_bare_applier_match_the_run` pins the
   seam: the feeder's events for the scripted schedule are a hand-written list,
   and a bare applier fed that list fires at the same stamps as the loop.
-- The tap (`ClockTopicSource`) notes every read frame's wire sequence number
-  (`SequenceGapWatch`, a `FailureRegimeLatch`): a skip warns once
-  (`CLOCK_SEQUENCE_GAP_WARNING`) and the repeats are counted. A gap is a hint,
-  not proof: a publisher can consume a number without sending a frame. A sample
-  the full queue evicted (`CLOCK_TAP_DEPTH`) always leaves one.
+- The tap (`ClockTopicSource`) notes every read frame's origin and wire sequence
+  number (`SequenceGapWatch`, a `FailureRegimeLatch` keyed by origin): a skip
+  inside one publisher's stream warns on the first gap, is counted after, and is
+  announced again at each tenfold count (`CLOCK_SEQUENCE_GAP_WARNING`); a frame
+  from another origin starts the count over. The feeder calls
+  `ClockSource::rebaseline_sequence` on its first poll after the epoch, so the
+  numbers the next frame skips (lost to the runtime build) print once as
+  `CLOCK_BUILD_WINDOW_LOSS_WARNING`, not as a gap. `run_sim_time` logs the
+  feeder's `sequence_gaps()` total at the end of the run. A gap is a hint, not
+  proof: a publisher can consume a number without sending a frame. With one
+  publisher, a sample the full queue evicted (`CLOCK_TAP_DEPTH`) always leaves one.
 - A period fires at most once per sample: a jump fires the latest passed deadline,
   never a catch-up burst. This ceiling (`SIM_TIME_PERIOD_FIRES_PER_SAMPLE`,
   `GraphRuntime::set_period_fire_ceiling`) is current behaviour, not contract:
