@@ -52,7 +52,7 @@ use crate::type_bridge::{
     is_idl_empty_struct_placeholder, is_primitive_type, mask_bit, mask_has, padding_ranges,
     plan_seal, primitive_size, read_u32_prefix, read_var_entry, ros_type, shadow_layout,
     warn_bad_entry, BorrowSeal, BorrowSlotGeometry, BridgeError, ForgeOutcome, ForgePlacement,
-    FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch, WindowExtent,
+    FrameCursor, NestedLayouts, SealItem, SealRefusal, SealScratch, StructDepth, WindowExtent,
     BORROW_TAIL_ALIGN, MAX_FRAME_BYTES,
 };
 
@@ -153,6 +153,9 @@ pub struct CppBridgedMessage {
     pub c_size: usize,
     pub can_loan: bool,
     members: *const CppMessageMembers,
+    /// The root's declared members, resolved once at registration; see the
+    /// C twin's `root_members`.
+    root_members: &'static [CppMessageMember],
     ops: Vec<CppFieldOp>,
     /// Wire layouts for every transitively nested type — see the
     /// C twin's [`crate::type_bridge::NestedLayouts`].
@@ -211,7 +214,7 @@ impl CppBridgedMessage {
         // 1. Schema set (this type + transitive nested types).
         let mut schemas: BTreeMap<String, MessageSchema> = BTreeMap::new();
         let mut type_ptrs: BTreeMap<usize, String> = BTreeMap::new();
-        collect_schemas_cpp(members, &mut schemas, &mut type_ptrs)?;
+        collect_schemas_cpp(members, StructDepth::Root, &mut schemas, &mut type_ptrs)?;
         let root_qualified = qualified_name_of_cpp(members)?;
 
         // 2. Same layout pipeline as native codegen + the C bridge.
@@ -231,14 +234,19 @@ impl CppBridgedMessage {
             let l = resolver
                 .layout_of(qname)
                 .ok_or(BridgeError::NoIntrospection)?;
-            verify_nested_lockstep_cpp(*ptr as *const CppMessageMembers, qname, &l)?;
+            let depth = if *ptr == members as usize {
+                StructDepth::Root
+            } else {
+                StructDepth::Nested
+            };
+            verify_nested_lockstep_cpp(*ptr as *const CppMessageMembers, depth, qname, &l)?;
             nested_layouts.insert(*ptr, l);
         }
 
         // 3. Per-field plan with verified offsets/sizes.
         let m = &*members;
         let c_size = m.size_of_;
-        let member_slice = declared_members_cpp(m);
+        let member_slice = root_declared_members_cpp(m);
         // (Layout-drift plausibility is enforced in collect_schemas_cpp,
         // which already visited the root AND every nested type in step 1.)
 
@@ -362,6 +370,7 @@ impl CppBridgedMessage {
             c_size,
             can_loan: loanable,
             members,
+            root_members: member_slice,
             ops,
             nested_layouts,
             loan_pad_ranges,
@@ -953,9 +962,8 @@ impl CppBridgedMessage {
     }
 
     fn member(&self, idx: usize) -> &CppMessageMember {
-        // SAFETY: idx was minted from the same declared-members slice at
-        // registration; rosidl data is static.
-        unsafe { &declared_members_cpp(&*self.members)[idx] }
+        // `idx` was minted from this very slice at registration.
+        &self.root_members[idx]
     }
 
     /// Size pre-pass: exact wire-frame byte count for this C++ message
@@ -1389,13 +1397,28 @@ unsafe fn nested_members_of_cpp(member: &CppMessageMember) -> *const CppMessageM
     (*member.members_).data as *const CppMessageMembers
 }
 
-/// The members a C++ struct DECLARES: the twin of
-/// [`crate::type_bridge::declared_members`]. rosidl's empty-struct
+/// Every member rosidl lists for a C++ struct, the placeholder included: the
+/// twin of `crate::type_bridge::all_members`, for a struct reached through a
+/// member ([`StructDepth::Nested`]).
+unsafe fn all_members_cpp(m: &CppMessageMembers) -> &'static [CppMessageMember] {
+    std::slice::from_raw_parts(m.members_, m.member_count_ as usize)
+}
+
+/// The member slice a walk at `depth` sees.
+unsafe fn members_at_cpp(m: &CppMessageMembers, depth: StructDepth) -> &'static [CppMessageMember] {
+    match depth {
+        StructDepth::Root => root_declared_members_cpp(m),
+        StructDepth::Nested => all_members_cpp(m),
+    }
+}
+
+/// The members the ROOT C++ struct declares: the twin of
+/// `crate::type_bridge::root_declared_members`. rosidl's empty-struct
 /// placeholder is the same member in both introspection languages
-/// ([`is_idl_empty_struct_placeholder`]), and every member walk in this
-/// bridge goes through here so it stays invisible to all of them.
-unsafe fn declared_members_cpp(m: &CppMessageMembers) -> &'static [CppMessageMember] {
-    let all = std::slice::from_raw_parts(m.members_, m.member_count_ as usize);
+/// ([`is_idl_empty_struct_placeholder`]); the root plan, schema, encode and
+/// decode walk this slice, a nested struct walks [`all_members_cpp`].
+unsafe fn root_declared_members_cpp(m: &CppMessageMembers) -> &'static [CppMessageMember] {
+    let all = all_members_cpp(m);
     match all {
         [only]
             if is_idl_empty_struct_placeholder(
@@ -1416,11 +1439,13 @@ unsafe fn declared_members_cpp(m: &CppMessageMembers) -> &'static [CppMessageMem
 /// this is a hard registration-time error.
 unsafe fn verify_nested_lockstep_cpp(
     members: *const CppMessageMembers,
+    depth: StructDepth,
     qname: &str,
     layout: &WireLayout,
 ) -> Result<(), BridgeError> {
     let m = &*members;
-    let member_slice = declared_members_cpp(m);
+    // The slice the schema was collected from (see the C twin).
+    let member_slice = members_at_cpp(m, depth);
     let mut fixed_idx = 0usize;
     let mut var_idx = 0usize;
     for member in member_slice {
@@ -1491,6 +1516,7 @@ unsafe fn verify_nested_lockstep_cpp(
 
 unsafe fn collect_schemas_cpp(
     members: *const CppMessageMembers,
+    depth: StructDepth,
     out: &mut BTreeMap<String, MessageSchema>,
     ptrs: &mut BTreeMap<usize, String>,
 ) -> Result<(), BridgeError> {
@@ -1499,6 +1525,7 @@ unsafe fn collect_schemas_cpp(
     let name = ffi::cstr(m.message_name_).ok_or(BridgeError::NoIntrospection)?;
     let package = cpp_package(ns).to_string();
     let qualified = format!("{package}/{name}");
+    let member_slice = members_at_cpp(m, depth);
     // Dedupe recursion by introspection POINTER (see the C twin's
     // `collect_schemas`) so every distinct typesupport instance gets a
     // layout entry.
@@ -1506,11 +1533,10 @@ unsafe fn collect_schemas_cpp(
         return Ok(());
     }
     if out.contains_key(&qualified) {
-        return collect_nested_schemas_cpp(declared_members_cpp(m), out, ptrs);
+        return collect_nested_schemas_cpp(member_slice, out, ptrs);
     }
 
     let mut schema = MessageSchema::new_in_package(name, &package);
-    let member_slice = declared_members_cpp(m);
     for member in member_slice {
         // Layout-drift plausibility guard, applied to EVERY visited
         // type (root + transitively nested): the
@@ -1562,7 +1588,7 @@ unsafe fn collect_nested_schemas_cpp(
             if nested.is_null() {
                 return Err(BridgeError::NoIntrospection);
             }
-            collect_schemas_cpp(nested, out, ptrs)?;
+            collect_schemas_cpp(nested, StructDepth::Nested, out, ptrs)?;
         }
     }
     Ok(())
@@ -1636,7 +1662,7 @@ unsafe fn nested_is_fixed_cpp(members: *const CppMessageMembers) -> bool {
         return false;
     }
     let m = &*members;
-    let member_slice = declared_members_cpp(m);
+    let member_slice = all_members_cpp(m);
     for member in member_slice {
         if member.type_id_ == ros_type::STRING || member.type_id_ == ros_type::WSTRING {
             return false;
@@ -1692,7 +1718,7 @@ unsafe fn member_data_runs_cpp(
     } else {
         1
     };
-    let nested_slice = declared_members_cpp(m);
+    let nested_slice = all_members_cpp(m);
     for i in 0..count {
         for nm in nested_slice {
             member_data_runs_cpp(nm, base + i * stride + nm.offset_ as usize, runs);
@@ -1835,7 +1861,7 @@ unsafe fn unwritable_bool_seq_below_cpp(
         return None;
     }
     let nm = &*nested;
-    let nested_slice = declared_members_cpp(nm);
+    let nested_slice = all_members_cpp(nm);
     for nested_member in nested_slice {
         if unwritable_bool_seq_member_cpp(nested_member) {
             return Some(member_name_cpp(nested_member));
@@ -2180,7 +2206,7 @@ unsafe fn encode_message_payload_cpp(
     }
 
     let m = &*members;
-    let member_slice = declared_members_cpp(m);
+    let member_slice = all_members_cpp(m);
 
     let layout = layouts
         .get_cpp(members)
@@ -2283,7 +2309,7 @@ unsafe fn encode_message_payload_cpp(
 
 unsafe fn zero_struct_padding_cpp(members: *const CppMessageMembers, buf: &mut [u8]) {
     let m = &*members;
-    let member_slice = declared_members_cpp(m);
+    let member_slice = all_members_cpp(m);
     let mut runs = Vec::new();
     for nm in member_slice {
         member_data_runs_cpp(nm, nm.offset_ as usize, &mut runs);
@@ -2432,7 +2458,7 @@ unsafe fn decode_message_payload_cpp(
     }
 
     let m = &*members;
-    let member_slice = declared_members_cpp(m);
+    let member_slice = all_members_cpp(m);
     let Some(layout) = layouts.get_cpp(members) else {
         return false;
     };

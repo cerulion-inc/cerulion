@@ -39,9 +39,11 @@ use rmw_cerulion::ffi::{
     rosidl_typesupport_introspection_c__MessageMembers,
     rosidl_typesupport_introspection_c__ServiceMembers,
 };
-use rmw_cerulion::type_bridge::{BridgeError, BridgedMessage};
+use rmw_cerulion::type_bridge::BridgedMessage;
 use rmw_cerulion::type_bridge_cpp::CppBridgedMessage;
 
+use cerulion_core::codegen::layout::LayoutResolver;
+use cerulion_core::codegen::{FieldDef, FieldType, MessageSchema};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::wire::WireHeader;
 use native_ros2_messages::std_srvs::{
@@ -107,6 +109,20 @@ fn c_member(
         members_: nested,
         offset_: offset as u32,
         ..Default::default()
+    }
+}
+
+/// A `T[N]` member of primitives (`uint8[16] goal_id`).
+fn c_fixed_array_member(
+    name: &str,
+    type_id: u8,
+    length: usize,
+    offset: usize,
+) -> rosidl_typesupport_introspection_c__MessageMember {
+    rosidl_typesupport_introspection_c__MessageMember {
+        is_array_: true,
+        array_size_: length,
+        ..c_member(name, type_id, offset, std::ptr::null())
     }
 }
 
@@ -228,14 +244,58 @@ fn cpp_member(name: &str, type_id: u8, offset: usize) -> CppMessageMember {
     }
 }
 
+/// A `std::array<T, N>` member of primitives.
+fn cpp_fixed_array_member(
+    name: &str,
+    type_id: u8,
+    length: usize,
+    offset: usize,
+) -> CppMessageMember {
+    CppMessageMember {
+        is_array_: true,
+        array_size_: length,
+        ..cpp_member(name, type_id, offset)
+    }
+}
+
+/// A nested-message member, pointing at the nested type's typesupport.
+fn cpp_nested_member(
+    name: &str,
+    offset: usize,
+    nested: *const rosidl_message_type_support_t,
+) -> CppMessageMember {
+    CppMessageMember {
+        members_: nested,
+        ..cpp_member(name, ROS_TYPE_MESSAGE, offset)
+    }
+}
+
+fn cpp_typesupport(members: *const CppMessageMembers) -> *const rosidl_message_type_support_t {
+    Box::leak(Box::new(rosidl_message_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_cpp"),
+        data: members as *const c_void,
+        ..Default::default()
+    }))
+}
+
+/// A `std_srvs::srv` part.
 fn cpp_members(
+    name: &str,
+    size_of: usize,
+    members: Vec<CppMessageMember>,
+) -> *const CppMessageMembers {
+    cpp_members_in("std_srvs::srv", name, size_of, members)
+}
+
+fn cpp_members_in(
+    namespace: &str,
     name: &str,
     size_of: usize,
     members: Vec<CppMessageMember>,
 ) -> *const CppMessageMembers {
     let members = Box::leak(members.into_boxed_slice());
     Box::leak(Box::new(CppMessageMembers {
-        message_namespace_: cstr("std_srvs::srv"),
+        message_namespace_: cstr(namespace),
         message_name_: cstr(name),
         member_count_: members.len() as u32,
         size_of_: size_of,
@@ -450,37 +510,218 @@ fn an_empty_part_bridged_from_cpp_is_a_header_only_frame() {
 // =====================================================================
 // A member-less message nested in another message
 // =====================================================================
+//
+// rcl_action wraps every action's feedback as
+// `<Action>_FeedbackMessage { goal_id; <Action>_Feedback feedback }` (and the
+// goal and result the same way), so an action with an empty feedback part
+// (`tf2_msgs/action/LookupTransform` has one) is a message that NESTS a
+// member-less message. rosidl lays the nested part out as its one
+// placeholder byte. The placeholder is hidden only for the type a bridge is
+// built for, so the nested byte stays on the wire and in the hash: ROS 2
+// peers on rmw_cerulion exchange the wrapper unchanged, and its hash is the
+// one a native twin that DECLARES the byte announces, never the field-less
+// twin's, so a native peer cannot match it by mistake.
 
-/// `rmw_probe/Holder { std_msgs/Empty e }`, laid out as rosidl does: the
-/// nested struct is its one placeholder byte, so the C field is one byte
-/// where the native wire has none. The bridge does not re-pack that shape
-/// yet, so it must refuse the type loudly at creation; it must never bridge
-/// it under a hash a native `Holder` would not announce.
-#[test]
-fn a_message_that_nests_a_member_less_message_is_refused_not_mis_hashed() {
-    let empty = c_typesupport(c_members(
-        "std_msgs__msg",
-        "Empty",
+/// The wrapper as rosidl generates it in C: the goal id as its sixteen
+/// bytes, then the placeholder-only feedback part.
+#[repr(C)]
+struct CFeedbackMessage {
+    goal_id: [u8; 16],
+    feedback: CPlaceholderOnly,
+}
+
+/// The same wrapper in C++: `std::array<uint8_t, 16>` is sixteen contiguous
+/// bytes, and the nested struct is its placeholder byte.
+#[repr(C)]
+struct CppFeedbackMessage {
+    goal_id: [u8; 16],
+    feedback: CppPlaceholderOnly,
+}
+
+const PROBE_PACKAGE: &str = "rmw_probe";
+const PROBE_FEEDBACK: &str = "Probe_Feedback";
+const PROBE_FEEDBACK_MESSAGE: &str = "Probe_FeedbackMessage";
+const PROBE_QUALIFIED: &str = "rmw_probe/Probe_FeedbackMessage";
+
+/// A goal id with no repeated byte, so a misplaced copy shows.
+const GOAL_ID: [u8; 16] = [
+    0x5a, 0x01, 0xe3, 0x27, 0x9c, 0x44, 0xb8, 0x6f, 0x12, 0xd0, 0x3b, 0xa7, 0xc9, 0x85, 0x6e, 0xf4,
+];
+
+fn c_feedback_message() -> *const rosidl_typesupport_introspection_c__MessageMembers {
+    let feedback = c_typesupport(c_members(
+        "rmw_probe__action",
+        PROBE_FEEDBACK,
         std::mem::size_of::<CPlaceholderOnly>(),
         vec![c_member(PLACEHOLDER, ROS_TYPE_UINT8, 0, std::ptr::null())],
     ));
-    let holder = c_members(
-        "rmw_probe__msg",
-        "Holder",
-        std::mem::size_of::<CPlaceholderOnly>(),
-        vec![c_member("e", ROS_TYPE_MESSAGE, 0, empty)],
-    );
-    match unsafe { BridgedMessage::new(holder) } {
-        Err(BridgeError::LayoutMismatch { message, detail }) => {
-            assert_eq!(message, "rmw_probe/Holder");
-            assert!(detail.contains("'e'"), "the refusal names the field: {detail}");
-        }
-        Err(other) => panic!("expected a layout refusal, got {other}"),
-        Ok(bridge) => panic!(
-            "a nested member-less message was bridged under hash 0x{:016x}; a native peer would never meet it",
-            bridge.schema_hash()
-        ),
+    c_members(
+        "rmw_probe__action",
+        PROBE_FEEDBACK_MESSAGE,
+        std::mem::size_of::<CFeedbackMessage>(),
+        vec![
+            c_fixed_array_member("goal_id", ROS_TYPE_UINT8, 16, 0),
+            c_member(
+                "feedback",
+                ROS_TYPE_MESSAGE,
+                std::mem::offset_of!(CFeedbackMessage, feedback),
+                feedback,
+            ),
+        ],
+    )
+}
+
+fn cpp_feedback_message() -> *const CppMessageMembers {
+    let feedback = cpp_typesupport(cpp_members_in(
+        "rmw_probe::action",
+        PROBE_FEEDBACK,
+        std::mem::size_of::<CppPlaceholderOnly>(),
+        vec![cpp_member(PLACEHOLDER, ROS_TYPE_UINT8, 0)],
+    ));
+    cpp_members_in(
+        "rmw_probe::action",
+        PROBE_FEEDBACK_MESSAGE,
+        std::mem::size_of::<CppFeedbackMessage>(),
+        vec![
+            cpp_fixed_array_member("goal_id", ROS_TYPE_UINT8, 16, 0),
+            cpp_nested_member(
+                "feedback",
+                std::mem::offset_of!(CppFeedbackMessage, feedback),
+                feedback,
+            ),
+        ],
+    )
+}
+
+/// The hash a NATIVE peer announces for the wrapper when its feedback part
+/// declares `feedback_fields`: the layout pipeline codegen runs at build
+/// time, with no bridge code in it.
+fn native_feedback_message_hash(feedback_fields: Vec<FieldDef>) -> u64 {
+    let mut feedback = MessageSchema::new_in_package(PROBE_FEEDBACK, PROBE_PACKAGE);
+    for field in feedback_fields {
+        feedback.add_field(field);
     }
+    let mut message = MessageSchema::new_in_package(PROBE_FEEDBACK_MESSAGE, PROBE_PACKAGE);
+    message.add_field(FieldDef::new(
+        "goal_id",
+        FieldType::FixedArray {
+            element_type: Box::new(FieldType::U8),
+            length: 16,
+        },
+    ));
+    message.add_field(FieldDef::new(
+        "feedback",
+        FieldType::Nested {
+            schema_name: PROBE_FEEDBACK.to_string(),
+            package: Some(PROBE_PACKAGE.to_string()),
+            fixed: None,
+        },
+    ));
+    let (mut resolver, warnings) = LayoutResolver::new(vec![feedback, message]);
+    assert!(
+        warnings.is_empty(),
+        "the native twin resolves: {warnings:?}"
+    );
+    resolver
+        .layout_of(PROBE_QUALIFIED)
+        .expect("the native twin has a layout")
+        .schema_hash
+}
+
+/// The placeholder byte as a declared native field.
+fn placeholder_field() -> FieldDef {
+    FieldDef::new(PLACEHOLDER, FieldType::U8)
+}
+
+/// The wrapper's hash keeps the nested byte: the twin that declares it, not
+/// the field-less one.
+fn assert_wrapper_hash_declares_the_nested_byte(bridged: u64) {
+    assert_eq!(
+        bridged,
+        native_feedback_message_hash(vec![placeholder_field()]),
+        "the wrapper hashes like a native twin whose feedback declares the byte"
+    );
+    assert_ne!(
+        bridged,
+        native_feedback_message_hash(Vec::new()),
+        "the wrapper must not hash like the field-less native twin it does not frame like"
+    );
+}
+
+#[test]
+fn an_action_feedback_wrapper_with_a_field_less_feedback_bridges_from_c_and_round_trips() {
+    let bridge = unsafe { BridgedMessage::new(c_feedback_message()) }
+        .unwrap_or_else(|e| panic!("rcl_action's feedback wrapper must bridge: {e}"));
+    assert_eq!(bridge.qualified_name, PROBE_QUALIFIED);
+    assert!(
+        bridge.can_loan,
+        "the wrapper is fixed and lays out as the wire does: it keeps the zero-copy loan path"
+    );
+    assert_wrapper_hash_declares_the_nested_byte(bridge.schema_hash());
+
+    let msg = CFeedbackMessage {
+        goal_id: GOAL_ID,
+        feedback: CPlaceholderOnly {
+            structure_needs_at_least_one_member: 0,
+        },
+    };
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 7, 19) }.expect("flatten");
+    let payload = &frame[WireHeader::SIZE..];
+    assert_eq!(
+        payload.len(),
+        std::mem::size_of::<CFeedbackMessage>(),
+        "the nested placeholder byte rides the wire"
+    );
+    assert_eq!(&payload[..16], &GOAL_ID);
+    assert_eq!(payload[16], 0);
+
+    let mut out = CFeedbackMessage {
+        goal_id: [0; 16],
+        feedback: CPlaceholderOnly {
+            structure_needs_at_least_one_member: 0xA5,
+        },
+    };
+    let ok = unsafe { bridge.unflatten(payload, &mut out as *mut _ as *mut c_void) };
+    assert!(ok, "a ROS 2 peer takes the wrapper whole");
+    assert_eq!(out.goal_id, GOAL_ID);
+    assert_eq!(
+        out.feedback.structure_needs_at_least_one_member, 0,
+        "the take writes the nested byte from the wire"
+    );
+}
+
+#[test]
+fn an_action_feedback_wrapper_with_a_field_less_feedback_bridges_from_cpp_and_round_trips() {
+    let bridge = unsafe { CppBridgedMessage::new(cpp_feedback_message()) }
+        .unwrap_or_else(|e| panic!("rcl_action's feedback wrapper must bridge: {e}"));
+    assert_eq!(bridge.qualified_name, PROBE_QUALIFIED);
+    assert!(bridge.can_loan);
+    assert_wrapper_hash_declares_the_nested_byte(bridge.schema_hash());
+
+    let msg = CppFeedbackMessage {
+        goal_id: GOAL_ID,
+        feedback: CppPlaceholderOnly {
+            structure_needs_at_least_one_member: 0,
+        },
+    };
+    let frame =
+        unsafe { bridge.flatten(&msg as *const _ as *const c_void, 7, 19) }.expect("flatten");
+    let payload = &frame[WireHeader::SIZE..];
+    assert_eq!(payload.len(), std::mem::size_of::<CppFeedbackMessage>());
+    assert_eq!(&payload[..16], &GOAL_ID);
+    assert_eq!(payload[16], 0);
+
+    let mut out = CppFeedbackMessage {
+        goal_id: [0; 16],
+        feedback: CppPlaceholderOnly {
+            structure_needs_at_least_one_member: 0xA5,
+        },
+    };
+    let ok = unsafe { bridge.unflatten(payload, &mut out as *mut _ as *mut c_void) };
+    assert!(ok);
+    assert_eq!(out.goal_id, GOAL_ID);
+    assert_eq!(out.feedback.structure_needs_at_least_one_member, 0);
 }
 
 // =====================================================================
