@@ -3685,6 +3685,20 @@ impl NetworkManager {
     /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
+    ///
+    /// The posture gates ingress (LAN to local) too. Switching to
+    /// [`LanAccess::Paired`] suspends every live ingress entry (see
+    /// [`Self::register_ingress`]): it undeclares the entry's zenoh data
+    /// subscriber and demand token and keeps its injector and counters. It then
+    /// waits out every in-flight receive callback before it returns (after every
+    /// lock here is released), so once it returns no LAN frame is re-injected
+    /// into local iceoryx2 until access reopens. A receive callback that runs
+    /// after the switch refuses its frame and counts it in
+    /// [`IngressStats::lan_refused_drops`]. An entry registered while paired
+    /// declares neither handle. Reopening declares both handles again for every
+    /// suspended entry; a failed declaration logs a warning and the next open
+    /// retries it. The remote plane's re-inject seam does not consult this
+    /// posture.
     pub fn set_lan_access(&self, access: LanAccess) {
         self.apply_lan_access(access);
     }
