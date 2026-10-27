@@ -3568,19 +3568,24 @@ def _workflow_folded_value(path, name):
 
 
 # Text people write around the repository, as an expression can reach it: a
-# body or a title by name (property names are not case sensitive), the old text
-# an `edited` event carries under `changes`, a whole object that holds such
-# text (`toJSON(github.event)`), or index syntax, which this reader cannot
-# follow and so counts. A `github` inside a longer name (`steps.github-app`,
+# body or a title by name in any rendering (`body`, `body_html`, `body_text`;
+# property names are not case sensitive), the old text an `edited` event
+# carries under `changes`, a whole object that holds such text
+# (`toJSON(github.event)`), or index syntax, which this reader cannot follow
+# and so counts. A `github` inside a longer name (`steps.github-app`,
 # `inputs.github-token`) is not the context, and quoted literals are removed
 # before the match, so a compare with `'github-actions[bot]'` reads nothing.
 EVENT_TEXT_RX = re.compile(
     r'(?i)(?<![\w.-])github\.event\.(?:(?:comment|issue|pull_request|review|discussion)'
-    r'\.(?:body|title)|changes)\b'
+    r'\.(?:body|title)\w*|changes)\b'
     r'|(?<![\w.-])github(?:\.event(?:\.(?:comment|issue|pull_request|review|discussion))?)?'
     r'(?![\w.\[-])'
     r'|(?<![\w.-])github(?:\.event(?:\.\w+)*)?\s*\[')
-EXPR_RX = re.compile(r'\$\{\{(.*?)\}\}', re.S)
+# One `${{ }}` expression. It ends at the first `}}` outside a quoted literal,
+# the way the runner finds the end: a `}}` inside `'...'` is text, and every
+# quote opens or closes a literal, so the escaped quote `''` is the close of
+# one literal and the open of the next.
+EXPR_RX = re.compile(r"\$\{\{((?:'[^']*'|[^'])*?)\}\}", re.S)
 QUOTED_RX = re.compile(r"'(?:[^']|'')*'")
 BLOCK_KEY_RX = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z_][\w-]*):\s*[|>][-+0-9]*(?:\s+#.*)?\s*$')
 # A JOB's condition: four spaces under `jobs: <id>:`, no list dash.
@@ -3602,9 +3607,11 @@ def _printed_event_text(text):
     with or without `${{ }}`) are printed with every expression already
     expanded, so a copy of the text lands in the public log and outlives an
     edit or a delete of the text itself. Only a JOB's `if:` is evaluated where
-    no log prints it, so it may read the text; so may a YAML comment. A shell
-    comment inside a `run:` block is still part of the printed script and
-    counts."""
+    no log prints it: the service evaluates it before a runner takes the job,
+    and the job the runner receives carries its steps' conditions but no job
+    condition, so nothing the runner logs, debug or not, can trace it. It may
+    read the text; so may a YAML comment. A shell comment inside a `run:`
+    block is still part of the printed script and counts."""
     lines = text.replace('\r\n', '\n').split('\n')
     printed = []
     block = None  # (column of the key, 'job-if' | 'step-if' | None) inside a block scalar
@@ -5499,6 +5506,11 @@ def self_test(out, base_env, argv0):
             ('          A: ${{ github.actor == \'github-actions[bot]\' }}', False),  # a literal
             ('          L: ${{ format(\'{0} on github\', github.run_id) }}', False),  # a literal
             ('          T: ${{ steps.github-app.outputs.token }} ${{ inputs.github-token }}', False),
+            # A `}}` inside a quoted literal does not end the expression ...
+            ('          Q: ${{ \'}}\' && github.event.comment.body }}', True),
+            ('          F: ${{ format(\'{0}}}\', github.run_id) }}', False),  # ... nor start one
+            # The other renderings of a body or a title are the same text.
+            ('          H: ' + e + 'comment.body_html }} ' + e + 'issue.body_text }}', True),
             ('        run: |', False),
             ('          # ' + e + 'review.body }}', True),           # a shell comment is printed
             ('          echo "$B"', False),
