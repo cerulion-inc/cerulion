@@ -163,13 +163,8 @@ pub async fn serve_endpoint(
     let shared =
         SharedTrust::new_with_clock(trust_store, device_index, mac_key, access_clock.clone());
     let classify = Arc::new(PairingAuthorizer::from_shared(shared.clone()));
-    // The robot's own revocation fetch: the supervisor's sync worker leaves
-    // fetched epochs in the state directory, applied here on a poll.
-    let pull = config.store_file.parent().map(|dir| {
-        let recheck = crate::epoch_pull::key_recheck_from_env();
-        Arc::new(EpochPull::new(dir, shared.clone(), access_clock.clone()).with_recheck(recheck))
-    });
-    let poller = pull.clone().map(|pull| tokio::spawn(pull.run()));
+    let shared_for_pull = shared.clone();
+    let pull_clock = access_clock.clone();
     // The wire plane's epoch-sync sink gets the SAME live handle + the SAME
     // trusted clock the accept gate and the access list run on, so a desk-pushed
     // epoch is authoritative everywhere at once.
@@ -228,12 +223,44 @@ pub async fn serve_endpoint(
         "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
     );
 
+    // The robot's own revocation fetch: the supervisor's sync worker leaves
+    // fetched epochs in the state directory, applied here on a poll. Started
+    // only after every fallible plane is built, and owned by a guard that
+    // aborts it however this future ends (an error, a cancelled future, a
+    // normal return).
+    let pull = config.store_file.parent().map(|dir| {
+        let recheck = crate::epoch_pull::key_recheck_from_env();
+        Arc::new(
+            EpochPull::new(dir, shared_for_pull.clone(), pull_clock.clone()).with_recheck(recheck),
+        )
+    });
+    let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
     let served =
         serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
-    if let Some(poller) = poller {
-        poller.abort();
-    }
+    poller.stop().await;
     served
+}
+
+/// A spawned task aborted when this guard drops.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Abort the task and wait for it to end. A blocking step it already
+    /// started (one file apply) runs to completion first.
+    async fn stop(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Assert the loaded trust store belongs to THIS device: the endpoint id (the

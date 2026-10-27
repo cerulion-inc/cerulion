@@ -466,3 +466,102 @@ async fn daemon_serve_endpoint_applies_the_robots_own_fetched_epoch_with_no_desk
     let _ = shutdown_tx.send(());
     let _ = bounded("serve shutdown", serve).await;
 }
+
+/// A correctly permissioned, genuinely signed pending epoch in `remoted`.
+fn install_pending(remoted: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = remoted.join(".epoch.pending.tmp");
+    std::fs::write(
+        &staged,
+        hex::encode(
+            EpochSyncWire::new(intermediate_cert(), epoch(4, vec![PROBE]))
+                .to_postcard()
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pending = remoted.join("epoch.pending");
+    std::fs::rename(&staged, &pending).unwrap();
+    pending
+}
+
+fn private_remoted_dir(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let remoted = root.join("remoted");
+    std::fs::create_dir_all(&remoted).unwrap();
+    std::fs::set_permissions(&remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    remoted
+}
+
+fn claimed_store() -> (TrustStore, DeviceAccountIndex) {
+    let root_set = RootSet::new(vec![pk(&sk(1))], 1).unwrap();
+    let mut store = TrustStore::provision(ROBOT, pk(&sk(0x77)), root_set, CHASSIS, 0).unwrap();
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    (store, DeviceAccountIndex::new())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_or_cancelled_serve_leaves_no_epoch_poller_running() {
+    // 1. A startup failure (the receipt log cannot open) returns an error, and no
+    //    poller is left behind to claim a later epoch.
+    let dir = tempfile::tempdir().unwrap();
+    let remoted = private_remoted_dir(dir.path());
+    let mut config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    config.receipt_file = remoted.clone(); // a directory: the receipt log refuses it
+    let endpoint = disabled_endpoint([0x34; 32]).await;
+    let (store, index) = claimed_store();
+    let failed = bounded(
+        "failing serve",
+        serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &endpoint,
+            RemotedClock::fixed(T_NOW),
+            None,
+            Some(test_manager("pull-fail")),
+            std::future::pending::<()>(),
+        ),
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "startup must fail on an unopenable receipt log"
+    );
+    let pending = install_pending(&remoted);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(pending.exists(), "no poller survived the failed startup");
+
+    // 2. A serve future that is cancelled leaves no poller behind either.
+    let dir = tempfile::tempdir().unwrap();
+    let remoted = private_remoted_dir(dir.path());
+    let config = RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, false);
+    std::fs::create_dir_all(&config.log_root).unwrap();
+    let endpoint = disabled_endpoint([0x35; 32]).await;
+    let (store, index) = claimed_store();
+    let manager = test_manager("pull-cancel");
+    let serving = tokio::spawn(async move {
+        let _ = serve_endpoint(
+            &config,
+            store,
+            index,
+            Vec::new(),
+            &endpoint,
+            RemotedClock::fixed(T_NOW),
+            None,
+            Some(manager),
+            std::future::pending::<()>(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    serving.abort();
+    let _ = serving.await;
+    let pending = install_pending(&remoted);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(pending.exists(), "no poller survived the cancelled serve");
+}
