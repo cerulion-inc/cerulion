@@ -24,6 +24,10 @@
 //!    each frame stamped with the sim time of its deadline, a sample that
 //!    jumps across several deadlines delivers ONE frame, and the run ends
 //!    cleanly when `running` clears.
+//! 7. A graph whose node library is missing, run with `--no-validate` beside
+//!    a `ros2:` entry, is refused by the library's name BEFORE the entry
+//!    starts, on sim time and on the real clock alike: the entry's own
+//!    preflight (its launch file is missing too) never gets to speak.
 //!
 //! Needs `cargo build -p test_node_macro_period_cdylib
 //! -p test_node_macro_external_cdylib` first. `#[serial]`: arms 5 and 6 load a
@@ -88,10 +92,24 @@ struct NodeSpec {
     fixture: &'static str,
 }
 
+/// Whether a hand-built workspace carries its nodes' prebuilt libraries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Libraries {
+    /// The fixture cdylibs are copied under `target/debug`: the run can load.
+    Prebuilt,
+    /// Sources only: the run's library resolution fails for every node.
+    Missing,
+}
+
 /// Hand-build a workspace in `root`: a `[workspace]` Cargo.toml, the node
 /// sources and prebuilt libraries under the node ids, and `graphs/demo.yaml`
 /// from `graph_yaml`.
 fn build_workspace(root: &Path, nodes: &[NodeSpec], graph_yaml: &str) {
+    build_workspace_with(root, nodes, graph_yaml, Libraries::Prebuilt);
+}
+
+/// [`build_workspace`], with or without the prebuilt libraries.
+fn build_workspace_with(root: &Path, nodes: &[NodeSpec], graph_yaml: &str, libraries: Libraries) {
     std::fs::create_dir_all(root.join("graphs")).unwrap();
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
     std::fs::write(
@@ -107,11 +125,13 @@ fn build_workspace(root: &Path, nodes: &[NodeSpec], graph_yaml: &str) {
             root.join(format!("nodes/{}/src/lib.rs", node.id)),
         )
         .expect("copy fixture src");
-        std::fs::copy(
-            cerulion_core::testing::find_fixture_cdylib(node.fixture),
-            root.join("target/debug").join(dylib_file(node.id)),
-        )
-        .expect("copy fixture cdylib");
+        if libraries == Libraries::Prebuilt {
+            std::fs::copy(
+                cerulion_core::testing::find_fixture_cdylib(node.fixture),
+                root.join("target/debug").join(dylib_file(node.id)),
+            )
+            .expect("copy fixture cdylib");
+        }
     }
 }
 
@@ -175,6 +195,9 @@ struct RunArgs<'a> {
     time_source: TimeSource,
     single_process: bool,
     record: Option<String>,
+    /// `--no-validate`: skip the validation report (arm 7 needs the run to
+    /// get past the report's own library check).
+    skip_validate: bool,
 }
 
 fn run(args: RunArgs<'_>) -> Result<(), String> {
@@ -186,7 +209,7 @@ fn run(args: RunArgs<'_>) -> Result<(), String> {
         args.time_source,
         CpuDmaLockMode::Auto,
         MonitorWaitMode::Auto,
-        false,
+        args.skip_validate,
         false,
         None,
         args.single_process,
@@ -233,6 +256,7 @@ fn sim_time_plus_the_virtual_flag_is_refused_before_any_file_is_written() {
         time_source: TimeSource::Virtual,
         single_process: true,
         record: None,
+        skip_validate: false,
     })
     .expect_err("two clock sources are refused");
     assert!(
@@ -270,6 +294,7 @@ fn sim_time_plus_record_is_refused_with_the_sim_time_text() {
         time_source: TimeSource::Real,
         single_process: true,
         record: Some(bag_dir.to_str().expect("utf-8").to_string()),
+        skip_validate: false,
     })
     .expect_err("a sim-time run is not recordable");
     assert!(
@@ -308,6 +333,7 @@ fn sim_time_with_process_groups_is_refused_unless_single_process() {
         time_source: TimeSource::Real,
         single_process: false,
         record: None,
+        skip_validate: false,
     })
     .expect_err("one /clock stream cannot drive several processes");
     assert!(
@@ -356,6 +382,7 @@ fn sim_time_refuses_a_graph_whose_own_node_publishes_the_clock() {
         time_source: TimeSource::Real,
         single_process: true,
         record: None,
+        skip_validate: false,
     })
     .expect_err("a graph cannot be its own clock source");
     assert!(
@@ -393,6 +420,7 @@ fn the_external_flag_is_held_to_the_one_clock_source_rule() {
         time_source: TimeSource::External,
         single_process: true,
         record: None,
+        skip_validate: false,
     })
     .expect_err("two clock sources are refused whichever spelling turned sim time on");
     assert!(
@@ -453,6 +481,7 @@ fn sim_time_with_an_external_node_is_refused_at_launch_without_waiting_for_a_clo
         time_source: TimeSource::Real,
         single_process: true,
         record: None,
+        skip_validate: false,
     });
     assert!(
         running.load(Ordering::Relaxed),
@@ -535,6 +564,7 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
             time_source: TimeSource::Real,
             single_process: true,
             record: None,
+            skip_validate: false,
         })
     });
 
@@ -609,4 +639,79 @@ fn a_period_node_fires_once_per_clock_sample_stamped_with_the_sim_time() {
         .join()
         .expect("the run thread does not panic")
         .expect("a sim-time run ends cleanly when `running` clears");
+}
+
+// ==========================================================================
+// 7. A missing node library beside a `ros2:` entry: refused by the library's
+//    name before the entry starts, on every clock.
+// ==========================================================================
+
+/// The ticker graph with a `ros2:` launch entry whose launch file is missing.
+/// The entry's own preflight refuses a missing launch file by name before it
+/// spawns anything, so whichever refusal the run returns says which came
+/// first: the library's, or the entry's.
+fn ticker_beside_a_ros2_entry(prefix: &str, sim_time: bool) -> String {
+    format!(
+        "name: demo\nprefix: {prefix}\nsim_time: {sim_time}\nnodes:\n\
+         - id: ticker\n  type: ticker\n  inputs: []\n  outputs:\n\
+         \x20 - name: cmd\n    schema: geometry_msgs/Vector3\n\
+         - id: bringup\n  ros2:\n    launch: launch/missing.launch.py\n"
+    )
+}
+
+/// How the run names the ticker's missing library.
+const TICKER_LIBRARY_MISSING: &str = "cdylib for node 'ticker' not found";
+
+/// How the `ros2:` entry's own preflight names the entry: the text the run
+/// must NOT return, because the entry never gets that far.
+const ROS2_ENTRY_PREFLIGHT: &str = "ros2 entry 'bringup'";
+
+/// One arm of 7: the ticker's library is missing and the report is skipped
+/// (`--no-validate`), so the run's own library refusal is the only one left
+/// ahead of the `ros2:` spawn.
+fn a_missing_library_is_refused_before_the_ros2_entry_starts(
+    tag: &str,
+    sim_time: bool,
+    time_source: TimeSource,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = arm_env(tmp.path());
+    let root = tmp.path().join("ws");
+    let yaml = ticker_beside_a_ros2_entry(&unique_prefix(tag), sim_time);
+    build_workspace_with(&root, &[TICKER], &yaml, Libraries::Missing);
+
+    let err = run(RunArgs {
+        root: &root,
+        running: Arc::new(AtomicBool::new(true)),
+        time_source,
+        single_process: true,
+        record: None,
+        skip_validate: true,
+    })
+    .expect_err("a graph whose library is missing cannot run");
+    assert!(
+        err.contains(TICKER_LIBRARY_MISSING),
+        "refused by the missing library's name: {err}"
+    );
+    assert!(
+        !err.contains(ROS2_ENTRY_PREFLIGHT),
+        "the ros2 entry never started, so its own preflight (the missing launch file) is \
+         not the refusal: {err}"
+    );
+    assert!(
+        run_dirs(tmp.path()).is_empty(),
+        "the refusal comes before the run directory is created"
+    );
+}
+
+#[test]
+#[serial]
+fn sim_time_with_a_missing_library_is_refused_before_its_ros2_entry_starts() {
+    a_missing_library_is_refused_before_the_ros2_entry_starts("nolibsim", true, TimeSource::Real);
+}
+
+#[test]
+#[serial]
+fn the_real_clock_with_a_missing_library_is_refused_before_its_ros2_entry_starts() {
+    a_missing_library_is_refused_before_the_ros2_entry_starts("nolibreal", false, TimeSource::Real);
 }

@@ -6110,9 +6110,9 @@ pub fn graph_run(
     // paying the exit budget and mutating global `/tmp` state — surprise
     // latency and a global side effect earned by an invalid command. Everything
     // above this line is preflight (the graph read, the prefix fill, workspace
-    // validation, the partition intent, the auto-partition consent, and the
-    // deployment rejection just above), so a run refused there returns
-    // immediately and touches nothing.
+    // validation, the partition intent, the auto-partition consent, the
+    // deployment rejection, and the library and sim-time refusals just
+    // above), so a run refused there returns immediately and touches nothing.
     //
     // Still a NAMED local, and still ahead of the dispatch — both load-bearing,
     // for the same reasons the run descriptor below states. Rust drops locals in
@@ -6145,7 +6145,14 @@ pub fn graph_run(
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
 
-    let _exit_hygiene = crate::ipc_cleanup::ExitHygieneGuard::armed();
+    // LIBRARIES: a native node type whose cdylib did not resolve is refused
+    // HERE, on every clock, before the graph's `ros2:` children are spawned,
+    // before the exit hygiene guard is armed and before the run directory is
+    // written. The validation report refuses it earlier; under
+    // `--no-validate` the only other refusal is the load, far below the
+    // spawn, and a child would have run its startup side effects for a run
+    // that cannot proceed. Same words as the load (`cached_cdylib`).
+    refuse_unresolved_cdylibs(workspace_root, &config, prefer_release, &cdylib_cache)?;
 
     // SIM TIME: nothing sweeps an external-policy node's fd or doorbell
     // between clock samples (the same rule as the virtual poll loop), so such
@@ -6154,22 +6161,35 @@ pub fn graph_run(
     // written, so a graph that can never run starts nothing: no child gets to
     // run its startup side effects for a run that is refused. The metadata
     // comes from the libraries the params pass above already holds (the same
-    // memo), so no library is loaded an extra time; a node whose library is
-    // not resolved is left to the load below, which refuses it by name. With
-    // sim time's own text, because the virtual loop's fix (`--time-source
-    // real`) resolves back to sim time on a `sim_time: true` graph.
+    // memo), so no library is loaded an extra time. With sim time's own
+    // text, because the virtual loop's fix (`--time-source real`) resolves
+    // back to sim time on a `sim_time: true` graph.
     if time_source == TimeSource::External {
         crate::sim_time_run::refuse_external_nodes_under_sim_time(graph_name, &config, |node| {
-            match cdylib_cache.get(node.node_type.as_str()) {
-                Some(Ok(lib)) => Some(crate::node_inspector::NodeInspector::inspect(
+            // A type the cache does not hold cannot happen
+            // (`resolve_cdylib_cache` fills every native type); it is left
+            // to the load, which names it. A type the cache holds a FAILED
+            // resolution for is the run's refusal, not a node to pass over:
+            // the refusal above already made it for every clock, and this
+            // preflight makes the same one, so a reorder of the two can never
+            // let a `ros2:` child start for a run that cannot load.
+            cdylib_cache.contains_key(node.node_type.as_str()).then(|| {
+                let lib = cached_cdylib(
+                    workspace_root,
+                    &node.node_type,
+                    prefer_release,
+                    &cdylib_cache,
+                )?;
+                crate::node_inspector::NodeInspector::inspect(
                     &params_inspector,
                     &lib.path,
                     &node.node_type,
-                )),
-                _ => None,
-            }
+                )
+            })
         })?;
     }
+
+    let _exit_hygiene = crate::ipc_cleanup::ExitHygieneGuard::armed();
 
     // `ros2:` entries: spawn the graph's ROS 2 half NOW — before the deployment
     // dispatch, so every run shape (supervisor, recording, both monolith arms)
@@ -15214,13 +15234,69 @@ pub(crate) fn load_node_factories(
     load_node_factories_from_cache(workspace_root, config, prefer_release, &cache)
 }
 
+/// What a [`ResolvedCdylibCache`] entry MEANS for a node type: the resolved
+/// library, or the error the run reports for it. The one definition both the
+/// load loop ([`load_node_factories_from_cache`]) and the pre-spawn refusal
+/// ([`refuse_unresolved_cdylibs`]) read, so a type refused early is refused
+/// with the words the load would have used.
+///
+/// A cached FAILURE holds the *rendered* error string; rather than re-wrap it
+/// (which would double the "cdylib for node ... not found:" prefix),
+/// `find_cdylib` is re-called on this rare abort path to reconstruct the exact
+/// typed [`CliError::CdylibNotFound`] with its searched-paths + rebuild-hint
+/// message. TOCTOU (the artifact appeared between the cache build and now):
+/// the cached, already-rendered reason is passed through verbatim. A MISS
+/// cannot happen (`resolve_cdylib_cache` populates every native node type in
+/// the config), so it is reported as the logic error it is.
+fn cached_cdylib<'a>(
+    workspace_root: &Path,
+    node_type: &str,
+    prefer_release: bool,
+    cache: &'a ResolvedCdylibCache,
+) -> CliResult<&'a ResolvedCdylib> {
+    match cache.get(node_type) {
+        Some(Ok(lib)) => Ok(lib),
+        Some(Err(reason)) => Err(
+            match find_cdylib(workspace_root, node_type, prefer_release) {
+                // Still missing (the common case): hand back the typed error.
+                Err(e) => e,
+                // TOCTOU: the artifact appeared between cache build and now.
+                Ok(_) => CliError::Validation(reason.clone()),
+            },
+        ),
+        None => Err(CliError::CdylibNotFound {
+            node_type: node_type.to_string(),
+            reason: "internal error: cdylib not resolved (please report)".to_string(),
+        }),
+    }
+}
+
+/// Refuse a run whose native node libraries did not ALL resolve, before the
+/// run starts anything: the refusal [`load_node_factories_from_cache`] would
+/// make, made ahead of the `ros2:` spawn, the exit hygiene guard and the run
+/// directory write, so a run that cannot load never starts a child for its
+/// startup side effects. The validation report refuses such a graph earlier;
+/// under `--no-validate` this is the refusal. The first unresolved type in
+/// declaration order is the error, as the load reports it; `Ok(())` when
+/// every type resolved, the common path.
+fn refuse_unresolved_cdylibs(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    prefer_release: bool,
+    cache: &ResolvedCdylibCache,
+) -> CliResult<()> {
+    // `ros2:` entries have no cdylib to resolve (the run spawns them instead).
+    for node_def in config.native_nodes() {
+        cached_cdylib(workspace_root, &node_def.node_type, prefer_release, cache)?;
+    }
+    Ok(())
+}
+
 /// The shared cdylib LOAD LOOP over a pre-built [`ResolvedCdylibCache`] — the
 /// single definition of the per-node resolution the single-process `graph_run`,
 /// the multi-process worker, and the supervisor's planning build all use. Warns
-/// on a stale build once per node TYPE; reconstructs the exact typed
-/// `CdylibNotFound` (with searched-paths + rebuild hint) on the abort path
-/// rather than re-wrapping the cached rendered string, and passes a
-/// TOCTOU-appeared artifact's cached reason through verbatim.
+/// on a stale build once per node TYPE; an unresolved type is the error
+/// [`cached_cdylib`] reconstructs for it.
 fn load_node_factories_from_cache(
     workspace_root: &Path,
     config: &GraphConfig,
@@ -15232,31 +15308,7 @@ fn load_node_factories_from_cache(
     // `ros2:` entries have no cdylib to load (the run spawns them instead).
     for node_def in config.native_nodes() {
         let node_type = node_def.node_type.as_str();
-        let lib = match cache.get(node_type) {
-            Some(Ok(lib)) => lib,
-            Some(Err(reason)) => {
-                // The cache holds the *rendered* error string; rather than
-                // re-wrap it (which would double the "cdylib for node ... not
-                // found:" prefix), re-call `find_cdylib` on this rare abort path
-                // to reconstruct the exact typed `CliError::CdylibNotFound` with
-                // its searched-paths + rebuild-hint message.
-                return match find_cdylib(workspace_root, node_type, prefer_release) {
-                    // Still missing (the common case): hand back the typed error.
-                    Err(e) => Err(e),
-                    // TOCTOU: the artifact appeared between cache build and now.
-                    // Pass the cached, already-rendered reason through verbatim.
-                    Ok(_) => Err(CliError::Validation(reason.clone())),
-                };
-            }
-            None => {
-                // `resolve_cdylib_cache` populates every node type in `config`,
-                // so a miss is a logic error.
-                return Err(CliError::CdylibNotFound {
-                    node_type: node_def.node_type.clone(),
-                    reason: "internal error: cdylib not resolved (please report)".to_string(),
-                });
-            }
-        };
+        let lib = cached_cdylib(workspace_root, node_type, prefer_release, cache)?;
         // The load path owns the stale-build log line; `graph_validate`
         // surfaces the same condition in its report. Warn once per type.
         if warned_stale.insert(node_type) {
@@ -30866,11 +30918,73 @@ nodes:
             at < spawn && at < run_dir,
             "the refusal must come before the ros2 spawn and the run directory write"
         );
+        let armed = body
+            .find("ExitHygieneGuard::armed()")
+            .expect("the exit hygiene guard must still be armed in graph_run");
+        assert!(
+            at < armed,
+            "the refusal is preflight: a refused run must not pay the exit hygiene pass \
+             the guard runs on drop"
+        );
         let gate = &body[..at];
         assert!(
             gate.rfind("if time_source == TimeSource::External {")
                 .is_some_and(|g| !body[g..at].contains('}')),
             "the refusal is gated on sim time and on nothing else"
+        );
+    }
+
+    /// A graph whose native node library did not resolve is refused before
+    /// the run starts anything, on EVERY clock: before its `ros2:` children
+    /// are spawned, before the exit hygiene guard is armed and before the run
+    /// directory is written. The validation report refuses such a graph
+    /// first; under `--no-validate` this is the refusal, and without it the
+    /// load below the spawn would be, after a child had run its startup side
+    /// effects for a run that cannot proceed.
+    ///
+    /// STRUCTURAL because the spawn needs a ROS 2 install on PATH; the
+    /// refusal is behaviourally pinned at the workspace seam by
+    /// `sim_time_graph_run_test` (a missing library beside a `ros2:` entry is
+    /// refused by the library's name, not by the entry's own preflight).
+    #[test]
+    fn graph_run_refuses_an_unresolved_library_before_spawning_ros2_children_on_every_clock() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let refusal = "refuse_unresolved_cdylibs(";
+        let at = body
+            .find(refusal)
+            .expect("the unresolved-library refusal must be in graph_run");
+        assert_eq!(
+            body.matches(refusal).count(),
+            1,
+            "the refusal is made once, ahead of every side effect"
+        );
+        // On every clock: ahead of the sim-time gate that encloses the
+        // external-node refusal (`graph_run` has earlier sim-time gates, for
+        // its notices), so it cannot sit inside it.
+        let external_refusal = body
+            .find("refuse_external_nodes_under_sim_time(")
+            .expect("the sim-time external-node refusal must still be in graph_run");
+        let sim_time_gate = body[..external_refusal]
+            .rfind("if time_source == TimeSource::External {")
+            .expect("the sim-time gate must still enclose the external-node refusal");
+        assert!(
+            at < sim_time_gate,
+            "the refusal is made on every clock: it comes before the sim-time gate"
+        );
+        let armed = body
+            .find("ExitHygieneGuard::armed()")
+            .expect("the exit hygiene guard must still be armed in graph_run");
+        let spawn = body
+            .find("Ros2Children::spawn(")
+            .expect("the ros2 children spawn must still be in graph_run");
+        let run_dir = body
+            .find("run_dir::mint_run_id(")
+            .expect("the run directory write must still be in graph_run");
+        assert!(
+            at < armed && at < spawn && at < run_dir,
+            "the refusal must come before the exit hygiene guard, the ros2 spawn and the \
+             run directory write"
         );
     }
 
@@ -33313,6 +33427,57 @@ network:
             "three instances of one type must produce one cache entry"
         );
         assert!(cache.get("camera").unwrap().is_ok());
+    }
+
+    /// The pre-spawn library refusal says what the load would: a type whose
+    /// cdylib is missing is refused as the typed `CdylibNotFound` naming it,
+    /// the first unresolved type in declaration order; a library that
+    /// appeared after the cache was built (TOCTOU) is refused with the
+    /// cached, already-rendered reason; and every type resolved is `Ok`.
+    #[test]
+    fn refuse_unresolved_cdylibs_says_what_the_load_would() {
+        let _env = unset_target_dir_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_n_instances("camera", 1);
+        config
+            .nodes
+            .append(&mut config_with_n_instances("lidar", 1).nodes);
+
+        // Nothing built: the first type in declaration order is the refusal.
+        let cache = resolve_cdylib_cache(tmp.path(), &config, false);
+        match refuse_unresolved_cdylibs(tmp.path(), &config, false, &cache) {
+            Err(CliError::CdylibNotFound { node_type, .. }) => assert_eq!(
+                node_type, "camera",
+                "the first unresolved type, in declaration order"
+            ),
+            other => panic!("a missing library is the typed CdylibNotFound: {other:?}"),
+        }
+
+        // The camera built: the lidar is the refusal now.
+        touch_cdylib(tmp.path(), "camera", "debug");
+        let cache = resolve_cdylib_cache(tmp.path(), &config, false);
+        match refuse_unresolved_cdylibs(tmp.path(), &config, false, &cache) {
+            Err(CliError::CdylibNotFound { node_type, .. }) => assert_eq!(node_type, "lidar"),
+            other => panic!("the next unresolved type is the refusal: {other:?}"),
+        }
+
+        // TOCTOU: the lidar appears AFTER that cache was built. The stale
+        // cache still refuses, with its own rendered reason passed through.
+        touch_cdylib(tmp.path(), "lidar", "debug");
+        let cached_reason = cache
+            .get("lidar")
+            .and_then(|resolved| resolved.as_ref().err())
+            .cloned()
+            .expect("the cache holds the lidar's failed resolution");
+        match refuse_unresolved_cdylibs(tmp.path(), &config, false, &cache) {
+            Err(CliError::Validation(reason)) => assert_eq!(reason, cached_reason),
+            other => panic!("a library that appeared after the cache was built: {other:?}"),
+        }
+
+        // Every type resolved: the common path.
+        let cache = resolve_cdylib_cache(tmp.path(), &config, false);
+        refuse_unresolved_cdylibs(tmp.path(), &config, false, &cache)
+            .expect("every library resolved");
     }
 
     #[test]
