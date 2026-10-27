@@ -6167,12 +6167,14 @@ pub fn graph_run(
     if time_source == TimeSource::External {
         crate::sim_time_run::refuse_external_nodes_under_sim_time(graph_name, &config, |node| {
             // A type the cache does not hold cannot happen
-            // (`resolve_cdylib_cache` fills every native type); it is left
-            // to the load, which names it. A type the cache holds a FAILED
-            // resolution for is the run's refusal, not a node to pass over:
-            // the refusal above already made it for every clock, and this
-            // preflight makes the same one, so a reorder of the two can never
-            // let a `ros2:` child start for a run that cannot load.
+            // (`resolve_cdylib_cache` fills every native type, and the
+            // refusal above reports a miss as the logic error it is), so
+            // `None` here is unreachable and kept total rather than asserted.
+            // A type the cache holds a FAILED resolution for is the run's
+            // refusal, not a node to pass over: the refusal above already
+            // made it for every clock, and this preflight makes the same one,
+            // so a reorder of the two can never let a `ros2:` child start for
+            // a run that cannot load.
             cdylib_cache.contains_key(node.node_type.as_str()).then(|| {
                 let lib = cached_cdylib(
                     workspace_root,

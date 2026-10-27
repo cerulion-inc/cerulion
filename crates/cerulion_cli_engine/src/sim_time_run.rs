@@ -428,14 +428,14 @@ pub const SIM_TIME_PERIOD_FIRES_PER_SAMPLE: u32 = 1;
 /// ceiling so the tap pins a bounded share of the publisher's pool. It is
 /// what the tap asks for, not always what it gets: iceoryx2 pins a topic's
 /// receive-queue ceiling when the publisher creates it, and a tap asking for
-/// more opens at that ceiling (16 for a publisher at the defaults, as a ROS 2
-/// node is). The tap logs the depth it got when it opens and warns when it
-/// is under this one ([`CLOCK_TAP_CAPPED_WARNING`]). When the queue is full,
-/// the next publish evicts the OLDEST unread sample: the next accepted sample
-/// then steps the graph by the whole gap, so two steps merge into one, a
-/// deadline between them fires once at the later sample, and the graph clock
-/// still lands on the latest published time. The loss shows as a gap in the
-/// wire sequence numbers the tap reads ([`SequenceGapWatch`]).
+/// more opens at that ceiling (16 when the publisher runs at the defaults, as
+/// a ROS 2 node does). The tap logs the depth it got when it opens and warns
+/// when it is under this one ([`CLOCK_TAP_CAPPED_WARNING`]). When the queue
+/// is full, the next publish evicts the OLDEST unread sample: the next
+/// accepted sample then steps the graph by the whole gap, so two steps merge
+/// into one, a deadline between them fires once at the later sample, and the
+/// graph clock still lands on the latest published time. The loss shows as a
+/// gap in the wire sequence numbers the tap reads ([`SequenceGapWatch`]).
 pub const CLOCK_TAP_DEPTH: usize = 64;
 
 /// The warning the clock tap prints, once, when it opened shallower than
