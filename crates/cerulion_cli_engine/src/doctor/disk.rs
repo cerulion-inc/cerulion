@@ -2,11 +2,17 @@
 //! `disk.recordings`: the filesystem a recording started here is written to.
 //!
 //! `graph run --record` writes under `recordings/` relative to the current
-//! directory and `bag record` writes `recording.mcap` in the current
-//! directory, so the check reads `./recordings` when it exists and the current
-//! directory otherwise. It reads
-//! `statvfs` (space and the read-only flag), `access(W_OK)` and, on Linux,
-//! `statfs`'s filesystem type, where a tmpfs is memory that a reboot empties.
+//! directory, flashback captures go to `<workspace>/recordings/flashbacks`,
+//! and `bag record` writes `recording.mcap` in the current directory. The
+//! check reads the first of `./recordings` and `<workspace>/recordings` that
+//! exists, a recording destination: a problem there is a `fail`. With
+//! neither, it reads the current directory, where `bag record` writes and
+//! where `graph run --record` would create `recordings/`; a problem there is a
+//! `warn`, because a diagnosis is often run from a directory nothing records
+//! in. `CERULION_FLASHBACK_DIR`, which moves flashback captures, is not read.
+//! It reads `statvfs` (space and the read-only flag), `access(W_OK)` and, on
+//! Linux, `statfs`'s filesystem type, where a tmpfs is memory that a reboot
+//! empties.
 
 use std::path::{Path, PathBuf};
 
@@ -37,12 +43,20 @@ pub(super) enum DiskReading {
     Unreadable { path: String, error: String },
 }
 
-/// The decision over the reading.
-pub(super) fn decide(r: &DiskReading) -> Outcome {
+/// The decision over the reading. `destination` is whether the path is an
+/// existing recordings directory rather than the current directory.
+pub(super) fn decide(r: &DiskReading, destination: bool) -> Outcome {
+    let blocked = if destination {
+        Status::Fail
+    } else {
+        Status::Warn
+    };
     match r {
         DiskReading::Unreadable { path, error } => {
             Outcome::new(Status::Warn, format!("could not read {path}: {error}"))
                 .with_fix(format!("run `df -h {path}` to see the filesystem"))
+                .reading("path", Reading::Text(path.clone()))
+                .reading("recordings_dir", Reading::Bool(destination))
         }
         DiskReading::Read {
             path,
@@ -60,19 +74,19 @@ pub(super) fn decide(r: &DiskReading) -> Outcome {
                     .reading("read_only", Reading::Bool(*read_only))
                     .reading("writable", Reading::Bool(*writable))
                     .reading("tmpfs", Reading::Bool(*tmpfs))
+                    .reading("recordings_dir", Reading::Bool(destination))
             };
             let elsewhere = "record somewhere else: `graph run --record=<DIR>` or \
                              `bag record -o <PATH>`";
             if *read_only {
-                base(Status::Fail, format!("{path} is on a read-only filesystem"))
-                    .with_fix(elsewhere)
+                base(blocked, format!("{path} is on a read-only filesystem")).with_fix(elsewhere)
             } else if !*writable {
-                base(Status::Fail, format!("{path} is not writable by this user")).with_fix(
-                    format!("make it writable (`chmod u+w {path}`), or {elsewhere}"),
-                )
+                base(blocked, format!("{path} is not writable by this user")).with_fix(format!(
+                    "make it writable (`chmod u+w {path}`), or {elsewhere}"
+                ))
             } else if *available == 0 {
                 base(
-                    Status::Fail,
+                    blocked,
                     format!("{path} has no space available (of {total} bytes)"),
                 )
                 .with_fix(format!("free space on that filesystem, or {elsewhere}"))
@@ -95,15 +109,15 @@ pub(super) fn decide(r: &DiskReading) -> Outcome {
     }
 }
 
-/// The directory a recording started in `cwd` lands in: `cwd/recordings` when
-/// it exists, else `cwd`.
-pub(super) fn recording_dir(cwd: &Path) -> PathBuf {
-    let recordings = cwd.join("recordings");
-    if recordings.is_dir() {
-        recordings
-    } else {
-        cwd.to_path_buf()
-    }
+/// The directory to read and whether it is a recordings directory: the first
+/// of `cwd/recordings` and `workspace_root/recordings` that exists, else
+/// `cwd` itself.
+pub(super) fn recording_dir(cwd: &Path, workspace_root: Option<&Path>) -> (PathBuf, bool) {
+    std::iter::once(cwd)
+        .chain(workspace_root)
+        .map(|base| base.join("recordings"))
+        .find(|dir| dir.is_dir())
+        .map_or_else(|| (cwd.to_path_buf(), false), |dir| (dir, true))
 }
 
 #[cfg(unix)]
@@ -148,7 +162,8 @@ fn is_tmpfs(_path: &Path) -> bool {
 
 #[cfg(unix)]
 fn run(ctx: &Context) -> Outcome {
-    decide(&read(&recording_dir(&ctx.cwd)))
+    let (dir, destination) = recording_dir(&ctx.cwd, ctx.workspace_root.as_deref());
+    decide(&read(&dir), destination)
 }
 
 #[cfg(not(unix))]
@@ -173,7 +188,7 @@ mod tests {
 
     #[test]
     fn passes_with_space_on_a_writable_disk() {
-        let o = decide(&read_ok(10));
+        let o = decide(&read_ok(10), true);
         assert_eq!(o.status, Status::Pass);
         assert_eq!(o.summary, "/w/recordings has 10 bytes available of 1000");
         assert_eq!(o.fix, None);
@@ -181,7 +196,7 @@ mod tests {
 
     #[test]
     fn fails_with_no_space() {
-        let o = decide(&read_ok(0));
+        let o = decide(&read_ok(0), true);
         assert_eq!(o.status, Status::Fail);
         assert!(o.fix.unwrap().contains("--record=<DIR>"));
     }
@@ -198,7 +213,7 @@ mod tests {
             *read_only = true;
             *writable = false;
         }
-        let o = decide(&r);
+        let o = decide(&r, true);
         assert_eq!(o.status, Status::Fail);
         assert_eq!(o.summary, "/w/recordings is on a read-only filesystem");
     }
@@ -209,7 +224,7 @@ mod tests {
         if let DiskReading::Read { writable, .. } = &mut r {
             *writable = false;
         }
-        let o = decide(&r);
+        let o = decide(&r, true);
         assert_eq!(o.status, Status::Fail);
         assert!(o.fix.unwrap().contains("chmod u+w /w/recordings"));
     }
@@ -220,28 +235,59 @@ mod tests {
         if let DiskReading::Read { tmpfs, .. } = &mut r {
             *tmpfs = true;
         }
-        let o = decide(&r);
+        let o = decide(&r, true);
         assert_eq!(o.status, Status::Warn);
         assert!(o.summary.contains("lost at reboot"));
     }
 
     #[test]
     fn unreadable_warns() {
-        let o = decide(&DiskReading::Unreadable {
-            path: "/w".to_string(),
-            error: "EACCES".to_string(),
-        });
+        let o = decide(
+            &DiskReading::Unreadable {
+                path: "/w".to_string(),
+                error: "EACCES".to_string(),
+            },
+            true,
+        );
         assert_eq!(o.status, Status::Warn);
     }
 
     #[test]
-    fn the_recording_dir_prefers_recordings_when_it_exists() {
-        let dir = std::env::temp_dir().join(format!("doctor-disk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(recording_dir(&dir), dir);
-        std::fs::create_dir(dir.join("recordings")).unwrap();
-        assert_eq!(recording_dir(&dir), dir.join("recordings"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn a_blocked_current_directory_warns_where_a_recordings_directory_fails() {
+        for (read_only, writable, available) in
+            [(true, false, 10), (false, false, 10), (false, true, 0)]
+        {
+            let mut r = read_ok(available);
+            if let DiskReading::Read {
+                read_only: ro,
+                writable: w,
+                ..
+            } = &mut r
+            {
+                *ro = read_only;
+                *w = writable;
+            }
+            assert_eq!(decide(&r, true).status, Status::Fail, "{r:?}");
+            let here = decide(&r, false);
+            assert_eq!(here.status, Status::Warn, "{r:?}");
+            assert!(here.fix.unwrap().contains("--record=<DIR>"));
+            assert_eq!(
+                here.readings.get("recordings_dir"),
+                Some(&Reading::Bool(false))
+            );
+        }
+    }
+
+    #[test]
+    fn the_recording_dir_is_cwd_recordings_then_the_workspace_then_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (c, w) = (cwd.path(), ws.path());
+        assert_eq!(recording_dir(c, Some(w)), (c.to_path_buf(), false));
+        std::fs::create_dir(w.join("recordings")).unwrap();
+        assert_eq!(recording_dir(c, Some(w)), (w.join("recordings"), true));
+        assert_eq!(recording_dir(c, None), (c.to_path_buf(), false));
+        std::fs::create_dir(c.join("recordings")).unwrap();
+        assert_eq!(recording_dir(c, Some(w)), (c.join("recordings"), true));
     }
 }

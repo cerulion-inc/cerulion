@@ -32,16 +32,7 @@ pub(super) fn decide(path: Option<&str>, loaded: &LoadedAuth, now_ns: u64) -> Ou
     };
     let path_reading = Reading::Text(path.to_string());
     if let LoadedAuth::Corrupt(err) = loaded {
-        // `load_from` prefixes a failed read with `read ` and a failed parse
-        // with `parse `, each followed by the path.
-        let fix = if err.starts_with("read ") {
-            format!("make {path} readable by this user")
-        } else {
-            "run `cerulion login`, which writes a new one".to_string()
-        };
-        return Outcome::new(Status::Fail, format!("the sign-in file is unusable: {err}"))
-            .with_fix(fix)
-            .reading("auth_json", path_reading);
+        return corrupt(path, err).reading("auth_json", path_reading);
     }
     let outcome = match crate::auth::local_gate(loaded, now_ns) {
         LocalGate::RefuseNeverLoggedIn => Outcome::new(
@@ -90,6 +81,36 @@ pub(super) fn decide(path: Option<&str>, loaded: &LoadedAuth, now_ns: u64) -> Ou
             );
     }
     outcome
+}
+
+/// The outcome for a sign-in file `load_from` reported as `err`: `read
+/// <path>: <io error>` or `parse <path>: line <L> column <C>`, which carries
+/// the parse error's location and never its text.
+fn corrupt(path: &str, err: &str) -> Outcome {
+    if let Some(io) = err.strip_prefix(&format!("read {path}: ")) {
+        return Outcome::new(
+            Status::Fail,
+            format!("the sign-in file {path} cannot be read: {io}"),
+        )
+        .with_fix(format!("make {path} readable by this user"));
+    }
+    let location = err
+        .strip_prefix(&format!("parse {path}: "))
+        .filter(|loc| {
+            loc.strip_prefix("line ")
+                .and_then(|rest| rest.split_once(" column "))
+                .is_some_and(|(l, c)| {
+                    [l, c]
+                        .iter()
+                        .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+        })
+        .map_or(String::new(), |loc| format!(" at {loc}"));
+    Outcome::new(
+        Status::Fail,
+        format!("the sign-in file {path} cannot be parsed{location}"),
+    )
+    .with_fix("run `cerulion login`, which writes a new one")
 }
 
 /// `secs` as the largest whole unit: days, hours, minutes or seconds.
@@ -189,20 +210,29 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_file_fails_naming_the_parse_error() {
+    fn a_corrupt_file_fails_naming_only_the_line_and_column() {
         let o = decide(
             Some(PATH),
-            &LoadedAuth::Corrupt(format!("parse {PATH}: eof")),
+            &LoadedAuth::Corrupt(format!("parse {PATH}: line 1 column 42")),
             NOW,
         );
         assert_eq!(o.status, Status::Fail);
         assert_eq!(
             o.summary,
-            "the sign-in file is unusable: parse /h/.cerulion/auth.json: eof"
+            "the sign-in file /h/.cerulion/auth.json cannot be parsed at line 1 column 42"
         );
         assert_eq!(
             o.fix.as_deref(),
             Some("run `cerulion login`, which writes a new one")
+        );
+        let no_location = decide(
+            Some(PATH),
+            &LoadedAuth::Corrupt(format!("parse {PATH}: something else")),
+            NOW,
+        );
+        assert_eq!(
+            no_location.summary,
+            "the sign-in file /h/.cerulion/auth.json cannot be parsed"
         );
         let unreadable = decide(
             Some(PATH),
@@ -210,9 +240,51 @@ mod tests {
             NOW,
         );
         assert_eq!(
+            unreadable.summary,
+            "the sign-in file /h/.cerulion/auth.json cannot be read: permission denied"
+        );
+        assert_eq!(
             unreadable.fix.as_deref(),
             Some("make /h/.cerulion/auth.json readable by this user")
         );
+    }
+
+    #[test]
+    fn a_malformed_file_never_echoes_a_token_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"account_id":"a","session_token":"s","refresh_token":"r","expires_at_ns":"tok_SECRET_FRAGMENT","logged_in_ever":true}"#,
+        )
+        .unwrap();
+        let loaded = crate::auth::load_from(&path);
+        let LoadedAuth::Corrupt(err) = &loaded else {
+            panic!("expected a corrupt file, got another state");
+        };
+        assert!(
+            !err.contains("tok_SECRET"),
+            "load_from kept the token: {err}"
+        );
+        assert!(err.contains(": line 1 column "), "{err}");
+        let shown = path.display().to_string();
+        let o = decide(Some(&shown), &loaded, NOW);
+        assert_eq!(o.status, Status::Fail);
+        let text = format!("{o:?}");
+        assert!(!text.contains("tok_SECRET"), "{text}");
+        assert!(
+            o.summary.contains(" cannot be parsed at line 1 column "),
+            "{}",
+            o.summary
+        );
+        // The oracle: serde_json's own message for this file quotes the token,
+        // which is what `load_from` must not pass on.
+        let raw = serde_json::from_str::<crate::auth::AuthState>(
+            &std::fs::read_to_string(&path).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(raw.contains("tok_SECRET_FRAGMENT"), "{raw}");
     }
 
     #[test]
