@@ -38,7 +38,7 @@ pub const EPOCH_REQUEST_FILE: &str = "epoch.request";
 pub const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The environment variable setting how long a connecting key that was seen
 /// before goes without requesting another early fetch, in whole seconds
-/// ([`MIN_KEY_RECHECK_INTERVAL`] to [`MAX_KEY_RECHECK_INTERVAL`]).
+/// from 5 to 3600.
 pub const KEY_RECHECK_ENV: &str = "CERULION_REMOTED_EPOCH_RECHECK_S";
 /// The default recheck interval. A revoked key reconnecting after this long away
 /// is cut within seconds; one reconnecting sooner waits for the next periodic

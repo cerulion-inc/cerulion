@@ -298,8 +298,7 @@ fn supervise_server(
 }
 
 /// The environment variable setting how often a serving robot fetches its own
-/// revocation epoch, in whole seconds ([`MIN_EPOCH_SYNC_PERIOD`] to
-/// [`MAX_EPOCH_SYNC_PERIOD`]).
+/// revocation epoch, in whole seconds from 30 to 86400.
 pub const EPOCH_SYNC_PERIOD_ENV: &str = "CERULION_NETD_EPOCH_SYNC_PERIOD_S";
 /// The default fetch period. It bounds the revocation lag for a key that stays
 /// away, at one HTTPS request per robot per period to the account service.
@@ -311,7 +310,7 @@ const MIN_EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(30);
 const MAX_EPOCH_SYNC_PERIOD: Duration = Duration::from_secs(86_400);
 
 /// The fetch period from an [`EPOCH_SYNC_PERIOD_ENV`] value: whole seconds
-/// within the accepted range, else [`DEFAULT_EPOCH_SYNC_PERIOD`] with a warning.
+/// within the accepted range, else the 300 s default with a warning.
 pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
     let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
         return DEFAULT_EPOCH_SYNC_PERIOD;
