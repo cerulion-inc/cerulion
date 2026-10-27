@@ -402,8 +402,9 @@ impl LogSiteTable {
     ///
     /// The capture holds every claimed entry, then the restored entries no
     /// site has run since, smallest id first, up to [`LOG_SITE_SLOTS`] in
-    /// all. A restored entry is dropped only when the instance has seen more
-    /// than [`LOG_SITE_SLOTS`] distinct sites since the restore.
+    /// all. A restored entry no site has run since is therefore dropped once
+    /// the claimed entries and the restored ones with smaller ids fill
+    /// [`LOG_SITE_SLOTS`].
     ///
     /// Layout (little-endian): `u32` tag `CLOG`, `u32` entry count, then per
     /// entry `u64` site id and `u64` state word, in ascending id order, so
@@ -468,8 +469,8 @@ impl LogSiteTable {
     /// section tag (the node's field list changed since the recording);
     /// [`StateError::LogSiteRestore`] when the section holds no entry (a
     /// capture writes no section for an empty table) or more entries than
-    /// the table, or repeats or misorders an id; the cursor's own errors for
-    /// truncated bytes.
+    /// [`LOG_SITE_SLOTS`], names the reserved id 0, or repeats or misorders
+    /// an id; the cursor's own errors for truncated bytes.
     // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
     // it allocates only to name a refusal
     pub fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
