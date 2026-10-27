@@ -260,6 +260,9 @@ pub mod schema_store;
 // has it" cannot be expressed in Cargo at all — the probe lives here, and
 // `node build` consults it. Pure decision core + an injected pkg-config probe.
 pub mod system_deps;
+// The `graph run` warning for a tcp/ link on a host that resets idle TCP
+// connections to the initial congestion window.
+pub mod tcp_idle_warning;
 // The shared near-miss key predicate for hand-authored config
 // files whose FOREIGN sibling keys must stay legal (`~/.cerulion/config.toml`,
 // `~/.cerulion/robots.toml`), plus the Levenshtein bound `system_deps`'

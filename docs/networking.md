@@ -526,6 +526,32 @@ locator string is the whole choice. TCP stays the default.
 | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
 | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
 
+**TCP after idle on Linux.** With `net.ipv4.tcp_slow_start_after_idle`
+nonzero, the Linux default, the congestion window of a TCP connection that
+sends nothing for longer than one retransmission timeout decays toward its
+initial size, so each large message sent at a low rate pays a few extra round
+trips. The cost grows with the path's round-trip time: small on a LAN, large
+across a wide-area link. The window belongs to the sending host, and the
+`quic/` carrier's congestion controller has no idle reset. Measured 2026-10-26
+over a 31 ms wide-area path with a 301 KB message: at 1 Hz, `tcp/` 164.8 ms
+p50 / 257.7 ms p99 and `quic/` 79.3 / 107.5 ms; at 30 Hz both about 63 ms p50.
+
+`graph run`, `node run` and `ros2 attach` log this once per run, when the run
+sends topics off the machine over `tcp/` from a host where the sysctl is
+nonzero:
+
+- through a per-run gateway (a `network:` block, or an unreachable
+  `cerulion-netd`) whose locators include `tcp/`: a warning that names them;
+- through the shared `cerulion-netd` session: an info line, since every
+  networked run registers there whether or not a remote peer subscribes.
+
+The fixes are `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the sending
+host, kept in a file under `/etc/sysctl.d/`, or `quic/` on both ends: a
+`network:` block with `quic/` locators, their `tls:` files and an `egress:`
+list. The sysctl is per network namespace; the run reads it in its own. A
+`cerulion-netd` started with only `quic/` locators still gets the info line,
+because the run cannot see netd's locators. Other hosts never log it.
+
 Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
 lets the peer decide, which is why it does not satisfy a `best_effort` topic
 (the connection may come up with streams only).
