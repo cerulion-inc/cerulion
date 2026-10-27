@@ -10584,34 +10584,6 @@ fn supervisor_precreate_error(
     ))
 }
 
-/// The multi-process SUPERVISOR — the path `graph_run` dispatches
-/// to when the graph YAML declares `process_groups:`.
-///
-/// Builds the full graph ONCE (planning: fail-fast full-graph validation + the
-/// IMPURE `Levels`/`tightest_timing_ns` the pure planner needs), plans one worker
-/// per group, mints + injects the shared iceoryx2 `Config`, creates the shared
-/// SHM barrier ONLY under the `lockstep` opt-out (the body branches on
-/// `execution_mode`; the free-run default creates none and no rank maps one),
-/// then spawns one `cerulion graph run-worker --plan <f>` process
-/// per group (producer-owning groups first, gated on each worker's READY
-/// sentinel) and joins them under a fail-loud lifecycle contract (see the JOIN
-/// state machine below). Unix-only (the lockstep barrier is
-/// portable POSIX SHM, so macOS runs the real supervisor too) — the
-/// `resolve_deployment` dispatch in `graph_run` routes non-Unix hosts to
-/// the monolith FALLBACK before ever calling this; single-process `graph run`
-/// never reaches here.
-///
-/// `peer_loss` is the RESOLVED policy (`resolve_peer_loss` — flag wins, env
-/// seam when absent); `trace_limit` is the `--trace-limit` value stamped into
-/// every `WorkerPlan`; `monitor_wait` is the CLI park mode the supervisor
-/// resolves ONCE (with the host-side primitive probe) and stamps into every
-/// worker plan (`stamp_park_policy`); `cpu_dma_lock` is the `--no-cpu-dma-lock`
-/// opt-out stamped into every worker plan (`stamp_cap_mode` — without it
-/// the workers would run `Auto` and silently ignore the flag).
-// 9 positional args: every arg is a DISTINCT type (no same-typed swap the
-// compiler wouldn't reject), mirroring the runtime build-fn family's documented
-// suppression rationale: bundling buys no swap-safety here. (`cpu_dma_lock` is the
-// 9th.)
 /// For `--single-process`: put every native node in one process group when
 /// that process splits into more than one executor unit, and say so. Returns
 /// whether it did. A non-real time source, the lockstep execution mode, a
@@ -10801,6 +10773,34 @@ fn plan_supervisor_units(
     Ok(units)
 }
 
+/// The multi-process SUPERVISOR — the path `graph_run` dispatches
+/// to when the graph YAML declares `process_groups:`.
+///
+/// Builds the full graph ONCE (planning: fail-fast full-graph validation + the
+/// IMPURE `Levels`/`tightest_timing_ns` the pure planner needs), plans one worker
+/// per group, mints + injects the shared iceoryx2 `Config`, creates the shared
+/// SHM barrier ONLY under the `lockstep` opt-out (the body branches on
+/// `execution_mode`; the free-run default creates none and no rank maps one),
+/// then spawns one `cerulion graph run-worker --plan <f>` process
+/// per group (producer-owning groups first, gated on each worker's READY
+/// sentinel) and joins them under a fail-loud lifecycle contract (see the JOIN
+/// state machine below). Unix-only (the lockstep barrier is
+/// portable POSIX SHM, so macOS runs the real supervisor too) — the
+/// `resolve_deployment` dispatch in `graph_run` routes non-Unix hosts to
+/// the monolith FALLBACK before ever calling this; single-process `graph run`
+/// never reaches here.
+///
+/// `peer_loss` is the RESOLVED policy (`resolve_peer_loss` — flag wins, env
+/// seam when absent); `trace_limit` is the `--trace-limit` value stamped into
+/// every `WorkerPlan`; `monitor_wait` is the CLI park mode the supervisor
+/// resolves ONCE (with the host-side primitive probe) and stamps into every
+/// worker plan (`stamp_park_policy`); `cpu_dma_lock` is the `--no-cpu-dma-lock`
+/// opt-out stamped into every worker plan (`stamp_cap_mode` — without it
+/// the workers would run `Auto` and silently ignore the flag).
+// 9 positional args: every arg is a DISTINCT type (no same-typed swap the
+// compiler wouldn't reject), mirroring the runtime build-fn family's documented
+// suppression rationale: bundling buys no swap-safety here. (`cpu_dma_lock` is the
+// 9th.)
 #[allow(clippy::too_many_arguments)]
 fn graph_run_supervisor(
     workspace_root: &Path,
@@ -11093,8 +11093,13 @@ fn graph_run_supervisor(
     // Executor units: split every process group into units (chains on one
     // thread each) before planning, so each unit gets its own worker plan and
     // every edge between units the wiring of an edge between processes.
-    let units =
-        plan_supervisor_units(workspace_root, &config, &loaded_entry_infos, execution_mode)?;
+    let units = plan_supervisor_units(
+        workspace_root,
+        &config,
+        &loaded_entry_infos,
+        execution_mode,
+        time_source == TimeSource::Real,
+    )?;
     let config = units.config.clone();
     let mut plan = crate::multiprocess::plan_deployment(&config, &levels, tightest, &nonce)
         .map_err(CliError::from)?;
@@ -12962,10 +12967,10 @@ fn graph_run_supervisor(
                                 &mut credit_death_watch,
                             );
                             let survivors: usize = guards
-                                    .iter()
-                                    .filter(|g| !g.reaped())
-                                    .map(|g| g.units().len())
-                                    .sum();
+                                .iter()
+                                .filter(|g| !g.reaped())
+                                .map(|g| g.units().len())
+                                .sum();
                             match &barrier_owner {
                                 Some(barrier) => drop_dead_peers_batch(
                                     barrier,

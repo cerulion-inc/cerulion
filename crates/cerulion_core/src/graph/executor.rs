@@ -136,7 +136,9 @@ impl Boundary {
             ),
             Self::OverBudget(v) => v.describe(),
             Self::LinkCycle { producer } => {
-                format!("on a cycle of chain links (fed by {producer}), which no chain head reaches")
+                format!(
+                    "on a cycle of chain links (fed by {producer}), which no chain head reaches"
+                )
             }
         }
     }
@@ -364,11 +366,13 @@ struct Growing {
 
 /// Decide whether `node` may join the unit `unit` across the link from
 /// `producer`. `Ok(sum)` = merge, with the unit's new sum.
+/// `add` is what joining brings: the summed p50 tick of `node` and every node
+/// `isolate: false` already joined to it, and their tightest `tick_within`.
 fn merge_verdict(
     node: &str,
     producer: &str,
     unit: &Growing,
-    graph: &UnitGraph,
+    add: &Growing,
     profile: Option<UnitProfile<'_>>,
 ) -> Result<Option<u64>, Boundary> {
     let unprofiled = || Boundary::Unprofiled {
@@ -381,11 +385,7 @@ fn merge_verdict(
             Err(unprofiled())
         };
     };
-    let (Some(sum), Some(p50), Some(period_ns)) = (
-        unit.sum_ns,
-        profile.costs.node_p50_ns.get(node).copied(),
-        unit.period_ns,
-    ) else {
+    let (Some(sum), Some(p50), Some(period_ns)) = (unit.sum_ns, add.sum_ns, unit.period_ns) else {
         return if merge_mutant() {
             Ok(None)
         } else {
@@ -396,7 +396,7 @@ fn merge_verdict(
     if budget_mutant() {
         return Ok(Some(unit_ns));
     }
-    let deadline = match (unit.deadline_ns, graph.tick_within_ns.get(node).copied()) {
+    let deadline = match (unit.deadline_ns, add.deadline_ns) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
@@ -522,6 +522,29 @@ pub fn derive_units(
         candidates.insert(n);
     }
 
+    // The summed p50 tick and tightest `tick_within` of the unit rooted at
+    // `r` so far (a node and every node `isolate: false` joined to it).
+    let unit_totals = |r: usize, parent: &mut Vec<usize>| {
+        let mut sum_ns = costs.map(|_| 0u64);
+        let mut deadline_ns: Option<u64> = None;
+        for (i, member) in members.iter().enumerate() {
+            if root(parent, i) != r {
+                continue;
+            }
+            sum_ns = match (sum_ns, costs.and_then(|c| c.node_p50_ns.get(member))) {
+                (Some(acc), Some(p50)) => Some(acc.saturating_add(*p50)),
+                _ => None,
+            };
+            if let Some(&d) = graph.tick_within_ns.get(member) {
+                deadline_ns = Some(deadline_ns.map_or(d, |x: u64| x.min(d)));
+            }
+        }
+        Growing {
+            sum_ns,
+            period_ns: None,
+            deadline_ns,
+        }
+    };
     let mut walked: IndexSet<&str> = IndexSet::new();
     // Walk each chain of candidate links from the node that heads it, growing
     // one unit at a time.
@@ -536,48 +559,45 @@ pub fn derive_units(
         if !candidates.contains(first) {
             continue;
         }
-        // The head's unit so far: the head and every node `isolate: false`
-        // already joined to it.
         let head_root = index(head).map(|i| root(&mut parent, i));
-        let mut sum_ns = Some(0u64);
-        let mut deadline_ns: Option<u64> = None;
-        for (i, member) in members.iter().enumerate() {
-            if Some(root(&mut parent, i)) != head_root {
-                continue;
-            }
-            sum_ns = match (sum_ns, costs.and_then(|c| c.node_p50_ns.get(member))) {
-                (Some(acc), Some(p50)) => Some(acc.saturating_add(*p50)),
-                _ => None,
-            };
-            if let Some(&d) = graph.tick_within_ns.get(member) {
-                deadline_ns = Some(deadline_ns.map_or(d, |x: u64| x.min(d)));
-            }
-        }
+        let totals = head_root.map(|r| unit_totals(r, &mut parent));
         let mut unit = Growing {
-            sum_ns: costs.and(sum_ns),
+            sum_ns: totals.as_ref().and_then(|t| t.sum_ns),
             period_ns: head_period_ns(head, graph, costs),
-            deadline_ns,
+            deadline_ns: totals.as_ref().and_then(|t| t.deadline_ns),
         };
         let mut at = head;
         while let Some(&next) = link_out.get(at) {
             if !candidates.contains(next) || !walked.insert(next) {
                 break;
             }
-            match merge_verdict(next, at, &unit, graph, profile) {
+            let add = match index(next) {
+                Some(i) => {
+                    let r = root(&mut parent, i);
+                    unit_totals(r, &mut parent)
+                }
+                None => Growing {
+                    sum_ns: None,
+                    period_ns: None,
+                    deadline_ns: None,
+                },
+            };
+            match merge_verdict(next, at, &unit, &add, profile) {
                 Ok(sum) => {
                     if let (Some(a), Some(b)) = (index(next), index(at)) {
                         union(&mut parent, a, b);
                     }
                     unit.sum_ns = sum;
-                    if let Some(&d) = graph.tick_within_ns.get(next) {
-                        unit.deadline_ns = Some(unit.deadline_ns.map_or(d, |x| x.min(d)));
-                    }
+                    unit.deadline_ns = match (unit.deadline_ns, add.deadline_ns) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
                 Err(boundary) => {
                     starts.insert(next, boundary);
                     unit = Growing {
-                        deadline_ns: graph.tick_within_ns.get(next).copied(),
-                        sum_ns: costs.and_then(|c| c.node_p50_ns.get(next).copied()),
+                        deadline_ns: add.deadline_ns,
+                        sum_ns: add.sum_ns,
                         period_ns: costs
                             .and_then(|c| c.edge_rate_mhz.get(&(at.to_string(), next.to_string())))
                             .copied()
@@ -712,9 +732,7 @@ pub fn expand_process_groups(
     profile: Option<UnitProfile<'_>>,
     keep_whole: &IndexSet<String>,
 ) -> UnitPlan {
-    expand_process_groups_keyed(config, graph, profile, keep_whole, &|name| {
-        name.to_string()
-    })
+    expand_process_groups_keyed(config, graph, profile, keep_whole, &|name| name.to_string())
 }
 
 /// [`expand_process_groups`] with unit names compared under `key` (for
@@ -753,7 +771,10 @@ pub fn expand_process_groups_keyed(
         let mut owners: IndexMap<String, Vec<&str>> = IndexMap::new();
         for (host, units) in &units_by_host {
             for unit in units {
-                owners.entry(key(&unit.name)).or_default().push(host.as_str());
+                owners
+                    .entry(key(&unit.name))
+                    .or_default()
+                    .push(host.as_str());
             }
         }
         let colliding: Option<String> = units_by_host
@@ -1016,6 +1037,26 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn a_joining_node_brings_the_ticks_of_the_nodes_isolate_false_joined_to_it() {
+        // `y` declares isolate: false on its join edge from `c`, so it rides
+        // with `c`. Joining `src`'s unit therefore brings 1 + 2 ms against a
+        // 10 ms period, which reaches a quarter of it.
+        let mut g = graph(
+            &[("src", "c")],
+            &[("c", "y", ChainBar::ConsumerJoin { trigger_edges: 2 })],
+            &[("src", 10)],
+        );
+        g.isolate.insert("y".into(), false);
+        let c = costs(&[("src", 0), ("c", 1_000_000), ("y", 2_000_000)], &[]);
+        let units = derive_units("g", &s(&["src", "c", "y"]), &g, profile(&c));
+        assert_eq!(nodes(&units), [s(&["src"]), s(&["c", "y"])]);
+        let Some(Boundary::OverBudget(v)) = start_of(&units, "c") else {
+            panic!("c must start a unit over budget: {units:?}");
+        };
+        assert_eq!(v.unit_ns, 3_000_000);
     }
 
     #[test]

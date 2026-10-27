@@ -1688,8 +1688,9 @@ pub enum GraphAction {
     /// of trigger edges merges into one unit only where the graph's profile
     /// (`graphs/<NAME>.costs.yaml`) shows the unit's ticks stay under a
     /// quarter of its period and of its nodes' `tick_within_ms`;
-    /// `isolate: true` and `isolate: false` override. Every unit is printed
-    /// with its nodes and the reason it starts.
+    /// `isolate: true` and `isolate: false` override, except that a `block`
+    /// edge's producer and consumers always share a unit. Every unit is
+    /// printed with its nodes and the reason it starts.
     Plan {
         /// Graph name
         #[arg(add = ArgValueCandidates::new(completion::graph_names))]

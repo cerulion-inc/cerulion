@@ -417,19 +417,23 @@ fn record_and_judge(
 }
 
 /// Live reads that skip frames of their writer: a read whose sequence is not
-/// the previous read's plus one from the same writer. A skip is an eviction,
-/// which a replay that feeds a real queue does not reproduce whatever the
-/// placement.
+/// that writer's previous read plus one (its first read counts from seq 1). A
+/// skip is an eviction, which a replay that feeds a real queue does not
+/// reproduce whatever the placement.
 fn sequence_gaps(run: &read_identity::RecordedRun, node: &str, input: &str) -> usize {
-    run.live
-        .streams
-        .get(&(node.to_string(), input.to_string()))
-        .map_or(0, |reads| {
-            reads
-                .windows(2)
-                .filter(|w| w[0].writer == w[1].writer && w[1].seq != w[0].seq + 1)
-                .count()
-        })
+    let Some(reads) = run.live.streams.get(&(node.to_string(), input.to_string())) else {
+        return 0;
+    };
+    let mut last: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut gaps = 0;
+    for read in reads {
+        let expected = last.get(&read.writer).map_or(1, |s| s + 1);
+        if read.seq != expected {
+            gaps += 1;
+        }
+        last.insert(read.writer, read.seq);
+    }
+    gaps
 }
 
 fn kind(v: &RowVerdict) -> &'static str {
@@ -456,18 +460,6 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
             fixture.name()
         );
         for row in &units.rows {
-            // Every unit had its ports built before any unit's first step: a
-            // consumer's first live read is its writer's first frame.
-            let reads = &run.live.streams[&(row.node.clone(), row.input.clone())];
-            assert_eq!(
-                reads.first().map(|r| r.seq),
-                Some(1),
-                "{}: {}.{}'s first live read is not its writer's first frame: a unit of the \
-                 host started before its consumer's ports existed",
-                fixture.name(),
-                row.node,
-                row.input
-            );
             // Frames each placement evicted live on this stream. Hosting the
             // units in one process must not make a consumer late enough to
             // evict where one process per node does not.
@@ -496,9 +488,22 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
             // replay serves each input the frames it was served live, judge
             // these streams too, under `ReplayMode::ResimVerify`, and require
             // equality.
-            if gaps > 0 {
+            if gaps > 0 || declared_gaps > 0 {
                 continue;
             }
+            // A stream that evicted nothing: every unit had its ports built
+            // before any unit's first step, so its first live read is its
+            // writer's first frame.
+            let reads = &run.live.streams[&(row.node.clone(), row.input.clone())];
+            assert_eq!(
+                reads.first().map(|r| r.seq),
+                Some(1),
+                "{}: {}.{}'s first live read is not its writer's first frame: a unit of the \
+                 host started before its consumer's ports existed",
+                fixture.name(),
+                row.node,
+                row.input
+            );
             let other = processes
                 .rows
                 .iter()

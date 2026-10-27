@@ -2375,8 +2375,8 @@ fn gen_cdylib(
                     // The instance lock waits out a call still running on it;
                     // taking the entry out leaves `None` for any later caller.
                     // A poisoned instance (a tick that panicked under its lock)
-                    // is refused with code 3, so no node code runs on state a
-                    // panic may have left half-written.
+                    // is refused with code 3: the node's `shutdown()` is not
+                    // called on state a panic may have left half-written.
                     let taken = match removed.as_deref().map(::std::sync::Mutex::lock) {
                         None => None,
                         Some(Ok(mut slot)) => slot.take(),
