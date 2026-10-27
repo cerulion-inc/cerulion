@@ -172,19 +172,32 @@ impl Journal {
         Self::submit(&self.normal, call_id, frame, timeout, !latch_gated).await
     }
 
-    /// Publish the e-stop call ahead of everything queued, latch or not, and
-    /// wait for the graph's answer.
+    /// Queue the e-stop call on the urgent queue, which is read ahead of
+    /// everything else, latch or not. The call is queued when this returns;
+    /// the returned future waits for the graph's answer.
     ///
     /// # Errors
     ///
-    /// [`JournalError`] when the call is not published or not answered.
-    pub async fn urgent(
+    /// The future yields [`JournalError`] when the call is not published or
+    /// not answered.
+    pub fn urgent(
         &self,
         call_id: u64,
         frame: String,
         timeout: Duration,
-    ) -> Result<Value, JournalError> {
-        Self::submit(&self.urgent, call_id, frame, timeout, true).await
+    ) -> impl std::future::Future<Output = Result<Value, JournalError>> + Send + 'static {
+        let (reply, answer) = oneshot::channel();
+        let queued = self.urgent.send(CallRequest {
+            call_id,
+            frame,
+            timeout,
+            bypass_latch: true,
+            reply,
+        });
+        async move {
+            queued.map_err(|_| JournalError::Stopped)?;
+            answer.await.map_err(|_| JournalError::Stopped)?
+        }
     }
 
     async fn submit(

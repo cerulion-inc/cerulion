@@ -20,11 +20,11 @@ User reference: docs/rcp.md.
 - `estop_clear` reads the `engages` counter, then takes `call_lock`; inside
   `latch_io` (a std mutex never held across an await) it refuses
   (`estop_overtaken`) if an `estop` bumped the counter since, else writes
-  `intent`, deletes the file and opens the latch;
-  then it journals a LATCH-GATED frame, so an `estop` that lands first stays
-  the graph's last frame (`estop_overtaken`). `estop` re-closes the latch and
-  writes its file and `intent` inside `latch_io`, so the receipt log orders
-  engages and clears as they took effect. An undeletable file leaves the
+  `intent`, deletes the file and opens the latch; then it journals a
+  LATCH-GATED frame, so an `estop` that lands first stays the graph's last
+  frame (`estop_overtaken`). `estop` re-closes the latch, writes its file and
+  `intent`, and queues its urgent frame inside `latch_io`, so the receipt log
+  and the calls topic order engages and clears as they took effect. An undeletable file leaves the
   latch closed (`clear_failed`); an unreadable one at start counts as present.
 - The journal's `gate` reads the latch, then drops a latch-gated request whose
   caller dropped its reply (a cancelled MCP request); estop and read frames

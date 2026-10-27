@@ -505,11 +505,11 @@ impl ToolHost {
         let reason = reason_arg(args);
         let clean = json!({ "reason": reason });
         let digest = args_digest(&clean);
-        let intent = self.engage_latch(&reason, &digest);
-        tracing::warn!(reason = %reason, "e-stop engaged");
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, ESTOP_TOOL, &clean);
-        let answer = self.journal.urgent(call_id, frame, ESTOP_TIMEOUT).await;
+        let (intent, answer) = self.engage_latch(&reason, &digest, call_id, frame);
+        tracing::warn!(reason = %reason, "e-stop engaged");
+        let answer = answer.await;
         let (result, graph_error) = match answer {
             Ok(result) => {
                 self.record(ESTOP_TOOL, &digest, ReceiptOutcome::Ok);
@@ -539,8 +539,20 @@ impl ToolHost {
 
     /// The locked half of `estop`, after its lock-free close: inside
     /// `latch_io`, close the latch again, write the file when it is absent,
-    /// and write the `intent` receipt.
-    fn engage_latch(&self, reason: &str, digest: &str) -> Option<Receipt> {
+    /// write the `intent` receipt, and queue the e-stop frame on the journal's
+    /// urgent queue. A clear that takes the lock next queues its own frame
+    /// after this one. Returns the intent and the future that waits for the
+    /// graph's answer.
+    fn engage_latch(
+        &self,
+        reason: &str,
+        digest: &str,
+        call_id: u64,
+        frame: String,
+    ) -> (
+        Option<Receipt>,
+        impl std::future::Future<Output = Result<Value, JournalError>> + Send + 'static,
+    ) {
         let _io = self.latch_io.lock().unwrap_or_else(PoisonError::into_inner);
         // Closed again under the lock: a clear that opened the latch after
         // the lock-free close has released the lock by now.
@@ -554,7 +566,8 @@ impl ToolHost {
                 );
             }
         }
-        self.record(ESTOP_TOOL, digest, ReceiptOutcome::Intent)
+        let intent = self.record(ESTOP_TOOL, digest, ReceiptOutcome::Intent);
+        (intent, self.journal.urgent(call_id, frame, ESTOP_TIMEOUT))
     }
 
     /// The locked half of `estop_clear`: inside `latch_io`, refuse when an
@@ -722,13 +735,27 @@ mod tests {
 
     use cerulion_core::{TransportConfig, TransportManager};
 
-    use super::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL};
+    use std::time::Duration;
+
+    use cerulion_core::message::ShmMessage;
+    use native_ros2_messages::std_msgs::String as RosString;
+
+    use super::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
     use crate::journal::{Journal, JournalError};
     use crate::manifest::JournalConfig;
 
     /// A host with no tools on topics private to `tag`, with no graph
     /// answering, and its latch.
     fn host(tag: &str, receipts: &Path) -> (ToolHost, Arc<AtomicBool>) {
+        let (host, latch, _, _) = host_and_transport(tag, receipts);
+        (host, latch)
+    }
+
+    /// [`host`], with its transport and calls topic.
+    fn host_and_transport(
+        tag: &str,
+        receipts: &Path,
+    ) -> (ToolHost, Arc<AtomicBool>, Arc<TransportManager>, String) {
         let tag = format!("rcpd_latch_unit_{tag}_{}", std::process::id());
         let mgr = TransportManager::init_for_test(
             TransportConfig {
@@ -744,11 +771,77 @@ mod tests {
         };
         let latch = Arc::new(AtomicBool::new(false));
         let lock = ReceiptLock::acquire(receipts).expect("lock");
-        let journal =
-            Journal::spawn(mgr, journal_config, Vec::new(), latch.clone()).expect("journal");
+        let calls = journal_config.calls_topic.clone();
+        let journal = Journal::spawn(mgr.clone(), journal_config, Vec::new(), latch.clone())
+            .expect("journal");
         let host =
             ToolHost::open(Vec::new(), journal, latch.clone(), receipts, lock).expect("host");
-        (host, latch)
+        (host, latch, mgr, calls)
+    }
+
+    /// The `tool` of every frame published on `topic` until `stop` is set.
+    fn tap(
+        mgr: Arc<TransportManager>,
+        topic: String,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let calls = mgr.create_subscriber(&topic).expect("tap");
+            ready_tx.send(()).expect("ready");
+            let mut seen = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                calls
+                    .try_receive(|m| {
+                        let text = RosString::build_reader(m.payload())
+                            .data()
+                            .expect("utf-8")
+                            .to_owned();
+                        let call: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+                        seen.push(call["tool"].as_str().unwrap_or("").to_owned());
+                    })
+                    .expect("receive");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            seen
+        });
+        ready_rx.recv().expect("tap ready");
+        handle
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_estop_frame_is_queued_before_a_clear_that_follows_it_can_publish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (host, latch, mgr, calls) = host_and_transport("order", &dir.path().join("log.jsonl"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let tap = tap(mgr, calls, stop.clone());
+        // `estop` runs its lock-free close and its locked half, then pauses
+        // before awaiting the graph.
+        host.engages.fetch_add(1, Ordering::SeqCst);
+        latch.store(true, Ordering::SeqCst);
+        let frame = Journal::frame(1, ESTOP_TOOL, &serde_json::json!({}));
+        let (_, estop_answer) = host.engage_latch("stop", "d", 1, frame);
+        // A clear requested after that estop opens the latch and publishes.
+        let seen = host.engages.load(Ordering::SeqCst);
+        let (_, was) = host.open_latch("d", seen).expect("clear");
+        assert!(was);
+        let frame = Journal::frame(2, ESTOP_CLEAR_TOOL, &serde_json::json!({}));
+        let cleared = host.journal_clear(2, frame).await;
+        assert!(
+            matches!(cleared, Err(JournalError::Timeout { .. })),
+            "{cleared:?}"
+        );
+        // Only now does the paused estop await its answer.
+        let _ = estop_answer.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.store(true, Ordering::Relaxed);
+        let tools = tap.join().expect("tap");
+        assert_eq!(
+            tools,
+            [ESTOP_TOOL, ESTOP_CLEAR_TOOL],
+            "the graph's last frame matches the open latch"
+        );
+        assert!(!host.estopped());
     }
 
     #[test]
@@ -763,7 +856,9 @@ mod tests {
         assert!(was);
         assert!(!host.estopped());
         // Then `estop` takes the lock.
-        host.engage_latch("late", "d").expect("intent");
+        let frame = Journal::frame(1, ESTOP_TOOL, &serde_json::json!({}));
+        let (intent, _answer) = host.engage_latch("late", "d", 1, frame);
+        intent.expect("intent");
         assert!(
             host.estopped(),
             "the engage closes the latch again under the lock"

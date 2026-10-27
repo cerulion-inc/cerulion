@@ -166,7 +166,9 @@ It returns `estopped` (the latch after the clear), `was_estopped`, and
 `graph_acknowledged`; the latch stays open whether or not the graph
 answered. A later `estop` closes the latch and writes the file again.
 `estop` closes the latch, then, inside a lock, closes it again, writes the
-file and its `intent` receipt; `estop_clear` writes its `intent`, deletes the
+file and its `intent` receipt, and queues its frame ahead of everything else,
+so a clear that follows it publishes after that frame; `estop_clear` writes
+its `intent`, deletes the
 file and opens the latch inside the same lock. The receipt log therefore
 orders engages and clears as they took effect. An `estop` that lands while
 a clear holds that lock closes the latch at once and publishes its frame
