@@ -7348,6 +7348,28 @@ mod tests {
         assert!(info.output_names.is_empty());
     }
 
+    /// The `accumulate` input key: absent reads as not-accumulate (the shape
+    /// every node library built before the key existed emits), present as
+    /// accumulate. Neither warns as an unknown key.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_parse_info_json_accumulate_key_absent_reads_false() {
+        let without = r#"{"inputs":[{"name":"tf","depth":32}],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(without).unwrap();
+        assert!(!info.input_meta[0].accumulate, "absent key = not accumulate");
+        let with = r#"{"inputs":[{"name":"tf","depth":32,"accumulate":true}],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(with).unwrap();
+        assert!(info.input_meta[0].accumulate, "the key is read");
+        assert!(
+            !logs_contain("unknown key"),
+            "`accumulate` is a legal input key"
+        );
+        // The bare-string form carries no metadata at all.
+        let bare = r#"{"inputs":["tf"],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(bare).unwrap();
+        assert!(info.input_meta.iter().all(|m| !m.accumulate));
+    }
+
     #[test]
     fn test_parse_info_json_with_ports() {
         let json = r#"{"inputs":["a","b"],"outputs":["x"]}"#;
