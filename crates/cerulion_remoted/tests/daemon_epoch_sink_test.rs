@@ -567,7 +567,10 @@ async fn a_failed_or_cancelled_serve_leaves_no_epoch_poller_running() {
         !live.exists(),
         "the poller claims a pending epoch while the serve runs"
     );
-    assert!(!serving.is_finished(), "the serve is still running before the abort");
+    assert!(
+        !serving.is_finished(),
+        "the serve is still running before the abort"
+    );
     serving.abort();
     let _ = serving.await;
     let pending = install_pending(&remoted);
