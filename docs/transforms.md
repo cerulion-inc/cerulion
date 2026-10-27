@@ -156,16 +156,26 @@ The rules:
   the last, as long as each gap is within the jump limit. The next insert
   confirms a refused jump when its stamp is later than the refused one and
   within the jump limit of it, so a publisher that paused for longer than
-  that and resumes loses one sample, and a lone far-future stamp changes
-  nothing. An edge whose every gap is longer than the jump limit never
-  updates: each sample is refused and no later one confirms it, so raise
-  `jump_limit` to at least the longest gap for such an edge. `Duration::MAX`
-  turns the check off. Each refusal states the limit in force and names the
-  setting. Both refusals come back every time and count in the edge's
-  `window_refusals` and `jump_refusals`, read through `edge()`, so a stuck
-  edge is observable. A sample at a stamp the ring already holds is a no-op
-  when the transform is the same and replaces it when it differs (counted
-  in `replacements()`).
+  that and resumes loses one sample, and a lone far-future stamp on an edge
+  that holds a sample changes nothing. An edge whose every gap is longer
+  than the jump limit never updates: each sample is refused and no later
+  one confirms it, so raise `jump_limit` to at least the longest gap for
+  such an edge. `Duration::MAX` turns the check off. A `StampTooFarAhead`
+  error states the limit in force (`jump_limit_ns`) and names
+  `TfBufferConfig::jump_limit`. Both refusals come back every time and count
+  in the edge's `window_refusals` and `jump_refusals`, read through
+  `edge()`, so a stuck edge is observable. A sample at a stamp the ring
+  already holds is a no-op when the transform is the same and replaces it
+  when it differs (counted in `replacements()`).
+- **The first sample is the baseline.** Both stamp checks compare with the
+  edge's newest sample, so an empty ring has nothing to check against: its
+  first sample is accepted whatever its stamp. A ring is empty on a new
+  edge, on an edge declared by `set_edge_policy`, and on every edge after
+  `begin_epoch`. A far-future first stamp puts every later good stamp
+  before the window: the edge refuses each with `StampBeforeWindow`, its
+  `window_refusals` keeps rising, and `begin_epoch` empties the ring so the
+  next sample is the baseline again. A node that sees that count rise on an
+  edge whose publisher did not reset its clock has a bad first stamp on it.
 - **Rings sized up front.** Each ring holds enough samples for the window at
   up to 100 Hz (1001 samples). An edge that publishes faster fills its ring
   before its window: the oldest sample makes room and each one counts in the
@@ -178,11 +188,17 @@ The rules:
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
 - **Every refusal comes back.** A refused insert returns its error every
-  time: a sample the buffer did not keep is never an `Ok(())`, so no data is
-  lost silently. The edge counts each kind of refusal as well
+  time, so a refused sample is never lost to a silent `Ok(())`. The three
+  refusals about an edge's time or kind count on the edge as well
   (`static_refusals`, `window_refusals`, `jump_refusals`, read through
   `edge()`), so a node that would log every error on a 100 Hz edge can log
-  the first and report the running total instead.
+  the first and report the running total instead; the refusals about the
+  tree and the capacity (`SecondParent`, `Cycle`, `SelfEdge`,
+  `EmptyFrameId`, `FrameTableFull`, `NameBudgetFull`) come back every time
+  and have no counter. The one `Ok(())` that keeps nothing is an overflow:
+  on a full ring, a sample older than every sample it holds is the one that
+  makes room, and that loss counts in the edge's `overflows` like every
+  other overflow.
 - **Frame ids** have no length limit of their own. The buffer interns each
   id once, in a name table sized at construction (64 bytes per frame on
   average, 4096 bytes for the default 64 frames), and names a frame by its
@@ -314,7 +330,7 @@ alias of `TfError`.
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |
 | `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
-| `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
+| `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop, or when the edge's first sample carried a far-future stamp. |
 | `StampTooFarAhead { parent, child, stamp_ns, newest_ns, jump_limit_ns }` | The stamp is more than the jump limit in force (`jump_limit_ns`) past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. An edge whose every gap is longer than the limit needs a larger `TfBufferConfig::jump_limit`. |
 | `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with `TfBuffer::with_config` and a larger `TfBufferConfig::frames`. |
 | `NameBudgetFull { frame, len, left, budget }` | The new frame's `len`-byte id does not fit in the `left` bytes of the name budget. | Build the buffer with `TfBuffer::with_config` and a larger `TfBufferConfig::name_bytes`. |

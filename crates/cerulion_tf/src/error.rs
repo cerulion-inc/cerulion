@@ -101,7 +101,10 @@ pub enum TfError {
     /// The stamp is older than the edge's retention window: more than the
     /// buffer's retention before the newest sample on the edge. A clock
     /// reset or a bag loop that the buffer was not told about
-    /// ([`TfBuffer::begin_epoch`]) looks like this.
+    /// ([`TfBuffer::begin_epoch`]) looks like this, and so does an edge
+    /// whose first sample carried a far-future stamp: the first sample on
+    /// an empty ring is the baseline and is not checked, so every good
+    /// stamp after it is refused this way until the next epoch.
     StampBeforeWindow {
         /// The parent of the edge.
         parent: FrameId,
@@ -115,12 +118,15 @@ pub enum TfError {
     /// The stamp is more than the buffer's jump limit
     /// ([`TfBuffer::jump_limit`]) past the newest sample on the edge:
     /// accepted, one bad stamp would expire the whole ring at once. A single
-    /// far-future stamp is refused this way and leaves the ring as it was;
-    /// the next insert at a later stamp within the jump limit of the
-    /// refused one confirms the jump, since two inserts that agree on the
-    /// new time are a clock that moved forward. Returned for every such
-    /// insert; the edge counts every one. An edge whose every gap is longer
-    /// than the limit needs a larger [`crate::TfBufferConfig::jump_limit`].
+    /// far-future stamp on an edge that holds a sample is refused this way
+    /// and leaves the ring as it was; the next insert at a later stamp
+    /// within the jump limit of the refused one confirms the jump, since
+    /// two inserts that agree on the new time are a clock that moved
+    /// forward. The check compares with the newest sample, so the first
+    /// sample on an empty ring is the baseline and is not checked. Returned
+    /// for every such insert; the edge counts every one. An edge whose
+    /// every gap is longer than the limit needs a larger
+    /// [`crate::TfBufferConfig::jump_limit`].
     StampTooFarAhead {
         /// The parent of the edge.
         parent: FrameId,

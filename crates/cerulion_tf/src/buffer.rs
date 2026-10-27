@@ -181,7 +181,9 @@ pub struct EdgeInfo<'a> {
     pub static_refusals: u64,
     /// Every insert refused on this edge with
     /// [`TfError::StampBeforeWindow`]. A count that keeps rising is an edge
-    /// whose publisher's clock went back without a new epoch.
+    /// whose publisher's clock went back without a new epoch, or whose
+    /// first sample carried a far-future stamp; either way
+    /// [`TfBuffer::begin_epoch`] recovers it.
     pub window_refusals: u64,
     /// Every insert refused on this edge with
     /// [`TfError::StampTooFarAhead`].
@@ -253,6 +255,16 @@ pub struct LatestTransform {
 /// refusals return their error every time and count on the edge
 /// ([`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]).
 ///
+/// Both checks compare a stamp with the edge's newest sample, so an empty
+/// ring has nothing to check against: its first sample is the baseline,
+/// whatever its stamp. A ring is empty on a new edge, on an edge declared
+/// by [`Self::set_edge_policy`], and on every edge after
+/// [`Self::begin_epoch`]. A far-future first stamp puts every later good
+/// stamp before the window, so the edge keeps refusing with
+/// [`TfError::StampBeforeWindow`] and its [`EdgeInfo::window_refusals`]
+/// keeps rising; [`Self::begin_epoch`] empties the ring and the next sample
+/// is the baseline again.
+///
 /// A sample at a stamp the ring already holds is a no-op when the
 /// transform is the same and replaces it when it differs (counted in
 /// [`Self::replacements`]). The ring itself has a fixed
@@ -267,12 +279,19 @@ pub struct LatestTransform {
 ///
 /// # Refusals
 ///
-/// A refused insert returns its error every time: a sample the buffer did
-/// not keep is never an `Ok(())`, so a caller never loses data silently.
-/// The edge counts each kind of refusal as well ([`EdgeInfo::static_refusals`],
-/// [`EdgeInfo::window_refusals`], [`EdgeInfo::jump_refusals`]), so a node
-/// that would log every error on a 100 Hz edge can log the first and read
-/// the running total from [`Self::edge`] instead.
+/// A refused insert returns its error every time, so a caller never loses
+/// a refused sample to a silent `Ok(())`. The three refusals that are about
+/// an edge's time or kind count on the edge as well
+/// ([`EdgeInfo::static_refusals`], [`EdgeInfo::window_refusals`],
+/// [`EdgeInfo::jump_refusals`]), so a node that would log every error on a
+/// 100 Hz edge can log the first and read the running total from
+/// [`Self::edge`] instead; the refusals about the tree and the capacity
+/// ([`TfError::SecondParent`], [`TfError::Cycle`], [`TfError::SelfEdge`],
+/// [`TfError::EmptyFrameId`], [`TfError::FrameTableFull`],
+/// [`TfError::NameBudgetFull`]) come back every time and have no counter.
+/// The one `Ok(())` that keeps nothing is an overflow: on a full ring, a
+/// sample older than every sample it holds is the one that makes room, and
+/// that loss counts in [`EdgeInfo::overflows`] like every other overflow.
 ///
 /// # Epochs
 ///
