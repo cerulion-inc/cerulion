@@ -39,9 +39,10 @@ fn store(claimed: bool) -> TrustStore {
 }
 
 #[test]
-fn owner_certificate_keeps_row_bytes_and_only_advances_floor() {
+fn owner_certificate_keeps_the_owner_row_bytes_and_adds_one_device_row() {
     let mut s = store(true);
     let before = postcard::to_stdvec(s.access_rows()).unwrap();
+    assert_eq!(s.access_rows().len(), 1);
     assert_eq!(
         s.verify_owner_certificate(&proof(), &pk(&sk(20)), T_NOW + 1)
             .unwrap(),
@@ -49,7 +50,18 @@ fn owner_certificate_keeps_row_bytes_and_only_advances_floor() {
     );
     assert_eq!(s.high_water_ns(), T_NOW + 1);
     assert_eq!(s.owner(), Some(acct(1)));
-    assert_eq!(postcard::to_stdvec(s.access_rows()).unwrap(), before);
+    assert_eq!(rows_without_device(&s), before);
+    let device = only_device_row(&s);
+    assert_eq!(device.account, acct(1));
+    assert_eq!(device.device, Some(pk(&sk(20))));
+    assert_eq!(device.scope, Scope::OWNER_FULL);
+    assert_eq!(device.principal_kind, PrincipalKind::Human);
+    assert_eq!(
+        device.source,
+        cerulion_pairing::verify::PairingSource::CertificatePresentation
+    );
+    assert_eq!(device.added_at_ns, T_NOW + 1);
+    assert_eq!(device.expires_at_ns, None);
     let row = s.account_access(&acct(1), T_NOW + 1).unwrap();
     assert_eq!(row.scope, Scope::OWNER_FULL);
     assert_eq!(row.added_at_ns, T_NOW);
@@ -68,7 +80,30 @@ fn owner_certificate_keeps_row_bytes_and_only_advances_floor() {
     );
     let loaded = TrustStore::load(dir.path().join("a"), MAC_KEY).unwrap();
     assert_eq!(loaded.high_water_ns(), T_NOW + 1);
-    assert_eq!(postcard::to_stdvec(loaded.access_rows()).unwrap(), before);
+    assert_eq!(rows_without_device(&loaded), before);
+    assert_eq!(only_device_row(&loaded).device, Some(pk(&sk(20))));
+}
+
+/// The postcard bytes of the store's rows that name no device (the owner's row).
+fn rows_without_device(s: &TrustStore) -> Vec<u8> {
+    let rows: Vec<_> = s
+        .access_rows()
+        .iter()
+        .filter(|row| row.device.is_none())
+        .cloned()
+        .collect();
+    postcard::to_stdvec(&rows).unwrap()
+}
+
+/// The store's single device row; panics unless there is exactly one.
+fn only_device_row(s: &TrustStore) -> cerulion_pairing::verify::AccessRow {
+    let rows: Vec<_> = s
+        .access_rows()
+        .iter()
+        .filter(|row| row.device.is_some())
+        .collect();
+    assert_eq!(rows.len(), 1, "one device row: {rows:?}");
+    rows[0].clone()
 }
 
 #[test]
