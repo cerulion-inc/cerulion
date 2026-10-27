@@ -705,6 +705,8 @@ The items the macro generates for a node take the struct's visibility, so the st
 
 A node crate made before this layout needs two edits to link this way: change `crate-type = ["cdylib"]` to `crate-type = ["cdylib", "rlib"]` in its `Cargo.toml`, and change `struct <Name>` to `pub struct <Name>` on the `#[cerulion_node]` struct in `src/lib.rs`. Nothing else changes: the node still builds and runs with `cerulion node build` and `cerulion graph run` as before.
 
+An Android app links its nodes this way into one native library, its app runtime crate, and lists them once with `cerulion_android::embed_nodes! { "timer" => timer::TimerNodeEntry }`, naming each node by the entry type the macro generates for it, `<Struct>Entry`. Each string is the graph YAML `type:` the entry answers to. The app's embedded runtime runs a graph's nodes only from that list: a type that is not listed fails the start with error code 5, and `node_lib_dir` is refused for such a graph in an app. Java must call `CerulionRuntime.loadLibrary("<runtime library name>")` before any other `CerulionRuntime` call. The Android guide (`docs/android.md`, `Graph nodes in an app`) has the full steps.
+
 ---
 
 ## Node author API (the macros)
