@@ -311,11 +311,10 @@ its control socket only after the check, and a command that starts netd waits
 `tcp/`. What it changes is congestion control: a Linux TCP connection that idles
 longer than one retransmission timeout restarts from its initial window, so a
 large message sent about once a second pays several extra round trips, while
-the QUIC stack has no idle reset. On a robot to cloud link over a WireGuard
-overlay (301 KB request, 6.4 KB reply, once a second, 180 s), the round trip
-was 164.8 ms p50 and 257.7 ms p99 over `tcp/` and 69.2 ms p50 and 109.6 ms p99
-over `udp/...?rel=1`, one run each; the difference was not isolated to the
-idle reset alone.
+the QUIC stack has no idle reset, so the same message over `udp/...?rel=1`
+does not start each send from the initial window. The difference grows with the
+round trip and the message size. Cross-host figures will be added once they are
+measured on a natively built robot.
 
 Limits: the check runs once, when netd starts. A peer that appears later, or a
 QUIC link that later stops passing UDP, is not checked again until netd
