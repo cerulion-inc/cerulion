@@ -273,7 +273,9 @@ pub struct NetworkConfig {
     /// Per-topic egress put policy. A topic listed with
     /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
     /// by [`NetworkManager::publish_to_network`]; every other topic is put
-    /// reliable. Empty (the default) puts every topic reliable.
+    /// reliable. An entry's `send_queue` bounds the gateway's send queue for
+    /// the topic ([`NetworkManager::egress_send_queue`]). Empty (the default)
+    /// puts every topic reliable behind a queue as deep as its egress tap.
     pub egress_qos: Vec<EgressQos>,
 }
 
@@ -3522,6 +3524,9 @@ pub struct NetworkManager {
     /// Canonical topics put with zenoh's best-effort marker, derived once from
     /// `config.egress_qos` so a put reads a set rather than the list.
     best_effort_topics: HashSet<String>,
+    /// Canonical topic → its declared egress send-queue bound, derived once
+    /// from `config.egress_qos`.
+    send_queues: HashMap<String, std::num::NonZeroUsize>,
     session: OnceCell<zenoh::Session>,
     task: Mutex<TaskState>,
     /// Canonical-topic-keyed registry of active network→local ingress
@@ -3739,9 +3744,18 @@ impl NetworkManager {
             .filter(|q| q.reliability == EgressReliability::BestEffort)
             .map(|q| canonical_topic(&q.topic).into_owned())
             .collect();
+        let send_queues = config
+            .egress_qos
+            .iter()
+            .filter_map(|q| {
+                q.send_queue
+                    .map(|n| (canonical_topic(&q.topic).into_owned(), n))
+            })
+            .collect();
         Self {
             config,
             best_effort_topics,
+            send_queues,
             session: OnceCell::new(),
             task: Mutex::new(TaskState {
                 handle: None,
@@ -3823,9 +3837,9 @@ impl NetworkManager {
     /// every retained egress-topic announce token and disables every LAN egress
     /// bridge. The bridge manager refuses LAN enables until access is opened again;
     /// reopening permits demands but does not replay withheld announces.
-    /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
-    /// pass forwards another frame until access reopens: closing waits out every
-    /// pass that started before it (after every lock here is released).
+    /// Once this call returns with [`LanAccess::Paired`], no gateway puts another
+    /// frame until access reopens: closing waits out every drive pass and egress
+    /// put that started before it (after every lock here is released).
     ///
     /// The posture gates ingress (LAN to local) too. Switching to
     /// [`LanAccess::Paired`] suspends every live ingress entry (see
@@ -3917,9 +3931,10 @@ impl NetworkManager {
             (bridges, released)
         };
         drop(released);
-        // Every lock above is released before these waits: a gateway pass that
-        // loaded `true` just before the close still holds the shared guard until
-        // its batch is forwarded, so the exclusive take blocks until it drains.
+        // Every lock above is released before these waits: a drive pass that
+        // loaded `true` just before the close holds the shared guard until its
+        // batch is queued, and an egress sender holds it until its put returns,
+        // so the exclusive take blocks until both are done.
         // An ingress callback that read `lan_paired` before the store holds the
         // ingress gate until its frame is re-injected.
         if access == LanAccess::Paired {
@@ -4190,6 +4205,14 @@ impl NetworkManager {
         }
     }
 
+    /// The topic's declared egress send-queue bound from
+    /// [`NetworkConfig::egress_qos`], or `None` when it declares none.
+    pub fn egress_send_queue(&self, topic: &str) -> Option<std::num::NonZeroUsize> {
+        self.send_queues
+            .get(canonical_topic(topic).as_ref())
+            .copied()
+    }
+
     /// [`Self::publish_to_network`] with an explicit put reliability.
     ///
     /// `BestEffort` sets zenoh's best-effort marker on the put
@@ -4197,6 +4220,15 @@ impl NetworkManager {
     /// selects a best-effort link for the frame when the peer connection has
     /// one (a `mixed_rel` QUIC endpoint's datagram link) and the reliable link
     /// otherwise; the marker itself retransmits nothing.
+    ///
+    /// `Reliable` puts with zenoh's `CongestionControl::Block`, so a full zenoh
+    /// transmit queue makes this call wait rather than discard the frame;
+    /// `BestEffort` puts with `Drop`. A reliable call can wait as long as the
+    /// link is congested, up to zenoh's `wait_before_close` (5 s by default).
+    /// If the queue has not moved by then, zenoh discards the frame, closes
+    /// its link to the peer, and this call still returns `Ok`. The gateway
+    /// makes every put on a per-topic sender thread, so that wait does not
+    /// reach its drive loop except while a LAN close waits for the put.
     ///
     /// # Errors
     ///
@@ -4231,6 +4263,7 @@ impl NetworkManager {
         session
             .put(&key, frame)
             .reliability(zenoh_reliability)
+            .congestion_control(super::egress_send::congestion_control_for(reliability))
             .wait()
             .map_err(|e| TransportError::Publish {
                 topic: topic.to_string(),

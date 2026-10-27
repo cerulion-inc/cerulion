@@ -205,9 +205,10 @@ pub struct TopicBridgeManager {
     /// by [`Self::register_topic`] when the registered set grows. Shared out via
     /// [`Self::demand_signal`].
     demand_signal: Arc<DemandSignal>,
-    /// The egress-pass rendezvous: a gateway forwarding pass holds it SHARED
-    /// for the whole pass; closing LAN takes it EXCLUSIVELY once to wait every
-    /// pass that started before the close to finish.
+    /// The egress-pass rendezvous: a gateway drive pass holds it SHARED for the
+    /// whole pass, and an egress sender holds it SHARED across each put;
+    /// closing LAN takes it EXCLUSIVELY once to wait for every pass and put that
+    /// started before the close to finish.
     egress_pass: std::sync::RwLock<()>,
 }
 
@@ -237,16 +238,18 @@ impl TopicBridgeManager {
         Arc::clone(&self.demand_signal)
     }
 
-    /// The SHARED end of the egress-pass rendezvous, held by one gateway
-    /// forwarding pass for its whole duration (every flag load through the last
-    /// forward). Poison-recovering: a panicked pass must not wedge the close.
+    /// The SHARED end of the egress-pass rendezvous, held by one gateway drive
+    /// pass for its whole duration (every flag load through the last queued
+    /// frame) and by an egress sender across one put (its flag re-check through
+    /// the put's return). Poison-recovering: a panicked holder must not wedge
+    /// the close.
     pub(crate) fn egress_pass(&self) -> std::sync::RwLockReadGuard<'_, ()> {
         self.egress_pass
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Wait out every gateway forwarding pass that started before this call:
+    /// Wait out every gateway drive pass and egress put that started before this call:
     /// returns once the last shared `egress_pass` guard has dropped. MUST be
     /// called with NO bridge-manager or [`NetworkManager`](super::network::NetworkManager)
     /// lock held, and NEVER from inside a gateway pass (a pass holds the shared

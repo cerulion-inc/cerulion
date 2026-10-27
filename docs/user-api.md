@@ -2185,6 +2185,32 @@ network:
   every `egress` entry that sets no `reliability`. An entry's own
   `reliability` wins in both directions: `{topic: /r/cmd, reliability:
   reliable}` stays reliable under a `best_effort` default.
+- Egress send queue: the gateway hands each egress topic's frames to that
+  topic's own send queue and sender thread, so a congested link holds up the
+  topics it carries and not the gateway's other links (closing LAN access
+  while a put waits on a congested link waits for that put). Topics sent to
+  the same peer share that peer's link. A publishing node writes to shared
+  memory and does not wait on the network. A `reliable` frame waits for
+  zenoh's transmit queue instead of being dropped at the sender, for up to
+  zenoh's `wait_before_close` (5 s by default), after which zenoh drops it and
+  closes its link to that peer. When the topic's send queue is itself full, a
+  `reliable` topic refuses the new frame, counts it, and a warning names the
+  topic; a `best_effort` topic drops its oldest queued frame instead (newest
+  wins), counted too. An entry's `send_queue: N` (a whole number of frames,
+  1 or more) sets the queue's bound, for example `{topic: /r/camera,
+  send_queue: 32}`; without it the bound is the depth of the gateway's tap on
+  the topic. Each queued frame is a heap copy, so a topic's queue can hold
+  up to `send_queue` times its frame size. Every gateway logs, every 10 s, a
+  warning for a topic that refused or failed frames since the last report
+  (an info line for best-effort drops alone), and each topic's totals when it
+  stops. The gateway `cerulion-netd` hosts (a run with no
+  `network:` block) also reports each topic's `forwarded`, `dropped`,
+  `refused`, `failed`, `discarded`, `queued`, `in_flight` and `send_queue` in
+  its `status` reply; a run with a `network:` block uses its own gateway
+  process, which reports through its log. `forwarded` counts puts zenoh
+  accepted; a best-effort frame zenoh discards inside its own transmit queue
+  afterwards, and a reliable frame dropped at `wait_before_close`, are not
+  reported to the gateway.
 - `tls`: absolute PEM paths for `quic/` and `tls/` locators: `certificate` +
   `private_key` for a listener, `root_ca` for a connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh

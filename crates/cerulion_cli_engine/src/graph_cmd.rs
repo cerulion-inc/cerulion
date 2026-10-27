@@ -5262,8 +5262,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
     // interval) late — well inside the signal-matrix arms' seconds-scale exit
     // bounds, and nothing an operator can perceive.
     while running.load(Ordering::Relaxed) {
-        let forwarded = gateway.drive_once()?;
-        if forwarded == 0 {
+        let queued = gateway.drive_once()?;
+        if queued == 0 {
             gateway.idle_wait();
         }
     }
@@ -23480,10 +23480,18 @@ nodes:
             certificate: Some("/etc/cerulion/me.pem".into()),
             private_key: Some("/etc/cerulion/me.key".into()),
         };
-        let qos = vec![cerulion_core::EgressQos {
-            topic: "/r/scan".to_string(),
-            reliability: cerulion_core::EgressReliability::BestEffort,
-        }];
+        let qos = vec![
+            cerulion_core::EgressQos {
+                topic: "/r/scan".to_string(),
+                reliability: cerulion_core::EgressReliability::BestEffort,
+                send_queue: None,
+            },
+            cerulion_core::EgressQos {
+                topic: "/r/cam".to_string(),
+                reliability: cerulion_core::EgressReliability::Reliable,
+                send_queue: std::num::NonZeroUsize::new(8),
+            },
+        ];
         let cfg = cerulion_core::NetworkConfig {
             listen_endpoints: vec!["quic/0.0.0.0:7447?mixed_rel=1".to_string()],
             tls: Some(tls.clone()),
