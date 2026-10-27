@@ -104,6 +104,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        CerulionRuntime.loadLibrary("cerulion_android");
         int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
         if (init != CerulionRuntime.OK) {
             Log.e(TAG, "init=" + init);
@@ -271,7 +272,8 @@ public final class MainActivity extends Activity {
         } else if (getIntent().hasExtra("lan_access")) {
             Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
         }
-        config.put("node_lib_dir", getApplicationInfo().nativeLibraryDir);
+        // No node_lib_dir: graph nodes come from the node registry of the
+        // loaded runtime library.
         // Timestamp + random suffix: a restart inside the same millisecond
         // cannot reopen the previous run's bag.
         config.put("record", new JSONObject().put("file",

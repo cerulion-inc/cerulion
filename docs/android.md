@@ -26,7 +26,7 @@ and `cerulion_dds`.
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
 | App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade. |
-| Native nodes in an embedded app runtime | Not applicable | No | Android app transport is in-process; `graph_yaml` with native nodes is refused with error code 5. |
+| Native nodes in an embedded app runtime | Not applicable | Yes | Link the node crates into the app's native library and list them with `cerulion_android::embed_nodes!`. Nodes are not loaded from separate libraries in an app. |
 | local-transport | Yes | Yes | It is for one app process and not for process groups. |
 | Robust mutexes | Yes | No | Android cannot recover a lock held by an exited process. |
 | Remote plane in an app | Yes | Not hosted | An app can expose its gateway but does not host the paired remote plane. |
@@ -183,8 +183,9 @@ listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
 
 ## App embedding
 
-`cerulion_android` provides a Java facade backed by JNI. Build its native
-library for each device ABI and place it in the app's `jniLibs` directory:
+`cerulion_android` provides a Java facade backed by JNI. An app without graph
+nodes can load its native library directly. Build it for each device ABI and
+place it in the app's `jniLibs` directory:
 
 ```sh
 cargo ndk -t arm64-v8a --platform 30 \
@@ -194,11 +195,83 @@ cargo ndk -t arm64-v8a --platform 30 \
 
 Use `-t x86_64` for an x86_64 device. The Android runtime writes
 `files/iceoryx2.toml` with the default transport configuration before startup.
+The app runtime runs the graph, the gateway and the recorder alongside
+app-side publishing.
 
-Android apps use the in-process transport. A `graph_yaml` containing native
-nodes is refused with error code 5 because node libraries loaded at runtime
-cannot share the in-process transport. Run the app without `graph_yaml`.
-The app runtime runs the gateway and recorder alongside app-side publishing.
+### Graph nodes in an app
+
+Android apps use the in-process transport, so an app runs its graph nodes from
+its own native library: one library holds Cerulion and every node. Make an app
+runtime crate with its own `[workspace]` table, outside the node workspace (see
+`A node crate is a cdylib and an rlib` in the user API reference):
+
+```toml
+[workspace]
+
+[package]
+name = "myapp_runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_android = "1"
+timer = { path = "../nodes/timer", default-features = false }
+printer = { path = "../nodes/printer", default-features = false }
+```
+
+Copy the iceoryx2 `[patch.crates-io]` block from the node workspace's
+`Cargo.toml` into this file too: a patch applies only in the workspace that
+declares it. `cerulion_android`, `cerulion_core` and `native_ros2_messages`
+must resolve from one source, so when `cerulion_android` comes from a git
+checkout, patch the other two to the same checkout.
+
+Its `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
+node's generated entry type:
+
+```rust
+cerulion_android::embed_nodes! {
+    "timer" => timer::TimerNodeEntry,
+    "printer" => printer::PrinterNodeEntry,
+}
+```
+
+The macro defines the library's `JNI_OnLoad`, which registers the node types
+when Java loads the library. An app that writes its own `JNI_OnLoad` calls
+`cerulion_android::nodes::register` from it instead. Build the library with
+`cargo ndk -t arm64-v8a --platform 30 build --release -p myapp_runtime` and
+copy only `target/aarch64-linux-android/release/libmyapp_runtime.so` into
+`jniLibs/arm64-v8a/`. Do not use `cargo ndk -o` for this library: it also
+copies each node crate's own `.so`, and the app would then ship a second
+runtime.
+
+In Java, load that library before any other call:
+
+```java
+CerulionRuntime.loadLibrary("myapp_runtime");
+```
+
+Every other `CerulionRuntime` method throws `IllegalStateException` until
+`loadLibrary` has run. A second call with the same name does nothing; a call
+with a different name throws `IllegalStateException`.
+
+At each start the runtime looks every graph node's `type:` up among the linked
+types and makes a fresh node for it, so a stop and a new start in the same
+process run new node instances. Do not set `node_lib_dir`: with a graph that
+has native nodes it is refused with error code 5. A node type that is not
+linked, or a type listed twice in `embed_nodes!`, also fails the start with
+error code 5; `start` still returns `OK` because it only queues the start, and
+`status` then reports `state` `failed` with `last_error.code` 5 and a message
+that names the type and the linked types. `status` lists the linked types in
+`linked_nodes`.
+
+The app's graph topics are served by its gateway. A host sees them with
+`adb forward tcp:7683 tcp:7683` and
+`cerulion topic list --connect tcp/127.0.0.1:7683`. A `cerulion topic list`
+run on the device itself cannot see the app's topics, because they live in
+the app's in-process transport.
 
 `init` takes the files directory and the robot's name; the identity it
 registers under includes that robot name. `init` creates `files/cerulion-shm`
@@ -221,6 +294,7 @@ graph first stops what is left of the previous run and closes LAN access, even
 when the new configuration is then rejected.
 
 ```java
+CerulionRuntime.loadLibrary("cerulion_android");
 int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
 if (init != CerulionRuntime.OK) {
     Log.e(TAG, "init=" + init);
@@ -305,7 +379,7 @@ The configuration keys are:
 | Key | Meaning |
 |---|---|
 | `graph_yaml` | Optional graph YAML text. |
-| `node_lib_dir` | Optional absolute path to packaged node libraries. Android refuses `graph_yaml` containing native nodes with error code 5. |
+| `node_lib_dir` | Optional absolute path to node libraries, for a host runtime on the cross-process transport. A node type linked into the library wins over a library in this directory. The in-process transport an Android app uses refuses it for a graph with native nodes, with error code 5. |
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
@@ -449,8 +523,9 @@ for other processes, and non-empty process groups are refused. A
 `local-transport` host refuses every native cdylib node at load: each node
 library statically links its own copy of `cerulion_core`, so its process-local
 service registry is a different registry than the host's and its frames cannot
-be delivered. Drive the app's local topics through the publish and subscribe
-API in that process instead, or run a cross-process host.
+be delivered. Link the nodes into the app's own library instead (see
+`Graph nodes in an app` above), drive the app's local topics through the
+publish and subscribe API in that process, or run a cross-process host.
 
 Enable the feature on the dependency used by the app:
 
@@ -541,7 +616,10 @@ publisher event woke an idle subscriber across processes.
 Android does not provide robust mutex recovery. Shared-memory objects and
 abstract socket access depend on process ownership and SELinux policy. Native
 node libraries are built on a host and retain their target-triple directory
-when copied to a device. An Android app cannot host native graph nodes in its
-in-process transport, cannot host the paired remote plane, and cannot run
-`cerulion viz`. Emulator networking does not pass multicast to the host, so
+when copied to a device. An Android app runs only the graph nodes linked into
+its native library, cannot run a graph with `process_groups` (error code 5),
+cannot host the paired remote plane, and cannot run `cerulion viz`. A `tracing`
+line logged by a node in an app does not reach logcat. A `cerulion topic list`
+run on the device cannot see an app's topics; read them from a host through
+the app's gateway. Emulator networking does not pass multicast to the host, so
 test mDNS from a physical device or from the device itself.

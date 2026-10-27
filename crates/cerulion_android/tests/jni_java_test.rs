@@ -49,6 +49,7 @@ fn java_api_matches_hand_written_oracle() {
         .arg(classes.path())
         .arg("JniSmoke")
         .arg(files_dir.path())
+        .arg("cerulion_android")
         .output()
         .expect("run Java JNI smoke test");
     assert!(
@@ -58,9 +59,13 @@ fn java_api_matches_hand_written_oracle() {
     );
 
     let expected = "\
+status-before-load=call CerulionRuntime.loadLibrary(<your runtime library>) first
+load-again=no-exception
+load-other=CerulionRuntime is bound to libcerulion_android.so
 status-before-init=uninitialized
 init-bad=3
 init-ok=0
+linked-nodes=true
 publish-before-start=4
 start-invalid=0 state=failed error=3
 start-ok=0 state=running
