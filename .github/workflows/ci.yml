@@ -1547,12 +1547,27 @@ jobs:
           cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1 \
             --ignored --exact loader_refuses_a_matching_local_transport_cdylib
 
+      # The in-process transport is the one an Android app runs on: this
+      # graph runs nodes linked into the test binary from the node registry.
+      # cerulion_android depends on cerulion_core, so a cerulion_core change
+      # selects it too.
+      - name: local-transport linked node tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_linked_nodes_test -- --test-threads=1
+
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
         env:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_core (selected: $SELECTED)"
+
+      - name: selection marker, cerulion_android
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android (selected: $SELECTED)"
 
   examples:
     name: Examples (cargo check)
@@ -2640,6 +2655,9 @@ jobs:
       - name: cerulion_android first start failure tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
+      - name: cerulion_android linked node integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:

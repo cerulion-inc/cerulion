@@ -1259,6 +1259,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test_node_macro_period_cdylib",
+ "test_node_macro_relay_rlib",
  "thiserror 2.0.17",
  "toml",
  "tracing",
@@ -9366,6 +9368,14 @@ dependencies = [
 
 [[package]]
 name = "test_node_macro_qos_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_macro_relay_rlib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",

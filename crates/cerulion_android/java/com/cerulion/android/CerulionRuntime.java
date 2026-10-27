@@ -18,14 +18,43 @@ public final class CerulionRuntime {
     public static final int PANIC = 12;
     public static final int SPAWN = 13;
 
-    static {
-        System.loadLibrary("cerulion_android");
-    }
+    private static String loadedLibrary;
 
     private CerulionRuntime() {}
 
-    /** Initialize the process runtime. Returns {@link #OK}, or a stable error code. */
+    /**
+     * Load the app's native runtime library, the one library that links
+     * Cerulion and the app's graph nodes, for example
+     * {@code loadLibrary("myapp_runtime")} for {@code libmyapp_runtime.so}.
+     * Call it once, before any other method. A second call with the same
+     * name does nothing; a call with a different name throws
+     * {@link IllegalStateException}, because one process holds one runtime.
+     */
+    public static synchronized void loadLibrary(String name) {
+        if (loadedLibrary != null) {
+            if (!loadedLibrary.equals(name)) {
+                throw new IllegalStateException(
+                        "CerulionRuntime is bound to lib" + loadedLibrary + ".so");
+            }
+            return;
+        }
+        System.loadLibrary(name);
+        loadedLibrary = name;
+    }
+
+    private static synchronized void ensureLoaded() {
+        if (loadedLibrary == null) {
+            throw new IllegalStateException(
+                    "call CerulionRuntime.loadLibrary(<your runtime library>) first");
+        }
+    }
+
+    /**
+     * Initialize the process runtime. Returns {@link #OK}, or a stable error
+     * code. Throws {@link IllegalStateException} before {@link #loadLibrary}.
+     */
     public static int init(String filesDir, String robotName) {
+        ensureLoaded();
         return nativeInit(filesDir, robotName);
     }
 
@@ -34,18 +63,24 @@ public final class CerulionRuntime {
      * error code. {@link #BUSY} means another start or stop is in flight, so
      * retry. A retry answered {@link #BAD_STATE} means a runtime is already
      * running, owned by whoever started it; this caller must not stop it.
+     * A start that fails after it was queued, for example a graph node type
+     * that is not linked into the library, shows in {@link #status()} as
+     * state {@code failed} with {@code last_error.code}.
      */
     public static int start(String configJson) {
+        ensureLoaded();
         return nativeStart(configJson);
     }
 
     /** Publish without waiting for startup or shutdown. Returns a stable error code. */
     public static int publish(String topic, String json) {
+        ensureLoaded();
         return nativePublish(topic, json);
     }
 
     /** Return the latest JSON status snapshot without waiting for runtime work. */
     public static String status() {
+        ensureLoaded();
         return nativeStatus();
     }
 
@@ -55,6 +90,7 @@ public final class CerulionRuntime {
      * accepted or stable error code.
      */
     public static int stop() {
+        ensureLoaded();
         return nativeStop();
     }
 

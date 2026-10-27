@@ -77,6 +77,9 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # Library-only relay node (no cdylib target, no FFI exports): an app
+    # library links it as a plain dependency and runs it from the node registry.
+    "crates/test_fixtures/test_node_macro_relay_rlib",
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
