@@ -424,10 +424,10 @@ worker whose stdout is a machine-readable result, then `cerulion-remoted
 --provision-bundle <path>` to write the robot state, then `cerulion-remoted` to
 serve. The hidden worker exists so netd reuses the CLI engine's login and
 registration code without a `netd -> cli_engine` package edge; no operator ever
-runs either by hand. All three binaries must therefore sit in one directory,
-which today means a build from source: `cerulion-remoted` is in no release
-archive, no installer path and no Debian package, so no published artifact puts
-a robot daemon on a robot.
+runs either by hand. All three binaries must therefore sit in one directory.
+The release archives after v1.0.0, the installer and the Debian package place
+`cerulion`, `cerulion-netd` and `cerulion-remoted` side by side, so a released
+install with `CERULION_NETD_LISTEN` set runs this supervisor path.
 
 The robot's identity is the login device key, so the endpoint id a desk dials is
 the key registration proved possession of. Roots come from the issuer's

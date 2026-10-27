@@ -159,6 +159,13 @@ export CERULION_LOGIN_GATE=off
 mkdir -p "$HOME" "$TMPDIR"
 ```
 
+`CERULION_LOGIN_GATE=off` skips only the command-wide sign-in check. Serving
+the network still needs a saved login: a netd started with
+`CERULION_NETD_LISTEN`, a networked `graph run` (and its gateway), `node run`
+and `ros2 attach` refuse until one exists. Run `cerulion login` once in this
+shell, or point `CERULION_HOME` at a directory holding the state of a machine
+that signed in.
+
 On Android, netd and a `graph run` gateway refuse every LAN peer unless
 `CERULION_LAN_ACCESS=open` is set, the same posture as the app's
 `lan_access`; they raise the same mDNS beacon. Set it in the shell that
