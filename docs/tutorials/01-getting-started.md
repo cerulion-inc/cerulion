@@ -57,8 +57,10 @@ Three nodes forming a reactive pipeline:
   load, loudly. A downloaded release binary is pinned to the exact rustc that built
   it, named in the archive's `rustc-version.txt` (Rust 1.93.0 for the 1.0.0
   binaries), and the README's [Install](../../README.md#install) section gives the
-  `RUSTUP_TOOLCHAIN=` step for that case. Building this workspace from source needs
-  Rust 1.95 or newer. The workspace you create in step 1 also
+  `RUSTUP_TOOLCHAIN=` step for that case. On Homebrew and apt, run
+  `cerulion-install-rust` once to install that compiler, then put
+  `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. Building this workspace from
+  source needs Rust 1.95 or newer. The workspace you create in step 1 also
   records that compiler in its own `rust-toolchain.toml` when a matching rustup
   toolchain is already installed, so the builds below select it with no environment
   variable; when the CLI cannot verify a match it warns, leaves your environment's
@@ -165,13 +167,13 @@ safety_demo/
   .cargo/
     config.toml           # IOX2_LOG_LEVEL=error, RUST_LOG=warn
   .gitignore              # ignores .cerulion/ (the CLI's per-workspace state)
-  graphs/                 # Empty: we add a graph in Step 5
+  graphs/                 # Empty: we add a graph in Step 4
   nodes/                  # Empty: we add nodes next
   schemas/                # Empty: we use built-in ROS 2 types
 ```
 
 `recordings/` is not part of the scaffold. It appears the first time you run a
-graph (Step 6), and it is where the recording lands.
+graph (Step 5), and it is where the recording lands.
 
 > **How workspace discovery works:** When you run any `cerulion` command inside
 > `safety_demo/` (or any subdirectory), the CLI walks upward until it finds a
@@ -289,20 +291,46 @@ On Linux the library is `liblidar_sensor.so`.
 
 The `Params:` line lists the node's `#[param]` fields once the node is built.
 
-> **Note on schema introspection:** `cerulion schema info` covers BOTH
-> workspace-local schemas (`schemas/*.yaml`, looked up by file stem or
-> schema name) and built-in ROS2 message types: `cerulion schema info
-> sensor_msgs/LaserScan` (or `sensor_msgs::LaserScan`) prints the exact
-> per-field layout (fixed vs variable), wire fixed size, and schema hash
-> the generated types compiled against, as ONE unified recursive tree:
-> every non-primitive field's schema is expanded inline, indented directly
-> beneath it (e.g. `nav_msgs/Odometry`'s `header`, `pose`, and `twist`
-> expand down to their leaf fields). The same renderer serves every source:
-> a consistent `source:` line names the origin (built-in / workspace file /
-> `.msg` store / a robot over the network). A workspace schema that reuses a
-> built-in name wins for lookups, with a loud shadow warning on stderr.
-> `cerulion schema list` shows everything: workspace schemas plus all
-> built-in types grouped by package.
+### Inspect a schema
+
+`cerulion schema info` prints a message's wire layout as one recursive tree:
+every non-primitive field expands inline beneath it, and each line says whether
+the field is fixed or variable.
+
+```bash
+cerulion schema info sensor_msgs/LaserScan
+```
+
+**Expected output:**
+
+```
+schema: sensor_msgs/LaserScan
+source: built-in (ROS 2)
+wire fixed size: 28 bytes
+hash: 0x64cc8631dc24946b
+fields: 10
+  header: std_msgs/Header (variable)
+    stamp: builtin_interfaces/Time (fixed)
+      sec: int32 (fixed)
+      nanosec: uint32 (fixed)
+    frame_id: string (variable)
+  angle_min: float32 (fixed)
+  angle_max: float32 (fixed)
+  angle_increment: float32 (fixed)
+  time_increment: float32 (fixed)
+  scan_time: float32 (fixed)
+  range_min: float32 (fixed)
+  range_max: float32 (fixed)
+  ranges: float32[] (variable)
+  intensities: float32[] (variable)
+```
+
+The same verb covers workspace schemas (`schemas/*.yaml`, looked up by file stem
+or schema name) and built-in ROS 2 types (`sensor_msgs/LaserScan` or
+`sensor_msgs::LaserScan`); the `source:` line names where the definition came
+from. A workspace schema that reuses a built-in name wins for lookups, with a
+loud shadow warning on stderr. `cerulion schema list` shows everything:
+workspace schemas plus all built-in types grouped by package.
 
 > **Why LaserScan?** Unlike simpler messages (e.g., `Range` with a single float),
 > `LaserScan` contains variable-length arrays -- the same pattern used in
@@ -398,7 +426,7 @@ impl LidarSensorNode {
 **Key points:**
 - `#[cerulion_node(period_ms = 100)]` declares the node type AND its trigger
   policy: fire every 100 ms (10 Hz). Trigger policy always lives on the macro
-  side; the graph YAML (Step 5) carries topology only: IDs, wiring, schemas.
+  side; the graph YAML (Step 4) carries topology only: IDs, wiring, schemas.
   The folder name (`nodes/lidar_sensor/`) is the node type identifier, used
   by the graph YAML's `type:` field.
 - Ports are declared via field-level `#[input]` / `#[output]` attributes
@@ -465,7 +493,7 @@ struct SafetyControllerNode {
     /// Trigger input: fires `tick` when a new scan arrives on the
     /// graph-wired source topic. The `#[input(trigger)]` attribute
     /// declares this as the trigger; the `source:` for `scan` in the
-    /// graph YAML (Step 5) decides which upstream topic feeds it.
+    /// graph YAML (Step 4) decides which upstream topic feeds it.
     #[input(trigger)]
     scan: LaserScan,
 
@@ -618,66 +646,7 @@ impl DriveBaseNode {
 
 ---
 
-## Step 4: Verify Cargo.toml Dependencies
-
-The generated `Cargo.toml` for each node already has the right dependencies.
-The `cerulion_macros` crate is re-exported via `cerulion_core::prelude::*`,
-so no extra dependency is needed.
-
-Verify each node's `Cargo.toml` looks like this (the CLI generated it):
-
-```toml
-[package]
-name = "lidar_sensor"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[features]
-cdylib = []
-default = ["cdylib"]
-
-[dependencies]
-cerulion_core = { workspace = true }
-native_ros2_messages = { workspace = true }
-```
-
-The workspace root `Cargo.toml` defines the dependencies selected by the CLI:
-
-```toml
-[workspace]
-members = ["nodes/*"]
-resolver = "2"
-
-[workspace.dependencies]
-cerulion_core = "=X.Y.Z"
-native_ros2_messages = "=X.Y.Z"
-```
-
-An installed CLI writes exact published-version pins matching its own version
-(`cerulion --version`). When the CLI was built inside a `cerulion` source checkout, the same table
-instead holds normalized absolute paths into that checkout, for example
-`cerulion_core = { path = "/home/you/cerulion/crates/cerulion_core" }`.
-
-> **Why `cdylib`?** The graph runtime loads nodes as dynamic libraries at
-> startup, so each node is compiled into a `.dylib` (macOS) or a `.so` (Linux).
-> The `#[cerulion_node]` macro generates the entry points the runtime calls;
-> you never write or call them yourself.
->
-> **Why `{ workspace = true }`?** Using workspace-level dependency declarations
-> keeps all nodes using the same version of `cerulion_core` and
-> `native_ros2_messages`. The actual paths are defined once in the workspace
-> root `Cargo.toml`.
->
-> **Why the `cdylib` feature?** The `cdylib` feature flag controls whether the
-> `#[cerulion_node]` macro generates those entry points. It's
-> enabled by default so the node compiles as a loadable dynamic library.
-
----
-
-## Step 5: Create the Graph
+## Step 4: Create the Graph
 
 A **graph** is a YAML file that defines which node instances run and how
 they're wired together: topology only. (Trigger policy lives on each node
@@ -769,25 +738,25 @@ per-output knob. `docs/user-api.md` ("Graph YAML reference") lists every key.
 > any `max_slice_len:` here. The key exists for the day you need to override it
 > for one output.
 
-> **Trigger policies explained** (all declared on the macro side; the
-> graph YAML carries topology only):
->
-> | Policy | Macro attribute | Behavior |
-> |--------|-----------------|----------|
-> | **Period** | `#[cerulion_node(period_ms = N)]` | Fire every N ms regardless of data |
-> | **Data** | `#[input(trigger)]` on a field | Fire when that input port has new data |
-> | **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete aligned set**: one message from each trigger port, all within an N-ms window of each other. Each message is used by at most one set, so a burst holding three complete sets fires three times, each tick reading its own set. |
-> | **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete set, as soon as every trigger port has an unconsumed message**. No timing bound; not recommended for control loops because worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops. |
-> | **Data + deadline watchdog** | `#[input(trigger, expect_within_ms = N)]` | Fire on data arrival AND record a miss if no fresh data lands within N ms (the timeout records a miss, it does **not** fire the node). Replaces the removed `deadline_ms` trigger. |
-> | **External** | `#[cerulion_node(external)]` + an `external_source()` method | A **driver** node: it watches something outside Cerulion (a device file descriptor, a blocking SDK call) and fires itself when that signals. See "External nodes" in `docs/user-api.md`. |
->
-> The **data trigger** is the most common for reactive pipelines: it creates a
-> chain where each node fires exactly when its upstream publishes, giving
-> minimal latency without polling.
+**Trigger policies explained** (all declared on the macro side; the
+graph YAML carries topology only):
+
+| Policy | Macro attribute | Behavior |
+|--------|-----------------|----------|
+| **Period** | `#[cerulion_node(period_ms = N)]` | Fire every N ms regardless of data |
+| **Data** | `#[input(trigger)]` on a field | Fire when that input port has new data |
+| **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete aligned set**: one message from each trigger port, all within an N-ms window of each other. Each message is used by at most one set, so a burst holding three complete sets fires three times, each tick reading its own set. |
+| **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete set, as soon as every trigger port has an unconsumed message**. No timing bound; not recommended for control loops because worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops. |
+| **Data + deadline watchdog** | `#[input(trigger, expect_within_ms = N)]` | Fire on data arrival AND record a miss if no fresh data lands within N ms (the timeout records a miss, it does **not** fire the node). Replaces the removed `deadline_ms` trigger. |
+| **External** | `#[cerulion_node(external)]` + an `external_source()` method | A **driver** node: it watches something outside Cerulion (a device file descriptor, a blocking SDK call) and fires itself when that signals. See "External nodes" in `docs/user-api.md`. |
+
+The **data trigger** is the most common for reactive pipelines: it creates a
+chain where each node fires exactly when its upstream publishes, giving
+minimal latency without polling.
 
 ---
 
-## Step 6: Build and Run
+## Step 5: Build and Run
 
 ### Build all nodes
 
@@ -810,8 +779,12 @@ a laptop; later builds take seconds.
 > **What happens during build:** `cerulion node build` runs your `cargo` on the
 > node crate and produces a node library, `target/release/lib<node_type>.dylib`
 > on macOS or `.so` on Linux (`target/debug/` without `--release`). `graph run`
-> loads the libraries from there. Use `--release` for anything you will measure
-> or record; a debug build is far slower.
+> loads the libraries from there. That is why each node's generated `Cargo.toml`
+> sets `crate-type = ["cdylib", "rlib"]` (the `rlib` lets an app link the node as
+> a library) and turns on its `cdylib` feature by default: the
+> feature is what makes the `#[cerulion_node]` macro emit the entry points the
+> runtime calls. Use `--release` for anything you will measure or record; a debug
+> build is far slower.
 
 ### Check the graph
 
@@ -831,7 +804,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 This runs the graph **live**: an event-driven loop that wakes within microseconds
 of each publish. `--record` also writes the run to a bag under `recordings/`,
-which Step 8 uses.
+which Step 7 uses.
 
 **Multi-process by default:** the graph declares no `process_groups:` block, so
 on Linux and macOS `graph run` derives a **process-per-node partition** (one OS
@@ -886,7 +859,7 @@ Leave it running and open a second terminal.
 
 ---
 
-## Step 7: Inspect Topics (in a second terminal)
+## Step 6: Inspect Topics (in a second terminal)
 
 While the graph is running, open another terminal, `cd` into `safety_demo`,
 and use the topic introspection commands.
@@ -968,7 +941,7 @@ wire header:
   measured wall elapsed, from an epoch anchored to that rank's monotonic clock.
   So the stamps step by about the node's 100 ms period and carry the run's real
   jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
-  exact multiples. What makes the Step 8 replay exact is not a tidy clock but
+  exact multiples. What makes the Step 7 replay exact is not a tidy clock but
   the recorded posture: every step boundary is written into the bag and replayed
   from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
   where every rank advances the same 100 ms quantum behind a shared barrier, so
@@ -1050,7 +1023,7 @@ Last timestamp: 1997447829523916ns
 
 ---
 
-## Step 8: Stop, Verify, Change, Verify Again
+## Step 7: Stop, Verify, Change, Verify Again
 
 Let the graph run for at least five seconds, then go back to the first terminal
 and press **Ctrl+C**. The workers drain, the recorder finalizes the bag, and the
@@ -1138,7 +1111,7 @@ before it reaches the robot again. In CI the nonzero exit is the gate.
 
 ---
 
-## Step 9: Understand the Architecture
+## Step 8: Understand the Architecture
 
 Now that you have a working system, let's review what's happening under the
 hood.
@@ -1281,15 +1254,27 @@ contributes name-only, and a layout change inside such a target is not caught.
   in the user API.
 
 - **Capture the moment:** every serving `graph run` holds a rolling window of
-  the last ~30 seconds, recorded or not. `cerulion flashback` writes that window
-  to a bag; `cerulion bag info` reports whether the capture carries the
+  the last 30 seconds in memory, recorded or not. A capture writes that window
+  plus the 15 seconds after its trigger to a bag. The runtime takes one on its
+  own when it sees a fault, and you can ask for one from another shell:
+
+  ```bash
+  cerulion flashback --note "controller stopped late"
+  ```
+
+  `cerulion bag info` reports whether the capture carries the
   scheduler trace that re-execution needs, which depends on the run's shape. See
   [docs/flashback.md](../flashback.md); [docs/bag.md](../bag.md) covers
   recording and playback in full.
 
 - **Visualize it:** `cerulion viz` attaches the live topics to the viz daemon and
   [Cerulion Studio](../../README.md#studio-for-your-computer) connects to that
-  same daemon and renders them. Nothing is added to the graph for either.
+  same daemon and renders them. Nothing is added to the graph for either. Name
+  the topics you want, or pass none to attach every decodable local topic:
+
+  ```bash
+  cerulion viz /demo/lidar_sensor/scan /demo/safety_controller/cmd_vel
+  ```
 
 ---
 
@@ -1298,7 +1283,7 @@ contributes name-only, and a layout change inside such a target is not caught.
 | Command | Description |
 |---------|-------------|
 | `cerulion workspace create <name>` | Create a new workspace |
-| `cerulion node create <type> [--policy period_ms=N\|external] [-o SCHEMA NAME] [-T SCHEMA NAME] [-i SCHEMA NAME]` | Create node with ports (`-T` = trigger input; source-only nodes require `--policy`) |
+| `cerulion node create <type> [--policy period_ms=N\|sync_window_ms=N\|data_trigger=NAME\|external] [-o SCHEMA NAME] [-T SCHEMA NAME] [-i SCHEMA NAME]` | Create node with ports (`-T SCHEMA NAME` = trigger input, the same as `-i SCHEMA NAME --policy data_trigger=NAME`; `sync_window_ms` needs two or more trigger inputs; source-only nodes require `--policy`) |
 | `cerulion node list` | List all node types |
 | `cerulion node info <type>` | Show node details |
 | `cerulion node build <type> [--release]` | Build node cdylib |

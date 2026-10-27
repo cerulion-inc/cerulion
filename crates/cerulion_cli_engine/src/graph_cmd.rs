@@ -4984,7 +4984,14 @@ fn establish_network_egress(
         );
     } else {
         match register_egress_with_netd(launch, graph_name, ix_config_json.as_deref()) {
-            Ok(guard) => return Some(NetworkEgressHandle::Netd(guard)),
+            Ok(guard) => {
+                crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
+                    graph_name,
+                    crate::tcp_idle_warning::EgressRoute::Netd,
+                    &launch.plan,
+                );
+                return Some(NetworkEgressHandle::Netd(guard));
+            }
             Err(e) => {
                 tracing::warn!(
                     graph = %graph_name,
@@ -4995,8 +5002,13 @@ fn establish_network_egress(
             }
         }
     }
-    spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)
-        .map(NetworkEgressHandle::Child)
+    let child = spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)?;
+    crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
+        graph_name,
+        crate::tcp_idle_warning::EgressRoute::Child(&launch.network),
+        &launch.plan,
+    );
+    Some(NetworkEgressHandle::Child(child))
 }
 
 /// An AddrInUse-class session-open failure — the ONLY class the

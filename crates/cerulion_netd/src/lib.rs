@@ -84,6 +84,8 @@ pub mod mirror;
 pub mod net;
 pub mod protocol;
 pub mod query;
+pub mod quic_first;
+pub mod quic_probe;
 pub mod registry;
 
 // The iroh WAN plane, gated behind the `wan` feature, now DEFAULT-ON (the

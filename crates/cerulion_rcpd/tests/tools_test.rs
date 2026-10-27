@@ -17,7 +17,7 @@ use cerulion_rcpd::journal::Journal;
 use cerulion_rcpd::manifest::{LoadedManifest, RcpManifest};
 use cerulion_rcpd::observer::GraphSource;
 use cerulion_rcpd::server::RcpServer;
-use cerulion_rcpd::tools::{latch_path, ReceiptLock, ToolHost, ESTOP_TOOL};
+use cerulion_rcpd::tools::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
 use cerulion_rcpd::RcpdError;
 use native_ros2_messages::std_msgs::String as RosString;
 use rmcp::model::{
@@ -48,9 +48,16 @@ fn manager(tag: &str) -> Arc<TransportManager> {
     .expect("init isolated transport manager")
 }
 
-/// A manifest on topics private to this test: three mutating tools (`arm.slow`
-/// is answered late, `arm.mute` never), one read tool, one state topic.
+/// A manifest on topics private to this test: three reversible tools
+/// (`arm.slow` is answered late, `arm.mute` never), one read tool, one
+/// irreversible tool, one state topic.
 fn manifest(dir: &Path, prefix: &str) -> LoadedManifest {
+    manifest_with(dir, prefix, "")
+}
+
+/// [`manifest`] with `extra` (top-level YAML, such as a `limits` section)
+/// appended.
+fn manifest_with(dir: &Path, prefix: &str, extra: &str) -> LoadedManifest {
     let step = |name: &str, timeout_ms: u32| {
         format!(
             "  - name: {name}
@@ -78,7 +85,11 @@ tools:
     description: read only
     safety_class: read
     input_schema: {{ type: object, properties: {{}} }}
-",
+  - name: arm.cut
+    description: cut the cable
+    safety_class: irreversible
+    input_schema: {{ type: object, properties: {{}} }}
+{extra}",
         step("arm.step", 3000),
         step("arm.slow", 3000),
         step("arm.mute", 300),
@@ -181,17 +192,23 @@ struct Fixture {
 impl Fixture {
     async fn new(tag: &str, with_graph: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        Self::in_dir(tag, with_graph, dir).await
+        Self::in_dir(tag, with_graph, dir, "").await
     }
 
-    async fn in_dir(tag: &str, with_graph: bool, dir: tempfile::TempDir) -> Self {
+    /// A fixture whose manifest ends with `extra` (a `limits` section).
+    async fn with_extra(tag: &str, extra: &str) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Self::in_dir(tag, true, dir, extra).await
+    }
+
+    async fn in_dir(tag: &str, with_graph: bool, dir: tempfile::TempDir, extra: &str) -> Self {
         let prefix = unique(tag);
-        let loaded = manifest(dir.path(), &prefix);
+        let loaded = manifest_with(dir.path(), &prefix, extra);
         let mgr = manager(tag);
         let stop = Arc::new(AtomicBool::new(false));
         let graph = with_graph.then(|| spawn_graph(mgr.clone(), prefix.clone(), stop.clone()));
         let receipts = dir.path().join("receipts/log.jsonl");
-        let host = open_host(&mgr, &loaded, &receipts).expect("host");
+        let host = open_host_as_configured(&mgr, &loaded, &receipts).expect("host");
         let feed = GraphSource::new(mgr.clone(), loaded.identity.clone()).feed();
         let server = RcpServer::with_tools(feed, host, loaded.state.clone());
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -264,6 +281,25 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// [`open_host`] with the manifest's `limits.estop_clear` applied, as the
+/// binary applies it.
+fn open_host_as_configured(
+    mgr: &Arc<TransportManager>,
+    loaded: &LoadedManifest,
+    receipts: &Path,
+) -> Result<Arc<ToolHost>, RcpdError> {
+    let lock = ReceiptLock::acquire(receipts)?;
+    let latch = Arc::new(AtomicBool::new(false));
+    let journal = Journal::spawn(
+        mgr.clone(),
+        loaded.journal.clone(),
+        loaded.state.clone(),
+        latch.clone(),
+    )?;
+    ToolHost::open(loaded.tools.clone(), journal, latch, receipts, lock)
+        .map(|host| Arc::new(host.with_estop_clear(loaded.limits.estop_clear)))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_list_is_the_manifest_plus_estop() {
     let f = Fixture::new("list", false).await;
@@ -277,7 +313,15 @@ async fn tools_list_is_the_manifest_plus_estop() {
         .collect();
     assert_eq!(
         names,
-        ["arm.step", "arm.slow", "arm.mute", "arm.peek", ESTOP_TOOL]
+        [
+            "arm.step",
+            "arm.slow",
+            "arm.mute",
+            "arm.peek",
+            "arm.cut",
+            ESTOP_TOOL,
+            ESTOP_CLEAR_TOOL
+        ]
     );
 }
 
@@ -462,7 +506,7 @@ async fn the_latch_survives_a_restart() {
     let receipts = dir.path().join("receipts/log.jsonl");
     std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
     std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
-    let f = Fixture::in_dir("latch", true, dir).await;
+    let f = Fixture::in_dir("latch", true, dir, "").await;
     let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
     assert!(is_error);
     assert_eq!(body["error"]["code"], json!("estopped"));
@@ -475,6 +519,11 @@ async fn a_second_daemon_on_the_same_receipt_log_is_refused() {
     let receipts = dir.path().join("log.jsonl");
     let mgr = manager("lock");
     let first = open_host(&mgr, &loaded, &receipts).expect("first daemon");
+    let names: Vec<String> = first.list().iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        names.iter().any(|n| n == ESTOP_CLEAR_TOOL),
+        "a host built without with_estop_clear serves estop_clear: {names:?}"
+    );
     let second = open_host(&mgr, &loaded, &receipts);
     let Err(RcpdError::Receipts { reason, .. }) = second else {
         panic!("a second daemon must be refused");
@@ -604,4 +653,415 @@ fn the_audit_refuses_a_cut_head_and_a_missing_rotated_file() {
     std::fs::remove_file(cerud::receipt::rotated_path(&rotated, 1)).expect("delete .1");
     let err = cerulion_rcpd::audit::verify_log(&rotated).expect_err("gap");
     assert!(err.contains("is missing"), "{err}");
+}
+
+const OPERATOR_CLEARS: &str = "limits:\n  estop_clear: operator\n";
+
+/// The `tools/list` entries as JSON, keyed by name.
+async fn listed(f: &Fixture) -> std::collections::BTreeMap<String, Value> {
+    f.client
+        .list_all_tools()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|t| {
+            let json = serde_json::to_value(&t).expect("tool JSON");
+            (t.name.to_string(), json)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_list_labels_every_safety_class() {
+    let f = Fixture::new("labels", false).await;
+    let tools = listed(&f).await;
+    // (name, description, readOnlyHint, destructiveHint)
+    let expected = [
+        (
+            "arm.step",
+            "one period (safety class: reversible)",
+            false,
+            false,
+        ),
+        ("arm.peek", "read only (safety class: read)", true, false),
+        (
+            "arm.cut",
+            "cut the cable (safety class: irreversible)",
+            false,
+            true,
+        ),
+    ];
+    for (name, description, read_only, destructive) in expected {
+        let tool = &tools[name];
+        assert_eq!(tool["description"], json!(description), "{tool}");
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            json!(read_only),
+            "{tool}"
+        );
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            json!(destructive),
+            "{tool}"
+        );
+        assert_eq!(tool["annotations"]["openWorldHint"], json!(false), "{tool}");
+    }
+    for (name, destructive) in [(ESTOP_TOOL, false), (ESTOP_CLEAR_TOOL, true)] {
+        let tool = &tools[name];
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            json!(destructive),
+            "{tool}"
+        );
+        assert_eq!(tool["annotations"]["idempotentHint"], json!(true), "{tool}");
+    }
+    let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
+    assert!(estop.contains("estop_clear"), "{estop}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_irreversible_tool_runs_receipted_labelled_and_latch_gated() {
+    let mut f = Fixture::new("irreversible", true).await;
+    let (is_error, body) = f.call("arm.cut", json!({})).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["safety_class"], json!("irreversible"));
+    assert_eq!(body["result"]["tool"], json!("arm.cut"));
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
+    assert!(!is_error);
+    let (is_error, body) = f.call("arm.cut", json!({})).await;
+    assert!(is_error);
+    assert_eq!(body["error"]["code"], json!("estopped"));
+    assert_eq!(body["safety_class"], json!("irreversible"));
+    let (_, body) = f.call("arm.peek", json!({})).await;
+    assert_eq!(body["safety_class"], json!("read"));
+    let tools: Vec<Value> = f
+        .stop_graph()
+        .into_iter()
+        .map(|c| c["tool"].clone())
+        .collect();
+    assert_eq!(
+        tools,
+        [json!("arm.cut"), json!(ESTOP_TOOL), json!("arm.peek")]
+    );
+    assert_eq!(
+        f.receipts(),
+        pairs(&[
+            ("arm.cut", "intent"),
+            ("arm.cut", "ok"),
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            ("arm.cut", "denied"),
+            ("arm.peek", "ok"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_clears_the_estop_and_a_later_estop_latches_again() {
+    let mut f = Fixture::new("clear", true).await;
+    let latch = latch_path(&f.receipts);
+    let step = json!({ "q": [0.0, 0.0] });
+
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "first" })).await;
+    assert!(!is_error);
+    assert!(latch.exists(), "the latch file is written on engage");
+    let (_, body) = f.call("arm.step", step.clone()).await;
+    assert_eq!(body["error"]["code"], json!("estopped"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("estop_clear"),
+        "{body}"
+    );
+
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "reason": "safe" })).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["estopped"], json!(false));
+    assert_eq!(body["was_estopped"], json!(true));
+    assert_eq!(body["graph_acknowledged"], json!(true));
+    assert_eq!(
+        body["result"]["tool"],
+        json!(ESTOP_CLEAR_TOOL),
+        "the graph was told"
+    );
+    assert!(body["receipt"]["seq"].is_u64(), "{body}");
+    assert!(!latch.exists(), "the clear deletes the latch file");
+
+    let (is_error, body) = f.call("arm.step", step.clone()).await;
+    assert!(!is_error, "motion runs after the clear: {body}");
+
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "second" })).await;
+    assert!(!is_error);
+    assert!(
+        latch.exists(),
+        "an engage after a clear writes the file again"
+    );
+    assert_eq!(std::fs::read_to_string(&latch).expect("latch"), "second\n");
+    let (_, body) = f.call("arm.step", step.clone()).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("estopped"),
+        "an engage after a clear latches"
+    );
+
+    let seen = f.stop_graph();
+    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
+    assert_eq!(
+        tools,
+        [ESTOP_TOOL, ESTOP_CLEAR_TOOL, "arm.step", ESTOP_TOOL]
+    );
+    assert_eq!(
+        seen[1]["args"],
+        json!({ "reason": "safe" }),
+        "the clear is journaled"
+    );
+    assert_eq!(
+        f.receipts(),
+        pairs(&[
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            ("arm.step", "denied"),
+            (ESTOP_CLEAR_TOOL, "intent"),
+            (ESTOP_CLEAR_TOOL, "ok"),
+            ("arm.step", "intent"),
+            ("arm.step", "ok"),
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            ("arm.step", "denied"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clear_while_not_estopped_is_receipted_and_changes_nothing() {
+    let mut f = Fixture::new("clear_idle", true).await;
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "speed": 1 })).await;
+    assert!(is_error, "arguments outside the schema are refused: {body}");
+    assert_eq!(body["error"]["code"], json!("invalid_args"));
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["was_estopped"], json!(false));
+    assert_eq!(body["estopped"], json!(false));
+    let (is_error, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert!(!is_error);
+    let seen = f.stop_graph();
+    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
+    assert_eq!(
+        tools,
+        ["arm.step"],
+        "a clear with nothing latched is not journaled"
+    );
+    assert_eq!(
+        f.receipts(),
+        pairs(&[
+            (ESTOP_CLEAR_TOOL, "error:invalid_args"),
+            (ESTOP_CLEAR_TOOL, "intent"),
+            (ESTOP_CLEAR_TOOL, "ok"),
+            ("arm.step", "intent"),
+            ("arm.step", "ok"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_clears_a_latch_left_by_an_earlier_daemon() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receipts = dir.path().join("receipts/log.jsonl");
+    std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
+    std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
+    let mut f = Fixture::in_dir("clear_restart", true, dir, "").await;
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["was_estopped"], json!(true));
+    assert!(!latch_path(&receipts).exists());
+    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert!(!is_error, "{body}");
+    f.stop_graph();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_latch_file_that_cannot_be_deleted_keeps_the_estop_engaged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receipts = dir.path().join("receipts/log.jsonl");
+    // A non-empty directory where the latch file goes: it exists, so the
+    // daemon starts latched, and `remove_file` cannot delete it.
+    std::fs::create_dir_all(latch_path(&receipts).join("pinned")).expect("mkdir");
+    let mut f = Fixture::in_dir("clear_fails", true, dir, "").await;
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["code"], json!("clear_failed"));
+    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("estopped"),
+        "the latch stays closed"
+    );
+    assert!(f.stop_graph().is_empty(), "nothing was journaled");
+    assert_eq!(
+        f.receipts(),
+        pairs(&[
+            (ESTOP_CLEAR_TOOL, "intent"),
+            (ESTOP_CLEAR_TOOL, "error:clear_failed"),
+            ("arm.step", "denied"),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn under_operator_clearing_the_agent_cannot_clear_the_estop() {
+    let mut f = Fixture::with_extra("operator", OPERATOR_CLEARS).await;
+    let tools = listed(&f).await;
+    assert!(
+        !tools.contains_key(ESTOP_CLEAR_TOOL),
+        "estop_clear is not listed"
+    );
+    let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
+    assert!(!estop.contains("estop_clear"), "{estop}");
+
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
+    assert!(!is_error);
+    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["code"], json!("estop_clear_disabled"));
+    assert!(latch_path(&f.receipts).exists(), "the latch file stays");
+    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert_eq!(body["error"]["code"], json!("estopped"));
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("estop_clear"),
+        "{body}"
+    );
+
+    let seen = f.stop_graph();
+    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
+    assert_eq!(tools, [ESTOP_TOOL], "the refused clear was never journaled");
+    assert_eq!(
+        f.receipts(),
+        pairs(&[
+            (ESTOP_TOOL, "intent"),
+            (ESTOP_TOOL, "ok"),
+            (ESTOP_CLEAR_TOOL, "denied"),
+            ("arm.step", "denied"),
+        ])
+    );
+}
+
+/// The latch state the receipt log implies: an `estop` intent closes it; an
+/// `estop_clear` intent opens it unless that clear's closing receipt is
+/// `error:clear_failed`, since every other clear outcome is written after the
+/// latch opened. Clears are serialized, so a clear's closing receipt is the
+/// next `estop_clear` line after its intent.
+fn replay_latch(receipts: &[(String, String)], initially: bool) -> bool {
+    let mut closed = initially;
+    for (i, (verb, outcome)) in receipts.iter().enumerate() {
+        match (verb.as_str(), outcome.as_str()) {
+            (ESTOP_TOOL, "intent") => closed = true,
+            (ESTOP_CLEAR_TOOL, "intent") => {
+                let closing = receipts[i + 1..]
+                    .iter()
+                    .find(|(v, _)| v == ESTOP_CLEAR_TOOL)
+                    .map(|(_, o)| o.as_str());
+                if closing != Some("error:clear_failed") {
+                    closed = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    closed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreeing() {
+    let mut f = Fixture::new("race", true).await;
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let client = Arc::clone(&f.client);
+        let tool = if i % 2 == 0 {
+            ESTOP_TOOL
+        } else {
+            ESTOP_CLEAR_TOOL
+        };
+        tasks.push(tokio::spawn(async move {
+            call(&client, tool, json!({ "reason": format!("r{i}") })).await
+        }));
+    }
+    for task in tasks {
+        let (is_error, body) = task.await.expect("task");
+        if is_error {
+            assert_eq!(body["error"]["code"], json!("estop_overtaken"), "{body}");
+        }
+    }
+    // The settled state, read through a motion call.
+    let (refused, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    let receipts = f.receipts();
+    let seen = f.stop_graph();
+    let latched = replay_latch(&receipts, false);
+    assert_eq!(
+        refused, latched,
+        "the latch matches the receipt log: {receipts:?}"
+    );
+    assert_eq!(
+        latch_path(&f.receipts).exists(),
+        latched,
+        "the latch file matches the latch"
+    );
+    let last_builtin = seen
+        .iter()
+        .filter_map(|c| c["tool"].as_str())
+        .rfind(|t| *t == ESTOP_TOOL || *t == ESTOP_CLEAR_TOOL);
+    if latched {
+        assert_eq!(
+            last_builtin,
+            Some(ESTOP_TOOL),
+            "the graph's last word is the estop"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_estop_while_a_clear_waits_behind_a_call_is_not_cleared_by_it() {
+    let mut f = Fixture::new("clear_queued", true).await;
+    let client = Arc::clone(&f.client);
+    // The graph answers arm.slow after 1.5 s; the clear queues behind it.
+    let slow =
+        tokio::spawn(async move { call(&client, "arm.slow", json!({ "q": [0.0, 0.0] })).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let client = Arc::clone(&f.client);
+    let clear = tokio::spawn(async move { call(&client, ESTOP_CLEAR_TOOL, json!({})).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "late" })).await;
+    assert!(!is_error);
+    let (clear_error, body) = clear.await.expect("clear task");
+    assert!(clear_error, "{body}");
+    assert_eq!(body["error"]["code"], json!("estop_overtaken"));
+    assert_eq!(body["estopped"], json!(true));
+    let (slow_error, _) = slow.await.expect("slow task");
+    assert!(!slow_error);
+    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("estopped"),
+        "the later estop holds"
+    );
+    assert!(latch_path(&f.receipts).exists());
+    let seen = f.stop_graph();
+    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
+    assert_eq!(
+        tools,
+        ["arm.slow", ESTOP_TOOL],
+        "the refused clear was never journaled"
+    );
+    let clears: Vec<(String, String)> = f
+        .receipts()
+        .into_iter()
+        .filter(|(verb, _)| verb == ESTOP_CLEAR_TOOL)
+        .collect();
+    assert_eq!(
+        clears,
+        pairs(&[(ESTOP_CLEAR_TOOL, "error:estop_overtaken")])
+    );
 }

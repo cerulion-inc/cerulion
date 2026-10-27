@@ -207,6 +207,13 @@ const LEAN_CRATES: &[LeanCrate] = &[
                  crates), so it is safe in `default-members`.\"",
     },
     LeanCrate {
+        package: "cerulion_ops_proto",
+        allowed: &["serde", "serde_json", "thiserror"],
+        source: "crates/cerulion_ops_proto/Cargo.toml: \"serde + serde_json + thiserror ONLY, \
+                 and no workspace crate, so a closed client that links this crate links no AGPL \
+                 code.\"",
+    },
+    LeanCrate {
         package: "cerulion_hygiene",
         allowed: &["libc", "rustix", "tracing"],
         source: "crates/cerulion_hygiene/Cargo.toml: \"std + libc + rustix peer \
@@ -325,6 +332,10 @@ struct Package {
     name: String,
     version: String,
     manifest_path: String,
+    /// The SPDX expression cargo resolved for the package, workspace
+    /// inheritance applied; `None` when the manifest declares none.
+    #[serde(default)]
+    license: Option<String>,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
     dependencies: Vec<ManifestDep>,
@@ -1524,6 +1535,102 @@ fn the_confined_crates_reach_nothing_they_forbid() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule: a permissive crate links no AGPL workspace crate.
+// ---------------------------------------------------------------------------
+
+/// The license expression the permissive workspace crates declare.
+const PERMISSIVE_LICENSE: &str = "MIT OR Apache-2.0";
+
+/// The permissive members the docs name. The rule below derives its set from
+/// the manifests; this list only keeps that derivation from passing on an
+/// empty set.
+const DOCUMENTED_PERMISSIVE_MEMBERS: &[&str] = &[
+    "cerulion-wire",
+    "cerulion_link",
+    "cerulion_ops_proto",
+    "cerulion_pairing",
+];
+
+/// Names of the workspace members whose license is anything but
+/// [`PERMISSIVE_LICENSE`] (AGPL-3.0-only, or none declared).
+fn non_permissive_member_names() -> &'static BTreeSet<String> {
+    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let meta = metadata();
+        let g = Graph::new(meta);
+        meta.workspace_members
+            .iter()
+            .map(|id| g.by_id[id.as_str()])
+            .filter(|p| p.license.as_deref() != Some(PERMISSIVE_LICENSE))
+            .map(|p| p.name.clone())
+            .collect()
+    })
+}
+
+fn is_non_permissive_member(name: &str) -> bool {
+    non_permissive_member_names().contains(name)
+}
+
+/// SOURCE SENTENCES. `docs/internals/remote-access.md` section 2: the
+/// permissive crates "never depend on an AGPL crate". README.md: "The
+/// client-side `cerulion_wire`, `cerulion_link`, `cerulion_ops_proto` and
+/// `cerulion_pairing` crates are MIT OR Apache-2.0".
+///
+/// Over normal and build edges, which is what a dependent of the crate
+/// compiles and links; the crate's own dev-dependencies never reach a
+/// dependent.
+#[test]
+fn the_permissive_crates_reach_no_agpl_crate() {
+    let meta = metadata();
+    let g = Graph::new(meta);
+    let permissive: Vec<&str> = meta
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .filter(|id| g.by_id[id].license.as_deref() == Some(PERMISSIVE_LICENSE))
+        .collect();
+    let names: BTreeSet<&str> = permissive.iter().map(|id| g.name(id)).collect();
+    for documented in DOCUMENTED_PERMISSIVE_MEMBERS {
+        assert!(
+            names.contains(documented),
+            "`{documented}` no longer declares license `{PERMISSIVE_LICENSE}` (permissive \
+             members found: {names:?}). The README and remote-access.md section 2 say it does."
+        );
+    }
+    assert!(
+        is_non_permissive_member("cerud") && is_non_permissive_member("cerulion_core"),
+        "the AGPL member set is missing `cerud` or `cerulion_core`, so the predicate below \
+         would accept an AGPL edge"
+    );
+
+    for id in permissive {
+        let paths =
+            g.resolve(&[id], NORMAL_AND_BUILD)
+                .violations(&g, None, is_non_permissive_member);
+        assert!(
+            paths.is_empty(),
+            "`{}` ({PERMISSIVE_LICENSE}) reaches an AGPL workspace crate, so a closed client \
+             linking it links AGPL code.\nPaths:\n  {}",
+            g.name(id),
+            paths.join("\n  "),
+        );
+    }
+
+    // Control: the same checker and predicate DO report the AGPL `cerud`
+    // under an AGPL root that depends on it, as a path from that root.
+    let control = g
+        .resolve(&[g.member("cerulion_remoted")], NORMAL_AND_BUILD)
+        .violations(&g, None, is_non_permissive_member);
+    assert!(
+        control
+            .iter()
+            .any(|p| p.starts_with("cerulion_remoted -> ") && p.ends_with(" -> cerud")),
+        "the checker did not report `cerud` under `cerulion_remoted`, which depends on it: \
+         {control:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

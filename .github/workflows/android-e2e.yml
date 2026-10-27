@@ -34,9 +34,11 @@ on:
       - 'crates/cerud/**'
       - 'crates/native_ros2_messages/**'
       - 'crates/rmw_cerulion/**'
+      - 'crates/test_fixtures/android_e2e_demand_probe/**'
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   pull_request:
@@ -66,9 +68,11 @@ on:
       - 'crates/cerud/**'
       - 'crates/native_ros2_messages/**'
       - 'crates/rmw_cerulion/**'
+      - 'crates/test_fixtures/android_e2e_demand_probe/**'
       - 'examples/basic_timer/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tools/scripts/android_e2e_probe_verdict.sh'
       - 'tools/scripts/android_emulator_e2e.sh'
       - '.github/workflows/android-e2e.yml'
   # A `merge_group` run is treated like a `pull_request` run. The queue's
@@ -168,7 +172,8 @@ jobs:
             target
             !target/android-e2e
             examples/basic_timer/target
-          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
+            crates/cerulion_android/android/runtime/target
+          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock', 'crates/cerulion_android/android/runtime/Cargo.lock') }}
           restore-keys: |
             cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-android-emulator-main-
@@ -205,7 +210,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock', 'crates/cerulion_android/android/runtime/Cargo.lock') }}"
 
       - name: Cache cargo (save)
         if: >-
@@ -222,4 +227,5 @@ jobs:
             target
             !target/android-e2e
             examples/basic_timer/target
-          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock') }}
+            crates/cerulion_android/android/runtime/target
+          key: cargo-android-emulator-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock', 'examples/basic_timer/Cargo.lock', 'crates/cerulion_android/android/runtime/Cargo.lock') }}

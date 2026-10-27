@@ -2,7 +2,7 @@
 //! Pins the tutorial's documented graph YAML against future drift.
 //!
 //! The Getting Started tutorial at
-//! `docs/tutorials/01-getting-started.md` Step 5 documents a complete
+//! `docs/tutorials/01-getting-started.md` Step 4 documents a complete
 //! `obstacle_avoidance.yaml` graph file. Users copy that YAML
 //! verbatim and run it. This test loads the same YAML through
 //! `parse_graph_raw` + `validate_graph` and pins structural
@@ -45,7 +45,7 @@ use cerulion_core::graph::{parse_graph_raw, validate_graph};
 use tracing_test::traced_test;
 
 /// Exact snapshot of `obstacle_avoidance.yaml` from
-/// `docs/tutorials/01-getting-started.md` Step 5. Hand-maintained;
+/// `docs/tutorials/01-getting-started.md` Step 4. Hand-maintained;
 /// do not auto-derive from the markdown (see module doc-comment).
 const TUTORIAL_GRAPH_YAML: &str = r#"prefix: demo
 nodes:
@@ -134,7 +134,7 @@ fn tutorial_yaml_parses_validates_and_matches_oracle() {
     assert_eq!(
         lidar_scan.max_slice_len,
         Some(8192),
-        "tutorial's 8192-byte cap is sized for ~314 rays * 4B + headroom — see Step 5 callout"
+        "the snapshot's 8192-byte cap is sized for ~314 rays * 4B + headroom"
     );
 
     // ---- safety_controller: 1 input, 1 output ----

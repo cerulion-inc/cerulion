@@ -891,13 +891,40 @@ mod tests {
         (held_rx, release_tx)
     }
 
+    /// Wait up to 10 seconds for the `worker` (start or stop) worker to
+    /// reach the test hold. A worker that panics before the hold leaves the
+    /// installed hook, and so its sender, alive: a blocking `recv` would
+    /// then hang the test until the job timeout instead of failing it.
+    fn wait_for_hold(held: &std::sync::mpsc::Receiver<()>, worker: &str) {
+        wait_for_hold_within(held, worker, std::time::Duration::from_secs(10));
+    }
+
+    fn wait_for_hold_within(
+        held: &std::sync::mpsc::Receiver<()>,
+        worker: &str,
+        timeout: std::time::Duration,
+    ) {
+        if let Err(error) = held.recv_timeout(timeout) {
+            panic!("{worker} worker did not reach the hold within {timeout:?}: {error}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "start worker did not reach the hold within")]
+    fn wait_for_hold_fails_when_the_worker_never_reaches_the_hold() {
+        // The installed hook keeps the sender alive, as it does when a
+        // worker panics before it runs the hook.
+        let (_held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        wait_for_hold_within(&held_rx, "start", std::time::Duration::from_millis(50));
+    }
+
     #[test]
     fn running_is_reported_only_after_the_start_path_releases_the_runtime() {
         let host = static_test_host();
         let config = r#"{"publish":[{"topic":"/host_test/window","schema":"std_msgs/String"}]}"#;
         let (held, release) = hold_next_worker(host);
         assert_eq!(host.start(config), codes::OK);
-        held.recv().expect("start worker reaches the hold");
+        wait_for_hold(&held, "start");
 
         // The runtime has recorded Running and the start worker still holds
         // the runtime lock: a publish here is BUSY, so the app must not be
@@ -934,7 +961,7 @@ mod tests {
 
         let (held, release) = hold_next_worker(host);
         assert_eq!(host.stop(), codes::OK);
-        held.recv().expect("stop worker reaches the hold");
+        wait_for_hold(&held, "stop");
         assert_eq!(lock_status(&host.status).state, RuntimeState::Stopped);
         assert_eq!(host.start(config), codes::BUSY);
         assert_eq!(host.observed_status().state, RuntimeState::Stopping);
@@ -953,7 +980,7 @@ mod tests {
         let host = static_test_host();
         let (held, release) = hold_next_worker(host);
         assert_eq!(host.start("{not json"), codes::OK);
-        held.recv().expect("start worker reaches the hold");
+        wait_for_hold(&held, "start");
         assert_eq!(lock_status(&host.status).state, RuntimeState::Failed);
         assert_eq!(host.observed_status().state, RuntimeState::Starting);
 

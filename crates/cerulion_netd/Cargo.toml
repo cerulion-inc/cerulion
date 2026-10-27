@@ -226,6 +226,16 @@ tempfile = "3"
 # that demoting the success `info!` or the every-peer-failed `info!` to `debug!`
 # must FAIL a test, and a level claim can only be pinned by matching the level.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# The unencrypted-QUIC-first e2e opens real zenoh sessions on loopback and reads
+# their link table (`info().links()`, behind `unstable`). Same version and
+# features as cerulion_core's zenoh, so the build graph does not change.
+zenoh = { version = "1.10.1", default-features = false, features = [
+    "transport_tcp",
+    "transport_quic",
+    "transport_quic_datagram",
+    "transport_udp",
+    "unstable",
+] }
 # The desk-side epoch-push e2e writes a REAL cached epoch artifact (a
 # genuinely signed intermediate + access-list epoch — Principle #13, no fabricated
 # blobs), so it needs the same signing primitive cerulion_pairing uses. Dev-only.

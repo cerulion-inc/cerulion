@@ -103,6 +103,20 @@ ENVIRONMENT:
                                  network where mDNS does not cross. Default off: peers come from
                                  one `_cerulion._tcp` browse at boot plus the peer
                                  cache.
+    CERULION_UNENCRYPTED_QUIC=on Listen on unencrypted QUIC (udp/<host>:<port>?rel=1)
+                                 beside every tcp/ LISTEN locator, advertise it on
+                                 mDNS, and dial it first: a discovered peer that
+                                 advertises it, and a CONNECT locator written as
+                                 udp/<host>:<port>?rel=1, are probed over UDP at boot
+                                 and fall back to tcp/ on the same port with one
+                                 warning when QUIC does not answer. Explicit tcp/
+                                 CONNECT locators are used as written. No encryption
+                                 and no peer authentication, the same as tcp/.
+                                 Only the exact value on turns it on.
+    CERULION_NETD_QUIC_PROBE_TIMEOUT_MS
+                                 How long the boot probe waits for a QUIC answer
+                                 before falling back, in ms (default 1000;
+                                 values above 6000 are treated as 6000).
 ";
 
 /// The iroh WAN-plane env docs — appended to [`USAGE`] ONLY in a `--features wan`
@@ -212,7 +226,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // afterwards), browse `_cerulion._tcp` once and fold the answers plus the
     // verified `~/.cerulion/peers.json` cache into the connect endpoints, so a
     // desk dials a LAN robot with NO `CERULION_NETD_CONNECT`. Explicit env
-    // locators stay first and verbatim; discovered rows are TCP-probed so a dead
+    // locators stay first and verbatim (except an unanswered udp/...?rel=1 under
+    // CERULION_UNENCRYPTED_QUIC=on, see `quic_first`); discovered rows are TCP-probed so a dead
     // address cannot buy a background retry connector for the life of the
     // daemon. See `discovery_fold` for the once-at-boot cadence and its residual.
     let (network, peer_fold) = match net::network_config_from_env() {
@@ -711,6 +726,12 @@ mod tests {
         assert!(USAGE.contains(daemon::IDLE_GRACE_ENV));
         // The hard-exit deadline knob is discoverable from --help.
         assert!(USAGE.contains(HARD_EXIT_ENV));
+        assert!(USAGE.contains(&format!(
+            "{}={}",
+            cerulion_discovery::unencrypted_quic::UNENCRYPTED_QUIC_ENV,
+            cerulion_discovery::unencrypted_quic::UNENCRYPTED_QUIC_ON
+        )));
+        assert!(USAGE.contains(cerulion_netd::quic_probe::QUIC_PROBE_TIMEOUT_ENV));
     }
 
     /// `--help` states the SECOND meaning of `CERULION_NETD_LISTEN`.

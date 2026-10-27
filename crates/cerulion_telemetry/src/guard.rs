@@ -35,7 +35,7 @@ pub const MAX_EVENT_NAME_LEN: usize = 64;
 
 /// Property names the client sets on every event; a caller property with one
 /// of these names is dropped so it can never spoof process metadata.
-pub const RESERVED_KEYS: &[&str] = &["surface", "env", "app_version", "channel"];
+pub const RESERVED_KEYS: &[&str] = &["surface", "env", "app_version", "channel", "ci"];
 
 /// Why a property was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

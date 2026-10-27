@@ -287,6 +287,14 @@ pub struct PlaySummary {
     /// can read three orders of magnitude below a run's real overrun. Comparing
     /// this to [`PlaySummary::elapsed`] cannot be reset by anything.
     pub scheduled_span_ns: u64,
+    /// How long the recording SHOULD have taken from its first frame: the
+    /// longest PLAYED channel's cumulative scheduled advance, with no wall term.
+    ///
+    /// Every channel anchors at the run origin, the wall instant the first frame
+    /// was reached, so [`PlaySummary::scheduled_span_ns`] is that origin plus
+    /// this. The origin carries whatever the host spent opening the bag; this
+    /// carries only the recording's own deltas at this `--rate`.
+    pub scheduled_advance_ns: u64,
 }
 
 impl PlaySummary {
@@ -4510,6 +4518,12 @@ pub fn bag_play_with_manager(
         .map(|(_, c)| c.anchor_ns.unwrap_or(0).saturating_add(c.cumulative_ns))
         .max()
         .unwrap_or(0);
+    let scheduled_advance_ns = clocks
+        .iter()
+        .filter(|(ch, _)| played_channels.contains(*ch))
+        .map(|(_, c)| c.cumulative_ns)
+        .max()
+        .unwrap_or(0);
     let summary = PlaySummary {
         topics,
         passes,
@@ -4519,6 +4533,7 @@ pub fn bag_play_with_manager(
         slipped_frames,
         timeline_restarts,
         scheduled_span_ns,
+        scheduled_advance_ns,
         catchup_channels: catchup_channels.len() as u64,
     };
     tracing::info!(
@@ -9340,6 +9355,7 @@ mod tests {
             slipped_frames: 2,
             timeline_restarts: 500,
             scheduled_span_ns: 10_000_000_000,
+            scheduled_advance_ns: 10_000_000_000,
             catchup_channels: 0,
         };
         assert_eq!(summary.wall_overrun_ns(), Some(20_000_000_000));

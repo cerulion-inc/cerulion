@@ -43,12 +43,8 @@ cerulion node stage timer -g basic_timer
 cerulion node stage printer -g basic_timer -I count timer/count
 ```
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-Inside this repository it depends on `cerulion_core` and `native_ros2_messages`
-through the relative paths in `Cargo.toml`, so run it from inside this
-directory. A workspace you create yourself gets the published crates.io
-versions instead.
+This example is a standalone workspace: run its commands from inside this
+directory. See [Build and run from inside the example](../README.md#build-and-run-from-inside-the-example).
 
 ## Run it
 
@@ -70,9 +66,9 @@ cerulion graph run basic_timer --release step:=5
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. The graph declares no `process_groups:`,
-so `graph run` runs one process per node without asking and leaves the graph
-file unchanged; add `--yes` to save that layout in the graph YAML.
+minutes; later builds take seconds. The run derives one process per node
+without changing the graph file; see
+[The process layout on the first run](../README.md#the-process-layout-on-the-first-run).
 
 The run terminal shows the printer firing ten times a second, the count going
 up by the `step` of `2` the graph file sets:
