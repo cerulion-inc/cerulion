@@ -451,11 +451,12 @@ pub const CLOCK_SEQUENCE_GAP_WARNING: &str = "the frames read from `/clock` skip
 /// step after the epoch jumps over them. That is the build's doing, not the
 /// simulator's rate, and it is reported apart from
 /// [`CLOCK_SEQUENCE_GAP_WARNING`], whose count starts at this frame.
-pub const CLOCK_BUILD_WINDOW_LOSS_WARNING: &str = "samples published on `/clock` while the \
-    graph was being built overran the run's clock queue and are lost: the first step after the \
-    epoch jumps over them. Sequence gaps are counted from the first frame read after the \
-    build. If the start must see every sample, start the simulator's clock after the graph \
-    reports it is running on sim time.";
+pub const CLOCK_BUILD_WINDOW_LOSS_WARNING: &str = "the first frame read from `/clock` after \
+    the graph was built skipped numbers in the sequence: samples published during the build \
+    overran the run's clock queue and are lost, so the first step after the epoch jumps over \
+    them (a hint, as with any gap: a publisher can consume a number without sending a frame). \
+    Sequence gaps are counted from this frame. If the start must see every sample, start the \
+    simulator's clock after the graph reports it is running on sim time.";
 
 /// A skip in the wire sequence numbers of two frames the clock tap read in a
 /// row from one publisher, as [`SequenceGapWatch`] names it.
@@ -3028,11 +3029,11 @@ mod tests {
         logs_assert(|lines: &[&str]| {
             let build = lines
                 .iter()
-                .position(|l| l.contains("while the graph was being built"));
+                .position(|l| l.contains("samples published during the build overran"));
             let gap = lines
                 .iter()
                 .position(|l| l.contains("skipped sequence numbers"));
-            let builds = count_lines(lines, "while the graph was being built");
+            let builds = count_lines(lines, "samples published during the build overran");
             let gaps = count_lines(lines, "skipped sequence numbers");
             match (build, gap) {
                 (Some(b), Some(g)) if builds == 1 && gaps == 1 && b < g => Ok(()),
