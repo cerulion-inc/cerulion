@@ -141,3 +141,78 @@ impl TestTeam {
         TeamAuth::new(&key, &leaf, self.anchors(Some(&next))).expect("valid test credentials")
     }
 }
+
+/// The `(header length, content length)` of the DER element at `der[0..]`.
+fn der_header(der: &[u8]) -> (usize, usize) {
+    match der[1] {
+        n @ 0..=0x7f => (2, n as usize),
+        0x81 => (3, der[2] as usize),
+        0x82 => (4, ((der[2] as usize) << 8) | der[3] as usize),
+        other => panic!("unexpected DER length byte {other:#x}"),
+    }
+}
+
+impl TestTeam {
+    /// A leaf whose subject names `role` of generation `as_generation` while
+    /// its issuer is this generation's CA and this CA's key signs it: the
+    /// certificate a holder of this CA key could mint for another generation.
+    /// `as_generation` must print with as many digits as this generation.
+    ///
+    /// # Panics
+    ///
+    /// When the digit counts differ or the issued certificate does not have
+    /// the expected shape.
+    pub fn forged_leaf(&self, as_generation: u32, role: TeamRole, key: &MachineKey) -> Vec<u8> {
+        let claimed = cerulion_pairing::team::ca_common_name(as_generation, &self.team);
+        let actual = cerulion_pairing::team::ca_common_name(self.generation, &self.team);
+        assert_eq!(claimed.len(), actual.len(), "same digit count");
+        let mut der = issue_leaf(
+            &LeafParams {
+                team: self.team.clone(),
+                generation: as_generation,
+                role,
+                device_key: cerulion_pairing::format::PublicKey(key.public_key()),
+                account: None,
+                issued_at_ns: now_ns(),
+            },
+            &self.ca_key,
+        )
+        .expect("issue a leaf");
+        // Certificate = SEQUENCE { tbsCertificate, signatureAlgorithm, signature BIT STRING }.
+        let (outer, _) = der_header(&der);
+        let (tbs_h, tbs_len) = der_header(&der[outer..]);
+        let tbs = outer..outer + tbs_h + tbs_len;
+        let hits: Vec<usize> = der[tbs.clone()]
+            .windows(claimed.len())
+            .enumerate()
+            .filter(|(_, w)| *w == claimed.as_bytes())
+            .map(|(i, _)| i + outer)
+            .collect();
+        assert_eq!(hits.len(), 1, "the issuer name appears once in the TBS");
+        let at = hits[0];
+        der[at..at + actual.len()].copy_from_slice(actual.as_bytes());
+        use ed25519_dalek::Signer as _;
+        let signature = self.ca_key.sign(&der[tbs]).to_bytes();
+        let len = der.len();
+        der[len - 64..].copy_from_slice(&signature);
+        der
+    }
+
+    /// The PEM text of every DER in `ders` under `label`, concatenated and
+    /// base64-encoded the way zenoh's `*_base64` keys take it.
+    pub fn pem_base64(label: &str, ders: &[&[u8]]) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut pem = String::new();
+        for der in ders {
+            let body = b64.encode(der);
+            pem.push_str(&format!("-----BEGIN {label}-----\n"));
+            for chunk in body.as_bytes().chunks(64) {
+                pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+                pem.push('\n');
+            }
+            pem.push_str(&format!("-----END {label}-----\n"));
+        }
+        b64.encode(pem)
+    }
+}

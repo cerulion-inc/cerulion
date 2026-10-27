@@ -12,9 +12,11 @@
 //!   reach the robot, and the robot's reply comes back;
 //! - a machine whose leaf comes from another team's CA never links, while a
 //!   team machine links to the same listener;
-//! - a machine of the previous generation that holds the next CA links to a
-//!   rotated robot and gets the bundle exchange only; one without it never
-//!   links;
+//! - a machine of the previous generation fails the rotated robot's data
+//!   session, and on its bundle session (with the next CA) gets the bundle
+//!   exchange only;
+//! - a leaf a retired CA signed with a current-generation robot name fails the
+//!   data session, while a data session that anchors the retired CA admits it;
 //! - a viewer gateway pulls a robot topic, and a robot gateway that dials an
 //!   operator pulls the operator's topic, through the full demand path;
 //! - a `tcp/`, `udp/...?rel=1` or `#`-config locator fails the open naming
@@ -335,8 +337,28 @@ fn a_machine_of_another_team_never_links() {
     }
 }
 
+fn bundle_manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> NetworkManager {
+    NetworkManager::new(NetworkConfig {
+        listen_endpoints: listen,
+        connect_endpoints: connect,
+        auth: Some(NetworkAuth::TeamBundleLane(auth)),
+        ..NetworkConfig::default()
+    })
+}
+
+fn raw_linked(session: &zenoh::Session, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if session.info().peers_zid().wait().next().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 #[test]
-fn the_previous_generation_gets_the_bundle_exchange_only() {
+fn the_previous_generation_gets_the_bundle_session_only() {
     let g1 = TestTeam::new("acme", 1);
     let g2 = g1.rotated();
     let key = g1.machine_key(2);
@@ -345,16 +367,19 @@ fn the_previous_generation_gets_the_bundle_exchange_only() {
     let holds_next = TeamAuth::new(&key, &leaf, g1.anchors(Some(&next))).expect("g1 credentials");
     let g1_only = TeamAuth::new(&key, &leaf, g1.anchors(None)).expect("g1 credentials");
     for link in LINKS {
-        let (robot, locator) = listen(link, g2.machine(TeamRole::Robot, 1));
-        let rs = robot.session().unwrap();
-        let _bundle = rs
+        let robot_auth = g2.machine(TeamRole::Robot, 1);
+        let (robot, data_locator) = listen(link, robot_auth.clone());
+        let lane_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let lane = bundle_manager(robot_auth, vec![lane_locator.clone()], vec![]);
+        let ls = lane.session().expect("the bundle listener opens");
+        let _bundle = ls
             .declare_queryable("cerulion_auth/bundle")
             .callback(|q| {
                 let _ = q.reply(q.key_expr().clone(), "bundle").wait();
             })
             .wait()
             .unwrap();
-        let _catalog = rs
+        let _catalog = ls
             .declare_queryable("cerulion_q/robot1/catalog")
             .callback(|q| {
                 let _ = q.reply(q.key_expr().clone(), "catalog").wait();
@@ -362,14 +387,25 @@ fn the_previous_generation_gets_the_bundle_exchange_only() {
             .wait()
             .unwrap();
 
-        let stale = manager(g1_only.clone(), vec![], vec![locator.clone()]);
+        let old_data = manager(holds_next.clone(), vec![], vec![data_locator]);
         assert!(
-            !linked(&stale, Duration::from_secs(3)),
-            "{link}: a g1 machine without the next CA refuses the g2 leaf"
+            !linked(&old_data, Duration::from_secs(3)),
+            "{link}: the robot's data session does not trust the retired g1 CA"
+        );
+        let err = bundle_manager(g1_only.clone(), vec![], vec![lane_locator.clone()])
+            .session()
+            .expect_err("no lane anchors")
+            .to_string();
+        assert!(
+            err.contains("needs a retired or next generation CA"),
+            "{err}"
         );
 
-        let old = manager(holds_next.clone(), vec![], vec![locator]);
-        assert!(linked(&old, Duration::from_secs(10)), "{link}: links");
+        let old = bundle_manager(holds_next.clone(), vec![], vec![lane_locator]);
+        assert!(
+            linked(&old, Duration::from_secs(10)),
+            "{link}: the bundle session links"
+        );
         let os = old.session().unwrap();
         let replies = |key: &str| {
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -393,13 +429,144 @@ fn the_previous_generation_gets_the_bundle_exchange_only() {
         assert_eq!(
             replies("cerulion_q/robot1/catalog"),
             0,
-            "{link}: a catalog query is not"
+            "{link}: a catalog query is not, even on the robot's bundle session"
         );
         assert_eq!(
-            deliver(&robot, &old, "/team/telemetry", Duration::from_secs(3)),
+            deliver(&lane, &old, "/team/telemetry", Duration::from_secs(3)),
             0,
-            "{link}: no frames reach the previous generation"
+            "{link}: no frames cross the bundle session"
         );
+        drop(robot);
+    }
+}
+
+/// A zenoh session holding `auth`'s key with `leaf_der` presented in place
+/// of its own leaf and its own policy off, dialing `locator`.
+fn forged_dialer(auth: TeamAuth, leaf_der: &[u8], locator: &str) -> zenoh::Session {
+    forged_session(auth, leaf_der, vec![], vec![locator.to_string()])
+}
+
+/// [`forged_dialer`] with any listen and connect locators.
+fn forged_session(
+    auth: TeamAuth,
+    leaf_der: &[u8],
+    listen: Vec<String>,
+    connect: Vec<String>,
+) -> zenoh::Session {
+    let m = manager(auth, listen, connect);
+    let mut config = m.zenoh_config_for_test().expect("config builds");
+    let leaf = format!("\"{}\"", TestTeam::pem_base64("CERTIFICATE", &[leaf_der]));
+    for k in ["listen_certificate_base64", "connect_certificate_base64"] {
+        config
+            .insert_json5(&format!("transport/link/tls/{k}"), &leaf)
+            .unwrap();
+    }
+    config
+        .insert_json5("access_control/enabled", "false")
+        .unwrap();
+    zenoh::open(config).wait().expect("forged dialer opens")
+}
+
+/// Count frames `from` puts that reach a subscriber on `to` within `budget`.
+fn raw_deliver(from: &zenoh::Session, to: &zenoh::Session, budget: Duration) -> usize {
+    let key = NetworkManager::data_key("/team/cmd_vel");
+    let (tx, rx) = mpsc::channel();
+    let _sub = to
+        .declare_subscriber(key.clone())
+        .callback(move |_| {
+            let _ = tx.send(());
+        })
+        .wait()
+        .unwrap();
+    let deadline = Instant::now() + budget;
+    let mut got = 0;
+    while Instant::now() < deadline && got == 0 {
+        from.put(key.clone(), frame(0)).wait().unwrap();
+        while rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+            got += 1;
+        }
+    }
+    got
+}
+
+#[test]
+fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
+    let g1 = TestTeam::new("acme", 1);
+    let g2 = g1.rotated();
+    // The holder of the retired g1 CA key mints a leaf naming the current
+    // generation's robot role, over a key of its own.
+    let attacker_key = g2.machine_key(7);
+    let forged = g1.forged_leaf(2, TeamRole::Robot, &attacker_key);
+    for link in LINKS {
+        let robot_auth = g2.machine(TeamRole::Robot, 1);
+        let (robot, locator) = listen(link, robot_auth.clone());
+        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &locator);
+        assert!(
+            !raw_linked(&attacker, Duration::from_secs(3)),
+            "{link}: the data session refuses a leaf a retired CA signed"
+        );
+        assert_eq!(
+            raw_deliver(&attacker, robot.session().unwrap(), Duration::from_secs(2)),
+            0,
+            "{link}"
+        );
+
+        // Control: the same robot session with the retired CA added back to
+        // its anchors admits the forged leaf as a robot, and its put arrives.
+        let exposed_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let m = manager(robot_auth, vec![exposed_locator.clone()], vec![]);
+        let mut config = m.zenoh_config_for_test().unwrap();
+        let roots = format!(
+            "\"{}\"",
+            TestTeam::pem_base64(
+                "CERTIFICATE",
+                &[g2.ca_der(), &g2.next_ca_der(), g1.ca_der()]
+            )
+        );
+        config
+            .insert_json5("transport/link/tls/root_ca_certificate_base64", &roots)
+            .unwrap();
+        let exposed = zenoh::open(config).wait().expect("exposed robot opens");
+        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &exposed_locator);
+        assert!(
+            raw_linked(&attacker, Duration::from_secs(10)),
+            "{link}: with the retired CA as an anchor the forged leaf links"
+        );
+        assert!(
+            raw_deliver(&attacker, &exposed, Duration::from_secs(10)) > 0,
+            "{link}: and its puts reach the robot as a robot's"
+        );
+
+        // The other direction: a forged listener that a robot's data session
+        // dials is refused by the dialer's anchors, and accepted by a dialer
+        // whose anchors include the retired CA.
+        let forged_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let forged_listener = forged_session(
+            g2.machine(TeamRole::Viewer, 7),
+            &forged,
+            vec![forged_locator.clone()],
+            vec![],
+        );
+        let dialer = manager(
+            g2.machine(TeamRole::Robot, 1),
+            vec![],
+            vec![forged_locator.clone()],
+        );
+        assert!(
+            !linked(&dialer, Duration::from_secs(3)),
+            "{link}: a robot's data session refuses a listener a retired CA signed"
+        );
+        let m = manager(g2.machine(TeamRole::Robot, 1), vec![], vec![forged_locator]);
+        let mut config = m.zenoh_config_for_test().unwrap();
+        config
+            .insert_json5("transport/link/tls/root_ca_certificate_base64", &roots)
+            .unwrap();
+        let exposed_dialer = zenoh::open(config).wait().expect("exposed dialer opens");
+        assert!(
+            raw_linked(&exposed_dialer, Duration::from_secs(10)),
+            "{link}: a dialer anchoring the retired CA accepts it"
+        );
+        drop(forged_listener);
     }
 }
 

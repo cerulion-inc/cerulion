@@ -45,7 +45,7 @@ use super::gateway::is_reserved_topic;
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
 use super::run_registry;
-use super::team_auth::NetworkAuth;
+use super::team_auth::{NetworkAuth, TeamSession};
 use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
 use crate::wire::{WireHeader, WIRE_HEADER_VERSION};
@@ -261,9 +261,12 @@ pub struct NetworkConfig {
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
     /// How the session authenticates its links. `Some(NetworkAuth::Team)` opens
-    /// a mutually authenticated team session on `quic/` and `tls/` locators
-    /// only (see [`crate::transport::team_auth`]); it cannot be combined with
-    /// [`Self::tls`]. `None` (the default) sets no authentication of its own.
+    /// a mutually authenticated team data session, and
+    /// `Some(NetworkAuth::TeamBundleLane)` the bundle session, a separate
+    /// session admitting only the bundle exchange; both use `quic/` and
+    /// `tls/` locators only (see [`crate::transport::team_auth`]) and cannot
+    /// be combined with [`Self::tls`]. `None` (the default) sets no
+    /// authentication of its own.
     pub auth: Option<NetworkAuth>,
     /// Per-topic egress put policy. A topic listed with
     /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
@@ -5943,7 +5946,7 @@ impl NetworkManager {
             .map_err(|e| map_err("listen/endpoints", e))?;
 
         match (&self.config.auth, &self.config.tls) {
-            (Some(NetworkAuth::Team(_)), Some(_)) => {
+            (Some(NetworkAuth::Team(_) | NetworkAuth::TeamBundleLane(_)), Some(_)) => {
                 return Err(TransportError::SessionCreation {
                     reason: "a team session takes its certificates from the team credentials, \
                              and certificate files are set as well; remove the graph tls: block \
@@ -5955,6 +5958,13 @@ impl NetworkManager {
                 &mut config,
                 &self.config.listen_endpoints,
                 &self.config.connect_endpoints,
+                TeamSession::Data,
+            )?,
+            (Some(NetworkAuth::TeamBundleLane(team)), None) => team.apply(
+                &mut config,
+                &self.config.listen_endpoints,
+                &self.config.connect_endpoints,
+                TeamSession::BundleLane,
             )?,
             (None, Some(tls)) => apply_tls(&mut config, tls)?,
             (None, None) => {}
