@@ -13,7 +13,7 @@
 //! netd learns them. At daemon start, before `TransportManager::init`,
 //! [`fold_discovered_peers`] builds the connect set from, in order:
 //!
-//! 1. [`crate::net::CONNECT_ENV`] — explicit, first, and VERBATIM (see below;
+//! 1. [`crate::net::CONNECT_ENV`], explicit, first and VERBATIM (see below;
 //!    the one exception is `CERULION_UNENCRYPTED_QUIC=on`, under which an
 //!    explicit `udp/<host>:<port>?rel=1` that does not answer the QUIC probe is
 //!    dialled as `tcp/<host>:<port>`, see [`crate::quic_first`]).

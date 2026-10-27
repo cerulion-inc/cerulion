@@ -110,7 +110,7 @@ const NETD_BIN_NAME: &str = "cerulion-netd";
 /// means two consecutive wedged spawns, which is a genuinely broken install worth
 /// waiting to diagnose precisely — but it is the number to hold when tuning this
 /// ceiling, and any caller-side deadline must budget for it.
-const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a first-use readiness wait may stay silent on the QUIET verbs
 /// before it is reported as a stall.

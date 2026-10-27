@@ -40,6 +40,12 @@
 //! per peer per netd start, with every peer probed in parallel. Raise it with
 //! [`QUIC_PROBE_TIMEOUT_ENV`] only for a path whose measured round trip is above
 //! about 300 ms.
+//!
+//! A larger value is clamped to [`MAX_QUIC_PROBE_TIMEOUT`] (8000 ms) with one
+//! warning. The probe runs before netd binds its control socket, and a client
+//! that starts netd waits 10 s for that socket; 8000 ms plus the boot browse, the
+//! TCP probe round and both collectors' slack stays inside that wait (a
+//! compile-time assertion below holds the sum).
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -51,6 +57,22 @@ pub const QUIC_PROBE_TIMEOUT_ENV: &str = "CERULION_NETD_QUIC_PROBE_TIMEOUT_MS";
 /// How long a probe waits for a QUIC answer before the fold falls back. See the
 /// module docs for why it is 1000 ms.
 pub const DEFAULT_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// The largest probe bound [`resolve_quic_probe_timeout`] returns. See the
+/// module docs for why it is 8000 ms.
+pub const MAX_QUIC_PROBE_TIMEOUT: Duration = Duration::from_millis(8000);
+
+// netd's start-up holds the control socket back for the browse, the TCP probe
+// round (bound plus its 200 ms collector slack) and this probe round (bound plus
+// COLLECT_SLACK); the sum must fit the wait of a client that started netd.
+const _: () = assert!(
+    crate::discovery_fold::MDNS_FOLD_BUDGET.as_millis()
+        + cerulion_discovery::ladder::LADDER_PROBE_TIMEOUT.as_millis()
+        + 200
+        + MAX_QUIC_PROBE_TIMEOUT.as_millis()
+        + COLLECT_SLACK.as_millis()
+        < crate::client::SPAWN_READY_TIMEOUT.as_millis()
+);
 
 /// How often an unanswered probe is resent inside the bound (`kInitialRtt`).
 pub const QUIC_PROBE_RESEND: Duration = Duration::from_millis(333);
@@ -104,14 +126,26 @@ impl std::fmt::Display for QuicProbeOutcome {
 }
 
 /// The probe bound from a [`QUIC_PROBE_TIMEOUT_ENV`] value: a positive integer
-/// in milliseconds, else [`DEFAULT_QUIC_PROBE_TIMEOUT`] (an unparseable or zero
-/// value also logs one `warn!` naming it).
+/// in milliseconds, clamped to [`MAX_QUIC_PROBE_TIMEOUT`], else
+/// [`DEFAULT_QUIC_PROBE_TIMEOUT`]. An unparseable, zero or clamped value logs one
+/// `warn!` naming it.
 pub fn resolve_quic_probe_timeout(value: Option<&str>) -> Duration {
     let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return DEFAULT_QUIC_PROBE_TIMEOUT;
     };
     match raw.parse::<u64>() {
-        Ok(ms) if ms > 0 => Duration::from_millis(ms),
+        Ok(ms) if ms > 0 && Duration::from_millis(ms) <= MAX_QUIC_PROBE_TIMEOUT => {
+            Duration::from_millis(ms)
+        }
+        Ok(ms) if ms > 0 => {
+            tracing::warn!(
+                value = raw,
+                max_ms = MAX_QUIC_PROBE_TIMEOUT.as_millis() as u64,
+                "cerulion-netd: {QUIC_PROBE_TIMEOUT_ENV} is above the largest probe bound; \
+                 using the largest"
+            );
+            MAX_QUIC_PROBE_TIMEOUT
+        }
         _ => {
             tracing::warn!(
                 value = raw,
@@ -186,7 +220,8 @@ fn random_cid(salt: u64) -> [u8; PROBE_CID_LEN] {
     h.finish().to_be_bytes()
 }
 
-/// Probe one UDP address for a QUIC endpoint, waiting at most `timeout`.
+/// Probe one UDP address for a QUIC endpoint, waiting at most `timeout` clamped
+/// to [`MAX_QUIC_PROBE_TIMEOUT`].
 pub fn probe_quic(addr: SocketAddr, timeout: Duration) -> QuicProbeOutcome {
     let bind: SocketAddr = if addr.is_ipv4() {
         ([0, 0, 0, 0], 0).into()
@@ -200,12 +235,16 @@ pub fn probe_quic(addr: SocketAddr, timeout: Duration) -> QuicProbeOutcome {
     let dcid = random_cid(1);
     let scid = random_cid(2);
     let packet = probe_datagram(dcid, scid);
+    let timeout = timeout.min(MAX_QUIC_PROBE_TIMEOUT);
     let start = Instant::now();
+    // `timeout` is at most MAX_QUIC_PROBE_TIMEOUT, so neither add can fail; the
+    // fallbacks keep the loop finite if one did.
+    let deadline = start.checked_add(timeout).unwrap_or(start);
     let mut next_send = start;
     let mut buf = [0u8; 1500];
     loop {
         let now = Instant::now();
-        if now >= start + timeout {
+        if now >= deadline {
             return QuicProbeOutcome::NoAnswer { after: timeout };
         }
         if now >= next_send {
@@ -216,9 +255,9 @@ pub fn probe_quic(addr: SocketAddr, timeout: Duration) -> QuicProbeOutcome {
                 }
                 Err(e) => return QuicProbeOutcome::Failed(format!("send failed: {e}")),
             }
-            next_send = now + QUIC_PROBE_RESEND;
+            next_send = now.checked_add(QUIC_PROBE_RESEND).unwrap_or(deadline);
         }
-        let wait = (start + timeout)
+        let wait = deadline
             .min(next_send)
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
@@ -262,8 +301,8 @@ fn udp_locator_addr(locator: &str) -> Result<SocketAddr, String> {
 /// the probe threads to report.
 pub const COLLECT_SLACK: Duration = Duration::from_millis(200);
 
-/// Probe every `udp/` locator in parallel, each bounded by `timeout`, and
-/// return within `timeout` plus [`COLLECT_SLACK`] whatever the resolver or the
+/// Probe every `udp/` locator in parallel, each bounded by `timeout` clamped to
+/// [`MAX_QUIC_PROBE_TIMEOUT`], and return within that bound plus [`COLLECT_SLACK`] whatever the resolver or the
 /// network does. Every input locator has an entry in the result; one whose
 /// probe thread could not start, or had not reported by then (a hostname whose
 /// lookup stalls), is [`QuicProbeOutcome::Failed`]. Such a thread is detached
@@ -298,7 +337,9 @@ pub fn probe_quic_locators(
         }
     }
     drop(tx);
-    let deadline = Instant::now() + timeout + COLLECT_SLACK;
+    let timeout = timeout.min(MAX_QUIC_PROBE_TIMEOUT);
+    let now = Instant::now();
+    let deadline = now.checked_add(timeout + COLLECT_SLACK).unwrap_or(now);
     while pending > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
@@ -381,7 +422,19 @@ mod tests {
             resolve_quic_probe_timeout(Some("2500")),
             Duration::from_millis(2500)
         );
-        for bad in ["0", "-5", "1.5", "1s", "lots"] {
+        assert_eq!(
+            resolve_quic_probe_timeout(Some("8000")),
+            MAX_QUIC_PROBE_TIMEOUT
+        );
+        // Above the cap, up to u64::MAX: the cap.
+        for big in ["8001", "60000", "18446744073709551615"] {
+            assert_eq!(
+                resolve_quic_probe_timeout(Some(big)),
+                MAX_QUIC_PROBE_TIMEOUT,
+                "{big}"
+            );
+        }
+        for bad in ["0", "-5", "1.5", "1s", "lots", "18446744073709551616"] {
             assert_eq!(
                 resolve_quic_probe_timeout(Some(bad)),
                 DEFAULT_QUIC_PROBE_TIMEOUT,
@@ -392,6 +445,23 @@ mod tests {
         assert_eq!(QUIC_PROBE_RESEND.as_millis(), 333);
         let first_pto_ms = 333.0_f64 + 4.0 * 166.5;
         assert!((DEFAULT_QUIC_PROBE_TIMEOUT.as_millis() as f64 - first_pto_ms).abs() <= 1.0);
+    }
+
+    #[test]
+    fn an_oversized_bound_does_not_overflow_the_deadline() {
+        // A closed loopback port: answered at once, whatever the bound.
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("bind")
+            .port();
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        // Before the clamp, `Duration::MAX` overflowed the deadline and panicked.
+        assert_eq!(probe_quic(addr, Duration::MAX), QuicProbeOutcome::Refused);
+        let out = probe_quic_locators(&[format!("udp/127.0.0.1:{port}?rel=1")], Duration::MAX);
+        assert_eq!(
+            out.get(&format!("udp/127.0.0.1:{port}?rel=1")),
+            Some(&QuicProbeOutcome::Refused)
+        );
     }
 
     #[test]
