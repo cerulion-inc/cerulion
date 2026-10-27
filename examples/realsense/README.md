@@ -108,12 +108,12 @@ install line for this platform (see "Without the SDK").
 
 ## How this workspace was made
 
-The workspace was scaffolded with these verbs. The node bodies, the relative
-dependency paths in `Cargo.toml`, the `recordings/` line in `.gitignore`, the
-`max_slice_len` on the two image outputs (1 MiB, above the 921600-byte RGB
-frame), the `realsense` feature with its metadata block and the pinned
-`Cargo.lock` were then written by hand. `node create` takes one `-o`; the
-second output was added with `node modify`.
+These verbs scaffold the workspace. `node create` takes one `-o`, so the second
+output is added with `node modify`. No verb writes the rest, so to make it
+yourself you add: the node bodies; the `max_slice_len` on the two image outputs
+in the graph file (see below); the `realsense` feature with its metadata block;
+the relative dependency paths in `Cargo.toml`; the `recordings/` line in
+`.gitignore`; and the pinned `Cargo.lock`.
 
 ```bash
 cerulion workspace create realsense
@@ -126,12 +126,12 @@ cerulion node stage realsense_camera -g realsense
 cerulion node stage nearest_obstacle -g realsense -I depth realsense_camera/depth
 ```
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-Inside this repository it depends on `cerulion_core` and `native_ros2_messages`
-through the relative paths in `Cargo.toml`, so run it from inside this
-directory. A workspace you create yourself gets the published crates.io
-versions instead.
+`graphs/realsense.yaml` sets `max_slice_len: 1048576` (1 MiB) on the `color`
+and `depth` outputs. That sizes each output's shared-memory slot above the
+largest frame it publishes: the 921600-byte RGB frame (640 x 480 x 3).
+
+This example is a standalone workspace: run its commands from inside this
+directory. See [Build and run from inside the example](../README.md#build-and-run-from-inside-the-example).
 
 ## Run it
 
@@ -150,9 +150,9 @@ cerulion graph run realsense --release --record
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+minutes; later builds take seconds. The run derives one process per node
+without changing the graph file; see
+[The process layout on the first run](../README.md#the-process-layout-on-the-first-run).
 
 The run terminal logs the camera starting and, once a second, both nodes:
 

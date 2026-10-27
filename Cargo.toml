@@ -77,6 +77,9 @@ members = [
     # Period cdylib with a plain non-trigger input, for
     # the serial-routing-of-a-real-cdylib-under-parallel-fire pin.
     "crates/test_fixtures/test_node_macro_period_input_cdylib",
+    # Library-only relay node (no cdylib target, no FFI exports): an app
+    # library links it as a plain dependency and runs it from the node registry.
+    "crates/test_fixtures/test_node_macro_relay_rlib",
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
@@ -206,6 +209,10 @@ members = [
     # so the e2e can prove the hook's won-malloc detection reports status_won=0
     # for the foreign-allocator case (the handshake-gate degrade).
     "crates/test_fixtures/heaphook_shim",
+    # The Android emulator e2e's direct data demand probe: an ingress-only
+    # gateway that demands one topic without reading a catalog first, so the
+    # e2e can show a paired app refuses a LAN data demand and sends no frame.
+    "crates/test_fixtures/android_e2e_demand_probe",
     # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
     #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
@@ -233,6 +240,10 @@ members = [
     #    Build it via `cargo build -p cerulion_link` or `--workspace`.
     "crates/cerulion_wire", # permissive standalone wire-format decode seam (no cerulion_core dep)
     "crates/cerulion_link", # thin iroh dial-by-key QUIC wrapper (pulls iroh; NOT in default-members)
+    #  • `cerulion_ops_proto` is the `cerulion/ops/1` wire types and protocol
+    #    client (serde + serde_json + thiserror); `cerud` depends on it and
+    #    re-exports or wraps each item. Lean, so it goes in default-members.
+    "crates/cerulion_ops_proto",
     # The robot-level remote-plane daemon (AGPL). Owns the ONE
     # iroh endpoint and multiplexes the wire+ops ALPNs, gating every accept via a
     # deny-by-default PairingAuthorizer. Links cerulion_link (→ iroh) + cerud +
@@ -353,6 +364,9 @@ default-members = [
     # The tiny permissive wire decoder is lean (thiserror only), so it
     # IS in the default set. `cerulion_link` is NOT — it pulls the iroh tree.
     "crates/cerulion_wire",
+    # The permissive ops wire types (serde + serde_json + thiserror), a
+    # dependency of the default member `cerud`.
+    "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
     # The RCP daemon adds only rmcp, sse-stream and a second base64 to the
@@ -599,9 +613,12 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0
 # on any `rerun` feature change.
 re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
 
-# A FORK of iceoryx2 0.10.0 removing the process umask from
-# `UnixDatagramSocket::bind` (iceoryx2-bb-posix) and fixing the macOS shm
-# descriptor table (iceoryx2-pal-posix, below).
+# A FORK of iceoryx2 0.10.0 with three fixes: it removes the process umask from
+# `UnixDatagramSocket::bind` (iceoryx2-bb-posix), fixes the macOS shm descriptor
+# table (iceoryx2-pal-posix, below) and initializes the node counter of the
+# global management segment (iceoryx2, below). It also adds Android support
+# (below). The revision is held by the tag
+# `cerulion-pin-282f479b` on the fork, so it does not depend on a branch.
 #
 # `bind` installed a process global umask of `!permission` for the duration of
 # the bind and restored it on scope exit. The umask is per PROCESS, so while one
@@ -645,20 +662,23 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # started from whatever bytes the newly created segment held. The fork writes
 # the default state, a zero counter, when it creates the segment.
 #
+# The same revision also adds Android support: filesystem paths, file-backed
+# named shared memory with private-directory checks, abstract-namespace Unix
+# datagram sockets and POSIX timers for the watchdog.
+#
 # SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
 # follow our published crates, so anyone depending on a released `cerulion_core`
 # resolves the unpatched upstream until the fixes merge there. Node cdylibs
 # built outside this workspace keep the released copy; the host's fixed copy
 # recovers on its own.
 #
-# EXIT CONDITION: drop this entry when an iceoryx2 release carries all three
-# fixes.
+# EXIT CONDITION: drop this entry when an iceoryx2 release carries every change
+# this fork revision adds: the three fixes and the Android support above.
+#
 # THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
 # build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
 # crates.io members keep theirs, and the same types then exist twice. Every
 # member the graph carries is listed so exactly one copy of each is resolved.
-# This pin also provides Android filesystem paths, file-backed named shared
-# memory with private-directory checks, and abstract-namespace Unix datagram sockets.
 iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
 iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
 iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }

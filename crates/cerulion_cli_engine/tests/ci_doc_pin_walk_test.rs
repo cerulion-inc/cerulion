@@ -327,6 +327,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     // The user-facing reference page.
     ("cerulion_hygiene", "user_api_doc_test", &["docs"], &[]),
+    // The networking page's worked example of the netd banner.
+    (
+        "cerulion_netd",
+        "networking_doc_banner_test",
+        &["docs"],
+        &[],
+    ),
     // The robot example workspace: its lockfile and member manifests, read for
     // a telemetry edge no robot crate may carry.
     (
@@ -1305,14 +1312,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 75 where the root manifest's `members` array lists 74: the extra one is the
+/// 78 where the root manifest's `members` array lists 77: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 75;
+const WORKSPACE_MEMBER_COUNT: usize = 78;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.

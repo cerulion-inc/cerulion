@@ -500,9 +500,10 @@ pub enum Commands {
     /// Show or change usage telemetry consent.
     ///
     /// Release builds send coarse, content-free usage events (which verb ran,
-    /// its exit code and a duration bucket; never arguments, paths or data).
-    /// `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` also turn it off. Builds
-    /// without a telemetry key send nothing. See `docs/telemetry.md`.
+    /// how it ended, coarse durations and counts; never arguments, paths or
+    /// data). `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` (or `false`, `off`,
+    /// `no`) also turn it off. Builds without a telemetry key send nothing.
+    /// See `docs/telemetry.md`.
     Telemetry {
         #[command(subcommand)]
         action: TelemetryAction,

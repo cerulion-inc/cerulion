@@ -932,6 +932,16 @@ pub struct GetDemandState {
 /// shares one overflow latch, so a hostile or huge network cannot grow it.
 const KEYED_LATCHES_CAP: usize = 256;
 
+/// The most distinct replying peers a demander names in its ack peer set;
+/// past it a new peer is counted as an overflow and not stored, so a hostile
+/// or huge network cannot grow the set.
+const ACK_PEERS_CAP: usize = KEYED_LATCHES_CAP;
+
+/// The longest replying peer name (bytes) a demander stores in its ack peer
+/// set. The name is the robot segment of the reply key, which the replier
+/// chooses, so a longer one is counted as overlong and not stored.
+const ACK_PEER_MAX_LEN: usize = super::mirror_registry::MAX_MIRROR_ROBOT_LEN;
+
 /// Flood-suppression latches keyed per (stated version, topic) on the
 /// producer side and per (replying peer, topic) on the demander side, bounded
 /// at [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
@@ -1094,6 +1104,13 @@ pub struct DemandGetState {
     /// cumulative replies acking "refused:wire-header" (the producer runs a
     /// build with a different wire header version).
     wire_header_refused_acks: AtomicU64,
+    /// the replying peers whose acks the three counters above counted, at most
+    /// [`ACK_PEERS_CAP`] names of at most [`ACK_PEER_MAX_LEN`] bytes each.
+    ack_peers: Mutex<BTreeSet<String>>,
+    /// counted acks whose new peer was not stored because the set was full.
+    ack_peer_overflow: AtomicU64,
+    /// counted acks whose peer was not stored because its name was too long.
+    ack_peer_overlong: AtomicU64,
     /// flood suppression for the wire header refusals this demander receives,
     /// one latch per (replying peer, topic), re-armed by a grant from that peer.
     wire_header_latches: Mutex<KeyedLatches<(String, String)>>,
@@ -1166,11 +1183,58 @@ impl DemandGetState {
         self.wire_header_refused_acks.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): counted acks from a new peer that was
+    /// not stored because the peer set held its cap of 256 names. Not 0
+    /// means [`Self::ack_peers`] is incomplete.
+    pub fn ack_peer_overflow_count(&self) -> u64 {
+        self.ack_peer_overflow.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): counted acks whose peer name was
+    /// longer than 256 bytes, so it was not stored. Not 0
+    /// means [`Self::ack_peers`] is incomplete.
+    pub fn ack_peer_overlong_count(&self) -> u64 {
+        self.ack_peer_overlong.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): the replying robots whose acks the
+    /// ack counters counted, SORTED. An ack this build does not know names no
+    /// peer, as it is in no counter. A peer past the cap or over the length
+    /// limit is not named: see [`Self::ack_peer_overflow_count`] and
+    /// [`Self::ack_peer_overlong_count`].
+    pub fn ack_peers(&self) -> Vec<String> {
+        self.ack_peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Tally one demand ack from `peer` (the replying robot). A grant re-arms
     /// that peer's wire header latch for the topic; a wire header refusal is
     /// counted and loud on the first of a run per (peer, topic).
     // hot-path-alloc-ok-fn: cold, one ack per demand GET reply on the control plane.
     fn record_ack(&self, peer: &str, topic: &str, ack: &[u8]) {
+        if ack == ACK_ENABLED
+            || ack == ACK_REFUSED
+            || ack == ACK_REFUSED_WIRE_HEADER
+            || ack == LEGACY_ACK_ENABLED
+        {
+            let mut peers = self
+                .ack_peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if peer.len() > ACK_PEER_MAX_LEN {
+                self.ack_peer_overlong.fetch_add(1, Ordering::Relaxed);
+            } else if !peers.contains(peer) {
+                if peers.len() < ACK_PEERS_CAP {
+                    peers.insert(peer.to_string());
+                } else {
+                    self.ack_peer_overflow.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         let key = (peer.to_string(), topic.to_string());
         let mut latches = self
             .wire_header_latches
@@ -3685,6 +3749,27 @@ impl NetworkManager {
     /// Once this call returns with [`LanAccess::Paired`], no gateway forwarding
     /// pass forwards another frame until access reopens: closing waits out every
     /// pass that started before it (after every lock here is released).
+    ///
+    /// The posture gates ingress (LAN to local) too. Switching to
+    /// [`LanAccess::Paired`] suspends every live ingress entry (see
+    /// [`Self::register_ingress`]): it undeclares the entry's zenoh data
+    /// subscriber and demand token and keeps its injector and counters. It then
+    /// waits out every receive callback that already passed its posture check
+    /// (each holds the ingress gate through re-injection), after every lock here
+    /// is released. So once it returns, no frame from the zenoh LAN plane is
+    /// re-injected into local iceoryx2 until access reopens. A receive callback
+    /// that checks the posture after the switch, including one still in flight
+    /// when this call returns, refuses its frame and counts it in
+    /// [`IngressStats::lan_refused_drops`]. An entry registered while paired
+    /// declares neither handle. Reopening declares both handles again for every
+    /// suspended entry; a failed declaration logs a warning and the next open
+    /// retries it.
+    ///
+    /// On the ingress side, two paths do not consult this posture. The demand
+    /// GET loop ([`Self::start_demand_get_loop`]) keeps sending GETs while
+    /// paired, and each GET's selector names one ingress topic it demands.
+    /// [`IngressInjector::reinject_raw`] re-injects for any caller that holds an
+    /// injector, the remote plane among them.
     pub fn set_lan_access(&self, access: LanAccess) {
         self.apply_lan_access(access);
     }
@@ -6115,6 +6200,47 @@ mod tests {
         assert!(!bridges.is_lan_closed().unwrap());
     }
 
+    /// Closing LAN access waits out a receive callback that passed its posture
+    /// check: once the paired flag is stored (so a callback that checks it now
+    /// refuses its frame), the switch must NOT return while a callback holds
+    /// the ingress gate's shared guard, and it must return once that drops.
+    #[test]
+    fn paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate() {
+        let manager = NetworkManager::new(NetworkConfig::default());
+        manager.set_lan_access(LanAccess::Open);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            // The held shared guard stands in for a callback mid re-injection.
+            // It is a local of the scope closure, so a failed assert below
+            // drops it while unwinding: the blocked switch then finishes, the
+            // scope joins it, and the test fails instead of hanging.
+            let callback = manager
+                .ingress_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scope.spawn(|| {
+                manager.set_lan_access(LanAccess::Paired);
+                tx.send(()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !manager.lan_paired.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the switch must store the paired flag before it waits"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "the switch must wait while a callback holds the ingress gate"
+            );
+            drop(callback);
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the switch must return once the in-flight callback finishes");
+        });
+    }
+
     #[test]
     fn attach_under_paired_closes_the_bridges() {
         let manager = NetworkManager::new(NetworkConfig::default());
@@ -7165,6 +7291,60 @@ mod tests {
                 n => Err(format!("expected 1 loud refusal, got {n}")),
             }
         });
+    }
+
+    /// The demander names every peer whose ack it counted, once each and
+    /// sorted. An ack it does not count names no peer.
+    #[test]
+    fn the_demander_names_each_peer_whose_ack_it_counted() {
+        let state = DemandGetState::default();
+        assert!(state.ack_peers().is_empty());
+        state.record_ack("go2", "/a", ACK_REFUSED);
+        state.record_ack("alpha", "/a", ACK_ENABLED);
+        state.record_ack("go2", "/b", ACK_REFUSED);
+        state.record_ack("beta", "/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("gamma", "/a", LEGACY_ACK_ENABLED);
+        state.record_ack("newer", "/a", b"something-newer");
+        assert_eq!(
+            state.ack_peers(),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                "go2".to_string(),
+            ]
+        );
+    }
+
+    /// The peer set stops at its cap: each new peer past it is counted as an
+    /// overflow and not named, while a peer already named is re-counted with
+    /// no overflow. A name over the length limit is counted and not named.
+    #[test]
+    fn the_demander_peer_set_is_bounded_in_count_and_name_length() {
+        let state = DemandGetState::default();
+        for i in 0..ACK_PEERS_CAP + 3 {
+            state.record_ack(&format!("robot-{i:04}"), "/a", ACK_REFUSED);
+        }
+        assert_eq!(state.ack_peers().len(), 256);
+        assert_eq!(state.ack_peer_overflow_count(), 3);
+        // robot-0000 is named; robot-0258 is one of the three not stored.
+        assert_eq!(state.ack_peers()[0], "robot-0000");
+        assert!(!state.ack_peers().contains(&"robot-0258".to_string()));
+        state.record_ack("robot-0000", "/a", ACK_ENABLED);
+        assert_eq!(state.ack_peer_overflow_count(), 3);
+        assert_eq!(state.refused_ack_count(), 259);
+        assert_eq!(state.enabled_ack_count(), 1);
+        assert_eq!(state.ack_peer_overlong_count(), 0);
+
+        let fresh = DemandGetState::default();
+        let at_limit = "r".repeat(256);
+        let over_limit = "r".repeat(257);
+        fresh.record_ack(&over_limit, "/a", ACK_REFUSED);
+        fresh.record_ack(&at_limit, "/a", ACK_REFUSED);
+        assert_eq!(fresh.ack_peer_overlong_count(), 1);
+        assert_eq!(fresh.ack_peers(), vec![at_limit]);
+        assert_eq!(fresh.refused_ack_count(), 2);
+        assert_eq!(fresh.ack_peer_overflow_count(), 0);
     }
 
     /// Two producers on one topic each get their own latch: both refusals are

@@ -5,8 +5,8 @@
 # WHY. crates.io lets one account publish a burst of NEW crate names, then
 # one every ten minutes; past that it answers HTTP 429 naming the instant the
 # next slot opens ("Please try again after <RFC 1123 date>"). A first
-# release of this 17-crate workspace hits that after 6 crates, and a plain
-# `cargo publish --workspace` dies there with 11 crates unpublished.
+# release of this 19-crate workspace hits that after 6 crates, and a plain
+# `cargo publish --workspace` dies there with 13 crates unpublished.
 #
 # `cargo publish --workspace` cannot simply be re-run: cargo 1.97 refuses the
 # WHOLE invocation as soon as one selected member already exists at that

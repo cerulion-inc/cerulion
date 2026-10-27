@@ -38,11 +38,8 @@ across a process split. Co-locating both nodes in one `process_groups:` group,
 or running `--single-process`, keeps the edge inside one rank instead. See
 "Scope of the data guarantee" in `docs/multi_process.md`.
 
-This is a standalone workspace: it has its own `[workspace]` `Cargo.toml` and is
-excluded from the repo's root workspace (see the root `Cargo.toml` `exclude`).
-It depends on `cerulion_core` / `native_ros2_messages` via the relative paths in
-`Cargo.toml`, so run it from inside this directory. (In-repo examples use path
-deps; outside the repo, swap them for the published crates.io versions.)
+This example is a standalone workspace: run its commands from inside this
+directory. See [Build and run from inside the example](../README.md#build-and-run-from-inside-the-example).
 
 ## Run it
 
@@ -63,9 +60,9 @@ cerulion graph run obstacle_avoidance --release --record
 ```
 
 The first node build also compiles the Cerulion runtime, so it takes a few
-minutes; later builds take seconds. On the first run, Cerulion proposes one
-process per node and asks `Apply this partition to the graph file? [y/N]`.
-Press **Enter** to use that layout for this run only.
+minutes; later builds take seconds. The run derives one process per node
+without changing the graph file; see
+[The process layout on the first run](../README.md#the-process-layout-on-the-first-run).
 
 In a second terminal, watch the velocity command flow:
 

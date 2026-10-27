@@ -74,6 +74,9 @@ use mp_support::{
 };
 
 use cerulion_cli_engine::graph_cmd::PERMISSIVE_EGRESS_NOTICE;
+use cerulion_cli_engine::tcp_idle_warning::{
+    SLOW_START_AFTER_IDLE_SYSCTL, TCP_SLOW_START_AFTER_IDLE_WARNING,
+};
 use cerulion_netd::daemon::{self, NetdConfig, RunningNetd};
 use cerulion_netd::egress::{EgressError, EgressId, EgressPlane};
 use cerulion_netd::mirror::{MirrorError, MirrorPlane, MirrorRelease};
@@ -613,6 +616,10 @@ fn network_off_suppresses_breadcrumb_netd_and_gateway() {
         !out.contains(NETD_REGISTER_LINE),
         "CERULION_NETWORK=off must fire NO netd-register breadcrumb\ncombined:\n{out}"
     );
+    assert!(
+        !out.contains(TCP_SLOW_START_AFTER_IDLE_WARNING),
+        "CERULION_NETWORK=off has no network link, so no tcp/ idle warning\ncombined:\n{out}"
+    );
 
     send_signal(run_pid, libc::SIGINT);
     let status = guard
@@ -843,4 +850,178 @@ fn record_plus_declared_ingress_is_refused_naming_the_cause() {
         "a REFUSED run must never mutate the graph file"
     );
     assert!(!bak_path.exists(), "no .bak on the refused path");
+}
+
+// ── the tcp/ idle congestion-window warning ───────────────────────────────
+
+/// The env a host whose sysctl is 0 sets to let the firing arms run as
+/// non-firing checks. Without it such a host fails them, so a firing arm can
+/// never pass without having tested the firing path.
+const SYSCTL_OFF_OK_ENV: &str = "CERULION_TEST_TCP_IDLE_SYSCTL_OFF_OK";
+
+/// The test's own read of the sysctl, independent of the CLI's: `true` when
+/// this host restarts idle TCP connections from the initial window (any
+/// nonzero integer, as the kernel reads it). A host without the file reads
+/// `false`.
+fn host_resets_idle_tcp() -> bool {
+    std::fs::read_to_string(SLOW_START_AFTER_IDLE_SYSCTL)
+        .ok()
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .is_some_and(|v| v != 0)
+}
+
+/// The expected count of the warning for a run with tcp/ egress on this host:
+/// one line when the host resets idle TCP. A host where it does not must set
+/// [`SYSCTL_OFF_OK_ENV`], and then expects none.
+fn expected_tcp_warnings() -> usize {
+    if host_resets_idle_tcp() {
+        return 1;
+    }
+    assert!(
+        std::env::var_os(SYSCTL_OFF_OK_ENV).is_some(),
+        "{SLOW_START_AFTER_IDLE_SYSCTL} is 0 or missing on this host, so this arm cannot test \
+         the firing path; set {SYSCTL_OFF_OK_ENV}=1 to run it as a non-firing check"
+    );
+    eprintln!("SKIPPED firing path: {SLOW_START_AFTER_IDLE_SYSCTL} is off on this host");
+    0
+}
+
+/// Run the single-producer graph with `network_block` against an in-process
+/// spy netd until it prints `starting graph (live)` and, when
+/// `expect_gateway_child`, until its per-run gateway child exists; stop it
+/// with SIGINT and return both streams. Egress is set up before the run
+/// starts, so the readiness line orders the check after the warning.
+fn run_until_started(tag: &str, network_block: &str, expect_gateway_child: bool) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    build_single_producer_workspace(tmp.path(), tag, tag, network_block);
+    let port = probe_ephemeral_port();
+    let (sock_dir, sock) = unique_netd_socket(tag);
+    let (netd, spy) = start_spy_netd(&sock);
+    let (mut guard, stdout_path, stderr_path) =
+        spawn_graph_run(tmp.path(), tag, false, port, &sock, &[]);
+    wait_for_merged_line(
+        &stdout_path,
+        &stderr_path,
+        "starting graph (live)",
+        Duration::from_secs(60),
+    );
+    let run_pid = guard.id();
+    if expect_gateway_child {
+        assert!(
+            wait_for_gateway_child(run_pid, Duration::from_secs(15)).is_some(),
+            "a strict block with egress must run a per-run gateway child\ncombined:\n{}",
+            merged(&stdout_path, &stderr_path)
+        );
+    } else {
+        assert!(
+            wait_until(
+                || spy.registers.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(15)
+            ),
+            "the permissive run must register its egress with netd\ncombined:\n{}",
+            merged(&stdout_path, &stderr_path)
+        );
+    }
+    send_signal(run_pid, libc::SIGINT);
+    let status = guard
+        .wait_bounded(Duration::from_secs(60))
+        .expect("run did not exit after SIGINT");
+    let out = merged(&stdout_path, &stderr_path);
+    assert!(
+        status.success(),
+        "clean SIGINT must exit 0, got {status:?}\ncombined:\n{out}"
+    );
+    drop(netd);
+    let _ = std::fs::remove_dir_all(&sock_dir);
+    out
+}
+
+/// The tracing level of every logged line that carries the tcp/ idle text.
+fn idle_line_levels(out: &str) -> Vec<&'static str> {
+    out.lines()
+        .filter(|l| l.contains(TCP_SLOW_START_AFTER_IDLE_WARNING))
+        .map(|l| {
+            if l.contains(" WARN ") {
+                "WARN"
+            } else if l.contains(" INFO ") {
+                "INFO"
+            } else {
+                "OTHER"
+            }
+        })
+        .collect()
+}
+
+/// A strict block for the single-producer graph: `locator` as its only
+/// listener and the ticker's output as egress.
+fn strict_block(tag: &str, locator: &str) -> String {
+    format!("network:\n  mode: peer\n  listen:\n  - {locator}\n  egress:\n  - /{tag}/ticker/cmd\n")
+}
+
+/// The permissive default's egress rides the shared netd session, whose peer
+/// links are tcp/, so a run on a host that resets idle TCP logs the line
+/// exactly once, naming that route, at INFO: every networked run registers
+/// with netd whether or not a remote peer subscribes.
+#[test]
+#[serial]
+fn tcp_idle_warning_fires_once_for_permissive_egress_through_netd() {
+    let out = run_until_started("gwidle", "", false);
+    let expected = expected_tcp_warnings();
+    assert_eq!(
+        out.matches(TCP_SLOW_START_AFTER_IDLE_WARNING).count(),
+        expected,
+        "the tcp/ idle warning must appear {expected} time(s)\ncombined:\n{out}"
+    );
+    if expected == 1 {
+        assert!(
+            out.contains("cerulion-netd"),
+            "the line names the netd route\ncombined:\n{out}"
+        );
+        assert_eq!(
+            idle_line_levels(&out),
+            ["INFO"],
+            "the netd-route line is INFO, never WARN\ncombined:\n{out}"
+        );
+    }
+}
+
+/// A strict block whose gateway child listens on tcp/ warns once and names
+/// the locator.
+#[test]
+#[serial]
+fn tcp_idle_warning_fires_once_for_a_strict_tcp_gateway() {
+    let port = probe_ephemeral_port();
+    let locator = format!("tcp/127.0.0.1:{port}");
+    let out = run_until_started("gwidletcp", &strict_block("gwidletcp", &locator), true);
+    let expected = expected_tcp_warnings();
+    assert_eq!(
+        out.matches(TCP_SLOW_START_AFTER_IDLE_WARNING).count(),
+        expected,
+        "the tcp/ idle warning must appear {expected} time(s)\ncombined:\n{out}"
+    );
+    if expected == 1 {
+        assert!(
+            out.contains(&format!("tcp_locators={locator}")),
+            "the warning names the tcp/ locator\ncombined:\n{out}"
+        );
+        assert_eq!(
+            idle_line_levels(&out),
+            ["WARN"],
+            "the per-run gateway line is a WARN\ncombined:\n{out}"
+        );
+    }
+}
+
+/// A strict block whose gateway child has no tcp/ locator never warns,
+/// whatever the sysctl says.
+#[test]
+#[serial]
+fn tcp_idle_warning_does_not_fire_for_a_gateway_without_a_tcp_locator() {
+    let port = probe_ephemeral_port();
+    let locator = format!("udp/127.0.0.1:{port}?rel=1;mixed_rel=1");
+    let out = run_until_started("gwidleudp", &strict_block("gwidleudp", &locator), true);
+    assert!(
+        !out.contains(TCP_SLOW_START_AFTER_IDLE_WARNING),
+        "a gateway with no tcp/ locator must not warn\ncombined:\n{out}"
+    );
 }

@@ -82,6 +82,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "android_e2e_demand_probe"
+version = "1.0.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,6 +1138,7 @@ name = "cerud"
 version = "1.0.0"
 dependencies = [
  "cerud",
+ "cerulion_ops_proto",
  "clap",
  "hex",
  "libc",
@@ -1251,6 +1260,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test_node_macro_period_cdylib",
+ "test_node_macro_relay_rlib",
  "thiserror 2.0.17",
  "toml",
  "tracing",
@@ -1322,6 +1333,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "tempfile",
+ "toml",
  "tracing",
 ]
 
@@ -1564,6 +1576,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "cerulion_ops_proto"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -9357,6 +9378,14 @@ dependencies = [
 
 [[package]]
 name = "test_node_macro_qos_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_macro_relay_rlib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",

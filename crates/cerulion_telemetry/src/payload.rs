@@ -165,8 +165,14 @@ pub fn event_json(event: &Event, common: &Common) -> serde_json::Value {
             properties.insert(key.into(), json!(value));
         }
     }
+    properties.insert("ci".into(), json!(common.ci));
     match &event.kind {
-        Kind::Capture { props } => insert_props(&mut properties, props),
+        Kind::Capture { props } => {
+            if common.ci {
+                properties.insert("$process_person_profile".into(), json!(false));
+            }
+            insert_props(&mut properties, props);
+        }
         Kind::CaptureAnonymous { props } => {
             properties.insert("$process_person_profile".into(), json!(false));
             insert_props(&mut properties, props);

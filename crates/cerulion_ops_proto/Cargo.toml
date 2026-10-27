@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# `cerulion_ops_proto` is DELIBERATELY permissive-licensed (MIT OR Apache-2.0),
+# overriding the workspace-default AGPL. It holds the `cerulion/ops/1` wire
+# types (framing, handshake, request and response envelopes, the inventory
+# result) and the protocol-only client, so a closed client speaks the ops
+# protocol without linking the AGPL `cerud`. `cerud` depends on this crate:
+# it re-exports the types and constants at their old paths and wraps the
+# functions and the client; the daemon itself stays AGPL.
+[package]
+name = "cerulion_ops_proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "The cerulion/ops/1 wire protocol: length-prefixed JSON frames, version handshake, request and response envelopes, and a blocking ops client (permissive, no cerud dependency)"
+keywords = ["robotics", "protocol", "ops", "cerulion"]
+categories = ["network-programming", "encoding"]
+# Not published to crates.io: it is outside the documented publish set in
+# `docs/PUBLISHING.md`, like `cerulion-wire`.
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# serde + serde_json + thiserror ONLY, and no workspace crate, so a closed
+# client that links this crate links no AGPL code. The envelopes and the
+# inventory result derive Serialize/Deserialize; the payload encoding is JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Compile-time derive for the error enum.
+thiserror = "2"

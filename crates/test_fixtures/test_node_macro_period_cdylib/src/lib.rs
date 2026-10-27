@@ -25,7 +25,7 @@ use cerulion_core::prelude::*;
 use native_ros2_messages::geometry_msgs::Vector3;
 
 #[cerulion_node(period_ms = 50)]
-struct PeriodNode {
+pub struct PeriodNode {
     #[output]
     cmd: Vector3,
     /// Read in `init` from the graph's build-time environment snapshot, so
