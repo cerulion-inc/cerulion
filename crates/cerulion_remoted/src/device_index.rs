@@ -130,11 +130,19 @@ impl DeviceAccountIndex {
         }
     }
 
-    /// Atomically write the index to its backing path (`.tmp` then `rename`),
+    /// Atomically and durably write the index to its backing path,
     /// authenticated with `mac_key` (the SAME firmware secure-storage key the
-    /// trust store uses). Bindings are sorted by device-key hex for a
-    /// deterministic on-disk file.
+    /// trust store uses): write a sibling `.tmp`, fsync it, rename it over the
+    /// index, then fsync the directory. A failure up to and including the rename
+    /// leaves the old index in place and is returned; a failed directory fsync
+    /// after the rename is logged, since the new index is already in place.
+    /// Bindings are sorted by device-key hex for a deterministic on-disk file.
     pub fn save(&self, mac_key: &[u8]) -> Result<(), RemotedError> {
+        self.save_with(mac_key, &mut StdSaveFs)
+    }
+
+    /// [`Self::save`] over an injected [`SaveFs`].
+    fn save_with(&self, mac_key: &[u8], fs: &mut impl SaveFs) -> Result<(), RemotedError> {
         let path = self.path.as_ref().ok_or_else(|| {
             RemotedError::Index("no backing path set for the device index".into())
         })?;
@@ -159,19 +167,14 @@ impl DeviceAccountIndex {
         // module (all carry `path.display()`), so a caller handles one save-failure
         // class and the operator sees which file/op failed rather than a bare
         // context-free `Io`.
-        std::fs::write(&tmp, &framed).map_err(|e| {
-            RemotedError::Index(format!(
-                "{}: writing the device index failed: {e}",
-                tmp.display()
-            ))
-        })?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            RemotedError::Index(format!(
-                "{}: renaming the device index into place failed: {e}",
-                path.display()
-            ))
-        })?;
-        Ok(())
+        replace_durably(fs, &tmp, path, &framed).map_err(|(step, e)| {
+            let (at, op) = match step {
+                SaveStep::Write => (&tmp, "writing the device index"),
+                SaveStep::SyncFile => (&tmp, "syncing the device index"),
+                SaveStep::Rename => (path, "renaming the device index into place"),
+            };
+            RemotedError::Index(format!("{}: {op} failed: {e}", at.display()))
+        })
     }
 
     /// Bind a device key to an account (written at pairing time). A device key
@@ -300,6 +303,111 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+/// The step of [`replace_durably`] that failed, for the error text.
+#[derive(Debug, PartialEq, Eq)]
+enum SaveStep {
+    Write,
+    SyncFile,
+    Rename,
+}
+
+/// The file-system steps [`replace_durably`] runs, one method per step, so a
+/// test can record their order. [`StdSaveFs`] is the production implementation.
+trait SaveFs {
+    /// Create (or truncate) `path` for writing.
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File>;
+    /// Write all of `bytes` to `file`, which was created at `path`.
+    fn write(&mut self, file: &mut std::fs::File, path: &Path, bytes: &[u8])
+        -> std::io::Result<()>;
+    /// Flush `file` (created at `path`) and its metadata to stable storage.
+    fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()>;
+    /// Rename `from` over `to`.
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
+    /// Flush the directory `dir`, so a rename into it is on stable storage.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// [`SaveFs`] over `std::fs`.
+struct StdSaveFs;
+
+impl SaveFs for StdSaveFs {
+    fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::File::create(path)
+    }
+    fn write(
+        &mut self,
+        file: &mut std::fs::File,
+        _path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        std::io::Write::write_all(file, bytes)
+    }
+    fn sync_file(&mut self, file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    /// Unix opens the directory and fsyncs it. Off Unix this is a no-op.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+}
+
+/// Replace `path` with `bytes` so that a power loss at any point leaves either
+/// the old file or all of the new one: write `tmp`, fsync it, rename it over
+/// `path`, then fsync the directory holding `path` (the current directory for a
+/// bare file name). Without the first fsync the rename can reach the disk
+/// before the data does; without the second the rename itself can be lost.
+///
+/// A failure up to and including the rename removes `tmp` and is returned with
+/// the step that failed, with `path` unchanged. The rename is the commit point:
+/// a failed directory fsync after it is logged at `warn` and the replace
+/// returns `Ok`, because the new file is in place and a power loss can only
+/// bring back the old one.
+fn replace_durably(
+    fs: &mut impl SaveFs,
+    tmp: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), (SaveStep, std::io::Error)> {
+    let staged = fs
+        .create(tmp)
+        .map_err(|e| (SaveStep::Write, e))
+        .and_then(|mut file| {
+            fs.write(&mut file, tmp, bytes)
+                .map_err(|e| (SaveStep::Write, e))?;
+            fs.sync_file(&file, tmp)
+                .map_err(|e| (SaveStep::SyncFile, e))
+        });
+    if let Err(failed) =
+        staged.and_then(|()| fs.rename(tmp, path).map_err(|e| (SaveStep::Rename, e)))
+    {
+        let _ = std::fs::remove_file(tmp);
+        return Err(failed);
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    if let Err(e) = fs.sync_dir(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "the device index's directory could not be flushed after the rename"
+        );
+    }
+    Ok(())
 }
 
 /// Decode a 32-byte value from a hex string, erroring loudly on bad hex or the
@@ -472,5 +580,175 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("shorter than"), "err: {err}");
+    }
+
+    /// One recorded [`SaveFs`] step.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Create(PathBuf),
+        Write(PathBuf),
+        SyncFile(PathBuf),
+        Rename(PathBuf, PathBuf),
+        SyncDir(PathBuf),
+    }
+
+    /// Records each step, then performs it through [`StdSaveFs`]; `fail_at`
+    /// makes the step at that index fail instead.
+    #[derive(Default)]
+    struct Recorder {
+        steps: Vec<Step>,
+        fail_at: Option<usize>,
+    }
+
+    impl Recorder {
+        fn note(&mut self, step: Step) -> std::io::Result<()> {
+            self.steps.push(step);
+            if self.fail_at == Some(self.steps.len() - 1) {
+                return Err(std::io::Error::other("injected"));
+            }
+            Ok(())
+        }
+    }
+
+    impl SaveFs for Recorder {
+        fn create(&mut self, path: &Path) -> std::io::Result<std::fs::File> {
+            self.note(Step::Create(path.to_path_buf()))?;
+            StdSaveFs.create(path)
+        }
+        fn write(
+            &mut self,
+            file: &mut std::fs::File,
+            path: &Path,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            self.note(Step::Write(path.to_path_buf()))?;
+            StdSaveFs.write(file, path, bytes)
+        }
+        fn sync_file(&mut self, file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+            self.note(Step::SyncFile(path.to_path_buf()))?;
+            StdSaveFs.sync_file(file, path)
+        }
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.note(Step::Rename(from.to_path_buf(), to.to_path_buf()))?;
+            StdSaveFs.rename(from, to)
+        }
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            self.note(Step::SyncDir(dir.to_path_buf()))?;
+            StdSaveFs.sync_dir(dir)
+        }
+    }
+
+    #[test]
+    fn a_durable_replace_syncs_the_file_before_the_rename_and_the_directory_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-index");
+        let tmp = tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let mut fs = Recorder::default();
+        replace_durably(&mut fs, &tmp, &path, b"new bytes").unwrap();
+        assert_eq!(
+            fs.steps,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp.clone(), path.clone()),
+                Step::SyncDir(dir.path().to_path_buf()),
+            ]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn each_failed_step_is_named_and_stops_the_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-index");
+        let tmp = tmp_path(&path);
+        std::fs::write(&path, b"old").unwrap();
+        let expected = [
+            SaveStep::Write,
+            SaveStep::Write,
+            SaveStep::SyncFile,
+            SaveStep::Rename,
+        ];
+        for (i, want) in expected.into_iter().enumerate() {
+            let mut fs = Recorder {
+                fail_at: Some(i),
+                ..Recorder::default()
+            };
+            let (step, _) = replace_durably(&mut fs, &tmp, &path, b"x").unwrap_err();
+            assert_eq!(step, want, "failure injected at step {i}");
+            assert_eq!(fs.steps.len(), i + 1, "nothing runs after the failed step");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"old",
+                "step {i}: old index kept"
+            );
+            assert!(!tmp.exists(), "step {i}: the tmp is removed");
+        }
+        // The directory sync follows the commit point: its failure is logged and
+        // the new index stands.
+        let mut fs = Recorder {
+            fail_at: Some(4),
+            ..Recorder::default()
+        };
+        replace_durably(&mut fs, &tmp, &path, b"new").unwrap();
+        assert_eq!(fs.steps.len(), 5);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn save_names_the_path_and_the_step_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-index");
+        let tmp = tmp_path(&path);
+        let index = DeviceAccountIndex::new().with_path(&path);
+        let cases = [
+            (
+                1,
+                format!(
+                    "{}: writing the device index failed: injected",
+                    tmp.display()
+                ),
+            ),
+            (
+                2,
+                format!(
+                    "{}: syncing the device index failed: injected",
+                    tmp.display()
+                ),
+            ),
+            (
+                3,
+                format!(
+                    "{}: renaming the device index into place failed: injected",
+                    path.display()
+                ),
+            ),
+        ];
+        for (fail_at, want) in cases {
+            let mut fs = Recorder {
+                fail_at: Some(fail_at),
+                ..Recorder::default()
+            };
+            let err = index.save_with(MAC_KEY, &mut fs).unwrap_err();
+            assert!(matches!(err, RemotedError::Index(_)), "{err:?}");
+            assert!(err.to_string().contains(&want), "{err} vs {want}");
+        }
+        // The production path runs the same steps and the index loads back.
+        let mut fs = Recorder::default();
+        index.save_with(MAC_KEY, &mut fs).unwrap();
+        assert_eq!(
+            fs.steps,
+            vec![
+                Step::Create(tmp.clone()),
+                Step::Write(tmp.clone()),
+                Step::SyncFile(tmp.clone()),
+                Step::Rename(tmp, path.clone()),
+                Step::SyncDir(dir.path().to_path_buf()),
+            ]
+        );
+        DeviceAccountIndex::load(&path, MAC_KEY).expect("the saved index loads");
     }
 }
