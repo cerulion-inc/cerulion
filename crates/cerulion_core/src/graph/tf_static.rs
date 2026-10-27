@@ -67,6 +67,15 @@ pub(crate) fn effective_history_size(topic: &str, output: &OutputDef) -> usize {
     }
 }
 
+/// Whether `output` keeps history only because it is a latched static
+/// transform output: its `history_size` is 0, so the one message it keeps
+/// is the latch, not a declared history. A diagnostic that names
+/// `history_size` as the setting to change must not say so for this
+/// output, since it is already 0.
+pub(crate) fn is_implicit_latch(topic: &str, output: &OutputDef) -> bool {
+    is_latched_static_output(topic, &output.schema) && output.history_size == 0
+}
+
 /// The history a listener graph gives `topic` when it creates it: the
 /// latch history for `/tf_static`, nothing for any other topic.
 ///
@@ -240,6 +249,20 @@ mod tests {
             effective_history_size("/robot/mounts/tf_static", &relative),
             2
         );
+    }
+
+    #[test]
+    fn only_a_latched_output_with_no_declared_history_is_an_implicit_latch() {
+        let latched = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessage", 0);
+        assert!(is_implicit_latch(TF_STATIC_TOPIC, &latched));
+        // A declared history is the user's setting, not the latch.
+        let declared = output("tf_static", Some(TF_STATIC_TOPIC), "tf2_msgs/TFMessage", 1);
+        assert!(!is_implicit_latch(TF_STATIC_TOPIC, &declared));
+        // Not latched at all: `/tf`, and another schema on `/tf_static`.
+        let tf = output("tf", Some("/tf"), "tf2_msgs/TFMessage", 0);
+        assert!(!is_implicit_latch("/tf", &tf));
+        let other = output("tf_static", Some(TF_STATIC_TOPIC), "Vector3", 0);
+        assert!(!is_implicit_latch(TF_STATIC_TOPIC, &other));
     }
 
     #[test]

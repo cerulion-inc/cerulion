@@ -6978,7 +6978,21 @@ impl GraphRuntime {
                 // outstanding counters so every send mirrors into their
                 // queue-depth atomics. No-op unless the topic is all-block.
                 if let Some(counters) = pub_block_by_topic.get(&topic) {
-                    if history_size > 0 {
+                    // A latched `/tf_static` output with no `history_size`
+                    // keeps one message by default: its `history_size` is
+                    // already 0, so the remedy is the input policy, not that
+                    // setting.
+                    if super::tf_static::is_implicit_latch(&topic, output) {
+                        tracing::warn!(
+                            topic = %topic,
+                            history_size = history_size,
+                            "block topic is a latched static transform topic: it keeps its \
+                             last message for a late listener, and the outstanding mirror \
+                             does not track that kept message, so a late joiner's block \
+                             accounting may under-count. Static transforms are not a \
+                             stream: read this topic through a non-block input."
+                        );
+                    } else if history_size > 0 {
                         tracing::warn!(
                             topic = %topic,
                             history_size = history_size,
