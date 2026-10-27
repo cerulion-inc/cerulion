@@ -149,10 +149,12 @@ self_test() {
   local bin=$1
   local clang="$bin/aarch64-linux-android30-clang"
   [[ -x "$clang" ]] || { echo "FAIL jniLibs self-test: no NDK clang at $clang" >&2; exit 1; }
-  local work
-  work="$(mktemp -d "${TMPDIR:-/tmp}/jnilibs-gate.XXXXXX")"
-  # shellcheck disable=SC2064 # expand $work now: it is local to this function
-  trap "rm -rf '$work'" EXIT
+  # A global, read by the trap when it fires: the path never becomes trap
+  # source text, so a TMPDIR holding a quote or shell syntax only names a
+  # directory.
+  JNILIBS_SELF_TEST_WORK="$(mktemp -d "${TMPDIR:-/tmp}/jnilibs-gate.XXXXXX")"
+  trap 'rm -rf -- "$JNILIBS_SELF_TEST_WORK"' EXIT
+  local work=$JNILIBS_SELF_TEST_WORK
   cat >"$work/good.c" <<'EOF'
 int JNI_OnLoad(void *vm, void *reserved) { (void)vm; (void)reserved; return 0x00010006; }
 int Java_com_cerulion_android_CerulionRuntime_nativeInit(void) { return 0; }
