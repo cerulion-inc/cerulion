@@ -18,8 +18,9 @@
 //! A node may join its producer's unit only across a LINK: an edge the shared
 //! chain predicates ([`crate::graph::chain::linear_links`]) find to be a linear
 //! hand-off, one producer handing each frame to one consumer that fires on it.
-//! The same predicates serve the fusion census and the partitioner, so the three
-//! agree on what a chain is.
+//! The fusion census and the partitioner start from the same link predicates;
+//! the census then adds its own fusion rules, so every fused chain is a run of
+//! links.
 //!
 //! A link merges only when the graph's profile ([`PartitionCosts`], the cost
 //! snapshot `graph profile` writes) shows the merge is safe: the unit's summed
@@ -110,6 +111,11 @@ pub enum Boundary {
     },
     /// A link whose merge would put the unit over its tick budget.
     OverBudget(BudgetVerdict),
+    /// A node on a cycle made only of links, which no chain head reaches.
+    LinkCycle {
+        /// The producer across the node's link.
+        producer: String,
+    },
 }
 
 impl Boundary {
@@ -129,6 +135,9 @@ impl Boundary {
                  profile` to let a chain merge)"
             ),
             Self::OverBudget(v) => v.describe(),
+            Self::LinkCycle { producer } => {
+                format!("on a cycle of chain links (fed by {producer}), which no chain head reaches")
+            }
         }
     }
 }
@@ -513,6 +522,7 @@ pub fn derive_units(
         candidates.insert(n);
     }
 
+    let mut walked: IndexSet<&str> = IndexSet::new();
     // Walk each chain of candidate links from the node that heads it, growing
     // one unit at a time.
     for node in members {
@@ -550,7 +560,7 @@ pub fn derive_units(
         };
         let mut at = head;
         while let Some(&next) = link_out.get(at) {
-            if !candidates.contains(next) {
+            if !candidates.contains(next) || !walked.insert(next) {
                 break;
             }
             match merge_verdict(next, at, &unit, graph, profile) {
@@ -578,6 +588,16 @@ pub fn derive_units(
                 }
             }
             at = next;
+        }
+    }
+
+    // A candidate no walk reached sits on a cycle made only of links: it
+    // starts a unit of its own and says so.
+    for node in members {
+        let n = node.as_str();
+        if candidates.contains(n) && !walked.contains(n) {
+            let producer = link_in.get(n).map(|p| p.to_string()).unwrap_or_default();
+            starts.insert(n, Boundary::LinkCycle { producer });
         }
     }
 
@@ -1133,6 +1153,20 @@ mod tests {
         let units = derive_units("g", &s(&["pace", "fast", "slow"]), &g, None);
         assert_eq!(nodes(&units), [s(&["pace", "slow"]), s(&["fast"])]);
         assert_eq!(units[0].block_topics, s(&["t"]));
+    }
+
+    #[test]
+    fn a_cycle_of_links_starts_a_unit_with_a_reason() {
+        let g = graph(&[("a", "b"), ("b", "a")], &[], &[]);
+        let units = derive_units("g", &s(&["a", "b"]), &g, None);
+        assert_eq!(nodes(&units), [s(&["a"]), s(&["b"])]);
+        assert!(units.iter().all(|u| !u.boundaries.is_empty()));
+        assert_eq!(
+            start_of(&units, "a"),
+            Some(&Boundary::LinkCycle {
+                producer: "b".into()
+            })
+        );
     }
 
     #[test]

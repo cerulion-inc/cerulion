@@ -12794,7 +12794,11 @@ fn graph_run_supervisor(
                                     &rank_groups,
                                     &mut credit_death_watch,
                                 );
-                                let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                                let survivors: usize = guards
+                                    .iter()
+                                    .filter(|g| !g.reaped())
+                                    .map(|g| g.units().len())
+                                    .sum();
                                 match &barrier_owner {
                                     Some(barrier) => drop_dead_peers_batch(
                                         barrier,
@@ -12957,7 +12961,11 @@ fn graph_run_supervisor(
                                 &rank_groups,
                                 &mut credit_death_watch,
                             );
-                            let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                            let survivors: usize = guards
+                                    .iter()
+                                    .filter(|g| !g.reaped())
+                                    .map(|g| g.units().len())
+                                    .sum();
                             match &barrier_owner {
                                 Some(barrier) => drop_dead_peers_batch(
                                     barrier,

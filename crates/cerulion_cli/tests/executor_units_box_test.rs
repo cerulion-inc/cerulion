@@ -92,8 +92,11 @@ const COOLDOWN: Duration = Duration::from_millis(500);
 /// A baseline leg below this many steady samples measured nothing.
 const MIN_BASELINE_SAMPLES: usize = 2000;
 /// Live eviction runs a stream may show with its units in one process beyond
-/// what the same stream shows with one process per node.
-const EVICTION_TOLERANCE: usize = 2;
+/// what the same stream shows with one process per node: none. A unit's queue
+/// holds the same frames whichever process hosts it, so an extra eviction is a
+/// consumer that ran later in its host than in a process of its own, which is
+/// the co-hosting slow-down this check exists to surface.
+const EVICTION_TOLERANCE: usize = 0;
 /// A slow leg below this many steady samples measured nothing either.
 const MIN_SLOW_SAMPLES: usize = 1000;
 
