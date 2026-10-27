@@ -304,17 +304,20 @@ self_test() {
     _expect_title bad 'fix(core,,cli): doubled comma'     # empty scope mid-list
     _expect_title bad 'Bump serde from 1.0.219 to 1.0.221'  # no prefix configured
 
-    # A rejected title is refused WITHOUT being printed. Read from a file, not a
-    # command substitution: a subshell would lose the violation count.
+    # A rejected title is refused WITHOUT being printed. The command
+    # substitution is a subshell with its own violation count, so it prints
+    # that count on a last line of its own after what check_title printed. No
+    # file is written: the self-test stays free of I/O.
     _run=$((_run + 1))
-    violations=0
-    _cpt_out=$(mktemp)
-    check_title 'Rejected title marker q7xz' > "$_cpt_out" 2>&1
-    if [ "$violations" -eq 0 ] || grep -qF 'q7xz' "$_cpt_out"; then
-        printf 'SELF-TEST FAIL: a rejected title must be refused without being printed\n' >&2
-        _fails=$((_fails + 1))
-    fi
-    rm -f "$_cpt_out"
+    _cpt_out=$(violations=0
+               check_title 'Rejected title marker q7xz' 2>&1
+               printf '\nviolations=%s' "$violations")
+    case "$_cpt_out" in
+        *q7xz*|*"
+violations=0")
+            printf 'SELF-TEST FAIL: a rejected title must be refused without being printed\n' >&2
+            _fails=$((_fails + 1)) ;;
+    esac
 
     # THE TRACKER-ID SAMPLES ARE DERIVED FROM TRACKER_RE, NOT TYPED. A gate that
     # spells the token it bans is itself a leak (the agent-docs gate derives its
