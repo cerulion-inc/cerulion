@@ -359,8 +359,26 @@ jobs:
         id: version
         run: echo "version=$(tools/scripts/workspace_version.sh)" >> "$GITHUB_OUTPUT"
 
+      # Built inside ubuntu:20.04 (glibc 2.31), the release build's own
+      # script with the debug profile, so the package the smoke installs on
+      # 20.04, 22.04 and 24.04 below carries programs linked the way the
+      # released ones are. Writes target/x86_64-unknown-linux-gnu/debug/.
       - name: Build the four release binaries
-        run: cargo build --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted
+        run: |
+          docker run --rm \
+            -e TARGET=x86_64-unknown-linux-gnu \
+            -e CARGO_TERM_COLOR \
+            -e CERULION_BUILD_PROFILE=debug \
+            -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
+            -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE":/work \
+            ubuntu:20.04 \
+            bash /work/tools/scripts/build_release_linux_container.sh
+          python3 -B tools/scripts/check_release_glibc.py \
+            target/x86_64-unknown-linux-gnu/debug/cerulion \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-netd \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-connectd \
+            target/x86_64-unknown-linux-gnu/debug/cerulion-remoted
 
       # build_deb.sh requires every license notice the archive ships, so this
       # smoke has to produce the generated one like the release does. Doing it
@@ -391,10 +409,10 @@ jobs:
           stage="$RUNNER_TEMP/$stem"
           archive="$RUNNER_TEMP/$stem.tar.gz"
           mkdir -p "$stage" "$RUNNER_TEMP/debs"
-          cp target/debug/cerulion "$stage/cerulion"
-          cp target/debug/cerulion-netd "$stage/cerulion-netd"
-          cp target/debug/cerulion-connectd "$stage/cerulion-connectd"
-          cp target/debug/cerulion-remoted "$stage/cerulion-remoted"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion "$stage/cerulion"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-netd "$stage/cerulion-netd"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-connectd "$stage/cerulion-connectd"
+          cp target/x86_64-unknown-linux-gnu/debug/cerulion-remoted "$stage/cerulion-remoted"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
@@ -529,7 +547,7 @@ jobs:
             exit 1
           fi
           echo "APT bootstrap exact-keyring check passed"
-          for image in ubuntu:22.04 ubuntu:24.04; do
+          for image in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04; do
             echo "=== $image ==="
             docker run --rm --pull=missing --network host \
               -v "$RUNNER_TEMP/apt-repo:/repo:ro" \

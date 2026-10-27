@@ -3,13 +3,15 @@
 # an `ubuntu:20.04` container.
 #
 # Runs as root INSIDE the container with the checkout mounted at /work. The
+# release workflow builds the release archives with it, and CI's Debian
+# smoke builds the debug programs it packages with it. The
 # programs and the heap hook link against the container's glibc 2.31, so
 # every symbol version they reference exists on Ubuntu 20.04; the release
 # workflow's glibc check then confirms it. The build is native: the x86_64
 # leg runs on an x86_64 runner and the aarch64 leg on an arm64 runner.
 #
 # It writes into /work/target exactly where a host build would
-# (target/<TARGET>/release/...) and hands the target directory back to the
+# (target/<TARGET>/<release|debug>/...) and hands the target directory back to the
 # runner's user on exit, so the host steps that package the archive and the
 # deb read it unchanged.
 #
@@ -19,12 +21,14 @@
 #   CERULION_RELEASE_TOOLCHAIN the Rust toolchain to install (required; the
 #                              workflow passes the version it pins elsewhere)
 #   CERULION_HOST_OWNER        uid:gid that owns target/ afterwards (required)
+#   CERULION_BUILD_PROFILE     release (the default) or debug
 #   CERULION_POSTHOG_KEY       passed through to the CLI build (optional)
 set -euo pipefail
 
 target=${TARGET:?TARGET must name the Rust target triple}
 toolchain=${CERULION_RELEASE_TOOLCHAIN:?CERULION_RELEASE_TOOLCHAIN must name the Rust toolchain}
 owner=${CERULION_HOST_OWNER:?CERULION_HOST_OWNER must be uid:gid}
+profile=${CERULION_BUILD_PROFILE:-release}
 repo=/work
 
 die() {
@@ -33,6 +37,11 @@ die() {
 }
 
 [ -f "$repo/Cargo.toml" ] || die "repository is not mounted at $repo"
+case "$profile" in
+    release) profile_flag=--release ;;
+    debug) profile_flag= ;;
+    *) die "CERULION_BUILD_PROFILE must be release or debug, got '$profile'" ;;
+esac
 
 case "$(uname -m)/$target" in
     x86_64/x86_64-unknown-linux-gnu | aarch64/aarch64-unknown-linux-gnu) ;;
@@ -72,14 +81,16 @@ cargo --version
 rustc --version
 
 cd "$repo"
-cargo build --release --locked \
+# shellcheck disable=SC2086 # an empty profile_flag must vanish
+cargo build $profile_flag --locked \
     -p cerulion_cli -p cerulion_netd -p cerulion_connectd -p cerulion_remoted \
     --target "$target"
 # The heap hook, an LD_PRELOAD malloc interposer the CLI auto-injects into
 # every ros2 child when it sits beside the binaries.
-cargo build --release --locked -p cerulion_heaphook --target "$target"
+# shellcheck disable=SC2086
+cargo build $profile_flag --locked -p cerulion_heaphook --target "$target"
 
 for artifact in cerulion cerulion-netd cerulion-connectd cerulion-remoted libcerulion_heaphook.so; do
-    [ -f "target/$target/release/$artifact" ] ||
-        die "the build left no target/$target/release/$artifact"
+    [ -f "target/$target/$profile/$artifact" ] ||
+        die "the build left no target/$target/$profile/$artifact"
 done
