@@ -90,7 +90,11 @@ cargo build $profile_flag --locked \
 # shellcheck disable=SC2086
 cargo build $profile_flag --locked -p cerulion_heaphook --target "$target"
 
-for artifact in cerulion cerulion-netd cerulion-connectd cerulion-remoted libcerulion_heaphook.so; do
+# The compiler that built the artifacts, which the archive ships as
+# rustc-version.txt.
+rustc -vV > "target/$target/$profile/rustc-version.txt"
+
+for artifact in cerulion cerulion-netd cerulion-connectd cerulion-remoted libcerulion_heaphook.so rustc-version.txt; do
     [ -f "target/$target/$profile/$artifact" ] ||
         die "the build left no target/$target/$profile/$artifact"
 done

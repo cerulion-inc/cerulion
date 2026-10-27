@@ -372,7 +372,7 @@ jobs:
             -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
             -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
             -v "$GITHUB_WORKSPACE":/work \
-            ubuntu:20.04 \
+            ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 \
             bash /work/tools/scripts/build_release_linux_container.sh
           python3 -B tools/scripts/check_release_glibc.py \
             target/x86_64-unknown-linux-gnu/debug/cerulion \
