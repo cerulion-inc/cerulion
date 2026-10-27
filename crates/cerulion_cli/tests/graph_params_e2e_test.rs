@@ -348,8 +348,9 @@ fn stamped_vector3_frames(bag: &Path, topic: &str) -> Vec<(u64, (f64, f64, f64))
 }
 
 /// The param resume rule over the real binary and the cdylib FFI: the twin of
-/// the engine's in-process
-/// `a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed`.
+/// the in-process
+/// `a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed`
+/// in `cerulion_cli_engine/tests/replay_engine_test.rs`.
 ///
 /// The recording runs `cam0` at `gain: 2.0`, and a `cerulion flashback`
 /// capture of it begins mid-run, so its resim restores `cam0` from an anchor.
@@ -364,7 +365,10 @@ fn stamped_vector3_frames(bag: &Path, topic: &str) -> Vec<(u64, (f64, f64, f64))
 /// 2. The rebuilt node is refused with exit 2 and the one line for `scale`,
 ///    before it writes a `--record-out` bag. The build declares every name the
 ///    recording holds, so the refusal is the check the resume makes after the
-///    build, not the one for a param the build no longer declares.
+///    build, not the one for a param the build no longer declares. That check
+///    judges only a node the anchor carries a state blob for, so the refusal
+///    also shows the anchor carries one for `cam0`, a node whose fields are
+///    all params and one output port.
 /// 3. With `--allow-param-change` the rebuilt node resumes: its first resumed
 ///    frame carries `scale` 3.0 beside the recorded `gain` 2.0.
 ///
