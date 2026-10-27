@@ -512,7 +512,10 @@ async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names, ["arm.step", "arm.slow", "arm.mute", "estop"]);
+    assert_eq!(
+        names,
+        ["arm.step", "arm.slow", "arm.mute", "estop", "estop_clear"]
+    );
     let r = s.call_step(3).await;
     let text = r["result"]["content"][0]["text"]
         .as_str()
@@ -586,6 +589,15 @@ async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
     s.initialize().await;
     let r = s.call_step(2).await;
     assert!(denied(&r, DENIED_CODE), "viewer arm.step: {r}");
+    // Clearing is not under the e-stop floor: it is a tool like any other.
+    let r = s
+        .request(
+            9,
+            "tools/call",
+            json!({ "name": cerulion_rcpd::tools::ESTOP_CLEAR_TOOL, "arguments": {} }),
+        )
+        .await;
+    assert!(denied(&r, DENIED_CODE), "viewer estop_clear: {r}");
     let r = s
         .request(
             3,

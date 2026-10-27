@@ -1604,7 +1604,7 @@ mod tests {
             ),
             Ok(RcpClass::Estop)
         );
-        for near in ["Estop", "estop ", "estop.x", "e-stop"] {
+        for near in ["Estop", "estop ", "estop.x", "e-stop", "estop_clear"] {
             let m = format!(
                 r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{near}"}}}}"#
             );
