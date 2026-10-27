@@ -463,7 +463,26 @@ cerulion_core = { version = "1", features = ["local-transport"] }
 
 The emulator lane checks decoded topic values on the device and host, a
 recorded MCAP's topic, schema, and frame count, the paired catalog refusal
-with no decoded heartbeat frames, open access, and the app recording. Run it
+with no decoded heartbeat frames, open access, and the app recording. It also
+sends a heartbeat data demand directly, without reading the catalog first,
+through a host probe (`crates/test_fixtures/android_e2e_demand_probe`). The
+paired app must refuse that demand twice in a row and send no frame. The open
+app must grant the same demand and deliver frames, which shows that the paired
+refusal comes from the posture and not from the topic or the allow-list. When
+the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
+on the schema hash. In every run the probe's ingress must lose no frame to a
+decode error, a local re-injection failure or its own LAN posture. No host
+network daemon runs while the probe does: the run stops the one it started and
+fails while any `cerulion-netd` process is still alive on the host. The probe
+names the robot that sent each demand ack it counted, and the verdict fails a
+run with an ack from any robot other than the app, or with more acks than
+demand passes (a second peer answering). The probe names at most 256 robots,
+each at most 256 bytes long, and counts each ack from a robot it did not
+name; the verdict fails a run where either count is not 0. Before the device is used,
+the probe must refuse each bad argument and a connect endpoint its session
+cannot open, with exit code 1 and no report.
+`tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
+`tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
 locally with a booted API 30 emulator:
 
 ```sh
@@ -476,14 +495,17 @@ Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
 cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
 The run writes `e2e.log`, `logcat.txt`, device logs, the output and exit code of
-every echo (device and host timer, paired and open heartbeat), and pulled MCAP
-files there. The script needs a dedicated
-device: it refuses to start while a `cerulion` or `cerulion-netd` process is
-running, and clears only its own directory `/data/local/tmp/cer-e2e`, leaving
-the shared `/data/local/tmp/iceoryx2` untouched.
+every echo (device and host timer, paired and open heartbeat), the report of
+every demand probe run (`*-demand-probe*.txt`,
+`open-schema-mismatch-probe.txt`), and pulled MCAP files there. The script
+needs a dedicated device: it refuses to start while a `cerulion` or
+`cerulion-netd` process is running, and clears only its own directory
+`/data/local/tmp/cer-e2e`, leaving the shared `/data/local/tmp/iceoryx2`
+untouched.
 Host commands run with their own `HOME` and `XDG_RUNTIME_DIR` and without the
 caller's other `CERULION_*` variables, so they start a fresh network daemon,
-and the run refuses a host that already publishes a test topic locally. It sets
+and the run refuses a host that already publishes a test topic locally or
+already runs a `cerulion-netd` process. It sets
 the Android login gate off, reads the app recording named by the open run's
 `record_path`, waits for its closing MCAP magic before reading it, and bounds
 every device wait.
