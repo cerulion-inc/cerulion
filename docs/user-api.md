@@ -2332,11 +2332,13 @@ A `.srv` file is a request body and a response body split by one `---` line. Eac
 part parses as its own message in the package of the service, named as ROS 2 names
 it: `std_srvs/SetBool` gives `std_srvs/SetBool_Request` and
 `std_srvs/SetBool_Response`. The schema hash covers that name, so a native peer and
-a ROS 2 peer on `rmw_cerulion` agree on the hash of each part, an empty part included:
-`rmw_cerulion` leaves out the one-byte placeholder member rosidl adds to a struct with
-no fields, so `std_srvs/Empty_Request` hashes the same on both sides. The six
-`std_srvs` parts are pinned that way, through both introspection bridges, in
-`crates/rmw_cerulion/tests/service_part_hash_test.rs`. The generated Rust
+a ROS 2 peer on `rmw_cerulion` agree on the hash of each part: `rmw_cerulion` leaves
+out the one-byte placeholder member rosidl adds to a request or response with no
+fields, so `std_srvs/Empty_Request` hashes the same on both sides. The six `std_srvs`
+parts are pinned that way, through both introspection bridges, in
+`crates/rmw_cerulion/tests/service_part_hash_test.rs`. A part that nests a message
+with no fields keeps that message's placeholder byte on the `rmw_cerulion` side, so
+it does not meet a native peer. The generated Rust
 types keep that name too (`SetBool_Request`, `SetBool_RequestShm`,
 `SetBool_RequestSnapshot`), and each carries `#[allow(non_camel_case_types)]`, so
 code generated from a `.srv` passes `clippy -D warnings`.
