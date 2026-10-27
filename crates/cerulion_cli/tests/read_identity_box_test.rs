@@ -40,7 +40,10 @@
 //! cargo test -p cerulion_cli --test read_identity_box_test -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The harness workspace builds once per test process.
+//! Each arm builds the harness workspace in a scaffold directory it holds
+//! for its whole body, removed when the arm ends, passing or failing (`CERULION_KEEP_TEST_WS=1`
+//! keeps a failed arm's). Every workspace of this binary builds into one
+//! target directory, so the dependencies compile once per binary.
 
 #![cfg(not(target_os = "macos"))]
 // WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm spawns a
@@ -53,22 +56,24 @@
 mod det_scaffold;
 mod mp_support;
 mod read_identity;
+mod scaffold_dir;
 
 use read_identity::{
-    judge_replayed, Fixture, Floors, Outcome, Placement, ReplayMode, RowVerdict, Verdict,
+    judge_replayed, Fixture, Floors, Outcome, Placement, ReplayMode, RowVerdict, Verdict, Workspace,
 };
 use serial_test::serial;
 
 /// Record `fixture` under `placement`, replay it under `mode`, judge and
 /// print. Returns the live run and the outcome.
 fn record_and_judge_mode(
+    ws: &Workspace,
     fixture: Fixture,
     placement: Placement,
     mode: ReplayMode,
     plant: Option<(&str, usize)>,
 ) -> (read_identity::RecordedRun, Outcome) {
-    let run = read_identity::record_live(fixture, placement);
-    let replayed = read_identity::resim(&run, mode, plant);
+    let run = read_identity::record_live(ws, fixture, placement);
+    let replayed = read_identity::resim(ws, &run, mode, plant);
     let outcome = judge_replayed(fixture, &run.live, &replayed, Floors::default())
         .unwrap_or_else(|e| panic!("RI_HARNESS: {}: {e}", fixture.name()));
     outcome.print(
@@ -85,11 +90,13 @@ fn record_and_judge_mode(
 
 /// [`record_and_judge_mode`] under the neutral resim, which must run.
 fn record_and_judge(
+    ws: &Workspace,
     fixture: Fixture,
     placement: Placement,
     plant: Option<(&str, usize)>,
 ) -> (read_identity::RecordedRun, Verdict) {
-    let (run, outcome) = record_and_judge_mode(fixture, placement, ReplayMode::ResimNeutral, plant);
+    let (run, outcome) =
+        record_and_judge_mode(ws, fixture, placement, ReplayMode::ResimNeutral, plant);
     match outcome {
         Outcome::Judged { verdict, .. } => (run, verdict),
         Outcome::Refused { stderr } => {
@@ -117,7 +124,8 @@ fn sequence_gaps(run: &read_identity::RecordedRun, node: &str, input: &str) -> V
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn an_evicting_consumer_resim_diverges_today() {
-    let (run, verdict) = record_and_judge(Fixture::SlowEvict, Placement::Declared, None);
+    let ws = read_identity::workspace();
+    let (run, verdict) = record_and_judge(&ws, Fixture::SlowEvict, Placement::Declared, None);
     let gaps = sequence_gaps(&run, "slow", "inp");
     eprintln!(
         "READ_IDENTITY_EVICTIONS fixture=slow_evict gaps={} first_gap_read={}",
@@ -149,7 +157,9 @@ fn an_evicting_consumer_resim_diverges_today() {
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn an_evicting_consumer_under_verify_probe() {
+    let ws = read_identity::workspace();
     record_and_judge_mode(
+        &ws,
         Fixture::SlowEvict,
         Placement::Declared,
         ReplayMode::ResimVerify,
@@ -161,7 +171,8 @@ fn an_evicting_consumer_under_verify_probe() {
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn fan_out_verdict_probe() {
-    record_and_judge(Fixture::FanOut, Placement::Declared, None);
+    let ws = read_identity::workspace();
+    record_and_judge(&ws, Fixture::FanOut, Placement::Declared, None);
 }
 
 /// The multi-writer fixture also proves its shape: three writers on the one
@@ -170,7 +181,8 @@ fn fan_out_verdict_probe() {
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn multi_writer_verdict_probe() {
-    let (run, _verdict) = record_and_judge(Fixture::MultiWriter, Placement::Declared, None);
+    let ws = read_identity::workspace();
+    let (run, _verdict) = record_and_judge(&ws, Fixture::MultiWriter, Placement::Declared, None);
     let reads = &run.live.streams[&("tfbuf".to_string(), "tf".to_string())];
     let mut writers: Vec<u64> = reads.iter().map(|r| r.writer).collect();
     writers.sort_unstable();
@@ -198,21 +210,24 @@ fn multi_writer_verdict_probe() {
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn ranks2_verdict_probe() {
-    record_and_judge(Fixture::Ranks2, Placement::Declared, None);
+    let ws = read_identity::workspace();
+    record_and_judge(&ws, Fixture::Ranks2, Placement::Declared, None);
 }
 
 #[test]
 #[ignore = "needs a quiet Linux host: real multi-process runs"]
 #[serial]
 fn ranks3_verdict_probe() {
-    record_and_judge(Fixture::Ranks3, Placement::Declared, None);
+    let ws = read_identity::workspace();
+    record_and_judge(&ws, Fixture::Ranks3, Placement::Declared, None);
 }
 
 #[test]
 #[ignore = "needs a quiet Linux host: real runs"]
 #[serial]
 fn ranks2_single_process_verdict_probe() {
-    record_and_judge(Fixture::Ranks2, Placement::SingleProcess, None);
+    let ws = read_identity::workspace();
+    record_and_judge(&ws, Fixture::Ranks2, Placement::SingleProcess, None);
 }
 
 /// One recording resimmed twice, once with the sink's read 25 planted: judged
@@ -224,8 +239,9 @@ fn ranks2_single_process_verdict_probe() {
 fn a_planted_misread_is_caught() {
     const AT: usize = 25;
     let fixture = Fixture::Ranks2;
-    let run = read_identity::record_live(fixture, Placement::Declared);
-    let reads = |plant| match read_identity::resim(&run, ReplayMode::ResimNeutral, plant) {
+    let ws = read_identity::workspace();
+    let run = read_identity::record_live(&ws, fixture, Placement::Declared);
+    let reads = |plant| match read_identity::resim(&ws, &run, ReplayMode::ResimNeutral, plant) {
         read_identity::Replayed::Reads { log, .. } => log,
         read_identity::Replayed::Refused { stderr } => {
             panic!("RI_HARNESS: the neutral resim refused the recording:\n{stderr}")

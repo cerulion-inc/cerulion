@@ -8,6 +8,7 @@
 mod det_scaffold;
 mod mp_support;
 mod read_identity;
+mod scaffold_dir;
 
 use read_identity::{
     judge_streams, payload_hash, read_from_bits, Floors, Read, ReadLog, RowVerdict,
@@ -301,7 +302,7 @@ fn the_judge_refuses_a_stream_under_its_floor() {
 /// serializes.
 #[test]
 fn the_harness_workspace_builds_every_node_type() {
-    let ws = read_identity::workspace();
+    let ws = &read_identity::workspace();
     for (name, lib) in read_identity::built_cdylibs(ws) {
         assert!(lib.exists(), "{name}: {} built", lib.display());
     }

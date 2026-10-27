@@ -57,12 +57,15 @@
 mod det_scaffold;
 mod mp_support;
 mod read_identity;
+mod scaffold_dir;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use cerulion_core::graph::params::ParamValue;
-use read_identity::{graph_config, node_def, unique_names, write_graph, SAMPLES_DIR_ENV};
+use read_identity::{
+    graph_config, node_def, unique_names, write_graph, Workspace, SAMPLES_DIR_ENV,
+};
 use serial_test::serial;
 
 /// How long the slow node sleeps per fire.
@@ -145,10 +148,9 @@ fn leg_numbers(dir: &Path, from_ns: u64, to_ns: u64) -> Leg {
     }
 }
 
-/// Run one leg: the graph with `slow`, as declared (three processes) or
-/// `--single-process`, and return the fast node's numbers.
-fn run_leg(arm: &str, leg: &str, slow: Slow, single_process: bool) -> Leg {
-    let ws = read_identity::workspace();
+/// Run one leg in `ws`: the graph with `slow`, as declared (three processes)
+/// or `--single-process`, and return the fast node's numbers.
+fn run_leg(ws: &Workspace, arm: &str, leg: &str, slow: Slow, single_process: bool) -> Leg {
     let (graph, prefix) = unique_names("nb");
     let slow_node = match slow {
         Slow::DropOldest(us) => node_def(
@@ -230,9 +232,10 @@ fn assert_baseline_measured(base: &Leg) {
 #[serial]
 fn a_slow_node_in_another_process_does_not_slow_the_fast_node() {
     const ARM: &str = "cross_process";
-    let base = run_leg(ARM, "baseline", Slow::DropOldest(0), false);
+    let ws = &read_identity::workspace();
+    let base = run_leg(ws, ARM, "baseline", Slow::DropOldest(0), false);
     assert_baseline_measured(&base);
-    let control = run_leg(ARM, "control", Slow::Block(SLOW_SLEEP_US), false);
+    let control = run_leg(ws, ARM, "control", Slow::Block(SLOW_SLEEP_US), false);
     assert!(
         control.rate_hz <= base.rate_hz * 0.5,
         "RI_HARNESS: the block control did not slow the fast node ({:.1} Hz against a {:.1} Hz \
@@ -241,7 +244,7 @@ fn a_slow_node_in_another_process_does_not_slow_the_fast_node() {
         control.rate_hz,
         base.rate_hz
     );
-    let slow = run_leg(ARM, "slow", Slow::DropOldest(SLOW_SLEEP_US), false);
+    let slow = run_leg(ws, ARM, "slow", Slow::DropOldest(SLOW_SLEEP_US), false);
     assert!(
         slow.edges_ok,
         "the fast node did not fire across the whole window beside a slow node in another \
@@ -270,9 +273,10 @@ fn a_slow_node_in_another_process_does_not_slow_the_fast_node() {
 #[serial]
 fn a_slow_node_in_the_same_process_holds_the_fast_node_today() {
     const ARM: &str = "same_process";
-    let base = run_leg(ARM, "baseline", Slow::DropOldest(0), true);
+    let ws = &read_identity::workspace();
+    let base = run_leg(ws, ARM, "baseline", Slow::DropOldest(0), true);
     assert_baseline_measured(&base);
-    let slow = run_leg(ARM, "slow", Slow::DropOldest(SLOW_SLEEP_US), true);
+    let slow = run_leg(ws, ARM, "slow", Slow::DropOldest(SLOW_SLEEP_US), true);
     assert!(
         slow.rate_hz <= base.rate_hz * 0.5,
         "the slow node did not hold the fast node in one process ({:.1} Hz against a {:.1} Hz \

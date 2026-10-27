@@ -71,10 +71,12 @@
 //! mod det_scaffold;
 //! mod mp_support;
 //! mod read_identity;
+//! mod scaffold_dir;
 //! use read_identity::{judge_replayed, Fixture, Floors, Placement, ReplayMode};
 //!
-//! let run = read_identity::record_live(Fixture::Ranks2, Placement::Declared);
-//! let replayed = read_identity::resim(&run, ReplayMode::ResimVerify, None);
+//! let ws = read_identity::workspace();
+//! let run = read_identity::record_live(&ws, Fixture::Ranks2, Placement::Declared);
+//! let replayed = read_identity::resim(&ws, &run, ReplayMode::ResimVerify, None);
 //! let outcome = judge_replayed(Fixture::Ranks2, &run.live, &replayed, Floors::default()).unwrap();
 //! outcome.print("ranks2", "declared/resim_verify");
 //! let verdict = outcome.verdict().expect("the replay ran, it did not refuse");
@@ -98,7 +100,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use cerulion_cli_engine::node_cmd::{NodeCreateOptions, NodeLanguage};
@@ -107,8 +108,9 @@ use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::params::ParamValue;
 use cerulion_core::MacroPolicy;
 
-use crate::det_scaffold::{cdylib_target_base, SCHEMA};
+use crate::det_scaffold::SCHEMA;
 use crate::mp_support::{self, ChildGuard};
+use crate::scaffold_dir::{pin_target_dir, scaffold_target_dir, ScaffoldDir};
 
 /// The env var a consumer's read buffer is armed by and written under.
 pub const READS_DIR_ENV: &str = "CER_RI_READS_DIR";
@@ -902,18 +904,15 @@ impl RiSlowBlockNode {
     },
 ];
 
-/// The built workspace every fixture runs in. The `TempDir` keeps it alive for
-/// the test process.
+/// The built workspace the fixtures run in, removed when it drops.
 pub struct Workspace {
-    pub _tmp: tempfile::TempDir,
+    /// Owns the directory `root` lives in and removes it on drop.
+    pub _dir: ScaffoldDir,
     pub root: PathBuf,
     pub graphs_dir: PathBuf,
-}
-
-/// The workspace, built once per test process.
-pub fn workspace() -> &'static Workspace {
-    static WS: OnceLock<Workspace> = OnceLock::new();
-    WS.get_or_init(build_workspace)
+    /// Where the node cdylibs are built; the drivers hand it to the
+    /// `cerulion` processes they spawn as `CARGO_TARGET_DIR`.
+    pub target_dir: PathBuf,
 }
 
 /// The `lib.rs` of node type `t`: the scaffold's header (lint line and
@@ -926,10 +925,17 @@ fn node_source(scaffolded: &str, t: &NodeType) -> String {
     format!("{}{}{RECORD_FNS}", &scaffolded[..at], t.body)
 }
 
-fn build_workspace() -> Workspace {
-    let tmp = tempfile::tempdir().expect("RI_HARNESS: temp dir for the workspace");
+/// Scaffold and build the workspace in a new [`ScaffoldDir`], held by the
+/// caller. Every workspace of one test binary builds into one target
+/// directory ([`scaffold_target_dir`], keyed by the binary's crate name), so
+/// the dependencies compile once per binary and a later workspace rebuilds
+/// only the node crates and what depends on the workspace's schemas.
+pub fn workspace() -> Workspace {
+    let dir = ScaffoldDir::new("ri_ws");
     let ws =
-        workspace::workspace_create(tmp.path(), "ri_ws").expect("RI_HARNESS: workspace_create");
+        workspace::workspace_create(dir.path(), "ri_ws").expect("RI_HARNESS: workspace_create");
+    let target_dir = scaffold_target_dir(&ws.root, env!("CARGO_CRATE_NAME"));
+    pin_target_dir(&ws.root, &target_dir);
     let cargo_toml = ws.root.join("Cargo.toml");
     for t in NODE_TYPES {
         let policy = match &t.policy {
@@ -974,15 +980,16 @@ fn build_workspace() -> Workspace {
             .unwrap_or_else(|e| panic!("RI_HARNESS: node_build {}: {e}", t.name));
     }
     Workspace {
-        _tmp: tmp,
+        _dir: dir,
         root: ws.root.clone(),
         graphs_dir: ws.graphs_dir.clone(),
+        target_dir,
     }
 }
 
 /// Every node type's debug cdylib, by type name.
 pub fn built_cdylibs(ws: &Workspace) -> Vec<(&'static str, PathBuf)> {
-    let debug = cdylib_target_base(&ws.root).join("debug");
+    let debug = ws.target_dir.join("debug");
     NODE_TYPES
         .iter()
         .map(|t| (t.name, debug.join(mp_support::dylib_file(t.name))))
@@ -1383,6 +1390,8 @@ pub fn run_live(
     cmd.args(["graph", "run", graph])
         .args(extra)
         .current_dir(&ws.root)
+        // The workers load the node cdylibs from this target directory.
+        .env("CARGO_TARGET_DIR", &ws.target_dir)
         .env("CERULION_NETWORK", "off")
         .env("CERULION_HOME", &home)
         .env(
@@ -1510,8 +1519,7 @@ fn recording_defect(bag: &Path) -> Option<String> {
 /// Record `fixture` live under `placement` with the read log armed: a whole,
 /// finalized bag and the live reads. A recording with a defect
 /// (`recording_defect`) is retried ([`RECORD_ATTEMPTS`]), never judged.
-pub fn record_live(fixture: Fixture, placement: Placement) -> RecordedRun {
-    let ws = workspace();
+pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
         let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
@@ -1682,8 +1690,12 @@ pub fn judge_replayed(
 /// read to misrecord (`<node>:<index>`, see [`PLANT_ENV`]). An exit outside
 /// the mode's contract (a node failure, an internal error, a non-zero plain
 /// playback other than a refusal) panics `RI_HARNESS:`.
-pub fn resim(run: &RecordedRun, mode: ReplayMode, plant: Option<(&str, usize)>) -> Replayed {
-    let ws = workspace();
+pub fn resim(
+    ws: &Workspace,
+    run: &RecordedRun,
+    mode: ReplayMode,
+    plant: Option<(&str, usize)>,
+) -> Replayed {
     let n = std::fs::read_dir(run.dir.path())
         .map(|d| d.count())
         .unwrap_or(0);
@@ -1695,6 +1707,8 @@ pub fn resim(run: &RecordedRun, mode: ReplayMode, plant: Option<(&str, usize)>) 
         .arg(&run.bag)
         .args(mode.args())
         .current_dir(&ws.root)
+        // The replayed nodes load their cdylibs from this target directory.
+        .env("CARGO_TARGET_DIR", &ws.target_dir)
         .env("CERULION_NETWORK", "off")
         .env("CERULION_HOME", &home)
         .env(READS_DIR_ENV, &reads);

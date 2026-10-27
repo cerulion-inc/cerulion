@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The live determinism oracle's node SCAFFOLD: the graph shapes it splits,
 //! the generated node sources (including the read records the oracle judges)
-//! and the one-per-process workspace build. Node TYPES carry a `det_` prefix
+//! and the workspace build. Node TYPES carry a `det_` prefix
 //! (`det_relay`, `det_camera`), so the cdylibs this build leaves in the shared
 //! target directory never stand in for a node type another test expects to
 //! be absent. The read-identity harness (`read_identity/mod.rs`) builds on its
@@ -12,13 +12,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use cerulion_cli_engine::node_cmd::NodeCreateOptions;
 use cerulion_cli_engine::node_cmd::NodeLanguage;
 use cerulion_cli_engine::{node_cmd, workspace};
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::MacroPolicy;
+
+use crate::scaffold_dir::{pin_target_dir, scaffold_target_dir, ScaffoldDir};
 
 /// The graph topic prefix: topics resolve to `/detfree/<node>/<out>`.
 pub const GRAPH_PREFIX: &str = "detfree";
@@ -113,23 +114,20 @@ pub const LATENCY_DIR_ENV: &str = "CER_DET_LATENCY_DIR";
 pub const READS_DIR_ENV: &str = "CER_DET_READS_DIR";
 
 // ===========================================================================
-// Shared scaffold: built ONCE per test process, memoized.
+// The scaffold: one per caller, removed when its `Scaffold` drops.
 // ===========================================================================
 
-/// The one-per-process scaffolded workspace holding both shapes' graphs. The
-/// `TempDir` is stored so the built cdylibs and YAMLs survive the process.
+/// The scaffolded workspace holding every shape's graph.
 pub struct Scaffold {
-    /// Kept alive for the process lifetime so `ws_root` stays valid.
-    pub _tmp: tempfile::TempDir,
+    /// Owns the directory `ws_root` lives in and removes it on drop.
+    pub _dir: ScaffoldDir,
     pub ws_root: PathBuf,
+    /// Where the node cdylibs are built; a process that loads them reads it
+    /// as `CARGO_TARGET_DIR`.
+    pub target_dir: PathBuf,
     /// Graph name -> the config written to `graphs/<name>.yaml`, reused as the
     /// monolith oracle leg's config.
     pub configs: HashMap<&'static str, GraphConfig>,
-}
-
-pub fn scaffold() -> &'static Scaffold {
-    static SCAFFOLD: OnceLock<Scaffold> = OnceLock::new();
-    SCAFFOLD.get_or_init(build_scaffold)
 }
 
 /// The chain's graph config split per `shape`. Serializing this exact struct
@@ -343,10 +341,20 @@ pub fn install_read_buffer(nodes_dir: &Path, node: &str, record: &str, width: us
     );
 }
 
-pub fn build_scaffold() -> Scaffold {
-    let tmp = tempfile::tempdir().expect("DET_HARNESS: temp dir for scaffold workspace");
+/// Scaffold and build the workspace in a new [`ScaffoldDir`]. Every scaffold
+/// of one test binary builds into one target directory
+/// ([`scaffold_target_dir`], keyed by the binary's crate name), so the
+/// dependencies compile once per binary and a later scaffold rebuilds only the
+/// node crates and what depends on the workspace's schemas. A
+/// `read_identity` workspace of the same binary builds into that directory
+/// too; the node type prefixes (`det_`, `ri_`) keep the two sets of cdylibs
+/// apart.
+pub fn scaffold() -> Scaffold {
+    let dir = ScaffoldDir::new("det_ws");
     let ws =
-        workspace::workspace_create(tmp.path(), "det_ws").expect("DET_HARNESS: workspace_create");
+        workspace::workspace_create(dir.path(), "det_ws").expect("DET_HARNESS: workspace_create");
+    let target_dir = scaffold_target_dir(&ws.root, env!("CARGO_CRATE_NAME"));
+    pin_target_dir(&ws.root, &target_dir);
     let cargo_toml = ws.root.join("Cargo.toml");
 
     // ticker: pure Period 1ms source (no inputs, one output).
@@ -440,8 +448,9 @@ pub fn build_scaffold() -> Scaffold {
     }
 
     Scaffold {
-        _tmp: tmp,
+        _dir: dir,
         ws_root: ws.root,
+        target_dir,
         configs,
     }
 }
@@ -592,23 +601,6 @@ pub fn read_records(dir: &Path) -> Reads {
         );
     }
     out
-}
-
-/// Mirror of `graph_cmd::cdylib_target_base`: honor `CARGO_TARGET_DIR` (absolute
-/// or workspace-relative) exactly as cargo and `node_build` do, else
-/// `<ws>/target`.
-pub fn cdylib_target_base(ws_root: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(v) if !v.is_empty() => {
-            let dir = PathBuf::from(v);
-            if dir.is_absolute() {
-                dir
-            } else {
-                ws_root.join(dir)
-            }
-        }
-        _ => ws_root.join("target"),
-    }
 }
 
 /// A node's first read that differs from the monolith's: its index into the
