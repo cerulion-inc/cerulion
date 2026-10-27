@@ -86,15 +86,17 @@ jobs:
     # needs it, never through a step's `env:` block: the run log prints a
     # step's env values, and that copy would outlive an edit or a delete of the
     # text, the guard's own clean up included. This filter is the one reading
-    # both steps use: the comment's body, or the issue's when the event carries
-    # no comment text. Run with `jq -e`, a payload with neither a comment nor an
-    # issue, an empty file or `null` fails rather than reading as an empty body.
+    # both steps use, keyed on the payload's shape: a comment event's body is
+    # the comment's own text and nothing else, an issue event's body is the
+    # issue's. The forge sends `null` for an issue opened with no description,
+    # which is an empty body. A comment with no text, an issue with no `body`
+    # key, an empty file or a payload that is not an object produces no string,
+    # so `jq -e` fails rather than reading it as an empty body. The leak
+    # scanner's self-test runs this filter on hand-written payloads.
     env:
       LG_BODY_JQ: >-
-        if (.comment == null and .issue == null)
-        then error("no comment or issue in the event payload")
-        elif (.comment.body // "") != "" then .comment.body
-        else (.issue.body // "") end
+        objects | if has("comment") then .comment.body | strings
+        else .issue | objects | select(has("body")) | .body // "" | strings end
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

@@ -199,7 +199,10 @@ title or a body out of the event payload file inside the step and set that varia
 there. They never pass it through a step's `env:` block, an action's `with:` inputs or
 any other `${{ }}` expression the run log prints, because the log keeps that copy after
 the text is edited or deleted. The scanner self-test refuses any workflow under
-`.github/workflows` that does. `names` mode scans paths and
+`.github/workflows` that does. An issue or a pull request opened with no description
+reads as an empty body; a payload that is missing the text, such as a comment with no
+body, stops the scan and fails the check, and never reads as a clean empty body.
+`names` mode scans paths and
 the branch name. `media` mode parses PNG, JPEG, GIF, WebP and the MP4 and MOV family
 for comments, EXIF, XMP, location boxes and trailing bytes; a document, archive or
 container no walker can read is a hit until an allowlist entry names it.

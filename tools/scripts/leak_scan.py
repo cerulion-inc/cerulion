@@ -3510,7 +3510,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 262
+EXPECTED_ARMS = 263
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -3540,6 +3540,31 @@ def _workflow_triggers(path):
     except OSError:
         return None
     return set(TRIGGER_RX.findall(m.group(1))) if m else None
+
+
+def _workflow_folded_value(path, name):
+    """The folded (`>-`) value that workflow gives the key `name`, as YAML
+    reads it: the lines under the key joined with single spaces. None when the
+    file or the key cannot be read, so the caller fails the arm rather than
+    testing a value the workflow does not ship."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            lines = fh.read().split('\n')
+    except OSError:
+        return None
+    key = re.compile(r'^( *)' + re.escape(name) + r': >-$')
+    for i, line in enumerate(lines):
+        m = key.match(line)
+        if not m:
+            continue
+        parts = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip(' ')) <= len(m.group(1)):
+                break
+            if nxt.strip():
+                parts.append(nxt.strip())
+        return ' '.join(parts) or None
+    return None
 
 
 # Text people write around the repository, as an expression can reach it: a
@@ -5504,6 +5529,70 @@ def self_test(out, base_env, argv0):
         found = _workflows_printing_event_text(os.path.dirname(wf))
         arm('workflows-never-print-a-body-or-title-into-the-run-log', found == [],
             'unreadable workflow folder' if found is None else ', '.join(found))
+        # So the workflows read the text out of the event payload file with jq.
+        # Those filters are read OUT of the shipped YAML and run, with the flags
+        # the workflows pass, on hand-written payloads. A body the forge sends
+        # as `null`, an issue or a pull request opened with no description, is
+        # an empty body. A body that is absent, a comment with no text, an
+        # unreadable payload, is a read that failed, never an empty body to
+        # call clean, and the comment's own text is never swapped for the
+        # issue's.
+        main_wf = os.path.join(os.path.dirname(wf), 'leak-guard.yml')
+        filters = {name: _workflow_folded_value(path, name)
+                   for path, name in ((wf, 'LG_BODY_JQ'), (main_wf, 'LG_PR_TITLE_JQ'),
+                                      (main_wf, 'LG_PR_BODY_JQ'))}
+        comment = '{"action":"%s","comment":%s,"issue":{"body":"the issue"}}'
+        pr = '{"pull_request":%s}'
+        jq_rows = [
+            ('LG_BODY_JQ', comment % ('created', '{"body":"a comment"}'), 'a comment'),
+            ('LG_BODY_JQ', comment % ('deleted', '{"body":"a comment"}'), 'a comment'),
+            ('LG_BODY_JQ', comment % ('edited', '{"body":""}'), ''),
+            ('LG_BODY_JQ', comment % ('edited', '{"body":null}'), None),
+            ('LG_BODY_JQ', comment % ('edited', '{"id":7}'), None),
+            ('LG_BODY_JQ', comment % ('edited', 'null'), None),
+            ('LG_BODY_JQ', '{"comment":{"body":"a review note"},"pull_request":{}}',
+             'a review note'),
+            ('LG_BODY_JQ', '{"issue":{"body":"line one\\r\\nline two \\u00e9"}}',
+             'line one\r\nline two é'),
+            ('LG_BODY_JQ', '{"issue":{"title":"t","body":null}}', ''),
+            ('LG_BODY_JQ', '{"issue":{"title":"t"}}', None),
+            ('LG_BODY_JQ', '{"issue":null}', None),
+            ('LG_BODY_JQ', '{}', None),
+            ('LG_BODY_JQ', 'null', None),
+            ('LG_BODY_JQ', '', None),
+            ('LG_PR_TITLE_JQ', pr % '{"title":"fix: a title","body":null}', 'fix: a title'),
+            ('LG_PR_TITLE_JQ', pr % '{"title":null,"body":"b"}', None),
+            ('LG_PR_TITLE_JQ', pr % '{"body":"b"}', None),
+            ('LG_PR_TITLE_JQ', pr % 'null', None),
+            ('LG_PR_TITLE_JQ', '{"merge_group":{"head_sha":"a"}}', ''),
+            ('LG_PR_TITLE_JQ', '{"before":"a","after":"b"}', ''),
+            ('LG_PR_TITLE_JQ', 'null', None),
+            ('LG_PR_TITLE_JQ', '', None),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t","body":"a body\\n"}', 'a body\n'),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t","body":null}', ''),
+            ('LG_PR_BODY_JQ', pr % '{"title":"t"}', None),
+            ('LG_PR_BODY_JQ', pr % 'null', None),
+            ('LG_PR_BODY_JQ', '{"merge_group":{"head_sha":"a"}}', ''),
+            ('LG_PR_BODY_JQ', '{"before":"a","after":"b"}', ''),
+            ('LG_PR_BODY_JQ', 'null', None),
+            ('LG_PR_BODY_JQ', '', None),
+        ]
+        payload = os.path.join(tmp, 'event.json')
+        jq_bad = [n for n, f in sorted(filters.items()) if f is None]
+        for i, (name, text, want) in enumerate(jq_rows if not jq_bad else []):
+            with open(payload, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+            try:
+                p = subprocess.run(['jq', '-e', '-j', filters[name], payload],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                got = p.stdout.decode('utf-8') if p.returncode == 0 else None
+            except OSError as exc:
+                jq_bad.append('jq could not run: %s' % exc)
+                break
+            if got != want:
+                jq_bad.append('row %d %s: got %r, want %r' % (i, name, got, want))
+        arm('workflows-read-the-payload-text-and-fail-closed-on-a-missing-body',
+            not jq_bad, 'unreadable or wrong: ' + '; '.join(jq_bad))
         # The workflows set the body variables in the step's own shell, so
         # a variable the flag names but nobody set is a broken handoff: the run
         # must not happen, never scan an empty body and call it clean.
