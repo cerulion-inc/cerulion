@@ -1107,10 +1107,13 @@ jobs:
       # future pull request. A gate whose own regex is broken must not be
       # discovered by an author who cannot merge.
       #
-      # The values come from the event payload through the ENVIRONMENT, never
-      # interpolated into the shell: a PR title is attacker-controlled text and
-      # `${{ github.event.pull_request.title }}` inside a `run:` block is a
-      # script-injection seam.
+      # The values come from the event payload, never interpolated into the
+      # shell: a PR title is attacker-controlled text and the title expression
+      # inside a `run:` block is a script-injection seam. The title is read out
+      # of the payload file by this step's own `run:` block and handed to the
+      # script with `--title`, not through the step's `env:` block: the run log
+      # prints a step's env values, and that copy would outlive an edit of the
+      # title. The script does not print a title it refuses, for the same reason.
       - name: PR title and branch convention
         # PULL REQUESTS ONLY, deliberately not merge_group: this step reads
         # `github.event.pull_request.title` and `.head.ref`, and a merge_group
@@ -1120,7 +1123,6 @@ jobs:
         # place they exist.
         if: github.event_name == 'pull_request'
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           # The number is minted by THIS repository and never reused; the head
           # ref is fork-controlled text. The grandfather list in the script is
@@ -1134,6 +1136,9 @@ jobs:
           # maintainer push to a bot branch would change it.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
+          # The run shell is `bash -e`, so a payload that cannot be read stops
+          # the step rather than checking an empty title.
+          PR_TITLE=$(jq -e -j '.pull_request.title' "$GITHUB_EVENT_PATH")
           ./tools/scripts/check_pr_title.sh --self-test
           ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
