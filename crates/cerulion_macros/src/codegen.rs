@@ -1652,7 +1652,7 @@ fn gen_cdylib(
                             // Instance-lock poison containment: drive
                             // the user's `external_source()` under an INNER
                             // `catch_unwind` so a panicking override does NOT unwind
-                            // through the live instance guard (`guard`) — an
+                            // through the live instance guard (`guard`): an
                             // unwind through it would poison the instance lock and
                             // brick this node instance. `external_source` is a
                             // one-shot pre-binding query; unlike `tick`, torn node

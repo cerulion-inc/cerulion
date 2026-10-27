@@ -7138,7 +7138,7 @@ fn worker_transport(
 /// so the supervisor sees each unit as it sees a worker process. The units of
 /// one process share its fate: the first one to return, with an error or
 /// without, clears `running`, which stops the others at their next step
-/// boundary, and the process reports the worst outcome — an error, then a
+/// boundary, and the process reports the worst outcome: an error, then a
 /// node-fatal verdict, then success.
 pub fn graph_run_worker_host(
     workspace_root: &Path,
@@ -12145,7 +12145,7 @@ fn graph_run_supervisor(
                 ReadyWait::Ready => {}
                 ReadyWait::CtrlC => {
                     // Stop spawning further workers; drain the ones already up
-                    // (NOT a fail-loud — user-initiated). The JOIN loop below
+                    // (NOT a fail-loud: user-initiated). The JOIN loop below
                     // flips to Draining on its first pass (`running` is false)
                     // and SIGINTs every spawned worker, flipping each one's own
                     // `running` so its `wait_for_go` returns early and
