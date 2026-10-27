@@ -59,6 +59,9 @@ pub mod login_cmd;
 // The robot-gateway discovery LADDER — the shared peer types + the
 // parallel gather engine (mDNS / cache / hostname rungs under one ceiling).
 pub mod discovery_ladder;
+// `cerulion doctor`: read-only host checks, each a pure decision over one
+// reading, with the fix for every warning and failure.
+pub mod doctor;
 pub mod error;
 // `cerulion flashback` — the operator's manual trigger, and the
 // one surface a capture refusal's loud, numbered report has to reach.

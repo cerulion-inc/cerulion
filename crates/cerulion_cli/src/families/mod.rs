@@ -31,6 +31,7 @@ use cerulion_cli_engine::error::{render_user_error, CliResult};
 
 use crate::cli::{Cli, VerbLogClass};
 
+mod doctor;
 mod nested;
 mod schema;
 
@@ -63,7 +64,7 @@ pub(crate) trait VerbFamily: Sync {
 }
 
 /// Every registered family. Adding a family is one line here.
-pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema];
+pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema, &doctor::Doctor];
 
 /// Why a set of families cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]

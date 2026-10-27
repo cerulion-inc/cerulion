@@ -380,6 +380,31 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | `cerulion logout` | Sign this machine out. Removes the session and refresh tokens from `~/.cerulion/auth.json` (the account id and the signed-in-before marker stay, the same record Cerulion Studio's "Sign out" writes), then revokes the session at the account service (`POST /v1/auth/revoke`). Every command the login gate covers is then refused (exit 7, "signed out") until the next `cerulion login`; at a terminal that command starts the sign-in instead. STDOUT is one line, `signed_out: account=<id>`, or `not_signed_in` when no session was stored (exit 0, nothing changed). Exit 1 when `auth.json` could not be rewritten (nothing was signed out), or when the machine was signed out but the service did not confirm the revoke (offline, service error): the session then stays valid at the service until it expires. A cached device certificate is left; revoke the device with `cerulion account devices revoke`. |
 | `cerulion account devices list` / `devices revoke <DEVICE_ID>` | List and revoke the desks enrolled on your account: self-service management of your own machines. Robot access management lives in Studio and the web account page, not the CLI. |
 
+### `cerulion doctor`
+
+`cerulion doctor [--json] [--local] [--check ID]... [--timeout-ms MS]` checks this host for problems that slow or stop Cerulion. Each check reads one fact about the machine and reports `pass`, `info` (a fact with no judgement), `warn` (Cerulion works, slower or less reliably in the way the line says), `fail` (a Cerulion feature does not work here as the machine is) or `skip` (the check does not apply on this platform, or was not run on request). Every `warn` and `fail` prints why it matters and the exact command or edit that fixes it. No check needs root, and none writes a file or changes a sysctl or a network setting; `limits.open-files` raises the verb's own soft open-file limit the way `graph run` does, so it reads the limit a graph gets. The verb runs on a machine that has never signed in: the login gate does not run before it. Like every command it sends one usage event when telemetry is on; no finding is in it.
+
+| Flag | Effect |
+|---|---|
+| `--json` | Print the report as one JSON object on stdout instead of the table. |
+| `--local` | Skip the checks that use the network; no check in this release does. `CERULION_NETWORK=off` does the same. |
+| `--check ID` | Run only this check; repeatable. An unknown id is a usage error (exit 2). |
+| `--timeout-ms MS` | How long to wait for the checks, which run at the same time. A check that has not answered by then is reported as `warn` and nothing it would have read is shown. Default 4000: twice the bounded scan the stale-node check makes. |
+
+Exit 0 when no check failed (warnings included), 1 when any check failed, 2 for a usage error.
+
+The JSON object carries `report_version` (1; it changes only when a field is removed or changes meaning), `cerulion_version`, `os`, `arch`, `timeout_ms`, `exit_code`, `counts` (one number per status) and `checks`, one entry per check in the order below: `id`, `status`, `summary`, `why`, `fix` (a string for every `warn` and `fail`, else `null`), `network`, `elapsed_ms` (`null` for a check that did not answer) and `readings`, the named values the check read. A check id is never reused for another meaning.
+
+| Check | Reads | Fails or warns when |
+|---|---|---|
+| `limits.open-files` | The open-file limit after the raise `graph run` makes, and each workspace graph's ports | Fails when `graph run` would refuse a workspace graph at that limit; the fix is the refusal's own remedy |
+| `shm.dev-shm` | Linux: `/dev/shm` size, free space and mount flags | Fails when it is missing or read-only; warns when one scheduler-trace ring no longer fits |
+| `shm.stale-nodes` | The iceoryx2 node registry, and on macOS the `/tmp/*.shm_state` files, read the way `cerulion clean --report-only` reads them | Warns when dead processes left nodes or state files (the fix is `cerulion clean`), or when the registry or the state-file scan could not be read in full |
+| `iceoryx2.cwd-config` | `config/iceoryx2.toml` in the current directory against the user and system iceoryx2 config | Warns when a process started here uses another shared-memory root or prefix than one started elsewhere |
+| `disk.recordings` | The filesystem under `./recordings`, where `graph run --record` writes, or the current directory, where `bag record` writes | Fails when it is read-only, not writable or full; warns when it is tmpfs |
+| `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, the sign-in file cannot be read or parsed, or no config directory resolves |
+| `cpu.governor` | Linux: each CPU's frequency governor, floor and maximum | Never: it is `info` only, and Cerulion changes no governor |
+
 ### Other
 
 | Command | Effect |
