@@ -245,8 +245,11 @@ pub async fn serve_endpoint(
 struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
-    /// Abort the task and wait for it to end. A blocking step it already
-    /// started (one file apply) runs to completion first.
+    /// Abort the task and wait for the aborted future to end. An apply already
+    /// handed to the blocking pool is not awaited: it runs to completion on its
+    /// own. That apply replaces the trust store by a rename in the same
+    /// directory, so the store file holds the old store or the new one, never
+    /// a torn one.
     async fn stop(mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
