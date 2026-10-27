@@ -151,8 +151,8 @@ fn authorize_via_magic_link(port: u16, email: &CapturingEmailSender, user_code: 
 }
 
 /// Log in for real against the running service and return the session-bearing
-/// [`AuthState`] (writes `auth.json`, `identity/device.key` and `device.cert` under
-/// the current `CERULION_HOME`).
+/// [`AuthState`] (writes `auth.json`, `identity/device.key` (aliased as `desk.key`)
+/// and `device.cert` under the current `CERULION_HOME`).
 fn login(port: u16, email: &Arc<CapturingEmailSender>) -> AuthState {
     let buf = SharedBuf::new();
     let worker = std::thread::spawn({
