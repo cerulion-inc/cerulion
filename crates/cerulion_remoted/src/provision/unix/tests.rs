@@ -223,6 +223,32 @@ async fn a_valid_mac_without_the_registered_owner_binding_is_not_complete_state(
 }
 
 #[tokio::test]
+async fn a_store_claimed_by_another_account_is_refused_even_with_the_owner_binding() {
+    let (_temporary, config, bundle) = setup();
+    let registered = provision(&config, NOW).unwrap();
+    let dir = config.state_root.join(REMOTED_SUBDIR);
+    let mac = fs::read(dir.join(TRUST_STORE_MAC_KEY_FILENAME)).unwrap();
+    let secret = fs::read(dir.join(CHASSIS_SECRET_FILENAME)).unwrap();
+    let roots: RootSet =
+        postcard::from_bytes(&hex::decode(&bundle.root_set_postcard).unwrap()).unwrap();
+    let mut store =
+        TrustStore::provision(ROBOT, registered.endpoint_id, roots, &secret, NOW).unwrap();
+    store
+        .claim(AccountId([0x61; 32]), &secret, PrincipalKind::Human, NOW)
+        .unwrap();
+    let path = dir.join(TRUST_STORE_FILENAME);
+    reserve_save_temp(&path).unwrap();
+    store.with_path(&path).save(&mac).unwrap();
+    let before = snapshot(&dir);
+    let error = provision(&config, NOW).unwrap_err().to_string();
+    assert!(
+        error.contains("robot state does not match the registered identity and owner"),
+        "{error}"
+    );
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[tokio::test]
 async fn invalid_owner_proofs_refuse_before_creating_robot_state() {
     for change in 0..6 {
         let (_temporary, config, mut bundle) = setup();
