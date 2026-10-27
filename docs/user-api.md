@@ -409,6 +409,9 @@ The JSON object carries `report_version` (1; it changes only when a field is rem
 | `gpu.cuda` | Linux: the NVIDIA driver version, `/dev/nvidia<N>` devices, Jetson release, CUDA toolkit version and whether the loader cache names `libcuda.so.1`, from files only | Warns when this host has an NVIDIA device node or is a Jetson and `/etc/ld.so.cache` does not name `libcuda.so.1`; otherwise `info` |
 | `ros.distro` | `ROS_DISTRO`, `ROS_VERSION` and `AMENT_PREFIX_PATH` | Never: `info` when a ROS 2 distribution is sourced, `skip` when none is (a ROS 1 shell, `ROS_VERSION=1`, counts as none) |
 | `ros.rmw` | Whether `librmw_cerulion.so` is where `cerulion ros2 run` looks (`CERULION_LIB_DIR`, else beside `cerulion`), and `RMW_IMPLEMENTATION` | Fails when a ROS 2 environment is sourced and the library is missing or its directory cannot be resolved (the fix is the one `ros2 run` prints); warns or informs otherwise. Not applicable on macOS |
+| `account.certificates` | `device.cert` in the Cerulion config directory: its validity window and whether it attests this machine's device key (no network, no signature or chain check) | Fails when it is expired, unusable, or issued for another device key, or when this machine's device key cannot be read or `device.key` and `desk.key` disagree; warns when it is not valid yet; `skip` when there is none |
+| `daemon.netd` | The `cerulion-netd` control socket, with one `status` request that registers nothing; no daemon is started, and the connection restarts a desk daemon's idle grace | Warns when the socket cannot be reached or the daemon does not answer its status; `info` when it is not running |
+| `daemon.remoted` | `cerulion-remoted` beside `cerulion`, and on Linux whether one runs | Never: `info` only |
 
 ### Other
 
