@@ -135,7 +135,8 @@ pub(super) struct StaleReading {
 pub(super) struct StateFileScan {
     /// The directory scanned.
     pub(super) dir: String,
-    /// Files whose creator is provably gone, plus empty orphans.
+    /// Files whose creator is provably gone plus empty files past their
+    /// minimum age (the two populations `cerulion clean` reclaims).
     pub(super) dead: u64,
     /// Why the scan did not see every file: refused, out of budget, or
     /// entries skipped. `None` when it saw them all.
@@ -162,8 +163,12 @@ pub(super) fn decide_stale(r: &StaleReading) -> Outcome {
     }
     if let Some(scan) = r.state_files.as_ref().filter(|s| s.dead > 0) {
         found.push(format!(
-            "{} whose creator is gone in {}",
-            plural(scan.dead, ".shm_state file", ".shm_state files"),
+            "{} in {}",
+            plural(
+                scan.dead,
+                "dead or empty .shm_state file",
+                "dead or empty .shm_state files"
+            ),
             scan.dir
         ));
     }
@@ -220,10 +225,16 @@ fn scan_incomplete(scan: &crate::shm_state::ShmStateReport) -> Option<String> {
             "the state files in {dir} could not be scanned ({refused})"
         ));
     }
-    if scan.truncated || scan.classification_truncated {
+    if scan.truncated {
         return Some(format!(
             "the scan of {dir} ran out of its time budget after {} files",
             scan.counted
+        ));
+    }
+    if scan.classification_truncated {
+        return Some(format!(
+            "the scan of {dir} classified {} of {} files before its time budget ran out",
+            scan.classified, scan.counted
         ));
     }
     (scan.skipped_entries > 0).then(|| {
@@ -419,8 +430,7 @@ mod tests {
         let o = decide_stale(&reading(1, 0, Some(1)));
         assert_eq!(
             o.summary,
-            "1 dead iceoryx2 node in /tmp/iceoryx2/nodes and 1 .shm_state file whose creator is \
-             gone in /tmp left"
+            "1 dead iceoryx2 node in /tmp/iceoryx2/nodes and 1 dead or empty .shm_state file in /tmp left"
         );
     }
 

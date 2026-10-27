@@ -10,6 +10,10 @@
 //! directory and file prefix every shared-memory topic lives under, so two
 //! processes that load different values do not see each other's topics.
 //!
+//! The user file is looked for under `$HOME`; iceoryx2 itself uses the home
+//! directory of the user's passwd entry, which differs only when `HOME` was
+//! changed for this process.
+//!
 //! This check reads the project file of the current directory and the file
 //! (or the defaults) a process started anywhere else would load, and compares
 //! the two keys.

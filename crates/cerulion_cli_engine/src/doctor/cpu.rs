@@ -39,8 +39,7 @@ pub(super) fn decide(cpus: &[CpuFreq]) -> Outcome {
     if cpus.is_empty() {
         return Outcome::new(
             Status::Info,
-            "no cpufreq interface under /sys/devices/system/cpu (common in a virtual machine), \
-             so the clock is managed outside this kernel",
+            "no cpufreq directory under /sys/devices/system/cpu, so there is no governor to read",
         )
         .reading("cpus", Reading::Int(0));
     }

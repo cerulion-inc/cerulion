@@ -387,7 +387,7 @@ Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
 | Flag | Effect |
 |---|---|
 | `--json` | Print the report as one JSON object on stdout instead of the table. |
-| `--local` | Skip the checks that use the network. `CERULION_NETWORK=off` does the same. |
+| `--local` | Skip the checks that use the network; no check in this release does. `CERULION_NETWORK=off` does the same. |
 | `--check ID` | Run only this check; repeatable. An unknown id is a usage error (exit 2). |
 | `--timeout-ms MS` | How long to wait for the checks, which run at the same time. A check that has not answered by then is reported as `warn` and nothing it would have read is shown. Default 4000: twice the bounded scan the stale-node check makes. |
 
@@ -399,10 +399,10 @@ The JSON object carries `report_version` (1; it changes only when a field is rem
 |---|---|---|
 | `limits.open-files` | The open-file limit after the raise `graph run` makes, and each workspace graph's ports | Fails when `graph run` would refuse a workspace graph at that limit; the fix is the refusal's own remedy |
 | `shm.dev-shm` | Linux: `/dev/shm` size, free space and mount flags | Fails when it is missing or read-only; warns when one scheduler-trace ring no longer fits |
-| `shm.stale-nodes` | The iceoryx2 node registry, and on macOS the `/tmp/*.shm_state` files, read the way `cerulion clean --report-only` reads them | Warns when dead processes left nodes or state files; the fix is `cerulion clean` |
+| `shm.stale-nodes` | The iceoryx2 node registry, and on macOS the `/tmp/*.shm_state` files, read the way `cerulion clean --report-only` reads them | Warns when dead processes left nodes or state files (the fix is `cerulion clean`), or when the registry or the state-file scan could not be read in full |
 | `iceoryx2.cwd-config` | `config/iceoryx2.toml` in the current directory against the user and system iceoryx2 config | Warns when a process started here uses another shared-memory root or prefix than one started elsewhere |
 | `disk.recordings` | The filesystem under `./recordings`, where `graph run --record` writes, or the current directory, where `bag record` writes | Fails when it is read-only, not writable or full; warns when it is tmpfs |
-| `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, or the file cannot be parsed |
+| `account.login` | The local sign-in state, with no network | Fails when this machine never signed in, signed out, the sign-in file cannot be read or parsed, or no config directory resolves |
 | `cpu.governor` | Linux: each CPU's frequency governor, floor and maximum | Never: it is `info` only, and Cerulion changes no governor |
 
 ### Other

@@ -7,7 +7,9 @@
 //! reports the limits in force afterwards. Inside a workspace it estimates
 //! every graph under `graphs/` with
 //! [`cerulion_core::fd_limit::open_file_shortfall`], the estimate `graph run`
-//! refuses a graph on, so a graph this check flags is one `graph run` refuses.
+//! refuses a graph on. When the raise reports no limit, the check reads the
+//! current limit instead (`graph run` then refuses nothing), and
+//! `CERULION_OPEN_FILE_CHECK=0` turns `graph run`'s refusal into a warning.
 
 use std::path::Path;
 
@@ -93,8 +95,13 @@ pub(super) fn decide(
                 base(
                     Status::Warn,
                     format!(
-                        "{summary}, but {unparsed_graphs} graph files under graphs/ did not \
-                         parse and were not estimated"
+                        "{summary}, but {} under graphs/ did not parse and were not \
+                         estimated",
+                        if unparsed_graphs == 1 {
+                            "1 graph file".to_string()
+                        } else {
+                            format!("{unparsed_graphs} graph files")
+                        }
                     ),
                 )
                 .with_fix(
