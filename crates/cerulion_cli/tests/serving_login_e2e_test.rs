@@ -22,7 +22,9 @@ fn run(root: &Path, home: &Path, args: &[&str], network_off: bool) -> Output {
         .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
         .env("NO_COLOR", "1")
-        .env_remove("CERULION_LOGIN_GATE")
+        // The command-wide login gate is off, so each arm reaches the serving
+        // gate, which `CERULION_LOGIN_GATE` does not switch off.
+        .env("CERULION_LOGIN_GATE", "off")
         .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")
         .stdin(Stdio::null());
