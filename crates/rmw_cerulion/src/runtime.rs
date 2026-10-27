@@ -82,7 +82,7 @@ pub struct EndpointRecord {
     pub node_namespace: String,
     /// The topic's ROS graph type name ("pkg/msg/Name").
     pub type_name: String,
-    /// Deterministic entity gid (== `rmw_get_gid_for_publisher`).
+    /// Entity gid (== `rmw_get_gid_for_publisher` for a publisher).
     pub endpoint_gid: [u8; 16],
     /// QoS the endpoint was created with.
     pub qos: QosSnapshot,
@@ -700,6 +700,8 @@ pub struct PublisherData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<PublisherInner>,
+    /// Entity gid ([`crate::gid`]), also carried by the iceoryx2 port's name
+    /// ([`crate::gid::publisher_port_name`]).
     pub gid: [u8; 16],
     pub sequence: AtomicU64,
     /// Flood-suppressed loudness + an unconditional counter for
@@ -873,6 +875,9 @@ pub struct SubscriptionInner {
     /// adopted take — the all-or-nothing rollback ledger (see
     /// `adopt_ranges`).
     pub adopt_registered: Vec<(usize, usize)>,
+    /// Resolves each taken sample's origin publisher id to the publisher's
+    /// rmw gid, reported in `rmw_message_info_t::publisher_gid`.
+    pub publisher_gids: crate::gid::PublisherGidResolver,
 }
 
 /// One outstanding loaned take.
@@ -1051,8 +1056,7 @@ pub struct SubscriptionData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<SubscriptionInner>,
-    /// Deterministic per-process entity gid (entity counter + schema
-    /// hash, never random) — the endpoint id reported by
+    /// Entity gid ([`crate::gid`]): the endpoint id reported by
     /// `rmw_get_subscriptions_info_by_topic` and the key the graph
     /// registry deregisters by on destroy.
     pub gid: [u8; 16],
@@ -1139,6 +1143,8 @@ pub struct ClientData {
     pub request_bridge: Arc<crate::bridge::AnyBridge>,
     pub response_bridge: Arc<crate::bridge::AnyBridge>,
     pub client: Mutex<cerulion_core::transport::service::ServiceClient>,
+    /// Entity gid ([`crate::gid`]): `rmw_get_gid_for_client`, the request
+    /// header's writer guid and the client's reply topic.
     pub gid: [u8; 16],
     /// See [`SubscriptionData::decode_failures`] — a response the
     /// bridge cannot decode must not be dropped silently.

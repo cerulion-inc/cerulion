@@ -431,23 +431,28 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         *taken = false;
         let data = &*((*subscription).data as *const crate::runtime::SubscriptionData);
         // Poisoned = wedged: never re-enter torn iceoryx2 state.
-        let Some(inner) = runtime::lock_unpoisoned(&data.inner) else {
+        let Some(mut inner) = runtime::lock_unpoisoned(&data.inner) else {
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
 
         let mut frame: Option<Vec<u8>> = None;
-        let mut info_out: Option<(u64, u64)> = None;
+        let mut info_out: Option<(u64, u64, u128)> = None;
         let receive = inner.subscriber.try_receive_one(|msg| {
+            let origin = msg.origin();
             // Reassemble the full frame (header + payload) — "cerulion"
             // serialization format IS the wire frame.
             let header = msg.header();
             let mut buf = vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
             header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
             buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             frame = Some(buf);
         });
+        let publisher_gid = match info_out {
+            Some((_, _, origin)) if !message_info.is_null() => inner.publisher_gids.resolve(origin),
+            _ => [0u8; 16],
+        };
         drop(inner);
         if let Err(e) = receive {
             tracing::error!(topic = %data.topic, error = %e, "serialized take failed");
@@ -471,7 +476,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         // like the deserializing take path does.
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match crate::runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -479,7 +484,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, &publisher_gid);
             info.from_intra_process = false;
             *message_info = info;
         }

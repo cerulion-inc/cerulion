@@ -5,7 +5,7 @@
 
 use std::os::raw::{c_char, c_void};
 
-use cerulion_core::transport::service::{derive_client_guid, ServiceEnvelope};
+use cerulion_core::transport::service::ServiceEnvelope;
 use cerulion_core::wire::MaxSliceLen;
 
 use crate::bridge::AnyBridge;
@@ -403,14 +403,9 @@ pub unsafe extern "C" fn rmw_create_client(
             return std::ptr::null_mut();
         };
 
-        let node_data = &*((*node).data as *const crate::runtime::NodeData);
-        // Deterministic GUID: node identity + service + per-process entity
-        // counter (replay-stable; never random).
-        let guid = derive_client_guid(
-            &format!("{}/{}", node_data.namespace, node_data.name),
-            &info.service_name_cerulion,
-            runtime::next_entity_id(),
-        );
+        // The entity gid (`crate::gid`), host-unique, so two processes'
+        // clients of one service never share a reply topic.
+        let guid = crate::gid::mint_gid();
 
         let client = match rt.transport.create_service_client(
             &info.service_name_cerulion,
