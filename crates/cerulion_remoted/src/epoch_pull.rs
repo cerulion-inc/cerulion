@@ -63,11 +63,11 @@ pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
         }
         _ => {
             tracing::warn!(
-                "{KEY_RECHECK_ENV}={value:?} is not whole seconds from {} to {}; using the \
-                 default {} s",
-                MIN_KEY_RECHECK_INTERVAL.as_secs(),
-                MAX_KEY_RECHECK_INTERVAL.as_secs(),
-                KEY_RECHECK_INTERVAL.as_secs()
+                value = ?value,
+                min_s = MIN_KEY_RECHECK_INTERVAL.as_secs(),
+                max_s = MAX_KEY_RECHECK_INTERVAL.as_secs(),
+                default_s = KEY_RECHECK_INTERVAL.as_secs(),
+                "{KEY_RECHECK_ENV} is not whole seconds within min_s..=max_s; using default_s"
             );
             KEY_RECHECK_INTERVAL
         }

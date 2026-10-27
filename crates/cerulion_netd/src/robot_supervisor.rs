@@ -319,11 +319,11 @@ pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
         Ok(period) if (MIN_EPOCH_SYNC_PERIOD..=MAX_EPOCH_SYNC_PERIOD).contains(&period) => period,
         _ => {
             tracing::warn!(
-                "{EPOCH_SYNC_PERIOD_ENV}={value:?} is not whole seconds from {} to {}; using \
-                 the default {} s",
-                MIN_EPOCH_SYNC_PERIOD.as_secs(),
-                MAX_EPOCH_SYNC_PERIOD.as_secs(),
-                DEFAULT_EPOCH_SYNC_PERIOD.as_secs()
+                value = ?value,
+                min_s = MIN_EPOCH_SYNC_PERIOD.as_secs(),
+                max_s = MAX_EPOCH_SYNC_PERIOD.as_secs(),
+                default_s = DEFAULT_EPOCH_SYNC_PERIOD.as_secs(),
+                "{EPOCH_SYNC_PERIOD_ENV} is not whole seconds within min_s..=max_s; using default_s"
             );
             DEFAULT_EPOCH_SYNC_PERIOD
         }

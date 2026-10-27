@@ -312,6 +312,11 @@ created_dev=1
 device "mkdir -p '$DEV' '$DEV/basic_timer/target/$TRIPLE/debug' '$DEV/config' '$DEV/basic_timer/config' && mkdir -m 700 '$DEV/shm'" 
 device "printf '[global]\nroot-path = \"%s/iceoryx2\"\n' '$DEV' > '$DEV/config/iceoryx2.toml' && cp '$DEV/config/iceoryx2.toml' '$DEV/basic_timer/config/iceoryx2.toml'"
 device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; mkdir -p \"\$HOME\" \"\$TMPDIR\""
+# Serving needs a saved login even with CERULION_LOGIN_GATE=off. This is a
+# fixture login: an expired session the serving gate accepts offline. The
+# device netd points its account service at a closed loopback port, so no
+# registration or refresh leaves the emulator.
+device "mkdir -p '$DEV/home/.cerulion' && printf '%s' '{\"account_id\":\"00112233-4455-4677-8899-aabbccddeeff\",\"session_token\":\"e2e-expired-session\",\"refresh_token\":\"e2e-offline-refresh\",\"expires_at_ns\":0,\"logged_in_ever\":true}' > '$DEV/home/.cerulion/auth.json' && chmod 600 '$DEV/home/.cerulion/auth.json'"
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
@@ -328,7 +333,7 @@ done < <(printf '%s\n' "${node_libs[@]}")
 device "chmod 755 '$DEV_CER' '$DEV_NETD'"
 pass "device push" "node_libraries=${#node_libs[@]}"
 
-device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
+device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_ACCOUNT_SERVICE=http://127.0.0.1:1 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
 started_netd=1
 deadline=$((SECONDS + 20))
 ready=0

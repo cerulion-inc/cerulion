@@ -1857,13 +1857,13 @@ fn validate_hello(line: &str) -> Result<u32, ClientError> {
         .map_err(|e| ClientError::Protocol(format!("unparseable hello banner: {e}")))?;
     if hello.hello != HELLO_MARKER {
         return Err(ClientError::Protocol(format!(
-            "unexpected banner marker '{}' (expected '{HELLO_MARKER}') — is this really \
+            "unexpected banner marker '{}' (expected '{HELLO_MARKER}'); is this really \
              cerulion-netd?",
             hello.hello
         )));
     }
     // Accept any daemon whose vocabulary INCLUDES this consumer's
-    // baseline (demand/release/status = v1) — a NEWER daemon is a superset, and an
+    // baseline (demand/release/status = v1): a NEWER daemon is a superset, and an
     // OLDER-but-still-v1 daemon serves the baseline (so a v2 client keeps working
     // against a pinned v1 daemon). Refuse ONLY a daemon too old for the baseline.
     // Per-verb gating for the v2 egress verbs happens at the send site
@@ -1873,7 +1873,7 @@ fn validate_hello(line: &str) -> Result<u32, ClientError> {
         return Err(ClientError::Protocol(format!(
             "cerulion-netd speaks protocol v{} but this client needs at least v{CLIENT_MIN_DAEMON_VERSION} \
              for the demand/release control vocabulary (this client speaks v{PROTOCOL_VERSION}). \
-             Upgrade cerulion-netd — it is older than this client can talk to.",
+             Upgrade cerulion-netd: it is older than this client can talk to.",
             hello.protocol
         )));
     }
