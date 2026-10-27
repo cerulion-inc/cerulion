@@ -383,8 +383,8 @@ lock.acquire();
 The gateway is not open by default. Under `"lan_access": "paired"` every LAN
 request (topic demand, catalog and schema) is refused, and LAN ingress is
 refused too: no host on the network can publish into the app's topics. The robot identity can
-still appear in discovery, but topic announce tokens are withheld so the LAN
-does not learn topic names; `topic list` warns that the robot refused to serve
+still appear in discovery, but topic announce tokens are withheld, so the topics
+the app publishes are not named on the LAN; `topic list` warns that the robot refused to serve
 its catalog. The posture stays in front of every installed demand authorizer.
 Choose the posture at runtime startup with the app's `lan_access` key. A start
 keeps access paired while it builds the gateway and opens the configured posture
