@@ -948,6 +948,9 @@ mod tests {
             site_id("a.rs", "m", 11, 5, "warn_once(\"x\")"),
             site_id("a.rs", "m", 10, 6, "warn_once(\"x\")"),
             site_id("a.rs", "m", 10, 5, "warn_once(\"y\")"),
+            // The macro name counts: another macro family at the same
+            // location with the same arguments is another site.
+            site_id("a.rs", "m", 10, 5, "info_once(\"x\")"),
         ] {
             assert_ne!(base, other);
         }
