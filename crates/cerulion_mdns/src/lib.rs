@@ -63,6 +63,8 @@ use std::path::PathBuf;
 mod browse;
 pub use browse::{browse_rung, browse_rung_report, instance_from_fullname, BrowseRungReport};
 
+use cerulion_discovery::unencrypted_quic::tcp_twin_of_udp_rel;
+pub use cerulion_discovery::unencrypted_quic::UDP_REL_TXT_KEY;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Deserialize;
 
@@ -327,6 +329,24 @@ pub fn sanitize_instance(robot: &str) -> String {
 pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
     let ep = listen_endpoints.iter().find(|e| e.starts_with("tcp/"))?;
     let endpoint = ep.strip_prefix("tcp/")?;
+    lan_dialable_port(endpoint)
+}
+
+/// The port of the first `udp/<host>:<port>?rel=1` listen endpoint (exactly that
+/// metadata) whose host is not loopback and whose port is nonzero: what a
+/// gateway advertises as [`UDP_REL_TXT_KEY`] while `CERULION_UNENCRYPTED_QUIC=on`.
+/// `None` when there is none. Pure.
+pub fn udp_rel_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16> {
+    let ep = listen_endpoints
+        .iter()
+        .find(|e| tcp_twin_of_udp_rel(e).is_some())?;
+    let endpoint = ep.strip_prefix("udp/")?.strip_suffix("?rel=1")?;
+    lan_dialable_port(endpoint)
+}
+
+/// `<host>:<port>` to its port when the host is not loopback (an IP literal or
+/// a `.localhost` name) and the port is nonzero.
+fn lan_dialable_port(endpoint: &str) -> Option<u16> {
     let (host, raw_port) = endpoint.rsplit_once(':')?;
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
@@ -361,9 +381,13 @@ pub fn srv_port_from_listen_endpoints(listen_endpoints: &[String]) -> Option<u16
 /// ignores the extra keys — NOT byte-identical to the old beacon. Address
 /// auto-detection is enabled so the daemon fills the A/AAAA records — the `""`
 /// ip is intentional.
-fn build_gateway_service_info(robot: &str, port: u16) -> Result<ServiceInfo, MdnsError> {
+fn build_gateway_service_info(
+    robot: &str,
+    port: u16,
+    udp_rel_port: Option<u16>,
+) -> Result<ServiceInfo, MdnsError> {
     let facts = load_beacon_facts();
-    build_gateway_service_info_with_facts(robot, port, facts.as_ref())
+    build_gateway_service_info_with_facts(robot, port, udp_rel_port, facts.as_ref())
 }
 
 /// The PURE inner builder — takes the already-loaded beacon facts (so the TXT
@@ -371,11 +395,15 @@ fn build_gateway_service_info(robot: &str, port: u16) -> Result<ServiceInfo, Mdn
 fn build_gateway_service_info_with_facts(
     robot: &str,
     port: u16,
+    udp_rel_port: Option<u16>,
     facts: Option<&BeaconTxtFacts>,
 ) -> Result<ServiceInfo, MdnsError> {
     let instance = sanitize_instance(robot);
     let host_name = format!("{instance}.local.");
-    let properties = gateway_txt_properties(robot, facts);
+    let mut properties = gateway_txt_properties(robot, facts);
+    if let Some(udp_rel) = udp_rel_port.filter(|&p| p != 0) {
+        properties.push((UDP_REL_TXT_KEY.to_string(), udp_rel.to_string()));
+    }
     let prop_refs: Vec<(&str, &str)> = properties
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -407,12 +435,25 @@ fn build_gateway_service_info_with_facts(
 /// registration failure is a loud `Err` the caller demotes to a warn — the
 /// advertisement is an additive overlay, never load-bearing.
 pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, MdnsError> {
+    advertise_gateway_with_udp_rel(robot, port, None)
+}
+
+/// [`advertise_gateway`], plus the TXT key [`UDP_REL_TXT_KEY`]`=<udp_rel_port>`
+/// when `udp_rel_port` is `Some` nonzero: the port of this gateway's unencrypted
+/// QUIC listener (`udp/<addr>:<udp_rel_port>?rel=1`). A gateway passes it only
+/// while `CERULION_UNENCRYPTED_QUIC=on`; with `None` the record is exactly the one
+/// [`advertise_gateway`] publishes.
+pub fn advertise_gateway_with_udp_rel(
+    robot: &str,
+    port: u16,
+    udp_rel_port: Option<u16>,
+) -> Result<MdnsAdvertiseGuard, MdnsError> {
     // Build the (pure) ServiceInfo BEFORE starting the daemon: `ServiceDaemon`
     // has no `Drop` shutdown, so any early return between `new()` and the
     // guard construction would leak its background
     // thread. Info-first leaves `register` as the only fallible step after
     // the daemon exists, and that path shuts it down explicitly below.
-    let info = build_gateway_service_info(robot, port)?;
+    let info = build_gateway_service_info(robot, port, udp_rel_port)?;
     let fullname = info.get_fullname().to_string();
     let daemon = ServiceDaemon::new().map_err(|e| MdnsError::DaemonStart { source: e })?;
     if let Err(e) = daemon.register(info) {
@@ -428,6 +469,7 @@ pub fn advertise_gateway(robot: &str, port: u16) -> Result<MdnsAdvertiseGuard, M
     tracing::info!(
         robot = %robot,
         port,
+        udp_rel_port,
         fullname = %fullname,
         "advertising the gateway over mDNS (_cerulion._tcp)"
     );
@@ -591,6 +633,59 @@ mod tests {
     }
 
     #[test]
+    fn udp_rel_port_reads_the_first_lan_unencrypted_quic_listener() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            udp_rel_port_from_listen_endpoints(&s(&["tcp/0.0.0.0:7683", "udp/0.0.0.0:7683?rel=1"])),
+            Some(7683)
+        );
+        assert_eq!(
+            udp_rel_port_from_listen_endpoints(&s(&["udp/[::]:7690?rel=1"])),
+            Some(7690)
+        );
+        // Not the unencrypted QUIC spelling, loopback, or port zero: none.
+        for listen in [
+            s(&["tcp/0.0.0.0:7683"]),
+            s(&["udp/0.0.0.0:7683"]),
+            s(&["udp/0.0.0.0:7683?rel=1;mixed_rel=1"]),
+            s(&["udp/127.0.0.1:7683?rel=1"]),
+            s(&["udp/0.0.0.0:0?rel=1"]),
+            s(&["quic/0.0.0.0:7683"]),
+        ] {
+            assert_eq!(
+                udp_rel_port_from_listen_endpoints(&listen),
+                None,
+                "{listen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_udp_rel_txt_key_is_present_only_when_a_port_is_given() {
+        let txt_of = |udp_rel: Option<u16>| {
+            let info =
+                build_gateway_service_info_with_facts("go2", 7683, udp_rel, None).expect("builds");
+            let props = info.get_properties();
+            props
+                .get_property_val_str(UDP_REL_TXT_KEY)
+                .map(str::to_string)
+        };
+        assert_eq!(txt_of(Some(7683)).as_deref(), Some("7683"));
+        assert_eq!(txt_of(None), None);
+        assert_eq!(txt_of(Some(0)), None);
+        // With no port the property set is exactly the one `advertise_gateway`
+        // has always published.
+        let plain = build_gateway_service_info_with_facts("go2", 7683, None, None).expect("builds");
+        let mut keys: Vec<String> = plain
+            .get_properties()
+            .iter()
+            .map(|p| p.key().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["agent", "arch", "os", "robot", "ver"]);
+    }
+
+    #[test]
     fn build_gateway_service_info_pins_fullname_port_and_txt() {
         // Oracle pins on the advertise-side ServiceInfo — sanitized instance
         // in the fullname, the SRV port, and the UNSANITIZED robot in TXT. The
@@ -599,7 +694,7 @@ mod tests {
         // + facts keys are purely ADDITIVE — an older browser reads
         // `robot=` and ignores the rest), so this is backward-compatible, NOT a
         // byte-identical TXT record.
-        let info = build_gateway_service_info("orin/cam.1", 7683).expect("builds");
+        let info = build_gateway_service_info("orin/cam.1", 7683, None).expect("builds");
         assert_eq!(info.get_fullname(), "orin-cam-1._cerulion._tcp.local.");
         assert_eq!(info.get_port(), 7683);
         assert_eq!(info.get_property_val_str("robot"), Some("orin/cam.1"));
@@ -791,7 +886,7 @@ mod tests {
             iroh_port: Some(41234),
             claimable: Some("maybe".to_string()),
         };
-        let info = build_gateway_service_info_with_facts("go2", 7683, Some(&facts))
+        let info = build_gateway_service_info_with_facts("go2", 7683, None, Some(&facts))
             .expect("a hostile facts file must NOT fail the registration");
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
         assert_eq!(info.get_property_val_str("eid"), None);
@@ -838,7 +933,7 @@ mod tests {
     fn build_service_info_with_full_facts_carries_every_txt_key() {
         let facts = full_facts();
         let info =
-            build_gateway_service_info_with_facts("go2", 7683, Some(&facts)).expect("builds");
+            build_gateway_service_info_with_facts("go2", 7683, None, Some(&facts)).expect("builds");
         assert_eq!(info.get_fullname(), "go2._cerulion._tcp.local.");
         assert_eq!(info.get_port(), 7683);
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
@@ -899,7 +994,7 @@ mod tests {
         assert_eq!(facts.claimable.as_deref(), Some("0"));
 
         // And the production entry point enriches the ServiceInfo end-to-end.
-        let info = build_gateway_service_info("go2", 7683).expect("builds");
+        let info = build_gateway_service_info("go2", 7683, None).expect("builds");
         assert_eq!(info.get_property_val_str("robot"), Some("go2"));
         assert_eq!(
             info.get_property_val_str("eid"),

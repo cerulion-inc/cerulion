@@ -1576,6 +1576,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "zenoh",
 ]
 
 [[package]]
