@@ -15,6 +15,7 @@
 //! cargo test -p rmw_cerulion --test rmw_e2e_test -- --test-threads=1
 //! ```
 
+use iceoryx2::service::port_factory::PortFactory as _;
 use serial_test::serial;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
@@ -481,7 +482,7 @@ fn untouched_loan_publishes_rosidl_defaults_not_zeros() {
         // The pointer the typesupport's init just wrote through, and that
         // rclcpp will overlay the message struct on, is 8-aligned (the
         // borrow path's fail-closed alignment gate let it through; the
-        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +32
+        // de-facto iceoryx2 0.9.1 mechanism is chunk+40 B header @ 8, +40
         // WireHeader — see `rmw_borrow_loaned_message`).
         assert_eq!(
             (loaned as usize) % std::mem::align_of::<CQuat>(),
@@ -2236,7 +2237,7 @@ fn c_abi_loaned_take_round_trip_and_return() {
             }
         );
         // message_info: source_timestamp is EXACTLY the wire timestamp —
-        // cross-checked against the WireHeader sitting 32 bytes before the
+        // cross-checked against the WireHeader sitting 40 bytes before the
         // loaned pointer in the SAME held frame.
         let header_bytes = std::slice::from_raw_parts(
             (out as *const u8).sub(cerulion_core::wire::WireHeader::SIZE),
@@ -2979,6 +2980,200 @@ fn c_abi_ros_topic_accepts_more_endpoints_than_the_iceoryx2_defaults() {
                 assert_eq!(rmw_destroy_publisher(node, p), RMW_RET_OK);
             }
             for s in subscriptions {
+                assert_eq!(rmw_destroy_subscription(node, s), RMW_RET_OK);
+            }
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
+    }
+}
+
+/// A raw iceoryx2 node with the data and event services it opened.
+type RawAttach = (
+    iceoryx2::node::Node<iceoryx2::service::ipc::Service>,
+    iceoryx2::service::port_factory::publish_subscribe::PortFactory<
+        iceoryx2::service::ipc::Service,
+        [u8],
+        (),
+    >,
+    iceoryx2::service::port_factory::event::PortFactory<iceoryx2::service::ipc::Service>,
+);
+
+/// Opens `topic`'s data and event services from a fresh raw iceoryx2 node on
+/// the rmw singleton's config (one more attached process, as iceoryx2 counts
+/// them against `max_nodes`).
+fn raw_attach(topic: &str) -> RawAttach {
+    let node = iceoryx2::node::NodeBuilder::new()
+        .config(iceoryx2::config::Config::global_config())
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("raw iceoryx2 node");
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let data = node
+        .service_builder(&data_name)
+        .publish_subscribe::<[u8]>()
+        .open();
+    let data = data.unwrap_or_else(|e| panic!("raw open of {topic}/data: {e:?}"));
+    let event = node.service_builder(&event_name).event().open();
+    let event = event.unwrap_or_else(|e| panic!("raw open of {topic}/event: {e:?}"));
+    (node, data, event)
+}
+
+/// Every ROS process attaches `/rosout`, and iceoryx2 counts attached
+/// processes per service against `max_nodes` (default 20 for the data
+/// service, 36 for the event service). A topic an rmw endpoint creates takes
+/// one process per publisher and subscriber slot (32 + 32 for a small type),
+/// so more processes than either default attach. Each raw iceoryx2 node below
+/// stands in for one process.
+#[test]
+#[serial]
+fn c_abi_ros_topic_accepts_more_processes_than_the_iceoryx2_node_default() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtNodes{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("nodes_node_{suffix}"));
+        let topic_str = format!("/rmw_e2e/nodes/{suffix}");
+        let topic = CString::new(topic_str.clone()).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null(), "the rmw publisher creates the topic");
+
+        let defaults = &iceoryx2::config::Config::global_config().defaults;
+        let attach = defaults
+            .publish_subscribe
+            .max_nodes
+            .max(defaults.event.max_nodes)
+            + 1;
+        let mut held = Vec::new();
+        for i in 0..attach {
+            let (raw, data, event) = raw_attach(&topic_str);
+            if i == 0 {
+                assert_eq!(data.static_config().max_publishers(), 32);
+                assert_eq!(data.static_config().max_subscribers(), 32);
+                assert_eq!(
+                    data.static_config().max_nodes(),
+                    64,
+                    "one node per publisher and subscriber slot"
+                );
+                assert_eq!(event.static_config().max_nodes(), 64);
+            }
+            held.push((raw, data, event));
+        }
+        drop(held);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The virtual size of this process, from `/proc/self/status` (`VmSize`, kB).
+#[cfg(target_os = "linux")]
+fn vm_size_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmSize:"))
+        .expect("VmSize line");
+    let kb: u64 = line
+        .trim_start_matches("VmSize:")
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .expect("VmSize value");
+    kb * 1024
+}
+
+/// A variable type with no tier entry takes the 128 MiB slice ceiling, and
+/// each subscriber slot adds `subscriber_max_buffer_size +
+/// subscriber_max_borrowed_samples` slices to every publisher's data segment.
+/// The rmw sizes such a topic's subscriber floor from the ceiling (8 slots at
+/// 128 MiB, the iceoryx2 default), so one publisher of this non-loanable type
+/// (2 borrowed samples per slot) reserves about 18 GiB of virtual address
+/// space instead of the 72 GiB 32 slots would. Both creation
+/// orders, since whichever endpoint creates the service sets its caps. On
+/// Linux the growth of this process's `VmSize` across the publisher create
+/// (the publisher maps its own data segment) is read too.
+#[test]
+#[serial]
+fn c_abi_large_slice_topic_floors_subscribers_by_its_ceiling() {
+    #[repr(C)]
+    struct CLabeled {
+        id: f64,
+        label: CRosString,
+    }
+    const GIB: u64 = 1 << 30;
+    for subscription_first in [false, true] {
+        let order = if subscription_first {
+            "subscription first"
+        } else {
+            "publisher first"
+        };
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = make_message_ts(
+                "rmw_e2e__msg",
+                &format!("Big{suffix}"),
+                std::mem::size_of::<CLabeled>(),
+                vec![
+                    member("id", ROS_TYPE_DOUBLE, 0),
+                    member("label", ROS_TYPE_STRING, 8),
+                ],
+            );
+            let (_, node, _opts) = setup_node(&format!("big_node_{suffix}"));
+            let topic_str = format!("/rmw_e2e/big/{suffix}");
+            let topic = CString::new(topic_str.clone()).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let subscription = if subscription_first {
+                let s = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+                assert!(
+                    !s.is_null(),
+                    "{order}: the rmw subscription creates the topic"
+                );
+                Some(s)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let before = vm_size_bytes();
+            let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            assert!(!publisher.is_null(), "{order}: the rmw publisher attaches");
+            #[cfg(target_os = "linux")]
+            let grown = vm_size_bytes().saturating_sub(before);
+
+            let (_raw, data, _event) = raw_attach(&topic_str);
+            let config = data.static_config();
+            let (_, default_subs) = iceoryx2_default_port_caps();
+            assert_eq!(
+                config.max_subscribers(),
+                default_subs.max(8),
+                "{order}: 128 MiB slices take 8 subscriber slots (1 GiB of slice per floor)"
+            );
+            assert_eq!(
+                config.max_publishers(),
+                32,
+                "{order}: the publisher floor is unchanged"
+            );
+            // At most 4 loaned samples per publisher port (`RMW_LOANED_SAMPLES_BUDGET`).
+            let slots = config.max_subscribers()
+                * (config.subscriber_max_buffer_size() + config.subscriber_max_borrowed_samples())
+                + config.history_size()
+                + 4;
+            let reserved = slots as u64 * 128 * 1024 * 1024;
+            assert!(
+                reserved <= 24 * GIB,
+                "{order}: one publisher's segment is {reserved} bytes ({slots} slots of 128 MiB)"
+            );
+            #[cfg(target_os = "linux")]
+            assert!(
+                grown <= 24 * GIB,
+                "{order}: VmSize grew {grown} bytes across one publisher create"
+            );
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+            if let Some(s) = subscription {
                 assert_eq!(rmw_destroy_subscription(node, s), RMW_RET_OK);
             }
             assert_eq!(rmw_destroy_node(node), RMW_RET_OK);

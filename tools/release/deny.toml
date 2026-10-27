@@ -356,8 +356,13 @@ unknown-git = "deny"
 # The same revision makes the macOS shared-memory descriptor table recover when
 # a descriptor is closed through another linked copy of iceoryx2 (a node cdylib
 # dropping host-built ports), which 0.10.0 answers with ENFILE on the next
-# `shm_open` of that number.
-# PRUNE this the moment an iceoryx2 release carries BOTH fixes.
+# `shm_open` of that number. It also writes a zero node counter when it creates
+# the global management segment, where 0.10.0 left the counter that goes into
+# every node id as whatever bytes the new segment held.
+# The revision also adds Android support: filesystem paths, file-backed named
+# shared memory with private-directory checks, abstract-namespace Unix datagram
+# sockets and POSIX timers for the watchdog. PRUNE this the moment an iceoryx2
+# release carries every change this fork revision adds.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",

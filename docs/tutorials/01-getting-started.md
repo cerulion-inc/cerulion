@@ -834,35 +834,19 @@ of each publish. `--record` also writes the run to a bag under `recordings/`,
 which Step 8 uses.
 
 **Multi-process by default:** the graph declares no `process_groups:` block, so
-on Linux and macOS `graph run` first derives a **process-per-node partition**
-(one OS process per node, for maximal fault isolation) and shows it for
-confirmation:
-
-```
-graph partition: obstacle_avoidance
-mode: process-per-node baseline (no cost artifact at .../graphs/obstacle_avoidance.costs.yaml ...)
-nodes: 3  groups: 3
-...
-+process_groups:
-+  grp_lidar_sensor: [lidar_sensor]
-+  grp_safety_controller: [safety_controller]
-+  grp_drive_base: [drive_base]
-...
-Apply this partition to the graph file? [y/N]
-```
-
-Press **Enter** to use that layout for this run and leave the file untouched, or
-**y** to write the partition into `graphs/obstacle_avoidance.yaml` (a `.bak`
-backup is kept), after which later runs skip the prompt. Prefer everything in one
-process? Opt out with `--single-process` (no derivation, no prompt). Scripting
-it? `--yes` writes without asking, and a run with no terminal attached never
-writes at all.
+on Linux and macOS `graph run` derives a **process-per-node partition** (one OS
+process per node, for maximal fault isolation) and runs it without asking, on a
+terminal or in a script, leaving `graphs/obstacle_avoidance.yaml` unchanged. Add
+`--yes` to write the partition into the graph file (a `.bak` backup is kept), after
+which later runs use it as declared. `cerulion graph partition obstacle_avoidance`
+shows the proposed partition and offers to save it. Prefer everything in one
+process? Opt out with `--single-process` (no derivation).
 
 Graph validation runs automatically before execution. If a check fails (a missing
 source, an unbuilt node, a schema that does not resolve), you get the report and
 the graph does not start.
 
-**Expected output (after the prompt):** the supervisor spawns one worker process
+**Expected output:** the supervisor spawns one worker process
 per group, waits for each worker's READY, starts the recorder, then releases them
 together. Representative lines (timestamps, pids and paths vary; long lines are
 cut at `...`):
@@ -889,8 +873,6 @@ velocity commands, all through **zero-copy shared memory**, with a crash in any
 one group contained to its own process.
 
 > **Warnings you will see on this first run, and what they mean.**
-> - `WARN auto-partition declined: running MULTI-PROCESS with the derived process
->   groups IN-MEMORY` is the Enter you just pressed, said back to you.
 > - `WARN absolute source is inside this graph's own prefix namespace but matches
 >   no declared output` (twice per consuming worker) suggests a misspelled
 >   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
@@ -1203,7 +1185,7 @@ Subscriber:    wait/poll    ->  callback with &[u8] reference into shared memory
 
 ### Wire format
 
-Every message on the wire has a 32-byte `WireHeader`:
+Every message on the wire has a 40-byte `WireHeader`:
 
 ```
 +----------------------------------+
@@ -1213,6 +1195,7 @@ Every message on the wire has a 32-byte `WireHeader`:
 |  offset_table_count:  u32  (4B)  |  Number of variable fields
 |  sequence:            u32  (4B)  |  Monotonic counter
 |  timestamp_ns:        u64  (8B)  |  Publish time (nanoseconds)
+|  step_tag:            u64  (8B)  |  Producer step (0 = untagged)
 +----------------------------------+
 |  Payload (message fields)        |
 +----------------------------------+
@@ -1259,9 +1242,9 @@ contributes name-only, and a layout change inside such a target is not caught.
 
 - **Measure latency:** For latency measurement techniques, see [Measuring Latency](02-latency-measurement.md).
 
-- **Keep the partition:** Answer **y** at the prompt (or run
+- **Keep the partition:** Run `cerulion graph run obstacle_avoidance --yes` (or
   `cerulion graph partition obstacle_avoidance`) to write the `process_groups:`
-  block into the graph file, so later runs start without asking.
+  block into the graph file, so later runs use the declared groups.
   `cerulion graph profile obstacle_avoidance` measures the nodes first, which
   lets the partition fuse cheap nodes into one process.
 
@@ -1322,7 +1305,7 @@ contributes name-only, and a layout change inside such a target is not caught.
 | `cerulion node stage <type> -g GRAPH [-i ID] [-I NAME SOURCE]...` | Add an instance to a graph and wire its inputs |
 | `cerulion graph create <name> [-n prefix]` | Create a graph |
 | `cerulion graph validate <name> [--release]` | Check the graph, its nodes, their libraries and schemas without running |
-| `cerulion graph run <name> [--release] [--record] [--single-process] [--yes]` | Run the graph live (Ctrl+C to stop). `--release` loads release-built nodes; `--record` writes a bag under `recordings/`. An unpartitioned graph derives a multi-process partition on Linux and macOS (`--single-process` opts out; `--yes` persists it without the prompt) |
+| `cerulion graph run <name> [--release] [--record] [--single-process] [--yes]` | Run the graph live (Ctrl+C to stop). `--release` loads release-built nodes; `--record` writes a bag under `recordings/`. An unpartitioned graph derives a multi-process partition on Linux and macOS (`--single-process` opts out; `--yes` saves it to the graph file with a `.bak` backup) |
 | `cerulion graph partition <name> [--dry-run] [--yes]` | Derive + write the `process_groups:` partition (cost-aware with a `graph profile` snapshot; process-per-node baseline without): preview + confirm, surgical rewrite, `.bak` backup |
 | `cerulion graph list` | List all graphs |
 | `cerulion topic list` | List active topics |

@@ -1725,6 +1725,7 @@ impl BridgedMessage {
             offset_table_count: self.layout.variable_fields.len() as u32,
             sequence,
             timestamp_ns,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         let mut head = [0u8; WireHeader::SIZE];
         header.write_to_buf(&mut head);
@@ -3149,7 +3150,7 @@ pub(crate) fn align_up(value: usize, align: usize) -> usize {
 //
 // `rmw_borrow_loaned_message` for a windowed type loans ONE slot shaped
 //
-//   [WireHeader 32][C struct: c_size][zeroed remnant][window TAIL …]
+//   [WireHeader 40][C struct: c_size][zeroed remnant][window TAIL …]
 //                  ^payload 0        ^data_floor     ^tail_off
 //
 // hands rclcpp the C struct pointer (constructed in the slot by the

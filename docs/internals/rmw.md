@@ -719,19 +719,27 @@ unset); `rmw_wait_spin_test` carries the explicit-env clamp-at-`u64::MAX` pins a
   publishers beside the leaked port) and cross-process by
   `rmw_leak_at_destroy_registry_test`.
 - **Port caps.** An rmw publisher or subscription that CREATES a topic's iceoryx2
-  service creates it with 32 publisher and 32 subscriber slots
-  (`ROS_TOPIC_CREATE_PUBLISHERS` / `ROS_TOPIC_CREATE_SUBSCRIBERS`, applied as the
-  create-leg-only `create_publisher_floor` / `create_subscriber_floor`), and its event
-  service with `publishers + 2 x subscribers` notifier and listener slots (one per data
-  port, plus room for the standalone listener of a graph's unified data-trigger input,
-  so a graph that later owns the topic still opens it). iceoryx2's `max_nodes` default
-  still limits a service to 20 attached processes. iceoryx2's create defaults
+  service creates it with 32 publisher slots (`ROS_TOPIC_CREATE_PUBLISHERS`) and
+  `ros_topic_create_subscribers(slice ceiling)` subscriber slots: 1 GiB
+  (`ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET`) divided by the type's slice ceiling, at most 32
+  (`ROS_TOPIC_CREATE_SUBSCRIBERS`), so 8 at the 128 MiB tier, where 32 slots would
+  reserve 72 to 80 GiB of virtual address space per publisher (18 to 20 GiB at 8).
+  Both are applied as the create-leg-only `create_publisher_floor` /
+  `create_subscriber_floor`. A floored create also sets the data service's `max_nodes` to `publishers + subscribers` (64 for a small
+  type, 40 at the 128 MiB tier; iceoryx2's default is 20 processes per service), and
+  creates the event service with that node cap and `publishers + 2 x subscribers`
+  notifier and listener slots, read from the live data caps whenever a floor is set,
+  including when `iceoryx2.toml` already sets the data caps (one per data port, plus
+  room for the standalone listener of a graph's unified data-trigger input, so a graph
+  that later owns the topic still opens it). iceoryx2's create defaults
   are 2 publishers and 8 subscribers, and every ROS node publishes `/rosout`, so at
   those defaults a third node's `rcl_node_init` failed. The floors arm no open
   requirement: an rmw endpoint attaching to a service another opener created (a native
   graph's single-writer topic, `cerulion topic echo`) attaches to that service's
-  caps. Pinned by `rmw_e2e_test`'s `c_abi_ros_topic_accepts_more_endpoints_than_the_iceoryx2_defaults`
-  and `c_abi_ros_endpoints_attach_to_a_service_a_native_opener_created`.
+  caps. Pinned by `rmw_e2e_test`'s `c_abi_ros_topic_accepts_more_endpoints_than_the_iceoryx2_defaults`,
+  `c_abi_ros_topic_accepts_more_processes_than_the_iceoryx2_node_default`,
+  `c_abi_large_slice_topic_floors_subscribers_by_its_ceiling` and
+  `c_abi_ros_endpoints_attach_to_a_service_a_native_opener_created`.
 - **Zero-copy loan path, take side.** `can_loan_take()` is the TAKE
   gate and is wider than `can_loan()`. A fixed type hands out the received frame's SHM
   payload pointer directly. A type carrying at least one FORGEABLE primitive sequence
@@ -1021,7 +1029,7 @@ rejected frame puts nothing on the wire and burns no sequence.
 There are exactly TWO reject gates, and it is worth being precise about what the second
 one does NOT cover: the header must PARSE (`WireHeader::read_from_buf`), and its
 `schema_hash` must match the publisher's. `read_from_buf` checks only that the buffer
-holds the 32-byte header; it does not validate `total_size` against the buffer length.
+holds the 40-byte header; it does not validate `total_size` against the buffer length.
 So a buffer shorter than the header is rejected under the malformed-header arm, but a
 frame carrying a VALID header and a payload truncated relative to `total_size` is
 **published**. Truncation is not an independently detected reject condition; do not

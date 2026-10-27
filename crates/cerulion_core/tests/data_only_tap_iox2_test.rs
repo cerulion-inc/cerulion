@@ -50,7 +50,7 @@ fn manager_with(name: &str, buffer: usize, ix: iceoryx2::config::Config) -> Arc<
     .expect("init isolated transport manager")
 }
 
-/// A valid wire frame (32-byte header + body) so the tap's
+/// A valid wire frame (40-byte header + body) so the tap's
 /// `OwnedInboundSample::payload()` slices to exactly `total_size` — the frame we
 /// published, byte-for-byte (a padded loan slot would otherwise trail capacity).
 fn wire_frame(seq: u32, body: &[u8]) -> Vec<u8> {

@@ -2,7 +2,7 @@
 
 A raw, zero-copy Python client for the Cerulion transport: iceoryx2 shared
 memory on the local host; cross-host (zenoh) transport is not exposed by
-this client yet. Frames are 32-byte wire headers plus
+this client yet. Frames are 40-byte wire headers plus
 an opaque payload; there is no serialization envelope and no type registry.
 
 ## Install
@@ -395,9 +395,15 @@ corrupted, truncated, or unfinalized bag raises `BagError` at open. Every
 walk over the data (`open_bag`, each `messages()` iterator as it yields,
 and `topics()` on a bag whose summary carries no statistics) releases the
 mapped pages behind it, so resident memory stays bounded on large bags.
+The one exception is a bag recorded by a release with the 32-byte wire header:
+its frames are upgraded to the current 40-byte layout when the bag is first
+walked, into one copy reserved at its exact size (the bag's frames plus 8 bytes
+each) and held until the bag is closed. Such a bag whose copy would pass 2 GiB
+raises `BagError` naming `cerulion bag migrate`, which writes a current copy of
+it.
 `Record.view(schema)` decodes a typed message from those bytes; `schema` is a
 message class, or a schema name with `schemas=`.
-A record whose embedded wire header is shorter than 32 bytes, or whose
+A record whose embedded wire header is shorter than 40 bytes, or whose
 `total_size` disagrees with the record length, raises `BagError`. An
 unknown topic filter raises `ValueError`.
 

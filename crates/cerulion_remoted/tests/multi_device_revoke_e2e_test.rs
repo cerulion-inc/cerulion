@@ -4,7 +4,7 @@
 //! sweep paths — no inert shipping.
 //!
 //! Two desks (A + B) of the SAME account pair to a robot and each demand + stream a
-//! topic over the real `cerulion/wire/1` plane (loopback iroh + a per-test iceoryx2
+//! topic over the real `cerulion/wire/2` plane (loopback iroh + a per-test iceoryx2
 //! SHM root). Mid-session the robot applies a CA-signed epoch revoking ONLY desk A's
 //! DEVICE key. Desk A is EVICTED (its uni stream resets) while desk B stays
 //! connected — the surgical, account-preserving device revocation.
@@ -262,6 +262,7 @@ fn make_frame(seq: u32) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: 1_000_000 + seq as u64 * 10_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);

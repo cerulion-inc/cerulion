@@ -38,7 +38,8 @@
 //! - `test_schema_validation_accepts_match` — duplicates the round-trip
 //!   tests below.
 
-use cerulion_core::wire::MaxSliceLen;
+use cerulion_core::wire::{MaxSliceLen, WireHeader};
+use iceoryx2::service::port_factory::PortFactory as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -61,7 +62,7 @@ fn unique_topic(base: &str) -> String {
 }
 
 /// Create a publisher + subscriber pair on a unique topic with a 256-byte
-/// buffer (room for the 32-byte WireHeader plus a fixed 24-byte payload).
+/// buffer (room for the 40-byte WireHeader plus a fixed 24-byte payload).
 fn setup_pubsub(base: &str) -> (CerulionPublisher, CerulionSubscriber) {
     let mgr = TransportManager::get_or_init().expect("init");
     let topic = unique_topic(base);
@@ -345,7 +346,7 @@ fn test_try_receive_one_owned_hold_and_budget() {
     }
     std::thread::sleep(Duration::from_millis(50));
 
-    // First owned take: frame 1, held. Full-frame shape: 32-byte header +
+    // First owned take: frame 1, held. Full-frame shape: 40-byte header +
     // 24-byte Vector3 fixed section, seq 0.
     let held = subscriber
         .try_receive_one_owned()
@@ -354,7 +355,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
     let header = held.wire_header().expect("held frame header");
     assert_eq!(header.sequence, 0, "FIFO: first published frame first");
     assert_eq!(held.payload().len(), WireHeader::SIZE + 24);
-    let x = f64::from_le_bytes(held.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        held.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 1.0);
 
     // HOLD across further publishes: the held bytes must be UNCHANGED —
@@ -381,7 +386,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, f64::from(expect_x), "FIFO order");
         more.push(s);
     }
@@ -406,7 +415,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 5 must still be queued");
-    let x = f64::from_le_bytes(next.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        next.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 5.0, "no frame was lost to the refused receive");
 
     // Drain the rest + empty.
@@ -418,7 +431,11 @@ fn test_try_receive_one_owned_hold_and_budget() {
             .try_receive_one_owned()
             .expect("owned receive")
             .expect("queued frame");
-        let x = f64::from_le_bytes(s.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            s.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, f64::from(expect_x));
     }
     assert!(
@@ -491,7 +508,11 @@ fn test_create_port_floors_size_the_created_service() {
             .try_receive_one_owned()
             .expect("owned receive")
             .unwrap_or_else(|| panic!("subscriber {i} must receive the frame"));
-        let x = f64::from_le_bytes(sample.payload()[32..40].try_into().unwrap());
+        let x = f64::from_le_bytes(
+            sample.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(x, 7.0, "subscriber {i} payload");
     }
 }
@@ -608,6 +629,141 @@ fn test_create_port_floors_out_of_range_are_refused() {
     }
 }
 
+/// A transport manager on its own isolated iceoryx2 root, so a test can read
+/// the services it creates through raw iceoryx2 nodes on the same config.
+fn isolated_manager(name: &str, ix: iceoryx2::config::Config) -> std::sync::Arc<TransportManager> {
+    TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: name.into(),
+            clock: std::sync::Arc::new(cerulion_core::clock::VirtualClock::new()),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        ix,
+    )
+    .expect("init isolated transport manager")
+}
+
+/// A raw iceoryx2 node on `ix`: one more attached process, as iceoryx2 counts
+/// them against a service's `max_nodes`.
+fn raw_node(
+    ix: &iceoryx2::config::Config,
+) -> iceoryx2::node::Node<iceoryx2::service::ipc::Service> {
+    iceoryx2::node::NodeBuilder::new()
+        .config(ix)
+        .create::<iceoryx2::service::ipc::Service>()
+        .expect("raw iceoryx2 node")
+}
+
+/// A floored opener creates the data and event services with room for one
+/// attached node per data port (`publishers + subscribers`), above iceoryx2's
+/// `max_nodes` defaults (20 data, 36 event). With floors of 32 and 32 the
+/// service takes 64 nodes, so a 21st process on `/rosout` attaches; at the
+/// default the 20th raw node below (the 21st with the creator) is refused
+/// with `ExceedsMaxNumberOfNodes`.
+#[test]
+fn test_create_port_floors_raise_the_node_cap() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let mgr = isolated_manager("node_floor", ix.clone());
+    let topic = unique_topic("node_floor");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(32);
+    cfg.create_subscriber_floor = Some(32);
+    let _publisher = mgr
+        .create_publisher_with_topic_config(&topic, MaxSliceLen::const_new(256), 0, cfg)
+        .expect("floored publisher creates the service");
+
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let defaults = &ix.defaults;
+    let attach = defaults
+        .publish_subscribe
+        .max_nodes
+        .max(defaults.event.max_nodes)
+        + 1;
+    let mut held = Vec::new();
+    for i in 0..attach {
+        let node = raw_node(&ix);
+        let data = node
+            .service_builder(&data_name)
+            .publish_subscribe::<[u8]>()
+            .open()
+            .unwrap_or_else(|e| {
+                panic!("raw node {i} of {attach} must open the data service: {e:?}")
+            });
+        let event = node
+            .service_builder(&event_name)
+            .event()
+            .open()
+            .unwrap_or_else(|e| {
+                panic!("raw node {i} of {attach} must open the event service: {e:?}")
+            });
+        if i == 0 {
+            assert_eq!(
+                data.static_config().max_nodes(),
+                64,
+                "data max_nodes = 32 + 32"
+            );
+            assert_eq!(
+                event.static_config().max_nodes(),
+                64,
+                "event max_nodes follows the data service"
+            );
+        }
+        held.push((node, data, event));
+    }
+}
+
+/// When the iceoryx2 config already sets both data caps to the floor values,
+/// the floors raise nothing on the data service, and the event service a
+/// floored opener creates must still be sized from the live data caps
+/// (`publishers + 2 x subscribers`), not left at the config's event defaults
+/// (16 notifiers and listeners, fewer than the 64 data ports).
+#[test]
+fn test_create_port_floors_size_the_event_service_when_config_already_raises_data_caps() {
+    let mut ix = cerulion_core::testing::iceoryx_test_config();
+    ix.defaults.publish_subscribe.max_publishers = 32;
+    ix.defaults.publish_subscribe.max_subscribers = 32;
+    let mgr = isolated_manager("event_from_config_caps", ix.clone());
+    let topic = unique_topic("event_from_config_caps");
+    let mut cfg = mgr.default_topic_config();
+    cfg.create_publisher_floor = Some(32);
+    cfg.create_subscriber_floor = Some(32);
+    let _subscriber = mgr
+        .create_subscriber_with_buffers(&topic, cfg, cfg.subscriber_max_buffer_size)
+        .expect("floored subscriber creates the service");
+
+    let node = raw_node(&ix);
+    let data_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/data").as_str().try_into().expect("name");
+    let event_name: iceoryx2::service::service_name::ServiceName =
+        format!("{topic}/event").as_str().try_into().expect("name");
+    let data = node
+        .service_builder(&data_name)
+        .publish_subscribe::<[u8]>()
+        .open()
+        .expect("open the data service raw");
+    let event = node
+        .service_builder(&event_name)
+        .event()
+        .open()
+        .expect("open the event service raw");
+    assert_eq!(data.static_config().max_publishers(), 32);
+    assert_eq!(data.static_config().max_subscribers(), 32);
+    assert_eq!(
+        event.static_config().max_listeners(),
+        32 + 2 * 32,
+        "event listeners sized from the live data caps"
+    );
+    assert_eq!(
+        event.static_config().max_notifiers(),
+        32 + 2 * 32,
+        "event notifiers sized from the live data caps"
+    );
+}
+
 /// The create-leg borrow floor NEVER arms an open
 /// requirement — a floored publisher create must ATTACH to a pre-existing
 /// service born at the iceoryx2 default (2), and the effective loan budget
@@ -664,7 +820,11 @@ fn test_borrow_floor_open_leg_tolerates_smaller_service() {
         .try_receive_one_owned()
         .expect("recovered receive")
         .expect("frame 3");
-    let x = f64::from_le_bytes(c.payload()[32..40].try_into().unwrap());
+    let x = f64::from_le_bytes(
+        c.payload()[WireHeader::SIZE..WireHeader::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(x, 3.0);
     drop(b);
     drop(c);

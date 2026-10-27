@@ -85,10 +85,10 @@ pub(crate) const RMW_TAKE_LOAN_BORROW_BUDGET: usize = 4;
 /// and `/tf` are shared the same way), and iceoryx2's create default is 2
 /// publishers, so a third node on a topic could not attach its publisher and
 /// `rcl_node_init` failed on the `/rosout` one. 32 is the number of nodes
-/// that can publish one topic. iceoryx2 separately caps the processes
-/// attached to one service at its `max_nodes` default (20), and the rmw is
-/// one iceoryx2 node per process, so with one ROS node per process that
-/// limit is reached first.
+/// that can publish one topic. iceoryx2 also caps the processes attached to
+/// one service (`max_nodes`, default 20; the rmw is one iceoryx2 node per
+/// process); a floored create sets that cap to one process per publisher and
+/// subscriber slot, so the publisher slots bind first.
 ///
 /// Applied as [`TopicServiceConfig::create_publisher_floor`]: create-leg
 /// only, so an rmw endpoint still attaches to a service another opener
@@ -98,16 +98,41 @@ pub(crate) const RMW_TAKE_LOAN_BORROW_BUDGET: usize = 4;
 /// [`TopicServiceConfig::create_publisher_floor`]: cerulion_core::transport::TopicServiceConfig::create_publisher_floor
 pub(crate) const ROS_TOPIC_CREATE_PUBLISHERS: usize = 32;
 
-/// The subscriber-slot twin of [`ROS_TOPIC_CREATE_PUBLISHERS`] (iceoryx2's
-/// create default is 8; `/clock` under `use_sim_time` and `/tf` carry one
-/// subscription per node). Each slot adds
-/// `subscriber_max_buffer_size + subscriber_max_borrowed_samples` slice-sized
-/// slots to every publisher's pool on the topic: virtual address space,
-/// demand-paged, not resident memory. Applied as
-/// [`TopicServiceConfig::create_subscriber_floor`].
+/// The most subscriber slots a ROS topic's iceoryx2 service is CREATED with by
+/// an rmw endpoint, the subscriber-slot twin of [`ROS_TOPIC_CREATE_PUBLISHERS`]
+/// (iceoryx2's create default is 8; `/clock` under `use_sim_time` and `/tf`
+/// carry one subscription per node). The floor a topic gets is
+/// [`ros_topic_create_subscribers`], which lowers it for large slice ceilings.
+/// Applied as [`TopicServiceConfig::create_subscriber_floor`].
 ///
 /// [`TopicServiceConfig::create_subscriber_floor`]: cerulion_core::transport::TopicServiceConfig::create_subscriber_floor
 pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
+
+/// The slice bytes the subscriber floor may account for, summed over the
+/// floor's slots: [`ros_topic_create_subscribers`] divides it by the topic's
+/// slice ceiling. 1 GiB gives 8 slots at the 128 MiB tier (`sensor_msgs/Image`,
+/// `PointCloud2`, unlisted variable types), 32 at 32 MiB and below.
+pub(crate) const ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET: u64 = 1 << 30;
+
+/// The create-leg subscriber floor for a ROS topic whose slices are
+/// `slice_len` bytes: [`ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET`] / `slice_len`,
+/// clamped to `1..=`[`ROS_TOPIC_CREATE_SUBSCRIBERS`].
+///
+/// Each subscriber slot adds `subscriber_max_buffer_size +
+/// subscriber_max_borrowed_samples` slices (16 + 2, or 16 + 4 for a loanable
+/// type, at the rmw defaults) to every publisher's data segment, and each
+/// subscribing process maps every publisher's segment. The segment is demand-paged, so the cost is virtual
+/// address space, not resident memory. At 128 MiB slices, 32 slots reserve
+/// 72 to 80 GiB per publisher, which a 39-bit VA arm64 kernel (512 GiB of
+/// user space) runs out of after a few image publishers; 8 slots reserve
+/// 18 to 20 GiB. A floor at or below the node config's `max_subscribers`
+/// default changes nothing, so a large ceiling never lowers that default.
+pub(crate) fn ros_topic_create_subscribers(slice_len: MaxSliceLen) -> usize {
+    let slots = ROS_TOPIC_SUBSCRIBER_SLICE_BUDGET / u64::from(slice_len.get());
+    usize::try_from(slots)
+        .unwrap_or(ROS_TOPIC_CREATE_SUBSCRIBERS)
+        .clamp(1, ROS_TOPIC_CREATE_SUBSCRIBERS)
+}
 
 /// Windowed borrow: the
 /// iceoryx2 `publisher_max_loaned_samples` a LOANABLE rmw topic's publisher
@@ -535,7 +560,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // 1 <= default*3/4).
         let mut topic_config = rt.transport.default_topic_config();
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
-        topic_config.create_subscriber_floor = Some(ROS_TOPIC_CREATE_SUBSCRIBERS);
         topic_config.history_size = history;
         if history > 0 {
             topic_config.subscriber_max_buffer_size = topic_config
@@ -570,6 +594,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // geometry is cached on the handle so the per-call paths never
         // recompute eligibility.
         let slice_len = slice_len_for(&bridge);
+        topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
         let windowed_geo = windowed_borrow_geometry(
             &bridge,
             slice_len.get() as usize,
@@ -1383,7 +1408,7 @@ pub unsafe extern "C" fn rmw_borrow_loaned_message(
         // `static_cast` only; only the heap fallback constructs) and its
         // dtor never runs `~MessageT`, so the slot state IS the message's
         // initial state — and zeros are NOT rosidl defaults (a Quaternion
-        // declares `float64 w 1`). Zero ONLY the 32-byte header region
+        // declares `float64 w 1`). Zero ONLY the 40-byte header region
         // (rewritten at publish; deterministic meanwhile), then run the
         // typesupport's `init_function` on the payload — the loaned
         // message's REAL construction. repr(C) padding stays unwritten
@@ -1713,6 +1738,7 @@ unsafe fn publish_windowed_loan(
                 offset_table_count: data.bridge.layout().variable_fields.len() as u32,
                 sequence: seq,
                 timestamp_ns: now,
+                step_tag: cerulion_core::wire::StepTag::UNTAGGED,
             };
             {
                 let bytes = loan.bytes_uninit_mut();
@@ -1974,6 +2000,7 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             offset_table_count: 0,
             sequence: seq,
             timestamp_ns: now,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         header.write_to_buf(&mut loan.bytes_mut()[..WireHeader::SIZE]);
 
@@ -2252,9 +2279,11 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // still attaches).
         let mut topic_config = rt.transport.default_topic_config();
         // Whichever endpoint creates the service sizes its port caps, so the
-        // subscription carries the publisher's floors too.
+        // subscription carries the publisher's floors too, the subscriber
+        // floor from the same per-type slice ceiling the publisher uses.
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
-        topic_config.create_subscriber_floor = Some(ROS_TOPIC_CREATE_SUBSCRIBERS);
+        topic_config.create_subscriber_floor =
+            Some(ros_topic_create_subscribers(slice_len_for(&bridge)));
         // The take-side gate (fixed types AND forgeable-
         // sequence types) — distinct from the publisher's `can_loan`.
         let can_loan_take = bridge.can_loan_take();
@@ -3686,7 +3715,7 @@ pub unsafe extern "C" fn rmw_take_sequence(
 /// one-read-path decision: no bypass read plane), validates it BEFORE any
 /// pointer escapes, then holds the sample in the subscription's
 /// `pending_takes` table and hands rclcpp a pointer DIRECTLY into the SHM
-/// payload (past the 32-byte `WireHeader`). Zero copies, zero payload allocs.
+/// payload (past the 40-byte `WireHeader`). Zero copies, zero payload allocs.
 ///
 /// The held sample is what makes the pointer sound: iceoryx2's borrow
 /// accounting pins the publisher-pool slot until the `Sample` drops (the pool
@@ -4341,6 +4370,33 @@ mod slice_ceiling_tests {
     const CATCH_ALL: u32 = 128 * 1024 * 1024;
     const SMALL_TIER: u32 = 256 * 1024;
 
+    /// The subscriber floor follows the slice ceiling: 1 GiB of slice per
+    /// floor, capped at 32 slots. Each tier of the slice-ceiling table, the
+    /// budget's own break points, and the extremes.
+    #[test]
+    fn subscriber_floor_scales_with_the_slice_ceiling() {
+        const MIB: u32 = 1024 * 1024;
+        let cases = [
+            (CATCH_ALL, 8),
+            (64 * MIB, 16),
+            (33 * MIB, 31),
+            (32 * MIB, 32),
+            (16 * MIB, 32),
+            (4 * MIB, 32),
+            (SMALL_TIER, 32),
+            (WireHeader::SIZE as u32, 32),
+            (1024 * MIB, 1),
+            (u32::MAX, 1),
+        ];
+        for (slice, want) in cases {
+            assert_eq!(
+                ros_topic_create_subscribers(MaxSliceLen::const_new(slice)),
+                want,
+                "slice ceiling {slice}"
+            );
+        }
+    }
+
     fn leaked_cstr(s: &str) -> *const c_char {
         CString::new(s).expect("cstr").into_raw()
     }
@@ -4550,7 +4606,7 @@ mod slice_ceiling_tests {
     /// section` bound, and an env entry naming it is IGNORED — loudly (one
     /// WARN per creation naming the type), never silently inert and never
     /// applied (an applied narrow override would refuse every publish of a
-    /// frame that is ALWAYS exactly 56 bytes here).
+    /// frame that is ALWAYS exactly 64 bytes here).
     #[traced_test]
     #[test]
     fn a_fixed_type_keeps_its_exact_bound_and_an_override_naming_it_warns_ignored() {
@@ -4562,7 +4618,7 @@ mod slice_ceiling_tests {
             exact,
             "no override: exact bound, byte-identical to the pre-override bound"
         );
-        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:32");
+        let named = SliceCeilingOverrides::parse("rmw_slc/Pt:48");
         assert_eq!(
             slice_len_with_overrides(&bridge, &named).get(),
             exact,
@@ -4591,7 +4647,7 @@ mod slice_ceiling_tests {
     #[test]
     fn the_ignored_override_warn_is_once_per_type_not_per_creation() {
         let exact = (WireHeader::SIZE + 24) as u32;
-        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:32,rmw_slcflood/B:32");
+        let overrides = SliceCeilingOverrides::parse("rmw_slcflood/A:48,rmw_slcflood/B:48");
         let a = fixed_bridge("rmw_slcflood__msg", "A");
         for _ in 0..5 {
             assert_eq!(

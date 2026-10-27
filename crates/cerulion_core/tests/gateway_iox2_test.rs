@@ -92,6 +92,7 @@ fn oracle_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -883,6 +884,7 @@ fn make_frame(seq: u32, ts: u64, payload: &[u8]) -> Vec<u8> {
         offset_table_count: 0,
         sequence: seq,
         timestamp_ns: ts,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     };
     let mut frame = vec![0u8; WireHeader::SIZE + payload.len()];
     header.write_to_buf(&mut frame[..WireHeader::SIZE]);
@@ -2134,8 +2136,19 @@ fn lan_demand_client_role() {
         .unwrap();
     let session = zenoh::open(config).wait().expect("demand session opens");
 
+    // A demand GET states the demander's wire header version (two bytes,
+    // little-endian), as the production demander sends it; a GET stating
+    // none is refused as another release's.
     let get_once = |session: &zenoh::Session| -> String {
-        let replies = session.get(&selector).wait().expect("demand get");
+        let replies = session
+            .get(&selector)
+            .payload(
+                cerulion_core::wire::WIRE_HEADER_VERSION
+                    .to_le_bytes()
+                    .to_vec(),
+            )
+            .wait()
+            .expect("demand get");
         let mut payload = Vec::new();
         while let Ok(Some(reply)) = replies.recv_timeout(Duration::from_secs(10)) {
             if let Ok(sample) = reply.into_result() {
@@ -2572,7 +2585,7 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
     );
 
     // The child's in-flight query replies under the pre-close posture.
-    wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled");
+    wait_for_log_token(&mut demand.0, &log_path, "PRE:enabled/w2");
 
     network.set_after_demand_authorizer_read_for_test(None);
     network.set_on_announce_gate_contended_for_test(None);

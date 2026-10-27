@@ -545,8 +545,10 @@ fn topic_echo_prints_yaml_that_decodes_back_to_the_published_message() {
     )
     .expect("an echoed block, separator included, is message YAML input");
     let mut oracle = Vector3::SCHEMA_HASH.to_le_bytes().to_vec();
-    // total_size 56, offset table at 32 + 24, no variable fields, seq 0, ts 0.
-    oracle.extend_from_slice(&[56, 0, 0, 0, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // total_size 64, offset table at 40 + 24, no variable fields, seq 0, ts 0,
+    // step_tag untagged.
+    oracle.extend_from_slice(&[64, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    oracle.extend_from_slice(&[0u8; 8]);
     oracle.extend_from_slice(&[0u8; 8]);
     // The fixed section: x = 1000.0 (0x408F400000000000), then y and z zero.
     oracle.extend_from_slice(&[0, 0, 0, 0, 0, 0x40, 0x8F, 0x40]);

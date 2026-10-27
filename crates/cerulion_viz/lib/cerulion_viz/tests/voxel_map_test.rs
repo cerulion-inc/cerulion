@@ -243,6 +243,7 @@ fn shaped_cloud_frame(
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);
@@ -1539,6 +1540,7 @@ fn png_frame() -> Vec<u8> {
         offset_table_count: 3,
         sequence: 0,
         timestamp_ns: 5_000,
+        step_tag: cerulion_core::wire::StepTag::UNTAGGED,
     }
     .write_to_buf(&mut frame);
     frame.extend_from_slice(&payload);

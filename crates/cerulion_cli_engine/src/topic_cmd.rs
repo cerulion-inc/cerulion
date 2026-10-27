@@ -3914,7 +3914,7 @@ fn write_custom_decode(
     truncate_length: usize,
 ) {
     use cerulion_core::dynamic::{message_to_yaml_with, YamlEncodeOptions};
-    // Reconstruct the full wire frame (32-byte header + payload) once.
+    // Reconstruct the full wire frame (40-byte header + payload) once.
     let mut frame = vec![0u8; cerulion_core::wire::WireHeader::SIZE];
     header.write_to_buf(&mut frame);
     frame.extend_from_slice(payload);
@@ -6708,7 +6708,7 @@ mod tests {
             cerulion_core::SchemaDoc {
                 qualified: "hostile/Inner".to_string(),
                 encoding: cerulion_core::SchemaEncoding::Msg,
-                text: "float64[536870907] v\n".to_string(),
+                text: "float64[536870906] v\n".to_string(),
                 deps: vec![],
             },
             cerulion_core::SchemaDoc {
@@ -6753,7 +6753,7 @@ mod tests {
         let msg_dir = tmp.path().join("nav14").join("msg");
         std::fs::create_dir_all(&msg_dir).unwrap();
         std::fs::write(msg_dir.join("Huge.msg"), "float64[2305843009213693951] v\n").unwrap();
-        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870907] v\n").unwrap();
+        std::fs::write(msg_dir.join("Inner.msg"), "float64[536870906] v\n").unwrap();
         std::fs::write(msg_dir.join("Outer.msg"), "Inner[8589934592] arr\n").unwrap();
         std::fs::write(msg_dir.join("Wrapper.msg"), "Outer o\nfloat64 w\n").unwrap();
         let goal_text = "float64 x\nfloat64 y\n";
@@ -7433,8 +7433,8 @@ mod tests {
         .unwrap();
         let walker = local_walker_from_workspace(Some(tmp.path()));
         let mut header = WireHeader::with_schema(walker.schema_hash_for("Wrap").unwrap());
-        header.total_size = 40;
-        header.offset_table_offset = 32;
+        header.total_size = (WireHeader::SIZE + 8) as u32;
+        header.offset_table_offset = WireHeader::SIZE as u32;
         header.offset_table_count = 1;
         let mut buf = Vec::new();
         write_custom_decode(

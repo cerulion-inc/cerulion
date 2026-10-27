@@ -198,7 +198,7 @@ fn names_format_version_0(line: &str) -> bool {
 
 /// Does this line name the WIRE FRAME plane?
 ///
-/// That plane is a different one with a 32-byte header of its own, which this
+/// That plane is a different one with a header of its own, which this
 /// sweep must not touch. The allowance is WORD BOUNDED: as a substring test it
 /// also exempted `framework` and `frameless`, which have nothing to do with the
 /// wire frame, so a stale number on a line that happened to say `framework`
