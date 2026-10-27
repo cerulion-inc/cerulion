@@ -1184,3 +1184,28 @@ impl ChainReach {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TfBuffer;
+    use crate::{FrameId, TfError, Transform};
+
+    /// A handle names a registered slot only. The slot one past the last
+    /// registered one carries this buffer's identity but holds no frame:
+    /// the buffer does not own that handle, so a lookup by it is refused
+    /// and never reads the slot it names.
+    #[test]
+    fn a_handle_one_past_the_last_registered_slot_is_not_owned() {
+        let mut b = TfBuffer::new();
+        b.insert("odom", "base", 0, Transform::IDENTITY).unwrap();
+        let last = FrameId::new(b.tag, b.active() - 1);
+        let past = FrameId::new(b.tag, b.active());
+        assert!(b.owns(last));
+        assert!(!b.owns(past));
+        let odom = b.frame_id("odom").unwrap();
+        assert_eq!(
+            b.lookup_ids(odom, past, 0),
+            Err(TfError::UnknownFrameId { frame: past })
+        );
+    }
+}

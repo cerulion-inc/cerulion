@@ -108,3 +108,20 @@ fn hash(name: &str) -> usize {
     }
     h as usize
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hash;
+
+    /// The name index hashes with 64-bit FNV-1a: the published vectors for
+    /// the empty string (the offset basis) and `a`, and `odom` worked from
+    /// the same definition. A changed fold (`|` or `&` in place of `^`)
+    /// still builds a working table, so only the value pins the function
+    /// the probe sequence depends on.
+    #[test]
+    fn the_name_hash_is_fnv1a_64() {
+        assert_eq!(hash(""), 0xcbf2_9ce4_8422_2325_u64 as usize);
+        assert_eq!(hash("a"), 0xaf63_dc4c_8601_ec8c_u64 as usize);
+        assert_eq!(hash("odom"), 0x5d77_84b4_9bb7_c03a_u64 as usize);
+    }
+}

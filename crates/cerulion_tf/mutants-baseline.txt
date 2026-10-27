@@ -2,8 +2,8 @@
 # tf buffer allocates only in its constructor).
 #
 # Run:     cargo mutants -p cerulion_tf --timeout 300
-# Result:  620 mutants: 476 caught, 144 unviable (do not compile), 0 missed,
-#          0 timeouts.
+# Result:  792 mutants: 611 caught, 173 unviable (do not compile), 0 missed,
+#          8 timeouts (listed below).
 #
 # The timeout is set explicitly: the slerp tests run long enough that the
 # automatic timeout (20 s) can expire on a slerp mutant and report a timeout
@@ -15,3 +15,26 @@
 # it with a test, or list it here with a reason.
 #
 # No survivors.
+#
+# Timeouts. Each of these turns a loop that ends on a count or on an empty
+# slot into one that never ends, so no assertion can run against it: the
+# tests catch it by the clock (the 300 s timeout), and the mutant is dead,
+# not missed. The run reports them apart from the catches, so they are
+# listed here with what each loop does.
+#
+#   crates/cerulion_tf/src/edge_policy.rs:76:13: replace > with == in extrapolate
+#   crates/cerulion_tf/src/edge_policy.rs:76:13: replace > with >= in extrapolate
+#       `while k > 0` composes the whole steps of an extrapolation by
+#       repeated squaring; `k == 0` and `k >= 0` (k is unsigned) never leave
+#       the loop.
+#   crates/cerulion_tf/src/names.rs:77:34: replace & with ^ in NameTable::find
+#   crates/cerulion_tf/src/names.rs:77:29: replace + with * in NameTable::find
+#   crates/cerulion_tf/src/names.rs:91:37: replace - with / in NameTable::register
+#   crates/cerulion_tf/src/names.rs:93:29: replace != with == in NameTable::register
+#   crates/cerulion_tf/src/names.rs:94:25: replace & with ^ in NameTable::register
+#   crates/cerulion_tf/src/names.rs:94:20: replace + with * in NameTable::register
+#       The open-addressed probe `(i + 1) & mask` of the name index and its
+#       mask `len - 1`. Each mutant walks a slot sequence that never reaches
+#       an empty slot (one fixed slot, or two slots in turn), or waits on an
+#       empty slot to be taken. The sibling mask mutant `len + 1` indexes
+#       past the table and is a plain catch.

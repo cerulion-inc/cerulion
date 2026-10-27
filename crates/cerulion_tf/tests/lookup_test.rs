@@ -1008,3 +1008,25 @@ fn one_whole_extrapolation_step_composes_the_step_once_and_no_more() {
     b.insert("odom", "base", 1_000, shift(0.0)).unwrap();
     assert_eq!(b.lookup("odom", "base", 2_000).unwrap(), shift(1.7e308));
 }
+
+#[test]
+fn a_whole_step_extrapolation_is_the_composed_step_bit_for_bit() {
+    // A 2 m advance with a turn of 0.6 / 0.8 about z (about 74 degrees)
+    // over 1000 ns. One whole step past the newest sample is the newest
+    // sample composed with the step once, with no fractional step after
+    // it. The step squared has w = 0.64 - 0.36 = 0.28, which rounds to
+    // 0.28000000000000014 in the fixed order of this crate; a further
+    // compose with the identity would renormalize the rotation and move
+    // that w to 0.2800000000000001, one ulp away.
+    let mut b = TfBuffer::new();
+    b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 1_000 })
+        .unwrap();
+    let before = Transform::IDENTITY;
+    let after = tf([2.0, 0.0, 0.0], q(0.0, 0.0, 0.6, 0.8));
+    b.insert("odom", "base", 0, before).unwrap();
+    b.insert("odom", "base", 1_000, after).unwrap();
+    let step = before.inverse().unwrap().compose(&after).unwrap();
+    let want = after.compose(&step).unwrap();
+    assert_eq!(want.rotation().w(), 0.280_000_000_000_000_14);
+    assert_eq!(b.lookup("odom", "base", 2_000).unwrap(), want);
+}
