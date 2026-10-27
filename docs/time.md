@@ -23,10 +23,13 @@ decide how far each step advances it, and nothing else moves it. The
 clock-driven schedule is therefore a pure function of the sequence of
 ACCEPTED samples: two runs that accept the same samples step to the same
 stamps, and fire the same period nodes at them. The run reads `/clock`
-through a queue of 64 samples; when that queue is full, the next publish
-evicts the oldest unread sample, which then merges into the next step, so a
-simulator that outruns the graph can make two runs over the same published
-samples step differently. The run warns on the first gap, and again at each
+through a queue of up to 64 samples: it asks for 64, and the publisher sets
+the ceiling when it creates the topic (16 for a publisher at the defaults, as
+a ROS 2 node is). The run logs the depth it got when the tap opens, and warns
+when it is under 64. When that queue is full, the next publish evicts the
+oldest unread sample, which then merges into the next step, so a simulator
+that outruns the graph can make two runs over the same published samples
+step differently. The run warns on the first gap, and again at each
 tenfold count, when the frames it reads from `/clock` skip sequence numbers,
 and logs the total at the end of the run. A gap is a hint, not proof of a lost
 sample: a publisher can consume a sequence number without sending a frame,

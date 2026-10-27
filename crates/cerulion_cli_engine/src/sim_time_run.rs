@@ -28,8 +28,9 @@
 //!    sample steps the graph by the difference, an equal one by zero (data
 //!    triggers still drain while a paused simulator republishes the same
 //!    time), and a backward one is refused with a warning and never stored.
-//!    A sample the tap could not hold ([`CLOCK_TAP_DEPTH`]) never reaches the
-//!    feeder, so it merges into the next step. A clock that stops mid-run is
+//!    A sample the tap could not hold ([`CLOCK_TAP_DEPTH`], or the smaller
+//!    queue the publisher's topic allows) never reaches the feeder, so it
+//!    merges into the next step. A clock that stops mid-run is
 //!    reported once per stall ([`CLOCK_STALLED_WARNING`]): the graph stands
 //!    still, and says so.
 //!
@@ -419,18 +420,39 @@ pub trait ClockSource {
 #[doc(hidden)]
 pub const SIM_TIME_PERIOD_FIRES_PER_SAMPLE: u32 = 1;
 
-/// How many `/clock` samples the run's tap can hold between two polls.
+/// How many `/clock` samples the run's tap ASKS to hold between two polls.
 ///
 /// The tap is a polling reader, so its queue is what absorbs a simulator that
 /// publishes faster than the loop drains (the loop steps the whole graph per
 /// sample). The depth is a fixed, known number rather than the service
-/// ceiling so the tap pins a bounded share of the publisher's pool. When the
-/// queue is full, the next publish evicts the OLDEST unread sample: the next
-/// accepted sample then steps the graph by the whole gap, so two steps merge
-/// into one, a deadline between them fires once at the later sample, and the
-/// graph clock still lands on the latest published time. The loss shows as a
-/// gap in the wire sequence numbers the tap reads ([`SequenceGapWatch`]).
+/// ceiling so the tap pins a bounded share of the publisher's pool. It is
+/// what the tap asks for, not always what it gets: iceoryx2 pins a topic's
+/// receive-queue ceiling when the publisher creates it, and a tap asking for
+/// more opens at that ceiling (16 for a publisher at the defaults, as a ROS 2
+/// node is). The tap logs the depth it got when it opens and warns when it
+/// is under this one ([`CLOCK_TAP_CAPPED_WARNING`]). When the queue is full,
+/// the next publish evicts the OLDEST unread sample: the next accepted sample
+/// then steps the graph by the whole gap, so two steps merge into one, a
+/// deadline between them fires once at the later sample, and the graph clock
+/// still lands on the latest published time. The loss shows as a gap in the
+/// wire sequence numbers the tap reads ([`SequenceGapWatch`]).
 pub const CLOCK_TAP_DEPTH: usize = 64;
+
+/// The warning the clock tap prints, once, when it opened shallower than
+/// [`CLOCK_TAP_DEPTH`] (the log fields carry the depth asked for and the
+/// depth got): the publisher created `/clock` with a smaller receive-queue
+/// ceiling, and a tap cannot open deeper than the topic allows.
+pub const CLOCK_TAP_CAPPED_WARNING: &str = "the `/clock` queue is shallower than the run asked \
+    for: the publisher created the topic with a smaller receive-queue ceiling, and a tap cannot \
+    open deeper than that. A burst of samples longer than the queue evicts the oldest unread one \
+    (it merges into the next step). If every sample must count, publish `/clock` no faster than \
+    the graph steps.";
+
+/// The depth the tap got when the topic capped its queue below
+/// [`CLOCK_TAP_DEPTH`]: `Some(depth)` is the warn, `None` a queue as asked.
+fn capped_clock_tap_depth(depth: usize) -> Option<usize> {
+    (depth < CLOCK_TAP_DEPTH).then_some(depth)
+}
 
 /// The warning the clock tap prints when two frames it reads in a row from
 /// one publisher skip wire sequence numbers: on the first gap, and again at
@@ -606,6 +628,15 @@ impl ClockTopicSource {
         }
     }
 
+    /// The receive-queue depth the open tap GOT, `None` before it opens: the
+    /// topic the publisher created caps what the tap asked for
+    /// ([`CLOCK_TAP_DEPTH`]).
+    pub fn queue_depth(&self) -> Option<usize> {
+        self.subscriber
+            .as_ref()
+            .map(DataOnlySubscriber::buffer_size)
+    }
+
     /// Note a read frame's origin and sequence number and report what the
     /// watch says: a gap loud on the first, counted after and announced
     /// again at each tenfold count ([`CLOCK_SEQUENCE_GAP_WARNING`]); the
@@ -657,7 +688,9 @@ impl ClockTopicSource {
 
     /// Open the topic if its publisher exists yet. A topic nobody has created
     /// is the normal state before the simulator starts, so it is not an error;
-    /// any other failure is surfaced, it carries its own remedy.
+    /// any other failure is surfaced, it carries its own remedy. The depth
+    /// the tap got is logged once at open, a warning when the topic capped it
+    /// under [`CLOCK_TAP_DEPTH`] ([`CLOCK_TAP_CAPPED_WARNING`]).
     fn open_if_published(&mut self) -> CliResult<bool> {
         if self.subscriber.is_some() {
             return Ok(true);
@@ -667,6 +700,22 @@ impl ClockTopicSource {
             .create_data_only_subscriber_with_buffer(SIM_CLOCK_TOPIC, CLOCK_TAP_DEPTH)
         {
             Ok(subscriber) => {
+                let depth = subscriber.buffer_size();
+                match capped_clock_tap_depth(depth) {
+                    Some(depth) => tracing::warn!(
+                        graph = %self.graph_name,
+                        topic = SIM_CLOCK_TOPIC,
+                        requested = CLOCK_TAP_DEPTH,
+                        depth,
+                        "{CLOCK_TAP_CAPPED_WARNING}"
+                    ),
+                    None => tracing::info!(
+                        graph = %self.graph_name,
+                        topic = SIM_CLOCK_TOPIC,
+                        depth,
+                        "clock tap open"
+                    ),
+                }
                 self.subscriber = Some(subscriber);
                 Ok(true)
             }
@@ -1410,12 +1459,43 @@ mod tests {
         );
     }
 
+    /// The guide states the depth as what the tap asks for, capped by the
+    /// topic the publisher created, and says the run logs the depth it got.
     #[test]
     fn the_clock_guide_states_the_tap_depth() {
-        let guide = include_str!("../../../docs/time.md").replace('\n', " ");
+        let guide = include_str!("../../../docs/time.md")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            guide.contains(&format!("a queue of {CLOCK_TAP_DEPTH} samples")),
-            "docs/time.md must state CLOCK_TAP_DEPTH"
+            guide.contains(&format!("a queue of up to {CLOCK_TAP_DEPTH} samples")),
+            "docs/time.md must state CLOCK_TAP_DEPTH as the depth the tap asks for"
+        );
+        assert!(
+            guide.contains("the publisher sets the ceiling when it creates the topic"),
+            "docs/time.md must say the publisher's topic caps the queue"
+        );
+        assert!(
+            guide.contains("logs the depth it got when the tap opens"),
+            "docs/time.md must say the run logs the depth it got"
+        );
+    }
+
+    /// The capped-depth verdict at its boundary: one under the depth asked
+    /// for is the warn, the depth itself and more are not, and the default
+    /// ceiling a ROS 2 publisher creates the topic with is under it.
+    #[test]
+    fn a_queue_under_the_depth_asked_for_is_capped_at_the_boundary() {
+        assert_eq!(
+            capped_clock_tap_depth(CLOCK_TAP_DEPTH - 1),
+            Some(CLOCK_TAP_DEPTH - 1)
+        );
+        assert_eq!(capped_clock_tap_depth(CLOCK_TAP_DEPTH), None);
+        assert_eq!(capped_clock_tap_depth(CLOCK_TAP_DEPTH + 1), None);
+        assert_eq!(
+            capped_clock_tap_depth(16),
+            Some(16),
+            "the default ceiling a publisher creates the topic with"
         );
     }
 
@@ -2585,7 +2665,11 @@ mod tests {
     // The real `/clock` topic: open-only, then samples in order
     // -----------------------------------------------------------------
 
+    /// Also the depth the tap GOT: the publisher creates the topic at the
+    /// transport's DEFAULT ceiling (what a ROS 2 node does), so the tap that
+    /// asked for [`CLOCK_TAP_DEPTH`] opens at 16 and warns once that it did.
     #[test]
+    #[tracing_test::traced_test]
     fn the_clock_topic_source_reads_published_samples_in_order() {
         use cerulion_core::transport::TransportConfig;
         use cerulion_core::wire::MaxSliceLen;
@@ -2595,8 +2679,8 @@ mod tests {
             TransportConfig {
                 node_name: format!("sim_clock_src_{}", std::process::id()),
                 clock: clock.clone(),
-                subscriber_buffer_size: 16,
                 network: None,
+                ..TransportConfig::default()
             },
             cerulion_core::testing::iceoryx_test_config(),
         )
@@ -2607,6 +2691,7 @@ mod tests {
         // not an error (open-only never mints the topic).
         assert_eq!(source.read().expect("read"), ClockRead::Empty);
         assert!(source.subscriber.is_none(), "nothing to open yet");
+        assert_eq!(source.queue_depth(), None, "no queue before the tap opens");
 
         let mut publisher = transport
             .create_publisher(SIM_CLOCK_TOPIC, MaxSliceLen::const_new(256), 0)
@@ -2618,6 +2703,17 @@ mod tests {
         assert!(
             source.subscriber.is_some(),
             "opened on the first read after creation"
+        );
+        // The tap asked for CLOCK_TAP_DEPTH; the topic, created by a
+        // publisher at the defaults, caps it at 16, and the tap said so.
+        assert_eq!(
+            source.queue_depth(),
+            Some(16),
+            "the ceiling the publisher created the topic with caps the tap, not CLOCK_TAP_DEPTH"
+        );
+        assert!(
+            logs_contain(CLOCK_TAP_CAPPED_WARNING) && logs_contain("depth=16"),
+            "the capped depth is warned once at open, with the depth got as a field"
         );
         for (sec, nanosec) in [(12i32, 345u32), (12, 346), (13, 0)] {
             let mut proxy = publisher.loan_proxy::<Clock>().expect("loan");

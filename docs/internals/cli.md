@@ -1334,7 +1334,11 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
   `CLOCK_BUILD_WINDOW_LOSS_WARNING`, not as a gap. `run_sim_time` logs the
   feeder's `sequence_gaps()` total at the end of the run. A gap is a hint, not
   proof: a publisher can consume a number without sending a frame. With one
-  publisher, a sample the full queue evicted (`CLOCK_TAP_DEPTH`) always leaves one.
+  publisher, a sample the full queue evicted always leaves one. The queue is
+  at most `CLOCK_TAP_DEPTH` deep: the tap asks for that, the topic's ceiling
+  (set by the publisher at create) caps it, and the tap logs the depth it got
+  at open (`CLOCK_TAP_CAPPED_WARNING` when it is under; `queue_depth()` is the
+  observable).
 - A period fires at most once per sample: a jump fires the latest passed deadline,
   never a catch-up burst. This ceiling (`SIM_TIME_PERIOD_FIRES_PER_SAMPLE`,
   `GraphRuntime::set_period_fire_ceiling`) is current behaviour, not contract:
