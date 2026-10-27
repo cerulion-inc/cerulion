@@ -19,6 +19,8 @@ JNILIBS="$ROOT/crates/cerulion_android/android/app/src/main/jniLibs"
 
 build() {
   cargo build -p cerulion_cli -p cerulion_netd
+  # The direct data demand probe runs on the host, beside the host CLI.
+  cargo build -p android_e2e_demand_probe
   cargo ndk -t "$ABI" --platform 30 build -p cerulion_cli -p cerulion_netd
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   # The app ships ONE native library: the sample runtime library, which
@@ -144,6 +146,72 @@ host_echo() {
   host_capture timeout "${2:-8}" "${HOST_ENV[@]}" CERULION_PEERS=127.0.0.1:7683 \
     CERULION_NETD_CONNECT=tcp/127.0.0.1:7683 "$HOST_CER" topic echo "$topic"
 }
+PROBE="$ROOT/target/debug/android-e2e-demand-probe"
+# The robot identity the sample app runs under, read from the app source the
+# APK is built from. Every demand ack the probe counts must come from it.
+APP_IDENTITY="$(sed -nE 's/.*CerulionRuntime\.init\(getFilesDir\(\)\.getAbsolutePath\(\), "([A-Za-z0-9_-]+)"\).*/\1/p' \
+  "$ROOT/crates/cerulion_android/android/app/src/main/java/com/cerulion/sample/MainActivity.java" | head -1)"
+[[ -n "$APP_IDENTITY" ]] ||
+  fail "app identity" "could not read the robot name the sample app passes to CerulionRuntime.init"
+PROBE_ENDPOINT=tcp/127.0.0.1:7683
+# probe_refuses LABEL WANT ARG...: the probe refuses a bad argument, or an
+# endpoint its session cannot open, before it demands anything, so this needs
+# no device: exit 1, WANT in its output, and no report line.
+probe_refuses() {
+  local label=$1 want=$2 rc=0 out
+  shift 2
+  out="$(host_capture timeout 10 "${HOST_ENV[@]}" "$PROBE" "$@")" || rc=$?
+  (( rc == 1 )) || fail "$label" "rc=$rc args=$* output=$out"
+  grep -Fq -- "$want" <<<"$out" || fail "$label" "args=$* expected '$want' output=$out"
+  if grep -q '^demand_probe ' <<<"$out"; then
+    fail "$label" "args=$* printed a report: $out"
+  fi
+}
+probe_argument_error() { probe_refuses "probe argument errors" "$@"; }
+# run_probe LABEL EXPECT SCHEMA FILE: one direct data demand for the heartbeat
+# over a 10 s window, judged by android_e2e_probe_verdict.sh. `topic echo`
+# reads the catalog before it demands data; the probe demands without one.
+run_probe() {
+  local label=$1 expect=$2 schema=$3 file=$4 rc=0 out verdict
+  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "$PROBE_ENDPOINT" /app/heartbeat \
+    "$schema" 10)" || rc=$?
+  printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
+  (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
+  verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$APP_IDENTITY" "$out")" ||
+    fail "$label" "$verdict"
+  pass "$label" "$verdict"
+}
+# host_netd_pids: the pids of the live host processes named cerulion-netd. A
+# zombie is dead: it holds no socket and answers nothing, so it is left out.
+host_netd_pids() {
+  ps -A -o pid= -o stat= -o comm= | awk '{
+    pid = $1; stat = $2; $1 = ""; $2 = ""; sub(/^ +/, "")
+    n = split($0, path, "/")
+    if (path[n] == "cerulion-netd" && stat !~ /^Z/) print pid
+  }'
+}
+# stop_host_netd: stop the host network daemon that `host_list` and
+# `host_echo` spawned, then require that NO cerulion-netd is alive on the
+# host. The probe runs with no other zenoh peer on the host: a live host netd
+# would bridge the heartbeat into the shared memory the probe's subscriber
+# reads (frames that never crossed the probe's ingress), and its own demand
+# queryable can answer the probe's demand with `refused` for a topic it does
+# not produce (an ack the paired verdict would count as the app's posture
+# refusal). The check reads the process table, not the pid file: a netd whose
+# pid file is missing or elsewhere still fails it. The run refused to start
+# while a host netd was running, so any one alive now is this run's.
+stop_host_netd() {
+  local alive deadline
+  HOST_NETD_OWNED && { kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1 || true; }
+  deadline=$((SECONDS + 20))
+  while :; do
+    alive="$(host_netd_pids | tr '\n' ' ')"
+    [[ -n "${alive// /}" ]] || break
+    (( SECONDS < deadline )) || fail "host netd stop" "a host netd is still alive: pids=${alive% }"
+    sleep 1
+  done
+  rm -f "$HOST_NETD_PID"
+}
 cleanup() {
   local rc=$?
   set +e
@@ -185,12 +253,34 @@ if [[ "$("${ADB[@]}" shell getprop sys.boot_completed | tr -d '\r')" != 1 ]]; th
 fi
 device_serial="$("${ADB[@]}" get-serialno | tr -d '\r')"
 pass "emulator boot" "serial=$device_serial"
+# The demand probe must be the only zenoh peer on the host when it runs, and
+# stop_host_netd can only prove that if no host netd ran before this run.
+host_netd="$(host_netd_pids | tr '\n' ' ')"
+[[ -z "${host_netd// /}" ]] ||
+  fail "host netd free" "a cerulion-netd already runs on the host: pids=${host_netd% }"
+pass "host netd free" "no host netd"
 host_local="$("${HOST_ENV[@]}" "$HOST_CER" topic list --local 2>&1)" ||
   fail "host local topics" "$host_local"
 if grep -qE '/basic_timer/timer/count|/app/heartbeat|/app/timer/count|/app/relay/echo' <<<"$host_local"; then
   fail "host local topics" "the host already publishes a test topic"
 fi
 pass "host local topics" "no local test publisher"
+probe_argument_error 'usage: android-e2e-demand-probe'
+probe_argument_error 'usage: android-e2e-demand-probe' "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String 10 extra
+probe_argument_error "topic 'app/heartbeat' is not canonical" "$PROBE_ENDPOINT" app/heartbeat \
+  std_msgs/String 10
+probe_argument_error "schema 'std_msgs/Float64' is not one this probe knows" "$PROBE_ENDPOINT" \
+  /app/heartbeat std_msgs/Float64 10
+probe_argument_error "window 'ten' is not a whole number of seconds" "$PROBE_ENDPOINT" \
+  /app/heartbeat std_msgs/String ten
+probe_argument_error 'window must be at least one second' "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String 0
+pass "probe argument errors" "cases=6 rc=1 no report"
+# A connect endpoint zenoh cannot parse: the probe's session does not open.
+probe_refuses "probe setup error" "the probe's session did not open" not-an-endpoint \
+  /app/heartbeat std_msgs/String 1
+pass "probe setup error" "rc=1 no report"
 
 echo "android e2e: abi=$ABI triple=$TRIPLE device=${ANDROID_SERIAL:-default}"
 # The busy-device check runs BEFORE any rm or force-stop: a device that is
@@ -370,6 +460,12 @@ paired_ticks="$(printf '%s\n' "$paired_echo" | tick_values)"
 grep -Fq 'refused to serve its topic catalog to LAN peers (not authorized)' <<<"$paired_echo" ||
   fail "paired heartbeat" "rc=$paired_rc decoded_frames=0 output=$paired_echo"
 pass "paired heartbeat" "decoded_frames=0 rc=$paired_rc refused=not authorized"
+# Paired direct data demand: a paired app must refuse every answered demand
+# and send no frame. It runs twice, and both runs must give that verdict.
+# With the host netd stopped, the app is the only peer left to answer.
+stop_host_netd
+run_probe "paired direct demand" paired std_msgs/String paired-demand-probe.txt
+run_probe "paired direct demand, second run" paired std_msgs/String paired-demand-probe-2.txt
 
 # The paired run ran the graph too. Keep its log, then kill the app: the
 # open run below is a start after a kill, on top of whatever the killed
@@ -449,6 +545,16 @@ if ! grep -q '"nodes":3' <<<"$open_status" ||
 fi
 pass "app linked nodes" "nodes=3 linked_nodes=printer,relay,timer pid=$open_pid (paired run pid=$paired_pid)"
 pass "app start after kill" "start=0 in pid $open_pid after force-stop of pid $paired_pid, stale files tolerated"
+# The open `host_list` and `host_echo` spawned a new host netd: stop it too.
+stop_host_netd
+# Open control: the same demand IS granted and delivered when the app is open.
+# The app's refused ack does not say why it refused, so this is what ties the
+# paired refusal to the posture and not to the topic, schema or allow-list.
+run_probe "open direct demand" open std_msgs/String open-demand-probe.txt
+# Edge: the topic is std_msgs/String, the probe expects std_msgs/Int32. The
+# frames cross the network and the ingress drops every one on the schema.
+run_probe "open demand, wrong schema" schema-mismatch std_msgs/Int32 \
+  open-schema-mismatch-probe.txt
 record_path_of() {
   grep -o '"record_path":"[^"]*\.mcap"' | sed 's/.*"\([^"]*\)"$/\1/'
 }

@@ -710,6 +710,11 @@ jobs:
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
 
+      # The Android e2e runs on a path filter, so the verdict it applies to the
+      # direct data demand probe is pinned here, on every pull request.
+      - name: Android e2e demand probe verdict self-test
+        run: ./tools/scripts/test_android_e2e_probe_verdict.sh
+
       # Offline: the registry, the archives and the tag lookup are PATH shims,
       # so this runs here rather than in the release workflow, where the script
       # itself reads crates.io after an upload.
