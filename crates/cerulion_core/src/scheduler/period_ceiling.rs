@@ -10,11 +10,16 @@
 //! moves with the loop, where a missed deadline is a fire that is owed.
 //!
 //! A sim-time run steps the graph once per `/clock` sample, and a sample may
-//! jump the clock across several periods. There the contract is "at most one
-//! fire per accepted sample": the jump is the simulator's statement of where
+//! jump the clock across several periods. There a node fires at most once per
+//! accepted sample today: the jump is the simulator's statement of where
 //! time is now, not a backlog the node owes. The ceiling is that bound. It
 //! applies to EVERY `Period` node, a declared `max_catchup` included, because
 //! it is a property of the clock and not a node's burst policy.
+//!
+//! Hidden from the documented surface (with the setter and getter on the
+//! scheduler and the runtime): the one fire per sample is how a sim-time run
+//! behaves today, not part of its contract. A run that sub-steps to the
+//! nodes' own deadlines between two samples needs no ceiling.
 //!
 //! # The fires a ceiling keeps are the LATEST deadlines
 //!
@@ -212,5 +217,64 @@ mod tests {
         let adv = ceiled_period_advance(1_030 * MS, 1_025 * MS, 10 * MS, 1);
         assert_eq!(adv.fire_count, 0);
         assert_eq!(adv.next_fire_ns, 1_030 * MS);
+    }
+
+    /// The whole ceiling is off the documented surface, as one class: the
+    /// module itself (so `PeriodCaps` and `ceiled_period_advance` go with
+    /// it), the scheduler's and the runtime's setter and getter, and the
+    /// run's fires-per-sample constant. No doc on any of them calls the one
+    /// fire per sample a contract: it is how a sim-time run behaves today.
+    #[test]
+    fn the_ceiling_is_hidden_as_one_class_and_no_doc_calls_it_a_contract() {
+        let scheduler = include_str!("mod.rs");
+        assert!(
+            scheduler.contains("#[doc(hidden)]\npub mod period_ceiling;"),
+            "the period_ceiling module must be #[doc(hidden)] in scheduler/mod.rs"
+        );
+        let runtime = include_str!("../graph/runtime.rs");
+        for (file, src, item) in [
+            (
+                "scheduler/mod.rs",
+                scheduler,
+                "pub fn set_period_fire_ceiling(",
+            ),
+            ("scheduler/mod.rs", scheduler, "pub fn period_fire_ceiling("),
+            (
+                "graph/runtime.rs",
+                runtime,
+                "pub fn set_period_fire_ceiling(",
+            ),
+            ("graph/runtime.rs", runtime, "pub fn period_fire_ceiling("),
+        ] {
+            let at = src
+                .find(item)
+                .unwrap_or_else(|| panic!("{file} must still carry `{item}`"));
+            let attrs = &src[..at];
+            let line_before = attrs.trim_end().rsplit('\n').next().unwrap_or("");
+            assert_eq!(
+                line_before.trim(),
+                "#[doc(hidden)]",
+                "{file}: `{item}` must sit right under #[doc(hidden)], found {line_before:?}"
+            );
+        }
+        for (file, src) in [
+            (
+                "scheduler/period_ceiling.rs",
+                include_str!("period_ceiling.rs"),
+            ),
+            ("scheduler/mod.rs", scheduler),
+            ("graph/runtime.rs", runtime),
+        ] {
+            let docs = src
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//"))
+                .filter(|line| line.contains("fire per") || line.contains("fires per"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                !docs.contains("the contract is"),
+                "{file}: a doc still states the fire ceiling as a contract: {docs}"
+            );
+        }
     }
 }

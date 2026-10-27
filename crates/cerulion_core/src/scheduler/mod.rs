@@ -36,6 +36,9 @@ mod catchup_clamp_wiring_tests;
 pub mod handle;
 // The NODE-DEATH ledger both mint sites write.
 pub mod node_death;
+// The sim-time fire ceiling. Hidden: one fire per accepted sample is how a
+// sim-time run behaves today, not part of its contract.
+#[doc(hidden)]
 pub mod period_ceiling;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
