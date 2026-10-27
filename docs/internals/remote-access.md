@@ -69,7 +69,7 @@ Load-bearing boundary contracts:
 - **The ops protocol is a CRATE boundary**: the `cerulion/ops/1` wire types and
   the protocol-only client live in `cerulion_ops_proto` (MIT OR Apache-2.0), so a
   closed client links them without linking `cerud`. `cerud` depends on it and
-  re-exports every item at its old path (`cerud::protocol::{Hello,
+  re-exports the types and constants at their old paths (`cerud::protocol::{Hello,
   HandshakeReply, Request, Response, ..}`, `cerud::verbs::inventory::Inventory`);
   `cerud::protocol`'s frame and codec functions and `cerud::client::OpsClient`
   call the `cerulion_ops_proto` ones and convert `OpsProtoError` into the
