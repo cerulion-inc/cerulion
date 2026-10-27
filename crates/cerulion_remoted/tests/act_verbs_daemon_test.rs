@@ -170,8 +170,12 @@ fn expiring_owner_grant_for(subject_device_key: [u8; 32]) -> OwnerGrantWire {
     }
 }
 
-/// Run `calls` on one ops session to `addr` from `desk`, on a blocking task
-/// (the sync `OpsClient` reads and writes the QUIC stream synchronously).
+/// Run `verbs` with `{}` args, in sequence, on ONE ops session over its own
+/// connection from `desk` to `addr`, on a blocking task (the sync `OpsClient`
+/// reads and writes the QUIC stream synchronously). The session then
+/// finishes: dropping the client's stream finishes the desk's send half, and
+/// the connection is closed and awaited closed before this returns, so the
+/// next connection opens only after this one is gone.
 async fn ops_session(
     desk: &cerulion_link::Endpoint,
     addr: EndpointAddr,
@@ -192,11 +196,17 @@ async fn ops_session(
                 .into_iter()
                 .map(|verb| client.call(verb, serde_json::json!({})))
                 .collect::<Vec<_>>()
+            // `client` drops here: its stream's writer finishes the send half.
         }),
     )
     .await
     .expect("ops task");
-    drop(conn);
+    conn.close(0u32.into(), b"probe done");
+    let _ = bounded("probe connection closed", conn.closed()).await;
+    assert!(
+        conn.close_reason().is_some(),
+        "the probe connection is closed before the next connection opens"
+    );
     results
 }
 
@@ -253,6 +263,7 @@ async fn the_production_daemon_registers_every_act_verb() {
         "topic-snapshot",
         "topic-echo-once",
     ];
+    let robot_addr_next = robot_addr.clone();
     let results = ops_session(&desk_ep, robot_addr, verbs.clone()).await;
     let want = [
         "verb error: usage: missing string argument `topic`",
@@ -272,6 +283,15 @@ async fn the_production_daemon_registers_every_act_verb() {
             other => panic!("{verb}: expected the handler's usage error, got {other:?}"),
         }
     }
+
+    // The next connection opens only after the probe connection closed
+    // (`ops_session` awaited it), and the daemon serves it: `inventory` answers.
+    let next = ops_session(&desk_ep, robot_addr_next, vec!["inventory"]).await;
+    assert!(
+        next[0].is_ok(),
+        "the next ops connection is served: {:?}",
+        next[0]
+    );
 
     let _ = shutdown_tx.send(());
     let _ = bounded("serve join", serve).await;
