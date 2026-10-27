@@ -461,8 +461,13 @@ pub fn advertise_gateway_with_udp_rel(
     // guard construction would leak its background
     // thread. Info-first leaves `register` as the only fallible step after
     // the daemon exists, and that path shuts it down explicitly below.
+    let record = GatewayRecord {
+        robot: robot.into(),
+        port,
+        udp_rel_port,
+    };
     let facts = load_beacon_facts();
-    let info = build_gateway_service_info_with_facts(robot, port, udp_rel_port, facts.as_ref())?;
+    let info = record.service_info(facts.as_ref())?;
     let fullname = info.get_fullname().to_string();
     let daemon = ServiceDaemon::new().map_err(|e| MdnsError::DaemonStart { source: e })?;
     if let Err(e) = daemon.register(info) {
@@ -485,9 +490,7 @@ pub fn advertise_gateway_with_udp_rel(
     Ok(MdnsAdvertiseGuard {
         daemon,
         fullname,
-        robot: robot.into(),
-        port,
-        udp_rel_port,
+        record,
         facts,
     })
 }
@@ -500,10 +503,22 @@ pub struct MdnsAdvertiseGuard {
     /// The registered service fullname (`<instance>._cerulion._tcp.local.`),
     /// the key `unregister` takes.
     fullname: String,
+    record: GatewayRecord,
+    facts: Option<BeaconTxtFacts>,
+}
+
+/// What an advertisement registers. The guard keeps it, so a facts refresh
+/// re-registers the same robot, SRV port and `udp_rel` key with the new facts.
+struct GatewayRecord {
     robot: String,
     port: u16,
     udp_rel_port: Option<u16>,
-    facts: Option<BeaconTxtFacts>,
+}
+
+impl GatewayRecord {
+    fn service_info(&self, facts: Option<&BeaconTxtFacts>) -> Result<ServiceInfo, MdnsError> {
+        build_gateway_service_info_with_facts(&self.robot, self.port, self.udp_rel_port, facts)
+    }
 }
 
 impl MdnsAdvertiseGuard {
@@ -516,16 +531,11 @@ impl MdnsAdvertiseGuard {
         if !should_refresh_facts(self.facts.as_ref(), &facts, expected_eid) {
             return Ok(false);
         }
-        let info = build_gateway_service_info_with_facts(
-            &self.robot,
-            self.port,
-            self.udp_rel_port,
-            Some(&facts),
-        )?;
+        let info = self.record.service_info(Some(&facts))?;
         self.daemon
             .register(info)
             .map_err(|source| MdnsError::Register {
-                robot: self.robot.clone(),
+                robot: self.record.robot.clone(),
                 source,
             })?;
         self.facts = Some(facts);
@@ -595,13 +605,16 @@ mod tests {
         let mut restarted = facts.clone();
         restarted.iroh_port = Some(55555);
         assert!(should_refresh_facts(Some(&facts), &restarted, &eid));
-        let info =
-            build_gateway_service_info_with_facts("robot", 7447, Some(7683), Some(&restarted))
-                .unwrap();
+        let record = GatewayRecord {
+            robot: "robot".into(),
+            port: 7447,
+            udp_rel_port: Some(7683),
+        };
+        let info = record.service_info(Some(&restarted)).unwrap();
         assert_eq!(info.get_port(), 7447);
         assert_eq!(info.get_property_val_str("iroh_port"), Some("55555"));
         assert_eq!(info.get_property_val_str("claimable"), Some("0"));
-        // The refreshed record keeps the unencrypted QUIC port the guard was built with.
+        // The refreshed record keeps the unencrypted QUIC port it was advertised with.
         assert_eq!(info.get_property_val_str(UDP_REL_TXT_KEY), Some("7683"));
     }
 
