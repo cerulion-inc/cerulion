@@ -183,20 +183,29 @@ listen on `tcp/0.0.0.0:7683`, then connect the host CLI to
 
 ## App embedding
 
-`cerulion_android` provides a Java facade backed by JNI. An app without graph
-nodes can load its native library directly. Build it for each device ABI and
-place it in the app's `jniLibs` directory:
+`cerulion_android` provides a Java facade backed by JNI and the embedded
+runtime behind it. An app loads ONE native library: its own runtime crate, a
+`cdylib` that links `cerulion_android` and the app's graph nodes. The runtime
+runs the graph, the gateway and the recorder alongside app-side publishing,
+and writes `files/iceoryx2.toml` with the default transport configuration
+before startup.
+
+The sample app in `crates/cerulion_android/android` is a complete example.
+Its runtime crate, `android/runtime`, links the `timer` and `printer` nodes of
+`examples/basic_timer` and a `relay` node, and its graph ships in the APK as
+`app/src/main/assets/graph.yaml`. Build it for an arm64 device:
 
 ```sh
-cargo ndk -t arm64-v8a --platform 30 \
-  -o crates/cerulion_android/android/app/src/main/jniLibs \
-  build --release -p cerulion_android
+cd crates/cerulion_android/android/runtime
+cargo ndk -t arm64-v8a --platform 30 build --release -p cerulion_sample_runtime
+rm -rf ../app/src/main/jniLibs
+mkdir -p ../app/src/main/jniLibs/arm64-v8a
+cp target/aarch64-linux-android/release/libcerulion_sample_runtime.so ../app/src/main/jniLibs/arm64-v8a/
+bash ../../../../tools/scripts/android_jnilibs_gate.sh ../app/src/main/jniLibs cerulion_sample_runtime
+gradle -p .. assembleDebug
 ```
 
-Use `-t x86_64` for an x86_64 device. The Android runtime writes
-`files/iceoryx2.toml` with the default transport configuration before startup.
-The app runtime runs the graph, the gateway and the recorder alongside
-app-side publishing.
+Use `-t x86_64` and `x86_64-linux-android` for an x86_64 device.
 
 ### Graph nodes in an app
 
@@ -225,8 +234,18 @@ printer = { path = "../nodes/printer", default-features = false }
 Copy the iceoryx2 `[patch.crates-io]` block from the node workspace's
 `Cargo.toml` into this file too: a patch applies only in the workspace that
 declares it. `cerulion_android`, `cerulion_core` and `native_ros2_messages`
-must resolve from one source, so when `cerulion_android` comes from a git
-checkout, patch the other two to the same checkout.
+must resolve from one source; a split fails to compile with two different
+`NodeEntry` traits. When `cerulion_android` comes from git or a local
+checkout, take the other two from the same place:
+
+```toml
+[dependencies]
+cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+
+[patch.crates-io]
+cerulion_core = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+native_ros2_messages = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+```
 
 Its `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
 node's generated entry type:
@@ -241,11 +260,20 @@ cerulion_android::embed_nodes! {
 The macro defines the library's `JNI_OnLoad`, which registers the node types
 when Java loads the library. An app that writes its own `JNI_OnLoad` calls
 `cerulion_android::nodes::register` from it instead. Build the library with
-`cargo ndk -t arm64-v8a --platform 30 build --release -p myapp_runtime` and
-copy only `target/aarch64-linux-android/release/libmyapp_runtime.so` into
+`cargo ndk -t arm64-v8a --platform 30 build --release -p myapp_runtime`,
+empty the app's `jniLibs` directory, and copy only
+`target/aarch64-linux-android/release/libmyapp_runtime.so` into
 `jniLibs/arm64-v8a/`. Do not use `cargo ndk -o` for this library: it also
 copies each node crate's own `.so`, and the app would then ship a second
-runtime.
+runtime. `tools/scripts/android_jnilibs_gate.sh <jniLibs> myapp_runtime`
+checks the result: exactly one library per ABI, built for that ABI, every
+`LOAD` segment aligned to 16 KB, `JNI_OnLoad` exported and no node export such as
+`cerulion_node_info`. In `app/build.gradle`, set `minSdk 30`, the
+`abiFilters` you built, and add the `java/` directory of `cerulion_android`
+to `sourceSets.main.java.srcDirs`. Ship the graph as
+`app/src/main/assets/graph.yaml` with an explicit `prefix:`, because without
+one the runtime names the topics after the device's host name, and pass its
+text as `graph_yaml` in the start configuration.
 
 In Java, load that library before any other call:
 
@@ -294,7 +322,7 @@ graph first stops what is left of the previous run and closes LAN access, even
 when the new configuration is then rejected.
 
 ```java
-CerulionRuntime.loadLibrary("cerulion_android");
+CerulionRuntime.loadLibrary("myapp_runtime");
 int init = CerulionRuntime.init(getFilesDir().getAbsolutePath(), "android-app");
 if (init != CerulionRuntime.OK) {
     Log.e(TAG, "init=" + init);
@@ -557,8 +585,25 @@ name; the verdict fails a run where either count is not 0. Before the device is 
 the probe must refuse each bad argument and a connect endpoint its session
 cannot open, with exit code 1 and no report.
 `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
-`tools/scripts/test_android_e2e_probe_verdict.sh` tests it. Run the lane
-locally with a booted API 30 emulator:
+`tools/scripts/test_android_e2e_probe_verdict.sh` tests it.
+The lane also checks the sample app's linked graph nodes:
+
+- the APK carries exactly one native library, `libcerulion_sample_runtime.so`,
+  and the build step's jniLibs gate passed for it;
+- the app's status reports 3 nodes and `linked_nodes` printer, relay and
+  timer;
+- a host lists `/app/timer/count` and `/app/relay/echo` through the gateway
+  and decodes strictly increasing even values on both (the timer's `step` is
+  2, and the relay only publishes what arrives on its input);
+- the app recording holds both topics as `std_msgs/Int32` with at least half
+  the frames the timer period allows;
+- a stop and a new start in the same process run the graph again and write a
+  second, finalized recording with both topics;
+- a start after `am force-stop` succeeds in a new process over the files the
+  killed process left;
+- no SELinux denial is logged for the app's domain in any run.
+
+Run it locally with a booted API 30 emulator:
 
 ```sh
 bash tools/scripts/android_emulator_e2e.sh build
@@ -569,10 +614,12 @@ Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `CERULION_E2E_OUT` chooses the evidence directory (default
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
 cargo-ndk, and `gradle` on `PATH`; `GRADLE_ARGS` is passed through to Gradle.
-The run writes `e2e.log`, `logcat.txt`, device logs, the output and exit code of
-every echo (device and host timer, paired and open heartbeat), the report of
-every demand probe run (`*-demand-probe*.txt`,
-`open-schema-mismatch-probe.txt`), and pulled MCAP files there. The script
+The run writes `e2e.log`, `logcat.txt`, the paired and open runs' logcat
+(`logcat-paired.txt`, `logcat-open.txt`), device logs, the output and exit
+code of every echo (device and host timer, paired and open heartbeat, the
+app's timer and relay), the report of every demand probe run
+(`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), and the pulled
+MCAP files (`phase-a.mcap`, `app.mcap`, `app-restart.mcap`) there. The script
 needs a dedicated device: it refuses to start while a `cerulion` or
 `cerulion-netd` process is running, and clears only its own directory
 `/data/local/tmp/cer-e2e`, leaving the shared `/data/local/tmp/iceoryx2`
