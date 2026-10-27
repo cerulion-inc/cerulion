@@ -1996,7 +1996,7 @@ pub(crate) fn is_idl_empty_struct_placeholder(
 
 /// Which struct a member walk is at, which decides whether rosidl's
 /// empty-struct placeholder is visible to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum StructDepth {
     /// The type a bridge is built for: a topic, request or response type.
     /// Its placeholder is hidden ([`root_declared_members`]), so a
@@ -2004,10 +2004,13 @@ pub(crate) enum StructDepth {
     Root,
     /// A type reached through a member. Every listed member is kept
     /// ([`all_members`]): the nested C struct's placeholder byte stays on
-    /// the wire and in the hash, so ROS 2 peers exchange a message that
-    /// nests a member-less one unchanged, and its hash (which folds the
-    /// nested schema, byte included) stays apart from a native twin that
-    /// has no such byte. Such a message does not meet a native peer.
+    /// the wire, so ROS 2 peers exchange a message that nests a member-less
+    /// one unchanged. Such a message does not meet a native peer: as a
+    /// fixed member the nested schema, byte included, is folded into the
+    /// parent hash, which so differs from the native twin's; as a sequence
+    /// element only its name is folded, so the parent hashes like the
+    /// native twin while each element carries one byte the native stride
+    /// lacks.
     Nested,
 }
 
