@@ -11,11 +11,12 @@
 //! 1. the node crate has an `rlib` target, so a dependent crate can `use` it;
 //! 2. the node struct is `pub`, so its `<Pascal>NodeEntry` can be named;
 //! 3. with the `cdylib` feature off, the node's C exports are compiled out, so
-//!    the app library does not export `cerulion_node_info` (two linked nodes
-//!    would otherwise clash on that symbol).
+//!    the app library holds no `cerulion_node_info` at all, exported or local
+//!    (two linked nodes would otherwise clash on that symbol).
 //!
 //! The control arm builds the same node on its own with default features and
-//! finds `cerulion_node_info` in its cdylib, so an empty symbol search cannot
+//! finds `cerulion_node_info` in its cdylib's dynamic exports, the table
+//! `dlopen` resolves against, so an empty symbol search cannot
 //! pass for the wrong reason, and the CLI's `dlopen` path is shown intact.
 //!
 //! Host only. It compiles `cerulion_core` into a temporary workspace, so the
@@ -58,21 +59,49 @@ fn run_ok(mut cmd: Command, what: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// True when `lib` DEFINES the global symbol `symbol` (Mach-O names carry a
-/// leading underscore; an undefined `U` reference does not count).
-fn defines_symbol(lib: &Path, symbol: &str) -> bool {
+/// The symbol names `nm` lists as DEFINED in `lib` with `args` (an undefined
+/// `U` reference does not count; Mach-O names lose their leading underscore).
+fn defined_symbols(lib: &Path, args: &[&str]) -> Vec<String> {
     let mut nm = Command::new("nm");
-    nm.arg("-g").arg(lib);
-    let listing = run_ok(nm, &format!("nm -g {}", lib.display()));
-    listing.lines().any(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (kind, name) = match fields.as_slice() {
-            [_, kind, name] => (*kind, *name),
-            [kind, name] => (*kind, *name),
-            _ => return false,
-        };
-        kind != "U" && (name == symbol || name.strip_prefix('_') == Some(symbol))
-    })
+    nm.args(args).arg(lib);
+    let listing = run_ok(nm, &format!("nm {} {}", args.join(" "), lib.display()));
+    listing
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (kind, name) = match fields.as_slice() {
+                [_, kind, name] => (*kind, *name),
+                [kind, name] => (*kind, *name),
+                _ => return None,
+            };
+            if kind == "U" {
+                return None;
+            }
+            let name = if cfg!(target_os = "macos") {
+                name.strip_prefix('_').unwrap_or(name)
+            } else {
+                name
+            };
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+/// True when `lib` EXPORTS `symbol` in the table `dlopen` resolves against:
+/// the dynamic symbol table on ELF, the defined external symbols on Mach-O.
+fn exports_symbol(lib: &Path, symbol: &str) -> bool {
+    let args: &[&str] = if cfg!(target_os = "macos") {
+        &["-g", "-U"]
+    } else {
+        &["-D", "--defined-only"]
+    };
+    defined_symbols(lib, args).iter().any(|name| name == symbol)
+}
+
+/// True when `lib` defines `symbol` anywhere in its full symbol table, local
+/// or exported: a "compiled out" claim must not pass on a hidden copy.
+fn contains_symbol(lib: &Path, symbol: &str) -> bool {
+    defined_symbols(lib, &[]).iter().any(|name| name == symbol)
 }
 
 /// A generated workspace with one `timer` node and a `host_app` member that
@@ -184,13 +213,13 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
 
     let host_lib = debug.join(cdylib_file("host_app"));
     assert!(
-        defines_symbol(&host_lib, "host_app_linked_node_count"),
+        exports_symbol(&host_lib, "host_app_linked_node_count"),
         "the symbol search must see the app library's own export in {}",
         host_lib.display()
     );
     assert!(
-        !defines_symbol(&host_lib, "cerulion_node_info"),
-        "{} exports `cerulion_node_info`: `default-features = false` did not \
+        !contains_symbol(&host_lib, "cerulion_node_info"),
+        "{} contains `cerulion_node_info`: `default-features = false` did not \
          compile the node's C exports out",
         host_lib.display()
     );
@@ -201,7 +230,7 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
     run_ok(node_build, "cargo build -p timer");
     let node_lib = debug.join(cdylib_file("timer"));
     assert!(
-        defines_symbol(&node_lib, "cerulion_node_info"),
+        exports_symbol(&node_lib, "cerulion_node_info"),
         "{} must export `cerulion_node_info` for `cerulion graph run`",
         node_lib.display()
     );
