@@ -192,6 +192,22 @@ pub fn resolve_time_source(
 /// ROS 2 node on `/clock`.
 pub const ROS2_USE_SIM_TIME: &str = "use_sim_time";
 
+/// What a sim-time run added to a `ros2:` entry's argv to put it on
+/// `/clock`: the one decision [`put_ros2_entry_on_sim_time`] makes, returned
+/// so the spawn log reports the same decision it spawned with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimTimeArgument {
+    /// A `ros2 launch` entry got the launch argument `use_sim_time:=true`.
+    /// It reaches the launched nodes only through the launch file, so the
+    /// spawn logs [`ROS2_LAUNCH_USE_SIM_TIME_NOTICE`] for it.
+    LaunchArgument,
+    /// A `ros2 run` entry got the parameter `-p use_sim_time:=true`, which
+    /// always reaches the node.
+    Parameter,
+    /// The entry sets `use_sim_time` itself: nothing was added.
+    KeptEntryValue,
+}
+
 /// Put a `ros2:` entry of a sim-time graph on `/clock` too, so its nodes
 /// stamp, time out and fire on the same clock as the native nodes.
 ///
@@ -200,28 +216,40 @@ pub const ROS2_USE_SIM_TIME: &str = "use_sim_time";
 /// new one at the end); a `ros2 launch` entry gets the `use_sim_time:=true`
 /// launch argument, which the launch file must declare and pass to its nodes.
 /// A `use_sim_time` the entry already sets (in `params:`, or as an `args:`
-/// word `use_sim_time:=...`) is the entry's own choice and is kept.
-pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) {
+/// word `use_sim_time:=...`) is the entry's own choice and is kept. A
+/// `params_file:` may set it too, and the run cannot read the file: so the
+/// parameter is placed BEFORE `--params-file`, where a later rule wins in
+/// rcl, and a value in the file wins over the run's.
+pub fn put_ros2_entry_on_sim_time(def: &Ros2NodeDef, argv: &mut Vec<String>) -> SimTimeArgument {
     if ros2_entry_sets_use_sim_time(def) {
-        return;
+        return SimTimeArgument::KeptEntryValue;
     }
     let value = format!("{ROS2_USE_SIM_TIME}:=true");
     if def.launch.is_some() {
         argv.push(value);
-        return;
+        return SimTimeArgument::LaunchArgument;
     }
     // `Ros2NodeDef::argv` closes a `run` argv with its own `--ros-args`
-    // block exactly when the entry has a params file or params.
-    if def.params_file.is_none() && def.params.is_empty() {
-        argv.push("--ros-args".to_string());
-    }
-    argv.push("-p".to_string());
-    argv.push(value);
+    // block exactly when the entry has a params file or params. With a
+    // params file, that block's `--ros-args` is the LAST one in the argv,
+    // and the parameter goes right after it, ahead of `--params-file`.
+    let at = match argv.iter().rposition(|word| word == "--ros-args") {
+        Some(ros_args) if def.params_file.is_some() => ros_args + 1,
+        _ if def.params_file.is_none() && def.params.is_empty() => {
+            argv.push("--ros-args".to_string());
+            argv.len()
+        }
+        _ => argv.len(),
+    };
+    argv.insert(at, "-p".to_string());
+    argv.insert(at + 1, value);
+    SimTimeArgument::Parameter
 }
 
 /// Whether a `ros2:` entry sets `use_sim_time` itself: in `params:`, or as
 /// an `args:` word `use_sim_time:=...`. Such a value is the entry's own
-/// choice, and a sim-time run keeps it.
+/// choice, and a sim-time run keeps it. A value inside a `params_file:` is
+/// not read here; [`put_ros2_entry_on_sim_time`] lets it win by argv order.
 pub fn ros2_entry_sets_use_sim_time(def: &Ros2NodeDef) -> bool {
     let assignment = format!("{ROS2_USE_SIM_TIME}:=");
     def.params.contains_key(ROS2_USE_SIM_TIME)
@@ -229,29 +257,14 @@ pub fn ros2_entry_sets_use_sim_time(def: &Ros2NodeDef) -> bool {
 }
 
 /// The notice a sim-time run logs when it spawns a `ros2 launch` entry with
-/// the `use_sim_time:=true` launch argument. A `-p` parameter on `ros2 run`
+/// the `use_sim_time:=true` launch argument
+/// ([`SimTimeArgument::LaunchArgument`]). A `-p` parameter on `ros2 run`
 /// always reaches the node; a launch argument reaches the launched nodes
 /// only through the launch file, so the run says so at spawn.
 pub const ROS2_LAUNCH_USE_SIM_TIME_NOTICE: &str = "this `ros2 launch` entry is given the \
     launch argument `use_sim_time:=true`, which takes effect only if the launch file declares \
     a `use_sim_time` launch argument and passes it to its nodes; a launch file that does not \
     declare it leaves its nodes on their own clock";
-
-/// `Some(notice)` when a sim-time run ([`TimeSource::External`]) puts a
-/// `ros2 launch` entry on `/clock` through the launch argument
-/// ([`put_ros2_entry_on_sim_time`]), so the spawn can log
-/// [`ROS2_LAUNCH_USE_SIM_TIME_NOTICE`] once for it. `None` for a `ros2 run`
-/// entry (its parameter always takes effect), for an entry that sets
-/// `use_sim_time` itself, and on every other clock.
-pub fn ros2_launch_sim_time_notice(
-    def: &Ros2NodeDef,
-    time_source: TimeSource,
-) -> Option<&'static str> {
-    let given_the_argument = time_source == TimeSource::External
-        && def.launch.is_some()
-        && !ros2_entry_sets_use_sim_time(def);
-    given_the_argument.then_some(ROS2_LAUNCH_USE_SIM_TIME_NOTICE)
-}
 
 /// Decides, from the wall time elapsed since the run started and whether a
 /// clock has arrived, whether to print [`NO_CLOCK_WARNING`]: once, after the
@@ -1154,42 +1167,44 @@ mod tests {
         );
     }
 
+    /// The one decision names what it added, so the spawn log can report
+    /// it: the launch argument (which only the launch file can carry to its
+    /// nodes, hence the notice), the parameter (which always reaches the
+    /// node), or nothing for an entry that sets `use_sim_time` itself.
     #[test]
-    fn a_launch_entry_put_on_sim_time_is_told_the_launch_file_must_declare_it() {
+    fn putting_an_entry_on_sim_time_names_what_it_added() {
         let launch = Ros2NodeDef {
             launch: Some("bringup.launch.py".to_string()),
             ..Default::default()
         };
+        let mut argv = launch.argv(None);
         assert_eq!(
-            ros2_launch_sim_time_notice(&launch, TimeSource::External),
-            Some(ROS2_LAUNCH_USE_SIM_TIME_NOTICE),
-            "the launch argument works only if the launch file declares it, so the run says so"
+            put_ros2_entry_on_sim_time(&launch, &mut argv),
+            SimTimeArgument::LaunchArgument,
+            "the launch argument works only if the launch file declares it, so the spawn says so"
         );
-        for source in [TimeSource::Real, TimeSource::Virtual] {
-            assert_eq!(
-                ros2_launch_sim_time_notice(&launch, source),
-                None,
-                "{source:?}: the entry was not put on sim time"
-            );
-        }
         let own_value = Ros2NodeDef {
             launch: Some("bringup.launch.py".to_string()),
             args: vec!["use_sim_time:=false".to_string()],
             ..Default::default()
         };
+        let before = own_value.argv(None);
+        let mut argv = before.clone();
         assert_eq!(
-            ros2_launch_sim_time_notice(&own_value, TimeSource::External),
-            None,
+            put_ros2_entry_on_sim_time(&own_value, &mut argv),
+            SimTimeArgument::KeptEntryValue,
             "the entry's own value is kept as given, so there is nothing to declare"
         );
+        assert_eq!(argv, before, "nothing was added");
         let run = Ros2NodeDef {
             package: Some("pkg".to_string()),
             executable: Some("exe".to_string()),
             ..Default::default()
         };
+        let mut argv = run.argv(None);
         assert_eq!(
-            ros2_launch_sim_time_notice(&run, TimeSource::External),
-            None,
+            put_ros2_entry_on_sim_time(&run, &mut argv),
+            SimTimeArgument::Parameter,
             "a `-p` parameter on `ros2 run` always reaches the node"
         );
         assert!(
@@ -1199,9 +1214,52 @@ mod tests {
         );
     }
 
+    /// A `ros2 run` entry with a params file: the run cannot read the file,
+    /// so its parameter goes right after `--ros-args` and AHEAD of
+    /// `--params-file`. In rcl the later rule wins, so a `use_sim_time` the
+    /// file sets is the entry's own value and overrides the run's; a file
+    /// that does not set it leaves the run's in force. The entry's `params:`
+    /// still follow the file, as `Ros2NodeDef::argv` places them.
     #[test]
-    fn the_spawn_argv_puts_ros2_entries_on_sim_time_only_under_sim_time() {
-        use crate::ros2_graph::{spawn_argv, Ros2Entry};
+    fn a_params_file_entry_gets_the_parameter_ahead_of_the_file_so_the_file_wins() {
+        let mut params = IndexMap::new();
+        params.insert("rate".to_string(), serde_yaml::Value::from(5));
+        let def = Ros2NodeDef {
+            package: Some("pkg".to_string()),
+            executable: Some("exe".to_string()),
+            args: vec![
+                "--ros-args".to_string(),
+                "-r".to_string(),
+                "a:=b".to_string(),
+            ],
+            params_file: Some("params.yaml".to_string()),
+            params,
+            ..Default::default()
+        };
+        assert_eq!(
+            sim_argv(&def),
+            [
+                "run",
+                "pkg",
+                "exe",
+                "--ros-args",
+                "-r",
+                "a:=b",
+                "--ros-args",
+                "-p",
+                "use_sim_time:=true",
+                "--params-file",
+                "params.yaml",
+                "-p",
+                "rate:=5"
+            ],
+            "the parameter sits in the entry's LAST `--ros-args` block, ahead of the file"
+        );
+    }
+
+    #[test]
+    fn the_spawn_plan_puts_ros2_entries_on_sim_time_only_under_sim_time() {
+        use crate::ros2_graph::{spawn_plan, Ros2Entry};
         let root = tempfile::tempdir().expect("tempdir");
         let entry = Ros2Entry {
             id: "talker".to_string(),
@@ -1214,13 +1272,15 @@ mod tests {
         let wall = ["run", "demo_nodes_cpp", "talker"];
         for source in [TimeSource::Real, TimeSource::Virtual] {
             assert_eq!(
-                spawn_argv(&entry, root.path(), source).expect("argv"),
+                spawn_plan(&entry, root.path(), source).expect("argv").argv,
                 wall,
                 "{source:?}"
             );
         }
         assert_eq!(
-            spawn_argv(&entry, root.path(), TimeSource::External).expect("argv"),
+            spawn_plan(&entry, root.path(), TimeSource::External)
+                .expect("argv")
+                .argv,
             [
                 "run",
                 "demo_nodes_cpp",

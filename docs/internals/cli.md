@@ -1334,8 +1334,11 @@ files them under the verb their `PARENT` names. A flag on a built-in verb (such 
   `GraphRuntime::set_period_fire_ceiling`) is current behaviour, not contract:
   the items are `#[doc(hidden)]`, and the user pages say "today".
 - A frame is decoded only after its wire framing is checked.
-- `ros2:` entries are put on `/clock` by `spawn_argv` (`put_ros2_entry_on_sim_time`).
-  The spawn log prints the argv as spawned (`ros2_graph::command_line`), and a
-  `ros2 launch` entry that got the launch argument logs
-  `ROS2_LAUNCH_USE_SIM_TIME_NOTICE` once (`ros2_launch_sim_time_notice`).
+- `ros2:` entries are put on `/clock` by `ros2_graph::spawn_plan`
+  (`put_ros2_entry_on_sim_time`, which returns the `SimTimeArgument` it added:
+  the launch argument, the `-p` parameter placed ahead of `--params-file` so a
+  file value wins, or nothing for an entry that sets `use_sim_time` itself). The
+  spawn log prints the plan's command (`command_line` of the argv as spawned),
+  and a `LaunchArgument` plan logs `ROS2_LAUNCH_USE_SIM_TIME_NOTICE` once: one
+  decision drives the argv and the log.
 - Every warning and refusal text is a pinned constant.

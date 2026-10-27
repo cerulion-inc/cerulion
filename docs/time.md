@@ -119,7 +119,9 @@ launch argument `use_sim_time:=true`, which the launch file must declare and
 pass to its nodes. The run says so when it spawns such an entry, and its
 spawn line shows the command as spawned, argument included. An entry that
 sets `use_sim_time` itself (under `params:`, or as an `args:` word
-`use_sim_time:=...`) keeps its own value.
+`use_sim_time:=...`) keeps its own value. A `use_sim_time` inside the
+entry's `params_file:` wins too: the run places its `-p use_sim_time:=true`
+before `--params-file`, and ROS 2 applies the later value.
 
 ### A clock publisher
 
