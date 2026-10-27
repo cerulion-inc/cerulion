@@ -3976,6 +3976,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_ops_proto tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_ops_proto')
+        run: cargo test -p cerulion_ops_proto
+      - name: selection marker, cerulion_ops_proto
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_ops_proto') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_ops_proto (selected: $SELECTED)"
       - name: cerulion_rcpd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
         run: cargo test -p cerulion_rcpd

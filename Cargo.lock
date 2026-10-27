@@ -1138,6 +1138,7 @@ name = "cerud"
 version = "1.0.0"
 dependencies = [
  "cerud",
+ "cerulion_ops_proto",
  "clap",
  "hex",
  "libc",
@@ -1575,6 +1576,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "cerulion_ops_proto"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
