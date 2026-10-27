@@ -166,7 +166,10 @@ mod tests {
     fn no_cpufreq_is_info_too() {
         let o = decide(&[]);
         assert_eq!(o.status, Status::Info);
-        assert!(o.summary.starts_with("no cpufreq interface"));
+        assert_eq!(
+            o.summary,
+            "no cpufreq directory under /sys/devices/system/cpu, so there is no governor to read"
+        );
     }
 
     #[test]
