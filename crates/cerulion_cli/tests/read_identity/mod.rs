@@ -741,8 +741,10 @@ struct RiRelayNode {
     ri_id: String,
     #[param(default = 100, description = "this writer's identity")]
     ri_writer: u64,
-    #[param(default = 0, description = "microseconds each fire sleeps")]
+    #[param(default = 0, description = "microseconds a sleeping fire sleeps")]
     ri_sleep_us: u64,
+    #[param(default = 1, description = "every this many fires, one sleeps")]
+    ri_sleep_every: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
 }
@@ -750,7 +752,9 @@ struct RiRelayNode {
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
-        ri_sleep(self.ri_sleep_us);
+        if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
+            ri_sleep(self.ri_sleep_us);
+        }
         self.tick_count += 1;
         let r = [self.inp.x, self.inp.y, self.inp.z];
         if ri_on() {
@@ -1120,13 +1124,16 @@ pub enum Fixture {
     Ranks2,
     /// The same chain split `[src]` / `[relay]` / `[sink]`.
     Ranks3,
-    /// `Ranks3` with a relay that sleeps [`LATE_RELAY_SLEEP_US`] per fire, so
-    /// its fires bunch: one step drains several frames.
+    /// `Ranks3` with a relay that sleeps [`LATE_RELAY_SLEEP_US`] on every
+    /// [`LATE_RELAY_EVERY`]th fire, so its fires bunch (one step drains two or
+    /// three frames) without its queue overflowing.
     Ranks3LateRelay,
 }
 
-/// How long the late relay of [`Fixture::Ranks3LateRelay`] sleeps per fire.
+/// How long a sleeping fire of [`Fixture::Ranks3LateRelay`]'s relay sleeps.
 pub const LATE_RELAY_SLEEP_US: u64 = 2_000;
+/// Every this many fires of [`Fixture::Ranks3LateRelay`]'s relay, one sleeps.
+pub const LATE_RELAY_EVERY: u64 = 20;
 
 /// A fixture's nodes, its process groups in rank order, and its
 /// multi-publisher topics.
@@ -1322,6 +1329,7 @@ impl Fixture {
                             id("relay"),
                             writer(100),
                             ("ri_sleep_us", ParamValue::UInt(relay_sleep)),
+                            ("ri_sleep_every", ParamValue::UInt(LATE_RELAY_EVERY)),
                         ],
                     ),
                     node(
