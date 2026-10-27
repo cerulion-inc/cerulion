@@ -215,12 +215,12 @@ x509-parser = "0.18"
 # checks its leaf and issuing CA certificates with the same code that issues them.
 cerulion_pairing = { workspace = true }
 # PEM text for the in-memory certificates and key a team session hands zenoh
-# (`*_base64` keys). The version zenoh-link-commons already uses.
+# (`*_base64` keys); 0.22 is the line zenoh-link-commons 1.10 resolves.
 base64 = "0.22"
 # Clears the in-memory PKCS#8 key of a team session on drop.
 zeroize = "1"
 # Sign and derive the keys of test team certificates in `transport::test_ca`
-# (`test-helpers` only). Both are already in the tree through cerulion_pairing.
+# (`test-helpers` only); the same lines cerulion_pairing resolves.
 ed25519-dalek = { version = "2", optional = true }
 sha2 = { version = "0.10", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

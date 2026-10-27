@@ -6016,7 +6016,7 @@ fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()
     Ok(())
 }
 
-/// A `quic/` listener's certificate (the first CERTIFICATE block of the file)
+/// A `quic/` or `tls/` listener's certificate (the first CERTIFICATE block of the file)
 /// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
 /// which rejects a CA certificate presented as the end entity
 /// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the

@@ -2146,8 +2146,8 @@ network:
   every `egress` entry that sets no `reliability`. An entry's own
   `reliability` wins in both directions: `{topic: /r/cmd, reliability:
   reliable}` stays reliable under a `best_effort` default.
-- `tls`: absolute PEM paths for `quic/` locators: `certificate` +
-  `private_key` for a `quic/` listener, `root_ca` for a `quic/` connect (the
+- `tls`: absolute PEM paths for `quic/` and `tls/` locators: `certificate` +
+  `private_key` for a listener, `root_ca` for a connect (the
   connect also checks the certificate names the host or IP dialled, and zenoh
   trusts the public Web PKI roots beside `root_ca`). The carrier is the
   locator's first segment:

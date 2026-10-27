@@ -6,14 +6,20 @@
 //!
 //! What each test pins, on both links:
 //! - a robot's frames reach a viewer;
-//! - a viewer's frames never reach a robot, and an operator's do;
+//! - a viewer's frames never reach a robot, and an operator's do; a robot
+//!   that routes puts to every role still drops a viewer's put on ingress;
 //! - a viewer's demand liveliness token and its query on `cerulion_q/**`
 //!   reach the robot, and the robot's reply comes back;
-//! - a machine whose leaf comes from another team's CA never links;
-//! - a machine that trusts only an older generation never links to a newer
-//!   leaf;
-//! - a `tcp/` or `udp/...?rel=1` locator fails the open naming the locator,
-//!   and team credentials together with certificate files fail the open;
+//! - a machine whose leaf comes from another team's CA never links, while a
+//!   team machine links to the same listener;
+//! - a machine of the previous generation that holds the next CA links to a
+//!   rotated robot and gets the bundle exchange only; one without it never
+//!   links;
+//! - a viewer gateway pulls a robot topic, and a robot gateway that dials an
+//!   operator pulls the operator's topic, through the full demand path;
+//! - a `tcp/`, `udp/...?rel=1` or `#`-config locator fails the open naming
+//!   the locator, and team credentials together with certificate files fail
+//!   the open;
 //! - the config's `Debug` and serialized forms carry no key material.
 
 use std::sync::mpsc;
@@ -46,11 +52,18 @@ fn manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> Network
     })
 }
 
+/// A manager listening on a fresh loopback `link` locator, its session open,
+/// and that locator.
+fn listen(link: &str, auth: TeamAuth) -> (NetworkManager, String) {
+    let locator = format!("{link}/127.0.0.1:{}", free_port());
+    let m = manager(auth, vec![locator.clone()], vec![]);
+    m.session().expect("the listener opens");
+    (m, locator)
+}
+
 /// A listening `server` and a `client` connecting to it over `link`.
 fn pair(link: &str, server: TeamAuth, client: TeamAuth) -> (NetworkManager, NetworkManager) {
-    let locator = format!("{link}/127.0.0.1:{}", free_port());
-    let s = manager(server, vec![locator.clone()], vec![]);
-    s.session().expect("the listener opens");
+    let (s, locator) = listen(link, server);
     let c = manager(client, vec![], vec![locator]);
     (s, c)
 }
@@ -137,7 +150,7 @@ fn only_a_writer_role_delivers_to_a_robot() {
             "{link}: viewer links"
         );
         assert_eq!(
-            deliver(&viewer, &robot, "/team/cmd_vel", Duration::from_secs(3)),
+            deliver(&viewer, &robot, "/team/cmd_vel", Duration::from_secs(5)),
             0,
             "{link}: a viewer's frames never reach the robot"
         );
@@ -212,43 +225,180 @@ fn a_viewer_demand_token_and_query_reach_the_robot() {
     }
 }
 
+/// A robot session with the generated policy plus one extra rule: it
+/// declares its subscribers to every role, so a peer of any role routes puts
+/// to it, and only the robot's ingress rules decide what arrives.
+fn robot_declaring_to_all(link: &str, auth: TeamAuth) -> (zenoh::Session, String) {
+    let locator = format!("{link}/127.0.0.1:{}", free_port());
+    let mut acl = auth.access_control();
+    acl["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "test_declare_to_all",
+            "permission": "allow",
+            "flows": ["egress"],
+            "messages": ["declare_subscriber"],
+            "key_exprs": ["cerulion_w2/**"],
+        }));
+    for policy in acl["policies"].as_array_mut().unwrap() {
+        policy["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push("test_declare_to_all".into());
+    }
+    let m = manager(auth, vec![locator.clone()], vec![]);
+    let mut config = m.zenoh_config_for_test().expect("config builds");
+    config
+        .insert_json5("access_control", &acl.to_string())
+        .expect("policy set");
+    (zenoh::open(config).wait().expect("robot opens"), locator)
+}
+
+/// Frames a raw session holding `auth`'s credentials, with its own policy
+/// off, puts to `robot` within `budget`.
+fn raw_put_count(robot: &zenoh::Session, auth: TeamAuth, locator: &str, budget: Duration) -> usize {
+    let m = manager(auth, vec![], vec![locator.to_string()]);
+    let mut config = m.zenoh_config_for_test().expect("config builds");
+    config
+        .insert_json5("access_control/enabled", "false")
+        .expect("policy off");
+    let raw = zenoh::open(config).wait().expect("raw session opens");
+    let (tx, rx) = mpsc::channel();
+    let key = NetworkManager::data_key("/team/cmd_vel");
+    let _sub = robot
+        .declare_subscriber(key.clone())
+        .callback(move |_| {
+            let _ = tx.send(());
+        })
+        .wait()
+        .unwrap();
+    let deadline = Instant::now() + budget;
+    let mut got = 0;
+    while Instant::now() < deadline && got == 0 {
+        raw.put(key.clone(), frame(0)).wait().unwrap();
+        while rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+            got += 1;
+        }
+    }
+    got
+}
+
+#[test]
+fn a_robot_drops_a_viewer_put_on_ingress() {
+    let acme = TestTeam::new("acme", 1);
+    for link in LINKS {
+        let (robot, locator) = robot_declaring_to_all(link, acme.machine(TeamRole::Robot, 1));
+        assert!(
+            raw_put_count(
+                &robot,
+                acme.machine(TeamRole::Operator, 3),
+                &locator,
+                Duration::from_secs(10)
+            ) > 0,
+            "{link}: an operator's raw put arrives"
+        );
+        assert_eq!(
+            raw_put_count(
+                &robot,
+                acme.machine(TeamRole::Viewer, 2),
+                &locator,
+                Duration::from_secs(10)
+            ),
+            0,
+            "{link}: the robot's ingress rules drop a viewer's put it routed to"
+        );
+    }
+}
+
 #[test]
 fn a_machine_of_another_team_never_links() {
     let acme = TestTeam::new("acme", 1);
     let rival = TestTeam::new("rival", 1);
     for link in LINKS {
-        let (robot, outsider) = pair(
-            link,
-            acme.machine(TeamRole::Robot, 1),
-            rival.machine(TeamRole::Owner, 2),
+        let (robot, locator) = listen(link, acme.machine(TeamRole::Robot, 1));
+        let member = manager(
+            acme.machine(TeamRole::Viewer, 2),
+            vec![],
+            vec![locator.clone()],
         );
+        assert!(
+            linked(&member, Duration::from_secs(10)),
+            "{link}: a team machine links to the listener"
+        );
+        let outsider = manager(rival.machine(TeamRole::Owner, 2), vec![], vec![locator]);
         assert!(
             !linked(&outsider, Duration::from_secs(3)),
             "{link}: a leaf from another team's CA never links"
         );
-        assert!(!linked(&robot, Duration::from_millis(100)), "{link}");
+        drop(robot);
     }
 }
 
 #[test]
-fn a_machine_of_an_older_generation_refuses_a_newer_leaf() {
+fn the_previous_generation_gets_the_bundle_exchange_only() {
     let g1 = TestTeam::new("acme", 1);
     let g2 = g1.rotated();
-    // The g2 robot trusts the retired g1 CA; the g1 machine trusts only g1,
-    // so its own side of the handshake refuses the g2 leaf.
     let key = g1.machine_key(2);
-    let old = TeamAuth::new(&key, &g1.leaf(TeamRole::Robot, &key), g1.ca_der(), &[])
-        .expect("g1 credentials");
+    let leaf = g1.leaf(TeamRole::Robot, &key);
+    let next = g1.next_ca_der();
+    let holds_next = TeamAuth::new(&key, &leaf, g1.anchors(Some(&next))).expect("g1 credentials");
+    let g1_only = TeamAuth::new(&key, &leaf, g1.anchors(None)).expect("g1 credentials");
     for link in LINKS {
-        let (robot, stale) = pair(link, g2.machine(TeamRole::Robot, 1), old.clone());
+        let (robot, locator) = listen(link, g2.machine(TeamRole::Robot, 1));
+        let rs = robot.session().unwrap();
+        let _bundle = rs
+            .declare_queryable("cerulion_auth/bundle")
+            .callback(|q| {
+                let _ = q.reply(q.key_expr().clone(), "bundle").wait();
+            })
+            .wait()
+            .unwrap();
+        let _catalog = rs
+            .declare_queryable("cerulion_q/robot1/catalog")
+            .callback(|q| {
+                let _ = q.reply(q.key_expr().clone(), "catalog").wait();
+            })
+            .wait()
+            .unwrap();
+
+        let stale = manager(g1_only.clone(), vec![], vec![locator.clone()]);
         assert!(
             !linked(&stale, Duration::from_secs(3)),
-            "{link}: a g1-only machine never links to a g2 robot"
+            "{link}: a g1 machine without the next CA refuses the g2 leaf"
+        );
+
+        let old = manager(holds_next.clone(), vec![], vec![locator]);
+        assert!(linked(&old, Duration::from_secs(10)), "{link}: links");
+        let os = old.session().unwrap();
+        let replies = |key: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut n = 0;
+            while Instant::now() < deadline && n == 0 {
+                n += os
+                    .get(key)
+                    .timeout(Duration::from_millis(300))
+                    .wait()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.result().is_ok())
+                    .count();
+            }
+            n
+        };
+        assert!(
+            replies("cerulion_auth/bundle") > 0,
+            "{link}: the bundle query is answered"
         );
         assert_eq!(
-            deliver(&robot, &stale, "/team/telemetry", Duration::from_secs(1)),
+            replies("cerulion_q/robot1/catalog"),
             0,
-            "{link}"
+            "{link}: a catalog query is not"
+        );
+        assert_eq!(
+            deliver(&robot, &old, "/team/telemetry", Duration::from_secs(3)),
+            0,
+            "{link}: no frames reach the previous generation"
         );
     }
 }
@@ -256,7 +406,11 @@ fn a_machine_of_an_older_generation_refuses_a_newer_leaf() {
 #[test]
 fn plaintext_locators_fail_the_open_naming_them() {
     let acme = TestTeam::new("acme", 1);
-    for locator in ["tcp/127.0.0.1:7999", "udp/127.0.0.1:7999?rel=1;mixed_rel=1"] {
+    for locator in [
+        "tcp/127.0.0.1:7999",
+        "udp/127.0.0.1:7999?rel=1;mixed_rel=1",
+        "tls/127.0.0.1:7999#enable_mtls=false",
+    ] {
         for (listen, connect) in [
             (vec![locator.to_string()], vec![]),
             (vec![], vec![locator.to_string()]),
@@ -264,7 +418,6 @@ fn plaintext_locators_fail_the_open_naming_them() {
             let m = manager(acme.machine(TeamRole::Robot, 1), listen, connect);
             let err = m.session().expect_err(locator).to_string();
             assert!(err.contains(locator), "the refusal names {locator}: {err}");
-            assert!(err.contains("quic/<host>:<port>"), "{err}");
         }
     }
 }
@@ -288,8 +441,25 @@ fn team_credentials_with_certificate_files_fail_the_open() {
 #[test]
 fn no_key_material_in_debug_or_serialized_config() {
     let acme = TestTeam::new("acme", 1);
-    let key = acme.machine_key(1);
+    use base64::Engine as _;
+    let seed = *acme.machine_key(1).seed();
     let auth = acme.machine(TeamRole::Robot, 1);
+    let secret = auth.private_key_base64_for_test().to_string();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let mut pkcs8 = vec![
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    pkcs8.extend_from_slice(&seed);
+    let forms = [
+        secret.clone(),
+        b64.encode(seed),
+        b64.encode(&pkcs8),
+        seed_hex,
+    ];
+    // The PEM key text starts "-----BEGIN PRIVATE KEY-----", whose base64 starts so.
+    assert!(secret.starts_with("LS0tLS1CRUdJTiBQUklWQVRF"));
     let cfg = NetworkConfig {
         listen_endpoints: vec!["quic/127.0.0.1:7999".to_string()],
         auth: Some(NetworkAuth::Team(auth)),
@@ -297,7 +467,6 @@ fn no_key_material_in_debug_or_serialized_config() {
     };
     let m = NetworkManager::new(cfg.clone());
     let zcfg = m.zenoh_config_for_test().expect("config builds");
-    let seed_hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
     let texts = [
         format!("{cfg:?}"),
         format!("{zcfg:?}"),
@@ -310,7 +479,9 @@ fn no_key_material_in_debug_or_serialized_config() {
             !text.contains("LS0tLS1CRUdJTiBQUklWQVRF"),
             "base64 of a PEM key header"
         );
-        assert!(!text.contains(&seed_hex));
+        for form in &forms {
+            assert!(!text.contains(form.as_str()), "key material in {text}");
+        }
     }
     // The access policy is in the config, keyed on exact common names.
     assert!(
@@ -320,12 +491,18 @@ fn no_key_material_in_debug_or_serialized_config() {
     );
 }
 
-/// The full gateway path over team links: a viewer's ingress gateway demands a
-/// robot topic (liveliness token and demand query), the robot's egress gateway
-/// enables it, taps the local publisher and forwards, and the viewer's local
-/// subscriber receives every frame byte for byte.
-#[test]
-fn a_viewer_gateway_pulls_a_robot_topic_through_the_demand_path() {
+/// One gateway pair over a team link: a producer machine whose egress
+/// gateway announces `topic` from a local publisher, and a consumer machine
+/// whose ingress gateway demands it. `producer_listens` picks which side
+/// listens and which dials. Returns the frames the consumer's local subscriber
+/// received, as (timestamp, x) pairs, after the producer published three.
+fn gateway_flow(
+    link: &str,
+    tag: &str,
+    producer_auth: TeamAuth,
+    consumer_auth: TeamAuth,
+    producer_listens: bool,
+) -> Vec<(u64, f64)> {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -338,125 +515,152 @@ fn a_viewer_gateway_pulls_a_robot_topic_through_the_demand_path() {
     use cerulion_core::wire::MaxSliceLen;
     use native_ros2_messages::geometry_msgs::Vector3;
 
+    let topic = format!("/team/{link}/{tag}_{}", std::process::id());
+    let locator = format!("{link}/127.0.0.1:{}", free_port());
+    let (producer_net, consumer_net) = if producer_listens {
+        ((vec![locator.clone()], vec![]), (vec![], vec![locator]))
+    } else {
+        ((vec![], vec![locator.clone()]), (vec![locator], vec![]))
+    };
+    let root_a = cerulion_core::testing::iceoryx_test_config();
+    let clock = Arc::new(VirtualClock::new());
+    let clock_dyn: Arc<dyn Clock> = clock.clone();
+    let producer = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("team_p_{link}_{tag}"),
+            clock: clock_dyn,
+            ..Default::default()
+        },
+        root_a.clone(),
+    )
+    .expect("init producer");
+    let net = |(listen, connect): (Vec<String>, Vec<String>), robot: &str, auth| NetworkConfig {
+        listen_endpoints: listen,
+        connect_endpoints: connect,
+        robot_identity: Some(robot.to_string()),
+        auth: Some(NetworkAuth::Team(auth)),
+        ..NetworkConfig::default()
+    };
+    // The consumer comes up first; a dialing side retries its connect in the
+    // background until the listener is up.
+    let consumer = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("team_c_{link}_{tag}"),
+            network: Some(net(consumer_net, &format!("{tag}-consumer"), consumer_auth)),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("init consumer gateway");
+    let sub = consumer
+        .create_subscriber(&topic)
+        .expect("consumer subscriber");
+    let gateway = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("team_g_{link}_{tag}"),
+            network: Some(net(producer_net, &format!("{tag}-producer"), producer_auth)),
+            ..Default::default()
+        },
+        root_a,
+    )
+    .expect("init producer gateway");
+    let mut producer_gw = GatewayRuntime::new(
+        gateway,
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowAll,
+            announce: vec![topic.clone()],
+            ingress: vec![],
+        },
+    )
+    .expect("producer gateway boots");
+    let mut publisher = producer
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .expect("producer publisher");
+    let mut consumer_gw = GatewayRuntime::new(
+        consumer,
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowList(vec![]),
+            announce: vec![],
+            ingress: vec![GatewayIngressEntry {
+                topic: topic.clone(),
+                schema_hash: Vector3::SCHEMA_HASH,
+            }],
+        },
+    )
+    .expect("consumer gateway boots");
+    let flag = producer_gw
+        .manager()
+        .bridge_manager()
+        .register_topic(&topic)
+        .expect("producer bridge flag");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+        consumer_gw.demand_get_once().expect("demand pass");
+        producer_gw.drive_once().expect("producer drive");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    while flag.load(Ordering::Relaxed)
+        && producer_gw.active_tap_topics().is_empty()
+        && Instant::now() < deadline
+    {
+        producer_gw.drive_once().expect("producer drive");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (ts, x) in GATEWAY_PLAN {
+        clock.set(ts);
+        let mut proxy = publisher.loan_proxy::<Vector3>().expect("loan");
+        proxy.x = x;
+        proxy.y = -x;
+        proxy.z = 2.0 * x;
+    }
+    let mut got = Vec::new();
+    while got.len() < GATEWAY_PLAN.len() && Instant::now() < deadline {
+        consumer_gw.demand_get_once().expect("demand pass");
+        producer_gw.drive_once().expect("producer drive");
+        sub.try_receive(|msg| {
+            let p = msg.payload();
+            let x = f64::from_le_bytes(p[..8].try_into().unwrap());
+            got.push((msg.header().timestamp_ns, x));
+        })
+        .expect("consumer receive");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    got
+}
+
+const GATEWAY_PLAN: [(u64, f64); 3] = [(10_000_000, 1.25), (20_000_000, 2.5), (30_000_000, 3.75)];
+
+/// A viewer's ingress gateway dials a listening robot and pulls a robot topic
+/// through the demand path (liveliness token and demand query).
+#[test]
+fn a_viewer_gateway_pulls_a_robot_topic_through_the_demand_path() {
     let acme = TestTeam::new("acme", 1);
-    for (n, link) in LINKS.into_iter().enumerate() {
-        let topic = format!("/team/{link}/pose_{}", std::process::id());
-        let locator = format!("{link}/127.0.0.1:{}", free_port());
-        let root_a = cerulion_core::testing::iceoryx_test_config();
-        let clock = Arc::new(VirtualClock::new());
-        let clock_dyn: Arc<dyn Clock> = clock.clone();
-        let producer = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: format!("team_p_{link}_{n}"),
-                clock: clock_dyn,
-                ..Default::default()
-            },
-            root_a.clone(),
-        )
-        .expect("init producer");
-        let robot = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: format!("team_robot_{link}_{n}"),
-                network: Some(NetworkConfig {
-                    listen_endpoints: vec![locator.clone()],
-                    robot_identity: Some("team-robot".to_string()),
-                    auth: Some(NetworkAuth::Team(acme.machine(TeamRole::Robot, 1))),
-                    ..NetworkConfig::default()
-                }),
-                ..Default::default()
-            },
-            root_a,
-        )
-        .expect("init robot gateway");
-        let mut robot_gw = GatewayRuntime::new(
-            robot,
-            GatewayPlan {
-                egress_policy: GatewayEgressPolicy::AllowAll,
-                announce: vec![topic.clone()],
-                ingress: vec![],
-            },
-        )
-        .expect("robot gateway boots");
-        let mut publisher = producer
-            .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
-            .expect("producer publisher");
-
-        let viewer = TransportManager::init_for_test(
-            TransportConfig {
-                node_name: format!("team_viewer_{link}_{n}"),
-                network: Some(NetworkConfig {
-                    connect_endpoints: vec![locator],
-                    robot_identity: Some("team-viewer".to_string()),
-                    auth: Some(NetworkAuth::Team(acme.machine(TeamRole::Viewer, 2))),
-                    ..NetworkConfig::default()
-                }),
-                ..Default::default()
-            },
-            cerulion_core::testing::iceoryx_test_config(),
-        )
-        .expect("init viewer gateway");
-        let sub = viewer.create_subscriber(&topic).expect("viewer subscriber");
-        let mut viewer_gw = GatewayRuntime::new(
-            viewer,
-            GatewayPlan {
-                egress_policy: GatewayEgressPolicy::AllowList(vec![]),
-                announce: vec![],
-                ingress: vec![GatewayIngressEntry {
-                    topic: topic.clone(),
-                    schema_hash: Vector3::SCHEMA_HASH,
-                }],
-            },
-        )
-        .expect("viewer gateway boots");
-        let flag = robot_gw
-            .manager()
-            .bridge_manager()
-            .register_topic(&topic)
-            .expect("robot bridge flag");
-
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !flag.load(Ordering::Relaxed) {
-            assert!(
-                Instant::now() < deadline,
-                "{link}: the viewer's demand never enabled egress"
-            );
-            viewer_gw.demand_get_once().expect("demand pass");
-            robot_gw.drive_once().expect("robot drive");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        while robot_gw.active_tap_topics().is_empty() {
-            assert!(Instant::now() < deadline, "{link}: tap did not attach");
-            robot_gw.drive_once().expect("robot drive");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let plan = [
-            (10_000_000u64, 1.25f64),
-            (20_000_000, 2.5),
-            (30_000_000, 3.75),
-        ];
-        for (ts, x) in plan {
-            clock.set(ts);
-            let mut proxy = publisher.loan_proxy::<Vector3>().expect("loan");
-            proxy.x = x;
-            proxy.y = -x;
-            proxy.z = 2.0 * x;
-        }
-        let mut got: Vec<(u64, f64)> = Vec::new();
-        while got.len() < plan.len() && Instant::now() < deadline {
-            viewer_gw.demand_get_once().expect("demand pass");
-            robot_gw.drive_once().expect("robot drive");
-            sub.try_receive(|msg| {
-                let p = msg.payload();
-                let x = f64::from_le_bytes(p[..8].try_into().unwrap());
-                got.push((msg.header().timestamp_ns, x));
-            })
-            .expect("viewer receive");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(
-            got,
-            plan.to_vec(),
-            "{link}: every frame arrives through the team link"
+    for link in LINKS {
+        let got = gateway_flow(
+            link,
+            "robot_to_viewer",
+            acme.machine(TeamRole::Robot, 1),
+            acme.machine(TeamRole::Viewer, 2),
+            true,
         );
+        assert_eq!(got, GATEWAY_PLAN.to_vec(), "{link}: every frame arrives");
+    }
+}
+
+/// A robot's ingress gateway dials a listening operator and pulls the
+/// operator's topic: the writer rules, and the policy of a dialing robot.
+#[test]
+fn a_robot_gateway_dials_an_operator_and_pulls_its_topic() {
+    let acme = TestTeam::new("acme", 1);
+    for link in LINKS {
+        let got = gateway_flow(
+            link,
+            "operator_to_robot",
+            acme.machine(TeamRole::Operator, 3),
+            acme.machine(TeamRole::Robot, 1),
+            true,
+        );
+        assert_eq!(got, GATEWAY_PLAN.to_vec(), "{link}: every frame arrives");
     }
 }

@@ -968,14 +968,15 @@ fn validate_network_block(config: &GraphConfig) -> TransportResult<()> {
 /// 7. **Known carrier**: every `listen` / `connect` locator classifies under
 ///    [`classify_locator`] (`tcp/`, `quic/`, `tls/`, `udp/`, with zenoh-valid
 ///    `rel` and `mixed_rel` values).
-/// 8. **`quic/` and `tls/` have their certificate files**: a `quic/` or `tls/`
-///    LISTEN locator needs `tls.certificate` and `tls.private_key`; a `quic/` or
-///    `tls/` CONNECT locator needs `tls.root_ca`. A certificate without its key (or a key without its
-///    certificate) is refused, and every `tls` path must be absolute.
-/// 9. **No inert `tls` setting**: `root_ca` is read only by a `quic/` connect
-///    and `certificate` / `private_key` only by a `quic/` listener (zenoh asks
-///    a connecting peer for no certificate), so each is refused without the
-///    locator that reads it.
+/// 8. **`quic/` and `tls/` have their certificate files**: a `quic/` or
+///    `tls/` LISTEN locator needs `tls.certificate` and `tls.private_key`; a
+///    `quic/` or `tls/` CONNECT locator needs `tls.root_ca`. A certificate
+///    without its key (or a key without its certificate) is refused, and every
+///    `tls` path must be absolute.
+/// 9. **No inert `tls` setting**: `root_ca` is read only by a `quic/` or
+///    `tls/` connect and `certificate` / `private_key` only by a `quic/` or
+///    `tls/` listener (zenoh asks a connecting peer for no certificate), so
+///    each is refused without the locator that reads it.
 /// 10. **Best effort needs a datagram link**: `default_reliability:
 ///     best_effort`, and a `reliability: best_effort` egress topic, each need
 ///     at least one `listen` or `connect` locator with `mixed_rel=1`
@@ -1801,7 +1802,7 @@ nodes:
         for (block, needles) in [
             (
                 "network:\n  mode: peer\n  listen:\n    - tls/0.0.0.0:7447\n",
-                &["tls/ locator but no tls.certificate"][..],
+                &["quic/ or tls/ locator but no tls.certificate"][..],
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - ws/0.0.0.0:7447\n",
@@ -1813,7 +1814,7 @@ nodes:
             ),
             (
                 "network:\n  mode: peer\n  listen:\n    - quic/0.0.0.0:7447\n",
-                &["tls/ locator but no tls.certificate"][..],
+                &["quic/ or tls/ locator but no tls.certificate"][..],
             ),
             (
                 "network:\n  mode: peer\n  connect:\n    - quic/10.0.0.2:7447\n",

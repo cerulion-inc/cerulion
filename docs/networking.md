@@ -593,12 +593,13 @@ network:
       private_key: /etc/cerulion/robot.key
   ```
 - **`tls`**: absolute paths to PEM files, read when the gateway opens its
-  session (a missing file fails the open, naming the path). A `quic/` listener
-  needs `certificate` and `private_key`; a `quic/` connect needs `root_ca`,
+  session (a missing file fails the open, naming the path). A `quic/` or
+  `tls/` listener needs `certificate` and `private_key`; a `quic/` or `tls/`
+  connect needs `root_ca`,
   the certificate(s) the peer's certificate chains to. A self-signed peer
   certificate can be its own `root_ca` (ECDSA P-256 and Ed25519 keys both
   work) when it is NOT marked as a CA: `openssl req -x509` marks it
-  `CA:TRUE` by default, and a `quic/` listener refuses to open with such a
+  `CA:TRUE` by default, and a `quic/` or `tls/` listener refuses to open with such a
   certificate, naming the file and the fix. Mint it as an end entity:
 
   ```sh

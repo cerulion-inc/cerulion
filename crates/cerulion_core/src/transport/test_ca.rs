@@ -14,7 +14,7 @@ use cerulion_pairing::team::{
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
-use super::team_auth::TeamAuth;
+use super::team_auth::{TeamAnchors, TeamAuth};
 
 /// One generation of a test team: its issuing CA key and certificate, and the
 /// retired generations below it.
@@ -94,6 +94,22 @@ impl TestTeam {
         &self.retired
     }
 
+    /// The issuing CA certificate of the next generation, DER: the CA
+    /// [`Self::rotated`] signs with (same key, issued now).
+    pub fn next_ca_der(&self) -> Vec<u8> {
+        TestTeam::new(self.team.as_str(), self.generation + 1).ca_der
+    }
+
+    /// Anchors with this generation, every retired one and `next` as the
+    /// next generation's CA.
+    pub fn anchors<'a>(&'a self, next: Option<&'a [u8]>) -> TeamAnchors<'a> {
+        TeamAnchors {
+            issuing_ca_der: &self.ca_der,
+            retired: &self.retired,
+            next_ca_der: next,
+        }
+    }
+
     /// A leaf for `key` in `role`, issued now.
     pub fn leaf(&self, role: TeamRole, key: &MachineKey) -> Vec<u8> {
         issue_leaf(
@@ -116,11 +132,12 @@ impl TestTeam {
     }
 
     /// Team credentials for machine `machine` in `role`: a leaf issued now
-    /// over [`Self::machine_key`], trusting this generation and every retired
-    /// one.
+    /// over [`Self::machine_key`], trusting this generation, every retired
+    /// one and the next one.
     pub fn machine(&self, role: TeamRole, machine: u8) -> TeamAuth {
         let key = self.machine_key(machine);
         let leaf = self.leaf(role, &key);
-        TeamAuth::new(&key, &leaf, &self.ca_der, &self.retired).expect("valid test credentials")
+        let next = self.next_ca_der();
+        TeamAuth::new(&key, &leaf, self.anchors(Some(&next))).expect("valid test credentials")
     }
 }

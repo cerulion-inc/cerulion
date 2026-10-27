@@ -2,25 +2,26 @@
 //! Mutually authenticated team sessions: the zenoh configuration a machine
 //! with team credentials opens its network session with.
 //!
-//! A team machine holds three things: its machine key (one ed25519 seed per
-//! machine, `cerulion_pairing::identity`), a leaf certificate over that key
-//! issued by the team issuing CA, and the issuing CA certificates of the
-//! team's current and retired generations (`cerulion_pairing::team`). The leaf
+//! A team machine holds its machine key (one ed25519 seed per machine,
+//! `cerulion_pairing::identity`), a leaf certificate over that key issued by
+//! the team issuing CA, and the team's trust anchors ([`TeamAnchors`]): the
+//! issuing CA of the current generation, the CAs of retired generations, and
+//! the CA the next rotation will use (`cerulion_pairing::team`). The leaf
 //! common name `<role>.g<N>.<team>.cerulion.invalid` names the role.
 //!
 //! [`TeamAuth::new`] checks those with the `cerulion_pairing` profile checkers
-//! and [`apply`](TeamAuth::apply) sets, on the session's zenoh config:
+//! and a session opened with them sets, on its zenoh config:
 //!
 //! | zenoh key | value |
 //! |---|---|
 //! | `transport/link/tls/enable_mtls` | `true`: both ends present and verify a certificate |
 //! | `transport/link/tls/{listen,connect}_certificate_base64` | the leaf, PEM |
 //! | `transport/link/tls/{listen,connect}_private_key_base64` | the machine key, PKCS#8 PEM built in memory |
-//! | `transport/link/tls/root_ca_certificate_base64` | the current and retired issuing CAs, PEM |
-//! | `transport/link/tls/verify_name_on_connect` | `false`: peers are dialed by bare IP; the access policy names the peer instead |
+//! | `transport/link/tls/root_ca_certificate_base64` | every anchor in [`TeamAnchors`], PEM |
+//! | `transport/link/tls/verify_name_on_connect` | `false`: the dialed host name or IP is not compared with the certificate |
 //! | `transport/link/tls/close_link_on_expiration` | `true`: a link closes when the peer leaf's notAfter passes |
 //! | `transport/link/protocols` | `["quic", "tls"]`: zenoh refuses any other link, including a gossip-learned one |
-//! | `scouting/gossip/autoconnect` | none: zenoh orders a peer's gossiped locators at random, so the session dials no gossip-learned peer; routing through linked peers is unchanged |
+//! | `scouting/{gossip,multicast}/autoconnect` | empty for routers and peers: a scouted or gossip-learned locator is never dialed; routing through linked peers is unchanged |
 //! | `access_control` | [`access_control`], default deny, keyed on the peer leaf common name |
 //!
 //! The `*_base64` values are zenoh `SecretValue`s: zenoh does not serialize
@@ -30,31 +31,47 @@
 //!
 //! zenoh's `quic/` and `tls/` links read the same `transport/link/tls`
 //! section, so both links carry the same identity. A team session refuses
-//! every other listen or connect locator ([`check_team_locator`]).
+//! every other listen or connect locator, and any locator with a `#` endpoint
+//! config, which zenoh would merge over that section ([`check_team_locator`]).
+//!
+//! ## Who a peer is
+//!
+//! A listener verifies a connecting peer against the team anchors only. A
+//! dialer verifies the listener against the team anchors and also against the
+//! public Web PKI roots, which zenoh's TLS and QUIC clients always load, with
+//! no name check. A listener whose certificate chains to the Web PKI therefore
+//! links, but its common name is not a team name, so it matches no subject and
+//! the default deny drops every message the policy filters in both directions.
+//!
+//! zenoh matches a subject's `cert_common_names` against the peer leaf's
+//! common name by exact string equality, and does not compare the name with
+//! the issuing CA. Any CA in the anchors can therefore issue a leaf that names
+//! any role of any generation, so a session is only as strong as the weakest
+//! anchor's private key. That includes the next generation's CA, whose key
+//! the issuer holds before the rotation, and every retired CA whose key still
+//! exists: a retired generation's CA key must be destroyed at its rotation.
 //!
 //! ## Access policy
 //!
-//! zenoh matches a subject's `cert_common_names` by exact string equality, so
-//! the policy lists the five role names of each generation it admits. Rules by
-//! role, for links to a peer whose leaf names that role in the current
-//! generation:
+//! The policy lists the five role names of each admitted generation. Rules
+//! for a peer whose leaf names a role of the current generation (ingress is
+//! what the peer may send, egress what this machine may send to it):
 //!
 //! | Role | Data (`cerulion_w2/**`) | Control (`cerulion_lv`, `cerulion_ann`, `cerulion_q`) | `cerulion_auth/**` |
 //! |---|---|---|---|
-//! | viewer, ci | receive puts; declare subscribers | all declarations, queries, replies, liveliness | bundle query only |
-//! | operator | viewer, plus put and delete | as viewer | bundle query only |
-//! | owner | operator | as viewer | everything |
-//! | robot | operator | as viewer | everything |
-//!
-//! A leaf of a retired generation (the "upgrade lane") may only query
-//! `cerulion_auth/bundle` and receive the reply. Every linked peer may answer
-//! this machine's own bundle query: a bundle is verified against the pinned
-//! root set before it is used, whoever sends it.
+//! | viewer, ci | receives puts; declares subscribers | declares demand tokens, queries, reads liveliness and receives tokens | bundle exchange |
+//! | operator | viewer, plus put and delete | viewer, plus announce tokens and answering queries | bundle exchange |
+//! | owner, robot | operator | every control message | everything |
 //!
 //! In zenoh peer mode a writer forwards a put only to subscribers it has seen
-//! declared, and a reader routes a query only to queryables it has seen, so
-//! each data and control rule exists in both flows: ingress for what the peer
-//! may send, egress for what this machine may send to it.
+//! declared, and a query reaches only queryables the asker has seen, so a
+//! writer's peer also gets egress `declare_subscriber`, and a reader egress
+//! `declare_queryable`. A liveliness query is an interest message and its
+//! answers are liveliness tokens in the other flow.
+//!
+//! A leaf of a retired generation, or of the next one, gets the bundle
+//! exchange only: it may query `cerulion_auth/bundle`, answer this machine's
+//! bundle query, and nothing else.
 
 use base64::Engine as _;
 use cerulion_pairing::identity::MachineKey;
@@ -90,7 +107,7 @@ pub enum TeamAuthError {
     /// The leaf or a CA certificate fails the team profile or its signature.
     #[error("team {what} certificate is not usable: {source}")]
     Certificate {
-        /// Which certificate: `leaf`, `issuing CA` or `retired CA g<N>`.
+        /// Which certificate: `leaf`, `issuing CA`, `retired CA g<N>` or `next CA`.
         what: String,
         /// The profile or signature failure.
         #[source]
@@ -107,15 +124,28 @@ pub enum TeamAuthError {
         /// Short fingerprint of this machine's key.
         machine_fingerprint: String,
     },
-    /// A retired CA names another team, or a generation not below the current one,
-    /// or repeats a generation.
-    #[error("retired CA g{generation}: {reason}")]
-    Retired {
-        /// The retired generation number as written.
+    /// A retired or next CA names another team or a generation out of place.
+    #[error("{which} CA g{generation}: {reason}")]
+    Anchor {
+        /// `retired` or `next`.
+        which: &'static str,
+        /// The generation number as written or as read.
         generation: u32,
         /// What is wrong with it.
         reason: &'static str,
     },
+}
+
+/// A team's trust anchors as a machine holds them.
+#[derive(Clone, Copy, Debug)]
+pub struct TeamAnchors<'a> {
+    /// The issuing CA of the current generation, DER.
+    pub issuing_ca_der: &'a [u8],
+    /// The issuing CAs of retired generations, each below the current one.
+    pub retired: &'a [RetiredGeneration],
+    /// The issuing CA of the next generation, published before the rotation
+    /// that starts it, DER.
+    pub next_ca_der: Option<&'a [u8]>,
 }
 
 /// A machine's team credentials, checked and held as the PEM text zenoh reads.
@@ -123,7 +153,7 @@ pub enum TeamAuthError {
 pub struct TeamAuth {
     leaf: LeafFacts,
     fingerprint: String,
-    retired_generations: Vec<u32>,
+    lane_generations: Vec<u32>,
     leaf_pem_b64: String,
     key_pem_b64: Zeroizing<String>,
     roots_pem_b64: String,
@@ -134,7 +164,7 @@ impl std::fmt::Debug for TeamAuth {
         f.debug_struct("TeamAuth")
             .field("common_name", &self.common_name())
             .field("fingerprint", &self.fingerprint)
-            .field("retired_generations", &self.retired_generations)
+            .field("lane_generations", &self.lane_generations)
             .finish_non_exhaustive()
     }
 }
@@ -143,9 +173,11 @@ impl TeamAuth {
     /// Check and hold team credentials.
     ///
     /// `leaf_der` must satisfy the team leaf profile, be signed by
-    /// `issuing_ca_der` (same team and generation) and certify `key`'s public
-    /// key. Each retired CA must satisfy the CA profile, name the same team and
-    /// a generation below the current one, at most once.
+    /// `anchors.issuing_ca_der` (same team and generation) and certify `key`'s
+    /// public key. Each retired CA must satisfy the CA profile, name the same
+    /// team and a generation below the current one, at most once. The next CA
+    /// must satisfy the CA profile and name the same team and the generation
+    /// after the current one.
     ///
     /// Where these certificates come from, and whether the CAs chain to a
     /// trusted root set, is the caller's check: this only builds the session
@@ -157,14 +189,13 @@ impl TeamAuth {
     pub fn new(
         key: &MachineKey,
         leaf_der: &[u8],
-        issuing_ca_der: &[u8],
-        retired: &[RetiredGeneration],
+        anchors: TeamAnchors<'_>,
     ) -> Result<TeamAuth, TeamAuthError> {
         let cert_err = |what: &str| {
             let what = what.to_string();
             move |source| TeamAuthError::Certificate { what, source }
         };
-        let ca = check_team_ca(issuing_ca_der).map_err(cert_err("issuing CA"))?;
+        let ca = check_team_ca(anchors.issuing_ca_der).map_err(cert_err("issuing CA"))?;
         let leaf = verify_leaf_issued_by(leaf_der, &ca).map_err(cert_err("leaf"))?;
         if leaf.device_key.0 != key.public_key() {
             return Err(TeamAuthError::KeyMismatch {
@@ -172,12 +203,13 @@ impl TeamAuth {
                 machine_fingerprint: key.short_fingerprint(),
             });
         }
-        let mut retired_generations = Vec::with_capacity(retired.len());
-        let mut roots_pem = pem("CERTIFICATE", issuing_ca_der);
-        for r in retired {
+        let mut lane_generations = Vec::with_capacity(anchors.retired.len() + 1);
+        let mut roots_pem = pem("CERTIFICATE", anchors.issuing_ca_der);
+        for r in anchors.retired {
             let facts = check_team_ca(&r.ca_der)
                 .map_err(cert_err(&format!("retired CA g{}", r.generation)))?;
-            let refuse = |reason| TeamAuthError::Retired {
+            let refuse = |reason| TeamAuthError::Anchor {
+                which: "retired",
                 generation: r.generation,
                 reason,
             };
@@ -190,20 +222,37 @@ impl TeamAuth {
             if r.generation >= leaf.generation {
                 return Err(refuse("a retired generation must be below the current one"));
             }
-            if retired_generations.contains(&r.generation) {
+            if lane_generations.contains(&r.generation) {
                 return Err(refuse("the generation is listed twice"));
             }
-            retired_generations.push(r.generation);
+            lane_generations.push(r.generation);
             roots_pem.push_str(&pem("CERTIFICATE", &r.ca_der));
         }
+        if let Some(next) = anchors.next_ca_der {
+            let facts = check_team_ca(next).map_err(cert_err("next CA"))?;
+            let refuse = |reason| TeamAuthError::Anchor {
+                which: "next",
+                generation: facts.generation,
+                reason,
+            };
+            if facts.team != leaf.team {
+                return Err(refuse("the certificate names another team"));
+            }
+            if Some(facts.generation) != leaf.generation.checked_add(1) {
+                return Err(refuse("the next generation must follow the current one"));
+            }
+            lane_generations.push(facts.generation);
+            roots_pem.push_str(&pem("CERTIFICATE", next));
+        }
         let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
-        let key_pem = Zeroizing::new(pem("PRIVATE KEY", &pkcs8_ed25519(key.seed())[..]));
+        let key_pem = pem_secret("PRIVATE KEY", &pkcs8_ed25519(key.seed()));
+        let key_pem_b64 = Zeroizing::new(b64(&key_pem));
         Ok(TeamAuth {
             fingerprint: key.short_fingerprint(),
             leaf_pem_b64: b64(&pem("CERTIFICATE", leaf_der)),
-            key_pem_b64: Zeroizing::new(b64(&key_pem)),
+            key_pem_b64,
             roots_pem_b64: b64(&roots_pem),
-            retired_generations,
+            lane_generations,
             leaf,
         })
     }
@@ -228,9 +277,9 @@ impl TeamAuth {
         &self.leaf.team
     }
 
-    /// The retired generations whose CAs this session also trusts.
-    pub fn retired_generations(&self) -> &[u32] {
-        &self.retired_generations
+    /// The retired and next generations whose leaves get the bundle exchange.
+    pub fn lane_generations(&self) -> &[u32] {
+        &self.lane_generations
     }
 
     /// The short fingerprint of the machine key (display only).
@@ -238,17 +287,23 @@ impl TeamAuth {
         &self.fingerprint
     }
 
+    /// The base64 text of the PEM private key zenoh is given.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn private_key_base64_for_test(&self) -> &str {
+        &self.key_pem_b64
+    }
+
     /// The generated zenoh `access_control` object (see the module docs).
     pub fn access_control(&self) -> Value {
         access_control(
             &self.leaf.team,
             self.leaf.generation,
-            &self.retired_generations,
+            &self.lane_generations,
         )
     }
 
     /// Set the team keys on `config` and refuse a listen or connect locator
-    /// that is not `quic/` or `tls/` (see the module docs for every key).
+    /// [`check_team_locator`] refuses (see the module docs for every key).
     ///
     /// # Errors
     ///
@@ -268,70 +323,78 @@ impl TeamAuth {
             }
         }
         let tls = "transport/link/tls";
-        // Base64 text needs no JSON escaping, so it is quoted directly and no
-        // unzeroized copy of the key is left behind in a `serde_json::Value`.
-        let secret = |v: &str| format!("\"{v}\"");
-        let settings: [(String, String); 11] = [
+        let no_autoconnect = json!({ "router": [], "peer": [] }).to_string();
+        let plain: [(String, String); 8] = [
             (format!("{tls}/enable_mtls"), "true".into()),
             (format!("{tls}/verify_name_on_connect"), "false".into()),
             (format!("{tls}/close_link_on_expiration"), "true".into()),
             (
-                format!("{tls}/root_ca_certificate_base64"),
-                secret(&self.roots_pem_b64),
-            ),
-            (
-                format!("{tls}/listen_certificate_base64"),
-                secret(&self.leaf_pem_b64),
-            ),
-            (
-                format!("{tls}/connect_certificate_base64"),
-                secret(&self.leaf_pem_b64),
-            ),
-            (
-                format!("{tls}/listen_private_key_base64"),
-                secret(&self.key_pem_b64),
-            ),
-            (
-                format!("{tls}/connect_private_key_base64"),
-                secret(&self.key_pem_b64),
-            ),
-            (
                 "transport/link/protocols".into(),
                 json!(["quic", "tls"]).to_string(),
             ),
+            ("scouting/gossip/autoconnect".into(), no_autoconnect.clone()),
+            ("scouting/multicast/autoconnect".into(), no_autoconnect),
             (
-                "scouting/gossip/autoconnect".into(),
-                json!({ "router": [], "peer": [] }).to_string(),
+                format!("{tls}/root_ca_certificate_base64"),
+                quoted(&self.roots_pem_b64),
             ),
             ("access_control".into(), self.access_control().to_string()),
         ];
-        for (key, value) in settings {
-            let value = Zeroizing::new(value);
+        let leaf = quoted(&self.leaf_pem_b64);
+        let key = Zeroizing::new(quoted(&self.key_pem_b64));
+        let certs = [
+            (format!("{tls}/listen_certificate_base64"), &leaf),
+            (format!("{tls}/connect_certificate_base64"), &leaf),
+            (format!("{tls}/listen_private_key_base64"), &*key),
+            (format!("{tls}/connect_private_key_base64"), &*key),
+        ];
+        let set = |config: &mut zenoh::Config, key: &str, value: &str| {
             config
-                .insert_json5(&key, &value)
+                .insert_json5(key, value)
                 .map_err(|e| TransportError::SessionCreation {
                     reason: format!("failed to set {key}: {e}"),
-                })?;
+                })
+        };
+        for (k, v) in &plain {
+            set(config, k, v)?;
+        }
+        for (k, v) in certs {
+            set(config, &k, v)?;
         }
         tracing::info!(
             common_name = %self.common_name(),
             fingerprint = %self.fingerprint,
-            retired_generations = ?self.retired_generations,
+            lane_generations = ?self.lane_generations,
             "team session: mutual TLS on quic/ and tls/ links"
         );
         Ok(())
     }
 }
 
-/// Refuse a locator a team session cannot authenticate: everything but
-/// `quic/` and `tls/`. The reason names the locator and the spelling to use.
+/// `text` as a JSON string literal. Base64 text needs no escaping.
+fn quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    out.push_str(text);
+    out.push('"');
+    out
+}
+
+/// Refuse a locator a team session cannot authenticate: every carrier but
+/// `quic/` and `tls/`, and any locator carrying a `#` endpoint config. The
+/// reason names the locator and the spelling to use.
 ///
 /// # Errors
 ///
-/// The reason, as text, for any carrier other than `quic/` or `tls/`, and for
-/// a locator [`classify_locator`] refuses.
+/// The reason, as text.
 pub fn check_team_locator(locator: &str) -> Result<(), String> {
     let use_instead = "use quic/<host>:<port>, or tls/<host>:<port> where UDP does not get through";
+    if locator.contains('#') {
+        return Err(format!(
+            "'{locator}' carries a '#' endpoint config, which zenoh merges over the team \
+             certificate and verification settings for that link; remove everything from '#' on"
+        ));
+    }
     match classify_locator(locator)? {
         Carrier::Quic { .. } | Carrier::Tls => Ok(()),
         Carrier::Tcp => Err(format!(
@@ -350,26 +413,15 @@ pub fn check_team_locator(locator: &str) -> Result<(), String> {
 }
 
 /// The generated zenoh `access_control` object for `team`: default deny, the
-/// role rules for the five common names of `generation`, the bundle query for
-/// the five common names of each retired generation, and the reply to this
-/// machine's own bundle query from any linked peer (see the module docs).
-pub fn access_control(team: &TeamShort, generation: u32, retired: &[u32]) -> Value {
+/// role rules for the five common names of `generation`, and the bundle
+/// exchange for the five common names of each of `lane` (retired and next
+/// generations). See the module docs.
+pub fn access_control(team: &TeamShort, generation: u32, lane: &[u32]) -> Value {
     let data = format!("{DATA_KEY_NAMESPACE}/**");
-    let control = [
-        format!("{}/**", liveliness_prefix()),
-        format!("{}/**", announce_prefix()),
-        format!("{CERULION_Q_PREFIX}/**"),
-    ];
+    let lv = format!("{}/**", liveliness_prefix());
+    let ann = format!("{}/**", announce_prefix());
+    let q = format!("{CERULION_Q_PREFIX}/**");
     let auth_all = format!("{TEAM_AUTH_PREFIX}/**");
-    let control_messages = [
-        "declare_subscriber",
-        "declare_queryable",
-        "query",
-        "reply",
-        "liveliness_token",
-        "declare_liveliness_subscriber",
-        "liveliness_query",
-    ];
     let every_message = [
         "put",
         "delete",
@@ -381,56 +433,103 @@ pub fn access_control(team: &TeamShort, generation: u32, retired: &[u32]) -> Val
         "declare_liveliness_subscriber",
         "liveliness_query",
     ];
-    let rule = |id: &str, flows: &[&str], messages: &[&str], keys: &[&str]| {
+    let liveliness_reads = ["declare_liveliness_subscriber", "liveliness_query"];
+    let rule = |id: &str, flow: &str, messages: &[&str], keys: &[&str]| {
         json!({
             "id": id,
             "permission": "allow",
-            "flows": flows,
+            "flows": [flow],
             "messages": messages,
             "key_exprs": keys,
         })
     };
-    let control_keys: Vec<&str> = control.iter().map(String::as_str).collect();
     let rules = vec![
-        rule("control_in", &["ingress"], &control_messages, &control_keys),
-        rule("control_out", &["egress"], &control_messages, &control_keys),
+        // A reader.
+        rule("read_in_sub", "ingress", &["declare_subscriber"], &[&data]),
+        rule("read_in_demand", "ingress", &["liveliness_token"], &[&lv]),
+        rule("read_in_query", "ingress", &["query"], &[&q]),
         rule(
-            "data_read_in",
-            &["ingress"],
-            &["declare_subscriber"],
-            &[&data],
+            "read_in_liveliness",
+            "ingress",
+            &liveliness_reads,
+            &[&lv, &ann],
         ),
-        rule("data_read_out", &["egress"], &["put", "delete"], &[&data]),
-        rule("data_write_in", &["ingress"], &["put", "delete"], &[&data]),
+        rule("read_out_data", "egress", &["put", "delete"], &[&data]),
         rule(
-            "data_write_out",
-            &["egress"],
-            &["declare_subscriber"],
-            &[&data],
-        ),
-        rule(
-            "auth_admin",
-            &["ingress", "egress"],
-            &every_message,
-            &[&auth_all],
-        ),
-        rule("bundle_in", &["ingress"], &["query"], &[TEAM_BUNDLE_KEY]),
-        rule(
-            "bundle_out",
-            &["egress"],
+            "read_out_answer",
+            "egress",
             &["reply", "declare_queryable"],
+            &[&q],
+        ),
+        rule(
+            "read_out_tokens",
+            "egress",
+            &["liveliness_token"],
+            &[&ann, &lv],
+        ),
+        rule("read_out_liveliness", "egress", &liveliness_reads, &[&lv]),
+        // A writer, on top of a reader.
+        rule("write_in_data", "ingress", &["put", "delete"], &[&data]),
+        rule(
+            "write_in_announce",
+            "ingress",
+            &["liveliness_token"],
+            &[&ann],
+        ),
+        rule(
+            "write_in_answer",
+            "ingress",
+            &["reply", "declare_queryable"],
+            &[&q],
+        ),
+        rule("write_out_sub", "egress", &["declare_subscriber"], &[&data]),
+        rule("write_out_query", "egress", &["query"], &[&q]),
+        rule("write_out_liveliness", "egress", &liveliness_reads, &[&ann]),
+        // Owner and robot: every control message, and the auth namespace.
+        rule(
+            "full_in",
+            "ingress",
+            &every_message,
+            &[&lv, &ann, &q, &auth_all],
+        ),
+        rule(
+            "full_out",
+            "egress",
+            &every_message,
+            &[&lv, &ann, &q, &auth_all],
+        ),
+        // The bundle exchange.
+        rule(
+            "bundle_in",
+            "ingress",
+            &["query", "reply", "declare_queryable"],
             &[TEAM_BUNDLE_KEY],
         ),
-        rule("bundle_ask", &["egress"], &["query"], &[TEAM_BUNDLE_KEY]),
         rule(
-            "bundle_answer",
-            &["ingress"],
-            &["reply", "declare_queryable"],
+            "bundle_out",
+            "egress",
+            &["query", "reply", "declare_queryable"],
             &[TEAM_BUNDLE_KEY],
         ),
     ];
-    let read = ["control_in", "control_out", "data_read_in", "data_read_out"];
-    let write = ["data_write_in", "data_write_out"];
+    let read = [
+        "read_in_sub",
+        "read_in_demand",
+        "read_in_query",
+        "read_in_liveliness",
+        "read_out_data",
+        "read_out_answer",
+        "read_out_tokens",
+        "read_out_liveliness",
+    ];
+    let write = [
+        "write_in_data",
+        "write_in_announce",
+        "write_in_answer",
+        "write_out_sub",
+        "write_out_query",
+        "write_out_liveliness",
+    ];
     let bundle = ["bundle_in", "bundle_out"];
     let mut subjects = Vec::new();
     let mut policies = Vec::new();
@@ -440,7 +539,7 @@ pub fn access_control(team: &TeamShort, generation: u32, retired: &[u32]) -> Val
             granted.extend(write);
         }
         if matches!(role, TeamRole::Owner | TeamRole::Robot) {
-            granted.push("auth_admin");
+            granted.extend(["full_in", "full_out"]);
         }
         granted.extend(bundle);
         let id = format!("role_{role}");
@@ -451,25 +550,18 @@ pub fn access_control(team: &TeamShort, generation: u32, retired: &[u32]) -> Val
         policies
             .push(json!({ "id": format!("policy_{role}"), "rules": granted, "subjects": [id] }));
     }
-    if !retired.is_empty() {
-        let lane: Vec<String> = retired
+    if !lane.is_empty() {
+        let names: Vec<String> = lane
             .iter()
             .flat_map(|g| team::common_names(*g, team))
             .collect();
-        subjects.push(json!({ "id": "upgrade_lane", "cert_common_names": lane }));
+        subjects.push(json!({ "id": "bundle_lane", "cert_common_names": names }));
         policies.push(json!({
-            "id": "policy_upgrade_lane",
+            "id": "policy_bundle_lane",
             "rules": bundle,
-            "subjects": ["upgrade_lane"],
+            "subjects": ["bundle_lane"],
         }));
     }
-    // A subject with no property matches every transport.
-    subjects.push(json!({ "id": "any_peer" }));
-    policies.push(json!({
-        "id": "policy_any_peer",
-        "rules": ["bundle_ask", "bundle_answer"],
-        "subjects": ["any_peer"],
-    }));
     json!({
         "enabled": true,
         "default_permission": "deny",
@@ -491,11 +583,12 @@ fn pkcs8_ed25519(seed: &[u8; 32]) -> Zeroizing<Vec<u8>> {
     der
 }
 
-/// RFC 7468 PEM text for `der` under `label`.
-fn pem(label: &str, der: &[u8]) -> String {
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut out = format!("-----BEGIN {label}-----\n");
-    let mut rest = body.as_str();
+/// Append RFC 7468 PEM text for base64 `body` under `label` to `out`.
+fn pem_into(label: &str, body: &str, out: &mut String) {
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n");
+    let mut rest = body;
     while !rest.is_empty() {
         // Base64 text is ASCII, so any byte index is a char boundary.
         let (line, tail) = rest.split_at(rest.len().min(64));
@@ -503,7 +596,30 @@ fn pem(label: &str, der: &[u8]) -> String {
         out.push('\n');
         rest = tail;
     }
-    out.push_str(&format!("-----END {label}-----\n"));
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
+}
+
+/// The length of the PEM text [`pem_into`] writes, so the buffer is
+/// allocated once and never moved while it grows.
+fn pem_capacity(label: &str, body_len: usize) -> usize {
+    2 * (label.len() + 17) + body_len + body_len.div_ceil(64)
+}
+
+/// RFC 7468 PEM text for `der` under `label`.
+fn pem(label: &str, der: &[u8]) -> String {
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::with_capacity(pem_capacity(label, body.len()));
+    pem_into(label, &body, &mut out);
+    out
+}
+
+/// [`pem`] for secret bytes: every buffer holding the text is cleared on drop.
+fn pem_secret(label: &str, der: &[u8]) -> Zeroizing<String> {
+    let body = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(der));
+    let mut out = Zeroizing::new(String::with_capacity(pem_capacity(label, body.len())));
+    pem_into(label, &body, &mut out);
     out
 }
 
@@ -552,12 +668,19 @@ mod tests {
                 "authentication switched off",
             ),
             ("udp/10.0.0.1:7684", "raw UDP"),
+            ("tls/10.0.0.1:7684#enable_mtls=false", "'#' endpoint config"),
+            (
+                "quic/10.0.0.1:7684#root_ca_certificate_file=/x",
+                "'#' endpoint config",
+            ),
             ("ws/10.0.0.1:1", "'ws' carrier"),
         ] {
             let err = check_team_locator(bad).expect_err(bad);
             assert!(err.contains(needle), "{bad}: {err}");
             if !bad.starts_with("ws/") {
                 assert!(err.contains(bad), "the refusal names the locator: {err}");
+            }
+            if !bad.starts_with("ws/") && !bad.contains('#') {
                 assert!(err.contains("quic/<host>:<port>"), "{err}");
             }
         }
@@ -568,7 +691,7 @@ mod tests {
         let team = TestTeam::new("acme", 2);
         let leaf = team.leaf(TeamRole::Robot, &MachineKey::from_seed([1; 32]));
         let other = MachineKey::from_seed([2; 32]);
-        let err = TeamAuth::new(&other, &leaf, team.ca_der(), &[]).unwrap_err();
+        let err = TeamAuth::new(&other, &leaf, team.anchors(None)).unwrap_err();
         assert!(matches!(err, TeamAuthError::KeyMismatch { .. }), "{err}");
         assert!(
             err.to_string().contains(&other.short_fingerprint()),
@@ -582,7 +705,7 @@ mod tests {
         let rival = TestTeam::new("rival", 2);
         let key = MachineKey::from_seed([1; 32]);
         let leaf = rival.leaf(TeamRole::Robot, &key);
-        let err = TeamAuth::new(&key, &leaf, acme.ca_der(), &[]).unwrap_err();
+        let err = TeamAuth::new(&key, &leaf, acme.anchors(None)).unwrap_err();
         assert!(
             matches!(err, TeamAuthError::Certificate { ref what, .. } if what == "leaf"),
             "{err}"
@@ -590,14 +713,37 @@ mod tests {
     }
 
     #[test]
-    fn retired_generations_must_be_below_current_same_team_and_unique() {
+    fn anchors_must_name_the_team_and_their_place_once() {
         let g3 = TestTeam::new("acme", 3);
         let key = MachineKey::from_seed([1; 32]);
         let leaf = g3.leaf(TeamRole::Viewer, &key);
         let g2 = TestTeam::new("acme", 2).retired();
         let g4 = TestTeam::new("acme", 4).retired();
         let other = TestTeam::new("rival", 1).retired();
-        assert!(TeamAuth::new(&key, &leaf, g3.ca_der(), std::slice::from_ref(&g2)).is_ok());
+        let with = |retired: &[RetiredGeneration], next: Option<&[u8]>| {
+            TeamAuth::new(
+                &key,
+                &leaf,
+                TeamAnchors {
+                    issuing_ca_der: g3.ca_der(),
+                    retired,
+                    next_ca_der: next,
+                },
+            )
+        };
+        let g4_der = g3.next_ca_der();
+        let ok = with(std::slice::from_ref(&g2), Some(&g4_der)).expect("valid anchors");
+        assert_eq!(ok.lane_generations(), [2, 4]);
+        for (next, needle) in [
+            (
+                TestTeam::new("acme", 5).ca_der().to_vec(),
+                "follow the current",
+            ),
+            (TestTeam::new("rival", 4).ca_der().to_vec(), "another team"),
+        ] {
+            let err = with(&[], Some(&next)).unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        }
         for (retired, needle) in [
             (vec![g4], "below the current"),
             (vec![other], "another team"),
@@ -610,7 +756,7 @@ mod tests {
                 "another generation",
             ),
         ] {
-            let err = TeamAuth::new(&key, &leaf, g3.ca_der(), &retired).unwrap_err();
+            let err = with(&retired, None).unwrap_err();
             assert!(err.to_string().contains(needle), "{err}");
         }
     }
@@ -622,14 +768,14 @@ mod tests {
         let text = format!("{auth:?}");
         assert!(text.contains("operator.g1.acme.cerulion.invalid"), "{text}");
         assert!(text.contains(auth.fingerprint()), "{text}");
-        assert!(!text.contains(auth.key_pem_b64.as_str()));
+        assert!(!text.contains(auth.private_key_base64_for_test()));
         assert!(!text.contains(&auth.leaf_pem_b64));
     }
 
     #[test]
     fn the_policy_lists_exact_names_per_generation_and_role() {
         let team = TeamShort::new("acme").unwrap();
-        let acl = access_control(&team, 3, &[2, 1]);
+        let acl = access_control(&team, 3, &[2, 1, 4]);
         assert_eq!(acl["default_permission"], "deny");
         let names = |id: &str| -> Vec<String> {
             let subject = acl["subjects"]
@@ -641,9 +787,21 @@ mod tests {
             serde_json::from_value(subject["cert_common_names"].clone()).unwrap()
         };
         assert_eq!(names("role_viewer"), ["viewer.g3.acme.cerulion.invalid"]);
-        let lane = names("upgrade_lane");
-        assert_eq!(lane.len(), 10);
+        let lane = names("bundle_lane");
+        assert_eq!(lane.len(), 15);
         assert!(lane.contains(&"robot.g1.acme.cerulion.invalid".to_string()));
+        assert!(lane.contains(&"owner.g4.acme.cerulion.invalid".to_string()));
+        // Every subject names team common names: none matches a peer whose
+        // certificate carries another name, such as a Web PKI certificate.
+        for subject in acl["subjects"].as_array().unwrap() {
+            let cns = subject["cert_common_names"]
+                .as_array()
+                .expect("names listed");
+            assert!(!cns.is_empty());
+            assert!(cns
+                .iter()
+                .all(|c| c.as_str().unwrap().ends_with(".acme.cerulion.invalid")));
+        }
         let rules_of = |id: &str| -> Vec<String> {
             let policy = acl["policies"]
                 .as_array()
@@ -653,11 +811,14 @@ mod tests {
                 .unwrap();
             serde_json::from_value(policy["rules"].clone()).unwrap()
         };
-        assert!(!rules_of("role_viewer").contains(&"data_write_in".to_string()));
-        assert!(rules_of("role_operator").contains(&"data_write_in".to_string()));
-        assert!(!rules_of("role_operator").contains(&"auth_admin".to_string()));
-        assert!(rules_of("role_owner").contains(&"auth_admin".to_string()));
-        assert_eq!(rules_of("upgrade_lane"), ["bundle_in", "bundle_out"]);
-        assert_eq!(rules_of("any_peer"), ["bundle_ask", "bundle_answer"]);
+        let has = |id: &str, rule: &str| rules_of(id).iter().any(|r| r == rule);
+        assert!(!has("role_viewer", "write_in_data"));
+        assert!(!has("role_viewer", "write_in_answer"));
+        assert!(!has("role_ci", "write_in_announce"));
+        assert!(has("role_operator", "write_in_data"));
+        assert!(!has("role_operator", "full_in"));
+        assert!(has("role_owner", "full_in"));
+        assert!(has("role_robot", "full_out"));
+        assert_eq!(rules_of("bundle_lane"), ["bundle_in", "bundle_out"]);
     }
 }
