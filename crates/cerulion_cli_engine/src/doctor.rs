@@ -28,10 +28,14 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod account;
+mod clock;
 mod cpu;
 mod disk;
+mod gpu;
 mod iceoryx2_config;
 mod limits;
+mod mtu;
+mod ros;
 mod shm;
 
 /// The version of the `--json` report shape. It changes only when a field is
@@ -185,6 +189,11 @@ pub static CATALOGUE: &[Check] = &[
     disk::RECORDINGS,
     account::LOGIN,
     cpu::GOVERNOR,
+    clock::SYNC,
+    mtu::MTU,
+    gpu::CUDA,
+    ros::DISTRO,
+    ros::RMW,
 ];
 
 /// The ids of every check, in catalogue order (for `--check` completion).

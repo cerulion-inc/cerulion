@@ -50,8 +50,13 @@ impl Drop for Sandbox {
 }
 
 fn run_in(root: &Path, cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cerulion"))
-        .args(args)
+    run_env(root, cwd, args, &[])
+}
+
+/// [`run_in`] with `env` set over the scrubbed environment.
+fn run_env(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    cmd.args(args)
         .current_dir(cwd)
         .env("HOME", root.join("home"))
         .env("CERULION_HOME", root.join("cerulion-home"))
@@ -60,8 +65,14 @@ fn run_in(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env_remove("CERULION_NETWORK")
         .env_remove("RUST_LOG")
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
-        .output()
-        .expect("run cerulion")
+        .env_remove("ROS_DISTRO")
+        .env_remove("AMENT_PREFIX_PATH")
+        .env_remove("RMW_IMPLEMENTATION")
+        .env_remove("CERULION_LIB_DIR");
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    cmd.output().expect("run cerulion")
 }
 
 fn json_of(out: &Output) -> serde_json::Value {
@@ -75,7 +86,7 @@ fn json_of(out: &Output) -> serde_json::Value {
 }
 
 /// The catalogue as the verb lists it, in order.
-const CHECK_IDS: [&str; 7] = [
+const CHECK_IDS: [&str; 12] = [
     "limits.open-files",
     "shm.dev-shm",
     "shm.stale-nodes",
@@ -83,6 +94,11 @@ const CHECK_IDS: [&str; 7] = [
     "disk.recordings",
     "account.login",
     "cpu.governor",
+    "clock.sync",
+    "net.mtu",
+    "gpu.cuda",
+    "ros.distro",
+    "ros.rmw",
 ];
 
 #[test]
@@ -260,4 +276,42 @@ fn a_malformed_sign_in_file_never_reaches_the_output() {
         assert!(!all.contains(SECRET), "{args:?} leaked the token: {all}");
         assert!(all.contains("cannot be parsed at line 1 column"), "{all}");
     }
+}
+
+#[test]
+fn no_sourced_ros_skips_the_distro_check_and_exits_0() {
+    let sb = Sandbox::new("nodistro");
+    let out = sb.run(&["doctor", "--json", "--check", "ros.distro"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json_of(&out)["checks"][0]["status"], "skip");
+}
+
+/// A sourced ROS 2 shell whose library directory holds no rmw library: the
+/// check fails with the path in its fix and the run exits 1.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sourced_ros_without_the_rmw_library_fails() {
+    let sb = Sandbox::new("normw");
+    let lib = sb.root.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let out = run_env(
+        &sb.root,
+        &sb.cwd(),
+        &["doctor", "--json", "--check", "ros.rmw"],
+        &[
+            ("ROS_DISTRO", Path::new("jazzy")),
+            ("CERULION_LIB_DIR", &lib),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let check = &json_of(&out)["checks"][0];
+    assert_eq!(check["status"], "fail", "{check}");
+    let expected = lib.join("librmw_cerulion.so");
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&*expected.to_string_lossy()),
+        "{check}"
+    );
 }
