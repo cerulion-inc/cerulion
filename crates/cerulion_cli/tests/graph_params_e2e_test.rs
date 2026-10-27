@@ -7,19 +7,20 @@
 //! three refusal classes exits non-zero from `graph validate` AND from
 //! `graph run` naming the node and the param; `node info` lists the declared
 //! params from the built library; a capture that resumes mid-run is refused
-//! when the node was rebuilt with a renamed param, and resumes on the new
-//! value with `--allow-param-change`.
+//! when the node was rebuilt with a param the recording names no value for,
+//! and resumes on that param's value with `--allow-param-change`.
 //!
 //! The node is the prebuilt `test_node_macro_param_cdylib` fixture (a period
 //! node whose `cmd` is a function of its four params: `x = gain`,
 //! `y = offset`, `z = frame_id.len()` or `-1.0` when disabled; defaults
 //! `1.0`, `0`, `"base_link"`, `true`). The resume arm rebuilds it as
-//! `test_node_macro_param_renamed_cdylib`, the same node with `gain` renamed
-//! to `scale`, default `3.0`. Every expected frame below is a HAND ORACLE from
-//! those bodies, never a second run of the same code.
+//! `test_node_macro_param_added_cdylib`, the same node with one more param,
+//! `scale`, default `3.0` (`x = scale`, `y = gain + offset`). Every expected
+//! frame below is a HAND ORACLE from those bodies, never a second run of the
+//! same code.
 //!
 //! Prerequisite: `cargo build -p test_node_macro_param_cdylib -p
-//! test_node_macro_param_renamed_cdylib -p test_node_macro_period_cdylib`
+//! test_node_macro_param_added_cdylib -p test_node_macro_period_cdylib`
 //! (the harness panics with that instruction when a fixture is missing).
 //! `#[serial]` arms run on the default iceoryx2 namespace; run this binary
 //! alone with `-- --test-threads=1`.
@@ -36,14 +37,13 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use cerulion_bag::BagReader;
-use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
 use cerulion_core::wire::WireHeader;
 use serial_test::serial;
 
 mod mp_support;
 use mp_support::{
-    dylib_file, fixture_cdylib, read_file, signal_live_process, wait_for_bag, wait_for_bag_state,
-    ChildGuard, RECORDED_WINDOW_TIMEOUT,
+    dylib_file, first_rank0_boundary, fixture_cdylib, mcaps, read_file, signal_live_process,
+    wait_for_bag, wait_for_bag_state, ChildGuard, RECORDED_WINDOW_TIMEOUT,
 };
 
 const PARAM_FIXTURE: &str = "test_node_macro_param_cdylib";
@@ -310,10 +310,9 @@ fn two_instances_publish_their_own_params_and_the_recording_resims_with_the_reco
     guard.finish().assert_clean();
 }
 
-/// The renamed twin of [`PARAM_FIXTURE`]: the same node with `gain` renamed
-/// to `scale`, default `3.0`, so its frames are `(scale, 0.0, 9.0)` with the
-/// defaults.
-const RENAMED_PARAM_FIXTURE: &str = "test_node_macro_param_renamed_cdylib";
+/// [`PARAM_FIXTURE`] rebuilt with one more param, `scale`, default `3.0`:
+/// `cmd = (scale, gain + offset, frame_id.len())`.
+const ADDED_PARAM_FIXTURE: &str = "test_node_macro_param_added_cdylib";
 
 /// The resume arm's Flashback window and anchor cadence: short, so a capture
 /// taken a few seconds into the run begins past step 0 and carries an anchor
@@ -333,65 +332,52 @@ const RESUME_MID_RUN_FRAMES: usize = 150;
 /// so it is retried, never weakened.
 const RESUME_ATTEMPTS: usize = 3;
 
-/// Every `.mcap` directly under `dir`, sorted.
-fn mcaps(dir: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mcap"))
-                .collect()
-        })
-        .unwrap_or_default();
-    out.sort();
-    out
-}
-
-/// Every `Vector3` frame on `topic` in a finalized `bag`, in log order.
-fn vector3_frames(bag: &Path, topic: &str) -> Vec<(f64, f64, f64)> {
+/// Every `Vector3` frame on `topic` in a finalized `bag`, in log order, with
+/// the `timestamp_ns` its wire header carries.
+fn stamped_vector3_frames(bag: &Path, topic: &str) -> Vec<(u64, (f64, f64, f64))> {
     let reader = BagReader::open(bag).expect("open bag");
     let (msgs, completeness) = reader.recover_messages().expect("recover");
     assert!(completeness.is_finalized(), "{completeness:?}");
     msgs.iter()
         .filter(|m| m.topic == topic)
-        .map(|m| vector3(&m.data))
+        .map(|m| {
+            let header = WireHeader::read_from_buf(&m.data).expect("a frame starts with a header");
+            (header.timestamp_ns, vector3(&m.data))
+        })
         .collect()
 }
 
-/// The step of the bag's FIRST rank-0 `STEP_BOUNDARY` record: the number a
-/// resim derives its resume point from. Zero means the recording begins at
-/// step 0 and resumes from nothing; above zero it resumes from an anchor.
-fn first_rank0_boundary_step(bag: &Path) -> Option<u64> {
-    let reader = BagReader::open(bag).expect("open the bag");
-    let (msgs, _) = reader.recover_messages().expect("recover the bag");
-    msgs.into_iter()
-        .filter(|m| m.topic == cerulion_bag::SCHEDULER_TRACE_TOPIC)
-        .map(|m| TraceRingRecord::from_bytes(m.data[..40].try_into().expect("a 40-byte record")))
-        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.rank() == 0)
-        .map(|r| r.step)
-}
-
-/// The param resume rule over the real binary and the cdylib FFI.
+/// The param resume rule over the real binary and the cdylib FFI: the twin of
+/// the engine's in-process
+/// `a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed`.
 ///
 /// The recording runs `cam0` at `gain: 2.0`, and a `cerulion flashback`
 /// capture of it begins mid-run, so its resim restores `cam0` from an anchor.
-/// A resim applies the RECORDED params, so a build that still declares `gain`
-/// resumes on 2.0 whatever the graph file says now. What the rule can see is a
-/// change to the declared params, so the node is rebuilt with `gain` renamed to
-/// `scale`, default 3.0: the recording ran the anchor on 2.0, and the resumed
-/// node would run on 3.0.
+/// A resim applies the RECORDED params, so no edit to the graph file can make
+/// a resumed `cam0` run `gain` on anything but 2.0. What the rule judges is a
+/// value in force that the recording does not hold, so the node is rebuilt
+/// with one more param, `scale`, default 3.0, which the recording names no
+/// value for. The recorded `gain` still applies to the rebuilt node.
 ///
 /// 1. The unchanged build resumes without the opt-in, on the recorded 2.0, so
 ///    the rule does not refuse every resume.
-/// 2. The renamed build is refused with exit 2 and one line per param, before
-///    it writes a `--record-out` bag.
-/// 3. With `--allow-param-change` the renamed build resumes, and its first
-///    resumed frame carries 3.0.
+/// 2. The rebuilt node is refused with exit 2 and the one line for `scale`,
+///    before it writes a `--record-out` bag. The build declares every name the
+///    recording holds, so the refusal is the check the resume makes after the
+///    build, not the one for a param the build no longer declares.
+/// 3. With `--allow-param-change` the rebuilt node resumes: its first resumed
+///    frame carries `scale` 3.0 beside the recorded `gain` 2.0.
 ///
-/// Hand oracles from the two fixture bodies: `cmd = (gain or scale, offset,
-/// frame_id.len())`, so `(2.0, 0.0, 9.0)` and `(3.0, 0.0, 9.0)`.
+/// Each resumed run begins at the capture's first recorded step: its first
+/// frame carries that step's clock target, read off the capture's trace, as
+/// its wire stamp. A run from step 0 or from a later step cannot.
+///
+/// Hand oracles from the two fixture bodies: `(gain, offset, frame_id.len())`
+/// is `(2.0, 0.0, 9.0)`, and `(scale, gain + offset, frame_id.len())` is
+/// `(3.0, 2.0, 9.0)`.
 #[test]
 #[serial]
-fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed() {
+fn a_capture_resumed_on_a_build_that_added_a_param_is_refused_unless_allowed() {
     let mut last_retry = String::new();
     for attempt in 1..=RESUME_ATTEMPTS {
         let tmp = tempfile::tempdir().unwrap();
@@ -471,9 +457,9 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
         );
         let capture = &captures[0];
 
-        let first = first_rank0_boundary_step(capture)
+        let boundary = first_rank0_boundary(capture)
             .expect("a capture of a `--record` run carries a rank-0 STEP_BOUNDARY");
-        if first == 0 {
+        if boundary.step == 0 {
             last_retry = format!(
                 "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
                  begins from start and resumes from no anchor"
@@ -481,10 +467,13 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
             eprintln!("{last_retry}");
             continue;
         }
-        let captured = vector3_frames(capture, &topic);
+        // The clock the first resumed step runs at, and so the stamp of the
+        // first frame a resumed `cam0` publishes.
+        let first_step_stamp = boundary.fire_time_ns;
+        let captured = stamped_vector3_frames(capture, &topic);
         assert!(!captured.is_empty(), "the capture holds no `{topic}` frame");
         assert!(
-            captured.iter().all(|f| *f == (2.0, 0.0, 9.0)),
+            captured.iter().all(|(_, f)| *f == (2.0, 0.0, 9.0)),
             "the anchor's run published gain 2.0: {captured:?}"
         );
 
@@ -501,18 +490,20 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
             Some(0),
             "the build the recording ran resumes without the opt-in:\n{err}"
         );
-        let frames = vector3_frames(&unchanged, &topic);
-        assert!(
-            !frames.is_empty(),
-            "the resumed node published nothing:\n{err}"
+        let frames = stamped_vector3_frames(&unchanged, &topic);
+        assert_eq!(
+            frames.first().map(|(stamp, _)| *stamp),
+            Some(first_step_stamp),
+            "the unchanged build resumes at the capture's first step {}:\n{err}",
+            boundary.step
         );
         assert!(
-            frames.iter().all(|f| *f == (2.0, 0.0, 9.0)),
+            frames.iter().all(|(_, f)| *f == (2.0, 0.0, 9.0)),
             "the resumed node runs on the recorded gain 2.0: {frames:?}"
         );
 
-        // 2. The renamed build is refused, one line per param, before any output.
-        stage_node(root, "cam", RENAMED_PARAM_FIXTURE);
+        // 2. The rebuilt node is refused, one line for `scale`, before any output.
+        stage_node(root, "cam", ADDED_PARAM_FIXTURE);
         let refused = root.join("refused.mcap");
         let (status, err) = resim(
             root,
@@ -523,14 +514,13 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
         assert_eq!(
             status.code(),
             Some(2),
-            "a renamed param refuses the resume:\n{err}"
+            "a param the recording holds no value for refuses the resume:\n{err}"
         );
-        let expected = "this recording resumes from a mid-run anchor, and 2 param value(s) in \
+        let expected = "this recording resumes from a mid-run anchor, and 1 param value(s) in \
                         force differ from the ones the recording names. A param is not node \
                         state: the resumed nodes run on the values in force, not on the \
                         recorded ones.\n  \
-                        node 'cam0' param 'scale': recorded no value, current 3.0\n  \
-                        node 'cam0' param 'gain': recorded 2.0, current no value\n\
+                        node 'cam0' param 'scale': recorded no value, current 3.0\n\
                         Fix: resume with a build whose params match the recording, or pass \
                         `--allow-param-change` to resume on the current values.";
         assert!(err.contains(expected), "the refusal text:\n{err}");
@@ -540,7 +530,7 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
             refused.display()
         );
 
-        // 3. The opt-in resumes the renamed build on its own value.
+        // 3. The opt-in resumes the rebuilt node on the value in force.
         let allowed = root.join("allowed.mcap");
         let (status, err) = resim(
             root,
@@ -557,15 +547,17 @@ fn a_capture_resumed_on_a_build_that_renamed_a_param_is_refused_unless_allowed()
             Some(0),
             "`--allow-param-change` resumes on the current values:\n{err}"
         );
-        let frames = vector3_frames(&allowed, &topic);
+        let frames = stamped_vector3_frames(&allowed, &topic);
         assert_eq!(
             frames.first(),
-            Some(&(3.0, 0.0, 9.0)),
-            "the first resumed tick reads scale 3.0:\n{err}"
+            Some(&(first_step_stamp, (3.0, 2.0, 9.0))),
+            "the first resumed tick, at the capture's first step {}, reads scale 3.0 and the \
+             recorded gain 2.0:\n{err}",
+            boundary.step
         );
         assert!(
-            frames.iter().all(|f| *f == (3.0, 0.0, 9.0)),
-            "every resumed tick reads scale 3.0: {frames:?}"
+            frames.iter().all(|(_, f)| *f == (3.0, 2.0, 9.0)),
+            "every resumed tick reads scale 3.0 and gain 2.0: {frames:?}"
         );
         return;
     }

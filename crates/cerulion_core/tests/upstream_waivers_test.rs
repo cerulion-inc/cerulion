@@ -267,7 +267,7 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_cli/tests/graph_params_e2e_test.rs",
-        "spawns `graph run --single-process`; its 6 macOS arms passed on Darwin 27 \
+        "spawns `graph run --single-process`; its 7 macOS arms passed on Darwin 27 \
          under `-- --test-threads=1`",
     ),
     (

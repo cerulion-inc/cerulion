@@ -80,10 +80,10 @@ members = [
     # Four #[param] fields across the cdylib FFI: specs in the info JSON,
     # values through the optional cerulion_node_init_with_params symbol.
     "crates/test_fixtures/test_node_macro_param_cdylib",
-    # The same node with `gain` renamed to `scale` (default 3.0): staged in
+    # The same node with one more param, `scale` (default 3.0): staged in
     # place of the original between a capture and its resim, for the
     # real-binary pin of the param resume rule.
-    "crates/test_fixtures/test_node_macro_param_renamed_cdylib",
+    "crates/test_fixtures/test_node_macro_param_added_cdylib",
     # Raw-FFI cdylib whose info JSON declares a param but which exports no
     # cerulion_node_init_with_params symbol; the host must refuse it at info time.
     "crates/test_fixtures/test_node_params_no_symbol_cdylib",

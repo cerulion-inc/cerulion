@@ -9317,7 +9317,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "test_node_macro_param_cdylib"
+name = "test_node_macro_param_added_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
@@ -9325,7 +9325,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "test_node_macro_param_renamed_cdylib"
+name = "test_node_macro_param_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
