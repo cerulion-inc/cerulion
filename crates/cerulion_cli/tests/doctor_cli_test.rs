@@ -193,3 +193,71 @@ fn an_unknown_check_is_a_usage_error() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("no.such"), "{err}");
 }
+
+/// A read-only current directory with no recordings directory is where a
+/// user runs a diagnosis from (`/` on macOS is a sealed volume), not a
+/// recording destination: the check warns and the run exits 0.
+#[cfg(unix)]
+#[test]
+fn a_read_only_current_directory_warns_and_exits_0() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("rocwd");
+    let ro = sb.root.join("readonly");
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = run_in(
+        &sb.root,
+        &ro,
+        &["doctor", "--json", "--check", "disk.recordings"],
+    );
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let check = &json_of(&out)["checks"][0];
+    assert_eq!(check["readings"]["recordings_dir"], false);
+    let uid = Command::new("id").arg("-u").output().expect("run id -u");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        // Root passes `access(W_OK)` whatever the mode bits say; a tmpfs
+        // TMPDIR still warns.
+        assert_ne!(check["status"], "fail", "{check}");
+    } else {
+        assert_eq!(check["status"], "warn", "{check}");
+        assert!(
+            check["fix"].as_str().unwrap().contains("--record=<DIR>"),
+            "{check}"
+        );
+    }
+}
+
+/// A malformed sign-in file whose parse error quotes a token-like value: the
+/// value reaches neither the table nor the JSON, and nothing on stderr.
+#[test]
+fn a_malformed_sign_in_file_never_reaches_the_output() {
+    const SECRET: &str = "tok_SECRET_FRAGMENT_7f3a";
+    let sb = Sandbox::new("authleak");
+    std::fs::write(
+        sb.root.join("cerulion-home/auth.json"),
+        format!(
+            r#"{{"account_id":"a","session_token":"s","refresh_token":"r","expires_at_ns":"{SECRET}","logged_in_ever":true}}"#
+        ),
+    )
+    .unwrap();
+    for args in [
+        &["doctor", "--check", "account.login"][..],
+        &["doctor", "--json", "--check", "account.login"][..],
+    ] {
+        let out = sb.run(args);
+        assert_eq!(out.status.code(), Some(1));
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!all.contains(SECRET), "{args:?} leaked the token: {all}");
+        assert!(all.contains("cannot be parsed at line 1 column"), "{all}");
+    }
+}

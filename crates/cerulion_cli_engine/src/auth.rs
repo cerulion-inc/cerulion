@@ -226,8 +226,10 @@ pub enum LoadedAuth {
         /// keeps it (an unrecognized value reads as `None`, as in [`AuthState`]).
         role: Option<MachineRole>,
     },
-    /// `auth.json` exists but could not be parsed. Carries the parse error for a
-    /// LOUD log at the boundary. Treated as never-logged-in by the gate
+    /// `auth.json` exists but could not be read or parsed. Carries the path and
+    /// the read error, or the parse error's line and column (never the parser's
+    /// message, which can quote a value from the file), for a LOUD log at the
+    /// boundary. Treated as never-logged-in by the gate
     /// (`corrupt ⇒ re-login`) — NEVER deleted here (a fresh login overwrites it
     /// atomically), NEVER a crash.
     Corrupt(String),
@@ -371,7 +373,9 @@ pub fn now_unix_ns() -> u64 {
 // ===========================================================================
 
 /// Read + parse `auth.json` from an explicit path. A missing file ⇒ [`Absent`];
-/// a present-but-unparseable file ⇒ [`Corrupt`] (never a crash, never a delete).
+/// a present-but-unparseable file ⇒ [`Corrupt`] (never a crash, never a delete),
+/// whose message names the path and the line and column of the parse error
+/// and never the error's own text, which can quote a value from the file.
 ///
 /// [`Absent`]: LoadedAuth::Absent
 /// [`Corrupt`]: LoadedAuth::Corrupt
@@ -385,7 +389,14 @@ pub fn load_from(path: &Path) -> LoadedAuth {
         Ok(state) => LoadedAuth::Present(state),
         Err(e) => match signed_out_account(&bytes) {
             Some((account_id, role)) => LoadedAuth::SignedOut { account_id, role },
-            None => LoadedAuth::Corrupt(format!("parse {}: {e}", path.display())),
+            // Only the location: serde_json's message can quote a value from
+            // the file, and the file holds bearer tokens.
+            None => LoadedAuth::Corrupt(format!(
+                "parse {}: line {} column {}",
+                path.display(),
+                e.line(),
+                e.column()
+            )),
         },
     }
 }
