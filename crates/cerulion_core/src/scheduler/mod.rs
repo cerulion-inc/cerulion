@@ -9060,8 +9060,8 @@ pub fn record_backpressure_event_n(
                     input = %input_name,
                     policy = "block",
                     total,
-                    "backpressure event: producer's tick deferred (sole-Block-consumer-full \
-                     or all-Block-buffers-full) — no data lost, \
+                    "backpressure event: producer's tick deferred because this `block` \
+                     consumer's credit slot is full; no data lost, \
                      `backpressure_block_fires_deferred_count` incremented"
                 );
             } else {

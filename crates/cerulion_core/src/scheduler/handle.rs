@@ -1014,9 +1014,8 @@ impl NodeHandle {
     /// Per-input `Block` deferred-fire count for `input_name`.
     ///
     /// Returns the number of times the producer's tick was deferred by
-    /// the scheduler because this subscriber's buffer was full AND the
-    /// policy was `Block` AND no non-Block subscribers existed on the
-    /// topic (sole-Block-consumer-full or all-Block-buffers-full case).
+    /// the scheduler because this `block` input's credit slot was full
+    /// (whatever the topic's other consumers declare).
     /// NO DATA WAS LOST in these events. Returns 0 if the input is
     /// unknown.
     pub fn backpressure_block_fires_deferred_count(&self, input_name: &str) -> u64 {
