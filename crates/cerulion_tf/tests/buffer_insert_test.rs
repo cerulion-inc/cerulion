@@ -726,16 +726,28 @@ type Snapshot = (
     u64,
     OwnedEdge,
     OwnedEdge,
+    bool,
     [Transform; 3],
     Transform,
 );
-type OwnedEdge = (String, bool, usize, Option<u64>, Option<u64>, u64);
+type OwnedEdge = (
+    String,
+    bool,
+    EdgePolicy,
+    usize,
+    Option<u64>,
+    Option<u64>,
+    u64,
+);
 
 fn snapshot(b: &TfBuffer) -> Snapshot {
     let own = |e: EdgeInfo<'_>| {
         (
             e.parent.to_string(),
             e.is_static,
+            // The policy, so a refused `set_edge_policy` that still wrote
+            // it fails.
+            e.policy,
             e.samples,
             e.oldest_ns,
             e.newest_ns,
@@ -748,6 +760,9 @@ fn snapshot(b: &TfBuffer) -> Snapshot {
         b.replacements(),
         own(edge(b, "base")),
         own(edge(b, "lidar")),
+        // The root has no edge of its own: a refused cycle (`base -> odom`
+        // or `lidar -> odom`) must not have created one.
+        b.edge("odom").is_none(),
         // Each stored sample at its exact stamp, and the midpoint between
         // them, so a refusal that rewrites the samples but keeps their mean
         // still fails.
@@ -830,8 +845,10 @@ fn an_edge_that_would_close_a_cycle_is_refused() {
             child: id(b, "odom"),
         },
     );
+    // A policy other than the default, so a refusal that wrote it to any
+    // edge changes the snapshot.
     refusal_leaves_the_buffer_untouched(
-        |b| b.set_edge_policy("base", "odom", EdgePolicy::Interpolate),
+        |b| b.set_edge_policy("base", "odom", EdgePolicy::HoldLast { max_age_ns: 50 }),
         |b| TfError::Cycle {
             parent: id(b, "base"),
             child: id(b, "odom"),
