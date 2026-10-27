@@ -36,6 +36,10 @@
 //!   daemon's schema directory, not the host's transport and schemas. A desk
 //!   reads a host's topics over the wire plane.
 //!
+//! The rcp plane (`cerulion/rcp/1`, [`crate::rcp`]) is daemon only as well: a
+//! library host serves none, so a desk's rcp session there is answered with
+//! the accept decision instead of a session.
+//!
 //! ## What a host takes on
 //!
 //! - **No kill switch.** The library entry does not read `--network` or
@@ -64,6 +68,7 @@ use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::error::RemotedError;
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
+use crate::rcp::RcpLink;
 use crate::wire::WirePlane;
 
 /// The ops handshake name the daemon announces.
@@ -130,9 +135,12 @@ impl OpsHost {
 }
 
 /// The kind of host a plane is bound for; the daemon's lease is made at serve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum HostKind {
-    Daemon,
+    /// The daemon, which also serves the rcp plane to `rcp`'s rcpd.
+    Daemon {
+        rcp: RcpLink,
+    },
     Embedded,
 }
 
@@ -237,7 +245,9 @@ impl RemotePlane {
             robot: cerulion_core::graph::robot_identity_from_env(),
             schemas: LocalSchemaSource::Socket(cerulion_netd::hygiene::default_socket_path()),
             transport: None,
-            host: HostKind::Daemon,
+            host: HostKind::Daemon {
+                rcp: config.rcp.clone(),
+            },
         }
     }
 
@@ -288,6 +298,9 @@ impl RemotePlane {
             bound_devices = device_index.len(),
             "cerulion_remoted: state loaded"
         );
+        if let HostKind::Daemon { rcp } = &self.host {
+            crate::rcp::prepare(rcp).map_err(RemotedError::Config)?;
+        }
 
         let endpoint =
             build_endpoint(EndpointConfig::new(device_key).with_relay(self.relay.clone())).await?;
@@ -340,9 +353,9 @@ impl BoundPlane {
         self.endpoint.bound_sockets()
     }
 
-    /// Serve the wire and ops planes until `shutdown` resolves or the endpoint
-    /// closes, then close the endpoint, on an error too. Access checks read the
-    /// wall clock.
+    /// Serve the wire and ops planes (and the rcp plane, on the daemon) until
+    /// `shutdown` resolves or the endpoint closes, then close the endpoint, on
+    /// an error too. Access checks read the wall clock.
     pub async fn serve(
         self,
         shutdown: impl std::future::Future<Output = ()>,
@@ -362,14 +375,14 @@ impl BoundPlane {
             LocalSchemaSource::Socket(socket) => base.with_local_schema_provider(socket),
             LocalSchemaSource::InProcess(source) => base.with_in_process_schema_provider(source),
         };
-        let (ops_host, server_name) = match plane.host {
-            HostKind::Daemon => (OpsHost::daemon(), DAEMON_SERVER_NAME),
+        let (ops_host, server_name, rcp) = match plane.host {
+            HostKind::Daemon { rcp } => (OpsHost::daemon(), DAEMON_SERVER_NAME, Some(rcp)),
             HostKind::Embedded => {
                 tracing::info!(
                     "cerulion_remoted: serving as a library host; restart, engage-estop \
-                     and the act verbs are refused (daemon only)"
+                     and the act verbs are refused and no rcp plane is served (daemon only)"
                 );
-                (OpsHost::Embedded, EMBEDDED_SERVER_NAME)
+                (OpsHost::Embedded, EMBEDDED_SERVER_NAME, None)
             }
         };
         let result = crate::daemon::serve_core(
@@ -383,6 +396,7 @@ impl BoundPlane {
             RemotedClock::wall(),
             None,
             base,
+            rcp,
             shutdown,
         )
         .await;

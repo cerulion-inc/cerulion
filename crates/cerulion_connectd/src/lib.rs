@@ -30,6 +30,8 @@
 //! - [`worker`]: [`run_connect`], the dial, demand and per-topic re-inject engine.
 //! - [`pair`]: [`run_pair`], the desk-side CPace pairing ceremony over the
 //!   robot's `cerulion/ops/1` plane (the `cerulion pair` verb's engine).
+//! - [`rcp`]: [`rcp::run_rcp`], the stdio MCP bridge to a robot's
+//!   `cerulion/rcp/1` plane (the `cerulion rcp` verb's engine).
 //! - [`error`]: the unified [`ConnectError`] enum.
 
 // Principle #12 (logging): library code never prints — it logs through
@@ -48,6 +50,7 @@ pub use cerulion_wireclient::{config, error, protocol};
 
 pub mod act;
 pub mod pair;
+pub mod rcp;
 pub mod schema;
 pub mod worker;
 

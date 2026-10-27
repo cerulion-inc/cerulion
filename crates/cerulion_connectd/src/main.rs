@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion-connectd` — the desk-side iroh sibling binary.
 //!
-//! Two subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
+//! Three subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
 //! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
@@ -12,8 +12,13 @@
 //!   Deterministic STDOUT state lines (`pairing:` / `paired:`); a distinct exit
 //!   code per outcome (see [`cerulion_connectd::pair`]).
 //!
-//! Both subcommands are spawned by `cerulion connect` / `cerulion pair`; users run
-//! those verbs, not this binary directly. All logic lives in the library.
+//! - `cerulion-connectd rcp …`: bridge stdio to the robot's `cerulion/rcp/1`
+//!   ALPN, so the robot's `cerulion-rcpd` serves as a local stdio MCP server.
+//!   STDOUT carries only MCP messages.
+//!
+//! The subcommands are spawned by `cerulion connect` / `cerulion pair` /
+//! `cerulion rcp`; users run those verbs, not this binary directly. All logic
+//! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -27,6 +32,7 @@ use cerulion_connectd::config::{
     ConnectConfig, DemandSet, DEFAULT_ROBOT_TIMEOUT,
 };
 use cerulion_connectd::pair::{run_pair, PairConfig, EXIT_INTERRUPTED, EXIT_USAGE};
+use cerulion_connectd::rcp::{run_rcp, stdin_reader, RcpConfig};
 use cerulion_connectd::resolve_epoch_dir_from_env;
 use cerulion_connectd::sanitize_peer_text;
 use cerulion_connectd::worker::run_connect;
@@ -46,7 +52,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect` and `cerulion pair` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion pair` and `cerulion rcp` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -77,6 +83,12 @@ enum ConnectdCommand {
     ///   the robot could not be reached in time, `4` the robot refused the
     ///   call or does not serve the verb.
     Act(ActCli),
+    /// Serve a robot's cerulion-rcpd as a local stdio MCP server.
+    ///
+    /// Dials the robot's rcp plane with the desk device key and bridges one
+    /// MCP session: newline-delimited JSON-RPC on stdin and stdout. Stdout
+    /// carries only MCP messages; logs go to stderr.
+    Rcp(RcpCli),
 }
 
 /// `cerulion-connectd act`: one act-verb call.
@@ -108,6 +120,36 @@ struct ActCli {
     relay_disabled: bool,
     /// Kill-switch: pass `off` to refuse the call before the endpoint is
     /// bound. `CERULION_NETWORK=off` also engages it.
+    #[arg(long)]
+    network: Option<String>,
+}
+
+/// `cerulion-connectd rcp`: the stdio MCP bridge flags.
+#[derive(Parser, Debug)]
+struct RcpCli {
+    /// The robot's iroh endpoint id (64-char hex).
+    #[arg(long, value_name = "HEX")]
+    eid: String,
+
+    /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable.
+    #[arg(long = "addr", value_name = "IP:PORT")]
+    addrs: Vec<String>,
+
+    /// The desk device key file (32 raw bytes). The robot admits only a key
+    /// it has paired; without one an ephemeral key is used and refused.
+    #[arg(long, value_name = "PATH")]
+    key_file: Option<PathBuf>,
+
+    /// Self-hosted relay URL. Default: n0 public relays.
+    #[arg(long, env = "CERULION_RELAY_URL")]
+    relay_url: Option<String>,
+
+    /// Disable all relays (LAN or direct-dial only).
+    #[arg(long)]
+    relay_disabled: bool,
+
+    /// Kill-switch: pass `off` to refuse to connect. `CERULION_NETWORK=off`
+    /// also engages it.
     #[arg(long)]
     network: Option<String>,
 }
@@ -295,7 +337,7 @@ fn resolve_relay(
 }
 
 /// Whether the `off` kill-switch is engaged (either the flag or the env) for
-/// the subcommand `command` (`connect`, `act`). Warns on an unrecognized
+/// the subcommand `command` (`connect`, `act`, `rcp`). Warns on an unrecognized
 /// non-`off` value (a mistyped `--network of` must never be a
 /// silently-ineffective switch).
 fn network_off(command: &'static str, flag: Option<&str>, env: Option<&str>) -> bool {
@@ -430,6 +472,7 @@ async fn main() -> ExitCode {
         ConnectdCommand::Connect(c) => run_connect_command(c).await,
         ConnectdCommand::Pair(p) => run_pair_command(p).await,
         ConnectdCommand::Act(a) => run_act_command(a).await,
+        ConnectdCommand::Rcp(r) => run_rcp_command(r).await,
     }
 }
 
@@ -498,6 +541,45 @@ async fn run_act_command(cli: ActCli) -> ExitCode {
             ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// The `rcp` subcommand: bridge stdio to the robot's rcp plane until the
+/// session ends.
+async fn run_rcp_command(cli: RcpCli) -> ExitCode {
+    if network_off(
+        "rcp",
+        cli.network.as_deref(),
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+    ) {
+        tracing::warn!(
+            "cerulion rcp: network kill-switch engaged (--network off / CERULION_NETWORK=off); \
+             refusing to connect"
+        );
+        return ExitCode::FAILURE;
+    }
+    let config = match rcp_config(&cli) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "cerulion rcp: configuration error");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_rcp(config, stdin_reader(), tokio::io::stdout()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "cerulion rcp: session failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn rcp_config(cli: &RcpCli) -> Result<RcpConfig, ConnectError> {
+    Ok(RcpConfig {
+        robot_eid: parse_eid(&cli.eid)?,
+        direct_addrs: parse_addrs(&cli.addrs)?,
+        desk_seed: resolve_desk_seed(cli.key_file.as_deref())?,
+        relay: resolve_relay(cli.relay_url.as_deref(), cli.relay_disabled)?,
+    })
 }
 
 /// The `connect` subcommand: dial the wire plane + re-inject until Ctrl-C / the

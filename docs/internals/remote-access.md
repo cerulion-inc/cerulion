@@ -19,9 +19,10 @@ robot exposes ONE iroh endpoint whose identity IS its ed25519 device key: the
 ONE 32-byte SECRET seeds both the iroh endpoint and the pairing
 `DeviceIdentity` (`client.rs::from_seed` consumes it), and its PUBLIC half
 doubles as the iroh `EndpointId` and the pairing transport public key; the
-seed is never the public half. iroh multiplexes both ALPNs on that endpoint
+seed is never the public half. iroh multiplexes every ALPN on that endpoint
 (`cerulion_link::alpn`: `cerulion/wire/2` = raw topic frames, `cerulion/ops/1` =
-ops verbs; the trailing `/1` is each plane's protocol-version boundary). Exactly
+ops verbs, `cerulion/rcp/1` = MCP sessions with the robot's `cerulion-rcpd`; the
+trailing number is each plane's protocol-version boundary). Exactly
 one process owns it: `cerulion-remoted`, dispatching by negotiated ALPN at accept
 (`daemon::handle_accepted`; pinned over real loopback endpoints by
 `crates/cerulion_remoted/tests/loopback_test.rs`), or a host process that embeds
@@ -433,6 +434,34 @@ iroh + real iceoryx2: `wire_plane_test.rs` (byte-for-byte against hand oracles).
   `daemon_demand_gate_test.rs` (the authorizer wired by the production
   `serve_endpoint` seam itself, so reverting the one wiring line fails a test).
 
+### The rcp plane (`cerulion_remoted::rcp`)
+
+Each bidi stream on `cerulion/rcp/1` is one MCP session; each frame is one
+JSON-RPC 2.0 message. The robot is an MCP streamable HTTP client of its local
+`cerulion-rcpd` (`--http`, default `127.0.0.1:7801`): every admitted message is
+one `POST` with rcpd's bearer token (read per session from
+`remoted/rcp.token`), the session id and protocol version rcpd issued, and
+`x-cerulion-caller: iroh:<device hex>/account:<account hex>`. rcpd runs the call
+under that caller (`cerulion_rcpd::caller`), so its receipts and the journaled
+call frame name the remote desk.
+
+`rcp::rcp_authorize` is the one decision function, over one locked read
+(`SharedTrust::snapshot_row_for_key`: claimed flag, key access, allowing row).
+At accept (`classify_accept`) it needs a claimed robot and an allowed key. Each
+message is parsed strictly (`classify_message`: one object, `jsonrpc` `"2.0"`,
+string `method`, object `params`, string or integer `id`, no other member) and
+classified by method: lifecycle needs an allowed row, `resources/*`,
+`subscriptions/listen` and `tools/list` need `CAP_OBSERVE` with role value
+`<= VIEWER`, `tools/call` naming `estop` needs an allowed row (the e-stop
+floor), any other `tools/call` needs `CAP_TELEOP` with role value `<= OPERATOR`
+(`rcp::requirement`). The canonical re-serialization is what reaches rcpd. Each
+frame back is checked against the class that produced it, and the session
+floor every `RcpLimits::revoke_check` (`--rcp-revoke-check-ms`); a key that fails the floor has its
+connection closed. Pinned end to end against a
+real rcpd by `rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
+(`cerulion-connectd rcp`, `connectd::rcp::bridge`): stdin lines to frames,
+frames to stdout lines.
+
 ## 7. The desk half: connect, pair, and the client substrate
 
 - **`cerulion connect <robot>`**: the CLI resolves robot address + demand set
@@ -703,7 +732,9 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   library host supplies both keys through its own `KeyProvider` and writes no
   key file),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
-  root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
+  root), `rcp.token` (the local `cerulion-rcpd` bearer token, bare or one
+  `CERULION_RCP_TOKEN=<token>` line; robot setup creates it 0600 for the
+  service user), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
   `beacon_facts_test.rs`).
 

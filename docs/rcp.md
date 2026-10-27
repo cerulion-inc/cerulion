@@ -36,7 +36,10 @@ Streamable HTTP is served at `/mcp`. Every request must carry
 `Authorization: Bearer <token>` matching `CERULION_RCP_TOKEN`, or it is
 answered `401`. Without the variable `--http` refuses to start. The default
 address is loopback; binding any other address logs a warning, and only
-`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header.
+`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header. A
+request may carry `x-cerulion-caller: <caller>` (1 to 200 characters from
+`[A-Za-z0-9:._@/-]`); a tool call it carries is receipted under that caller
+instead of `rcp-agent`, and a repeated or malformed value fails the call.
 
 ## The manifest
 
@@ -373,3 +376,34 @@ answer records. Every `late` receipt for a request an answer in the
 recording names must follow that request's `timeout` answer. The receipt
 log is shared by every run, so a `late` receipt for a request no answer in
 the recording names is another recording's and is left out.
+
+## Reaching rcpd from a desk
+
+`cerulion-remoted` serves the robot's rcpd to desks on its access list on the
+`cerulion/rcp/1` plane. Run rcpd with `--http` on its default loopback address
+and give it the token `cerulion-remoted` uses. At startup `cerulion-remoted`
+creates `<state root>/remoted/rcp.token` when it is absent: one
+`CERULION_RCP_TOKEN=<random token>` line, mode `0600`, owned by the user
+`cerulion-remoted` runs as. It refuses to start when the file exists and is
+readable by its group or by others. The file's format is a systemd
+environment file, so rcpd's unit reads it directly:
+
+```ini
+[Service]
+EnvironmentFile=/var/lib/cerulion/remoted/rcp.token
+ExecStart=/usr/bin/cerulion-rcpd --manifest /etc/cerulion/rcp.yaml --http
+```
+
+On the desk, `cerulion rcp <robot>` serves the robot's rcpd as a local stdio
+MCP server. The robot admits only a desk on its access list and checks every
+message: `resources/*`, `subscriptions/listen` and `tools/list` need the
+observe capability; `tools/call` needs the teleop capability and the operator
+role, except that any desk on the access list may call `estop`. Tool calls
+made this way are receipted under the desk's identity,
+`iroh:<device key hex>/account:<account hex>`, and the journaled call frame
+carries the same value as `"caller"`. `cerulion-remoted --rcp-addr` (a
+loopback address) and `--rcp-token-file` change the address and the file.
+The plane's bounds and timers are flags too: `--rcp-sessions-per-connection`,
+`--rcp-connections-per-key`, `--rcp-in-flight`, `--rcp-estops-in-flight`,
+`--rcp-session-buffer-bytes`, `--rcp-revoke-check-ms`, `--rcp-head-timeout-ms`
+and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).

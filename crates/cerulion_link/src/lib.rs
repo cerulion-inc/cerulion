@@ -20,7 +20,7 @@
 //! - [`assert_peer_identity`]: bind a connection's mutually-authenticated
 //!   peer key to an expected paired device key (the cert-subject == remote_id
 //!   check the higher layers assert).
-//! - [`alpn`]: the ALPN plane constants ([`alpn::WIRE`], [`alpn::OPS`]).
+//! - [`alpn`]: the ALPN plane constants ([`alpn::WIRE`], [`alpn::OPS`], [`alpn::RCP`]).
 //! - [`RelayConfig`]: the data-driven relay seam (n0 dev relays / disabled /
 //!   self-hosted prod URLs; no prod URLs hardcoded).
 //!   [`RelayConfig::resolve`] is the ONE shared precedence helper that turns

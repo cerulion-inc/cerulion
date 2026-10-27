@@ -22,7 +22,7 @@ pub struct EndpointConfig {
     /// [`EndpointId`].
     pub secret_key: [u8; 32],
     /// ALPN protocols this endpoint accepts on incoming connections (defaults
-    /// to [`alpn::ALL`] — both the wire and ops planes).
+    /// to [`alpn::ALL`]: the wire, ops and rcp planes).
     pub alpns: Vec<Vec<u8>>,
     /// Relay configuration (defaults to [`RelayConfig::N0Default`]).
     pub relay: RelayConfig,
@@ -40,7 +40,7 @@ impl std::fmt::Debug for EndpointConfig {
 }
 
 impl EndpointConfig {
-    /// A config from a 32-byte device secret, accepting BOTH planes over the
+    /// A config from a 32-byte device secret, accepting every plane over the
     /// dev-default n0 relays.
     pub fn new(secret_key: [u8; 32]) -> Self {
         Self {

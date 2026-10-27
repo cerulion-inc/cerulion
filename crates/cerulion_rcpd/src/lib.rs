@@ -18,6 +18,7 @@
 //! - [`audit`]: the receipt chain check behind `--verify-receipts`.
 //! - [`eye`]: Jev, the gate's second eye: asks and answers on the graph, one
 //!   System One request per look, receipts, replay and `--verify-bag`.
+//! - [`caller`]: the remote caller a tool call is receipted and journaled under.
 //! - [`server`]: the MCP handler.
 //! - [`http`]: the bearer-token streamable HTTP transport.
 //!
@@ -27,6 +28,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod audit;
+pub mod caller;
 pub mod error;
 pub mod eye;
 pub mod graph;

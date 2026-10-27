@@ -38,8 +38,8 @@ use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
-    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
-    schema_cmd, topic_cmd, viz_client, workspace,
+    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, rcp_cmd,
+    ros_cmd, schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
@@ -361,6 +361,12 @@ fn dispatch(cli: Cli) -> ExitCode {
     // intercept here like `connect` / `bag play --resim`.
     if matches!(cli.command, Commands::Pair { .. }) {
         return pair_exit_code(cli.command);
+    }
+
+    // `cerulion rcp` SPAWNS `cerulion-connectd rcp` with inherited stdio (the
+    // MCP stream) and forwards its exit code.
+    if matches!(cli.command, Commands::Rcp { .. }) {
+        return rcp_exit_code(cli.command);
     }
 
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
@@ -950,6 +956,53 @@ fn connect_exit_code(command: Commands) -> ExitCode {
         ),
     );
     match result {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolve + spawn `cerulion-connectd rcp` with inherited stdio (the MCP
+/// stream) and forward its exit code. Errors go to stderr; stdout stays MCP-only.
+fn rcp_exit_code(command: Commands) -> ExitCode {
+    let Commands::Rcp {
+        robot,
+        eid,
+        addrs,
+        key_file,
+        relay_url,
+        relay_disabled,
+        network,
+    } = command
+    else {
+        unreachable!("rcp_exit_code is only called for Commands::Rcp");
+    };
+    let args = rcp_cmd::RcpArgs {
+        robot,
+        eid,
+        addrs,
+        key_file,
+        relay_url,
+        relay_disabled,
+        network,
+    };
+    let plan = match rcp_cmd::plan(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let running = match setup_ctrlc_handler() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("warning: could not install a signal handler: {e}");
+            Arc::new(AtomicBool::new(true))
+        }
+    };
+    match connect_cmd::spawn_and_wait(&plan, running) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2396,6 +2449,9 @@ fn run(cli: Cli) -> CliResult<()> {
         // spawn `cerulion-connectd pair` + forward its 0–4 pairing exit code.
         Commands::Pair { .. } => {
             unreachable!("`cerulion pair` is dispatched in main() before run()")
+        }
+        Commands::Rcp { .. } => {
+            unreachable!("`cerulion rcp` is dispatched in main() before run()")
         }
         // `cerulion bagd` never reaches `run()`: `main`
         // dispatches it (unix) or errors (non-unix) before the logging setup.

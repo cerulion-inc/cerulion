@@ -1,0 +1,2044 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The `cerulion/rcp/1` plane: an MCP session between a desk on the robot's
+//! access list and the robot's local `cerulion-rcpd`.
+//!
+//! ## Wire
+//!
+//! Each bidi stream the desk opens carries ONE MCP session. Every frame
+//! ([`cerulion_link::write_frame`]) is one JSON-RPC 2.0 message, desk to robot
+//! and robot to desk. The robot side is an MCP streamable HTTP client of
+//! `cerulion-rcpd` on loopback: each admitted desk message becomes one `POST`
+//! carrying the rcpd bearer token, the session's `Mcp-Session-Id` and
+//! `MCP-Protocol-Version` once rcpd has issued them, and the
+//! [`CALLER_HEADER`] naming the desk's device key and account. Every JSON-RPC
+//! message rcpd answers with (a JSON body, or each `data:` event of an SSE
+//! body) goes back to the desk as one frame. After `notifications/initialized`
+//! the plane also opens rcpd's standalone `GET` event stream, when rcpd
+//! serves one, and relays its messages.
+//!
+//! ## Authorization
+//!
+//! [`rcp_authorize`] is the one authorization entry point. At accept it
+//! requires a claimed robot and a key whose account is on the access list.
+//! Then EVERY desk message is parsed by [`classify_message`] and checked by
+//! [`rcp_authorize`] for its class against the LIVE trust state before it is
+//! forwarded. Before each frame goes back to the desk, the class that produced it is checked
+//! again, and the session floor ([`RcpClass::Session`]) is checked every
+//! [`RcpLimits::revoke_check`] as well; a key that fails the floor has its
+//! connection closed.
+//!
+//! The e-stop takes no Observe/Act slot; its own bound is
+//! [`RcpLimits::estops_in_flight`]. Requests past either bound are
+//! answered with an error, never queued, and the reader never waits on the
+//! outbound queue: an error reply that does not fit is dropped.
+//!
+//! | Method | Class | Requirement ([`requirement`]) |
+//! |---|---|---|
+//! | `initialize`, `ping`, `notifications/initialized`, `notifications/cancelled` | Session | any account on the access list |
+//! | `resources/list`, `resources/read`, `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`, `subscriptions/listen`, `tools/list` | Observe | `CAP_OBSERVE` and role value <= `VIEWER` |
+//! | `tools/call` with `params.name` `estop` | Estop | any account on the access list (the e-stop floor) |
+//! | `tools/call`, any other tool | Act | `CAP_TELEOP` and role value <= `OPERATOR` |
+//! | anything else, a batch, a response, or any message that fails the strict parse | none | denied |
+//!
+//! A denied request is answered with a JSON-RPC error carrying its id; a
+//! message whose id cannot be read is answered with id `null`; a denied
+//! notification gets no answer. Nothing denied reaches rcpd. The plane adds
+//! and removes no rcpd tool limit: what rcpd refuses, it refuses.
+//!
+//! ## The rcpd link
+//!
+//! [`RcpLink`] names rcpd's loopback address and the robot-local token file.
+//! The file holds the token rcpd reads from `CERULION_RCP_TOKEN`, either bare
+//! or as one `CERULION_RCP_TOKEN=<token>` line, so the same file can be a
+//! systemd `EnvironmentFile=` for rcpd. The daemon runs [`ensure_token_file`]
+//! at startup through [`prepare`]; the token is read, with the same mode
+//! check, when each session opens. The link must be a loopback address.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use cerulion_link::{accept_frame_stream, read_frame, write_frame, Connection, SendStream};
+use cerulion_pairing::format::{AccountId, Role, Scope};
+use cerulion_pairing::verify::AccessRow;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST};
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Map, Value};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
+
+use crate::trust::{KeyAccess, SharedTrust};
+
+/// The header naming the desk's device key and account on each request to rcpd.
+pub const CALLER_HEADER: &str = "x-cerulion-caller";
+
+/// The environment variable rcpd reads its token from; also the optional
+/// prefix of a token file's line.
+pub const TOKEN_ENV: &str = "CERULION_RCP_TOKEN";
+
+/// rcpd's default `--http` address, 127.0.0.1:7801.
+pub const DEFAULT_RCPD_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    7801,
+));
+
+/// The largest desk message accepted, bytes: 16 times rcpd's own largest
+/// call frame (64 KiB), so the bound never refuses a call rcpd would take.
+pub const MAX_REQUEST_FRAME: usize = 1024 * 1024;
+
+/// The largest message relayed back to the desk, bytes: the link's frame cap,
+/// the most one frame can carry.
+pub const MAX_RESPONSE_MESSAGE: usize = cerulion_link::DEFAULT_MAX_FRAME_LEN;
+
+/// The QUIC close code of a connection whose key lost rcp access.
+pub const CLOSE_REVOKED: u32 = 0x5243_0001;
+
+// 0x5243_0002 is RETIRED (it meant "too many rcp connections for this key",
+// a refusal at the per-key cap); it is never reissued.
+
+/// The QUIC close code of a key's oldest connection, closed when a newer one
+/// from the same key would pass [`RcpLimits::connections_per_key`].
+pub const CLOSE_SUPERSEDED: u32 = 0x5243_0003;
+
+/// The JSON-RPC error code of a message the plane refuses to forward.
+pub const DENIED_CODE: i64 = -32001;
+
+/// The JSON-RPC error code of a message that fails the strict parse.
+pub const INVALID_REQUEST_CODE: i64 = -32600;
+
+/// The JSON-RPC error code of a request rcpd could not be reached for.
+pub const UPSTREAM_CODE: i64 = -32603;
+
+/// How long a TCP connect to rcpd may take. rcpd is on loopback, where a
+/// connect either completes at once or is refused, so this only bounds a
+/// wedged host; not tunable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Frames queued for the desk per session; the byte budget
+/// ([`RcpLimits::session_buffer_bytes`]) is the bound that matters, this only
+/// caps the count of tiny frames.
+const OUTBOUND_QUEUE: usize = 32;
+
+/// The rcp plane's bounds and timers. Each default states its reason; each is
+/// a `cerulion-remoted` flag ([`RcpFlags`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RcpLimits {
+    /// Concurrent sessions (bidi streams) per connection
+    /// (`--rcp-sessions-per-connection`, default 4): one MCP client uses one;
+    /// a few allow a reconnect overlapping its predecessor.
+    pub sessions_per_connection: usize,
+    /// Concurrent rcp connections per device key
+    /// (`--rcp-connections-per-key`, default 4): one desk runs a few MCP
+    /// clients at most; the cap stops one key exhausting robot sockets. A
+    /// connection past it closes the key's oldest, so a desk that crashed is
+    /// never locked out.
+    pub connections_per_key: usize,
+    /// Concurrent in-flight Observe, Act and lifecycle requests per session
+    /// (`--rcp-in-flight`, default 8): rcpd serializes tool calls, so more than
+    /// a few in flight only queue inside rcpd. A request past it is answered
+    /// with an error, never queued.
+    pub in_flight: usize,
+    /// Concurrent e-stop calls per session (`--rcp-estops-in-flight`, default
+    /// 2): rcpd latches on the first, so a second only covers a lost answer.
+    pub estops_in_flight: usize,
+    /// Bytes queued for the desk per session before producers wait
+    /// (`--rcp-session-buffer-bytes`, default 32 MiB): two of the largest
+    /// relayable messages ([`MAX_RESPONSE_MESSAGE`]).
+    pub session_buffer_bytes: usize,
+    /// How often a session re-checks the session floor with no traffic
+    /// (`--rcp-revoke-check-ms`, default 5000): the longest a revoked, idle
+    /// desk keeps its connection; a frame sent or answered is checked at once.
+    pub revoke_check: Duration,
+    /// How long rcpd may take to send a response head (`--rcp-head-timeout-ms`,
+    /// default 30000): rcpd sends a streamed head before running the tool, so
+    /// this bounds only a wedged rcpd, never a long tool call.
+    pub head_timeout: Duration,
+    /// How long forwarded requests may still answer after the desk ends its
+    /// side of the stream (`--rcp-drain-ms`, default 30000): matches the head
+    /// bound, so a request forwarded just before the end is not cut off.
+    pub drain: Duration,
+}
+
+impl Default for RcpLimits {
+    fn default() -> Self {
+        Self {
+            sessions_per_connection: 4,
+            connections_per_key: 4,
+            in_flight: 8,
+            estops_in_flight: 2,
+            session_buffer_bytes: 2 * MAX_RESPONSE_MESSAGE,
+            revoke_check: Duration::from_secs(5),
+            head_timeout: Duration::from_secs(30),
+            drain: Duration::from_secs(30),
+        }
+    }
+}
+
+/// The security class of one desk message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RcpClass {
+    /// Session lifecycle: initialize, ping, initialized, cancelled.
+    Session,
+    /// Reading the robot: resources, subscriptions, the tool list.
+    Observe,
+    /// Calling a tool.
+    Act,
+    /// Calling rcpd's built-in [`ESTOP_TOOL`]: the e-stop floor, any account
+    /// on the access list, as the ops plane's `engage-estop`.
+    Estop,
+}
+
+/// The name of rcpd's built-in e-stop tool.
+pub const ESTOP_TOOL: &str = "estop";
+
+/// What an account's scope must hold for a class: ALL of `required_caps`, and
+/// a role value <= `max_role` (a lower [`Role`] value is more privileged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RcpRequirement {
+    /// Capability bits that must all be present.
+    pub required_caps: u64,
+    /// The least privileged role admitted.
+    pub max_role: Role,
+}
+
+/// The requirement of each class. The single place the rcp policy lives.
+pub fn requirement(class: RcpClass) -> RcpRequirement {
+    match class {
+        RcpClass::Session => RcpRequirement {
+            required_caps: 0,
+            max_role: Role(u16::MAX),
+        },
+        RcpClass::Observe => RcpRequirement {
+            required_caps: Scope::CAP_OBSERVE,
+            max_role: Role::VIEWER,
+        },
+        RcpClass::Act => RcpRequirement {
+            required_caps: Scope::CAP_TELEOP,
+            max_role: Role::OPERATOR,
+        },
+        RcpClass::Estop => RcpRequirement {
+            required_caps: 0,
+            max_role: Role(u16::MAX),
+        },
+    }
+}
+
+/// Whether `scope` meets `class`'s [`requirement`].
+pub fn scope_meets(scope: Scope, class: RcpClass) -> bool {
+    let req = requirement(class);
+    (scope.caps & req.required_caps) == req.required_caps && scope.role.0 <= req.max_role.0
+}
+
+/// THE rcp authorization entry point, used at accept (`class` = `None`) and
+/// for every message (`class` = `Some`), over one torn-free read of the
+/// robot's trust state: `claimed`, the key's `access`, and the access `row`
+/// that allows it (`Some` exactly when `access` is [`KeyAccess::Allowed`]).
+///
+/// Admits when the robot is claimed, the key is allowed by `row`, and for a
+/// message, `row.scope` meets the class's [`requirement`]. A condition on the
+/// caller's account or principal kind belongs here, so it holds at accept and
+/// on every message at once.
+///
+/// # Errors
+///
+/// The refusal reason.
+pub fn rcp_authorize(
+    claimed: bool,
+    access: KeyAccess,
+    row: Option<&AccessRow>,
+    class: Option<RcpClass>,
+) -> Result<(), String> {
+    if let Some(reason) = crate::authorizer::cloud_refusal(access) {
+        return Err(format!("rcp plane refused: {reason}"));
+    }
+    if !claimed {
+        return Err("rcp plane refused: robot is UNCLAIMED".to_string());
+    }
+    let row = match (access, row) {
+        (KeyAccess::Allowed(_), Some(row)) => row,
+        (KeyAccess::Allowed(_), None) => {
+            return Err("rcp plane refused: no access row for an allowed key".to_string())
+        }
+        (KeyAccess::Unpaired, _) => {
+            return Err("rcp plane refused: unpaired device key".to_string())
+        }
+        (KeyAccess::NotAllowed, _) => {
+            return Err("rcp plane refused: the account is not on the access list \
+                        (revoked, removed, or its owner-signed grant expired)"
+                .to_string())
+        }
+        (KeyAccess::CloudRefused, _) => {
+            return Err("rcp plane refused: cloud access is off on this robot".to_string())
+        }
+        (KeyAccess::DeviceRevoked, _) => {
+            return Err(
+                "rcp plane refused: this device key is revoked by the current \
+                        access-list epoch"
+                    .to_string(),
+            )
+        }
+    };
+    let Some(class) = class else {
+        return Ok(());
+    };
+    if scope_meets(row.scope, class) {
+        Ok(())
+    } else {
+        let req = requirement(class);
+        Err(format!(
+            "scope (role {}, caps {:#06x}) lacks the {class:?} requirement (caps {:#06x}, role \
+             value <= {})",
+            row.scope.role.0, row.scope.caps, req.required_caps, req.max_role.0
+        ))
+    }
+}
+
+/// [`rcp_authorize`] over the LIVE trust state for `device_key`.
+///
+/// # Errors
+///
+/// The refusal reason.
+pub fn authorize_key(
+    shared: &SharedTrust,
+    device_key: &[u8; 32],
+    class: Option<RcpClass>,
+) -> Result<(), String> {
+    let (claimed, access, row) = shared.snapshot_row_for_key(device_key);
+    rcp_authorize(claimed, access, row.as_ref(), class)
+}
+
+/// One desk message that passed [`classify_message`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RcpMessage {
+    /// Its class.
+    pub class: RcpClass,
+    /// Its method.
+    pub method: String,
+    /// Its id; `None` for a notification.
+    pub id: Option<Value>,
+    /// The message re-serialized from the parsed value: what is forwarded.
+    pub canonical: Vec<u8>,
+}
+
+/// A desk message [`classify_message`] refused.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RcpRefusal {
+    /// The id to answer with: the message's id when readable, `Null` when not,
+    /// `None` for a notification (no answer).
+    pub reply_id: Option<Value>,
+    /// Why.
+    pub reason: String,
+}
+
+fn request_class(method: &str) -> Option<RcpClass> {
+    Some(match method {
+        "initialize" | "ping" => RcpClass::Session,
+        "resources/list"
+        | "resources/read"
+        | "resources/templates/list"
+        | "resources/subscribe"
+        | "resources/unsubscribe"
+        | "subscriptions/listen"
+        | "tools/list" => RcpClass::Observe,
+        "tools/call" => RcpClass::Act,
+        _ => return None,
+    })
+}
+
+fn notification_class(method: &str) -> Option<RcpClass> {
+    match method {
+        "notifications/initialized" | "notifications/cancelled" => Some(RcpClass::Session),
+        _ => None,
+    }
+}
+
+fn valid_id(id: &Value) -> bool {
+    match id {
+        Value::String(_) => true,
+        Value::Number(n) => n.is_i64() || n.is_u64(),
+        _ => false,
+    }
+}
+
+/// Parse one desk frame strictly and classify it by its MCP method.
+///
+/// Admitted: a single JSON object with exactly `"jsonrpc": "2.0"`, a string
+/// `method`, an optional `params` object, and for a request an `id` that is a
+/// string or an integer; no other top-level key. A `tools/call` must carry a
+/// `params.name` string. Anything else is refused, including batches and
+/// responses.
+///
+/// # Errors
+///
+/// [`RcpRefusal`] naming the reply id and the reason.
+pub fn classify_message(frame: &[u8]) -> Result<RcpMessage, RcpRefusal> {
+    let unreadable = |reason: &str| RcpRefusal {
+        reply_id: Some(Value::Null),
+        reason: reason.to_string(),
+    };
+    let value: Value =
+        serde_json::from_slice(frame).map_err(|e| unreadable(&format!("not JSON: {e}")))?;
+    let Value::Object(obj) = value else {
+        return Err(unreadable(
+            "not a single JSON-RPC object (batches are refused)",
+        ));
+    };
+    let id = obj.get("id").cloned();
+    if let Some(bad) = id.as_ref().filter(|i| !valid_id(i)) {
+        return Err(unreadable(&format!(
+            "id must be a string or an integer, got {bad}"
+        )));
+    }
+    let refuse = |reason: String| RcpRefusal {
+        reply_id: id.clone(),
+        reason,
+    };
+    if obj.get("jsonrpc") != Some(&Value::String("2.0".into())) {
+        return Err(refuse("jsonrpc must be \"2.0\"".into()));
+    }
+    if let Some(key) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "jsonrpc" | "id" | "method" | "params"))
+    {
+        return Err(refuse(format!(
+            "unexpected member {key:?} (responses and extensions are refused)"
+        )));
+    }
+    let Some(Value::String(method)) = obj.get("method") else {
+        return Err(refuse("method must be a string".into()));
+    };
+    let params = obj.get("params");
+    if params.is_some_and(|p| !p.is_object()) {
+        return Err(refuse("params must be an object".into()));
+    }
+    let class = if id.is_some() {
+        request_class(method)
+    } else {
+        notification_class(method)
+    };
+    let Some(class) = class else {
+        return Err(refuse(format!(
+            "method {method:?} is not served on the rcp plane{}",
+            if id.is_some() {
+                ""
+            } else {
+                " as a notification"
+            }
+        )));
+    };
+    let class = if class == RcpClass::Act {
+        match params.and_then(|p| p.get("name")) {
+            Some(Value::String(name)) if name == ESTOP_TOOL => RcpClass::Estop,
+            Some(Value::String(_)) => RcpClass::Act,
+            _ => return Err(refuse("tools/call needs a string params.name".into())),
+        }
+    } else {
+        class
+    };
+    if let Some(bad) = inexact_number(&Value::Object(obj.clone())) {
+        return Err(refuse(format!(
+            "the number {bad} is outside the range JSON numbers are forwarded exactly"
+        )));
+    }
+    let canonical = serde_json::to_vec(&Value::Object(obj.clone()))
+        .map_err(|e| refuse(format!("cannot re-serialize: {e}")))?;
+    Ok(RcpMessage {
+        class,
+        method: method.clone(),
+        id,
+        canonical,
+    })
+}
+
+/// The first number in `value` that re-serialization could change: a float of
+/// magnitude 2^53 or more (an integer literal past `u64` parses as one).
+fn inexact_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n
+            .as_f64()
+            .filter(|f| n.is_f64() && f.abs() >= 9_007_199_254_740_992.0),
+        Value::Array(items) => items.iter().find_map(inexact_number),
+        Value::Object(map) => map.values().find_map(inexact_number),
+        _ => None,
+    }
+}
+
+/// A JSON-RPC error message.
+pub fn error_frame(id: Value, code: i64, message: &str) -> Vec<u8> {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+        .to_string()
+        .into_bytes()
+}
+
+/// The caller identity rcpd receipts a forwarded call under.
+pub fn caller_identity(device_key: &[u8; 32], account: Option<AccountId>) -> String {
+    match account {
+        Some(a) => format!(
+            "iroh:{}/account:{}",
+            hex::encode(device_key),
+            hex::encode(a.0)
+        ),
+        None => format!("iroh:{}", hex::encode(device_key)),
+    }
+}
+
+/// Read the rcpd token from `path`: the file's trimmed content, minus an
+/// optional `CERULION_RCP_TOKEN=` prefix. The file must pass the same checks
+/// as [`ensure_token_file`]; the token must be visible ASCII.
+///
+/// # Errors
+///
+/// A reason naming the file.
+pub fn load_token(path: &Path) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("rcpd token file {}: {e}", path.display()))?;
+    check_token_file(path, &meta)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("rcpd token file {}: {e}", path.display()))?;
+    let line = text.trim();
+    let token = line
+        .strip_prefix(TOKEN_ENV)
+        .and_then(|rest| rest.strip_prefix('='))
+        .unwrap_or(line);
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!(
+            "rcpd token file {} must hold one token of visible ASCII (bare, or \
+             {TOKEN_ENV}=<token>)",
+            path.display()
+        ));
+    }
+    Ok(token.to_string())
+}
+
+/// Check `link` at daemon startup: a loopback rcpd address, and a private
+/// token file ([`ensure_token_file`]).
+///
+/// # Errors
+///
+/// The reason the daemon refuses to start.
+pub fn prepare(link: &RcpLink) -> Result<(), String> {
+    if !link.addr.ip().is_loopback() {
+        return Err(format!(
+            "--rcp-addr {} is not a loopback address; the rcp plane sends the rcpd token \
+             in cleartext HTTP, so rcpd must listen on loopback",
+            link.addr
+        ));
+    }
+    ensure_token_file(&link.token_file)
+}
+
+/// Make sure the token file at `path` exists and is private: create it when
+/// absent (one `CERULION_RCP_TOKEN=<64 hex>` line from 32 random bytes,
+/// created exclusively, mode 0600 on unix, synced), and refuse an existing file
+/// that is not a regular file or, on unix, is readable or writable by its group
+/// or others.
+///
+/// # Errors
+///
+/// A reason naming the file.
+pub fn ensure_token_file(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => return check_token_file(path, &meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("rcpd token file {}: {e}", path.display())),
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| format!("rcpd token file {}: no randomness: {e}", path.display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let created = options.open(path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(format!("{TOKEN_ENV}={}\n", hex::encode(seed)).as_bytes())?;
+        file.sync_all()
+    });
+    match created {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "cerulion_remoted: created the rcpd token file");
+            Ok(())
+        }
+        // Another process created it first: check what is there.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(path)
+                .map_err(|e| format!("rcpd token file {}: {e}", path.display()))?;
+            check_token_file(path, &meta)
+        }
+        Err(e) => Err(format!(
+            "rcpd token file {}: cannot create: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn check_token_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "rcpd token file {} is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "rcpd token file {} has mode {mode:o}; it must be private to its owner \
+                 (chmod 600)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The token file's name in the daemon's state directory.
+pub const RCP_TOKEN_FILENAME: &str = "rcp.token";
+
+/// Where the robot's rcpd listens and where its token lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcpLink {
+    /// rcpd's `--http` address (loopback).
+    pub addr: SocketAddr,
+    /// The robot-local token file.
+    pub token_file: PathBuf,
+    /// The plane's bounds and timers.
+    pub limits: RcpLimits,
+}
+
+impl RcpLink {
+    /// The default link for the daemon state directory `dir`:
+    /// [`DEFAULT_RCPD_ADDR`] and `dir/`[`RCP_TOKEN_FILENAME`].
+    pub fn under(dir: &Path) -> Self {
+        Self {
+            addr: DEFAULT_RCPD_ADDR,
+            token_file: dir.join(RCP_TOKEN_FILENAME),
+            limits: RcpLimits::default(),
+        }
+    }
+}
+
+/// The daemon's rcp flags.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct RcpFlags {
+    /// The local cerulion-rcpd `--http` address the rcp plane forwards to.
+    /// Default: 127.0.0.1:7801.
+    #[arg(long, value_name = "ADDR")]
+    pub rcp_addr: Option<SocketAddr>,
+
+    /// Override the file holding the local cerulion-rcpd bearer token.
+    /// Default: `<state-root>/remoted/rcp.token`.
+    #[arg(long, value_name = "PATH")]
+    pub rcp_token_file: Option<PathBuf>,
+
+    /// Concurrent rcp sessions per connection. Default: 4.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub rcp_sessions_per_connection: Option<u32>,
+
+    /// Concurrent rcp connections per desk key. Default: 4.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub rcp_connections_per_key: Option<u32>,
+
+    /// Concurrent resource and tool requests per rcp session. Default: 8.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub rcp_in_flight: Option<u32>,
+
+    /// Concurrent e-stop calls per rcp session. Default: 2.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub rcp_estops_in_flight: Option<u32>,
+
+    /// Bytes queued for the desk per rcp session. Default: 33554432.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(16_777_216..))]
+    pub rcp_session_buffer_bytes: Option<u32>,
+
+    /// How often an idle rcp session re-checks access, milliseconds (at most
+    /// 60000). Default: 5000.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..=60_000))]
+    pub rcp_revoke_check_ms: Option<u64>,
+
+    /// How long rcpd may take to send a response head, milliseconds. Default: 30000.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub rcp_head_timeout_ms: Option<u64>,
+
+    /// How long forwarded requests may answer after the desk closes its
+    /// stream, milliseconds. Default: 30000.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(0..))]
+    pub rcp_drain_ms: Option<u64>,
+}
+
+impl RcpFlags {
+    /// Apply the flags given over `link`.
+    pub fn apply(self, link: &mut RcpLink) {
+        if let Some(a) = self.rcp_addr {
+            link.addr = a;
+        }
+        if let Some(p) = self.rcp_token_file {
+            link.token_file = p;
+        }
+        let l = &mut link.limits;
+        let count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+        if let Some(n) = self.rcp_sessions_per_connection {
+            l.sessions_per_connection = count(n);
+        }
+        if let Some(n) = self.rcp_connections_per_key {
+            l.connections_per_key = count(n);
+        }
+        if let Some(n) = self.rcp_in_flight {
+            l.in_flight = count(n);
+        }
+        if let Some(n) = self.rcp_estops_in_flight {
+            l.estops_in_flight = count(n);
+        }
+        if let Some(n) = self.rcp_session_buffer_bytes {
+            l.session_buffer_bytes = count(n);
+        }
+        if let Some(ms) = self.rcp_revoke_check_ms {
+            l.revoke_check = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.rcp_head_timeout_ms {
+            l.head_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.rcp_drain_ms {
+            l.drain = Duration::from_millis(ms);
+        }
+    }
+}
+
+/// The rcp plane's serving context.
+#[derive(Debug)]
+pub struct RcpPlane {
+    link: RcpLink,
+    shared: SharedTrust,
+    connections: Mutex<HashMap<[u8; 32], Vec<LiveConnection>>>,
+    next_connection: std::sync::atomic::AtomicU64,
+}
+
+/// One admitted rcp connection, as the per-key table holds it.
+#[derive(Debug)]
+struct LiveConnection {
+    id: u64,
+    since: std::time::Instant,
+    connection: Connection,
+}
+
+impl RcpPlane {
+    /// A plane forwarding to `link`, authorizing against `shared` (the same
+    /// live handle the accept gate reads).
+    pub fn new(link: RcpLink, shared: SharedTrust) -> Self {
+        Self {
+            link,
+            shared,
+            connections: Mutex::new(HashMap::new()),
+            next_connection: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The rcpd link.
+    pub fn link(&self) -> &RcpLink {
+        &self.link
+    }
+
+    /// Admit `connection` for `key`. At [`RcpLimits::connections_per_key`]
+    /// the key's oldest connection is closed with [`CLOSE_SUPERSEDED`]: the
+    /// same key is the same device, so a reconnect after a crash (whose old
+    /// connection the robot only drops at the QUIC idle timeout) is admitted
+    /// at once.
+    fn admit_connection(
+        self: &Arc<Self>,
+        key: [u8; 32],
+        connection: &Connection,
+    ) -> ConnectionSlot {
+        let id = self
+            .next_connection
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut map = self
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let live = map.entry(key).or_default();
+        while live.len() >= self.link.limits.connections_per_key.max(1) {
+            let oldest = live.remove(0);
+            tracing::warn!(
+                key = %hex::encode(&key[..8]),
+                age_ms = oldest.since.elapsed().as_millis() as u64,
+                "cerulion_remoted: rcp connection superseded by a newer one from the same key"
+            );
+            oldest.connection.close(
+                CLOSE_SUPERSEDED.into(),
+                b"superseded by a newer rcp connection from this key",
+            );
+        }
+        live.push(LiveConnection {
+            id,
+            since: std::time::Instant::now(),
+            connection: connection.clone(),
+        });
+        ConnectionSlot {
+            plane: self.clone(),
+            key,
+            id,
+        }
+    }
+}
+
+/// One admitted connection; removed from the per-key table on drop.
+struct ConnectionSlot {
+    plane: Arc<RcpPlane>,
+    key: [u8; 32],
+    id: u64,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut map = self
+            .plane
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = map.get_mut(&self.key) {
+            live.retain(|c| c.id != self.id);
+            if live.is_empty() {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Serve one admitted rcp connection from `device_key` until it closes: each
+/// bidi stream is one session, at most [`RcpLimits::sessions_per_connection`]
+/// at once; past [`RcpLimits::connections_per_key`] a key's oldest connection
+/// is closed in favour of this one.
+pub async fn serve_rcp_connection(
+    connection: Connection,
+    device_key: [u8; 32],
+    plane: Arc<RcpPlane>,
+) {
+    let _slot = plane.admit_connection(device_key, &connection);
+    let slots = Arc::new(Semaphore::new(plane.link.limits.sessions_per_connection));
+    let mut sessions = JoinSet::new();
+    loop {
+        while sessions.try_join_next().is_some() {}
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            break;
+        };
+        let (send, recv) = match accept_frame_stream(&connection).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, "cerulion_remoted: rcp connection ended");
+                break;
+            }
+        };
+        let plane = plane.clone();
+        let conn = connection.clone();
+        sessions.spawn(async move {
+            serve_session(send, recv, conn, device_key, plane).await;
+            drop(permit);
+        });
+    }
+    sessions.shutdown().await;
+}
+
+/// Per-session state shared by the request tasks.
+struct Upstream {
+    addr: SocketAddr,
+    head_timeout: Duration,
+    token: String,
+    caller: String,
+    session_id: Mutex<Option<String>>,
+    protocol: Mutex<Option<String>>,
+}
+
+impl Upstream {
+    fn session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn protocol(&self) -> Option<String> {
+        self.protocol
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn request(&self, method: Method, accept: &'static str) -> hyper::http::request::Builder {
+        let mut b = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header(HOST, self.addr.to_string())
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(ACCEPT, accept)
+            .header(CALLER_HEADER, &self.caller);
+        if let Some(id) = self.session_id() {
+            b = b.header("mcp-session-id", id);
+        }
+        if let Some(v) = self.protocol() {
+            b = b.header("mcp-protocol-version", v);
+        }
+        b
+    }
+}
+
+/// One frame queued for the desk: the class whose requirement it must still
+/// meet when written, and its share of the session's byte budget.
+struct Outbound {
+    class: RcpClass,
+    frame: Vec<u8>,
+    _budget: OwnedSemaphorePermit,
+}
+
+/// The sending half of a session's outbound queue, bounded by
+/// [`RcpLimits::session_buffer_bytes`].
+#[derive(Clone)]
+struct Outlet {
+    tx: mpsc::Sender<Outbound>,
+    budget: Arc<Semaphore>,
+    /// The budget's size: no one frame takes more.
+    capacity: usize,
+}
+
+impl Outlet {
+    /// Queue `frame`; `false` once the writer has stopped.
+    async fn send(&self, class: RcpClass, frame: Vec<u8>) -> bool {
+        let bytes = u32::try_from(frame.len().clamp(1, self.capacity)).unwrap_or(u32::MAX);
+        let Ok(permit) = self.budget.clone().acquire_many_owned(bytes).await else {
+            return false;
+        };
+        self.tx
+            .send(Outbound {
+                class,
+                frame,
+                _budget: permit,
+            })
+            .await
+            .is_ok()
+    }
+
+    async fn error(&self, id: Value, code: i64, message: &str) -> bool {
+        self.send(RcpClass::Session, error_frame(id, code, message))
+            .await
+    }
+
+    /// Queue an error frame without waiting; `false` (the frame is dropped)
+    /// when the queue or the byte budget is full or the writer has stopped.
+    fn try_error(&self, id: Value, code: i64, message: &str) -> bool {
+        let frame = error_frame(id, code, message);
+        let bytes = u32::try_from(frame.len().clamp(1, self.capacity)).unwrap_or(u32::MAX);
+        let Ok(permit) = self.budget.clone().try_acquire_many_owned(bytes) else {
+            return false;
+        };
+        self.tx
+            .try_send(Outbound {
+                class: RcpClass::Session,
+                frame,
+                _budget: permit,
+            })
+            .is_ok()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+/// The id of a JSON-RPC response frame (`result` or `error`), if it is one.
+fn response_id(frame: &[u8]) -> Option<Value> {
+    let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(frame) else {
+        return None;
+    };
+    if obj.contains_key("result") || obj.contains_key("error") {
+        obj.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+async fn serve_session(
+    mut send: SendStream,
+    mut recv: cerulion_link::RecvStream,
+    connection: Connection,
+    device_key: [u8; 32],
+    plane: Arc<RcpPlane>,
+) {
+    let limits = plane.link.limits;
+    let caller = caller_identity(&device_key, plane.shared.account_for_key(&device_key));
+    let upstream = load_token(&plane.link.token_file).map(|token| {
+        Arc::new(Upstream {
+            addr: plane.link.addr,
+            head_timeout: limits.head_timeout,
+            token,
+            caller: caller.clone(),
+            session_id: Mutex::new(None),
+            protocol: Mutex::new(None),
+        })
+    });
+    if let Err(reason) = &upstream {
+        tracing::warn!(%reason, "cerulion_remoted: rcp session cannot reach rcpd");
+    }
+    let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
+    let out = Outlet {
+        tx: out_tx,
+        budget: Arc::new(Semaphore::new(limits.session_buffer_bytes)),
+        capacity: limits.session_buffer_bytes,
+    };
+
+    // The writer: each frame must still meet the requirement of the class that
+    // produced it; the session floor is also re-checked on a timer, and a key
+    // that fails it has its whole connection closed.
+    let shared = plane.shared.clone();
+    let writer_conn = connection.clone();
+    let writer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(limits.revoke_check);
+        let end = |reason: String| {
+            tracing::warn!(%reason, "cerulion_remoted: rcp session ended by the live trust state");
+            writer_conn.close(CLOSE_REVOKED.into(), b"rcp access revoked");
+        };
+        loop {
+            tokio::select! {
+                next = out_rx.recv() => {
+                    let Some(item) = next else { break };
+                    if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
+                        end(reason);
+                        break;
+                    }
+                    let frame = match authorize_key(&shared, &device_key, Some(item.class)) {
+                        Ok(()) => item.frame,
+                        // The scope no longer meets the class: a response is
+                        // answered with a denial, anything else is dropped.
+                        Err(reason) => match response_id(&item.frame) {
+                            Some(id) => error_frame(
+                                id,
+                                DENIED_CODE,
+                                &format!(
+                                    "result withheld: {reason}; rcpd may already have acted on \
+                                     this request"
+                                ),
+                            ),
+                            None => continue,
+                        },
+                    };
+                    if write_frame(&mut send, &frame).await.is_err() {
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
+                        end(reason);
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = send.finish();
+    });
+
+    let in_flight = Arc::new(Semaphore::new(limits.in_flight));
+    let estops = Arc::new(Semaphore::new(limits.estops_in_flight));
+    let mut tasks = JoinSet::new();
+    let mut streams = JoinSet::new();
+    let mut initialized = false;
+    let mut initialize_seen = false;
+    loop {
+        // Finished tasks are reaped as the session goes, not at its end.
+        while tasks.try_join_next().is_some() {}
+        while streams.try_join_next().is_some() {}
+        let frame = match read_frame(&mut recv, MAX_REQUEST_FRAME).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(error = %e, "cerulion_remoted: rcp session closed by the desk");
+                break;
+            }
+        };
+        if out.is_closed() {
+            break;
+        }
+        let message = match classify_message(&frame) {
+            Ok(m) => m,
+            Err(refusal) => {
+                tracing::info!(reason = %refusal.reason, %caller, "cerulion_remoted: rcp message refused");
+                if let Some(id) = refusal.reply_id {
+                    let reason = format!("refused: {}", refusal.reason);
+                    out.try_error(id, INVALID_REQUEST_CODE, &reason);
+                }
+                continue;
+            }
+        };
+        if let Err(reason) = authorize_key(&plane.shared, &device_key, Some(message.class)) {
+            tracing::info!(method = %message.method, %reason, %caller, "cerulion_remoted: rcp message denied");
+            if let Some(id) = message.id {
+                let text = format!("denied: {} needs more access: {reason}", message.method);
+                out.try_error(id, DENIED_CODE, &text);
+            }
+            continue;
+        }
+        let upstream = match &upstream {
+            Ok(u) => u.clone(),
+            Err(_) => {
+                if let Some(id) = message.id {
+                    out.try_error(id, UPSTREAM_CODE, "rcpd is not reachable on this robot");
+                }
+                continue;
+            }
+        };
+        // One handshake per stream.
+        let repeat = match message.method.as_str() {
+            "initialize" => std::mem::replace(&mut initialize_seen, true),
+            "notifications/initialized" => std::mem::replace(&mut initialized, true),
+            _ => false,
+        };
+        if repeat {
+            if let Some(id) = message.id {
+                out.try_error(
+                    id,
+                    INVALID_REQUEST_CODE,
+                    "refused: one initialize per rcp stream",
+                );
+            }
+            continue;
+        }
+        match message.class {
+            // The e-stop takes no Observe/Act slot and never waits: it has its
+            // own small bound, past which it is answered at once.
+            RcpClass::Estop => {
+                let Ok(permit) = estops.clone().try_acquire_owned() else {
+                    if let Some(id) = message.id {
+                        out.try_error(
+                            id,
+                            UPSTREAM_CODE,
+                            "refused: an e-stop is already in flight on this rcp stream",
+                        );
+                    }
+                    continue;
+                };
+                tasks.spawn(forward_and_relay(
+                    upstream,
+                    message,
+                    out.clone(),
+                    Some(permit),
+                ));
+            }
+            // Lifecycle messages keep their order: the response head (and the
+            // body of `initialize`) is in before the next desk message; any
+            // other body is relayed by a task.
+            RcpClass::Session => {
+                // A lifecycle body relayed by a task holds an in-flight slot
+                // like a request does, so a desk that stops reading cannot
+                // grow the task set.
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    if let Some(id) = message.id {
+                        out.try_error(
+                            id,
+                            UPSTREAM_CODE,
+                            "refused: too many requests in flight on this rcp stream",
+                        );
+                    }
+                    continue;
+                };
+                let is_initialized = message.method == "notifications/initialized";
+                if let Some(body) = forward(upstream.clone(), message, out.clone(), true).await {
+                    tasks.spawn(async move {
+                        body.await;
+                        drop(permit);
+                    });
+                }
+                if is_initialized && upstream.session_id().is_some() {
+                    streams.spawn(standalone_stream(upstream, out.clone()));
+                }
+            }
+            RcpClass::Observe | RcpClass::Act => {
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    if let Some(id) = message.id {
+                        out.try_error(
+                            id,
+                            UPSTREAM_CODE,
+                            "refused: too many requests in flight on this rcp stream",
+                        );
+                    }
+                    continue;
+                };
+                tasks.spawn(forward_and_relay(
+                    upstream,
+                    message,
+                    out.clone(),
+                    Some(permit),
+                ));
+            }
+        }
+    }
+    // The desk sent its last message: requests already forwarded may still
+    // answer, within the drain bound; the standalone stream never ends by itself.
+    streams.shutdown().await;
+    let drained = tokio::time::timeout(limits.drain, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tasks.shutdown().await;
+    }
+    if let Ok(u) = &upstream {
+        if u.session_id().is_some() {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, delete_session(u)).await;
+        }
+    }
+    drop(out);
+    let _ = writer.await;
+}
+
+async fn forward_and_relay(
+    upstream: Arc<Upstream>,
+    message: RcpMessage,
+    out: Outlet,
+    permit: Option<OwnedSemaphorePermit>,
+) {
+    if let Some(body) = forward(upstream, message, out, false).await {
+        body.await;
+    }
+    drop(permit);
+}
+
+/// Open a fresh loopback HTTP/1 connection to rcpd.
+async fn connect<B>(addr: SocketAddr) -> Result<hyper::client::conn::http1::SendRequest<B>, String>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("rcpd at {addr} did not accept within {CONNECT_TIMEOUT:?}"))?
+        .map_err(|e| format!("rcpd at {addr}: {e}"))?;
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| format!("rcpd at {addr}: {e}"))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(sender)
+}
+
+/// POST one admitted message to rcpd. Waits for the response head, within
+/// [`RcpLimits::head_timeout`], so a session id rcpd issues is recorded before the next
+/// desk message is forwarded, and returns the task that relays the body, if
+/// any. For `initialize` the body is relayed before returning, so the
+/// protocol version it carries is recorded too. `inline` is true on the
+/// session reader, whose failure replies never wait for queue space (they are
+/// dropped when it is full); a spawned task waits for it.
+async fn forward(
+    upstream: Arc<Upstream>,
+    message: RcpMessage,
+    out: Outlet,
+    inline: bool,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let id = message.id.clone();
+    let fail = |reason: String| {
+        let out = out.clone();
+        let id = id.clone();
+        async move {
+            tracing::warn!(%reason, "cerulion_remoted: rcp request to rcpd failed");
+            if let Some(id) = id {
+                if inline {
+                    out.try_error(id, UPSTREAM_CODE, "rcpd did not answer this request");
+                } else {
+                    out.error(id, UPSTREAM_CODE, "rcpd did not answer this request")
+                        .await;
+                }
+            }
+        }
+    };
+    let request = upstream
+        .request(Method::POST, "application/json, text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(message.canonical)));
+    let request = match request {
+        Ok(r) => r,
+        Err(e) => {
+            fail(format!("cannot build the rcpd request: {e}")).await;
+            return None;
+        }
+    };
+    let head = async {
+        let mut sender = connect::<Full<Bytes>>(upstream.addr).await?;
+        sender
+            .send_request(request)
+            .await
+            .map_err(|e| format!("rcpd request failed: {e}"))
+    };
+    let response = match tokio::time::timeout(upstream.head_timeout, head).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(reason)) => {
+            fail(reason).await;
+            return None;
+        }
+        Err(_) => {
+            fail(format!(
+                "rcpd sent no response head within {:?}",
+                upstream.head_timeout
+            ))
+            .await;
+            return None;
+        }
+    };
+    let is_initialize = message.method == "initialize";
+    if is_initialize {
+        if let Some(sid) = header_text(&response, "mcp-session-id") {
+            *upstream
+                .session_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(sid);
+        }
+    }
+    let status = response.status();
+    if status == StatusCode::ACCEPTED {
+        return None;
+    }
+    if !status.is_success() {
+        fail(format!("rcpd answered HTTP {status}")).await;
+        return None;
+    }
+    let head_timeout = upstream.head_timeout;
+    let relay = relay_body(response, upstream, id, is_initialize, message.class, out);
+    if is_initialize {
+        if tokio::time::timeout(head_timeout, relay).await.is_err() {
+            tracing::warn!("cerulion_remoted: rcpd's initialize result did not finish in time");
+        }
+        return None;
+    }
+    Some(relay)
+}
+
+fn header_text(response: &Response<Incoming>, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v: &HeaderValue| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Relay a response body's JSON-RPC messages to the desk, each under `class`.
+/// Records the protocol version from the initialize result before relaying
+/// it. A body that fails or outgrows the relay bound answers `request_id`
+/// with an error.
+async fn relay_body(
+    response: Response<Incoming>,
+    upstream: Arc<Upstream>,
+    request_id: Option<Value>,
+    is_initialize: bool,
+    class: RcpClass,
+    out: Outlet,
+) {
+    let sse = header_text(&response, CONTENT_TYPE.as_str())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    let mut body = response.into_body();
+    let mut events = SseBuffer::default();
+    let mut whole: Vec<u8> = Vec::new();
+    let failed = loop {
+        let Some(next) = body.frame().await else {
+            break false;
+        };
+        let Ok(frame) = next else {
+            break true;
+        };
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if sse {
+            let Ok(messages) = events.push(&chunk) else {
+                tracing::warn!("cerulion_remoted: rcpd event exceeded the relay bound");
+                break true;
+            };
+            for m in messages {
+                if is_initialize {
+                    record_protocol(&upstream, request_id.as_ref(), &m);
+                }
+                if !out.send(class, m).await {
+                    return;
+                }
+            }
+        } else {
+            if whole.len() + chunk.len() > MAX_RESPONSE_MESSAGE {
+                tracing::warn!("cerulion_remoted: rcpd response exceeded the relay bound");
+                break true;
+            }
+            whole.extend_from_slice(&chunk);
+        }
+    };
+    if failed {
+        if let Some(id) = request_id {
+            out.error(
+                id,
+                UPSTREAM_CODE,
+                "rcpd's answer to this request was cut off",
+            )
+            .await;
+        }
+        return;
+    }
+    if !sse && !whole.is_empty() {
+        if is_initialize {
+            record_protocol(&upstream, request_id.as_ref(), &whole);
+        }
+        out.send(class, whole).await;
+    }
+}
+
+fn record_protocol(upstream: &Upstream, initialize_id: Option<&Value>, message: &[u8]) {
+    let Some(init_id) = initialize_id else {
+        return;
+    };
+    if let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(message) {
+        if obj.get("id") == Some(init_id) {
+            if let Some(v) = protocol_version(&obj) {
+                *upstream
+                    .protocol
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(v);
+            }
+        }
+    }
+}
+
+fn protocol_version(obj: &Map<String, Value>) -> Option<String> {
+    obj.get("result")?
+        .get("protocolVersion")?
+        .as_str()
+        .filter(|v| !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_string)
+}
+
+/// rcpd's standalone `GET` event stream, relayed as Observe until it ends.
+async fn standalone_stream(upstream: Arc<Upstream>, out: Outlet) {
+    let Ok(request) = upstream
+        .request(Method::GET, "text/event-stream")
+        .body(Empty::<Bytes>::new())
+    else {
+        return;
+    };
+    let head = async {
+        let mut sender = connect::<Empty<Bytes>>(upstream.addr).await?;
+        sender
+            .send_request(request)
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let Ok(Ok(response)) = tokio::time::timeout(upstream.head_timeout, head).await else {
+        return;
+    };
+    if response.status() != StatusCode::OK {
+        tracing::debug!(status = %response.status(), "cerulion_remoted: rcpd serves no standalone stream");
+        return;
+    }
+    relay_body(response, upstream, None, false, RcpClass::Observe, out).await;
+}
+
+async fn delete_session(upstream: &Upstream) {
+    let Ok(mut sender) = connect::<Empty<Bytes>>(upstream.addr).await else {
+        return;
+    };
+    if let Ok(request) = upstream
+        .request(Method::DELETE, "application/json")
+        .body(Empty::<Bytes>::new())
+    {
+        let _ = sender.send_request(request).await;
+    }
+}
+
+/// An incremental `text/event-stream` parser yielding each event's `data`.
+#[derive(Debug, Default)]
+pub struct SseBuffer {
+    pending: Vec<u8>,
+    /// How far `pending` is known to hold no event boundary.
+    scanned: usize,
+}
+
+impl SseBuffer {
+    /// Feed `chunk`; return the `data` of every event it completes, in order.
+    /// Events with no `data` (priming events, comments) yield nothing.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` when an unfinished event grows past [`MAX_RESPONSE_MESSAGE`].
+    #[allow(clippy::result_unit_err)]
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        self.pending
+            .extend(chunk.iter().copied().filter(|&b| b != b'\r'));
+        let mut out = Vec::new();
+        loop {
+            let from = self.scanned.saturating_sub(1);
+            let Some(at) = self.pending[from..].windows(2).position(|w| w == b"\n\n") else {
+                self.scanned = self.pending.len();
+                break;
+            };
+            let end = from + at;
+            let event: Vec<u8> = self.pending.drain(..end + 2).collect();
+            self.scanned = 0;
+            let mut data: Vec<u8> = Vec::new();
+            let mut any = false;
+            for line in event.split(|&b| b == b'\n') {
+                if let Some(rest) = line.strip_prefix(b"data:") {
+                    let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+                    if any {
+                        data.push(b'\n');
+                    }
+                    data.extend_from_slice(rest);
+                    any = true;
+                }
+            }
+            if any && !data.iter().all(u8::is_ascii_whitespace) {
+                out.push(data);
+            }
+        }
+        if self.pending.len() > MAX_RESPONSE_MESSAGE {
+            return Err(());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn class_of(text: &str) -> Result<RcpClass, RcpRefusal> {
+        classify_message(text.as_bytes()).map(|m| m.class)
+    }
+
+    #[test]
+    fn requirement_table_is_the_ruled_policy() {
+        // Hand oracle: the founder's ruling (no new cap bit).
+        assert_eq!(
+            requirement(RcpClass::Act),
+            RcpRequirement {
+                required_caps: 0b0010,
+                max_role: Role(2)
+            }
+        );
+        assert_eq!(
+            requirement(RcpClass::Observe),
+            RcpRequirement {
+                required_caps: 0b0100,
+                max_role: Role(3)
+            }
+        );
+        assert_eq!(
+            requirement(RcpClass::Session),
+            RcpRequirement {
+                required_caps: 0,
+                max_role: Role(u16::MAX)
+            }
+        );
+        assert_eq!(
+            requirement(RcpClass::Estop),
+            RcpRequirement {
+                required_caps: 0,
+                max_role: Role(u16::MAX)
+            }
+        );
+    }
+
+    #[test]
+    fn scope_meets_checks_caps_and_role_independently() {
+        let s = |role: u16, caps: u64| Scope {
+            role: Role(role),
+            caps,
+        };
+        // Act: TELEOP and OPERATOR-or-better.
+        assert!(scope_meets(s(2, 0b0010), RcpClass::Act));
+        assert!(scope_meets(s(1, 0b1111), RcpClass::Act));
+        assert!(!scope_meets(s(3, 0b1111), RcpClass::Act), "viewer role");
+        assert!(!scope_meets(s(2, 0b1101), RcpClass::Act), "no teleop");
+        // Observe: OBSERVE and VIEWER-or-better.
+        assert!(scope_meets(s(3, 0b0100), RcpClass::Observe));
+        assert!(!scope_meets(s(3, 0b1011), RcpClass::Observe), "no observe");
+        assert!(
+            !scope_meets(s(4, 0b0100), RcpClass::Observe),
+            "role past viewer"
+        );
+        // Session: any role up to VIEWER, no caps.
+        assert!(scope_meets(s(3, 0), RcpClass::Session));
+        assert!(
+            scope_meets(s(u16::MAX, 0), RcpClass::Session),
+            "any allowed row"
+        );
+        // Estop: any scope at all.
+        assert!(scope_meets(s(3, 0), RcpClass::Estop));
+        assert!(scope_meets(s(u16::MAX, 0), RcpClass::Estop));
+    }
+
+    #[test]
+    fn methods_classify_by_the_table() {
+        let req = |m: &str| format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{m}","params":{{}}}}"#);
+        for m in ["initialize", "ping"] {
+            assert_eq!(class_of(&req(m)), Ok(RcpClass::Session), "{m}");
+        }
+        for m in [
+            "resources/list",
+            "resources/read",
+            "resources/templates/list",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "subscriptions/listen",
+            "tools/list",
+        ] {
+            assert_eq!(class_of(&req(m)), Ok(RcpClass::Observe), "{m}");
+        }
+        assert_eq!(
+            class_of(r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"x"}}"#),
+            Ok(RcpClass::Act)
+        );
+        assert_eq!(
+            class_of(
+                r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"estop"}}"#
+            ),
+            Ok(RcpClass::Estop)
+        );
+        for near in ["Estop", "estop ", "estop.x", "e-stop"] {
+            let m = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{near}"}}}}"#
+            );
+            assert_eq!(
+                class_of(&m),
+                Ok(RcpClass::Act),
+                "{near:?} is an ordinary tool"
+            );
+        }
+        for m in ["notifications/initialized", "notifications/cancelled"] {
+            let n = format!(r#"{{"jsonrpc":"2.0","method":"{m}"}}"#);
+            assert_eq!(class_of(&n), Ok(RcpClass::Session), "{m}");
+        }
+        for m in [
+            "prompts/list",
+            "completion/complete",
+            "logging/setLevel",
+            "tools/Call",
+            "resources/",
+            "",
+        ] {
+            assert!(class_of(&req(m)).is_err(), "{m} must be refused");
+        }
+    }
+
+    #[test]
+    fn strict_parse_refuses_every_malformed_shape() {
+        let cases: &[(&str, Option<Value>)] = &[
+            ("not json", Some(Value::Null)),
+            ("[]", Some(Value::Null)),
+            (
+                r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+                Some(Value::Null),
+            ),
+            (r#""ping""#, Some(Value::Null)),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+                Some(Value::Null),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
+                Some(Value::Null),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#,
+                Some(Value::Null),
+            ),
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+                Some(json!(1)),
+            ),
+            (r#"{"id":1,"method":"ping"}"#, Some(json!(1))),
+            (r#"{"jsonrpc":"2.0","id":1,"method":7}"#, Some(json!(1))),
+            (r#"{"jsonrpc":"2.0","id":1}"#, Some(json!(1))),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}"#,
+                Some(json!(1)),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","extra":1}"#,
+                Some(json!(1)),
+            ),
+            (r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, Some(json!(1))),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#,
+                Some(json!(1)),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":3}}"#,
+                Some(json!(1)),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+                Some(json!(1)),
+            ),
+            // A request method sent as a notification, and the reverse.
+            (
+                r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"x"}}"#,
+                None,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":2,"method":"notifications/initialized"}"#,
+                Some(json!(2)),
+            ),
+        ];
+        for (text, reply) in cases {
+            let refusal = classify_message(text.as_bytes()).expect_err(text);
+            assert_eq!(&refusal.reply_id, reply, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_method_key_forwards_only_what_was_classified() {
+        // serde_json keeps the last duplicate; the canonical form carries only it.
+        let m = classify_message(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"resources/list"}"#,
+        )
+        .expect("classified");
+        assert_eq!(m.class, RcpClass::Observe);
+        let fwd: Value = serde_json::from_slice(&m.canonical).expect("json");
+        assert_eq!(fwd["method"], json!("resources/list"));
+        assert_eq!(
+            String::from_utf8(m.canonical)
+                .unwrap()
+                .matches("method")
+                .count(),
+            1
+        );
+    }
+
+    fn row(role: u16, caps: u64) -> AccessRow {
+        AccessRow {
+            account: AccountId([3; 32]),
+            device: None,
+            scope: Scope {
+                role: Role(role),
+                caps,
+            },
+            principal_kind: cerulion_pairing::format::PrincipalKind::Human,
+            source: cerulion_pairing::verify::PairingSource::StrongChain,
+            name: None,
+            added_at_ns: 0,
+            expires_at_ns: None,
+            revoked: false,
+        }
+    }
+
+    fn allowed(r: &AccessRow) -> KeyAccess {
+        KeyAccess::Allowed(r.scope)
+    }
+
+    #[test]
+    fn the_accept_gate_requires_claimed_and_an_allowing_row() {
+        let r = row(3, 0);
+        assert_eq!(rcp_authorize(true, allowed(&r), Some(&r), None), Ok(()));
+        assert!(rcp_authorize(false, allowed(&r), Some(&r), None).is_err());
+        assert!(rcp_authorize(true, allowed(&r), None, None).is_err());
+        for a in [
+            KeyAccess::Unpaired,
+            KeyAccess::NotAllowed,
+            KeyAccess::DeviceRevoked,
+        ] {
+            assert!(rcp_authorize(true, a, None, None).is_err(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_cloud_refusal_wins_over_every_other_check() {
+        for claimed in [true, false] {
+            for class in [
+                None,
+                Some(RcpClass::Session),
+                Some(RcpClass::Estop),
+                Some(RcpClass::Observe),
+                Some(RcpClass::Act),
+            ] {
+                let err = rcp_authorize(claimed, KeyAccess::CloudRefused, None, class)
+                    .expect_err("a cloud refusal admits nothing");
+                assert!(
+                    err.contains("allow-from-cloud switch is off"),
+                    "{claimed} {class:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_needs_the_gate_and_its_class() {
+        // (claimed, row role, row caps, class, admitted): hand oracle.
+        let cases = [
+            (true, 2, 0b0110, RcpClass::Act, true),
+            (true, 2, 0b0110, RcpClass::Observe, true),
+            (true, 3, 0b0110, RcpClass::Act, false),
+            (true, 2, 0b0100, RcpClass::Act, false),
+            (true, 3, 0b0100, RcpClass::Observe, true),
+            (true, 3, 0b0000, RcpClass::Observe, false),
+            (true, 3, 0b0000, RcpClass::Session, true),
+            (false, 1, 0b1111, RcpClass::Session, false),
+            (true, 3, 0b0000, RcpClass::Estop, true),
+            (false, 1, 0b1111, RcpClass::Estop, false),
+        ];
+        for (claimed, role, caps, class, admitted) in cases {
+            let r = row(role, caps);
+            assert_eq!(
+                rcp_authorize(claimed, allowed(&r), Some(&r), Some(class)).is_ok(),
+                admitted,
+                "{claimed} role {role} caps {caps:#b} {class:?}"
+            );
+        }
+        for a in [
+            KeyAccess::Unpaired,
+            KeyAccess::NotAllowed,
+            KeyAccess::DeviceRevoked,
+        ] {
+            assert!(rcp_authorize(true, a, None, Some(RcpClass::Session)).is_err());
+        }
+    }
+
+    #[test]
+    fn sse_buffer_yields_data_across_chunk_boundaries() {
+        let mut b = SseBuffer::default();
+        assert_eq!(
+            b.push(b"id: 0\nretry: 3000\ndata:\n\n").unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(b.push(b"data: {\"a\"").unwrap(), Vec::<Vec<u8>>::new());
+        assert_eq!(
+            b.push(b":1}\r\n\r\n: ping\n\ndata: x\ndata: y\n\n")
+                .unwrap(),
+            vec![b"{\"a\":1}".to_vec(), b"x\ny".to_vec()]
+        );
+    }
+
+    #[test]
+    fn token_file_accepts_bare_and_env_forms_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rcp.token");
+        std::fs::write(&p, "abc123\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(load_token(&p).unwrap(), "abc123");
+        std::fs::write(&p, "CERULION_RCP_TOKEN=xyz\n").unwrap();
+        assert_eq!(load_token(&p).unwrap(), "xyz");
+        for bad in ["", "  \n", "a b", "CERULION_RCP_TOKEN=", "t\u{7f}"] {
+            std::fs::write(&p, bad).unwrap();
+            assert!(load_token(&p).is_err(), "{bad:?}");
+        }
+        assert!(load_token(&dir.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn ensure_token_file_creates_once_then_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rcp.token");
+        ensure_token_file(&p).expect("created");
+        let first = std::fs::read_to_string(&p).unwrap();
+        let token = load_token(&p).expect("loads");
+        assert_eq!(first, format!("CERULION_RCP_TOKEN={token}\n"));
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        ensure_token_file(&p).expect("reused");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            first,
+            "never rewritten"
+        );
+        let other = dir.path().join("other.token");
+        ensure_token_file(&other).unwrap();
+        assert_ne!(
+            load_token(&other).unwrap(),
+            token,
+            "each file gets its own token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_token_file_refuses_a_shared_or_odd_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rcp.token");
+        std::fs::write(&p, "CERULION_RCP_TOKEN=abc\n").unwrap();
+        for mode in [0o640, 0o604, 0o620, 0o602, 0o644] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = ensure_token_file(&p).expect_err("shared mode refused");
+            assert!(err.contains("chmod 600"), "{mode:o}: {err}");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            ensure_token_file(&p).is_ok(),
+            "an owner-only file is reused"
+        );
+        let d = dir.path().join("a-dir");
+        std::fs::create_dir(&d).unwrap();
+        assert!(ensure_token_file(&d).is_err());
+        let link = dir.path().join("link.token");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert!(ensure_token_file(&link).is_err(), "a symlink is refused");
+    }
+
+    #[test]
+    fn numbers_that_would_change_on_forwarding_are_refused() {
+        let call = |n: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"a","arguments":{{"q":[{n}]}}}}}}"#
+            )
+        };
+        for ok in [
+            "0",
+            "-1",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "1.5",
+            "9007199254740991.0",
+        ] {
+            assert!(classify_message(call(ok).as_bytes()).is_ok(), "{ok}");
+        }
+        for bad in ["18446744073709551616", "1e300", "-9007199254740992.0"] {
+            assert!(classify_message(call(bad).as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_token_repeats_the_mode_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rcp.token");
+        std::fs::write(&p, "abc\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_token(&p).unwrap(), "abc");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_token(&p).is_err());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert!(load_token(&link).is_err(), "a symlink is refused");
+    }
+
+    #[test]
+    fn prepare_refuses_a_non_loopback_rcpd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut link = RcpLink::under(dir.path());
+        link.addr = "10.0.0.5:7801".parse().unwrap();
+        assert!(prepare(&link).unwrap_err().contains("loopback"));
+        assert!(
+            !link.token_file.exists(),
+            "refused before any file is written"
+        );
+        link.addr = "[::1]:7801".parse().unwrap();
+        assert!(prepare(&link).is_ok());
+        assert!(link.token_file.exists());
+    }
+
+    #[tokio::test]
+    async fn the_outlet_waits_once_the_byte_budget_is_spent() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let out = Outlet {
+            tx,
+            budget: Arc::new(Semaphore::new(10)),
+            capacity: 10,
+        };
+        assert!(out.send(RcpClass::Session, vec![0; 8]).await);
+        let second = out.send(RcpClass::Session, vec![0; 8]);
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the second frame waits for budget"
+        );
+        drop(rx.recv().await.expect("first frame"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn every_limit_flag_overrides_its_default() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            rcp: RcpFlags,
+        }
+        let mut link = RcpLink::under(Path::new("/s"));
+        assert_eq!(link.limits, RcpLimits::default());
+        Cli::try_parse_from([
+            "x",
+            "--rcp-sessions-per-connection",
+            "2",
+            "--rcp-connections-per-key",
+            "3",
+            "--rcp-in-flight",
+            "5",
+            "--rcp-estops-in-flight",
+            "1",
+            "--rcp-session-buffer-bytes",
+            "20000000",
+            "--rcp-revoke-check-ms",
+            "250",
+            "--rcp-head-timeout-ms",
+            "1000",
+            "--rcp-drain-ms",
+            "0",
+        ])
+        .unwrap()
+        .rcp
+        .apply(&mut link);
+        assert_eq!(
+            link.limits,
+            RcpLimits {
+                sessions_per_connection: 2,
+                connections_per_key: 3,
+                in_flight: 5,
+                estops_in_flight: 1,
+                session_buffer_bytes: 20_000_000,
+                revoke_check: Duration::from_millis(250),
+                head_timeout: Duration::from_millis(1000),
+                drain: Duration::ZERO,
+            }
+        );
+        for bad in [
+            &["x", "--rcp-in-flight", "0"][..],
+            &["x", "--rcp-session-buffer-bytes", "1024"],
+            &["x", "--rcp-revoke-check-ms", "0"],
+            &["x", "--rcp-revoke-check-ms", "60001"],
+            &["x", "--rcp-sessions-per-connection", "0"],
+            &["x", "--rcp-connections-per-key", "0"],
+            &["x", "--rcp-estops-in-flight", "0"],
+            &["x", "--rcp-head-timeout-ms", "0"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn caller_identity_names_device_and_account() {
+        assert_eq!(
+            caller_identity(&[0xab; 32], Some(AccountId([0x01; 32]))),
+            format!("iroh:{}/account:{}", "ab".repeat(32), "01".repeat(32))
+        );
+        assert_eq!(
+            caller_identity(&[0xab; 32], None),
+            format!("iroh:{}", "ab".repeat(32))
+        );
+    }
+}

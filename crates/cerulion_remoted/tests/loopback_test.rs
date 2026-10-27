@@ -360,6 +360,8 @@ async fn run_accepts_a_store_bound_to_this_device() {
     drop(ep);
 
     let cfg = write_state(dir.path(), secret, real_id);
+    let token_file = cfg.rcp.token_file.clone();
+    assert!(!token_file.exists());
     // An immediately-ready shutdown: `run` builds the endpoint, passes the
     // binding check, then the accept loop breaks at once → Ok(()).
     let result = bounded("run(match)", run(cfg, async {})).await;
@@ -367,4 +369,25 @@ async fn run_accepts_a_store_bound_to_this_device() {
         result.is_ok(),
         "a matching store must bind + serve then exit cleanly, got {result:?}"
     );
+    // `run` provisioned the rcpd token file the rcp plane reads.
+    let token = cerulion_remoted::rcp::load_token(&token_file).expect("rcp.token written by run");
+    assert_eq!(token.len(), 64);
+}
+
+/// `run` refuses to start over a group- or world-readable rcpd token file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_refuses_a_shared_rcp_token_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let secret = [222u8; 32];
+    let ep = disabled_endpoint(secret).await;
+    let real_id = *ep.id().as_bytes();
+    drop(ep);
+    let cfg = write_state(dir.path(), secret, real_id);
+    std::fs::write(&cfg.rcp.token_file, "CERULION_RCP_TOKEN=abc\n").unwrap();
+    std::fs::set_permissions(&cfg.rcp.token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let result = bounded("run(shared token)", run(cfg, async {})).await;
+    let err = result.expect_err("a shared token file refuses the start");
+    assert!(err.to_string().contains("chmod 600"), "{err}");
 }
