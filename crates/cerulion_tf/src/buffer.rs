@@ -16,7 +16,7 @@ use crate::edge_policy::extrapolate;
 use crate::error::Describe;
 use crate::frame_id::normalize;
 use crate::names::NameTable;
-use crate::{EdgePolicy, FrameId, FrameLabel, TfError, Transform, WriterId};
+use crate::{EdgePolicy, FrameId, FrameLabel, TfError, Transform};
 
 /// The frame capacity of [`TfBufferConfig::default`]: how many distinct
 /// frame ids the buffer holds.
@@ -124,8 +124,6 @@ struct Sample {
 struct Frame {
     /// Index of the parent frame; `None` for a root.
     parent: Option<usize>,
-    /// The first writer that fed the edge; `None` before any insert.
-    writer: Option<WriterId>,
     /// The edge came in through `insert_static`: `static_transform` holds
     /// at every time and `samples` is empty.
     is_static: bool,
@@ -136,7 +134,6 @@ struct Frame {
     samples: VecDeque<Sample>,
     overflows: u64,
     static_refusals: u64,
-    second_writer_refusals: u64,
     window_refusals: u64,
     jump_refusals: u64,
     /// The stamp of the last insert refused as [`TfError::StampTooFarAhead`]
@@ -166,8 +163,6 @@ pub struct EdgeInfo<'a> {
     pub is_static: bool,
     /// The edge's policy past its newest sample.
     pub policy: EdgePolicy,
-    /// The writer that feeds the edge; `None` before its first insert.
-    pub writer: Option<WriterId>,
     /// Samples on the ring (always 0 for a static edge).
     pub samples: usize,
     /// The oldest buffered stamp, in nanoseconds; `None` when the ring is
@@ -184,9 +179,6 @@ pub struct EdgeInfo<'a> {
     /// Every dynamic insert refused on this static edge. The first one
     /// returned [`TfError::EdgeIsStatic`]; the rest returned `Ok(())`.
     pub static_refusals: u64,
-    /// Every insert from a second writer refused on this edge. The first
-    /// one returned [`TfError::SecondWriter`]; the rest returned `Ok(())`.
-    pub second_writer_refusals: u64,
     /// Every insert refused on this edge with
     /// [`TfError::StampBeforeWindow`]. A count that keeps rising is an edge
     /// whose publisher's clock went back without a new epoch.
@@ -220,15 +212,10 @@ pub struct StaticEdge<'a> {
 /// [`FrameId`]. Leading `/`s are removed first: `/odom` and `odom` name one
 /// frame.
 ///
-/// # Writers
-///
-/// Every insert names its [`WriterId`], and an edge keeps the first writer
-/// that fed it. An insert from another writer is refused: the first time
-/// on an edge with [`TfError::SecondWriter`], after that by counting it in
-/// [`EdgeInfo::second_writer_refusals`] and returning `Ok(())`, so a node
-/// that logs each insert error reports the conflict once with a running
-/// total. A dynamic insert on a static edge follows the same rule with
-/// [`TfError::EdgeIsStatic`] and [`EdgeInfo::static_refusals`].
+/// The buffer does not know which node published a transform: every
+/// sample of an edge is one feed, whoever sent it. Two nodes that publish
+/// the same edge interleave on its ring, so publish each edge from one
+/// node.
 ///
 /// # The rings
 ///
@@ -261,13 +248,16 @@ pub struct StaticEdge<'a> {
 /// [`EdgeInfo::overflows`].
 ///
 /// A static edge ([`Self::insert_static`]) holds one transform that never
-/// expires and wins at every time.
+/// expires and wins at every time. A dynamic insert on it is refused: the
+/// first time with [`TfError::EdgeIsStatic`], after that by counting it in
+/// [`EdgeInfo::static_refusals`] and returning `Ok(())`, so a node that
+/// logs each insert error reports the conflict once with a running total.
 ///
 /// # Epochs
 ///
 /// A clock reset or a bag loop moves time backwards. [`Self::begin_epoch`]
-/// clears every dynamic ring, keeps every frame, edge, writer, policy and
-/// static transform, and counts the epoch in [`Self::epoch`]; the new
+/// clears every dynamic ring, keeps every frame, edge, policy and static
+/// transform, and counts the epoch in [`Self::epoch`]; the new
 /// timeline then fills the rings from empty. Without it, the first stamps
 /// of the new timeline are older than the window and are refused.
 ///
@@ -341,14 +331,12 @@ impl TfBuffer {
         let table = (0..frames)
             .map(|_| Frame {
                 parent: None,
-                writer: None,
                 is_static: false,
                 static_transform: Transform::IDENTITY,
                 policy: EdgePolicy::Interpolate,
                 samples: VecDeque::with_capacity(ring_capacity),
                 overflows: 0,
                 static_refusals: 0,
-                second_writer_refusals: 0,
                 window_refusals: 0,
                 jump_refusals: 0,
                 pending_jump: None,
@@ -454,13 +442,11 @@ impl TfBuffer {
             parent: self.names.name(parent),
             is_static: frame.is_static,
             policy: frame.policy,
-            writer: frame.writer,
             samples: frame.samples.len(),
             oldest_ns: frame.samples.front().map(|s| s.stamp_ns),
             newest_ns: frame.samples.back().map(|s| s.stamp_ns),
             overflows: frame.overflows,
             static_refusals: frame.static_refusals,
-            second_writer_refusals: frame.second_writer_refusals,
             window_refusals: frame.window_refusals,
             jump_refusals: frame.jump_refusals,
         })
@@ -490,8 +476,7 @@ impl TfBuffer {
             })
     }
 
-    /// Records `T_parent_child` at `stamp_ns` on the edge's ring, written by
-    /// `writer`.
+    /// Records `T_parent_child` at `stamp_ns` on the edge's ring.
     ///
     /// Frames the buffer has not seen are registered. The sample lands in
     /// stamp order; see the type docs for retention, the ring capacity and
@@ -503,19 +488,18 @@ impl TfBuffer {
     /// [`TfError::SecondParent`], [`TfError::Cycle`],
     /// [`TfError::FrameTableFull`], [`TfError::NameBudgetFull`],
     /// [`TfError::StampBeforeWindow`] and [`TfError::StampTooFarAhead`];
-    /// [`TfError::EdgeIsStatic`] and [`TfError::SecondWriter`] the first
-    /// time on an edge. A refusal changes nothing but the edge's refusal
-    /// counters, and a [`TfError::StampTooFarAhead`] refusal also records
-    /// its stamp for the next insert to confirm.
+    /// [`TfError::EdgeIsStatic`] the first time on an edge. A refusal
+    /// changes nothing but the edge's refusal counters, and a
+    /// [`TfError::StampTooFarAhead`] refusal also records its stamp for the
+    /// next insert to confirm.
     pub fn insert(
         &mut self,
-        writer: WriterId,
         parent: &str,
         child: &str,
         stamp_ns: u64,
         transform: Transform,
     ) -> Result<(), TfError> {
-        let Some((p, c)) = self.admit(parent, child, Admit::Dynamic(writer))? else {
+        let Some((p, c)) = self.admit(parent, child, Admit::Dynamic)? else {
             return Ok(());
         };
         let (parent, child) = (self.id(p), self.id(c));
@@ -551,7 +535,6 @@ impl TfBuffer {
         }
         // Every check passed: the writes start here.
         frame.pending_jump = None;
-        frame.writer = Some(writer);
         let ring = &mut frame.samples;
         let mut i = match ring.binary_search_by_key(&stamp_ns, |s| s.stamp_ns) {
             Ok(i) => {
@@ -593,8 +576,8 @@ impl TfBuffer {
         Ok(())
     }
 
-    /// Records `T_parent_child` as a static transform, written by `writer`:
-    /// it holds at every time and never expires. Re-inserting a static edge
+    /// Records `T_parent_child` as a static transform: it holds at every
+    /// time and never expires. Re-inserting a static edge
     /// sets its value; a static insert on an edge with dynamic history
     /// clears that history, since the static transform wins at every time
     /// anyway, and counts every cleared sample in [`Self::expired`].
@@ -603,17 +586,15 @@ impl TfBuffer {
     ///
     /// [`TfError::EmptyFrameId`], [`TfError::SelfEdge`],
     /// [`TfError::SecondParent`], [`TfError::Cycle`],
-    /// [`TfError::FrameTableFull`] and [`TfError::NameBudgetFull`];
-    /// [`TfError::SecondWriter`] the first time on an edge. A refusal
-    /// changes nothing but the edge's refusal counter.
+    /// [`TfError::FrameTableFull`] and [`TfError::NameBudgetFull`]. A
+    /// refusal changes nothing.
     pub fn insert_static(
         &mut self,
-        writer: WriterId,
         parent: &str,
         child: &str,
         transform: Transform,
     ) -> Result<(), TfError> {
-        let Some((_, c)) = self.admit(parent, child, Admit::Static(writer))? else {
+        let Some((_, c)) = self.admit(parent, child, Admit::Static)? else {
             return Ok(());
         };
         let frame = &mut self.frames[c];
@@ -623,7 +604,6 @@ impl TfBuffer {
         self.expired += frame.samples.len() as u64;
         frame.samples.clear();
         frame.pending_jump = None;
-        frame.writer = Some(writer);
         frame.is_static = true;
         frame.static_transform = transform;
         Ok(())
@@ -657,10 +637,9 @@ impl TfBuffer {
     /// Starts a new timeline after a clock reset or a bag loop: clears
     /// every dynamic ring and every unconfirmed forward jump (counting the
     /// cleared samples in [`Self::expired`]) and increments
-    /// [`Self::epoch`]. Frames, edges,
-    /// writers, policies and static transforms are kept. The runtime that
-    /// resets the clock calls it at the reset, so a replay calls it at the
-    /// same point.
+    /// [`Self::epoch`]. Frames, edges, policies and static transforms are
+    /// kept. The runtime that resets the clock calls it at the reset, so a
+    /// replay calls it at the same point.
     pub fn begin_epoch(&mut self) {
         let active = self.active();
         for frame in &mut self.frames[..active] {
@@ -885,36 +864,21 @@ impl TfBuffer {
         Ok(Some((p, c)))
     }
 
-    /// The writer and static checks of an existing edge `p` to `c`:
-    /// `Some(Err)` for a first refusal, `Some(Ok)` for a counted repeat,
-    /// `None` when the write may go ahead.
+    /// The static check of an existing edge `p` to `c`: `Some(Err)` for a
+    /// first refusal, `Some(Ok)` for a counted repeat, `None` when the
+    /// write may go ahead.
     fn refusal(&mut self, p: usize, c: usize, kind: Admit) -> Option<Result<(), TfError>> {
         let (parent, child) = (self.id(p), self.id(c));
         let frame = &mut self.frames[c];
-        let writer = match kind {
+        match kind {
             // A policy has no place on a static edge; setting one is a
             // configuration call, refused every time.
-            Admit::Policy if frame.is_static => {
-                return Some(Err(TfError::EdgeIsStatic { parent, child }));
-            }
-            Admit::Policy => return None,
-            Admit::Dynamic(_) if frame.is_static => {
+            Admit::Policy if frame.is_static => Some(Err(TfError::EdgeIsStatic { parent, child })),
+            Admit::Dynamic if frame.is_static => {
                 let err = TfError::EdgeIsStatic { parent, child };
-                return Some(first_then_count(&mut frame.static_refusals, err));
+                Some(first_then_count(&mut frame.static_refusals, err))
             }
-            Admit::Dynamic(w) | Admit::Static(w) => w,
-        };
-        match frame.writer {
-            Some(existing) if existing != writer => {
-                let err = TfError::SecondWriter {
-                    parent,
-                    child,
-                    writer,
-                    existing_writer: existing,
-                };
-                Some(first_then_count(&mut frame.second_writer_refusals, err))
-            }
-            _ => None,
+            Admit::Policy | Admit::Dynamic | Admit::Static => None,
         }
     }
 
@@ -923,7 +887,6 @@ impl TfBuffer {
         let i = self.names.register(name);
         let frame = &mut self.frames[i];
         frame.parent = None;
-        frame.writer = None;
         frame.is_static = false;
         frame.static_transform = Transform::IDENTITY;
         frame.policy = EdgePolicy::Interpolate;
@@ -1174,8 +1137,8 @@ fn first_then_count(count: &mut u64, err: TfError) -> Result<(), TfError> {
 /// What an edge write is, for the checks in [`TfBuffer::admit`].
 #[derive(Debug, Clone, Copy)]
 enum Admit {
-    Dynamic(WriterId),
-    Static(WriterId),
+    Dynamic,
+    Static,
     Policy,
 }
 

@@ -108,19 +108,18 @@ root `Cargo.toml` under `[workspace.dependencies]`, with `<checkout>` a
 `cerulion` source checkout of the same version as the CLI.
 
 ```rust
-use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion, WriterId};
+use cerulion_tf::{TfBuffer, TfError, Transform, UnitQuaternion};
 
 let mut buffer = TfBuffer::new();
-let writer = WriterId::new(1);
 
 // A dynamic transform: odom -> base_link at 1 000 000 000 ns, 2 m along +x.
 let rotation = UnitQuaternion::new(0.0, 0.0, 0.0, 1.0)?;
 let transform = Transform::new([2.0, 0.0, 0.0], rotation)?;
-buffer.insert(writer, "odom", "base_link", 1_000_000_000, transform)?;
+buffer.insert("odom", "base_link", 1_000_000_000, transform)?;
 
 // A static transform: the lidar mount, 0.25 m forward and 0.5 m up.
 let mount = Transform::new([0.25, 0.0, 0.5], UnitQuaternion::IDENTITY)?;
-buffer.insert_static(writer, "base_link", "lidar", mount)?;
+buffer.insert_static("base_link", "lidar", mount)?;
 
 // The lidar in odom, at the stamp of the sample above.
 let odom_lidar = buffer.lookup("odom", "lidar", 1_000_000_000)?;
@@ -140,14 +139,10 @@ The rules:
 - **One parent per frame.** A transform naming a child that already has a
   different parent is refused (`SecondParent`); so is a self edge and an edge
   that would make a frame its own ancestor (`Cycle`). The tree stays a tree.
-- **One writer per edge.** Every insert names a `WriterId`, any value that
-  tells the publishing nodes apart. An edge keeps the first writer that fed
-  it, and a transform for that edge from another writer is refused
-  (`SecondWriter`), so two broadcasters of one edge are an error rather than
-  samples interleaved on one ring. An accumulate input does not say which
-  node published each frame, so a feed of a whole `/tf` input passes one
-  `WriterId` for all of it, and the check then guards the edges the node
-  feeds from separate inputs or writes itself.
+- **One feed per edge.** The buffer does not know which node published a
+  transform: an accumulate input does not say which node sent each frame,
+  so every sample of an edge is one feed. Two nodes that publish the same
+  edge interleave on its ring; publish each edge from one node.
 - **A window of history.** Each dynamic edge keeps the samples of the last
   10 s before its newest stamp, the tf2 default, whatever its publish rate.
   An insert drops every sample older than that window (counted in
@@ -181,11 +176,11 @@ The rules:
 - **Static wins.** A static edge holds at every time. A dynamic transform
   for a static edge is refused (`EdgeIsStatic`), and a static insert on an
   edge with dynamic history clears that history.
-- **Loud once, counted after.** `EdgeIsStatic` and `SecondWriter` come back
-  the first time on an edge. Every later refusal on that edge returns
-  `Ok(())` and counts in the edge's `static_refusals` or
-  `second_writer_refusals`, so a node that logs each insert error reports
-  the conflict once, and the running total stays readable from `edge()`.
+- **Loud once, counted after.** `EdgeIsStatic` comes back the first time on
+  an edge. Every later refusal on that edge returns `Ok(())` and counts in
+  the edge's `static_refusals`, so a node that logs each insert error
+  reports the conflict once, and the running total stays readable from
+  `edge()`.
 - **Frame ids** have no length limit of their own. The buffer interns each
   id once, in a name table sized at construction (64 bytes per frame on
   average, 4096 bytes for the default 64 frames), and names a frame by its
@@ -205,7 +200,7 @@ exactly as it was, apart from the refusal counters above and the stamp a
 
 A bag that loops or a simulator that resets moves time backwards. Call
 `buffer.begin_epoch()` at that point: it clears every dynamic ring, keeps
-every frame, edge, writer, policy and static transform, and counts the epoch
+every frame, edge, policy and static transform, and counts the epoch
 in `epoch()`. The new timeline then fills the rings from empty. Without it,
 the first stamps of the new timeline are older than the window and come back
 as `StampBeforeWindow`, so a missed reset is an error, never a frozen tree.
@@ -304,7 +299,6 @@ alias of `TfError`.
 | `SecondParent { child, parent, existing_parent }` | `child` already has a different parent. | Two broadcasters claim the same child; keep one. |
 | `Cycle { parent, child }` | The edge would make a frame its own ancestor. | Fix the frame tree. |
 | `EdgeIsStatic { parent, child }` | A dynamic transform or an edge policy arrived for a static edge. | Publish the edge on one topic only. |
-| `SecondWriter { parent, child, writer, existing_writer }` | Another writer already feeds the edge. | Two broadcasters publish the same edge; keep one. |
 | `StampBeforeWindow { parent, child, stamp_ns, newest_ns }` | The stamp is older than the window before the edge's newest sample. | Call `begin_epoch` on a clock reset or a bag loop. |
 | `StampTooFarAhead { parent, child, stamp_ns, newest_ns }` | The stamp is more than the jump limit past the edge's newest sample, and no insert just before it agrees. | Fix the publisher's stamps; a clock that moved forward is confirmed by its next stamp. |
 | `FrameTableFull { frame, capacity }` | The buffer holds `capacity` frames and `frame` is new. | Build the buffer with a larger frame capacity. |
@@ -339,5 +333,7 @@ Frames follow REP-103: right-handed, metres, radians.
   supported; a node publishes its transforms and holds its own buffer.
 - A blocking lookup with a timeout.
 - Re-parenting a frame at runtime.
-- Telling the publishers of one accumulate input apart: a `/tf` feed passes
-  one `WriterId` for the whole input.
+- Telling two broadcasters of one edge apart. An accumulate input does not
+  say which node published each frame, so the buffer cannot refuse a second
+  broadcaster of an edge: their samples interleave on its ring. Publish each
+  edge from one node.

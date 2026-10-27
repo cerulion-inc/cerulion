@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Frame handles, writer handles, and the inline label an error carries for
-//! a frame id the buffer has not registered.
+//! Frame handles, and the inline label an error carries for a frame id the
+//! buffer has not registered.
 //!
 //! The buffer interns every frame id it registers: the name lives once in
 //! the buffer's name table and everything else, errors included, carries a
@@ -54,35 +54,6 @@ impl FrameId {
 impl fmt::Display for FrameId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{}", self.slot)
-    }
-}
-
-/// The publisher of a transform: the node that wrote it.
-///
-/// Every insert names its writer, and an edge keeps the first writer that
-/// fed it. A second writer on the same edge is refused
-/// ([`crate::TfError::SecondWriter`]), so two broadcasters of one edge are
-/// a loud error rather than samples interleaved on one ring. The value is
-/// the caller's: any id that tells the publishing nodes apart, the same for
-/// every message of one node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WriterId(u64);
-
-impl WriterId {
-    /// The writer with the id `raw`.
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The raw id.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for WriterId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "writer {}", self.0)
     }
 }
 

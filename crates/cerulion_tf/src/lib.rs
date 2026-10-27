@@ -13,10 +13,10 @@
 //!
 //! A node holds one [`TfBuffer`], feeds it every transform it receives
 //! ([`TfBuffer::insert`] for `/tf`, [`TfBuffer::insert_static`] for
-//! `/tf_static`), each with the [`WriterId`] of the node that published it,
-//! and reads it with [`TfBuffer::lookup`] or [`TfBuffer::lookup_latest`].
-//! The buffer keeps one parent and one writer per frame, interns frame ids
-//! into [`FrameId`] handles, keeps a fixed window of history per edge
+//! `/tf_static`), and reads it with [`TfBuffer::lookup`] or
+//! [`TfBuffer::lookup_latest`]. The buffer keeps one parent per frame,
+//! interns frame ids into [`FrameId`] handles, keeps a fixed window of
+//! history per edge
 //! ([`TfBufferConfig::retention`], 10 s by default), refuses a malformed
 //! transform before writing anything, and returns a [`TfError`] that names
 //! the frames involved when a lookup cannot be answered. Past an edge's
@@ -91,6 +91,6 @@ pub use edge_policy::EdgePolicy;
 #[allow(deprecated)]
 pub use error::TfMathError;
 pub use error::{Describe, TfError};
-pub use frame_id::{FrameId, FrameLabel, WriterId, FRAME_LABEL_BYTES};
+pub use frame_id::{FrameId, FrameLabel, FRAME_LABEL_BYTES};
 pub use quaternion::UnitQuaternion;
 pub use transform::Transform;

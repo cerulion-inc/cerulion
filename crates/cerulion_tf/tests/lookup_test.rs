@@ -10,7 +10,6 @@
 
 use cerulion_tf::{
     EdgePolicy, FrameId, FrameLabel, TfBuffer, TfBufferConfig, TfError, Transform, UnitQuaternion,
-    WriterId,
 };
 use std::f64::consts::FRAC_1_SQRT_2;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -47,9 +46,6 @@ fn z_minus_90() -> UnitQuaternion {
     q(0.0, 0.0, -FRAC_1_SQRT_2, FRAC_1_SQRT_2)
 }
 
-/// The one writer of every edge in this file.
-const W: WriterId = WriterId::new(1);
-
 fn id(b: &TfBuffer, frame: &str) -> FrameId {
     b.frame_id(frame).expect("a registered frame")
 }
@@ -82,14 +78,13 @@ fn assert_close(got: Transform, want: Transform, tol: f64) {
 fn turning_edge() -> TfBuffer {
     let mut b = TfBuffer::new();
     b.insert(
-        W,
         "odom",
         "base",
         0,
         tf([0.0, 0.0, 0.0], UnitQuaternion::IDENTITY),
     )
     .unwrap();
-    b.insert(W, "odom", "base", 1_000, tf([2.0, 0.0, 0.0], z90()))
+    b.insert("odom", "base", 1_000, tf([2.0, 0.0, 0.0], z90()))
         .unwrap();
     b
 }
@@ -100,9 +95,9 @@ fn turning_edge() -> TfBuffer {
 fn an_exact_stamp_hit_returns_the_sample_bit_for_bit() {
     let mut b = TfBuffer::new();
     let sample = tf([1.5, -2.25, 3.0], q(0.1, 0.2, 0.3, 0.9));
-    b.insert(W, "odom", "base", 100, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 200, sample).unwrap();
-    b.insert(W, "odom", "base", 300, shift(9.0)).unwrap();
+    b.insert("odom", "base", 100, shift(0.0)).unwrap();
+    b.insert("odom", "base", 200, sample).unwrap();
+    b.insert("odom", "base", 300, shift(9.0)).unwrap();
     let got = b.lookup("odom", "base", 200).unwrap();
     assert_eq!(got.translation(), sample.translation());
     assert_eq!(
@@ -131,14 +126,13 @@ fn the_midpoint_is_a_linear_translation_and_a_slerp_rotation() {
 fn a_third_of_the_way_is_a_third_of_the_turn() {
     let mut b = TfBuffer::new();
     b.insert(
-        W,
         "odom",
         "base",
         0,
         tf([0.0, 0.0, 0.0], UnitQuaternion::IDENTITY),
     )
     .unwrap();
-    b.insert(W, "odom", "base", 3_000, tf([3.0, 0.0, 0.0], z90()))
+    b.insert("odom", "base", 3_000, tf([3.0, 0.0, 0.0], z90()))
         .unwrap();
     let got = b.lookup("odom", "base", 1_000).unwrap();
     assert_close3(got.translation(), [1.0, 0.0, 0.0], TOL);
@@ -152,7 +146,7 @@ fn interpolation_uses_the_bracketing_pair_not_the_ring_ends() {
     // the ends (0 at 0, 30 at 300) gives a different answer at every
     // interior stamp: 12.5 at 125 and 27.5 at 275.
     for (stamp, x) in [(0u64, 0.0), (100, 10.0), (200, 40.0), (300, 30.0)] {
-        b.insert(W, "odom", "base", stamp, shift(x)).unwrap();
+        b.insert("odom", "base", stamp, shift(x)).unwrap();
     }
     // 125 is a quarter of the way from the 100 sample to the 200 sample:
     // 10 + 0.25 * (40 - 10) = 17.5.
@@ -168,14 +162,13 @@ fn a_chain_through_the_root_composes_every_edge() {
     // odom -> base: 1 m along +x (dynamic, constant over the ring).
     // base -> lidar: the static mount, 0.17 m forward and 0.11 m up.
     let mut b = TfBuffer::new();
-    b.insert(W, "map", "odom", 0, tf([10.0, 0.0, 0.0], z90()))
+    b.insert("map", "odom", 0, tf([10.0, 0.0, 0.0], z90()))
         .unwrap();
-    b.insert(W, "map", "odom", 1_000, tf([10.0, 0.0, 0.0], z90()))
+    b.insert("map", "odom", 1_000, tf([10.0, 0.0, 0.0], z90()))
         .unwrap();
-    b.insert(W, "odom", "base", 0, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 1_000, shift(1.0)).unwrap();
+    b.insert("odom", "base", 0, shift(1.0)).unwrap();
+    b.insert("odom", "base", 1_000, shift(1.0)).unwrap();
     b.insert_static(
-        W,
         "base",
         "lidar",
         tf([0.17, 0.0, 0.11], UnitQuaternion::IDENTITY),
@@ -196,10 +189,9 @@ fn a_chain_through_the_root_composes_every_edge() {
 fn two_siblings_resolve_through_their_common_parent() {
     // base -> lidar is turned 90 about z; base -> camera is not.
     let mut b = TfBuffer::new();
-    b.insert_static(W, "base", "lidar", tf([0.17, 0.0, 0.11], z90()))
+    b.insert_static("base", "lidar", tf([0.17, 0.0, 0.11], z90()))
         .unwrap();
     b.insert_static(
-        W,
         "base",
         "camera",
         tf([0.27, 0.0, 0.05], UnitQuaternion::IDENTITY),
@@ -217,7 +209,7 @@ fn two_siblings_resolve_through_their_common_parent() {
 fn the_inverse_direction_is_the_inverse_transform() {
     // odom -> base: 1 m along +x, 2 m along +y, turned 90 about z.
     let mut b = TfBuffer::new();
-    b.insert(W, "odom", "base", 7, tf([1.0, 2.0, 0.0], z90()))
+    b.insert("odom", "base", 7, tf([1.0, 2.0, 0.0], z90()))
         .unwrap();
     let got = b.lookup("base", "odom", 7).unwrap();
     // The odom origin seen from base: undo the turn (-90, sending (1, 2)
@@ -242,7 +234,7 @@ fn a_frame_to_itself_is_the_identity() {
 #[test]
 fn a_static_edge_answers_at_every_time() {
     let mut b = turning_edge();
-    b.insert_static(W, "base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
     for stamp in [0u64, 500, 1_000, u64::MAX] {
         assert_eq!(b.lookup("base", "lidar", stamp).unwrap(), shift(0.17));
     }
@@ -269,9 +261,9 @@ fn stamps_near_the_epoch_and_a_billion_seconds_later_interpolate_alike() {
     let mut early = TfBuffer::new();
     let mut later = TfBuffer::new();
     for (stamp, x) in [(0u64, 0.0), (1_000, 4.0)] {
-        early.insert(W, "odom", "base", stamp, shift(x)).unwrap();
+        early.insert("odom", "base", stamp, shift(x)).unwrap();
         later
-            .insert(W, "odom", "base", late + stamp, shift(x))
+            .insert("odom", "base", late + stamp, shift(x))
             .unwrap();
     }
     let a = early.lookup("odom", "base", 250).unwrap();
@@ -299,8 +291,8 @@ fn a_gap_wider_than_2_to_the_53_ns_rounds_the_fraction_the_same_way_every_time()
         retention: Duration::from_nanos(span),
         ..TfBufferConfig::default()
     });
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", span, shift(2.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", span, shift(2.0)).unwrap();
     // 2^53 is exact: the fraction is 0.5 and the translation 1 m.
     assert_eq!(b.lookup("odom", "base", 1 << 53).unwrap(), shift(1.0));
     // 2^53 + 1 is halfway between the doubles 2^53 and 2^53 + 2; the tie
@@ -320,10 +312,10 @@ fn lookup_latest_resolves_at_the_newest_time_the_whole_chain_has() {
     // map -> odom has samples to 900 ns; odom -> base to 1000 ns. The
     // latest time both hold is 900 ns.
     let mut b = TfBuffer::new();
-    b.insert(W, "map", "odom", 0, shift(0.0)).unwrap();
-    b.insert(W, "map", "odom", 900, shift(9.0)).unwrap();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 1_000, shift(10.0)).unwrap();
+    b.insert("map", "odom", 0, shift(0.0)).unwrap();
+    b.insert("map", "odom", 900, shift(9.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 1_000, shift(10.0)).unwrap();
     let latest = b.lookup_latest("map", "base").unwrap();
     assert_eq!(latest, b.lookup("map", "base", 900).unwrap());
     // At 900 ns: map -> odom is 9 m; odom -> base is 9 m (0.9 of 10 m).
@@ -338,8 +330,8 @@ fn lookup_latest_resolves_at_the_newest_time_the_whole_chain_has() {
 #[test]
 fn lookup_latest_on_static_edges_only_needs_no_time() {
     let mut b = TfBuffer::new();
-    b.insert_static(W, "base", "lidar", shift(0.17)).unwrap();
-    b.insert_static(W, "base", "camera", shift(0.27)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", "camera", shift(0.27)).unwrap();
     let got = b.lookup_latest("lidar", "camera").unwrap();
     assert_close3(got.translation(), [0.10, 0.0, 0.0], 1e-15);
 }
@@ -438,8 +430,8 @@ fn an_empty_buffer_knows_no_frame() {
 #[test]
 fn two_trees_have_no_path() {
     let mut b = TfBuffer::new();
-    b.insert(W, "map", "odom", 0, shift(1.0)).unwrap();
-    b.insert(W, "base", "lidar", 0, shift(1.0)).unwrap();
+    b.insert("map", "odom", 0, shift(1.0)).unwrap();
+    b.insert("base", "lidar", 0, shift(1.0)).unwrap();
     assert_eq!(
         b.lookup("map", "lidar", 0),
         Err(TfError::NoPath {
@@ -459,8 +451,8 @@ fn two_trees_have_no_path() {
 #[test]
 fn one_nanosecond_before_the_oldest_sample_is_out_of_range() {
     let mut b = TfBuffer::new();
-    b.insert(W, "odom", "base", 100, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 300, shift(3.0)).unwrap();
+    b.insert("odom", "base", 100, shift(1.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
     assert_eq!(
         b.lookup("odom", "base", 99),
         Err(TfError::OutOfRange {
@@ -483,8 +475,8 @@ fn one_nanosecond_before_the_oldest_sample_is_out_of_range() {
 #[test]
 fn one_nanosecond_after_the_newest_sample_is_not_yet_available() {
     let mut b = TfBuffer::new();
-    b.insert(W, "odom", "base", 100, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 300, shift(3.0)).unwrap();
+    b.insert("odom", "base", 100, shift(1.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
     assert_eq!(
         b.lookup("odom", "base", 301),
         Err(TfError::NotYetAvailable {
@@ -509,7 +501,7 @@ fn one_nanosecond_after_the_newest_sample_is_not_yet_available() {
 #[test]
 fn a_single_sample_answers_at_its_stamp_only() {
     let mut b = TfBuffer::new();
-    b.insert(W, "odom", "base", 500, shift(5.0)).unwrap();
+    b.insert("odom", "base", 500, shift(5.0)).unwrap();
     assert_eq!(b.lookup("odom", "base", 500).unwrap(), shift(5.0));
     assert_eq!(
         b.lookup("odom", "base", 499),
@@ -536,10 +528,10 @@ fn a_single_sample_answers_at_its_stamp_only() {
 fn a_refusal_on_a_chain_names_the_failing_edge() {
     // map -> odom covers 0..=1000 ns; odom -> base covers only 500..=600.
     let mut b = TfBuffer::new();
-    b.insert(W, "map", "odom", 0, shift(0.0)).unwrap();
-    b.insert(W, "map", "odom", 1_000, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 500, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 600, shift(1.0)).unwrap();
+    b.insert("map", "odom", 0, shift(0.0)).unwrap();
+    b.insert("map", "odom", 1_000, shift(1.0)).unwrap();
+    b.insert("odom", "base", 500, shift(0.0)).unwrap();
+    b.insert("odom", "base", 600, shift(1.0)).unwrap();
     assert_eq!(
         b.lookup("map", "base", 700),
         Err(TfError::NotYetAvailable {
@@ -568,10 +560,10 @@ fn lookup_latest_with_windows_that_do_not_overlap_is_out_of_range() {
     // odom -> base holds 0..=100; map -> odom holds 500..=600. The newest
     // time both could have is 100, which map -> odom does not reach.
     let mut b = TfBuffer::new();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 100, shift(1.0)).unwrap();
-    b.insert(W, "map", "odom", 500, shift(0.0)).unwrap();
-    b.insert(W, "map", "odom", 600, shift(1.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 100, shift(1.0)).unwrap();
+    b.insert("map", "odom", 500, shift(0.0)).unwrap();
+    b.insert("map", "odom", 600, shift(1.0)).unwrap();
     assert_eq!(
         b.lookup_latest("map", "base"),
         Err(TfError::OutOfRange {
@@ -587,9 +579,9 @@ fn lookup_latest_with_windows_that_do_not_overlap_is_out_of_range() {
 #[test]
 fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
     let mut b = TfBuffer::new();
-    b.insert(W, "a", "b", 0, shift(1e308)).unwrap();
-    b.insert(W, "b", "c", 0, shift(1e308)).unwrap();
-    b.insert(W, "a", "d", 0, shift(-1e308)).unwrap();
+    b.insert("a", "b", 0, shift(1e308)).unwrap();
+    b.insert("b", "c", 0, shift(1e308)).unwrap();
+    b.insert("a", "d", 0, shift(-1e308)).unwrap();
     assert_eq!(
         b.lookup("a", "c", 0),
         Err(TfError::ChainMath {
@@ -625,7 +617,7 @@ fn a_chain_whose_translations_overflow_is_refused_naming_the_lookup_frames() {
 #[test]
 fn lookups_never_change_the_buffer() {
     let mut b = turning_edge();
-    b.insert_static(W, "base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
     let before = (
         b.frame_count(),
         b.expired(),
@@ -653,7 +645,6 @@ fn lookups_never_change_the_buffer() {
 fn nav_chain(b: &mut TfBuffer, step_ms: u64) {
     for k in 0..20u64 {
         b.insert(
-            W,
             "map",
             "odom",
             k * 1_000_000_000,
@@ -662,7 +653,7 @@ fn nav_chain(b: &mut TfBuffer, step_ms: u64) {
         .unwrap();
     }
     for n in 0..(20_000 / step_ms) {
-        b.insert(W, "odom", "base", n * step_ms * 1_000_000, shift(n as f64))
+        b.insert("odom", "base", n * step_ms * 1_000_000, shift(n as f64))
             .unwrap();
     }
 }
@@ -768,13 +759,11 @@ fn hold_last_on_the_slow_edge_lets_the_chain_resolve_at_the_fast_edges_newest_st
         .unwrap();
     for k in 0..15u64 {
         let y = tf([0.0, k as f64, 0.0], UnitQuaternion::IDENTITY);
-        stale
-            .insert(W, "map", "odom", k * 1_000_000_000, y)
-            .unwrap();
+        stale.insert("map", "odom", k * 1_000_000_000, y).unwrap();
     }
     for n in 0..2_000u64 {
         stale
-            .insert(W, "odom", "base", n * 10_000_000, shift(n as f64))
+            .insert("odom", "base", n * 10_000_000, shift(n as f64))
             .unwrap();
     }
     assert_eq!(
@@ -797,9 +786,9 @@ fn lookup_latest_on_held_edges_only_resolves_at_their_newest_stamp() {
     let hold = EdgePolicy::HoldLast { max_age_ns: 1_000 };
     b.set_edge_policy("map", "odom", hold).unwrap();
     b.set_edge_policy("odom", "base", hold).unwrap();
-    b.insert(W, "map", "odom", 100, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 400, shift(4.0)).unwrap();
+    b.insert("map", "odom", 100, shift(1.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 400, shift(4.0)).unwrap();
     // The newest stamp among them is 400; map -> odom holds 1 m there.
     assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(5.0));
 }
@@ -811,8 +800,8 @@ fn extrapolate_continues_the_last_motion_up_to_its_bound() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 5_000 })
         .unwrap();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 1_000, shift(2.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 1_000, shift(2.0)).unwrap();
     // 2 m per 1000 ns: half a step past the newest is 3 m, two steps 6 m,
     // two and a half 7 m.
     assert_eq!(b.lookup("odom", "base", 1_500).unwrap(), shift(3.0));
@@ -841,8 +830,8 @@ fn extrapolate_continues_a_turn_in_the_frame_of_the_newest_sample() {
     // From the origin facing +x to (2, 0) facing +y over 1000 ns. One more
     // step repeats the motion from there, in the turned frame: 2 m along
     // +y to (2, 2), facing -x (180 about z).
-    b.insert(W, "odom", "base", 0, Transform::IDENTITY).unwrap();
-    b.insert(W, "odom", "base", 1_000, tf([2.0, 0.0, 0.0], z90()))
+    b.insert("odom", "base", 0, Transform::IDENTITY).unwrap();
+    b.insert("odom", "base", 1_000, tf([2.0, 0.0, 0.0], z90()))
         .unwrap();
     let got = b.lookup("odom", "base", 2_000).unwrap();
     assert_close3(got.translation(), [2.0, 2.0, 0.0], 1e-15);
@@ -854,7 +843,7 @@ fn extrapolate_with_one_sample_has_no_motion_to_continue() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 1_000 })
         .unwrap();
-    b.insert(W, "odom", "base", 100, shift(1.0)).unwrap();
+    b.insert("odom", "base", 100, shift(1.0)).unwrap();
     assert_eq!(b.lookup("odom", "base", 100).unwrap(), shift(1.0));
     assert!(matches!(
         b.lookup("odom", "base", 101),
@@ -867,8 +856,8 @@ fn an_extrapolation_that_overflows_is_chain_math_naming_the_lookup_frames() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: u64::MAX })
         .unwrap();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 1, shift(1e300)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 1, shift(1e300)).unwrap();
     assert_eq!(
         b.lookup("odom", "base", 1_000_000_000),
         Err(TfError::ChainMath {
@@ -883,7 +872,7 @@ fn an_extrapolation_that_overflows_is_chain_math_naming_the_lookup_frames() {
 #[test]
 fn lookup_by_handle_is_lookup_by_name() {
     let mut b = turning_edge();
-    b.insert_static(W, "base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
     let (odom, lidar) = (id(&b, "odom"), id(&b, "lidar"));
     assert_eq!(
         b.lookup_ids(odom, lidar, 500),
@@ -903,9 +892,7 @@ fn lookup_by_handle_is_lookup_by_name() {
 fn a_handle_from_another_buffer_is_refused() {
     let b = turning_edge();
     let mut other = turning_edge();
-    other
-        .insert_static(W, "base", "lidar", shift(0.17))
-        .unwrap();
+    other.insert_static("base", "lidar", shift(0.17)).unwrap();
     let foreign = other.frame_id("lidar").unwrap();
     assert_eq!(
         b.lookup_ids(id(&b, "odom"), foreign, 500),
@@ -923,7 +910,7 @@ fn a_handle_from_another_buffer_in_a_used_slot_is_refused() {
     // look up `base`.
     let b = turning_edge();
     let mut other = TfBuffer::new();
-    other.insert_static(W, "map", "lidar", shift(0.17)).unwrap();
+    other.insert_static("map", "lidar", shift(0.17)).unwrap();
     let (map, lidar) = (id(&other, "map"), id(&other, "lidar"));
     let odom = id(&b, "odom");
     assert_eq!(
@@ -946,13 +933,13 @@ fn latest_counts_a_one_sample_extrapolating_edge_only_to_its_sample() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("map", "odom", EdgePolicy::Extrapolate { max_ns: 1_000 })
         .unwrap();
-    b.insert(W, "map", "odom", 100, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 0, shift(0.0)).unwrap();
-    b.insert(W, "odom", "base", 200, shift(2.0)).unwrap();
+    b.insert("map", "odom", 100, shift(1.0)).unwrap();
+    b.insert("odom", "base", 0, shift(0.0)).unwrap();
+    b.insert("odom", "base", 200, shift(2.0)).unwrap();
     assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(2.0));
     // With a second sample the edge has motion and reaches past it: the
     // chain resolves at 200 ns, map -> odom one 50 ns step past 150 ns.
-    b.insert(W, "map", "odom", 150, shift(1.5)).unwrap();
+    b.insert("map", "odom", 150, shift(1.5)).unwrap();
     assert_eq!(b.lookup_latest("map", "base").unwrap(), shift(4.0));
 }
 
@@ -962,8 +949,8 @@ fn extrapolate_steps_by_the_span_between_the_two_newest_samples() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 4_000 })
         .unwrap();
-    b.insert(W, "odom", "base", 1_000, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 3_000, shift(3.0)).unwrap();
+    b.insert("odom", "base", 1_000, shift(1.0)).unwrap();
+    b.insert("odom", "base", 3_000, shift(3.0)).unwrap();
     // 2 m per 2000 ns: 1000 ns past the newest is 4 m, 4000 ns is 7 m.
     assert_eq!(b.lookup("odom", "base", 4_000).unwrap(), shift(4.0));
     assert_eq!(b.lookup("odom", "base", 7_000).unwrap(), shift(7.0));
@@ -977,7 +964,7 @@ fn one_whole_extrapolation_step_composes_the_step_once_and_no_more() {
     let mut b = TfBuffer::new();
     b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 1_000 })
         .unwrap();
-    b.insert(W, "odom", "base", 0, shift(-1.7e308)).unwrap();
-    b.insert(W, "odom", "base", 1_000, shift(0.0)).unwrap();
+    b.insert("odom", "base", 0, shift(-1.7e308)).unwrap();
+    b.insert("odom", "base", 1_000, shift(0.0)).unwrap();
     assert_eq!(b.lookup("odom", "base", 2_000).unwrap(), shift(1.7e308));
 }

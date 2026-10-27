@@ -15,8 +15,6 @@ frames, and the tf buffer that answers `lookup(parent, child, time)`.
   that publishes it on `/tf_static`.
 - Frame ids are interned into `FrameId` handles with no length limit of
   their own; `lookup_ids` skips the string work on every tick.
-- One writer per edge: a second broadcaster of an edge is a typed error,
-  reported once and counted after.
 - Past an edge's newest sample, a per-edge `EdgePolicy` decides: nothing
   (the default), the newest sample held, or the last motion continued, each
   within a bound. `begin_epoch` starts a new timeline after a clock reset or

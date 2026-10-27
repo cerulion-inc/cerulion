@@ -22,9 +22,7 @@
 //! ONE `#[test]` body on purpose: the window is process-global, and a second
 //! test in this binary could reset it mid-measurement.
 
-use cerulion_tf::{
-    EdgePolicy, TfBuffer, TfBufferConfig, TfError, Transform, UnitQuaternion, WriterId,
-};
+use cerulion_tf::{EdgePolicy, TfBuffer, TfBufferConfig, TfError, Transform, UnitQuaternion};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::f64::consts::FRAC_1_SQRT_2;
@@ -148,9 +146,6 @@ fn every_operation() {
     ));
 }
 
-const W: WriterId = WriterId::new(1);
-const W2: WriterId = WriterId::new(2);
-
 /// A frame id longer than any inline label: interned whole, with no limit.
 const LONG_ID: &str = "robot_0/camera_aligned_depth_to_color_frame_with_a_long_suffix";
 
@@ -184,22 +179,22 @@ fn every_buffer_operation(b: &mut TfBuffer) {
         .unwrap();
     // On a ring of 3, 400 overflows 100; 1300 expires 200; 300 is then
     // replaced by a different value.
-    b.insert(W, "odom", "base", black_box(100), shift(0.0))
+    b.insert("odom", "base", black_box(100), shift(0.0))
         .unwrap();
-    b.insert(W, "odom", "base", 200, shift(1.0)).unwrap();
-    b.insert(W, "odom", "base", 300, turn).unwrap();
-    b.insert(W, "odom", "base", 400, shift(4.0)).unwrap();
-    b.insert(W, "odom", "base", 1_300, shift(5.0)).unwrap();
-    b.insert(W, "odom", "base", 300, shift(3.0)).unwrap();
-    b.insert(W, "odom", "base", 300, shift(3.0)).unwrap();
-    b.insert_static(W, "base", "lidar", shift(0.17)).unwrap();
-    b.insert_static(W, "base", LONG_ID, shift(0.05)).unwrap();
+    b.insert("odom", "base", 200, shift(1.0)).unwrap();
+    b.insert("odom", "base", 300, turn).unwrap();
+    b.insert("odom", "base", 400, shift(4.0)).unwrap();
+    b.insert("odom", "base", 1_300, shift(5.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", LONG_ID, shift(0.05)).unwrap();
     b.set_edge_policy("map", "x", EdgePolicy::HoldLast { max_age_ns: 10 })
         .unwrap();
     // A second tree, and a chain whose translations overflow when composed.
-    b.insert(W, "x", "y", 0, shift(1.0)).unwrap();
-    b.insert(W, "p", "q", 0, shift(1e308)).unwrap();
-    b.insert(W, "q", "r", 0, shift(1e308)).unwrap();
+    b.insert("x", "y", 0, shift(1.0)).unwrap();
+    b.insert("p", "q", 0, shift(1e308)).unwrap();
+    b.insert("q", "r", 0, shift(1e308)).unwrap();
 
     black_box(b.lookup("odom", "base", black_box(400))).unwrap();
     black_box(b.lookup("odom", "base", 850)).unwrap();
@@ -244,44 +239,40 @@ fn every_buffer_operation(b: &mut TfBuffer) {
     assert!(matches!(refusals[4], Err(TfError::EdgeEmpty { .. })));
     assert!(matches!(refusals[5], Err(TfError::ChainMath { .. })));
     assert_eq!(
-        b.insert(W, "", "base", 0, shift(0.0)),
+        b.insert("", "base", 0, shift(0.0)),
         Err(TfError::EmptyFrameId)
     );
     assert!(matches!(
-        b.insert(W, "base", "base", 0, shift(0.0)),
+        b.insert("base", "base", 0, shift(0.0)),
         Err(TfError::SelfEdge { .. })
     ));
     assert!(matches!(
-        b.insert(W, "map", "base", 0, shift(0.0)),
+        b.insert("map", "base", 0, shift(0.0)),
         Err(TfError::SecondParent { .. })
     ));
     assert!(matches!(
-        b.insert(W, "lidar", "odom", 0, shift(0.0)),
+        b.insert("lidar", "odom", 0, shift(0.0)),
         Err(TfError::Cycle { .. })
     ));
     assert!(matches!(
-        b.insert(W, "odom", "base", 0, shift(0.0)),
+        b.insert("odom", "base", 0, shift(0.0)),
         Err(TfError::StampBeforeWindow { .. })
     ));
     // 10 000 is more than the window past the newest stamp, 1300.
-    let ahead = b.insert(W, "odom", "base", 10_000, shift(0.0));
+    let ahead = b.insert("odom", "base", 10_000, shift(0.0));
     assert!(matches!(ahead, Err(TfError::StampTooFarAhead { .. })));
     write!(sink, "{}", b.describe(ahead.as_ref().unwrap_err())).unwrap();
     // A first refusal, or a counted repeat when the operations run again.
     assert!(matches!(
-        b.insert(W, "base", "lidar", 0, shift(0.0)),
+        b.insert("base", "lidar", 0, shift(0.0)),
         Err(TfError::EdgeIsStatic { .. }) | Ok(())
     ));
     assert!(matches!(
-        b.insert(W2, "odom", "base", 1_300, shift(0.0)),
-        Err(TfError::SecondWriter { .. }) | Ok(())
-    ));
-    assert!(matches!(
-        b.insert(W, "z", "w", 0, shift(0.0)),
+        b.insert("z", "w", 0, shift(0.0)),
         Err(TfError::FrameTableFull { .. })
     ));
     assert!(matches!(
-        b.insert_static(W, "z", "w", shift(0.0)),
+        b.insert_static("z", "w", shift(0.0)),
         Err(TfError::FrameTableFull { .. })
     ));
 }
@@ -363,7 +354,7 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     assert_eq!(buffer.frame_count(), 10);
     assert_eq!(buffer.epoch(), 2);
     let base = buffer.edge("base").unwrap();
-    assert_eq!((base.overflows, base.second_writer_refusals), (2, 2));
+    assert_eq!(base.overflows, 2);
     assert_eq!((base.window_refusals, base.jump_refusals), (2, 2));
     assert_eq!(buffer.edge("lidar").unwrap().static_refusals, 2);
 
@@ -376,10 +367,10 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     ALLOC.open();
     for stamp in [100u64, 200, 300] {
         converted
-            .insert(W, "base", "camera", black_box(stamp), mount)
+            .insert("base", "camera", black_box(stamp), mount)
             .unwrap();
     }
-    converted.insert_static(W, "base", "camera", mount).unwrap();
+    converted.insert_static("base", "camera", mount).unwrap();
     black_box(converted.lookup("base", "camera", black_box(7))).unwrap();
     let during_conversion = ALLOC.close();
     assert_eq!(
@@ -401,7 +392,7 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
         name_bytes: 8,
         ..TfBufferConfig::default()
     });
-    tight.insert(W, "odom", "base", 0, shift).unwrap();
+    tight.insert("odom", "base", 0, shift).unwrap();
     let (odom, base) = (
         tight.frame_id("odom").unwrap(),
         tight.frame_id("base").unwrap(),
@@ -410,10 +401,8 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
     let mut sink = Sink::default();
     ALLOC.open();
     let refusals = [
-        tight
-            .insert(W, "base", black_box("c"), 1, shift)
-            .unwrap_err(),
-        tight.insert_static(W, "base", LONG_ID, shift).unwrap_err(),
+        tight.insert("base", black_box("c"), 1, shift).unwrap_err(),
+        tight.insert_static("base", LONG_ID, shift).unwrap_err(),
         tight.lookup_ids(black_box(foreign), base, 0).unwrap_err(),
         tight
             .lookup_latest_ids(odom, black_box(foreign))

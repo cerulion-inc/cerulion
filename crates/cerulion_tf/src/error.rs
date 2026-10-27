@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::{FrameId, FrameLabel, TfBuffer, WriterId};
+use crate::{FrameId, FrameLabel, TfBuffer};
 
 /// The former name of [`TfError`], from before the crate had a buffer.
 /// Every variant it had is a variant of [`TfError`] with the same fields,
@@ -35,8 +35,8 @@ pub type TfMathError = TfError;
 /// names of the buffer that returned it.
 ///
 /// The insert refusals are `EmptyFrameId`, `SelfEdge`, `SecondParent`,
-/// `Cycle`, `EdgeIsStatic`, `SecondWriter`, `StampBeforeWindow`,
-/// `StampTooFarAhead`, `FrameTableFull` and `NameBudgetFull`. The lookup refusals are
+/// `Cycle`, `EdgeIsStatic`, `StampBeforeWindow`, `StampTooFarAhead`,
+/// `FrameTableFull` and `NameBudgetFull`. The lookup refusals are
 /// `EmptyFrameId`, `UnknownFrame`, `UnknownFrameId`, `NoPath`, `EdgeEmpty`,
 /// `NotYetAvailable`, `OutOfRange` and `ChainMath`.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
@@ -97,20 +97,6 @@ pub enum TfError {
         parent: FrameId,
         /// The child of the static edge.
         child: FrameId,
-    },
-    /// A second writer published an edge another writer already feeds. Two
-    /// writers of one edge would interleave on one ring, so the second is
-    /// refused. Returned for the first such insert on an edge; the edge
-    /// counts every one.
-    SecondWriter {
-        /// The parent of the edge.
-        parent: FrameId,
-        /// The child of the edge.
-        child: FrameId,
-        /// The writer of the refused transform.
-        writer: WriterId,
-        /// The writer that feeds the edge.
-        existing_writer: WriterId,
     },
     /// The stamp is older than the edge's retention window: more than the
     /// buffer's retention before the newest sample on the edge. A clock
@@ -313,18 +299,6 @@ impl TfError {
                 f,
                 "transform `{}` to `{}` is static; a dynamic transform or an edge policy on a \
                  static edge is refused",
-                n(parent),
-                n(child)
-            ),
-            Self::SecondWriter {
-                parent,
-                child,
-                writer,
-                existing_writer,
-            } => write!(
-                f,
-                "transform `{}` to `{}` is fed by {existing_writer}; a transform from {writer} \
-                 is refused, since two writers of one edge would interleave",
                 n(parent),
                 n(child)
             ),

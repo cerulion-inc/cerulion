@@ -19,10 +19,8 @@
 //! fraction formed from the stamps and the composition along the chain are
 //! all under the same bit pin.
 
-use cerulion_tf::{EdgePolicy, TfBuffer, Transform, UnitQuaternion, WriterId};
+use cerulion_tf::{EdgePolicy, TfBuffer, Transform, UnitQuaternion};
 
-/// The one writer of every edge in this file.
-const W: WriterId = WriterId::new(1);
 use std::f64::consts::FRAC_1_SQRT_2;
 
 const N: usize = 47;
@@ -143,12 +141,10 @@ fn buffer_program() -> [f64; M] {
     let z90 = q(0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2);
 
     let mut buf = TfBuffer::new();
-    buf.insert(W, "map", "odom", 0, a).unwrap();
-    buf.insert(W, "map", "odom", 1_000, b).unwrap();
-    buf.insert(W, "odom", "base", 0, Transform::IDENTITY)
-        .unwrap();
+    buf.insert("map", "odom", 0, a).unwrap();
+    buf.insert("map", "odom", 1_000, b).unwrap();
+    buf.insert("odom", "base", 0, Transform::IDENTITY).unwrap();
     buf.insert(
-        W,
         "odom",
         "base",
         1_000,
@@ -156,14 +152,12 @@ fn buffer_program() -> [f64; M] {
     )
     .unwrap();
     buf.insert_static(
-        W,
         "base",
         "lidar",
         Transform::new([0.17, 0.0, 0.11], z90).unwrap(),
     )
     .unwrap();
     buf.insert_static(
-        W,
         "base",
         "camera",
         Transform::new([0.27, 0.0, 0.05], UnitQuaternion::IDENTITY).unwrap(),
@@ -213,11 +207,10 @@ fn policy_program() -> [u64; 21] {
     buf.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 10_000 })
         .unwrap();
     // A first timeline, then a reset to a second one.
-    buf.insert(W, "odom", "base", 50_000, Transform::IDENTITY)
+    buf.insert("odom", "base", 50_000, Transform::IDENTITY)
         .unwrap();
     buf.begin_epoch();
     buf.insert(
-        W,
         "map",
         "odom",
         0,
@@ -225,7 +218,6 @@ fn policy_program() -> [u64; 21] {
     )
     .unwrap();
     buf.insert(
-        W,
         "odom",
         "base",
         0,
@@ -233,7 +225,6 @@ fn policy_program() -> [u64; 21] {
     )
     .unwrap();
     buf.insert(
-        W,
         "odom",
         "base",
         300,
