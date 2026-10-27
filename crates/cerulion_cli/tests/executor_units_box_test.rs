@@ -200,7 +200,7 @@ fn run_leg(leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     ];
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+    let dir = read_identity::RunDir::new();
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let start = Instant::now();
@@ -335,7 +335,7 @@ fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
     ];
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+    let dir = read_identity::RunDir::new();
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let start = Instant::now();
@@ -516,6 +516,19 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
                         row.input
                     )
                 });
+            if kind(&row.verdict) != kind(&other.verdict) {
+                for (label, verdict_row, bag) in [
+                    ("one_group", &row.verdict, &run.bag),
+                    ("declared", &other.verdict, &declared_run.bag),
+                ] {
+                    if let RowVerdict::Diverged { live, .. } = verdict_row {
+                        print_read_window(bag, label, live.seq);
+                    }
+                }
+                if let RowVerdict::Diverged { live, .. } = &row.verdict {
+                    print_read_window(&declared_run.bag, "declared_same_seq", live.seq);
+                }
+            }
             assert_eq!(
                 kind(&row.verdict),
                 kind(&other.verdict),
@@ -694,4 +707,121 @@ fn the_recorded_fuse_refusal_mutant_is_caught() {
         message.contains("refused a bag carrying the retired `fuse:` key"),
         "the arm failed, but not on the refusal the mutant makes: {message}"
     );
+}
+
+/// Print, from `bag`'s scheduler trace, every record of the ranks that served a
+/// frame within 4 of `seq`, over the steps those reads span plus one either
+/// side: `READ_WINDOW` lines carrying rank, step, record kind, node index, and
+/// for a read its input index, outcome kind, served sequence and popped count.
+/// Fires per step are the `fire` lines of one rank and step.
+fn print_read_window(bag: &Path, label: &str, seq: u64) {
+    let reader = match cerulion_bag::BagReader::open(bag) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "READ_WINDOW label={label} cannot open {}: {e}",
+                bag.display()
+            );
+            return;
+        }
+    };
+    let mut recs: Vec<(u32, u64, u32, u32, u32, u64, u64)> = Vec::new();
+    let Ok(messages) = reader.messages() else {
+        eprintln!("READ_WINDOW label={label} cannot walk {}", bag.display());
+        return;
+    };
+    for m in messages.flatten() {
+        if m.topic != cerulion_bag::SCHEDULER_TRACE_TOPIC {
+            continue;
+        }
+        for r in m.data.chunks_exact(40) {
+            let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().expect("8 bytes"));
+            let u32_at = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().expect("4 bytes"));
+            // (rank, step, type, node_idx, level/meta, slot1, slot2)
+            recs.push((
+                u32_at(36) & 0xFFFF,
+                u64_at(0),
+                u32_at(32),
+                u32_at(24),
+                u32_at(28),
+                u64_at(8),
+                u64_at(16),
+            ));
+        }
+    }
+    let near = |served: u64| served != u64::MAX && served + 4 >= seq && served <= seq + 4;
+    let hits: Vec<(u32, u64)> = recs
+        .iter()
+        .filter(|r| r.2 == 6 && near(r.5))
+        .map(|r| (r.0, r.1))
+        .collect();
+    if hits.is_empty() {
+        eprintln!("READ_WINDOW label={label} no read served a frame within 4 of seq {seq}");
+        return;
+    }
+    for rank in hits
+        .iter()
+        .map(|h| h.0)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let steps: Vec<u64> = hits.iter().filter(|h| h.0 == rank).map(|h| h.1).collect();
+        let lo = steps.iter().min().copied().unwrap_or(0).saturating_sub(1);
+        let hi = steps.iter().max().copied().unwrap_or(0) + 1;
+        for r in recs
+            .iter()
+            .filter(|r| r.0 == rank && r.1 >= lo && r.1 <= hi)
+        {
+            match r.2 {
+                1 => eprintln!(
+                    "READ_WINDOW label={label} rank={} step={} kind=fire node={}",
+                    r.0, r.1, r.3
+                ),
+                6 => {
+                    eprintln!(
+                    "READ_WINDOW label={label} rank={} step={} kind=read node={} in={} outcome={} \
+                     seq={} popped={}",
+                    r.0,
+                    r.1,
+                    r.3,
+                    r.4 >> 16,
+                    r.4 & 0x3FFF,
+                    if r.5 == u64::MAX { "-".to_string() } else { r.5.to_string() },
+                    r.6 & 0xFFFF_FFFF
+                )
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The discriminating probe: the three-rank chain with one process per node and
+/// a relay late enough that its fires bunch, re-executed neutral. If its relay
+/// stream diverges like the one-group run's, the divergence is the replay's
+/// (it feeds a real queue of fixed depth), not the executor units'. It prints;
+/// its floors are the only assertions.
+#[test]
+#[ignore = "box-only: real runs on a quiet Linux host"]
+#[serial]
+fn a_late_relay_with_one_process_per_node_replay_probe() {
+    let fixture = Fixture::Ranks3LateRelay;
+    let (run, verdict) = record_and_judge(fixture, Placement::Declared);
+    assert!(
+        verdict.compared_floor(Floors::default()).is_ok(),
+        "RI_HARNESS: {} compared too few reads\n{}",
+        fixture.name(),
+        verdict.render()
+    );
+    for row in &verdict.rows {
+        let gaps = sequence_gaps(&run, &row.node, &row.input);
+        eprintln!(
+            "LATE_RELAY_PROBE node={} input={} live_gaps={gaps} verdict={}",
+            row.node,
+            row.input,
+            kind(&row.verdict)
+        );
+        if let RowVerdict::Diverged { live, .. } = &row.verdict {
+            print_read_window(&run.bag, "late_relay_declared", live.seq);
+        }
+    }
 }

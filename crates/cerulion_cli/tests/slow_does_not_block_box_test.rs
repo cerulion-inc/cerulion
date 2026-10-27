@@ -186,7 +186,7 @@ fn run_leg(ws: &Workspace, arm: &str, leg: &str, slow: Slow, single_process: boo
         ("g_slow", vec!["slow"]),
     ];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+    let dir = read_identity::RunDir::new();
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let extra: &[&str] = if single_process {

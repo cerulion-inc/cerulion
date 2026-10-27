@@ -741,6 +741,8 @@ struct RiRelayNode {
     ri_id: String,
     #[param(default = 100, description = "this writer's identity")]
     ri_writer: u64,
+    #[param(default = 0, description = "microseconds each fire sleeps")]
+    ri_sleep_us: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
 }
@@ -748,6 +750,7 @@ struct RiRelayNode {
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
+        ri_sleep(self.ri_sleep_us);
         self.tick_count += 1;
         let r = [self.inp.x, self.inp.y, self.inp.z];
         if ri_on() {
@@ -1117,7 +1120,13 @@ pub enum Fixture {
     Ranks2,
     /// The same chain split `[src]` / `[relay]` / `[sink]`.
     Ranks3,
+    /// `Ranks3` with a relay that sleeps [`LATE_RELAY_SLEEP_US`] per fire, so
+    /// its fires bunch: one step drains several frames.
+    Ranks3LateRelay,
 }
+
+/// How long the late relay of [`Fixture::Ranks3LateRelay`] sleeps per fire.
+pub const LATE_RELAY_SLEEP_US: u64 = 2_000;
 
 /// A fixture's nodes, its process groups in rank order, and its
 /// multi-publisher topics.
@@ -1164,6 +1173,7 @@ impl Fixture {
             Fixture::MultiWriter => "multi_writer",
             Fixture::Ranks2 => "ranks2",
             Fixture::Ranks3 => "ranks3",
+            Fixture::Ranks3LateRelay => "ranks3_late_relay",
         }
     }
 
@@ -1173,7 +1183,9 @@ impl Fixture {
             Fixture::SlowEvict => &[("slow", "inp")],
             Fixture::FanOut => &[("sink_a", "inp"), ("sink_b", "inp")],
             Fixture::MultiWriter => &[("tfbuf", "tf")],
-            Fixture::Ranks2 | Fixture::Ranks3 => &[("relay", "inp"), ("sink", "inp")],
+            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
+                &[("relay", "inp"), ("sink", "inp")]
+            }
         }
     }
 
@@ -1293,7 +1305,12 @@ impl Fixture {
                     vec![tf],
                 )
             }
-            Fixture::Ranks2 | Fixture::Ranks3 => {
+            Fixture::Ranks2 | Fixture::Ranks3 | Fixture::Ranks3LateRelay => {
+                let relay_sleep = if self == Fixture::Ranks3LateRelay {
+                    LATE_RELAY_SLEEP_US
+                } else {
+                    0
+                };
                 let nodes = vec![
                     src(),
                     node(
@@ -1301,7 +1318,11 @@ impl Fixture {
                         "ri_relay",
                         vec![input("inp", "src/out".into())],
                         vec![out("out", None)],
-                        &[id("relay"), writer(100)],
+                        &[
+                            id("relay"),
+                            writer(100),
+                            ("ri_sleep_us", ParamValue::UInt(relay_sleep)),
+                        ],
                     ),
                     node(
                         "sink",
@@ -1398,12 +1419,54 @@ pub fn graph_config(
 // Drivers.
 // ===========================================================================
 
+/// The env var that keeps a failing run's directory (its bag and its read
+/// logs) instead of deleting it.
+pub const KEEP_TEST_WS_ENV: &str = "CERULION_KEEP_TEST_WS";
+
+/// A run's private directory. It is deleted when dropped, except while the
+/// test is panicking with [`KEEP_TEST_WS_ENV`] set to `1`: then it is kept and
+/// its path printed, so a failing box run leaves its bag and read logs behind.
+pub struct RunDir {
+    dir: Option<tempfile::TempDir>,
+}
+
+impl RunDir {
+    pub fn new() -> Self {
+        RunDir {
+            dir: Some(tempfile::tempdir().expect("RI_HARNESS: run dir")),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.as_ref().expect("RI_HARNESS: run dir").path()
+    }
+}
+
+impl Default for RunDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let keep =
+            std::thread::panicking() && std::env::var(KEEP_TEST_WS_ENV).as_deref() == Ok("1");
+        if let (true, Some(dir)) = (keep, self.dir.take()) {
+            eprintln!(
+                "RI_HARNESS: kept the failing run's directory {}",
+                dir.keep().display()
+            );
+        }
+    }
+}
+
 /// One recorded live run: its private directory, the finalized bag and the
 /// live read log.
 pub struct RecordedRun {
     pub fixture: Fixture,
     pub placement: Placement,
-    pub dir: tempfile::TempDir,
+    pub dir: RunDir,
     pub bag: PathBuf,
     pub live: ReadLog,
     /// Where the live run's nodes wrote their records.
@@ -1622,7 +1685,7 @@ fn recording_defect(bag: &Path) -> Option<String> {
 pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
-        let dir = tempfile::tempdir().expect("RI_HARNESS: run dir");
+        let dir = RunDir::new();
         let (graph, prefix) = unique_names(fixture.name());
         write_graph(ws, &fixture.graph_config(&graph, &prefix));
         let reads = dir.path().join("live_reads");
