@@ -81,7 +81,11 @@ fn robot() -> (PairingAuthorizer, SharedTrust) {
 fn a_cloud_device_is_refused_the_act_verbs_only_while_the_switch_is_off() {
     let (authz, shared) = robot();
     for verb in [TOPIC_PUBLISH, TOPIC_SNAPSHOT] {
-        assert_eq!(authz.authorize_verb(&caller(90), verb), AuthzDecision::Allow, "{verb} on");
+        assert_eq!(
+            authz.authorize_verb(&caller(90), verb),
+            AuthzDecision::Allow,
+            "{verb} on"
+        );
     }
     CloudAccessVerb::new(shared.clone())
         .execute_with_caller(&caller(11), &serde_json::json!({ "allow": false }))
@@ -91,6 +95,10 @@ fn a_cloud_device_is_refused_the_act_verbs_only_while_the_switch_is_off() {
             AuthzDecision::Deny { reason } => assert!(reason.contains(REFUSAL), "{verb}: {reason}"),
             other => panic!("{verb}: a cloud device was admitted with the switch off: {other:?}"),
         }
-        assert_eq!(authz.authorize_verb(&caller(11), verb), AuthzDecision::Allow, "{verb} owner");
+        assert_eq!(
+            authz.authorize_verb(&caller(11), verb),
+            AuthzDecision::Allow,
+            "{verb} owner"
+        );
     }
 }
