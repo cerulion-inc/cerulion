@@ -4,13 +4,16 @@
 # Each distro has an expected state in the table below. `build` means rmw_cerulion must compile
 # against the distro's real headers (generated bindings, never the vendored fallback), must export
 # no symbol the distro's headers do not declare, and (on the x86_64 lanes) its serial test suite
-# must pass. After the build, a `build` row also runs a REAL rclpy cross-process exchange over
+# must pass. After the build, a `build` row also checks the std_srvs service parts against the
+# distro's OWN typesupport (the #[ignore]'d test in service_part_hash_test.rs loads the distro's
+# std_srvs introspection libraries and hashes every part through both bridges against the native
+# generated hash) and runs a REAL rclpy cross-process exchange over
 # rmw_cerulion in this distro's container (both directions, the three #[ignore]'d tests in
 # rclpy_xproc_test.rs run with --ignored against the freshly staged .so), with a wrong-payload
 # self-test that must red and a staged-vs-built digest check, so a green lane proves a real rclpy
 # peer talks to native Cerulion on this distro. The emulated aarch64 leg sets
 # RMW_GATE_SKIP_SERIAL_SUITE=1 to defer the in-process serial suite (the x86_64 lanes always run
-# it); the build, symbol audit, staged digest and the exchange still run there. `refuse`
+# it); the build, symbol audit, typesupport check, staged digest and the exchange still run there. `refuse`
 # means the build is expected to stop at a KNOWN place, and
 # the gate requires that exact marker in the build log: any other failure is a lane failure, and a
 # distro that silently starts building fails the lane too, so the table can never lag the truth.
@@ -157,8 +160,45 @@ case "$expect" in
                 echo "(a test that started passing or a new failure both land here; update the table in the PR that changes $distro)"; exit 1
             fi
         else
-            echo "== in-process serial suite SKIPPED on $distro (RMW_GATE_SKIP_SERIAL_SUITE=1); the gate still runs build + symbol audit + staged-library digest + rclpy exchanges + wrong-payload self-test =="
+            echo "== in-process serial suite SKIPPED on $distro (RMW_GATE_SKIP_SERIAL_SUITE=1); the gate still runs build + symbol audit + real-typesupport part check + staged-library digest + rclpy exchanges + wrong-payload self-test =="
         fi
+        # ===================================================================
+        # REAL-TYPESUPPORT SERVICE PART CHECK. The distro's OWN std_srvs
+        # introspection libraries (C and C++) are loaded from AMENT_PREFIX_PATH
+        # (the sourced setup.bash above also puts their dependencies on
+        # LD_LIBRARY_PATH), each service's typesupport handle is fetched through
+        # the getter rosidl exports, and the six Empty/SetBool/Trigger request and
+        # response parts go through the two bridge constructors; every bridged
+        # hash must equal the native generated SCHEMA_HASH, and the three empty
+        # parts must carry exactly rosidl's placeholder member. Only real rosidl
+        # proves which members a part carries, so this runs on every build row,
+        # the emulated leg included (the hand-built twin runs in the serial
+        # suite). The #[ignore]'d test in
+        # crates/rmw_cerulion/tests/service_part_hash_test.rs, run by name and
+        # judged like the exchanges below (rule 37: one summary, `1 passed;
+        # 0 failed`, and the named `test <name> ... ok` line).
+        # -------------------------------------------------------------------
+        TYPESUPPORT_TEST=real_std_srvs_typesupport_parts_hash_like_the_native_parts
+        tslog="/tmp/rmw_typesupport_${distro}.log"
+        echo "== rmw real-typesupport service part check on $distro: $TYPESUPPORT_TEST (--ignored) =="
+        cargo test --locked -p rmw_cerulion --release --test service_part_hash_test -- \
+            --ignored --test-threads=1 --exact "$TYPESUPPORT_TEST" 2>&1 | tee "$tslog"
+        rc_ts=${PIPESTATUS[0]}
+        plain_ts="${tslog}.plain"; strip_ansi "$tslog" > "$plain_ts"
+        if crashed "$plain_ts"; then
+            echo "GATE FAIL: $distro real-typesupport check crashed or its test target did not compile (rc=$rc_ts)"; exit 1
+        fi
+        summary_ts="$(grep -E '^test result: ' "$plain_ts" | tail -n 1)"
+        [ -n "$summary_ts" ] || { echo "GATE FAIL: $distro real-typesupport check printed NO 'test result:' summary - the binary did not run (rc=$rc_ts); last lines:"; tail -n 40 "$plain_ts"; exit 1; }
+        passed_ts=$(printf '%s\n' "$summary_ts" | awk '{print $4}')
+        failed_ts=$(printf '%s\n' "$summary_ts" | awk '{print $6}')
+        case "$passed_ts" in ''|*[!0-9]*) echo "GATE FAIL: $distro real-typesupport check - unparseable passed count in: $summary_ts"; exit 1 ;; esac
+        case "$failed_ts" in ''|*[!0-9]*) echo "GATE FAIL: $distro real-typesupport check - unparseable failed count in: $summary_ts"; exit 1 ;; esac
+        [ "$rc_ts" -eq 0 ] || { echo "GATE FAIL: $distro real-typesupport check exited rc=$rc_ts: a std_srvs part from the distro's own typesupport does not hash like the native generated part, or the libraries are missing; see $tslog"; exit 1; }
+        [ "$failed_ts" -eq 0 ] || { echo "GATE FAIL: $distro real-typesupport check summary reports $failed_ts failed"; exit 1; }
+        [ "$passed_ts" -eq 1 ] || { echo "GATE FAIL: $distro real-typesupport check summary reports $passed_ts passed, expected exactly 1 (one name filter); a zero or other count is a non-run (rule 37): $summary_ts"; exit 1; }
+        grep -qE "^test ${TYPESUPPORT_TEST} \.\.\. ok$" "$plain_ts" || { echo "GATE FAIL: $distro real-typesupport check passed a test, but the named '^test ${TYPESUPPORT_TEST} ... ok' line is absent (rule 37)"; echo "-- test lines seen:"; grep -E "^test " "$plain_ts" | head -20; exit 1; }
+        echo "TYPESUPPORT CHECK OK ($distro): the six std_srvs parts from the distro's own introspection hash like the native parts through both bridges (1 passed; 0 failed)"
         # ===================================================================
         # rclpy CROSS-PROCESS EXCHANGE (item: distro-lane rclpy step).
         # A REAL python3 rclpy process talks to in-process native Cerulion over

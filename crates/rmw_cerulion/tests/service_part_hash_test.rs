@@ -24,13 +24,20 @@
 //! distro's `std_srvs` introspection libraries (found through
 //! `AMENT_PREFIX_PATH`); the rmw distro lanes run it with `--ignored`.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
-use rmw_cerulion::ffi::introspection_cpp::{CppMessageMember, CppMessageMembers};
+use rmw_cerulion::ffi;
+use rmw_cerulion::ffi::introspection_cpp::{
+    CppMessageMember, CppMessageMembers, CppServiceMembers,
+};
 use rmw_cerulion::ffi::{
-    rosidl_message_type_support_t, rosidl_typesupport_introspection_c__MessageMember,
+    rosidl_message_type_support_t, rosidl_service_type_support_t,
+    rosidl_typesupport_introspection_c__MessageMember,
     rosidl_typesupport_introspection_c__MessageMembers,
+    rosidl_typesupport_introspection_c__ServiceMembers,
 };
 use rmw_cerulion::type_bridge::{BridgeError, BridgedMessage};
 use rmw_cerulion::type_bridge_cpp::CppBridgedMessage;
@@ -474,4 +481,180 @@ fn a_message_that_nests_a_member_less_message_is_refused_not_mis_hashed() {
             bridge.schema_hash()
         ),
     }
+}
+
+// =====================================================================
+// The distro's own std_srvs introspection libraries
+// =====================================================================
+
+/// The getter rosidl exports for a `std_srvs` service's introspection
+/// typesupport (`ROSIDL_TYPESUPPORT_INTERFACE__SERVICE_SYMBOL_NAME`).
+fn service_handle_symbol(language: &str, service: &str) -> String {
+    format!(
+        "rosidl_typesupport_introspection_{language}__get_service_type_support_handle__std_srvs__srv__{service}"
+    )
+}
+
+/// The first `<prefix>/lib/<lib>` on `AMENT_PREFIX_PATH` that exists. A
+/// missing variable or library is a NAMED failure: this arm only runs when
+/// asked for (`--ignored`), inside a sourced ROS 2 install.
+fn ament_library(lib: &str) -> PathBuf {
+    let prefixes = std::env::var("AMENT_PREFIX_PATH").unwrap_or_else(|_| {
+        panic!(
+            "AMENT_PREFIX_PATH is not set: this arm needs a sourced ROS 2 install \
+             (source /opt/ros/<distro>/setup.bash)"
+        )
+    });
+    prefixes
+        .split(':')
+        .map(|prefix| Path::new(prefix).join("lib").join(lib))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{lib} is not under any AMENT_PREFIX_PATH entry ({prefixes}); \
+                 install the distro's std_srvs package"
+            )
+        })
+}
+
+fn dlerror() -> String {
+    let e = unsafe { libc::dlerror() };
+    if e.is_null() {
+        "no dlerror".to_string()
+    } else {
+        unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned()
+    }
+}
+
+/// A dlopen'd typesupport library (process-lifetime, like rosidl's data).
+struct Library(*mut c_void);
+
+impl Library {
+    fn open(path: &Path) -> Self {
+        let c = CString::new(path.as_os_str().as_bytes()).expect("path");
+        let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        assert!(
+            !handle.is_null(),
+            "dlopen({}) failed: {}",
+            path.display(),
+            dlerror()
+        );
+        Self(handle)
+    }
+
+    /// Call the exported service typesupport getter `symbol`.
+    fn service_handle(&self, symbol: &str) -> *const rosidl_service_type_support_t {
+        let c = CString::new(symbol).expect("symbol");
+        let sym = unsafe { libc::dlsym(self.0, c.as_ptr()) };
+        assert!(!sym.is_null(), "{symbol} is not exported: {}", dlerror());
+        // SAFETY: rosidl declares every `*__get_service_type_support_handle__*`
+        // export with exactly this signature.
+        let getter: unsafe extern "C" fn() -> *const rosidl_service_type_support_t =
+            unsafe { std::mem::transmute(sym) };
+        let ts = unsafe { getter() };
+        assert!(!ts.is_null(), "{symbol} returned a null typesupport");
+        ts
+    }
+}
+
+/// The parts rosidl generates WITHOUT a declared member.
+const EMPTY_PARTS: [&str; 3] = [
+    "std_srvs/Empty_Request",
+    "std_srvs/Empty_Response",
+    "std_srvs/Trigger_Request",
+];
+
+/// rosidl's shape for an empty part: exactly one member, the placeholder.
+/// This is what proves the hand-built tables above are rosidl's shape, not
+/// a shape this crate imagined.
+fn assert_real_empty_part_shape(qualified_name: &str, member_count: u32, only_name: Option<&str>) {
+    if EMPTY_PARTS.contains(&qualified_name) {
+        assert_eq!(
+            member_count, 1,
+            "{qualified_name}: rosidl gives an empty struct one member"
+        );
+        assert_eq!(
+            only_name,
+            Some(PLACEHOLDER),
+            "{qualified_name}: that member is the placeholder"
+        );
+    } else {
+        assert_ne!(
+            only_name,
+            Some(PLACEHOLDER),
+            "{qualified_name}: a part with fields carries no placeholder"
+        );
+    }
+}
+
+/// The six parts as the distro's OWN rosidl generated them: `std_srvs`' C
+/// and C++ introspection libraries are loaded from `AMENT_PREFIX_PATH`, each
+/// service's typesupport handle is fetched through the getter rosidl exports,
+/// and the request and response members go through the same two bridge
+/// constructors as the hand-built arms. Each bridged hash must equal the
+/// native generated one, and the three empty parts must carry exactly the
+/// placeholder member.
+///
+/// Runs only with `--ignored` inside a sourced ROS 2 install (the rmw distro
+/// lanes do that, see `tools/ci/rmw-distros/gate.sh`). A plain `cargo test`
+/// skips it; asked for without ROS, it fails by name, never vacuously.
+#[test]
+#[ignore]
+fn real_std_srvs_typesupport_parts_hash_like_the_native_parts() {
+    let services = ["Empty", "SetBool", "Trigger"];
+
+    // C introspection (rclpy, rclc).
+    let c_lib = Library::open(&ament_library(
+        "libstd_srvs__rosidl_typesupport_introspection_c.so",
+    ));
+    let mut c_bridged = Vec::new();
+    for service in services {
+        let ts = c_lib.service_handle(&service_handle_symbol("c", service));
+        let identifier = unsafe { ffi::cstr((*ts).typesupport_identifier) };
+        assert_eq!(identifier, Some("rosidl_typesupport_introspection_c"));
+        let sm =
+            unsafe { &*((*ts).data as *const rosidl_typesupport_introspection_c__ServiceMembers) };
+        for members in [sm.request_members_, sm.response_members_] {
+            let bridge = unsafe { BridgedMessage::new(members) }.unwrap_or_else(|e| {
+                panic!("{service}: the C bridge must accept the distro's members: {e}")
+            });
+            let m = unsafe { &*members };
+            let only_name = unsafe { ffi::cstr((*m.members_).name_) };
+            assert_real_empty_part_shape(&bridge.qualified_name, m.member_count_, only_name);
+            c_bridged.push((bridge.qualified_name.clone(), bridge.schema_hash()));
+        }
+    }
+    let drifted = drift(c_bridged);
+    assert!(
+        drifted.is_empty(),
+        "the distro's C introspection and a native peer would not meet on:\n{}",
+        drifted.join("\n")
+    );
+
+    // C++ introspection (rclcpp).
+    let cpp_lib = Library::open(&ament_library(
+        "libstd_srvs__rosidl_typesupport_introspection_cpp.so",
+    ));
+    let mut cpp_bridged = Vec::new();
+    for service in services {
+        let ts = cpp_lib.service_handle(&service_handle_symbol("cpp", service));
+        let identifier = unsafe { ffi::cstr((*ts).typesupport_identifier) };
+        assert_eq!(identifier, Some("rosidl_typesupport_introspection_cpp"));
+        let sm = unsafe { &*((*ts).data as *const CppServiceMembers) };
+        for members in [sm.request_members_, sm.response_members_] {
+            let bridge = unsafe { CppBridgedMessage::new(members) }.unwrap_or_else(|e| {
+                panic!("{service}: the C++ bridge must accept the distro's members: {e}")
+            });
+            let m = unsafe { &*members };
+            let only_name = unsafe { ffi::cstr((*m.members_).name_) };
+            assert_real_empty_part_shape(&bridge.qualified_name, m.member_count_, only_name);
+            cpp_bridged.push((bridge.qualified_name.clone(), bridge.schema_hash()));
+        }
+    }
+    let drifted = drift(cpp_bridged);
+    assert!(
+        drifted.is_empty(),
+        "the distro's C++ introspection and a native peer would not meet on:\n{}",
+        drifted.join("\n")
+    );
 }
