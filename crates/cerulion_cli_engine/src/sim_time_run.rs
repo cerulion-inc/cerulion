@@ -1398,9 +1398,13 @@ mod tests {
         (header, frame)
     }
 
+    /// The delivered length of a frame that is exactly one wire header and
+    /// one clock body, whatever the header's size is.
+    const HEADER_AND_CLOCK_LEN: usize = WireHeader::SIZE + std::mem::size_of::<ClockBytes>();
+
     #[test]
     fn a_well_framed_clock_frame_yields_its_hash_and_body() {
-        let (header, frame) = framed(40, 40);
+        let (header, frame) = framed(HEADER_AND_CLOCK_LEN as u32, HEADER_AND_CLOCK_LEN);
         let (hash, body) = clock_frame_body(Some(header), &frame).expect("framing holds");
         assert_eq!(hash, Clock::SCHEMA_HASH);
         assert_eq!(body, &clock_bytes(1, 0).0[..]);
@@ -1435,11 +1439,12 @@ mod tests {
                 frame_bytes: 64
             })
         );
-        let (short, frame) = framed(8, 64);
+        let one_short = WireHeader::SIZE as u32 - 1;
+        let (short, frame) = framed(one_short, 64);
         assert_eq!(
             clock_frame_body(Some(short), &frame),
             Err(ClockRejection::BadFraming {
-                total_size: Some(8),
+                total_size: Some(one_short),
                 frame_bytes: 64
             })
         );
@@ -1457,7 +1462,7 @@ mod tests {
     /// undersized: framing and payload size are two separate verdicts.
     #[test]
     fn a_header_only_frame_is_framed_but_undersized() {
-        let (header, frame) = framed(32, 32);
+        let (header, frame) = framed(WireHeader::SIZE as u32, WireHeader::SIZE);
         let (hash, body) = clock_frame_body(Some(header), &frame).expect("framing holds");
         assert!(body.is_empty());
         assert_eq!(
