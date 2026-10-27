@@ -5,18 +5,21 @@
 
 #![cfg(unix)]
 
+mod mp_support;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cerulion_cli_engine::auth;
 use iceoryx2::prelude::SemanticString;
+use mp_support::ChildGuard;
 
 struct HttpSentinel {
     address: SocketAddr,
@@ -89,14 +92,6 @@ impl HttpSentinel {
 impl Drop for HttpSentinel {
     fn drop(&mut self) {
         self.finish();
-    }
-}
-
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -214,25 +209,21 @@ impl Fixture {
     fn run(&mut self, mut command: Command) -> Output {
         let stdout = self.root.path().join("stdout");
         let stderr = self.root.path().join("stderr");
-        let mut child = ChildGuard(
+        let mut child = ChildGuard::single_process(
             command
                 .stdout(std::fs::File::create(&stdout).unwrap())
                 .stderr(std::fs::File::create(&stderr).unwrap())
                 .spawn()
                 .unwrap(),
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                break status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "CLI deadline: {}",
-                std::fs::read_to_string(&stderr).unwrap()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let status = child
+            .wait_bounded(Duration::from_secs(10))
+            .unwrap_or_else(|| {
+                panic!(
+                    "CLI deadline: {}",
+                    std::fs::read_to_string(&stderr).unwrap()
+                )
+            });
         let out = Output {
             status,
             stdout: std::fs::read(stdout).unwrap(),
