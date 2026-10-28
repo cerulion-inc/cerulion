@@ -1,0 +1,7 @@
+# Build artifacts only. Cargo.lock is deliberately RE-INCLUDED (the same rule
+# as ../latency/native/.gitignore): the repo root .gitignore ignores every
+# non-root Cargo.lock, but this isolated workspace's lockfile pins the exact
+# flatbuffers, prost, capnp and criterion releases the vendored generated code
+# and the published method were built with.
+/target/
+!Cargo.lock

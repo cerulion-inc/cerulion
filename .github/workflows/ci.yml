@@ -905,10 +905,10 @@ jobs:
                         -type f -name Cargo.toml -not -path '*/target/*' | sort)
           # A walk that matched nothing would be a silent green. The floor is
           # the exact number of roots in the tree (two under benches/latency,
-          # eight examples, the fuzz crate, the Android sample's runtime
-          # crate), so losing any one of them trips it.
+          # benches/wire-formats, eight examples, the fuzz crate, the Android
+          # sample's runtime crate), so losing any one of them trips it.
           # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 12 ]; then
+          if [ "$checked" -lt 13 ]; then
             echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
             exit 1
           fi
