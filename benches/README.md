@@ -33,13 +33,13 @@ python3 benches/latency/bench.py compile-csv && python3 benches/latency/bench.py
 
 | Directory | Status | What it is |
 |---|---|---|
-| `latency/` | **ACTIVE: the public suite** | Complete, self-contained latency campaign: native floor + comparison lines, real-CLI workspace lines (`cerulion graph run`, mono + split + split3 legs, free-run default with an opt-in lockstep arm), ROS 2 cell matrix in Docker, driver (`bench.py`), strict offline aggregation, smoke gate, plot system. Raw `.bin` samples → offline percentiles; no number ships without its harness (Principle #13). |
+| `latency/` | **ACTIVE: the public suite** | Complete, self-contained latency campaign: native floor + comparison lines, real-CLI workspace lines (`cerulion graph run`, mono + split + split3 legs, free-run default with an opt-in lockstep arm), ROS 2 cell matrix in Docker, driver (`bench.py`), strict offline aggregation, smoke gate, plot system. Raw `.bin` samples → offline percentiles; no number ships without its harness (no fake data). |
 
 ## Conventions (all suites)
 
 - Standalone workspaces (NOT root-workspace members); each has its own
   `Cargo.toml` + `Cargo.lock`. Always build `--release`.
-- No fake data, ever (Principle #13): no latency number appears anywhere
+- No fake data, ever: no latency number appears anywhere
   until a real run produces it, and every published number is
   recomputable from committed raw samples + the committed harness + the
   host spec: no number leaves the repo without its harness.

@@ -102,8 +102,8 @@ whose achieved rate is not the 100 Hz target (`@20Hz` at the marker,
 kept in `--release` renders: an unmarked fallback point would claim a
 measurement the cell never made). A cell that exhausts the ladder at a
 size renders **"did not sustain"** (an EMPTY CSV row plus a loud note
-and an in-figure gap explanation), never a latency number (Principle
-#13). That outcome is itself a product contrast, not a harness failure:
+and an in-figure gap explanation), never a latency number (no fake
+data). That outcome is itself a product contrast, not a harness failure:
 the accurate rendering of "this transport cannot move 16 MB at any ladder
 rate" is exactly that sentence.
 
@@ -976,7 +976,7 @@ double-count is visible instead of silently quoted (plot_usage.py
 draws PSS solid, RSS dashed). Unreadable values (e.g. `smaps_rollup`
 of a root-owned chrt/sudo tree read by an unprivileged sampler) are
 recorded as EMPTY and counted in the sidecar footer, never zeroed
-(Principle #13). **A summed PSS is served only under provable FULL
+(no fake data). **A summed PSS is served only under provable FULL
 coverage** (footer present with `pss_denied=0` and every PSS tick
 covering every sampled process): a partially-denied tree summed only
 its readable minority would fabricate a LOW memory number, so
@@ -1526,7 +1526,7 @@ test the hypothesis directly instead of implying it:
 > structurally forced out of its zero-copy lanes into full serialize +
 > delivery memcpy, and that cost is O(payload).
 
-No number appears in this section until the cells have been measured (Principle #13);
+No number appears in this section until the cells have been measured (no fake data);
 the hypothesis is stated so the sweep can confirm or refute it.
 
 ### The two classes, per stack

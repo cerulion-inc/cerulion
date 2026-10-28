@@ -300,10 +300,10 @@ cargo test -p cerulion_core --test latency_threshold_test --release -- --test-th
 ### No fabricated data, ever
 
 Cerulion's whole value is that its numbers are *real*. We never commit fake,
-mocked, or simulated data in benchmarks, tests, or docs (this is core
-Principle #13). If a test needs data, it uses real, measured, or
-deterministically generated data, never an invented number. This is how we keep
-our performance claims trustworthy, and we'd love your help holding that line.
+mocked, or simulated data in benchmarks, tests, or docs. If a test needs data,
+it uses real, measured, or deterministically generated data, never an invented
+number. This is how we keep our performance claims trustworthy, and we'd love
+your help holding that line.
 
 **A red CI check is never you failing.** It's just CI telling you something needs
 a tweak: push again, no problem. If you're stuck on a check, ask in Discussions
@@ -357,8 +357,8 @@ any kind. Whatever tool you use, the same bar applies:
 - **You own your PR.** Review and *understand* everything you submit: you're
   accountable for it in review, not the tool.
 - **The Quality Contract must pass**, exactly as it does for hand-written code.
-- **Principle #13 is absolute.** Never let an agent invent benchmark numbers,
-  test fixtures, or measured data.
+- **The no-fake-data rule is absolute.** Never let an agent invent benchmark
+  numbers, test fixtures, or measured data.
 
 ## What to expect from review
 

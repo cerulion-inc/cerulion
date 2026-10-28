@@ -21,7 +21,7 @@ post-processing. Published result packages live under
 > `docs/benchmarks/results/` (see `docs/benchmarks/README.md`). The working
 > directory `results/` here is empty and `expected-ranges.yaml` ships with
 > `hosts: {}`: a host captures its own baseline before the smoke gate means
-> anything. This repo's Principle #13 (never fabricate data) applies to
+> anything. This repo's no-fake-data rule (never fabricate data) applies to
 > benchmarks with full force: no latency number appears anywhere in this
 > suite until a real run produces it, and every published number is
 > recomputable from its committed package.
@@ -480,7 +480,7 @@ baselines until a real machine captures one. Capture runs its cells three
 times and records `[p50/2, p50*2]` bounds around the **median** of the
 three measured p50s under that host's machine hash (a lucky single rep
 cannot set the bounds); entries are written only by `--capture-baseline`,
-never by hand (Principle #13). The gate refuses to run when ambient `CER_BENCH_*`
+never by hand (no fake data). The gate refuses to run when ambient `CER_BENCH_*`
 overrides are present in the environment (they would silently change what
 the baseline means).
 
@@ -665,7 +665,7 @@ climbing) are the portable story.
 ## Reporting requirements
 
 - `results/` stays empty until real runs land. No placeholder CSVs, no
-  synthetic samples, anywhere (Principle #13).
+  synthetic samples, anywhere (no fake data).
 - Percentiles are computed offline from committed raw `.bin` samples;
   every published number is independently recomputable.
 - Every cell that doesn't run is a printed skip with a reason, not a
