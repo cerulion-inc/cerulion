@@ -14,9 +14,8 @@
 //!   wait returns at once, rcl finds the steady timer not yet due, and the
 //!   recorded publish is missing.
 //!
-//! Not covered here (no colcon fixture in this slice): an rclcpp node on ROS
-//! time with the TimeSource clock thread, and the rclcpp MultiThreadedExecutor
-//! refusal.
+//! rclcpp nodes on ROS time (with the clock thread) and the rclcpp
+//! `MultiThreadedExecutor` refusal are in `rmw_replay_rclcpp_mixer_test.rs`.
 //!
 //! `#[ignore]`: needs ROS 2, `demo_nodes_cpp` and the staged `.so`; the recipe
 //! is in `replay_harness`. Linux only.

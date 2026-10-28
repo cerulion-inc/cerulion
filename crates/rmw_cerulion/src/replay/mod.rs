@@ -34,7 +34,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ffi::{self, rmw_ret_t, RMW_RET_ERROR, RMW_RET_TIMEOUT};
 use crate::runtime::GuardConditionState;
@@ -58,6 +58,13 @@ pub const VERDICT_SUFFIX: &str = ".verdict.json";
 /// How long a replayed `rmw_wait` with nothing left to serve sleeps before it
 /// returns `RMW_RET_TIMEOUT`, so a spinning executor does not burn a core.
 const IDLE_AFTER_LOG: Duration = Duration::from_millis(20);
+/// How long a served window waits for the entities the recording created
+/// before it (see `Player::creation_fence`). Below the watchdog's 5 s, so a
+/// fence never reads as a stalled token.
+const CREATION_FENCE: Duration = Duration::from_secs(2);
+/// How long a recording thread waits for the clock section (see
+/// `Recorder::clock_section`) before it goes on without it.
+const CLOCK_SECTION_WAIT: Duration = Duration::from_millis(5);
 
 /// What this process does with its deliveries.
 pub(crate) enum Mode {
@@ -165,6 +172,34 @@ thread_local! {
     };
     static OUTPUT_ARMED: Cell<bool> = const { Cell::new(false) };
     static OUTPUT_CAPTURE: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
+    /// Recording: this thread took `/clock` and has not re-entered `rmw_wait`.
+    static CLOCK_HELD: Cell<bool> = const { Cell::new(false) };
+    /// Recording: this thread's `rmw_wait` returned and it has made no rmw
+    /// call since (rcl checks its timers in that span).
+    static POST_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread holds the Python GIL (`PyGILState_Check`, looked up
+/// once in the process; `false` in a process without Python).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn holds_python_gil() -> bool {
+    static CHECK: OnceLock<Option<unsafe extern "C" fn() -> libc::c_int>> = OnceLock::new();
+    let f = CHECK.get_or_init(|| {
+        // SAFETY: dlsym with a NUL-terminated name; a non-null result is the
+        // C function `int PyGILState_Check(void)`.
+        let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"PyGILState_Check".as_ptr()) };
+        (!p.is_null()).then(|| unsafe {
+            std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_int>(p)
+        })
+    });
+    // SAFETY: PyGILState_Check may be called from any thread at any time.
+    f.is_some_and(|f| unsafe { f() } == 1)
+}
+
+/// No `libc` here (a Linux-only dependency); replay runs on Linux only.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn holds_python_gil() -> bool {
+    false
 }
 
 /// This thread's index: the order in which threads first reached a hook.
@@ -261,6 +296,9 @@ struct Registry {
     next_id: EntityId,
     guards: u32,
     nodes: Vec<String>,
+    /// Replay: every recorded entity a live entity has been bound to (kept
+    /// after the live entity is destroyed).
+    bound: HashSet<EntityId>,
 }
 
 impl Registry {
@@ -679,6 +717,10 @@ impl Recorder {
         meta: impl FnOnce(rmw_ret_t) -> TakeMeta,
     ) -> rmw_ret_t {
         TAKE_CAPTURE.with(|c| c.borrow_mut().have = false);
+        self.clock_leave(false);
+        if !CLOCK_HELD.with(Cell::get) && self.is_clock_sub(key) {
+            self.clock_section(true);
+        }
         let ret = {
             let _armed = Armed::new(&TAKE_ARMED);
             live()
@@ -727,6 +769,9 @@ pub(crate) fn output(key: usize, kind: OutputKind, live: impl FnOnce() -> rmw_re
         return live();
     }
     OUTPUT_CAPTURE.with(|c| c.set(None));
+    if let Mode::Record(r) = m {
+        r.clock_leave(false);
+    }
     let ret = {
         let _armed = Armed::new(&OUTPUT_ARMED);
         live()
@@ -817,6 +862,11 @@ pub(crate) struct Recorder {
     registry: Mutex<Registry>,
     detector: Detector,
     not_replayable: AtomicBool,
+    /// The clock section: (threads holding a `/clock` take, threads inside a
+    /// post-wait span). See [`Recorder::clock_section`].
+    clock: Mutex<(u32, u32)>,
+    clock_cv: std::sync::Condvar,
+    clock_waits_timed_out: std::sync::atomic::AtomicU64,
 }
 
 impl Recorder {
@@ -871,7 +921,75 @@ impl Recorder {
             registry: Mutex::new(Registry::default()),
             detector: Detector::default(),
             not_replayable: AtomicBool::new(false),
+            clock: Mutex::new((0, 0)),
+            clock_cv: std::sync::Condvar::new(),
+            clock_waits_timed_out: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The clock section keeps two things the rmw cannot see apart in the
+    /// recording. rcl checks a thread's timers right after its `rmw_wait`
+    /// returns, against the ROS time a `/clock` callback (on rclcpp's clock
+    /// thread) sets after its take. Live, those two race; replayed, the token
+    /// serves them one at a time in the recorded order. So while recording:
+    /// a `rmw_wait` return waits until no `/clock` take is between its take
+    /// and its thread's next `rmw_wait` (its callback has set the time), and
+    /// a `/clock` take waits until no thread is between its `rmw_wait` return
+    /// and its next rmw call (its timer check is done). Each side waits at
+    /// most [`CLOCK_SECTION_WAIT`], then goes on, counted and reported when
+    /// the log closes.
+    fn clock_section(&self, enter_clock: bool) {
+        let mut g = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + CLOCK_SECTION_WAIT;
+        loop {
+            let busy = if enter_clock { g.1 > 0 } else { g.0 > 0 };
+            if !busy {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.clock_waits_timed_out.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            g = self
+                .clock_cv
+                .wait_timeout(g, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if enter_clock {
+            g.0 += 1;
+            CLOCK_HELD.with(|c| c.set(true));
+        } else {
+            g.1 += 1;
+            POST_WAIT.with(|c| c.set(true));
+        }
+    }
+
+    /// This thread made an rmw call: its post-wait span (if any) ends; on
+    /// `rmw_wait` entry its `/clock` take (if any) ends too.
+    fn clock_leave(&self, wait_entry: bool) {
+        let post = POST_WAIT.with(|c| c.replace(false));
+        let clock = wait_entry && CLOCK_HELD.with(|c| c.replace(false));
+        if post || clock {
+            let mut g = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+            if post {
+                g.1 = g.1.saturating_sub(1);
+            }
+            if clock {
+                g.0 = g.0.saturating_sub(1);
+            }
+            self.clock_cv.notify_all();
+        }
+    }
+
+    fn is_clock_sub(&self, key: usize) -> bool {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_key
+            .get(&key)
+            .is_some_and(|e| e.topic == "/clock" && e.name.starts_with("sub:"))
     }
 
     fn append(&self, rec: Record) -> u64 {
@@ -891,6 +1009,16 @@ impl Recorder {
     fn finish(&self) {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let trailer = w.finish();
+        let timed_out = self.clock_waits_timed_out.load(Ordering::Relaxed);
+        if timed_out > 0 {
+            tracing::warn!(
+                log = %w.path().display(),
+                timed_out,
+                "rmw_cerulion delivery log: {timed_out} clock-section waits gave up after {} ms; \
+                 a replay may diverge at a timer that fired next to a /clock update",
+                CLOCK_SECTION_WAIT.as_millis()
+            );
+        }
         if !trailer.complete || trailer.dropped > 0 {
             tracing::error!(
                 log = %w.path().display(),
@@ -972,6 +1100,7 @@ impl Recorder {
     ) -> rmw_ret_t {
         let thread = thread_ix();
         WAITED.with(|w| w.set(true));
+        self.clock_leave(true);
         if let Some(d) = self.detector.on_wait(owner, thread) {
             self.mark_not_replayable(&d);
         }
@@ -990,6 +1119,8 @@ impl Recorder {
             let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             arrays.entities(&reg).iter().map(|e| e.id).collect()
         };
+        // After the live wait, before the record's order key is minted.
+        self.clock_section(false);
         self.append(Record::Wait(WaitRec {
             k: 0,
             thread,
@@ -1022,6 +1153,8 @@ struct PlayState {
     /// Each recorded thread's last served take: the callback a stalled token
     /// holder is in.
     last_take: HashMap<u32, EntityId>,
+    /// Served takes not ordered across threads (made holding the Python GIL).
+    takes_unordered: usize,
 }
 
 /// The replay side.
@@ -1038,6 +1171,10 @@ pub(crate) struct Player {
     /// Each recorded thread's first attached set (maps a replaying thread to
     /// the recorded one at its first wait).
     first_attached: HashMap<u32, Vec<EntityId>>,
+    /// Every recorded entity as (creation order key, id), by key.
+    created: Vec<(u64, EntityId)>,
+    /// The creation fence's position in `created` (`usize::MAX` once lifted).
+    fence_cursor: Mutex<usize>,
     state: Mutex<PlayState>,
 }
 
@@ -1052,6 +1189,7 @@ fn refused_verdict(log: &Path, why: &str) -> Verdict {
         units_served: 0,
         windows_served_as_sets: 0,
         windows_split: 0,
+        takes_unordered: 0,
         segments_compared: 0,
         segments_divergent: 0,
         segments_inherited: 0,
@@ -1141,6 +1279,8 @@ impl Player {
                 .or_insert_with(|| w.attached.clone());
         }
         let gate = Gate::new(&schedule);
+        let mut created: Vec<(u64, EntityId)> = rec_by_name.values().map(|e| (e.k, e.id)).collect();
+        created.sort_unstable();
         let oracle = Oracle::new(&log.records, names);
         tracing::info!(
             log = %path.display(),
@@ -1158,6 +1298,8 @@ impl Player {
             rec_by_name,
             rec_nodes,
             first_attached,
+            created,
+            fence_cursor: Mutex::new(0),
             state: Mutex::new(PlayState {
                 takes: TakeQueues::new(&takes),
                 graph: GraphAnswers::new(&graphs),
@@ -1171,6 +1313,7 @@ impl Player {
                 verdict_written: false,
                 exhausted: false,
                 last_take: HashMap::new(),
+                takes_unordered: 0,
             }),
             schedule,
         })
@@ -1220,6 +1363,60 @@ impl Player {
         let rec = self.rec_by_name.get(&ent.name).map(|r| r.id);
         if let Some(e) = reg.by_key.get_mut(&key) {
             e.rec = rec;
+        }
+        if let Some(r) = rec {
+            reg.bound.insert(r);
+        }
+    }
+
+    /// The creation fence: before window `k` is served, every entity the
+    /// recording created before `k` must exist live. Entity creation is not a
+    /// served event, so without the fence a thread can be served a window
+    /// (an rclcpp clock thread's "entities changed" guard) before another
+    /// thread creates the entity the recorded wake-up collected, and that
+    /// thread's next wait then lacks it. Waits at most [`CREATION_FENCE`];
+    /// an entity still missing then is reported as an input mismatch and the
+    /// fence is lifted for the rest of the replay.
+    fn creation_fence(&self, k: u64, rec_thread: u32) {
+        let deadline = Instant::now() + CREATION_FENCE;
+        loop {
+            let missing = {
+                let mut cur = self.fence_cursor.lock().unwrap_or_else(|e| e.into_inner());
+                if *cur == usize::MAX {
+                    return;
+                }
+                let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                while *cur < self.created.len()
+                    && self.created[*cur].0 < k
+                    && reg.bound.contains(&self.created[*cur].1)
+                {
+                    *cur += 1;
+                }
+                if *cur >= self.created.len() || self.created[*cur].0 >= k {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let id = self.created[*cur].1;
+                    *cur = usize::MAX;
+                    Some(id)
+                } else {
+                    None
+                }
+            };
+            if let Some(id) = missing {
+                let mut st = self.lock();
+                let (name, _) = st.oracle.describe(id);
+                st.oracle.input_mismatch(
+                    format!(
+                        "the recording created {name} before window order key {k}, and this \
+                         process had not created it {}s later",
+                        CREATION_FENCE.as_secs()
+                    ),
+                    Some(rec_thread),
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1333,6 +1530,9 @@ impl Player {
             Turn::Serve(i) => {
                 let unit = &self.schedule.units[i];
                 let window = &self.schedule.windows[unit.window];
+                if unit.first {
+                    self.creation_fence(window.k, rec_thread);
+                }
                 let mut st = self.lock();
                 if unit.first {
                     st.oracle.event(live, window.k);
@@ -1466,13 +1666,40 @@ impl Player {
         if let Some(m) = served.mismatch {
             st.oracle.input_mismatch(m, rec_thread);
         }
-        if let Some(r) = &served.rec {
+        if let (Some(r), Some(t)) = (&served.rec, rec_thread) {
+            // The take's turn across threads (gate.rs, "Takes in order across
+            // threads"), with the state unlocked: other threads' waits and
+            // takes run meanwhile. Not while this thread holds the Python GIL
+            // (rclpy takes with it held): the thread whose turn comes first
+            // may need the GIL to reach its rmw call, so the take runs at
+            // once. rclpy keeps each node's clock on that node's executor
+            // thread, so its timer checks do not race another thread.
+            if holds_python_gil() {
+                st.takes_unordered += 1;
+                return self.finish_take(st, live, rec_thread, entity, served.rec);
+            }
+            drop(st);
+            self.gate.take_turn(t, r.k, |stall| self.on_stall(stall));
+            st = self.lock();
+        }
+        self.finish_take(st, live, rec_thread, entity, served.rec)
+    }
+
+    fn finish_take(
+        &self,
+        mut st: std::sync::MutexGuard<'_, PlayState>,
+        live: u32,
+        rec_thread: Option<u32>,
+        entity: EntityId,
+        rec: Option<TakeRec>,
+    ) -> Result<Option<TakeRec>, ()> {
+        if let Some(r) = &rec {
             st.oracle.event(live, r.k);
             if let Some(t) = rec_thread {
                 st.last_take.insert(t, entity);
             }
         }
-        Ok(served.rec)
+        Ok(rec)
     }
 
     /// A served take could not be decoded into the caller's message.
@@ -1546,6 +1773,7 @@ impl Player {
             units_served: served,
             windows_served_as_sets: self.schedule.set_served_windows,
             windows_split: self.schedule.split_windows,
+            takes_unordered: st.takes_unordered,
             segments_compared: o.segments_compared,
             segments_divergent: o.segments_divergent,
             segments_inherited: o.segments_inherited,

@@ -55,7 +55,7 @@ Outputs are compared as a 64-bit FNV-1a hash of each payload, one segment at a t
 
 Replay reproduces the recorded run when all of these hold for the process:
 
-1. **C1** Every thread that runs callbacks is a single-threaded executor thread that calls `rmw_wait`. Several single-threaded executors on several threads are fine: the replay serves their windows in the recorded order and lets one thread run at a time.
+1. **C1** Every thread that runs callbacks is a single-threaded executor thread that calls `rmw_wait`. Several single-threaded executors on several threads are fine: the replay serves their windows and takes in the recorded order and lets one thread run at a time. That includes rclcpp's clock thread, which takes `/clock` on its own executor when `use_sim_time` is set: while recording, a `/clock` update and another thread's timer check are kept apart (each waits at most 5 ms for the other), so the recorded order is one the replay can serve.
 2. **C2** No node logic reads the wall or steady clock. Use ROS time (`use_sim_time`, with `/clock` recorded); a wall timer (`create_wall_timer`) or a `time.time_ns()` read diverges, and the verdict names it.
 3. **C3** Random numbers are seeded or absent.
 4. **C4** No callback blocks on work another thread owns. If one does, the watchdog names it.
@@ -65,7 +65,7 @@ Replay reproduces the recorded run when all of these hold for the process:
 The rmw checks what it can and refuses the rest by name, at `rmw_init`, before the node runs:
 
 - a log recorded by a different process: another command line, another `ROS_DISTRO`, or another build of `librmw_cerulion.so` (its file digest is in the log). The refusal names the field.
-- a multi-threaded executor. An rclcpp `MultiThreadedExecutor` (two threads waiting on one wait set) and an rclpy `MultiThreadedExecutor` (takes from a pool thread that never waits) are detected while recording, the log is marked not replayable, and its replay fails with `ros2 process <command> (nodes <names>): MultiThreadedExecutor, not replayable`.
+- a multi-threaded executor. An rclcpp `MultiThreadedExecutor` (two threads waiting on one wait set) and an rclpy `MultiThreadedExecutor` (takes from a pool thread that never waits) are detected while recording, the log is marked not replayable, and its replay fails with `ros2 process <command> (nodes <names>): MultiThreadedExecutor, not replayable`. The rclcpp mark needs a second executor thread to reach `rmw_wait`: with callbacks that finish in microseconds, the thread that just ran one takes the executor's wait mutex again first, the second thread never waits, and the recording carries no mark (that run executed as a single thread). If the second thread waits during the replay, the replay is refused then.
 - a node the recording did not create at that point.
 - `CERULION_RMW_DELIVERY_LOG` and `CERULION_RMW_REPLAY` both set.
 - a serialized take (`rmw_take_serialized_message`, used by rosbag2's recorder): the log records decoded takes only, so it is marked not replayable.
@@ -78,7 +78,8 @@ Graph queries are answered from the recording too: `count_publishers`, `count_su
 - That any ROS 2 process replays. Only processes that meet C1 to C6 do; the others are named where the rmw can see them, and otherwise diverge.
 - That a launch replays as a whole. Each process replays alone, against its own log; processes that feed each other are not replayed together.
 - That replay covers `EventsExecutor`, rclcpp intra-process communication or loaned takes. A replay turns loans off (rclcpp then takes by copy, the same message).
-- That every distro is runtime-tested. The tests run on ROS 2 Humble. Foxy, Jazzy and Lyrical builds compile the same code.
+- That every distro is runtime-tested. The tests run on ROS 2 Humble, with rclpy nodes, the stock `demo_nodes_cpp` executables and rclcpp nodes on ROS time. Foxy, Jazzy and Lyrical builds compile the same code.
+- That two replays write byte-identical verdict files in every field. `guards_not_triggered_live` counts recorded-ready guard conditions with no live trigger when served; the last windows carry the shutdown guards the recording's Ctrl-C triggered, so the count can differ by one between replays of an rclcpp log.
 
 ## Files
 

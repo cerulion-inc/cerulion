@@ -334,7 +334,9 @@ case "$expect" in
         # the rmw's verdict file. Each named test runs in its OWN cargo
         # invocation and must report exactly `1 passed; 0 failed` with its own
         # `test <name> ... ok` line (rule 37). The rclcpp arms need
-        # demo_nodes_cpp, which ros-base does not ship: installed here.
+        # demo_nodes_cpp, which ros-base does not ship: installed here; the
+        # rclcpp fixture (tests/fixtures/replay_probe_cpp) is built by colcon
+        # inside its test, so colcon must be on PATH.
         # -------------------------------------------------------------------
         case " $replay_runtime_distros " in
         *" $distro "*)
@@ -342,14 +344,21 @@ case "$expect" in
                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "ros-$distro-demo-nodes-cpp" >/dev/null 2>&1 \
                     || { echo "GATE FAIL: $distro replay - could not install ros-$distro-demo-nodes-cpp"; exit 1; }
             fi
+            if ! command -v colcon >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-colcon-common-extensions build-essential cmake >/dev/null 2>&1 \
+                    || { echo "GATE FAIL: $distro replay - could not install colcon for the rclcpp replay fixture"; exit 1; }
+            fi
             REPLAY_TIMEOUT="${REPLAY_TIMEOUT:-900}"
-            REPLAY_EXPECTED=9
+            REPLAY_EXPECTED=12
             replay_ok=0
             for spec in \
                 rmw_replay_rclpy_probe_test:the_mixer_replays_byte_identical_five_times \
                 rmw_replay_rclpy_probe_test:a_wall_clock_read_is_named_as_the_divergence \
                 rmw_replay_rclcpp_probe_test:the_rclcpp_listener_replays_every_take_in_order \
                 rmw_replay_rclcpp_probe_test:the_rclcpp_wall_timer_talker_is_named \
+                rmw_replay_rclcpp_mixer_test:the_rclcpp_probe_replays_byte_identical_five_times \
+                rmw_replay_rclcpp_mixer_test:an_rclcpp_wall_clock_read_is_named_as_the_divergence \
+                rmw_replay_rclcpp_mixer_test:an_rclcpp_multithreaded_executor_is_refused_and_a_single_thread_is_not \
                 rmw_replay_refusal_test:an_rclpy_multithreaded_executor_is_refused_and_a_single_thread_is_not \
                 rmw_replay_refusal_test:both_variables_set_is_refused_by_name \
                 rmw_replay_refusal_test:a_log_of_another_process_is_refused \

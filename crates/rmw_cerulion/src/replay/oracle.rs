@@ -116,6 +116,9 @@ pub(crate) struct Verdict {
     pub units_served: usize,
     pub windows_served_as_sets: usize,
     pub windows_split: usize,
+    /// Served takes run without their cross-thread turn (made holding the
+    /// Python GIL; see `gate.rs`).
+    pub takes_unordered: usize,
     pub segments_compared: usize,
     pub segments_divergent: usize,
     pub segments_inherited: usize,

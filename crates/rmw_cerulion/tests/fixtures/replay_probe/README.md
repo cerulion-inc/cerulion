@@ -1,6 +1,6 @@
 # replay_probe fixtures
 
-rclpy nodes for the exact-replay tests (`tests/rmw_replay_*_test.rs`). Each
+rclpy nodes for the exact-replay tests (the rclcpp ones are the ament_cmake package `../replay_probe_cpp`: `talker_cpp`, `mixer_cpp` (node `mixer`; `MIXER_WALLCLOCK=1`, `PROBE_MT=1`, `PROBE_CB_SLEEP_US`) and `listener_cpp`, built by colcon inside `rmw_replay_rclcpp_mixer_test`) (`tests/rmw_replay_*_test.rs`). Each
 node logs every callback, in order, to `<PROBE_OUT>/<node>.jsonl`; the tests
 compare those logs between a recorded run and its replays. None of them is
 built or run by a plain `cargo test`: the replay tests are `#[ignore]` and need

@@ -32,6 +32,18 @@
 //! single-threaded executors on several threads (the rclcpp clock thread, a
 //! tf2 listener) it makes their callbacks interleave in the recorded order.
 //!
+//! # Takes in order across threads
+//!
+//! A served take also waits for its turn: it runs once every unit and every
+//! other thread's waiting take with a smaller order key is served and the
+//! token is free, and then holds the token until its thread's next rmw call.
+//! So a thread's window that the recording returned between another thread's
+//! wait return and that thread's take is served in between, as recorded. This
+//! is what keeps an rclcpp clock thread's `/clock` take (and the ROS time its
+//! callback sets) on the recorded side of the executor thread's rcl timer
+//! check, which runs right after that thread's `rmw_wait` returns, while it
+//! holds the token.
+//!
 //! # The watchdog
 //!
 //! A thread that has waited [`WATCHDOG`] for its turn with no rmw progress
@@ -210,11 +222,14 @@ struct TokenState {
     next: usize,
     holder: Option<(u32, usize)>,
     remaining: HashMap<u32, usize>,
+    /// Order keys of the served takes waiting for their turn.
+    waiting_takes: std::collections::BTreeSet<u64>,
 }
 
 /// The token and the unit cursor.
 pub(crate) struct Gate {
     units_thread: Vec<u32>,
+    units_key: Vec<u64>,
     state: Mutex<TokenState>,
     cv: Condvar,
     /// Bumped on every rmw event of the replaying process: the watchdog's
@@ -230,10 +245,12 @@ impl Gate {
         }
         Gate {
             units_thread: schedule.units.iter().map(|u| u.thread).collect(),
+            units_key: schedule.units.iter().map(|u| u.key).collect(),
             state: Mutex::new(TokenState {
                 next: 0,
                 holder: None,
                 remaining,
+                waiting_takes: std::collections::BTreeSet::new(),
             }),
             cv: Condvar::new(),
             progress: AtomicU64::new(0),
@@ -248,6 +265,59 @@ impl Gate {
     /// The number of units served so far.
     pub(crate) fn served(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).next
+    }
+
+    /// Block until the served take with order key `k` on `thread` may run
+    /// (see "Takes in order across threads"), then hold the token. Releases
+    /// the token first if `thread` holds it. `on_stall` is called once per
+    /// stall that lasts [`WATCHDOG`] with no progress; the take then runs.
+    pub(crate) fn take_turn(&self, thread: u32, k: u64, mut on_stall: impl FnMut(Stall)) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(st.holder, Some((h, _)) if h == thread) {
+            st.holder = None;
+            self.cv.notify_all();
+        }
+        st.waiting_takes.insert(k);
+        let mut last_progress = self.progress.load(Ordering::Relaxed);
+        let mut since = Instant::now();
+        loop {
+            let units_before = st.next < self.units_key.len() && self.units_key[st.next] < k;
+            let takes_before = st.waiting_takes.first().is_some_and(|&first| first < k);
+            if st.holder.is_none() && !units_before && !takes_before {
+                break;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+            let now_progress = self.progress.load(Ordering::Relaxed);
+            if now_progress != last_progress {
+                last_progress = now_progress;
+                since = Instant::now();
+            } else if since.elapsed() >= WATCHDOG {
+                let (holder_thread, unit) = match st.holder {
+                    Some(h) => h,
+                    None => (
+                        self.units_thread.get(st.next).copied().unwrap_or(thread),
+                        st.next,
+                    ),
+                };
+                st.waiting_takes.remove(&k);
+                self.cv.notify_all();
+                drop(st);
+                on_stall(Stall {
+                    holder_thread,
+                    unit,
+                    waiting_thread: thread,
+                });
+                return;
+            }
+        }
+        st.waiting_takes.remove(&k);
+        st.holder = Some((thread, st.next.saturating_sub(1)));
+        self.progress.fetch_add(1, Ordering::Relaxed);
+        self.cv.notify_all();
     }
 
     /// Block until it is `thread`'s turn. Releases the token if `thread`
@@ -269,7 +339,11 @@ impl Gate {
             if st.remaining.get(&thread).copied().unwrap_or(0) == 0 {
                 return Turn::NoMore;
             }
-            if st.holder.is_none() && self.units_thread[st.next] == thread {
+            let take_before = st
+                .waiting_takes
+                .first()
+                .is_some_and(|&t| t < self.units_key[st.next]);
+            if st.holder.is_none() && self.units_thread[st.next] == thread && !take_before {
                 let idx = st.next;
                 st.next += 1;
                 st.holder = Some((thread, idx));
@@ -549,6 +623,51 @@ mod tests {
         t1.join().unwrap();
         assert_eq!(*log.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(gate.served(), 3);
+    }
+
+    #[test]
+    fn a_take_waits_for_another_threads_window_recorded_before_it() {
+        // The rclcpp clock thread (1) returns from its wait at k 10 and takes
+        // /clock at k 12; the executor thread (0) returned from its wait at
+        // k 11 in between, and checked its timers before the time moved.
+        let waits = [
+            wait(10, 1, RMW_RET_OK, &[CLOCK]),
+            wait(11, 0, RMW_RET_OK, &[A]),
+        ];
+        let takes = [take(12, 1, CLOCK), take(13, 0, A)];
+        let s = Schedule::build(&waits, &takes, &clock_set());
+        let gate = Arc::new(Gate::new(&s));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        // Thread 1 is served its window and goes to take at once.
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Serve(0));
+        let (g, o) = (Arc::clone(&gate), Arc::clone(&order));
+        let clock = std::thread::spawn(move || {
+            g.take_turn(1, 12, |_| panic!("no stall"));
+            o.lock().unwrap().push("take clock k12");
+            // Back in rmw_wait: the token passes on.
+            assert_eq!(g.wait_turn(1, |_| panic!("no stall")), Turn::Exhausted);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the /clock take waits for thread 0's window at k 11"
+        );
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Serve(1));
+        order.lock().unwrap().push("serve window k11");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            order.lock().unwrap().len(),
+            1,
+            "thread 0 holds the token until its next rmw call (its timer check)"
+        );
+        // Thread 0's take at k 13 waits for the clock take at k 12.
+        gate.take_turn(0, 13, |_| panic!("no stall"));
+        order.lock().unwrap().push("take a k13");
+        clock.join().unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["serve window k11", "take clock k12", "take a k13"]
+        );
     }
 
     #[test]

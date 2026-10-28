@@ -1158,6 +1158,34 @@ unit is its own. A waiter that sees no rmw progress for 5 s reports the holder (
 entity of its last served take, its node and window) and writes a `watchdog`
 verdict; it keeps waiting.
 
+**Takes in order across threads** (`Gate::take_turn`). A served take also waits
+until every unit and every other thread's waiting take with a smaller `k` is
+served and the token is free, then holds the token until its thread's next rmw
+call. This keeps rclcpp's clock thread right: rcl checks the executor thread's
+timers inside `rcl_wait`, right after `rmw_wait` returns (while that thread holds
+the token), against the ROS time the clock thread's `/clock` callback sets after
+its take. A recording in which the executor thread's wait returned between the
+clock thread's wait return and its take is served the same way. A take made
+while the thread holds the Python GIL (`PyGILState_Check`, looked up with
+`dlsym`) does not wait: the thread whose turn comes first may need the GIL to
+reach its rmw call. rclpy keeps each node's clock on that node's executor thread,
+so its timer checks do not race another thread. Such takes are counted
+(`takes_unordered`).
+
+**Creation fence** (`Player::creation_fence`). Entity creation is not a served
+event. Before the first unit of a window is served, every entity the recording
+created before the window's `k` must exist live (at most 2 s; an entity still
+missing is an input mismatch, and the fence is lifted). Without it, rclcpp's clock
+thread is served its "entities changed" guard before the executor thread creates
+`/clock`'s subscription, and its next wait lacks it.
+
+**Clock section, while recording** (`Recorder::clock_section`). The recording
+must not hold an order that replay cannot serve. A `rmw_wait` return waits until
+no `/clock` take is between its take and its thread's next `rmw_wait` (its callback
+has set the time); a `/clock` take waits until no other thread is between its
+`rmw_wait` return and its next rmw call (its timer check is done). Each side waits
+at most 5 ms and then goes on; the count is logged when the log closes.
+
 **Takes and outputs on replay.** A take pops the entity's next recorded take,
 checks it against the thread's recorded take order (a different order is an input
 mismatch), and decodes the recorded body with the entity's own bridge into the
@@ -1231,6 +1259,7 @@ table stays at 112 (`rmw_absent_export_table_test`).
 | `src/replay/` unit tests (lib binary) | The delivery log codec (every record round-trips; truncation, trailing bytes, other versions and a hostile id count refused), a finished log reading back in `k` order and complete, a log torn inside a chunk reading every whole record before the tear and incomplete, the serving schedule (take-order splits with guards on the last unit, the `/clock` set rule, timeouts, two threads interleaving by take `k`), the token over two real threads, the watchdog firing after 5 s with the holder named, per-entity take serving with out-of-order takes named, graph answers, the oracle (identical, `/rosout` excluded, culprit vs inherited, a missing output naming the recorded publisher, construction-time outputs counted, never compared), both multi-threaded marks, the env refusal, identity checks, entity naming | no | none |
 | `tests/rmw_replay_rclpy_probe_test.rs` | `#[ignore]`, real rclpy processes: the probe `mixer` recorded on the clockpub/talker graph replays alone 140/140 `/out` byte-identical and in callback order 5/5 with byte-identical `identical` verdicts; with `MIXER_WALLCLOCK=1` the verdict names node `mixer`, topic `/out`, inputs matched, 2/2 | run by name, one fresh process each (`gate.sh`, Humble) | ROS 2 + staged `.so`, `tests/fixtures/replay_probe/` |
 | `tests/rmw_replay_rclcpp_probe_test.rs` | `#[ignore]`, the stock `demo_nodes_cpp` executables: `listener` recorded under `talker` replays alone with the same `I heard` lines in order and an `identical` verdict; the wall-timer `talker` replayed alone is named at node `talker`, topic `/chatter` | as above | ROS 2 + staged `.so` + `demo_nodes_cpp` |
+| `tests/rmw_replay_rclcpp_mixer_test.rs` | `#[ignore]`, the ament_cmake fixture `tests/fixtures/replay_probe_cpp` (built by colcon in the test): `talker_cpp`, `mixer_cpp` and `listener_cpp` on a `SingleThreadedExecutor` with `use_sim_time` and rclcpp's clock thread (two waiting threads each), recorded in one run, each replays alone with every callback and output identical 5/5 and `identical` verdicts equal but for `guards_not_triggered_live`; `MIXER_WALLCLOCK=1` is named at node `mixer`, topic `/out`, 2/2; `PROBE_MT=1` (2-thread `MultiThreadedExecutor`, 5 ms of callback work) records a not-replayable log and its replay is refused naming `MultiThreadedExecutor` and `mixer`; the single-threaded control replays `identical` | as above | ROS 2 + staged `.so` + colcon |
 | `tests/rmw_replay_refusal_test.rs` | `#[ignore]`: `mixer --mt` (rclpy MultiThreadedExecutor) records a not-replayable log and its replay exits nonzero naming `MultiThreadedExecutor` and `mixer`, verdict `refused`, while the single-threaded control replays `identical`; both variables set refused naming both; a log replayed under another command line refused naming the field | as above | ROS 2 + staged `.so`, fixtures |
 | `tests/rmw_replay_token_test.rs` | `#[ignore]`: `two_exec.py` (two single-threaded executors on two threads) replays both nodes' callback logs identical 2/2; with `--block` the watchdog names `sub:/left#0` of node `right` within 10 s | as above | ROS 2 + staged `.so`, fixtures |
 | `tests/rmw_absent_export_table_test.rs` | The per-distro absent-export table as a gate: every `extern "C"` `rmw_*` export guarded by a capability cfg is read out of `src/`, mapped to the era its capability arrived in through `era_check::CAPABILITY_MIN_ERA`, and the set a distro lacks is compared with that row's hand-typed `absent_symbols` in `tools/ci/rmw-distros/gate.sh` in BOTH directions, so a new guarded export fails until every older row names it and a stale row fails until it drops the name; both parsers are pinned by hand-written source and gate snippets with hand-written readings (a negated guard, a compound guard, a cfg whose reach a code line ends, the fallback arm), both comparison directions are pinned on a fixture era table, a guard shape the reader does not interpret is a REFUSAL naming the export and the attribute rather than an unguarded export (the comparison alone is blind to it, which the compound arm pins), the refusal is driven at the WALK level too over a source directory the test writes (one file with a compound guard one directory down from one with a recognised guard, against a recognised-only control), so an aggregation that dropped the refusal list cannot read as no finding, and the tree arm refuses a vacuous read (an export-count floor plus at least one non-empty derived set) | no (pure text, no transport) | none |
