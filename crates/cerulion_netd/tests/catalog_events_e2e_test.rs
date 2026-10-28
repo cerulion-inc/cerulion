@@ -292,6 +292,36 @@ impl Client {
         panic!("no subscribe response within {PROTOCOL_READ_TIMEOUT:?}");
     }
 
+    fn status_round_trip(&mut self, id: u64) {
+        self.send(&Request::Status { id });
+        let deadline = Instant::now() + PROTOCOL_READ_TIMEOUT;
+        while Instant::now() < deadline {
+            let line = match self.read_line() {
+                Ok(line) => line,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => panic!("the connection died instead of answering status: {e}"),
+            };
+            match classify_control_line(&line) {
+                ControlLine::Response(text) => {
+                    match serde_json::from_str::<Response>(&text).expect("response parses") {
+                        Response::Status(s) if s.id == id => return,
+                        other => panic!("expected status response {id}, got {other:?}"),
+                    }
+                }
+                ControlLine::Event(_) => continue,
+                ControlLine::Unknown(t) => panic!("unclassifiable line: {t}"),
+            }
+        }
+        panic!("no status response within {PROTOCOL_READ_TIMEOUT:?}");
+    }
+
     /// Read lines until ONE catalog-change push arrives (or the deadline passes).
     fn next_push(&mut self, within: Duration) -> Option<CatalogChanged> {
         let deadline = Instant::now() + within;
@@ -339,6 +369,17 @@ impl Client {
             }
         }
         out
+    }
+}
+
+/// The poke was written before the first request was sent. The handler writes the
+/// first response, then returns to its loop top and drains its waker before it can
+/// read the second request, so once the second response arrives every byte poked into
+/// that connection's pipe has been counted.
+fn settle_drains(clients: &mut [&mut Client], first_id: u64) {
+    for client in clients {
+        client.status_round_trip(first_id);
+        client.status_round_trip(first_id + 1);
     }
 }
 
@@ -438,30 +479,22 @@ fn a_catalog_push_is_delivered_by_a_wake_not_the_read_timeout() {
     );
 }
 
-/// The ANTI-TAUTOLOGY control: a connection that never subscribed is
-/// never woken.
-///
-/// Without it, "the counter grew" would be satisfied by a waker poked on every
-/// publish regardless of subscription — which would wake every idle `topic echo`
-/// connection on the machine for an event it did not ask for and cannot act on, and
-/// would make the positive arm above pass for the wrong reason.
-///
-/// The SUBSCRIBED connection's own wake is not counted on: a push that lands
-/// while its handler is between waits (just back from a read timeout) is drained
-/// and delivered at the loop top with no wait ending on the waker, so its
-/// contribution is 0 or 1 and a fixed settle cannot tell which. The control
-/// therefore holds TWO idle connections that never subscribe: a waker poked for
-/// every connection ends both their waits, so it reads at least 2 whatever the
-/// subscriber contributed, while a correct daemon reads at most 1.
+/// A wake count cannot show which connection was poked: handlers drain push bytes
+/// at the loop top before waiting, for both subscriber and idle connections.
+/// That means a broadcast can deliver the push without incrementing the counter.
+/// This test counts the poke bytes consumed by every connection instead.
+/// In phase one, one subscribed client and two quiet clients are connected.
+/// One catalog change must deliver one push and account for exactly one byte.
+/// In phase two, the subscriber disconnects before another catalog change.
+/// No connection may then consume a poke byte.
+/// Each phase settles handlers with two status round trips per connection.
+/// The first response returns the handler to loop top, where it drains its waker
+/// before reading the second request, so the second response proves the drain.
 #[test]
 fn an_unsubscribed_connection_is_never_woken_by_a_catalog_push() {
     let (netd, _dir, sock, announce) = start_daemon("wknosub");
-    // ONE subscriber — the watch thread only starts on the first subscription, so a
-    // daemon with nobody subscribed can never publish and the control would be
-    // vacuous.
     let (mut sub, _) = Client::connect(&sock);
     sub.subscribe(1);
-    // TWO connections that deliberately never subscribe.
     let (mut quiet, _) = Client::connect(&sock);
     let (mut quiet2, _) = Client::connect(&sock);
     assert!(
@@ -474,27 +507,33 @@ fn an_unsubscribed_connection_is_never_woken_by_a_catalog_push() {
         .next_push(Duration::from_secs(10))
         .expect("the SUBSCRIBED connection receives the push");
     assert_eq!(push.event, CATALOG_CHANGED_EVENT);
+    settle_drains(&mut [&mut sub, &mut quiet, &mut quiet2], 10);
     assert_eq!(netd.catalog_version(), 1, "exactly one published change");
-    // Settle on the handlers' own progress rather than a fixed sleep: every handler
-    // ends a wait at least once per `CONN_READ_TIMEOUT`, and a poked one ends its
-    // wait at once, so two passes per connection past the push leaves a stray poke
-    // nowhere to hide on a slow host. The ceiling only catches a stalled daemon.
-    let passes = netd.conn_read_loop_iterations();
-    assert!(
-        wait_until(
-            || netd.conn_read_loop_iterations() >= passes + 6,
-            Duration::from_secs(10)
-        ),
-        "the three connection handlers must keep going round their loops after the push"
+    assert_eq!(
+        netd.conn_waker_total_drain(),
+        1,
+        "exactly one poke byte across all three connections, the subscriber's; \
+         a waker poked for every connection reads 3"
     );
 
-    let wakes = netd.conn_push_wakes();
+    drop(sub);
     assert!(
-        wakes <= 1,
-        "only the subscribed connection may be woken, got {wakes} wakes. A waker poked \
-         for every connection would wake every idle `topic echo` on the machine for an \
-         event it never asked for, and would make the positive arm above pass for the \
-         wrong reason"
+        wait_until(
+            || netd.catalog_subscriber_count() == 0 && netd.active_connections() == 2,
+            Duration::from_secs(10)
+        ),
+        "the subscriber must disconnect before the next catalog change"
+    );
+    announce.push_alive("orin", None);
+    assert!(
+        wait_until(|| netd.catalog_version() == 2, Duration::from_secs(10)),
+        "the second catalog change must publish"
+    );
+    settle_drains(&mut [&mut quiet, &mut quiet2], 20);
+    assert_eq!(
+        netd.conn_waker_total_drain(),
+        1,
+        "no subscriber remains, so no connection may be poked; any poke grows this count"
     );
     assert!(
         quiet.next_push(Duration::from_millis(200)).is_none()
