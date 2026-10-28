@@ -581,8 +581,11 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `network-daemons.md`).
 - Robot inventory (state root, `remoted/` subdir; `remoted::config`):
   `device_key`, `trust_store` + `trust_store.mac_key` (the daemon loads the
-  trust-store MAC key from this file, so robot setup must provision and protect
-  it; there is no secure-storage backend and no enforcing test),
+  trust-store MAC key from this file, so robot setup must provision it, mode
+  0600; there is no secure-storage backend. On load the daemon clears the group
+  and other permission bits of the device key, the MAC key, the trust store and
+  the device index, without following a symbolic link at the path, and saves
+  create the trust store and the device index 0600),
   `device_index.json`, `receipts.log`, `logs/` (the `log-tail` confinement
   root), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;

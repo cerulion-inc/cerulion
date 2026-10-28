@@ -576,9 +576,12 @@ fn load_state(config: &RemotedConfig) -> Result<RemotedState, RemotedError> {
 }
 
 /// Load the 32-byte ed25519 device secret (raw bytes). An absent / wrong-size
-/// key is a provisioning gap, never fabricated.
+/// key is a provisioning gap, never fabricated. On Unix, when `path` itself is a
+/// regular file with a single link, its group and other permission bits are
+/// cleared before it is read; a symbolic link at `path` is read through
+/// unchanged.
 fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
-    let bytes = std::fs::read(path).map_err(|e| {
+    let bytes = crate::private_file::read_private(path, "device key").map_err(|e| {
         RemotedError::DeviceKey(format!(
             "{}: {e} (provision the robot's 32-byte device key)",
             path.display()
@@ -611,8 +614,12 @@ fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 /// - **not `expected` + present-but-unreadable** → still a LOUD
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
+///
+/// On Unix, when `path` itself is a regular file with a single link, its group
+/// and other permission bits are cleared before it is read; a symbolic link at
+/// `path` is read through unchanged.
 fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
-    match std::fs::read(path) {
+    match crate::private_file::read_private(path, "trust-store MAC key") {
         Ok(bytes) => Ok(bytes),
         // Genuinely-fresh robot: nothing on disk needs this key and it is simply
         // absent. Defer to the absent store's own `Store` provisioning gap.
@@ -728,5 +735,63 @@ mod tests {
             let key = load_mac_key(&path, expected).unwrap();
             assert_eq!(key, b"present-mac-key", "expected={expected}");
         }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_0644_device_key_is_loaded_and_narrowed_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_key");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_device_key(&path).unwrap(), [7u8; 32]);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_device_key_is_loaded_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("device_key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(load_device_key(&link).unwrap(), [9u8; 32]);
+        assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_0644_mac_key_is_loaded_and_narrowed_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust_store.mac_key");
+        std::fs::write(&path, b"a-mac-key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_mac_key(&path, true).unwrap(), b"a-mac-key");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_mac_key_is_loaded_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"linked-mac-key").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("trust_store.mac_key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(load_mac_key(&link, true).unwrap(), b"linked-mac-key");
+        assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
     }
 }
