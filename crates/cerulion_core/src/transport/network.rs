@@ -922,10 +922,15 @@ pub struct GetDemandState {
     /// not this build's.
     wire_header_refusals: AtomicU64,
     /// flood suppression for the wire header refusal, one latch per
-    /// (stated version, topic): loud on the first refusal of each, counted
-    /// repeats, decade re-announcements. A GET at this build's version comes
-    /// from another peer, so it never re-arms a mismatched key.
+    /// (stated version, topic), a key part at most [`LATCH_KEY_PART_MAX_LEN`]
+    /// bytes: loud on the first refusal of each, counted repeats, decade
+    /// re-announcements. A GET at this build's version comes from another
+    /// peer, so it never re-arms a mismatched key.
     wire_header_latches: Mutex<KeyedLatches<(Option<u16>, String)>>,
+    /// wire header refusals whose demanded topic was longer than
+    /// [`LATCH_KEY_PART_MAX_LEN`], so no per-topic latch was stored: they were
+    /// reported through the shared overflow latch.
+    wire_header_latch_overlong: AtomicU64,
 }
 
 /// The most distinct keys a [`KeyedLatches`] tracks; past it every new key
@@ -942,9 +947,19 @@ const ACK_PEERS_CAP: usize = KEYED_LATCHES_CAP;
 /// chooses, so a longer one is counted as overlong and not stored.
 const ACK_PEER_MAX_LEN: usize = super::mirror_registry::MAX_MIRROR_ROBOT_LEN;
 
+/// The longest key part (bytes) either demand wire header latch table stores:
+/// the replying peer name and the topic on the demander side, the demanded
+/// topic on the producer side. A peer chooses the reply key and the demand
+/// key, so a longer part is counted as overlong and never stored; its refusal
+/// is reported through the table's shared overflow latch instead. The same
+/// limit as the ack peer set's. Every real canonical topic is shorter
+/// (a local topic is at most 249 bytes), so no real key loses its own latch.
+const LATCH_KEY_PART_MAX_LEN: usize = ACK_PEER_MAX_LEN;
+
 /// Flood-suppression latches keyed per (stated version, topic) on the
 /// producer side and per (replying peer, topic) on the demander side, bounded
-/// at [`KEYED_LATCHES_CAP`] keys plus one shared overflow latch.
+/// at [`KEYED_LATCHES_CAP`] keys of parts at most [`LATCH_KEY_PART_MAX_LEN`]
+/// bytes, plus one shared overflow latch for every key it will not store.
 struct KeyedLatches<K: Ord> {
     by_key: std::collections::BTreeMap<K, FailureRegimeLatch>,
     overflow: FailureRegimeLatch,
@@ -974,6 +989,11 @@ impl<K: Ord> KeyedLatches<K> {
         self.by_key
             .get_mut(key)
             .and_then(FailureRegimeLatch::on_success)
+    }
+
+    /// The shared overflow latch, for a key this table will not store.
+    fn overflow(&mut self) -> &mut FailureRegimeLatch {
+        &mut self.overflow
     }
 }
 
@@ -1022,6 +1042,14 @@ impl GetDemandState {
         self.wire_header_refusals.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): wire header refusals whose demanded
+    /// topic was longer than 256 bytes, so they share the overflow latch
+    /// instead of their own. Not 0 means a peer sends demands for topics no
+    /// build of this robot can carry.
+    pub fn wire_header_refusal_latch_overlong_count(&self) -> u64 {
+        self.wire_header_latch_overlong.load(Ordering::Relaxed)
+    }
+
     /// The wire header gate of one demand GET, run before any grant decision:
     /// `Some(ack)` refuses it (counted, loud on the first of a run, egress
     /// untouched), `None` lets the grant decision run.
@@ -1035,13 +1063,19 @@ impl GetDemandState {
             Some(v) => v.to_string(),
             None => "unreadable".to_string(),
         };
-        let decision = self
+        let mut latches = self
             .wire_header_latches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decision = if canonical.len() > LATCH_KEY_PART_MAX_LEN {
+            self.wire_header_latch_overlong
+                .fetch_add(1, Ordering::Relaxed);
+            latches.overflow().on_failure()
+        } else {
             // hot-path-alloc-ok: cold, a refused demand GET on the control plane.
-            .latch((peer, canonical.to_string()))
-            .on_failure();
+            latches.latch((peer, canonical.to_string())).on_failure()
+        };
+        drop(latches);
         match decision {
             RegimeDecision::Loud => tracing::warn!(
                 topic = %canonical,
@@ -7262,6 +7296,137 @@ mod tests {
                 n => Err(format!("expected 4 loud refusals (one per key), got {n}")),
             }
         });
+    }
+
+    /// The producer's stored wire header latch keys, in table order.
+    fn producer_latch_keys(state: &GetDemandState) -> Vec<(Option<u16>, String)> {
+        state
+            .wire_header_latches
+            .lock()
+            .unwrap()
+            .by_key
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The topic oracles for the key-part length limit: 256 bytes is kept,
+    /// 257 bytes is refused.
+    fn latch_topic_at_and_over_the_limit() -> (String, String) {
+        let topic_at = format!("/{}", "t".repeat(255));
+        let topic_over = format!("/{}", "t".repeat(256));
+        assert_eq!(topic_at.len(), 256);
+        assert_eq!(topic_over.len(), 257);
+        (topic_at, topic_over)
+    }
+
+    /// T1's steps 1 to 4 against the producer gate, each refusal arm once
+    /// with an overlong topic and once at the limit.
+    fn drive_producer_latch_bounds(state: &GetDemandState, topic_at: &str, topic_over: &str) {
+        // Step 1: version 99 on an overlong topic is refused and counted,
+        // and no key is stored.
+        assert_eq!(
+            state.wire_header_gate(topic_over, Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 1);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 1);
+        assert!(producer_latch_keys(state).is_empty());
+
+        // Step 2: the same version on a topic at the limit keeps its own latch.
+        assert_eq!(
+            state.wire_header_gate(topic_at, Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 2);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 1);
+        assert_eq!(
+            producer_latch_keys(state),
+            vec![(Some(99), topic_at.to_string())]
+        );
+
+        // Step 3: the version 1 arm and the unreadable arm with an overlong
+        // topic are each counted and store nothing.
+        assert_eq!(
+            state.wire_header_gate(topic_over, None),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 3);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 2);
+        assert_eq!(
+            state.wire_header_gate(topic_over, Some(&[0x02])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 4);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 3);
+        assert_eq!(producer_latch_keys(state).len(), 1);
+
+        // Step 4: a passing GET on an overlong topic counts and stores nothing.
+        assert_eq!(
+            state.wire_header_gate(topic_over, Some(&[0x02, 0x00])),
+            None
+        );
+        assert_eq!(state.wire_header_refusal_count(), 4);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 3);
+        assert_eq!(producer_latch_keys(state).len(), 1);
+        assert_eq!(state.grant_count(), 0);
+        assert_eq!(state.refusal_count(), 0);
+        assert!(state.granted_topics().is_empty());
+    }
+
+    /// The producer's wire header latch table stores no topic longer than
+    /// 256 bytes: such a refusal is counted as overlong and reported through
+    /// the shared overflow latch (loud once, then repeats), while a topic of
+    /// 256 bytes keeps its own latch. The refusal ack is unchanged.
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_producer_wire_header_latch_refuses_an_overlong_topic_and_keeps_one_at_the_limit() {
+        let (topic_at, topic_over) = latch_topic_at_and_over_the_limit();
+        let state = GetDemandState::default();
+        drive_producer_latch_bounds(&state, &topic_at, &topic_over);
+        logs_assert(|lines: &[&str]| {
+            let loud = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("WARN") && l.contains("demand REFUSED: the demanding machine")
+                })
+                .count();
+            let repeats = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("DEBUG")
+                        && l.contains(
+                            "demand GET refused for a wire header version mismatch (repeat)",
+                        )
+                })
+                .count();
+            // Loud: step 1 (overflow latch) and step 2 (own key). Repeats:
+            // the two step 3 refusals on the shared overflow latch.
+            match (loud, repeats) {
+                (2, 2) => Ok(()),
+                other => Err(format!("expected (2 loud, 2 repeats), got {other:?}")),
+            }
+        });
+    }
+
+    /// Two fresh producer states driven by the same refusals read the same
+    /// counters and the same stored keys, equal to the hand-written oracle.
+    #[test]
+    fn the_producer_wire_header_latch_bounds_read_the_same_on_two_runs() {
+        let (topic_at, topic_over) = latch_topic_at_and_over_the_limit();
+        let run = || {
+            let state = GetDemandState::default();
+            drive_producer_latch_bounds(&state, &topic_at, &topic_over);
+            (
+                state.wire_header_refusal_count(),
+                state.wire_header_refusal_latch_overlong_count(),
+                producer_latch_keys(&state),
+            )
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first, second);
+        assert_eq!(first, (4, 3, vec![(Some(99), topic_at.clone())]));
     }
 
     /// The demander tallies each ack class into its own counter.
