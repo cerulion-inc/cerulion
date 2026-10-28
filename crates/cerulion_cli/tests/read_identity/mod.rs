@@ -688,16 +688,6 @@ fn ri_flush(id: &str, input: &str, reads: &mut Vec<[u64; 3]>) {
 #[allow(dead_code)]
 const RI_TIMED_TICKS: u32 = 4;
 
-/// This thread's `(on-CPU ns, runqueue-wait ns, timeslices)` from
-/// `/proc/thread-self/schedstat`, zeros where the file is absent.
-/// The instant the relay's first timed tick reads first: tick entry offsets
-/// are measured from it.
-#[allow(dead_code)]
-fn ri_base() -> std::time::Instant {
-    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    *BASE.get_or_init(std::time::Instant::now)
-}
-
 /// The CPU this thread last ran on: field 39 of `/proc/thread-self/stat`,
 /// `u64::MAX` where the file is absent.
 #[allow(dead_code)]
@@ -710,6 +700,8 @@ fn ri_cpu() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// This thread's `(on-CPU ns, runqueue-wait ns, timeslices)` from
+/// `/proc/thread-self/schedstat`, zeros where the file is absent.
 #[allow(dead_code)]
 fn ri_schedstat() -> [u64; 3] {
     let text = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
@@ -720,20 +712,32 @@ fn ri_schedstat() -> [u64; 3] {
     out
 }
 
+/// The relay's timed ticks, held outside the node's state so they never
+/// reach a captured or compared node state.
+#[allow(dead_code)]
+static RI_TIMES: std::sync::Mutex<Vec<[u64; 8]>> = std::sync::Mutex::new(Vec::new());
+
+#[allow(dead_code)]
+fn ri_push_time(t: [u64; 8]) {
+    RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+}
+
 /// Write the relay's timed ticks as `<id>_<pid>_<k>.times`, one line per tick:
 /// `tick <index> <entry offset ns> <wall ns> <cpu ns> <runqueue wait ns> <slices>
 /// <cpu at entry> <cpu at exit>`.
 #[allow(dead_code)]
-fn ri_flush_times(id: &str, times: &[[u64; 8]]) {
+fn ri_flush_times(id: &str) {
     use std::io::Write as _;
     let Some(dir) = std::env::var_os("CER_RI_READS_DIR") else {
         return;
     };
-    if times.is_empty() {
+    let times = std::mem::take(&mut *RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(first) = times.first().map(|t| t[1]) else {
         return;
-    }
+    };
     let mut out = String::new();
-    for t in times {
+    for mut t in times {
+        t[1] = t[1].saturating_sub(first);
         out.push_str(&format!(
             "tick {} {} {} {} {} {} {} {}\n",
             t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]
@@ -810,15 +814,13 @@ struct RiRelayNode {
     ri_sleep_every: u64,
     tick_count: u32,
     ri_reads: Vec<[u64; 3]>,
-    ri_times: Vec<[u64; 8]>,
 }
 
 #[cerulion_node_impl]
 impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         let timed = ri_on() && self.tick_count < RI_TIMED_TICKS;
-        let base = ri_base();
-        let entry = std::time::Instant::now();
+        let entry_ns = if timed { self.real_ns() } else { 0 };
         let sched_entry = if timed { ri_schedstat() } else { [0; 3] };
         let cpu_entry = if timed { ri_cpu() } else { 0 };
         if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
@@ -833,12 +835,13 @@ impl RiRelayNode {
         self.out.y = f64::from(self.tick_count);
         self.out.z = ri_fold(r);
         if timed {
+            let exit_ns = self.real_ns();
             let sched_exit = ri_schedstat();
             let cpu_exit = ri_cpu();
-            self.ri_times.push([
+            ri_push_time([
                 u64::from(self.tick_count - 1),
-                entry.duration_since(base).as_nanos() as u64,
-                entry.elapsed().as_nanos() as u64,
+                entry_ns,
+                exit_ns.saturating_sub(entry_ns),
                 sched_exit[0].saturating_sub(sched_entry[0]),
                 sched_exit[1].saturating_sub(sched_entry[1]),
                 sched_exit[2].saturating_sub(sched_entry[2]),
@@ -851,7 +854,7 @@ impl RiRelayNode {
 
     fn shutdown(&mut self) -> Result<(), NodeError> {
         ri_flush(&self.ri_id, "inp", &mut self.ri_reads);
-        ri_flush_times(&self.ri_id, &self.ri_times);
+        ri_flush_times(&self.ri_id);
         Ok(())
     }
 }
