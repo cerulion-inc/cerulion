@@ -148,6 +148,15 @@ trace rings held nothing yet because its nodes had not fired inside the window,
 or that the capture's trace retention hit its byte ceiling
 (`CERULION_FLASHBACK_TRACE_MAX_MB`, 64 MiB).
 
+A capture's trace ends at the last step each rank finished recording: a step
+is kept only when the trace also holds that rank's next step boundary, so a
+capture taken while a step was running never holds an output whose read record
+it lacks. `handoff.trace_end_cut` says how many final steps this removed. Their
+frames stay in the bag at their own step's target; where the clock advanced into
+that step, that is after the covered range (`anchor.resim_covered_through_ns`),
+and `bag play --resim --verify` reports them as trailing rather than comparing
+them.
+
 ---
 
 ## Watching a live run from outside

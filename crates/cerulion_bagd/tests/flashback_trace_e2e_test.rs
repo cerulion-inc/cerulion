@@ -228,11 +228,14 @@ fn departure(step: u64) -> TraceRingRecord {
     }
 }
 
-/// A trace spanning the anchor step and three steps past it.
+/// A trace spanning the anchor step and three steps past it, then the next
+/// step's boundary, which proves step `ANCHOR_STEP + 3` complete.
 ///
 /// Written by hand, in the order the scheduler pushes them (a boundary at
 /// `begin_step`, then that step's fires), so the trim's answer can be compared
 /// against a set this file states rather than against the trim's own output.
+/// The capture's end cut removes the trailing boundary's step, so the oracle
+/// below stops at `ANCHOR_STEP + 3`.
 fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
     let mut out = Vec::new();
     for step in (ANCHOR_STEP - 2)..=(ANCHOR_STEP + 3) {
@@ -240,6 +243,7 @@ fn trace_across_the_anchor() -> Vec<TraceRingRecord> {
         out.push(fire(step, 0));
         out.push(fire(step, 1));
     }
+    out.push(boundary(ANCHOR_STEP + 4));
     out
 }
 
@@ -264,7 +268,7 @@ fn trace_from_step_zero() -> Vec<TraceRingRecord> {
 fn expected_kept() -> Vec<TraceRingRecord> {
     trace_across_the_anchor()
         .into_iter()
-        .filter(|r| r.step > ANCHOR_STEP)
+        .filter(|r| r.step > ANCHOR_STEP && r.step <= ANCHOR_STEP + 3)
         .collect()
 }
 
@@ -860,6 +864,16 @@ fn a_capture_carries_its_trace_trimmed_to_its_anchor_and_reads_resimmable() {
         )),
         "the count is MEASURED, and it is the number of records the bag really holds — \
          stated in the handoff's own vocabulary, the one place this manifest says it: {m}"
+    );
+    // The end cut, stated: the one rank's final step (the trailing boundary
+    // alone) was removed, and the sentence says why.
+    let end_cut = m["handoff"]["trace_end_cut"]
+        .as_str()
+        .expect("the handoff states the capture's end cut");
+    assert!(
+        end_cut.starts_with("1 final step(s) removed (1 scheduler-trace record(s))")
+            && end_cut.contains("read record"),
+        "the end cut names its count and its cause: {end_cut}"
     );
     // The RECORDER's own drained count, on the mode whose
     // reader is the WRITER THREAD.
@@ -1687,8 +1701,11 @@ fn a_peer_ending_shorter_renders_the_folds_instant_and_names_it_as_the_fold() {
         rank0.push(boundary(step));
         rank0.push(fire(step, 0));
     }
-    // The PEER's own stream, on its own ring, ending two steps earlier.
-    let peer: Vec<TraceRingRecord> = (0..=1u64).map(boundary).collect();
+    // Step 4's boundary proves step 3; the capture's end cut removes step 4.
+    rank0.push(boundary(4));
+    // The PEER's own stream, on its own ring, ending two steps earlier; its
+    // step-2 boundary proves step 1 and is itself cut.
+    let peer: Vec<TraceRingRecord> = (0..=2u64).map(boundary).collect();
     let h = capture_inner_full(
         "peershorterrender",
         &rank0,

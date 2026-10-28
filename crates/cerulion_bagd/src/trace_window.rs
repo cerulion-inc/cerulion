@@ -440,6 +440,12 @@ pub(crate) struct TrimmedTrace {
     pub executed_nodes: Vec<String>,
     /// Records the trim discarded as belonging to steps before the resume.
     pub discarded: usize,
+    /// Records removed before the trim as belonging to a rank's final,
+    /// unfinished step ([`end_at_last_complete_step`]). Zero out of
+    /// [`trim_to_anchor`] and [`keep_all`], which see only what survived it.
+    pub tail_cut: usize,
+    /// Final steps the end cut removed, one per rank that carried a boundary.
+    pub tail_steps_cut: usize,
     /// The same five facts PER RANK, keyed by the rank on the record.
     ///
     /// # Why the scalars above cannot serve
@@ -506,6 +512,82 @@ pub(crate) fn trim_to_anchor(
     node_ids: &BTreeMap<u32, Vec<String>>,
 ) -> TrimmedTrace {
     walk(records, Some(anchor_steps), node_ids)
+}
+
+/// A retained trace ended at the last step each rank finished recording.
+///
+/// Returned by [`end_at_last_complete_step`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompleteSteps {
+    /// The records that survive the cut, in retained order.
+    pub records: Vec<TraceRingRecord>,
+    /// Records removed because they belong to a rank's final, unfinished step.
+    pub cut: usize,
+    /// Final steps removed: one per rank that carried a step boundary.
+    pub steps_cut: usize,
+}
+
+/// PURE: end a retained trace at the last step each rank finished recording.
+///
+/// # What a capture's last step holds
+///
+/// A scheduler pushes one step's records in this order: the step's
+/// `STEP_BOUNDARY` at `begin_step`, then, level by level, each fired node's
+/// `FIRE` after its tick returns and the level's `READ_OUTCOME` records at the
+/// level's end (`Scheduler::merge_read_outcomes`). A node's output frame is
+/// published inside its tick, so it is committed to the topic before the read
+/// record that explains it reaches the ring.
+///
+/// A capture of a live run cuts the trace at whatever record the recorder's
+/// retention held at the close. That cut can land inside a step, after a
+/// node's tick published its frame and before the level-end merge pushed its
+/// read. The frame window is read after the trace, so the capture holds the
+/// frame and not the read. A replay drives every step that has a boundary,
+/// and its read gate then finds no recorded read for the consult that
+/// produced the frame.
+///
+/// # The rule
+///
+/// A rank's step `S` is complete when the trace holds that rank's boundary for
+/// step `S + 1`, because the ring is one producer's FIFO and the scheduler
+/// pushes boundary `S + 1` only after every record of step `S`. The final
+/// boundary on each rank has no successor, so its step is not proven: every
+/// record of that rank stamped at or after that step is removed. Departure
+/// records (`is_departure_boundary`, on any rank and at any step) are kept
+/// unchanged, and so is every record of a rank that carries no boundary.
+///
+/// Every record kept is from a step whose read records all reached the ring
+/// before the next boundary, hence before the close read the trace, hence
+/// before the close drained the frames. The frames of the removed step stay in
+/// the capture, stamped at that step's target. Where the clock advanced into
+/// that step, the target is above the last kept boundary's, the trailing shape
+/// the capture's covered range excludes from verification.
+pub fn end_at_last_complete_step(
+    records: impl IntoIterator<Item = TraceRingRecord>,
+) -> CompleteSteps {
+    let records: Vec<TraceRingRecord> = records.into_iter().collect();
+    let mut last_boundary: BTreeMap<u32, u64> = BTreeMap::new();
+    for rec in &records {
+        if rec.record_type == RECORD_TYPE_STEP_BOUNDARY && !rec.is_departure_boundary() {
+            let slot = last_boundary.entry(rec.rank()).or_insert(rec.step);
+            *slot = (*slot).max(rec.step);
+        }
+    }
+    let total = records.len();
+    let kept: Vec<TraceRingRecord> = records
+        .into_iter()
+        .filter(|rec| {
+            rec.is_departure_boundary()
+                || last_boundary
+                    .get(&rec.rank())
+                    .is_none_or(|last| rec.step < *last)
+        })
+        .collect();
+    CompleteSteps {
+        cut: total - kept.len(),
+        steps_cut: last_boundary.len(),
+        records: kept,
+    }
 }
 
 /// PURE: keep EVERY retained record — what a capture with no anchor carries.
@@ -1498,5 +1580,177 @@ mod tests {
             a.records.iter().map(|r| r.step).collect::<Vec<_>>(),
             vec![5, 5, 5]
         );
+    }
+
+    // ------------------------------------------------------------- end cut
+
+    /// One READ_OUTCOME record for `node_idx` at `step`; the cut reads only the
+    /// step, the kind and the rank, so the packed outcome fields stay zero.
+    fn read(step: u64, node_idx: u32) -> TraceRingRecord {
+        TraceRingRecord {
+            step,
+            fire_time_ns: 0,
+            duration_ns: 1,
+            node_idx,
+            global_level: 0,
+            record_type: cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME,
+            reserved: 0,
+        }
+    }
+
+    /// The ring order of one ticker -> relay step: the boundary, the ticker's
+    /// fire, the relay's fire after its tick published, and the relay's read
+    /// at its level's end.
+    fn whole_step(step: u64) -> Vec<TraceRingRecord> {
+        vec![
+            boundary(step, step * 1_000),
+            fire(step, 0),
+            fire(step, 1),
+            read(step, 1),
+        ]
+    }
+
+    /// A retention cut between the relay's fire and its level-end read keeps
+    /// only the steps the next boundary proves, and removes the unfinished one
+    /// whole: its boundary, the fires the tick already pushed, and nothing
+    /// that could pair an output with a missing read.
+    #[test]
+    fn the_end_cut_removes_a_final_step_that_holds_an_output_but_not_its_read() {
+        let mut records = Vec::new();
+        for step in 3..=5 {
+            records.extend(whole_step(step));
+        }
+        // Step 6 as a snapshot taken between the relay's FIRE and its READ.
+        let unfinished = [boundary(6, 6_000), fire(6, 0), fire(6, 1)];
+        records.extend(unfinished.iter().copied());
+
+        let out = end_at_last_complete_step(records.clone());
+        let mut want = Vec::new();
+        for step in 3..=5 {
+            want.extend(whole_step(step));
+        }
+        assert_eq!(
+            out.records, want,
+            "exactly the three proven steps survive, in retained order"
+        );
+        assert_eq!(
+            out.cut,
+            unfinished.len(),
+            "the unfinished step's records, counted"
+        );
+        assert_eq!(out.steps_cut, 1, "one rank, one final step");
+        assert!(
+            out.records.iter().all(|r| r.step < 6),
+            "nothing of the unproven step survives: {:?}",
+            out.records.iter().map(|r| r.step).collect::<Vec<_>>()
+        );
+
+        // The step the trace proves last is the step whose boundary a resume
+        // covers to, and its read is present.
+        let trimmed = trim_to_anchor(out.records.into_iter(), &cut(3), &nodes());
+        assert_eq!(trimmed.last_boundary_target_ns, Some(5_000));
+        assert_eq!(trimmed.first_recorded_step, Some(4));
+        assert_eq!(
+            trimmed
+                .records
+                .iter()
+                .filter(|r| r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME)
+                .count(),
+            2,
+            "one read per kept step past the anchor (steps 4 and 5)"
+        );
+    }
+
+    /// The cut takes the final step even when it LOOKS complete, because only
+    /// the successor boundary proves it: a step with all its records and no
+    /// next boundary is indistinguishable from one cut after its last record.
+    #[test]
+    fn the_end_cut_takes_the_final_step_even_when_it_carries_every_record() {
+        let mut records = whole_step(1);
+        records.extend(whole_step(2));
+        let out = end_at_last_complete_step(records);
+        assert_eq!(out.records, whole_step(1));
+        assert_eq!(out.cut, whole_step(2).len());
+    }
+
+    /// One boundary and nothing past it proves no step at all.
+    #[test]
+    fn a_trace_with_one_boundary_proves_no_step() {
+        let out = end_at_last_complete_step(whole_step(9));
+        assert!(out.records.is_empty(), "{:?}", out.records);
+        assert_eq!(out.cut, whole_step(9).len());
+    }
+
+    /// Each rank is cut at its OWN last boundary: under free run the ranks reach
+    /// different steps, and a single cut would drop a proven step of the faster
+    /// rank or keep an unproven one of the slower.
+    #[test]
+    fn the_end_cut_is_per_rank() {
+        let mut records = Vec::new();
+        for step in 4..=7 {
+            records.push(ranked_boundary(0, step, step * 1_000));
+            records.push(ranked_fire(0, step, 0));
+        }
+        for step in 4..=9 {
+            records.push(ranked_boundary(1, step, step * 1_000 + 7));
+            records.push(ranked_fire(1, step, 0));
+        }
+        let out = end_at_last_complete_step(records);
+        let steps_of = |rank: u32| {
+            let mut s: Vec<u64> = out
+                .records
+                .iter()
+                .filter(|r| r.rank() == rank)
+                .map(|r| r.step)
+                .collect();
+            s.dedup();
+            s
+        };
+        assert_eq!(steps_of(0), vec![4, 5, 6], "rank 0 ends at its step 6");
+        assert_eq!(
+            steps_of(1),
+            vec![4, 5, 6, 7, 8],
+            "rank 1 ends at its step 8"
+        );
+        assert_eq!(out.cut, 4, "two records of each rank's final step");
+        assert_eq!(out.steps_cut, 2, "one final step per rank");
+    }
+
+    /// Records of a ring that carries no boundary (the departure ring) are kept
+    /// whatever their step: no boundary on their rank proves or disproves them.
+    #[test]
+    fn the_end_cut_keeps_a_departure_ring_record() {
+        let mut stamped = fire(50, 0);
+        stamped.reserved = cerulion_core::trace_ring::DEPARTURE_RING_RANK;
+        let mut records = whole_step(1);
+        records.extend(whole_step(2));
+        records.push(stamped);
+        let out = end_at_last_complete_step(records);
+        assert!(
+            out.records.contains(&stamped),
+            "the departure record survives: {:?}",
+            out.records
+        );
+        assert_eq!(out.records.len(), whole_step(1).len() + 1);
+    }
+
+    /// A departure-kind record on a rank that DOES carry boundaries, stamped
+    /// at that rank's last boundary, is kept by the departure clause alone:
+    /// the boundary rule by itself would remove it with the rest of step 2.
+    #[test]
+    fn the_end_cut_keeps_a_departure_record_inside_the_removed_step() {
+        let mut departure = fire(2, 1);
+        departure.record_type = cerulion_core::trace_ring::RECORD_TYPE_DEPARTURE;
+        let mut records = whole_step(1);
+        records.extend(whole_step(2));
+        records.push(departure);
+        let out = end_at_last_complete_step(records);
+        assert!(
+            out.records.contains(&departure),
+            "the departure record survives the cut of its step: {:?}",
+            out.records
+        );
+        assert_eq!(out.records.len(), whole_step(1).len() + 1);
+        assert_eq!(out.cut, whole_step(2).len());
     }
 }
