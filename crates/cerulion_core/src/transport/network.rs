@@ -1146,8 +1146,13 @@ pub struct DemandGetState {
     /// counted acks whose peer was not stored because its name was too long.
     ack_peer_overlong: AtomicU64,
     /// flood suppression for the wire header refusals this demander receives,
-    /// one latch per (replying peer, topic), re-armed by a grant from that peer.
+    /// one latch per (replying peer, topic), a key part at most
+    /// [`LATCH_KEY_PART_MAX_LEN`] bytes, re-armed by a grant from that peer.
     wire_header_latches: Mutex<KeyedLatches<(String, String)>>,
+    /// wire header refusal acks whose peer name or topic was longer than
+    /// [`LATCH_KEY_PART_MAX_LEN`], so no per-(peer, topic) latch was stored:
+    /// they were reported through the shared overflow latch.
+    wire_header_latch_overlong: AtomicU64,
     /// once-per-regime GET-failure latch (loud-once; a dead link must not flood).
     fail: Mutex<GatherFailureLatch>,
 }
@@ -1217,6 +1222,14 @@ impl DemandGetState {
         self.wire_header_refused_acks.load(Ordering::Relaxed)
     }
 
+    /// Observable state (Principle #3): "refused:wire-header" (or legacy
+    /// grant) acks whose peer name or topic was longer than 256 bytes, so
+    /// they share the overflow latch instead of their own. Not 0 means one
+    /// producer's refusals may be suppressed under another's.
+    pub fn wire_header_refused_ack_latch_overlong_count(&self) -> u64 {
+        self.wire_header_latch_overlong.load(Ordering::Relaxed)
+    }
+
     /// Observable state (Principle #3): counted acks from a new peer that was
     /// not stored because the peer set held its cap of 256 names. Not 0
     /// means [`Self::ack_peers`] is incomplete.
@@ -1247,7 +1260,8 @@ impl DemandGetState {
 
     /// Tally one demand ack from `peer` (the replying robot). A grant re-arms
     /// that peer's wire header latch for the topic; a wire header refusal is
-    /// counted and loud on the first of a run per (peer, topic).
+    /// counted and loud on the first of a run per (peer, topic); a refusal
+    /// whose peer or topic is overlong shares the overflow latch instead.
     // hot-path-alloc-ok-fn: cold, one ack per demand GET reply on the control plane.
     fn record_ack(&self, peer: &str, topic: &str, ack: &[u8]) {
         if ack == ACK_ENABLED
@@ -1269,14 +1283,19 @@ impl DemandGetState {
                 }
             }
         }
-        let key = (peer.to_string(), topic.to_string());
+        let key_fits =
+            peer.len() <= LATCH_KEY_PART_MAX_LEN && topic.len() <= LATCH_KEY_PART_MAX_LEN;
         let mut latches = self
             .wire_header_latches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ack == ACK_ENABLED {
             self.enabled_acks.fetch_add(1, Ordering::Relaxed);
-            latches.success(&key);
+            // An overlong key has no latch of its own to re-arm, and a grant
+            // never re-arms the shared overflow latch.
+            if key_fits {
+                latches.success(&(peer.to_string(), topic.to_string()));
+            }
         } else if ack == ACK_REFUSED {
             self.refused_acks.fetch_add(1, Ordering::Relaxed);
         } else if ack == ACK_REFUSED_WIRE_HEADER || ack == LEGACY_ACK_ENABLED {
@@ -1284,7 +1303,16 @@ impl DemandGetState {
             // previous key namespace: as unreachable as an explicit refusal.
             self.wire_header_refused_acks
                 .fetch_add(1, Ordering::Relaxed);
-            match latches.latch(key).on_failure() {
+            let decision = if key_fits {
+                latches
+                    .latch((peer.to_string(), topic.to_string()))
+                    .on_failure()
+            } else {
+                self.wire_header_latch_overlong
+                    .fetch_add(1, Ordering::Relaxed);
+                latches.overflow().on_failure()
+            };
+            match decision {
                 RegimeDecision::Loud => tracing::warn!(
                     topic = %topic,
                     peer = %peer,
@@ -7456,6 +7484,174 @@ mod tests {
                 n => Err(format!("expected 1 loud refusal, got {n}")),
             }
         });
+    }
+
+    /// The demander's stored wire header latch keys, in table order.
+    fn demander_latch_keys(state: &DemandGetState) -> Vec<(String, String)> {
+        state
+            .wire_header_latches
+            .lock()
+            .unwrap()
+            .by_key
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// T2's steps 1 to 7 against the demander, every ack arm with an overlong
+    /// peer or topic and one refusal with both parts at the limit.
+    fn drive_demander_latch_bounds(
+        state: &DemandGetState,
+        peer_at: &str,
+        peer_over: &str,
+        topic_at: &str,
+        topic_over: &str,
+    ) {
+        // Step 1: an overlong peer is counted on both limits, stores nothing.
+        state.record_ack(peer_over, "/a", ACK_REFUSED_WIRE_HEADER);
+        assert_eq!(state.wire_header_refused_ack_count(), 1);
+        assert_eq!(state.ack_peer_overlong_count(), 1);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 1);
+        assert!(demander_latch_keys(state).is_empty());
+        assert!(state.ack_peers().is_empty());
+
+        // Step 2: an overlong topic still names its peer, but stores no key.
+        state.record_ack("go2", topic_over, ACK_REFUSED_WIRE_HEADER);
+        assert_eq!(state.wire_header_refused_ack_count(), 2);
+        assert_eq!(state.ack_peer_overlong_count(), 1);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 2);
+        assert!(demander_latch_keys(state).is_empty());
+        assert_eq!(state.ack_peers(), vec!["go2".to_string()]);
+
+        // Step 3: both parts at the limit keep their own latch.
+        state.record_ack(peer_at, topic_at, ACK_REFUSED_WIRE_HEADER);
+        assert_eq!(state.wire_header_refused_ack_count(), 3);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 2);
+        assert_eq!(
+            demander_latch_keys(state),
+            vec![(peer_at.to_string(), topic_at.to_string())]
+        );
+        assert_eq!(
+            state.ack_peers(),
+            vec!["go2".to_string(), peer_at.to_string()]
+        );
+
+        // Step 4: the legacy grant arm shares the refusal latch.
+        state.record_ack(peer_over, "/a", LEGACY_ACK_ENABLED);
+        assert_eq!(state.wire_header_refused_ack_count(), 4);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 3);
+
+        // Step 5: a grant is counted, never counted as overlong, and stores
+        // or re-arms nothing.
+        state.record_ack(peer_over, "/a", ACK_ENABLED);
+        assert_eq!(state.enabled_ack_count(), 1);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 3);
+        assert_eq!(demander_latch_keys(state).len(), 1);
+
+        // Step 6: a plain refusal never touches the latch table.
+        state.record_ack(peer_over, "/a", ACK_REFUSED);
+        assert_eq!(state.refused_ack_count(), 1);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 3);
+
+        // Step 7: an ack this build does not know changes no counter.
+        state.record_ack(peer_over, "/a", b"something-newer");
+        assert_eq!(state.wire_header_refused_ack_count(), 4);
+        assert_eq!(state.enabled_ack_count(), 1);
+        assert_eq!(state.refused_ack_count(), 1);
+        assert_eq!(state.ack_peer_overlong_count(), 4);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 3);
+        assert_eq!(demander_latch_keys(state).len(), 1);
+    }
+
+    /// The peer oracles for the key-part length limit: 256 bytes is kept,
+    /// 257 bytes is refused.
+    fn latch_peer_at_and_over_the_limit() -> (String, String) {
+        let peer_at = "r".repeat(256);
+        let peer_over = "r".repeat(257);
+        assert_eq!(peer_at.len(), 256);
+        assert_eq!(peer_over.len(), 257);
+        (peer_at, peer_over)
+    }
+
+    /// The demander's wire header latch table stores no peer name or topic
+    /// longer than 256 bytes: such a refusal is counted as overlong and
+    /// reported through the shared overflow latch, which a grant never
+    /// re-arms. Both parts at 256 bytes keep their own latch.
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_demander_wire_header_latch_refuses_an_overlong_peer_or_topic_and_keeps_both_at_the_limit(
+    ) {
+        let (peer_at, peer_over) = latch_peer_at_and_over_the_limit();
+        let (topic_at, topic_over) = latch_topic_at_and_over_the_limit();
+        let state = DemandGetState::default();
+        drive_demander_latch_bounds(&state, &peer_at, &peer_over, &topic_at, &topic_over);
+
+        // Step 8: after the step 5 grant, an overlong refusal is still a
+        // repeat on the shared latch.
+        state.record_ack(&peer_over, "/a", ACK_REFUSED_WIRE_HEADER);
+        assert_eq!(state.wire_header_refused_ack_count(), 5);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 4);
+        assert_eq!(demander_latch_keys(&state).len(), 1);
+        logs_assert(|lines: &[&str]| {
+            let loud = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("WARN") && l.contains("demand REFUSED by the producing machine")
+                })
+                .count();
+            let repeats = lines
+                .iter()
+                .filter(|l| {
+                    l.contains("DEBUG")
+                        && l.contains(
+                            "demand refused by the producer for a wire header version mismatch \
+                             (repeat)",
+                        )
+                })
+                .count();
+            // Loud: step 1 (overflow latch) and step 3 (own key). Repeats on
+            // the shared overflow latch: steps 2, 4 and 8.
+            match (loud, repeats) {
+                (2, 3) => Ok(()),
+                other => Err(format!("expected (2 loud, 3 repeats), got {other:?}")),
+            }
+        });
+    }
+
+    /// Two fresh demander states driven by the same acks read the same
+    /// counters, stored keys and peers, equal to the hand-written oracle.
+    #[test]
+    fn the_demander_wire_header_latch_bounds_read_the_same_on_two_runs() {
+        let (peer_at, peer_over) = latch_peer_at_and_over_the_limit();
+        let (topic_at, topic_over) = latch_topic_at_and_over_the_limit();
+        let run = || {
+            let state = DemandGetState::default();
+            drive_demander_latch_bounds(&state, &peer_at, &peer_over, &topic_at, &topic_over);
+            (
+                state.wire_header_refused_ack_count(),
+                state.enabled_ack_count(),
+                state.refused_ack_count(),
+                state.ack_peer_overlong_count(),
+                state.wire_header_refused_ack_latch_overlong_count(),
+                demander_latch_keys(&state),
+                state.ack_peers(),
+            )
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            (
+                4,
+                1,
+                1,
+                4,
+                3,
+                vec![(peer_at.clone(), topic_at.clone())],
+                vec!["go2".to_string(), peer_at.clone()],
+            )
+        );
     }
 
     /// The demander names every peer whose ack it counted, once each and
