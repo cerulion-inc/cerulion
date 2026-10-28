@@ -36,9 +36,9 @@ test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
 # show its oracle catches it. Off by default and in every release build; only an
 # explicit `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
-# It turns on cerulion_core's feature of the same name, which carries that crate's
-# own seams (`CERULION_UNIT_COLLAPSE_MUTANT` keeps every process group one
-# executor unit).
+# This crate's seams include `CERULION_UNIT_COLLAPSE_MUTANT`, which keeps every
+# process group one executor unit. The feature also turns on cerulion_core's
+# feature of the same name, which carries the unit planner's seams.
 oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dependencies]
