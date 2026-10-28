@@ -102,7 +102,7 @@ Known limits:
 
 ### Exact replay of one process
 
-`rmw_cerulion` can record what one ROS 2 process consumed and replay that process alone against the recording, with a verdict that names the first divergent node, topic and window (`docs/ros2_replay.md`). It is runtime-tested on Humble only (rclpy nodes, rclcpp nodes on ROS time with the clock thread, and the stock `demo_nodes_cpp` executables); Foxy, Jazzy and Lyrical builds compile the same code. Single-threaded executors only: a multi-threaded executor is refused by name, and loaned takes are turned off during a replay.
+`rmw_cerulion` can record what one ROS 2 process consumed and replay that process alone against the recording, with a verdict that names the first divergent node, topic and window (`docs/ros2_replay.md`). It is runtime-tested on Humble only (rclpy nodes, rclcpp nodes on ROS time with the clock thread, and the stock `demo_nodes_cpp` executables); Foxy, Jazzy and Lyrical builds compile the same code. Single-threaded executors only: a multi-threaded executor is refused by name where the rmw can see it (not an rclcpp `MultiThreadedExecutor` whose callbacks finish in microseconds, which runs as one thread), and loaned takes are turned off during a replay. Five graph queries are answered from the recording; the others are answered live.
 
 ## Claims without a retained artifact
 

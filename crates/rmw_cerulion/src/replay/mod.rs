@@ -515,16 +515,45 @@ fn process_label(cmdline: &[String]) -> String {
     s
 }
 
-/// The refusal message for a multi-threaded executor.
-fn mt_message(cmdline: &[String], nodes: &[String], detail: &str) -> String {
+/// Why a process is not replayable, as the refusal names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotReplayable {
+    /// A multi-threaded executor (see [`detect`]).
+    MultiThreaded,
+    /// A serialized take, which bypasses the bridge the log records at.
+    SerializedTake,
+    /// A thread that never calls `rmw_wait` publishes after the process's
+    /// first wait (see `oracle.rs`).
+    UnorderedThread,
+}
+
+impl NotReplayable {
+    fn cause(self) -> &'static str {
+        match self {
+            NotReplayable::MultiThreaded => "MultiThreadedExecutor",
+            NotReplayable::SerializedTake => "serialized take",
+            NotReplayable::UnorderedThread => "publishing thread outside every executor",
+        }
+    }
+}
+
+/// The refusal message of a process that is not replayable, naming the
+/// cause, the process and its nodes.
+fn refusal_message(
+    cause: NotReplayable,
+    cmdline: &[String],
+    nodes: &[String],
+    detail: &str,
+) -> String {
     format!(
-        "ros2 process {} (nodes {}): MultiThreadedExecutor, not replayable ({detail})",
+        "ros2 process {} (nodes {}): {}, not replayable ({detail})",
         process_label(cmdline),
         if nodes.is_empty() {
             "none".to_string()
         } else {
             nodes.join(", ")
-        }
+        },
+        cause.cause()
     )
 }
 
@@ -568,8 +597,33 @@ fn log_stem(cmdline: &[String]) -> String {
 // ===========================================================================
 
 static AT_EXIT: Once = Once::new();
+/// Set when the atexit handler runs: thread-locals, the tracing dispatcher's
+/// among them, may already be destroyed, so [`note`] writes to fd 2 itself.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// Log one line: through `tracing`, or straight to stderr at process exit
+/// (a `tracing` call there panics on its destroyed thread-local).
+fn note(level: tracing::Level, line: &str) {
+    if !EXITING.load(Ordering::Relaxed) {
+        match level {
+            tracing::Level::ERROR => tracing::error!("{line}"),
+            tracing::Level::WARN => tracing::warn!("{line}"),
+            _ => tracing::info!("{line}"),
+        }
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        // SAFETY: fd 2 is the process's stderr; ManuallyDrop never closes it.
+        let mut err = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(2) });
+        let _ = err.write_all(format!("{level} {line}\n").as_bytes());
+    }
+}
 
 extern "C" fn at_exit() {
+    EXITING.store(true, Ordering::Relaxed);
     let _ = std::panic::catch_unwind(|| {
         if let Some(m) = MODE.get() {
             match m {
@@ -728,7 +782,7 @@ impl Recorder {
         let m = meta(ret);
         let thread = thread_ix();
         if let Some(d) = self.detector.on_take(thread, WAITED.with(Cell::get)) {
-            self.mark_not_replayable(&d);
+            self.mark_not_replayable(NotReplayable::MultiThreaded, &d);
         }
         let entity = self.entity_id(key);
         let (seq, source_ts, body) = TAKE_CAPTURE.with(|c| {
@@ -845,9 +899,10 @@ pub(crate) fn subscription_loans_allowed() -> bool {
 /// what it delivered: recording marks the log not replayable.
 pub(crate) fn report_serialized_take(topic: &str) {
     if let Mode::Record(r) = mode() {
-        r.mark_not_replayable(&format!(
-            "a serialized take on {topic} (the delivery log records decoded takes only)"
-        ));
+        r.mark_not_replayable(
+            NotReplayable::SerializedTake,
+            &format!("on {topic}; the delivery log records decoded takes only"),
+        );
     }
 }
 
@@ -867,6 +922,10 @@ pub(crate) struct Recorder {
     clock: Mutex<(u32, u32)>,
     clock_cv: std::sync::Condvar,
     clock_waits_timed_out: std::sync::atomic::AtomicU64,
+    /// Clock-section entries that found the other side busy and waited, and
+    /// the nanoseconds they waited in all (logged when the log closes).
+    clock_waits: std::sync::atomic::AtomicU64,
+    clock_wait_ns: std::sync::atomic::AtomicU64,
 }
 
 impl Recorder {
@@ -908,7 +967,8 @@ impl Recorder {
         }
         let (path, file) = claimed.ok_or_else(|| {
             format!(
-                "rmw_cerulion: {DELIVERY_LOG_ENV}: {stem}{LOG_SUFFIX} and 999 numbered siblings                  already exist in {}",
+                "rmw_cerulion: {DELIVERY_LOG_ENV}: {stem}{LOG_SUFFIX} and 999 numbered \
+                siblings already exist in {}",
                 dir.display()
             )
         })?;
@@ -924,6 +984,8 @@ impl Recorder {
             clock: Mutex::new((0, 0)),
             clock_cv: std::sync::Condvar::new(),
             clock_waits_timed_out: std::sync::atomic::AtomicU64::new(0),
+            clock_waits: std::sync::atomic::AtomicU64::new(0),
+            clock_wait_ns: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -940,12 +1002,15 @@ impl Recorder {
     /// the log closes.
     fn clock_section(&self, enter_clock: bool) {
         let mut g = self.clock.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = std::time::Instant::now() + CLOCK_SECTION_WAIT;
+        let start = std::time::Instant::now();
+        let deadline = start + CLOCK_SECTION_WAIT;
+        let mut waited = false;
         loop {
             let busy = if enter_clock { g.1 > 0 } else { g.0 > 0 };
             if !busy {
                 break;
             }
+            waited = true;
             let now = std::time::Instant::now();
             if now >= deadline {
                 self.clock_waits_timed_out.fetch_add(1, Ordering::Relaxed);
@@ -956,6 +1021,11 @@ impl Recorder {
                 .wait_timeout(g, deadline - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+        }
+        if waited {
+            self.clock_waits.fetch_add(1, Ordering::Relaxed);
+            self.clock_wait_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if enter_clock {
             g.0 += 1;
@@ -1010,21 +1080,39 @@ impl Recorder {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let trailer = w.finish();
         let timed_out = self.clock_waits_timed_out.load(Ordering::Relaxed);
+        let waits = self.clock_waits.load(Ordering::Relaxed);
+        let log = w.path().display().to_string();
+        if waits > 0 {
+            let ns = self.clock_wait_ns.load(Ordering::Relaxed);
+            note(
+                tracing::Level::INFO,
+                &format!(
+                    "rmw_cerulion delivery log: the clock section waited {waits} times, {} us \
+                     in all ({log})",
+                    ns / 1000
+                ),
+            );
+        }
         if timed_out > 0 {
-            tracing::warn!(
-                log = %w.path().display(),
-                timed_out,
-                "rmw_cerulion delivery log: {timed_out} clock-section waits gave up after {} ms; \
-                 a replay may diverge at a timer that fired next to a /clock update",
-                CLOCK_SECTION_WAIT.as_millis()
+            note(
+                tracing::Level::WARN,
+                &format!(
+                    "rmw_cerulion delivery log: {timed_out} clock-section waits gave up after {} \
+                     ms; a replay may diverge at a timer that fired next to a /clock update \
+                     ({log})",
+                    CLOCK_SECTION_WAIT.as_millis()
+                ),
             );
         }
         if !trailer.complete || trailer.dropped > 0 {
-            tracing::error!(
-                log = %w.path().display(),
-                dropped = trailer.dropped,
-                error = w.failed().unwrap_or("unknown"),
-                "rmw_cerulion delivery log closed INCOMPLETE"
+            note(
+                tracing::Level::ERROR,
+                &format!(
+                    "rmw_cerulion delivery log closed INCOMPLETE: {log}, {} records dropped, \
+                     error: {}",
+                    trailer.dropped,
+                    w.failed().unwrap_or("unknown")
+                ),
             );
         }
     }
@@ -1068,7 +1156,7 @@ impl Recorder {
             .unwrap_or(UNKNOWN_ENTITY)
     }
 
-    fn mark_not_replayable(&self, detail: &str) {
+    fn mark_not_replayable(&self, cause: NotReplayable, detail: &str) {
         if self.not_replayable.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1078,7 +1166,7 @@ impl Recorder {
             .unwrap_or_else(|e| e.into_inner())
             .nodes
             .clone();
-        let reason = mt_message(&self.header.cmdline, &nodes, detail);
+        let reason = refusal_message(cause, &self.header.cmdline, &nodes, detail);
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.append(Record::NotReplayable {
             k: 0,
@@ -1102,7 +1190,7 @@ impl Recorder {
         WAITED.with(|w| w.set(true));
         self.clock_leave(true);
         if let Some(d) = self.detector.on_wait(owner, thread) {
-            self.mark_not_replayable(&d);
+            self.mark_not_replayable(NotReplayable::MultiThreaded, &d);
         }
         let attached: Vec<EntityId> = {
             let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -1147,6 +1235,8 @@ struct PlayState {
     node_cursor: usize,
     guards_not_triggered: usize,
     refused: Option<String>,
+    /// See [`Verdict::refused_at`].
+    refused_at: Option<&'static str>,
     watchdog: Option<WatchdogReport>,
     verdict_written: bool,
     exhausted: bool,
@@ -1155,6 +1245,12 @@ struct PlayState {
     last_take: HashMap<u32, EntityId>,
     /// Served takes not ordered across threads (made holding the Python GIL).
     takes_unordered: usize,
+    /// Torn log: takes and graph queries past the recording (see `oracle.rs`).
+    inputs_past_log_end: usize,
+    /// Outputs made after exhaustion closed every segment.
+    outputs_after_exhaustion: usize,
+    /// The end-of-replay checks ran (see `Player::final_checks`).
+    final_checked: bool,
 }
 
 /// The replay side.
@@ -1197,11 +1293,17 @@ fn refused_verdict(log: &Path, why: &str) -> Verdict {
         outputs_excluded: 0,
         outputs_before_first_event: 0,
         outputs_off_window: 0,
+        outputs_unordered: 0,
+        outputs_past_log_end: 0,
+        outputs_after_exhaustion: 0,
+        inputs_past_log_end: 0,
+        takes_not_replayed: 0,
         guards_not_triggered_live: 0,
         culprit: None,
         input_mismatch: None,
         watchdog: None,
         refused: Some(why.to_string()),
+        refused_at: Some("start".to_string()),
     }
 }
 
@@ -1279,9 +1381,10 @@ impl Player {
                 .or_insert_with(|| w.attached.clone());
         }
         let gate = Gate::new(&schedule);
+        let torn = log.ending != LogEnding::Complete;
         let mut created: Vec<(u64, EntityId)> = rec_by_name.values().map(|e| (e.k, e.id)).collect();
         created.sort_unstable();
-        let oracle = Oracle::new(&log.records, names);
+        let oracle = Oracle::new(&log.records, names, torn);
         tracing::info!(
             log = %path.display(),
             windows = schedule.windows.len(),
@@ -1301,7 +1404,7 @@ impl Player {
             created,
             fence_cursor: Mutex::new(0),
             state: Mutex::new(PlayState {
-                takes: TakeQueues::new(&takes),
+                takes: TakeQueues::new(&takes, torn),
                 graph: GraphAnswers::new(&graphs),
                 oracle,
                 thread_map: HashMap::new(),
@@ -1309,11 +1412,15 @@ impl Player {
                 node_cursor: 0,
                 guards_not_triggered: 0,
                 refused: None,
+                refused_at: None,
                 watchdog: None,
                 verdict_written: false,
                 exhausted: false,
                 last_take: HashMap::new(),
                 takes_unordered: 0,
+                inputs_past_log_end: 0,
+                outputs_after_exhaustion: 0,
+                final_checked: false,
             }),
             schedule,
         })
@@ -1353,7 +1460,7 @@ impl Player {
                 self.rec_nodes.len()
             ),
         };
-        self.refuse(&mut st, why.clone());
+        self.refuse(&mut st, why.clone(), "start");
         Err(why)
     }
 
@@ -1428,13 +1535,14 @@ impl Player {
     }
 
     /// Refuse the rest of the replay: logged once, verdict written.
-    fn refuse(&self, st: &mut PlayState, why: String) {
+    fn refuse(&self, st: &mut PlayState, why: String, at: &'static str) {
         if st.refused.is_some() {
             return;
         }
         tracing::error!("{why}");
         let _ = ffi::rcutils_set_error_state_best_effort(&why);
         st.refused = Some(why);
+        st.refused_at = Some(at);
         self.write_verdict(st);
     }
 
@@ -1500,14 +1608,24 @@ impl Player {
             let mut st = self.lock();
             if let Some(d) = detected {
                 let nodes = self.live_nodes();
-                let why = mt_message(&self.header.cmdline, &nodes, &d);
-                self.refuse(&mut st, format!("rmw_cerulion replay refused: {why}"));
+                let why = refusal_message(
+                    NotReplayable::MultiThreaded,
+                    &self.header.cmdline,
+                    &nodes,
+                    &d,
+                );
+                self.refuse(
+                    &mut st,
+                    format!("rmw_cerulion replay refused: {why}"),
+                    "run",
+                );
             }
             if st.refused.is_some() {
                 drop(st);
                 arrays.null_all();
                 return RMW_RET_ERROR;
             }
+            st.oracle.waited(live);
             let attached: Vec<EntityId> = ents.iter().filter_map(|e| e.rec).collect();
             let mapped = self.map_thread(&mut st, live, Some(&attached));
             if mapped.is_none() {
@@ -1583,6 +1701,7 @@ impl Player {
                     if !st.exhausted {
                         st.exhausted = true;
                         st.oracle.close_all();
+                        self.final_checks(&mut st);
                         self.write_verdict(&mut st);
                     }
                 }
@@ -1639,12 +1758,21 @@ impl Player {
 
     fn serve_take(&self, key: usize, kind: TakeKind) -> Result<Option<TakeRec>, ()> {
         let live = thread_ix();
-        self.gate.note_progress();
+        self.gate.note_work();
         let mut st = self.lock();
         if let Some(d) = self.detector.on_take(live, WAITED.with(Cell::get)) {
             let nodes = self.live_nodes();
-            let why = mt_message(&self.header.cmdline, &nodes, &d);
-            self.refuse(&mut st, format!("rmw_cerulion replay refused: {why}"));
+            let why = refusal_message(
+                NotReplayable::MultiThreaded,
+                &self.header.cmdline,
+                &nodes,
+                &d,
+            );
+            self.refuse(
+                &mut st,
+                format!("rmw_cerulion replay refused: {why}"),
+                "run",
+            );
         }
         if st.refused.is_some() {
             return Err(());
@@ -1663,6 +1791,18 @@ impl Player {
             return Ok(None);
         }
         let served = st.takes.serve(rec_thread, entity, kind, &name);
+        if served.past_end {
+            if st.oracle.at_tail(live) {
+                // A torn log: the recording may have made this take after its
+                // last surviving record. Served as not taken.
+                st.inputs_past_log_end += 1;
+            } else {
+                st.oracle.input_mismatch(
+                    format!("took from {name} after this thread's last recorded take"),
+                    rec_thread,
+                );
+            }
+        }
         if let Some(m) = served.mismatch {
             st.oracle.input_mismatch(m, rec_thread);
         }
@@ -1711,12 +1851,17 @@ impl Player {
 
     fn output(&self, key: usize, mut out: Out) {
         let live = thread_ix();
-        self.gate.note_progress();
+        self.gate.note_work();
         if let Some((rec, _)) = self.rec_of(key) {
             out.entity = rec;
         }
         let mut st = self.lock();
         if st.exhausted {
+            // Every segment is closed: nothing recorded is left to compare
+            // this with. An output of a thread that never waits still counts
+            // as unordered (the verdict is rewritten when the process ends).
+            st.outputs_after_exhaustion += 1;
+            st.oracle.output_after_close(live, out.entity);
             return;
         }
         st.oracle.output(live, out);
@@ -1728,10 +1873,16 @@ impl Player {
         name: &str,
         live: impl FnOnce() -> (rmw_ret_t, u64),
     ) -> (rmw_ret_t, u64) {
-        self.gate.note_progress();
+        self.gate.note_work();
         let mut st = self.lock();
         match st.graph.next(query, name) {
             Some(r) => (r.ret, r.answer),
+            None if self.ending != LogEnding::Complete => {
+                // A torn log: the answer may be past its last surviving record.
+                st.inputs_past_log_end += 1;
+                drop(st);
+                live()
+            }
             None => {
                 st.oracle.input_mismatch(
                     format!("a {query:?} query on {name} beyond the recording"),
@@ -1743,12 +1894,64 @@ impl Player {
         }
     }
 
+    /// The checks that need the whole replay: a recorded take the replay
+    /// never made is named (once every unit is served). Runs once.
+    fn final_checks(&self, st: &mut PlayState) {
+        if st.final_checked {
+            return;
+        }
+        st.final_checked = true;
+        if self.gate.served() < self.schedule.units.len() {
+            return;
+        }
+        // A torn log's last take on a thread may be one the recording made
+        // just before it stopped: not named (`takes_not_replayed` counts it).
+        let first = st
+            .takes
+            .first_unserved_where(|thread, k| !st.oracle.is_tail(thread, k));
+        if let Some((thread, entity, k)) = first {
+            st.oracle.untaken(thread, entity, k);
+        }
+    }
+
+    /// Why the process is refused at the end: a thread outside every executor
+    /// published after the first wait (see `oracle.rs`).
+    fn unordered_refusal(&self, st: &PlayState) -> Option<String> {
+        let (n, entity) = st.oracle.unordered();
+        if n == 0 {
+            return None;
+        }
+        let topic = entity
+            .map(|e| st.oracle.describe(e).0)
+            .unwrap_or_else(|| "<an entity the recording does not have>".to_string());
+        Some(format!(
+            "rmw_cerulion replay refused: {}",
+            refusal_message(
+                NotReplayable::UnorderedThread,
+                &self.header.cmdline,
+                &self.live_nodes(),
+                &format!(
+                    "{n} outputs, the first on {topic}, came from a thread that never calls \
+                     rmw_wait; the replay orders executor threads only, so these outputs \
+                     were not compared"
+                ),
+            )
+        ))
+    }
+
     fn verdict(&self, st: &PlayState) -> Verdict {
         let o = &st.oracle;
         let served = self.gate.served();
         let total = self.schedule.units.len();
         let complete = self.ending == LogEnding::Complete;
-        let verdict = if st.refused.is_some() {
+        let (refused, refused_at) = match &st.refused {
+            Some(why) => (Some(why.clone()), st.refused_at),
+            None => match self.unordered_refusal(st) {
+                Some(why) => (Some(why), Some("end")),
+                None => (None, None),
+            },
+        };
+        let verdict = if refused.is_some() {
             "refused"
         } else if st.watchdog.is_some() {
             "watchdog"
@@ -1781,65 +1984,87 @@ impl Player {
             outputs_excluded: o.outputs_excluded,
             outputs_before_first_event: o.outputs_before_first_event,
             outputs_off_window: o.outputs_off_window,
+            outputs_unordered: o.unordered().0,
+            outputs_past_log_end: o.outputs_past_log_end,
+            outputs_after_exhaustion: st.outputs_after_exhaustion,
+            inputs_past_log_end: st.inputs_past_log_end,
+            takes_not_replayed: st.takes.unserved(),
             guards_not_triggered_live: st.guards_not_triggered,
             culprit: o.culprit.clone(),
             input_mismatch: o.input_mismatch.clone(),
             watchdog: st.watchdog.clone(),
-            refused: st.refused.clone(),
+            refused,
+            refused_at: refused_at.map(str::to_string),
         }
     }
 
     fn write_verdict(&self, st: &mut PlayState) {
         let v = self.verdict(st);
-        match v.verdict.as_str() {
-            "diverged" => {
-                if let Some(c) = &v.culprit {
-                    tracing::error!(
-                        "rmw_cerulion replay DIVERGED: process `{}`, node '{}', topic {}: window {} \
-                         (after delivery index {}) inputs matched, outputs differ (output {} of {} \
-                         recorded, {} replayed). Verdict: {}",
-                        v.process,
-                        c.node,
-                        c.topic,
-                        c.window,
-                        c.delivery,
-                        c.output_index,
-                        c.recorded_outputs,
-                        c.replayed_outputs,
-                        verdict_path(&self.path).display()
-                    );
-                }
-            }
-            "input_mismatch" => {
-                if let Some(m) = &v.input_mismatch {
-                    tracing::error!(
-                        "rmw_cerulion replay INPUT MISMATCH: process `{}`: {}. Verdict: {}",
-                        v.process,
-                        m.what,
-                        verdict_path(&self.path).display()
-                    );
-                }
-            }
-            other => tracing::info!(
-                verdict = other,
-                file = %verdict_path(&self.path).display(),
-                "rmw_cerulion replay verdict written"
-            ),
-        }
+        // The file first: at process exit a log line may not get out.
         write_verdict_file(&self.path, &v);
         st.verdict_written = true;
+        let file = verdict_path(&self.path).display().to_string();
+        match (
+            v.verdict.as_str(),
+            &v.culprit,
+            &v.input_mismatch,
+            &v.refused,
+        ) {
+            ("diverged", Some(c), _, _) => note(
+                tracing::Level::ERROR,
+                &format!(
+                    "rmw_cerulion replay DIVERGED: process `{}`, node '{}', topic {}: window {} \
+                     (after delivery index {}) inputs matched, {} (output {} of {} recorded, {} \
+                     replayed). Verdict: {file}",
+                    v.process,
+                    c.node,
+                    c.topic,
+                    c.window,
+                    c.delivery,
+                    c.what,
+                    c.output_index,
+                    c.recorded_outputs,
+                    c.replayed_outputs,
+                ),
+            ),
+            ("input_mismatch", _, Some(m), _) => note(
+                tracing::Level::ERROR,
+                &format!(
+                    "rmw_cerulion replay INPUT MISMATCH: process `{}`: {}. Verdict: {file}",
+                    v.process, m.what
+                ),
+            ),
+            ("refused", _, _, Some(why)) => {
+                note(tracing::Level::ERROR, &format!("{why}. Verdict: {file}"))
+            }
+            (other, ..) => note(
+                tracing::Level::INFO,
+                &format!("rmw_cerulion replay verdict written: {other}, {file}"),
+            ),
+        }
     }
 
     fn write_verdict_if_unwritten(&self) {
         let mut st = self.lock();
         if !st.verdict_written {
             st.oracle.close_all();
+            self.final_checks(&mut st);
             self.write_verdict(&mut st);
         }
     }
 
+    /// At process exit: the verdict if none was written, else rewritten once
+    /// the schedule was used up, so the outputs made after exhaustion are
+    /// counted in it.
     fn finish(&self) {
-        self.write_verdict_if_unwritten();
+        let mut st = self.lock();
+        if !st.verdict_written {
+            st.oracle.close_all();
+            self.final_checks(&mut st);
+            self.write_verdict(&mut st);
+        } else if st.exhausted {
+            self.write_verdict(&mut st);
+        }
     }
 }
 
@@ -1934,9 +2159,11 @@ mod tests {
     }
 
     #[test]
-    fn the_multithreaded_refusal_names_the_process_and_its_nodes() {
-        let m = mt_message(
-            &["python3".into(), "mixer.py".into()],
+    fn each_refusal_names_its_own_cause_the_process_and_its_nodes() {
+        let cmd = ["python3".to_string(), "mixer.py".to_string()];
+        let m = refusal_message(
+            NotReplayable::MultiThreaded,
+            &cmd,
             &["mixer".into()],
             "detail",
         );
@@ -1944,6 +2171,22 @@ mod tests {
             m,
             "ros2 process python3 mixer.py (nodes mixer): MultiThreadedExecutor, not replayable \
              (detail)"
+        );
+        let m = refusal_message(
+            NotReplayable::SerializedTake,
+            &cmd,
+            &["mixer".into()],
+            "on /a",
+        );
+        assert_eq!(
+            m,
+            "ros2 process python3 mixer.py (nodes mixer): serialized take, not replayable (on /a)"
+        );
+        assert!(!m.contains("MultiThreadedExecutor"), "{m}");
+        let m = refusal_message(NotReplayable::UnorderedThread, &cmd, &[], "x");
+        assert!(
+            m.contains("(nodes none): publishing thread outside every executor, not replayable"),
+            "{m}"
         );
     }
 

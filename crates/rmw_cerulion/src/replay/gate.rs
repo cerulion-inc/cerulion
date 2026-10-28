@@ -203,7 +203,8 @@ pub(crate) enum Turn {
     Serve(usize),
     /// This thread has no recorded window left (others may).
     NoMore,
-    /// The recorded schedule is fully served.
+    /// The recorded schedule is fully served and no thread holds the token
+    /// or waits for a take's turn: every served unit's callbacks are done.
     Exhausted,
 }
 
@@ -224,6 +225,11 @@ struct TokenState {
     remaining: HashMap<u32, usize>,
     /// Order keys of the served takes waiting for their turn.
     waiting_takes: std::collections::BTreeSet<u64>,
+    /// The schedule is used up and the last holder stalled (reported once).
+    stalled_at_end: bool,
+    /// The schedule is used up and a thread still holds the token: since
+    /// when, and the work counter then.
+    end_watch: Option<(Instant, u64)>,
 }
 
 /// The token and the unit cursor.
@@ -235,6 +241,10 @@ pub(crate) struct Gate {
     /// Bumped on every rmw event of the replaying process: the watchdog's
     /// "no progress" is this counter standing still.
     progress: AtomicU64,
+    /// Bumped on every take, output and graph query (not on waits): once the
+    /// schedule is used up, idle threads keep waiting, so the last holder's
+    /// stall is this counter standing still.
+    work: AtomicU64,
 }
 
 impl Gate {
@@ -251,14 +261,23 @@ impl Gate {
                 holder: None,
                 remaining,
                 waiting_takes: std::collections::BTreeSet::new(),
+                stalled_at_end: false,
+                end_watch: None,
             }),
             cv: Condvar::new(),
             progress: AtomicU64::new(0),
+            work: AtomicU64::new(0),
         }
     }
 
-    /// Record rmw progress (any take, output or served wait).
+    /// Record rmw progress (a wait).
     pub(crate) fn note_progress(&self) {
+        self.progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record rmw work (a take, an output or a graph query): progress too.
+    pub(crate) fn note_work(&self) {
+        self.work.fetch_add(1, Ordering::Relaxed);
         self.progress.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -334,7 +353,42 @@ impl Gate {
         let mut reported = false;
         loop {
             if st.next >= self.units_thread.len() {
-                return Turn::Exhausted;
+                if st.holder.is_none() && st.waiting_takes.is_empty() {
+                    return Turn::Exhausted;
+                }
+                // Another thread is inside the callbacks of the last units:
+                // their outputs belong to recorded segments still open, so
+                // exhaustion (which closes every segment) waits until the
+                // holder is back in rmw_wait (or the process ends). This
+                // thread idles meanwhile (`NoMore`): a thread that must leave
+                // its executor, such as rclcpp's clock thread at shutdown, is
+                // not held. A holder that does no rmw work (take, output or
+                // graph query) for [`WATCHDOG`] is reported once as a stall;
+                // its open segment is never compared half done.
+                if !st.stalled_at_end {
+                    let work = self.work.load(Ordering::Relaxed);
+                    match st.end_watch {
+                        Some((at, w)) if w == work => {
+                            if at.elapsed() >= WATCHDOG {
+                                st.stalled_at_end = true;
+                                let last = self.units_thread.len().saturating_sub(1);
+                                let (holder_thread, unit) = st.holder.unwrap_or((
+                                    self.units_thread.get(last).copied().unwrap_or(thread),
+                                    last,
+                                ));
+                                drop(st);
+                                on_stall(Stall {
+                                    holder_thread,
+                                    unit,
+                                    waiting_thread: thread,
+                                });
+                                return Turn::NoMore;
+                            }
+                        }
+                        _ => st.end_watch = Some((Instant::now(), work)),
+                    }
+                }
+                return Turn::NoMore;
             }
             if st.remaining.get(&thread).copied().unwrap_or(0) == 0 {
                 return Turn::NoMore;
@@ -364,7 +418,8 @@ impl Gate {
                 last_progress = now_progress;
                 since = Instant::now();
                 reported = false;
-            } else if !reported && since.elapsed() >= WATCHDOG {
+            } else if !reported && since.elapsed() >= WATCHDOG && st.next < self.units_thread.len()
+            {
                 reported = true;
                 let (holder_thread, unit) = match st.holder {
                     Some(h) => h,
@@ -390,7 +445,10 @@ impl Gate {
 #[derive(Default)]
 pub(crate) struct TakeQueues {
     per_entity: HashMap<(EntityId, TakeKind), VecDeque<TakeRec>>,
-    per_thread: HashMap<u32, VecDeque<(EntityId, TakeKind)>>,
+    /// Each recorded thread's takes not yet served: (entity, kind, order key).
+    per_thread: HashMap<u32, VecDeque<(EntityId, TakeKind, u64)>>,
+    /// The log was torn (see [`TakeQueues::new`]).
+    torn: bool,
 }
 
 /// A take served from the log.
@@ -401,11 +459,20 @@ pub(crate) struct Served {
     /// Set when the replayed take differs from the recording: the replayed
     /// process took from an entity in an order the live run did not.
     pub mismatch: Option<String>,
+    /// A take past this thread's last recorded take in a torn log: the
+    /// recording may have made it after its last surviving record. Served as
+    /// not taken; not a mismatch.
+    pub past_end: bool,
 }
 
 impl TakeQueues {
-    pub(crate) fn new(takes: &[TakeRec]) -> TakeQueues {
-        let mut q = TakeQueues::default();
+    /// `torn`: the log did not close cleanly, so a take past a thread's last
+    /// recorded take may be one the recording made after the log's end.
+    pub(crate) fn new(takes: &[TakeRec], torn: bool) -> TakeQueues {
+        let mut q = TakeQueues {
+            torn,
+            ..TakeQueues::default()
+        };
         for t in takes {
             q.per_entity
                 .entry((t.entity, t.kind))
@@ -414,9 +481,33 @@ impl TakeQueues {
             q.per_thread
                 .entry(t.thread)
                 .or_default()
-                .push_back((t.entity, t.kind));
+                .push_back((t.entity, t.kind, t.k));
         }
         q
+    }
+
+    /// The recorded take with the smallest order key that the replay has not
+    /// made, as (thread, entity, order key).
+    #[cfg(test)]
+    pub(crate) fn first_unserved(&self) -> Option<(u32, EntityId, u64)> {
+        self.first_unserved_where(|_, _| true)
+    }
+
+    /// [`TakeQueues::first_unserved`] among the takes `keep(thread, k)` accepts.
+    pub(crate) fn first_unserved_where(
+        &self,
+        keep: impl Fn(u32, u64) -> bool,
+    ) -> Option<(u32, EntityId, u64)> {
+        self.per_thread
+            .iter()
+            .flat_map(|(t, q)| q.iter().map(move |&(e, _, k)| (*t, e, k)))
+            .filter(|&(t, _, k)| keep(t, k))
+            .min_by_key(|&(_, _, k)| k)
+    }
+
+    /// The number of recorded takes the replay has not made.
+    pub(crate) fn unserved(&self) -> usize {
+        self.per_thread.values().map(VecDeque::len).sum()
     }
 
     /// Serve the next recorded take of `entity` to the recorded thread
@@ -429,9 +520,14 @@ impl TakeQueues {
         entity_name: &str,
     ) -> Served {
         let mut mismatch = None;
-        match thread.and_then(|t| self.per_thread.get_mut(&t)) {
+        let order = match thread {
+            Some(t) if self.torn => Some(self.per_thread.entry(t).or_default()),
+            Some(t) => self.per_thread.get_mut(&t),
+            None => None,
+        };
+        match order {
             Some(order) => match order.front() {
-                Some(&front) if front == (entity, kind) => {
+                Some(&(e, k, _)) if (e, k) == (entity, kind) => {
                     order.pop_front();
                 }
                 Some(_) => {
@@ -439,9 +535,17 @@ impl TakeQueues {
                         "took from {entity_name} where the recording took from another entity \
                          next on this thread"
                     ));
-                    if let Some(pos) = order.iter().position(|&x| x == (entity, kind)) {
+                    if let Some(pos) = order.iter().position(|&(e, k, _)| (e, k) == (entity, kind))
+                    {
                         order.remove(pos);
                     }
+                }
+                None if self.torn => {
+                    return Served {
+                        rec: None,
+                        mismatch: None,
+                        past_end: true,
+                    };
                 }
                 None => {
                     mismatch = Some(format!(
@@ -462,7 +566,11 @@ impl TakeQueues {
         if rec.is_none() && mismatch.is_none() {
             mismatch = Some(format!("took from {entity_name} beyond its recording"));
         }
-        Served { rec, mismatch }
+        Served {
+            rec,
+            mismatch,
+            past_end: false,
+        }
     }
 }
 
@@ -644,8 +752,10 @@ mod tests {
         let clock = std::thread::spawn(move || {
             g.take_turn(1, 12, |_| panic!("no stall"));
             o.lock().unwrap().push("take clock k12");
-            // Back in rmw_wait: the token passes on.
-            assert_eq!(g.wait_turn(1, |_| panic!("no stall")), Turn::Exhausted);
+            // Back in rmw_wait: the token passes on. Thread 0 may hold it by
+            // now (its take at k 13), so this thread idles or sees the end.
+            let t = g.wait_turn(1, |_| panic!("no stall"));
+            assert!(matches!(t, Turn::NoMore | Turn::Exhausted), "{t:?}");
         });
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -668,6 +778,8 @@ mod tests {
             *order.lock().unwrap(),
             vec!["serve window k11", "take clock k12", "take a k13"]
         );
+        // Thread 0 back in rmw_wait: the schedule is used up.
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Exhausted);
     }
 
     #[test]
@@ -704,9 +816,119 @@ mod tests {
     }
 
     #[test]
+    fn exhaustion_waits_until_the_last_holder_is_back_in_rmw_wait() {
+        let waits = [wait(10, 0, RMW_RET_OK, &[A]), wait(12, 1, RMW_RET_OK, &[B])];
+        let s = Schedule::build(&waits, &[take(11, 0, A), take(13, 1, B)], &clock_set());
+        let gate = Gate::new(&s);
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Serve(0));
+        // Thread 0 is back in rmw_wait with nothing left of its own.
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::NoMore);
+        // Thread 1 is served the last unit and holds the token inside its
+        // callback.
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Serve(1));
+        // Thread 0 idles, never told Exhausted while thread 1 holds the
+        // token, and is not held either (it returns at once).
+        for _ in 0..3 {
+            let t = Instant::now();
+            assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::NoMore);
+            assert!(t.elapsed() < Duration::from_secs(1));
+        }
+        // Thread 1 is back in rmw_wait: the schedule is exhausted for both.
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Exhausted);
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Exhausted);
+    }
+
+    #[test]
+    fn a_last_holder_that_stalls_is_reported_and_its_segment_is_never_closed() {
+        let waits = [wait(10, 0, RMW_RET_OK, &[A]), wait(12, 1, RMW_RET_OK, &[B])];
+        let s = Schedule::build(&waits, &[take(11, 0, A), take(13, 1, B)], &clock_set());
+        let gate = Gate::new(&s);
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Serve(0));
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::NoMore);
+        // Thread 1 takes the last unit and never comes back to rmw_wait.
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Serve(1));
+        let started = Instant::now();
+        let mut stalls = Vec::new();
+        // Thread 0 polls the way an idle executor thread does. Its own waits
+        // do not count as the holder's work; the holder's outputs do.
+        let mut worked = false;
+        while stalls.is_empty() {
+            gate.note_progress();
+            assert_eq!(gate.wait_turn(0, |st| stalls.push(st)), Turn::NoMore);
+            if !worked && started.elapsed() >= Duration::from_secs(1) {
+                // The holder publishes once: the stall clock restarts.
+                gate.note_work();
+                worked = true;
+            }
+            assert!(started.elapsed() < WATCHDOG * 3, "no stall reported");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(started.elapsed() >= WATCHDOG + Duration::from_secs(1));
+        assert_eq!(
+            stalls,
+            vec![Stall {
+                holder_thread: 1,
+                unit: 1,
+                waiting_thread: 0
+            }],
+            "the stall names the holder and its unit"
+        );
+        // Reported once; still not Exhausted (which would close the
+        // holder's open segment).
+        assert_eq!(gate.wait_turn(0, |_| panic!("reported once")), Turn::NoMore);
+        // The holder comes back: the schedule is exhausted.
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Exhausted);
+        assert_eq!(gate.wait_turn(0, |_| panic!("no stall")), Turn::Exhausted);
+    }
+
+    #[test]
+    fn a_torn_logs_takes_past_a_threads_last_record_are_past_the_end() {
+        let takes = [take(11, 0, A), take(12, 0, B)];
+        let mut q = TakeQueues::new(&takes, true);
+        assert_eq!(q.unserved(), 2);
+        assert_eq!(q.first_unserved(), Some((0, A, 11)));
+        assert!(q
+            .serve(Some(0), A, TakeKind::Message, "sub:/a#0")
+            .rec
+            .is_some());
+        assert!(q
+            .serve(Some(0), B, TakeKind::Message, "sub:/b#0")
+            .rec
+            .is_some());
+        assert_eq!((q.unserved(), q.first_unserved()), (0, None));
+        let s = q.serve(Some(0), A, TakeKind::Message, "sub:/a#0");
+        assert!(
+            s.past_end && s.rec.is_none() && s.mismatch.is_none(),
+            "{s:?}"
+        );
+        // A thread with no recorded take at all, in a torn log.
+        let s = q.serve(Some(3), A, TakeKind::Message, "sub:/a#0");
+        assert!(s.past_end && s.mismatch.is_none(), "{s:?}");
+        // The same take in a log that closed cleanly is a mismatch.
+        let mut q = TakeQueues::new(&takes, false);
+        q.serve(Some(0), A, TakeKind::Message, "sub:/a#0");
+        q.serve(Some(0), B, TakeKind::Message, "sub:/b#0");
+        let s = q.serve(Some(0), A, TakeKind::Message, "sub:/a#0");
+        assert!(!s.past_end && s.mismatch.is_some(), "{s:?}");
+    }
+
+    #[test]
+    fn a_recorded_take_never_made_stays_unserved() {
+        let takes = [take(11, 0, A), take(12, 0, B), take(14, 1, A)];
+        let mut q = TakeQueues::new(&takes, false);
+        q.serve(Some(0), A, TakeKind::Message, "sub:/a#0");
+        assert_eq!(q.unserved(), 2);
+        assert_eq!(q.first_unserved(), Some((0, B, 12)));
+        assert_eq!(
+            q.first_unserved_where(|t, k| (t, k) != (0, 12)),
+            Some((1, A, 14))
+        );
+    }
+
+    #[test]
     fn takes_are_served_per_entity_and_out_of_order_takes_are_named() {
         let takes = [take(11, 0, A), take(12, 0, B), take(13, 0, A)];
-        let mut q = TakeQueues::new(&takes);
+        let mut q = TakeQueues::new(&takes, false);
         let s = q.serve(Some(0), A, TakeKind::Message, "sub:/a#0");
         assert_eq!(s.rec.unwrap().k, 11);
         assert!(s.mismatch.is_none());

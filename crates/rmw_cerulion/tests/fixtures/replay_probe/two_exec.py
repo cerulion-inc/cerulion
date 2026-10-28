@@ -81,6 +81,16 @@ def main():
         pass
     for t in threads:
         t.join(2.0)
+    # Exit through libc exit(): C atexit handlers run (the rmw closes its
+    # delivery log there), Python finalization does not. Finalization ends the
+    # daemon executor threads with a forced unwind through rclpy C++ frames,
+    # which aborts the process (std::terminate) in about half the runs, with
+    # rmw_fastrtps_cpp as with rmw_cerulion, and leaves the log torn.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    import ctypes
+
+    ctypes.CDLL(None).exit(0)
 
 
 if __name__ == "__main__":

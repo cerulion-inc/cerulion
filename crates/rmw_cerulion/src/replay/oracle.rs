@@ -17,6 +17,17 @@
 //! first rmw event (construction time): they cannot depend on a delivery, and
 //! rclpy's construction-time `/parameter_events` publish carries a wall-clock
 //! stamp, because `use_sim_time` takes effect only after it.
+//!
+//! A torn log (the recorded process was killed, or the recorder hit a write
+//! error) lost an unknown suffix of records, so each recorded thread's LAST
+//! segment may be missing outputs: that segment is compared only as far as
+//! the recording goes (the recorded outputs must be the first replayed ones),
+//! and the replayed outputs past it are counted, never compared.
+//!
+//! A thread that publishes and never calls `rmw_wait` (a plain thread outside
+//! every executor) is not ordered by the replay at all. Its outputs made
+//! after the process's first wait are counted as UNORDERED, and the verdict
+//! refuses the process by name rather than calling it identical.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -77,6 +88,9 @@ pub(crate) struct Culprit {
     /// The order key of the recorded event the segment follows (0: before the
     /// thread's first event).
     pub anchor_k: u64,
+    /// What differs: `outputs differ`, or that the recording took a delivery
+    /// here that the replay never took.
+    pub what: String,
     /// Position of the first differing output in the segment.
     pub output_index: usize,
     pub recorded_outputs: usize,
@@ -126,11 +140,28 @@ pub(crate) struct Verdict {
     pub outputs_excluded: usize,
     pub outputs_before_first_event: usize,
     pub outputs_off_window: usize,
+    /// Outputs of threads that never wait, made after the first wait (see
+    /// the module docs); nonzero refuses the process.
+    pub outputs_unordered: usize,
+    /// Torn log: replayed outputs past a thread's last recorded segment.
+    pub outputs_past_log_end: usize,
+    /// Outputs made after the schedule was used up and every segment closed.
+    pub outputs_after_exhaustion: usize,
+    /// Torn log: takes past a thread's last recorded take (served as not
+    /// taken) and graph queries past the recorded answers (answered live).
+    pub inputs_past_log_end: usize,
+    /// Recorded takes the replay never made.
+    pub takes_not_replayed: usize,
     pub guards_not_triggered_live: usize,
     pub culprit: Option<Culprit>,
     pub input_mismatch: Option<InputMismatch>,
     pub watchdog: Option<WatchdogReport>,
     pub refused: Option<String>,
+    /// When the refusal came: `start` (at `rmw_init` or node creation,
+    /// before the node ran), `run` (the replay stopped serving when the cause
+    /// was seen) or `end` (the process ran to the end and its outputs were
+    /// not all comparable).
+    pub refused_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -142,6 +173,12 @@ struct LiveSegment {
     /// Outputs made before the thread was mapped (construction time): kept
     /// until the mapping names the recorded thread.
     pending_unmapped: bool,
+    /// Outputs made while unmapped after some thread had waited, and the
+    /// first one's entity: unordered unless this thread waits later.
+    late_unmapped: usize,
+    late_entity: Option<EntityId>,
+    /// This live thread has called `rmw_wait`.
+    waited: bool,
 }
 
 /// What the oracle needs to know about each recorded entity.
@@ -164,6 +201,10 @@ pub(crate) struct Oracle {
     visited: HashSet<(u32, u64)>,
     live: BTreeMap<u32, LiveSegment>,
     inputs_ok: bool,
+    /// Torn log: each recorded thread's last event (its open tail segment).
+    tails: HashMap<u32, u64>,
+    /// Some live thread has waited.
+    any_wait: bool,
     pub(crate) culprit: Option<Culprit>,
     pub(crate) input_mismatch: Option<InputMismatch>,
     pub(crate) segments_compared: usize,
@@ -173,11 +214,13 @@ pub(crate) struct Oracle {
     pub(crate) outputs_excluded: usize,
     pub(crate) outputs_before_first_event: usize,
     pub(crate) outputs_off_window: usize,
+    pub(crate) outputs_past_log_end: usize,
 }
 
 impl Oracle {
-    /// Build the recorded side from a log's records (in `k` order).
-    pub(crate) fn new(records: &[Record], names: EntityNames) -> Oracle {
+    /// Build the recorded side from a log's records (in `k` order). `torn`:
+    /// the log did not close cleanly (see the module docs).
+    pub(crate) fn new(records: &[Record], names: EntityNames, torn: bool) -> Oracle {
         let excluded: HashSet<EntityId> = names
             .topic
             .iter()
@@ -231,6 +274,7 @@ impl Oracle {
                 _ => {}
             }
         }
+        let tails = if torn { current } else { HashMap::new() };
         Oracle {
             names,
             excluded,
@@ -240,6 +284,8 @@ impl Oracle {
             visited: HashSet::new(),
             live: BTreeMap::new(),
             inputs_ok: true,
+            tails,
+            any_wait: false,
             culprit: None,
             input_mismatch: None,
             segments_compared: 0,
@@ -249,6 +295,7 @@ impl Oracle {
             outputs_excluded: 0,
             outputs_before_first_event: 0,
             outputs_off_window: 0,
+            outputs_past_log_end: 0,
         }
     }
 
@@ -256,11 +303,91 @@ impl Oracle {
     /// Construction-time outputs made before this are compared against the
     /// recorded thread's pre-event segment.
     pub(crate) fn map_thread(&mut self, live: u32, rec: u32) {
+        self.waited(live);
         let seg = self.live.entry(live).or_default();
         if seg.rec_thread.is_none() {
             seg.rec_thread = Some(rec);
             seg.pending_unmapped = false;
         }
+    }
+
+    /// The live thread `live` called `rmw_wait` (mapped or not): it is an
+    /// executor thread, so its earlier outputs are construction time, not
+    /// unordered.
+    pub(crate) fn waited(&mut self, live: u32) {
+        self.any_wait = true;
+        let seg = self.live.entry(live).or_default();
+        seg.waited = true;
+        seg.late_unmapped = 0;
+        seg.late_entity = None;
+    }
+
+    /// Whether `k` is the recorded thread `thread`'s last event in a torn
+    /// log: the recording may have stopped there, so a take at it that the
+    /// replay never made is not a divergence.
+    pub(crate) fn is_tail(&self, thread: u32, k: u64) -> bool {
+        self.tails.get(&thread) == Some(&k)
+    }
+
+    /// Whether the live thread `live` is in its recorded thread's last
+    /// segment of a torn log (past its last surviving record).
+    pub(crate) fn at_tail(&self, live: u32) -> bool {
+        self.live.get(&live).is_some_and(|seg| {
+            seg.rec_thread
+                .and_then(|r| self.tails.get(&r))
+                .is_some_and(|&k| k == seg.anchor)
+        })
+    }
+
+    /// The outputs of live threads that never waited, made after some thread
+    /// waited, and the first one's entity.
+    pub(crate) fn unordered(&self) -> (usize, Option<EntityId>) {
+        let mut n = 0;
+        let mut first = None;
+        for seg in self.live.values().filter(|s| !s.waited) {
+            n += seg.late_unmapped;
+            first = first.or(seg.late_entity);
+        }
+        (n, first)
+    }
+
+    /// Name a recorded take the replay never made as the culprit, unless an
+    /// input differed first or an earlier culprit is named.
+    pub(crate) fn untaken(&mut self, thread: u32, entity: EntityId, k: u64) {
+        if !self.inputs_ok || self.culprit.as_ref().is_some_and(|c| c.anchor_k <= k) {
+            return;
+        }
+        let info = self.anchors.get(&(thread, k)).copied().unwrap_or_default();
+        let recorded = self
+            .recorded
+            .get(&(thread, k))
+            .map(|v| {
+                v.iter()
+                    .filter(|o| !self.excluded.contains(&o.entity))
+                    .count()
+            })
+            .unwrap_or(0);
+        let lookup = |m: &HashMap<EntityId, String>| {
+            m.get(&entity)
+                .cloned()
+                .unwrap_or_else(|| "<an entity the recording does not have>".to_string())
+        };
+        let entity_name = lookup(&self.names.name);
+        self.culprit = Some(Culprit {
+            node: lookup(&self.names.node),
+            topic: lookup(&self.names.topic),
+            what: format!(
+                "the recording took a delivery from {entity_name} here, and the replay never did"
+            ),
+            entity: entity_name,
+            window: info.window,
+            delivery: info.delivery,
+            thread,
+            anchor_k: k,
+            output_index: 0,
+            recorded_outputs: recorded,
+            replayed_outputs: 0,
+        });
     }
 
     /// An input differed from the recording: every later difference is
@@ -286,11 +413,29 @@ impl Oracle {
             self.outputs_excluded += 1;
             return;
         }
+        let any_wait = self.any_wait;
         let seg = self.live.entry(live).or_default();
         if seg.rec_thread.is_none() {
             seg.pending_unmapped = true;
+            if any_wait && !seg.waited {
+                seg.late_unmapped += 1;
+                seg.late_entity.get_or_insert(out.entity);
+            }
         }
         seg.outs.push(out);
+    }
+
+    /// An output on `live` after every segment was closed: counted as
+    /// unordered when `live` never waited (see [`Oracle::unordered`]).
+    pub(crate) fn output_after_close(&mut self, live: u32, entity: EntityId) {
+        if self.excluded.contains(&entity) || !self.any_wait {
+            return;
+        }
+        let seg = self.live.entry(live).or_default();
+        if seg.rec_thread.is_none() && !seg.waited {
+            seg.late_unmapped += 1;
+            seg.late_entity.get_or_insert(entity);
+        }
     }
 
     fn close(&mut self, live: u32) {
@@ -315,6 +460,7 @@ impl Oracle {
             self.outputs_before_first_event += outs.len();
             return;
         }
+        let tail = self.tails.get(&rec_thread) == Some(&anchor);
         let recorded: Vec<Out> = if first_visit {
             self.recorded
                 .get(&key)
@@ -330,6 +476,15 @@ impl Oracle {
             // continue it): its outputs were already compared.
             Vec::new()
         };
+        let mut outs = outs;
+        if tail {
+            // A torn log's last segment of this thread: compare as far as the
+            // recording goes; the rest is past the log's end.
+            if outs.len() > recorded.len() {
+                self.outputs_past_log_end += outs.len() - recorded.len();
+                outs.truncate(recorded.len());
+            }
+        }
         if outs.is_empty() && recorded.is_empty() {
             return;
         }
@@ -366,6 +521,7 @@ impl Oracle {
             node: lookup(&self.names.node),
             topic: lookup(&self.names.topic),
             entity: lookup(&self.names.name),
+            what: "outputs differ".to_string(),
             window: info.window,
             delivery: info.delivery,
             thread: rec_thread,
@@ -482,7 +638,7 @@ mod tests {
 
     #[test]
     fn identical_outputs_compare_clean_and_rosout_is_excluded() {
-        let mut o = Oracle::new(&recording(), names());
+        let mut o = Oracle::new(&recording(), names(), false);
         o.map_thread(0, 0);
         o.event(0, 1);
         o.output(0, live(OUT, 100));
@@ -499,7 +655,7 @@ mod tests {
 
     #[test]
     fn the_first_divergent_segment_with_matching_inputs_is_named() {
-        let mut o = Oracle::new(&recording(), names());
+        let mut o = Oracle::new(&recording(), names(), false);
         o.map_thread(0, 0);
         o.event(0, 1);
         o.output(0, live(OUT, 100));
@@ -524,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_difference_after_an_input_mismatch_is_inherited_not_named() {
-        let mut o = Oracle::new(&recording(), names());
+        let mut o = Oracle::new(&recording(), names(), false);
         o.map_thread(0, 0);
         o.event(0, 1);
         o.output(0, live(OUT, 100));
@@ -539,7 +695,7 @@ mod tests {
 
     #[test]
     fn a_missing_output_names_the_recorded_publisher() {
-        let mut o = Oracle::new(&recording(), names());
+        let mut o = Oracle::new(&recording(), names(), false);
         o.map_thread(0, 0);
         o.event(0, 1);
         // The replayed timer did not fire (a wall timer): nothing published.
@@ -553,13 +709,126 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_logs_last_segment_is_compared_only_as_far_as_the_log_goes() {
+        // The log lost its suffix after wait(6): the output at 7 is gone.
+        let mut torn = recording();
+        torn.pop();
+        let mut o = Oracle::new(&torn, names(), true);
+        o.map_thread(0, 0);
+        o.event(0, 1);
+        o.output(0, live(OUT, 100));
+        o.event(0, 4);
+        o.output(0, live(OUT, 200));
+        o.event(0, 6);
+        assert!(
+            o.at_tail(0),
+            "wait(6) is this thread's last surviving record"
+        );
+        o.output(0, live(OUT, 300));
+        o.close_all();
+        assert_eq!(
+            o.culprit, None,
+            "an output lost with the log's tail is not a culprit"
+        );
+        assert_eq!(o.outputs_past_log_end, 1);
+
+        // The log lost its suffix after take(4) and out(5): the recorded
+        // outputs that survive must still be the first replayed ones.
+        let torn: Vec<Record> = recording().into_iter().take(5).collect();
+        let mut o = Oracle::new(&torn, names(), true);
+        assert!(
+            o.is_tail(0, 4) && !o.is_tail(0, 1),
+            "take(4) is the last surviving event"
+        );
+        assert!(!Oracle::new(&recording(), names(), false).is_tail(0, 6));
+        o.map_thread(0, 0);
+        o.event(0, 1);
+        o.output(0, live(OUT, 100));
+        o.event(0, 4);
+        o.output(0, live(OUT, 201));
+        o.output(0, live(OUT, 300));
+        o.close_all();
+        let c = o
+            .culprit
+            .expect("a surviving recorded output that differs is named");
+        assert_eq!((c.anchor_k, c.output_index), (4, 0));
+
+        // The same replay of a log that closed cleanly names the missing
+        // output: only a torn log has a tail.
+        let mut o = Oracle::new(&recording(), names(), false);
+        o.map_thread(0, 0);
+        o.event(0, 1);
+        o.output(0, live(OUT, 100));
+        o.event(0, 4);
+        o.output(0, live(OUT, 200));
+        o.event(0, 6);
+        assert!(!o.at_tail(0));
+        o.close_all();
+        assert_eq!(o.culprit.expect("culprit").anchor_k, 6);
+    }
+
+    #[test]
+    fn outputs_of_a_thread_that_never_waits_are_unordered_after_the_first_wait() {
+        let mut o = Oracle::new(&recording(), names(), false);
+        // Before any thread waits: construction time, whatever the thread.
+        o.output(5, live(OUT, 1));
+        o.output(7, live(OUT, 2));
+        assert_eq!(o.unordered(), (0, None));
+        o.map_thread(0, 0);
+        o.event(0, 1);
+        o.output(0, live(OUT, 100));
+        // Thread 5 publishes on its own and never waits.
+        o.output(5, live(OUT, 3));
+        // /rosout is excluded, never counted.
+        o.output(5, live(ROS, 4));
+        // Thread 7 publishes, then waits: an executor thread after all.
+        o.output(7, live(OUT, 5));
+        o.waited(7);
+        o.close_all();
+        assert_eq!(o.unordered(), (1, Some(OUT)));
+        // After every segment is closed (the schedule is used up), thread 5
+        // still counts; the waiting thread 0 does not.
+        o.output_after_close(5, OUT);
+        o.output_after_close(5, ROS);
+        o.output_after_close(0, OUT);
+        assert_eq!(o.unordered(), (2, Some(OUT)));
+    }
+
+    #[test]
+    fn a_recorded_take_the_replay_never_made_is_named() {
+        let mut o = Oracle::new(&recording(), names(), false);
+        o.map_thread(0, 0);
+        o.event(0, 1);
+        o.output(0, live(OUT, 100));
+        o.close_all();
+        assert_eq!(o.culprit, None);
+        o.untaken(0, SUB, 4);
+        let c = o.culprit.expect("the untaken delivery is named");
+        assert_eq!(
+            (
+                c.node.as_str(),
+                c.entity.as_str(),
+                c.anchor_k,
+                c.recorded_outputs
+            ),
+            ("mixer", "sub:/a#0", 4, 1)
+        );
+        assert!(c.what.contains("never did"), "{}", c.what);
+        // After an input mismatch the untaken delivery is inherited.
+        let mut o = Oracle::new(&recording(), names(), false);
+        o.input_mismatch("x".into(), Some(0));
+        o.untaken(0, SUB, 4);
+        assert_eq!(o.culprit, None);
+    }
+
+    #[test]
     fn construction_time_outputs_are_counted_and_never_compared() {
         let mut rec = vec![out(1, OUT, 50)];
         rec.extend(recording().into_iter().map(|mut r| {
             r.set_k(r.k() + 10);
             r
         }));
-        let mut o = Oracle::new(&rec, names());
+        let mut o = Oracle::new(&rec, names(), false);
         // A wall-clock-stamped construction publish differs from the recording.
         o.output(0, live(OUT, 51));
         o.map_thread(0, 0);
