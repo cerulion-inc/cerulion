@@ -2231,6 +2231,10 @@ mod tests {
             ("features", cfg!(cerulion_has_features)),
             ("network_flow", cfg!(cerulion_has_network_flow)),
             ("actual_domain_id", cfg!(cerulion_has_actual_domain_id)),
+            (
+                "service_endpoint_info",
+                cfg!(cerulion_has_service_endpoint_info),
+            ),
         ] {
             any_present |= present;
             assert_eq!(caps.contains(&token), present, "capability token {token}");
@@ -2238,7 +2242,7 @@ mod tests {
         // The token set is CLOSED: a new capability
         // added to build.rs must land here too, and the `"none"` spelling
         // is correct only when every cfg is really off.
-        const KNOWN: [&str; 17] = [
+        const KNOWN: [&str; 18] = [
             "fetch_function",
             "is_key",
             "any_key_member",
@@ -2256,6 +2260,7 @@ mod tests {
             "features",
             "network_flow",
             "actual_domain_id",
+            "service_endpoint_info",
         ];
         if caps == ["none"] {
             assert!(

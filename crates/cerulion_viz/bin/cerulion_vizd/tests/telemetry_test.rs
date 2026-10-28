@@ -414,3 +414,53 @@ fn a_start_blocked_on_the_consent_lock_at_the_deadline_is_abandoned_and_sends_no
     drop(collector);
     let _ = std::fs::remove_dir_all(home);
 }
+
+/// Clears the CI variables and puts them back on drop, passing or failing.
+struct CiVarsCleared(Vec<(&'static str, std::ffi::OsString)>);
+
+impl CiVarsCleared {
+    fn new() -> Self {
+        let saved = cerulion_telemetry::ci::CI_ENV_VARS
+            .iter()
+            .filter_map(|name| Some((*name, std::env::var_os(name)?)))
+            .collect();
+        for name in cerulion_telemetry::ci::CI_ENV_VARS {
+            std::env::remove_var(name);
+        }
+        CiVarsCleared(saved)
+    }
+}
+
+impl Drop for CiVarsCleared {
+    fn drop(&mut self) {
+        for (name, value) in self.0.drain(..) {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+#[test]
+fn the_daemon_sends_nothing_until_the_cli_has_shown_its_notice() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let home = isolated_home("notice");
+    let _restore = CiVarsCleared::new();
+    let mut collector = Collector::start();
+    std::env::set_var("POSTHOG_API_KEY", "phc_test");
+    std::env::set_var("POSTHOG_HOST", &collector.host);
+
+    assert!(
+        Telemetry::start().is_none(),
+        "no notice shown on this machine yet, so the daemon starts no telemetry"
+    );
+    consent::mark_notice_shown().expect("notice shown");
+    let telemetry = Telemetry::start().expect("starts once the notice was shown");
+    let started = collector.next(Duration::from_secs(5));
+    assert_eq!(started["event"], "vizd_started");
+    assert_eq!(started["properties"]["ci"], false);
+
+    telemetry.shutdown();
+    std::env::remove_var("POSTHOG_API_KEY");
+    std::env::remove_var("POSTHOG_HOST");
+    drop(collector);
+    let _ = std::fs::remove_dir_all(home);
+}

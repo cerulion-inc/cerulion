@@ -33,6 +33,10 @@ workspace = true
 # against. Unlike `seed_logged_in_at`, these ARE reached from the integration
 # tests, which is what the dev-dependency self-reference below is for.
 test-seams = []
+# Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
+# show its oracle catches it. Off by default and in every release build; only an
+# explicit `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
+oracle-mutants = []
 
 [dependencies]
 cerulion_core = { workspace = true }
@@ -78,6 +82,8 @@ serde_json = "1"
 # cerulion_remoted, cerud, cerulion_viz) and is already allow-listed by
 # `deny.toml` — this adds a version, not a new dependency to audit.
 sha2 = "0.10"
+# Cold-path encoding for the private robot bootstrap process boundary.
+hex = "0.4"
 regex = "1.10"
 # Must track `cerulion_core`'s iceoryx2 version (0.9). The CLI's
 # `topic_cmd::topic_list` / `topic_info` introspection path calls

@@ -30,6 +30,23 @@ pub const VIZD_HEARTBEAT: EventSpec = EventSpec {
     allowlist: &["uptime_minutes"],
 };
 
+/// The client, or `None` until the CLI has shown its first-run notice on
+/// this machine: the daemon prints no notice of its own, so it sends nothing
+/// before the CLI has shown one. A CI run needs no notice.
+fn client_after_notice() -> Option<Client> {
+    notice_cleared(
+        cerulion_telemetry::ci::detected(),
+        consent::notice_shown().ok(),
+    )
+    .then(|| Client::from_env(common()))
+    .flatten()
+}
+
+/// Whether the daemon may send: under CI, or once the notice was shown.
+fn notice_cleared(ci: bool, notice_shown: Option<bool>) -> bool {
+    ci || notice_shown == Some(true)
+}
+
 /// The properties every vizd event carries.
 pub fn common() -> Common {
     Common {
@@ -42,6 +59,7 @@ pub fn common() -> Common {
         .into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         channel: None,
+        ci: cerulion_telemetry::ci::detected(),
     }
 }
 
@@ -134,8 +152,8 @@ pub struct Telemetry {
 impl Telemetry {
     /// Send `vizd_started` and start the heartbeat.
     pub fn start() -> Option<Telemetry> {
-        let client = Client::from_env(common())?;
-        let anon_id = consent::anon_id().ok().flatten()?;
+        let client = client_after_notice()?;
+        let anon_id = consent::event_anon_id().ok().flatten()?;
         Telemetry::begin(client, &anon_id, HEARTBEAT_INTERVAL, None)
     }
 
@@ -143,7 +161,7 @@ impl Telemetry {
     /// the anonymous id and consent still come from the environment (tests).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn start_with(client: Client, interval: Duration) -> Option<Telemetry> {
-        let anon_id = consent::anon_id().ok().flatten()?;
+        let anon_id = consent::event_anon_id().ok().flatten()?;
         Telemetry::begin(client, &anon_id, interval, None)
     }
 
@@ -181,7 +199,7 @@ impl Telemetry {
             if !consent::status().enabled {
                 return;
             }
-            let Some(anon_id) = consent::anon_id().ok().flatten() else {
+            let Some(anon_id) = consent::event_anon_id().ok().flatten() else {
                 return;
             };
             // Queued under the consent lock: an opt-out that has returned is
@@ -245,7 +263,7 @@ impl Telemetry {
     /// Run [`Telemetry::start`] on its own thread, so a consent file held
     /// locked by another process never delays the daemon or its shutdown.
     pub fn start_in_background() -> Starting {
-        Starting::spawn(|| Client::from_env(common()), HEARTBEAT_INTERVAL)
+        Starting::spawn(client_after_notice, HEARTBEAT_INTERVAL)
     }
 
     /// Stop the heartbeat and flush, both within one
@@ -313,7 +331,8 @@ impl Starting {
                 // The client and the anonymous id come first: a consent file
                 // held locked by another process blocks here, before anything
                 // is queued and outside the abandon lock.
-                let prepared = client().and_then(|c| Some((c, consent::anon_id().ok().flatten()?)));
+                let prepared =
+                    client().and_then(|c| Some((c, consent::event_anon_id().ok().flatten()?)));
                 if *lock(&flag) {
                     return;
                 }
@@ -372,5 +391,22 @@ impl Starting {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notice_cleared;
+
+    #[test]
+    fn the_daemon_sends_under_ci_or_once_the_notice_was_shown() {
+        assert!(notice_cleared(true, None), "CI needs no notice");
+        assert!(notice_cleared(true, Some(false)));
+        assert!(notice_cleared(false, Some(true)));
+        assert!(!notice_cleared(false, Some(false)));
+        assert!(
+            !notice_cleared(false, None),
+            "an unreadable consent file is not a shown notice"
+        );
     }
 }

@@ -1264,6 +1264,100 @@ pub unsafe extern "C" fn rmw_get_subscriptions_info_by_topic(
     })
 }
 
+/// The argument checks `rmw/get_service_endpoint_info.h` lists ahead of
+/// any query, in its order, then `RMW_RET_UNSUPPORTED` with `refusal` set
+/// as the rcutils error string. `GraphRegistry::services` and `::clients`
+/// hold one `(type name, count)` pair per service name and no per-endpoint
+/// node name, namespace, gid or QoS, so no `rmw_service_endpoint_info_t`
+/// can be filled from them.
+///
+/// # Safety
+/// `node`, `allocator`, `service_name` and `out` must each be null or
+/// point to a live object of its type.
+#[cfg(cerulion_has_service_endpoint_info)]
+unsafe fn service_endpoint_info_unsupported(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    out: *mut ffi::rmw_service_endpoint_info_array_t,
+    refusal: &'static std::ffi::CStr,
+) -> rmw_ret_t {
+    ffi::ffi_guard(RMW_RET_ERROR, || unsafe {
+        if node.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        // `rcutils_allocator_is_valid`: all four function pointers set.
+        let allocator_valid = !allocator.is_null() && {
+            let a = &*allocator;
+            a.allocate.is_some()
+                && a.deallocate.is_some()
+                && a.reallocate.is_some()
+                && a.zero_allocate.is_some()
+        };
+        if !allocator_valid || ffi::cstr(service_name).is_none() || out.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if (*out).size != 0 || !(*out).info_array.is_null() {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        if !ffi::is_our_identifier((*node).implementation_identifier) {
+            return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+        }
+        let _ = ffi::rcutils_set_error_state_cstr(refusal);
+        ffi::RMW_RET_UNSUPPORTED
+    })
+}
+
+/// Lyrical and later (`rmw/service_endpoint_info_array.h`): compiled out
+/// whole on a build whose headers lack
+/// `rmw_service_endpoint_info_array_t`. Validates its
+/// arguments, then answers `RMW_RET_UNSUPPORTED` with an rcutils error
+/// string naming the call: the runtime graph holds one `(type name,
+/// count)` pair per service and no per-client endpoint record.
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_clients_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    clients_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        clients_info,
+        c"rmw_get_clients_info_by_service is not supported by rmw_cerulion: it records no per-client endpoint information",
+    )
+}
+
+/// Lyrical and later; the server-side twin of
+/// [`rmw_get_clients_info_by_service`].
+///
+/// # Safety
+/// rmw ABI contract.
+#[cfg(cerulion_has_service_endpoint_info)]
+#[no_mangle]
+pub unsafe extern "C" fn rmw_get_servers_info_by_service(
+    node: *const ffi::rmw_node_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    service_name: *const c_char,
+    _no_mangle: bool,
+    servers_info: *mut ffi::rmw_service_endpoint_info_array_t,
+) -> rmw_ret_t {
+    service_endpoint_info_unsupported(
+        node,
+        allocator,
+        service_name,
+        servers_info,
+        c"rmw_get_servers_info_by_service is not supported by rmw_cerulion: it records no per-server endpoint information",
+    )
+}
+
 // =====================================================================
 // QoS compatibility / misc
 // =====================================================================

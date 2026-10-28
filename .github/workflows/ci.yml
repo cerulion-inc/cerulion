@@ -715,6 +715,12 @@ jobs:
       - name: Android e2e demand probe verdict self-test
         run: ./tools/scripts/test_android_e2e_probe_verdict.sh
 
+      # The emulator e2e reads its millisecond clock from bash 5's
+      # $EPOCHREALTIME, not GNU date. Its self-test needs no device, so it
+      # runs here on every pull request.
+      - name: Android e2e millisecond clock self-test
+        run: bash tools/scripts/android_emulator_e2e.sh self-test
+
       # Offline: the registry, the archives and the tag lookup are PATH shims,
       # so this runs here rather than in the release workflow, where the script
       # itself reads crates.io after an upload.
@@ -876,8 +882,8 @@ jobs:
       # the same failure mode (`a hand list goes stale`) this workflow keeps
       # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
       #
-      # SCOPE: the walk names the three top-level TREES that exist today
-      # (`benches`, `examples`, `crates/cerulion_core/fuzz`). A brand-new
+      # SCOPE: the walk names the four TREES that exist today (`benches`,
+      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
       # top-level excluded tree would need a line here, visible in review,
       # unlike a missing file inside a directory already swept.
       - name: Check formatting (the workspaces the root does not cover)
@@ -901,13 +907,14 @@ jobs:
             cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
             echo "::endgroup::"
             checked=$((checked + 1))
-          done < <(find benches examples crates/cerulion_core/fuzz \
+          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
                         -type f -name Cargo.toml -not -path '*/target/*' | sort)
           # A walk that matched nothing would be a silent green. The floor is
           # the exact number of roots in the tree (two under benches/latency,
-          # five examples, the fuzz crate), so losing any one of them trips it.
+          # benches/wire-formats, eight examples, the fuzz crate, the Android
+          # sample's runtime crate), so losing any one of them trips it.
           # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 8 ]; then
+          if [ "$checked" -lt 13 ]; then
             echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
             exit 1
           fi
@@ -1411,6 +1418,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            crates/cerulion_android/android/runtime/target
           key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
@@ -1441,8 +1449,41 @@ jobs:
       - name: Check local-transport on Android
         run: cargo ndk -t arm64-v8a --platform 30 check -p cerulion_core --features local-transport
 
-      - name: Build cerulion_android on Android
-        run: cargo ndk -t arm64-v8a --platform 30 build -p cerulion_android
+      # An app ships one native library: its runtime crate links
+      # cerulion_android and the graph's nodes. Build the sample app's runtime
+      # library the way an app does, copy exactly that one file into a
+      # jniLibs tree, and gate it (one library per ABI, 16 KB aligned LOAD
+      # segments, the JNI exports and no node exports). The self-test first
+      # proves the gate refuses each defect.
+      - name: Build the sample app runtime library on Android
+        working-directory: crates/cerulion_android/android/runtime
+        run: cargo ndk -t arm64-v8a --platform 30 build --release -p cerulion_sample_runtime
+
+      - name: Gate the sample app's jniLibs
+        run: |
+          jnilibs="$RUNNER_TEMP/jniLibs"
+          mkdir -p "$jnilibs/arm64-v8a"
+          cp crates/cerulion_android/android/runtime/target/aarch64-linux-android/release/libcerulion_sample_runtime.so "$jnilibs/arm64-v8a/"
+          # The self-test runs under a TMPDIR whose path holds a quote, and
+          # must remove its work directory from there on exit.
+          selftest_tmp="$RUNNER_TEMP/jnilibs self'test"
+          mkdir -p "$selftest_tmp"
+          TMPDIR="$selftest_tmp" bash tools/scripts/android_jnilibs_gate.sh --self-test "$jnilibs" cerulion_sample_runtime
+          if [ -n "$(ls -A "$selftest_tmp")" ]; then
+            echo "::error::the jniLibs self-test left files in its TMPDIR: $(ls -A "$selftest_tmp")"
+            exit 1
+          fi
+
+      # The Java facade against a host build of the same runtime library:
+      # load it by name, see the linked node types and run the sample graph.
+      - name: Build the sample app runtime library on the host
+        working-directory: crates/cerulion_android/android/runtime
+        run: cargo build -p cerulion_sample_runtime
+
+      - name: Java JNI smoke test against the sample runtime library
+        run: |
+          CERULION_APP_RUNTIME_LIB="$PWD/crates/cerulion_android/android/runtime/target/debug/libcerulion_sample_runtime.so" \
+            cargo test -p cerulion_android --test jni_java_test -- --ignored --test-threads=1
 
       - name: Cache cargo (prune the namespace to the current key)
         id: cache-prune
@@ -1466,6 +1507,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            crates/cerulion_android/android/runtime/target
           key: cargo-android-arm64-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}
 
   local-transport:
@@ -1547,12 +1589,27 @@ jobs:
           cargo test -p cerulion_core --features local-transport --test local_transport_test -- --test-threads=1 \
             --ignored --exact loader_refuses_a_matching_local_transport_cdylib
 
+      # The in-process transport is the one an Android app runs on: this
+      # graph runs nodes linked into the test binary from the node registry.
+      # cerulion_android depends on cerulion_core, so a cerulion_core change
+      # selects it too.
+      - name: local-transport linked node tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_linked_nodes_test -- --test-threads=1
+
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
         env:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_core (selected: $SELECTED)"
+
+      - name: selection marker, cerulion_android
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android (selected: $SELECTED)"
 
   examples:
     name: Examples (cargo check)
@@ -2640,6 +2697,12 @@ jobs:
       - name: cerulion_android first start failure tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
+      - name: cerulion_android linked node integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
+      - name: cerulion_android sample graph asset tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test sample_graph_asset_test
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:
@@ -3919,6 +3982,15 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerud (selected: $SELECTED)"
+      - name: cerulion_ops_proto tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_ops_proto')
+        run: cargo test -p cerulion_ops_proto
+      - name: selection marker, cerulion_ops_proto
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_ops_proto') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_ops_proto (selected: $SELECTED)"
       - name: cerulion_rcpd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
         run: cargo test -p cerulion_rcpd

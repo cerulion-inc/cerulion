@@ -49,6 +49,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// This machine's install-determined role: a **Studio** install
@@ -89,8 +91,8 @@ pub enum MachineRole {
 /// Holds bearer secrets — always written 0600 via [`write_to`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthState {
-    /// The cloud `AccountId`, `base64url`-encoded (matches `/v1/me`'s
-    /// `account_id`). Opaque to the CLI — it identifies the logged-in account.
+    /// The account service identity exactly as returned by `/v1/me`: a hosted
+    /// UUID or a legacy id. Pairing derives its separate 32-byte account id.
     pub account_id: String,
     /// The opaque session token (the WAN-gate credential; short-lived).
     pub session_token: String,
@@ -355,6 +357,13 @@ pub fn device_cert_path() -> Option<PathBuf> {
 /// machine).
 pub fn identity_layout() -> Option<cerulion_pairing::identity::IdentityLayout> {
     cerulion_config_dir().map(cerulion_pairing::identity::IdentityLayout::at)
+}
+
+/// The machine key file a reader takes the key from
+/// ([`cerulion_pairing::identity::IdentityLayout::machine_key_read_path`] under
+/// [`cerulion_config_dir`]). `None` when no config directory resolves.
+pub fn machine_key_read_path() -> Option<PathBuf> {
+    identity_layout().map(|layout| layout.machine_key_read_path())
 }
 
 /// The current Unix time in nanoseconds (saturating; monotone-enough for TTL
@@ -862,7 +871,10 @@ pub fn cache_verified_device_cert_at_absent_consumers(cert_b64: &str, cert_accou
     };
     let _ = with_store_lock(&auth_path, || {
         match load().state() {
-            Some(state) if state.account_id == cert_account => {}
+            Some(state)
+                if crate::account_identity::pairing_account_id(&state.account_id)
+                    .ok()
+                    .is_some_and(|account| URL_SAFE_NO_PAD.encode(account.0) == cert_account) => {}
             other => {
                 tracing::info!(
                     cert_account = %cert_account,
@@ -1124,7 +1136,7 @@ impl std::error::Error for ClearCertError {}
 /// to stop being the store. A separate, never-renamed file is a stable thing to
 /// serialize on, and being empty it can be locked without opening a credential
 /// for writing.
-pub const STORE_LOCK_FILE: &str = ".studio-auth.lock";
+pub const STORE_LOCK_FILE: &str = cerulion_discovery::robot_state::AUTH_STORE_LOCK_FILE;
 
 /// Where [`STORE_LOCK_FILE`] sits for a given `auth.json` path.
 #[must_use]
@@ -1142,12 +1154,19 @@ pub fn store_lock_path(auth_path: &Path) -> PathBuf {
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(1_000);
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The never-renamed sibling of `auth.json` whose exclusive lock serializes
+/// session refreshes across processes (a refresh token is single-use).
+pub const REFRESH_LOCK_FILE: &str = ".auth-refresh.lock";
+/// How long a refresh waits for a peer's refresh to finish: the refresh
+/// request's own HTTP timeout plus margin.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A held store lock: released when dropped, and by the KERNEL if this process
 /// dies holding it — which is what makes a crashed writer unable to wedge the
 /// store for the next login.
 #[cfg(unix)]
 #[must_use = "the lock is released the moment this value drops"]
-struct StoreLock {
+pub(crate) struct StoreLock {
     /// Kept solely to HOLD the `flock` (it is owned by the open file
     /// DESCRIPTION), never read.
     _file: std::fs::File,
@@ -1156,13 +1175,36 @@ struct StoreLock {
 /// Non-Unix: no `flock`, nothing held. `~/.cerulion` is a Unix path story and a
 /// fake lock claiming exclusion would be worse than none.
 #[cfg(not(unix))]
-struct StoreLock;
+pub(crate) struct StoreLock;
 
-#[cfg(unix)]
 fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(&store_lock_path(auth_path), auth_path, LOCK_WAIT, "writing")
+}
+
+/// The exclusive lock that serializes session refreshes across processes, held
+/// across the refresh request ([`REFRESH_LOCK_WAIT`] bounds the wait for it).
+/// Separate from the store lock, so a store write never waits on the network.
+pub(crate) fn hold_refresh_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(
+        &auth_path.with_file_name(REFRESH_LOCK_FILE),
+        auth_path,
+        REFRESH_LOCK_WAIT,
+        "refreshing the session in",
+    )
+}
+
+/// An exclusive `flock` on `path` (created 0600 if absent), retried every
+/// [`LOCK_POLL`] until `wait` passes.
+#[cfg(unix)]
+fn hold_lock_file(
+    path: &Path,
+    auth_path: &Path,
+    wait: std::time::Duration,
+    doing: &str,
+) -> std::io::Result<StoreLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let path = store_lock_path(auth_path);
+    let path = path.to_path_buf();
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             create_secret_dir(parent)?;
@@ -1178,7 +1220,7 @@ fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
         .mode(0o600)
         .open(&path)?;
 
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match flock_exclusive_nonblocking(&file) {
             Ok(()) => return Ok(StoreLock { _file: file }),
@@ -1187,10 +1229,10 @@ fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         format!(
-                            "another Cerulion process is writing {} and did not finish within \
+                            "another Cerulion process is {doing} {} and did not finish within \
                              {}ms",
                             auth_path.display(),
-                            LOCK_WAIT.as_millis()
+                            wait.as_millis()
                         ),
                     ));
                 }
@@ -1221,7 +1263,12 @@ fn flock_exclusive_nonblocking(f: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn hold_store_lock(_auth_path: &Path) -> std::io::Result<StoreLock> {
+fn hold_lock_file(
+    _path: &Path,
+    _auth_path: &Path,
+    _wait: std::time::Duration,
+    _doing: &str,
+) -> std::io::Result<StoreLock> {
     Ok(StoreLock)
 }
 
@@ -1310,7 +1357,7 @@ pub(crate) fn atomic_write_secret(final_path: &Path, bytes: &[u8]) -> std::io::R
 /// [`atomic_write_secret`]'s first half: everything up to (not including) the
 /// rename that publishes it. Split out so a caller writing SEVERAL secrets can
 /// learn that all of them are writable before any of them is visible.
-fn stage_secret(final_path: &Path, bytes: &[u8]) -> std::io::Result<StagedCert> {
+pub(crate) fn stage_secret(final_path: &Path, bytes: &[u8]) -> std::io::Result<StagedCert> {
     if let Some(parent) = final_path.parent() {
         if !parent.as_os_str().is_empty() {
             create_secret_dir(parent)?;
@@ -1343,6 +1390,21 @@ pub struct StagedCert {
 }
 
 impl StagedCert {
+    /// Publish a complete secret only when its destination is absent.
+    /// A crash before the link leaves only a private staging file; a crash after
+    /// it leaves complete bytes. Neither an existing file nor a symlink is replaced.
+    #[cfg(unix)]
+    pub(crate) fn commit_new(self) -> std::io::Result<()> {
+        std::fs::hard_link(&self.tmp, &self.final_path)?;
+        if let Some(parent) = self.final_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        // Keep `committed` false: Drop unlinks the staging name, while the final
+        // hard link retains the synced inode. A failed directory sync also leaves
+        // a complete final file for the next locked attempt to validate.
+        Ok(())
+    }
+
     /// The path this will publish to, for the caller's own log lines.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1377,9 +1439,8 @@ impl StagedCert {
 
 impl Drop for StagedCert {
     fn drop(&mut self) {
-        // A committed staging file was RENAMED away, so there is nothing to
-        // remove; an uncommitted one leaves the destination untouched, so all this
-        // removes is the hidden temp.
+        // A replaced staging file was renamed away. Otherwise remove only the
+        // hidden temp; an exclusively published final hard link remains intact.
         if self.committed {
             return;
         }
@@ -2472,6 +2533,77 @@ mod tests {
             now.expires_at_ns, 2,
             "the waiter's write is the last one and must be intact"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod refresh_lock_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    const HOLDER_ENV: &str = "CERULION_TEST_REFRESH_LOCK_HOLDER";
+    const THIS_TEST: &str =
+        "auth::refresh_lock_tests::a_killed_refresh_lock_holder_never_wedges_the_next_refresh";
+
+    #[test]
+    fn a_killed_refresh_lock_holder_never_wedges_the_next_refresh() {
+        // Child mode: hold the lock, announce it, and wait to be killed.
+        if let Some(path) = std::env::var_os(HOLDER_ENV) {
+            let _held = hold_refresh_lock(Path::new(&path)).unwrap();
+            println!("REFRESH_LOCK_HELD");
+            std::thread::sleep(Duration::from_secs(120));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", THIS_TEST, "--nocapture", "--test-threads=1"])
+            .env(HOLDER_ENV, &auth_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Kill the holder however this test ends.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stdout = holder.stdout.take().unwrap();
+        let mut holder = Reap(holder);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("REFRESH_LOCK_HELD") {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("the holder process took the lock");
+        // While the holder lives, the lock is not free.
+        let path = auth_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let held = hold_refresh_lock(&path).is_ok();
+            let _ = done_tx.send((held, started.elapsed()));
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the lock is held by the live holder"
+        );
+        // SIGKILL: no destructor runs; the kernel drops the flock with the process.
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        let (held, waited) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the waiter acquired the lock after the holder died");
+        assert!(held);
+        assert!(waited < REFRESH_LOCK_WAIT, "{waited:?}");
     }
 }
 

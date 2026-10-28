@@ -265,6 +265,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   recovery never buys a still-broken peer a fresh quota.
 - A diagnostic latch never wedges the path it observes and never silently resets its
   regime on a poisoned mutex (`lock_regime_latch` arm).
+- The two demand wire header latch tables (`KeyedLatches` in `transport/network.rs`) are
+  bounded in key COUNT (`KEYED_LATCHES_CAP`, 256) and key part LENGTH
+  (`LATCH_KEY_PART_MAX_LEN`, 256 bytes, the ack peer set's limit). A key the table will not
+  store reports through its shared overflow latch and is counted
+  (`wire_header_refusal_latch_overlong_count` on the producer,
+  `wire_header_refused_ack_latch_overlong_count` on the demander, surfaced on
+  `GatewayRuntime` as `demand_*`).
 - Three older latches predate the shared machine, each serving one site:
   `graph/drain_latch.rs` (pre-step drain warnings), `transport/output_discard_latch.rs`
   (incomplete-output discards) and `transport/notify_delivery_latch.rs` (notify-delivery

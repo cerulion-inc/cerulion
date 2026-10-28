@@ -26,6 +26,9 @@ name = "cerud"
 path = "src/main.rs"
 
 [dependencies]
+# The cerulion/ops/1 wire types, framing and protocol client (MIT OR
+# Apache-2.0). `protocol`, `client` and `verbs::inventory` re-export them.
+cerulion_ops_proto = { path = "../cerulion_ops_proto" }
 # Structured logging (never println! in library code). Cap release logging at
 # info, mirroring cerulion_core / cerulion_bagd.
 tracing = { version = "0.1.44", features = ["release_max_level_info"] }

@@ -1,0 +1,70 @@
+# benches/wire-formats: a single-threaded wire-format microbenchmark.
+# Cerulion's generated message types against FlatBuffers, Protobuf (prost)
+# and Cap'n Proto, on the same logical content: encode into a preallocated
+# slot, read a few fields back from bytes in memory, and bytes on the wire.
+# No transport is involved. See README.md.
+
+[package]
+name = "cerulion_wire_format_bench"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+description = "Cerulion wire-format microbenchmark: Cerulion, FlatBuffers, prost and Cap'n Proto encode and read costs"
+
+# Isolated workspace, not part of the root workspace: a root `cargo build`
+# or CI job never resolves flatbuffers, prost, capnp or criterion, and this
+# directory builds against its own committed Cargo.lock.
+[workspace]
+
+[lib]
+name = "wire_formats"
+path = "src/lib.rs"
+
+[[bin]]
+name = "check"
+path = "src/bin/check.rs"
+
+[[bin]]
+name = "flatbuffers_dirty_slot"
+path = "src/bin/flatbuffers_dirty_slot.rs"
+
+[[bench]]
+name = "wire"
+harness = false
+
+[dependencies]
+# Path deps go up two levels from benches/wire-formats.
+cerulion_core = { path = "../../crates/cerulion_core" }
+native_ros2_messages = { path = "../../crates/native_ros2_messages" }
+# Exact pins: the vendored generated code in src/ was produced by these
+# releases' generators (flatc 25.12.19, capnpc-rust 0.27.0) and is only
+# known to compile against them. Moving a pin means regenerating (README.md).
+flatbuffers = "=25.12.19"
+prost = "=0.14.4"
+bytes = "=1.12.1"
+capnp = "=0.27.3"
+
+[build-dependencies]
+# build.rs runs Cerulion's own schema codegen for msg/ImuSample.msg, the
+# same steps crates/native_ros2_messages/build.rs uses.
+cerulion_core = { path = "../../crates/cerulion_core" }
+
+[dev-dependencies]
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+# No LTO and no target-cpu flags, for every format alike.
+[profile.release]
+debug = false
+incremental = false
+
+[profile.bench]
+debug = false
+incremental = false
+
+# The repo lint rules (AGENTS.md) apply to bench code too. The vendored
+# generated modules carry their own allow list in src/lib.rs.
+[lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"

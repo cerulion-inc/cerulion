@@ -118,8 +118,9 @@ use serde_json::Value;
 /// A RECORDING spy [`cerulion_vizd::DemandPlane`] (a DI test double —
 /// Principle #13, not fake data) that SUCCEEDS every demand/release but creates NO
 /// real mirror, so the daemon's tap step fails on the non-existent `{topic}/data`
-/// service — the fault the rollback test needs. Records every demand + release for
-/// hand-oracle assertions.
+/// service, the fault the rollback test needs. A test that runs its own publisher
+/// on the daemon's manager gives the tap a local service in place of the mirror.
+/// Records every demand + release for hand-oracle assertions.
 #[derive(Default)]
 struct RecordingDemandPlane {
     demands: std::sync::Mutex<Vec<(String, String, u64)>>,
@@ -14356,4 +14357,182 @@ fn model_import_status_route_ownership_and_layout_e2e() {
         daemon.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+// ── A REMOTE attach reports the archetype its FRAMES classify as ────────────
+//
+// A remote attach seeds `status` from the pinned schema NAME, so a row has an
+// archetype before any frame arrives. The name table cannot see content: it maps
+// every `sensor_msgs/CompressedImage` to `Image`, while the sink draws one whose
+// `data` is an H.264 access unit as `VideoStream` (the shape a Go2 front camera
+// arrives in). So the first decodable frame must replace the name guess, and a
+// re-attach must not write the guess back over it. A re-attach that pins a
+// DIFFERENT schema is refused, and the tap keeps the schema and archetype it had.
+//
+// The demand plane is the RECORDING double: its demand succeeds without creating
+// a mirror, and the test's own publisher on the SAME manager is the local service
+// a netd mirror would have been. The recorded demand proves the first attach
+// took the remote arm, and that neither re-attach demanded a second mirror.
+#[test]
+fn a_remote_h264_compressed_image_attach_reports_the_video_stream_archetype_e2e() {
+    let _statics = blueprint_statics_guard();
+    let mgr = isolated_transport_with_network("camremote");
+    let topic = "/vizd/camremote";
+    let keyframe = h264_frame(&annex_b(&[GO2_SPS, GO2_PPS, GO2_IDR_HEAD]));
+    let _publisher = Publisher::spawn_fixed_frame(Arc::clone(&mgr), topic, keyframe);
+    let (worker, _flush, _storage) = memory_worker("camremote");
+    let (socket, dir) = temp_socket("camremote");
+    let plane = Arc::new(RecordingDemandPlane::default());
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        Arc::clone(&mgr),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::clone(&plane) as Arc<dyn cerulion_vizd::DemandPlane>,
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+    let attach = |client: &mut Client, id: u64, schema: &str| -> Value {
+        client.request(&format!(
+            r#"{{"id":{id},"method":"attach","topic":"{topic}","robot":"go2","schema":"{schema}"}}"#
+        ))
+    };
+    let status_row = |client: &mut Client, id: u64| -> Option<Value> {
+        let st = client.request(&format!(r#"{{"id":{id},"method":"status"}}"#));
+        entry_for(&st["topics"], "topic", topic).cloned()
+    };
+
+    let att = attach(&mut client, 1, "sensor_msgs/CompressedImage");
+    assert_eq!(att["ok"].as_bool(), Some(true), "remote attach: {att}");
+    assert_eq!(att["robot"].as_str(), Some("go2"), "{att}");
+    assert_eq!(att["already_attached"].as_bool(), Some(false), "{att}");
+    assert_eq!(
+        att["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{att}"
+    );
+    // The reply's archetype is the name seed, taken under the same lock that
+    // creates the tap's stats, so no frame verdict can precede it.
+    assert_eq!(
+        att["archetype"].as_str(),
+        Some("Image"),
+        "the first attach reply names the schema name's archetype: {att}"
+    );
+
+    // THE pin: once a frame has been drained and decoded, `status` names what
+    // the sink draws. Waiting on `frames > 0` as well means the verdict is read
+    // off a row that has seen data, not only off the seed.
+    let mut id = 10;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            id += 1;
+            status_row(&mut client, id).is_some_and(|r| {
+                r["frames"].as_u64().unwrap_or(0) > 0
+                    && r["archetype"].as_str() == Some("VideoStream")
+            })
+        }),
+        "status must name the archetype the frames classify as: {:?}",
+        status_row(&mut client, 2)
+    );
+    let row = status_row(&mut client, 3).expect("status row");
+    assert_eq!(
+        row["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "the schema stays the pinned type: {row}"
+    );
+    let list = client.request(r#"{"id":4,"method":"list"}"#);
+    let listed = entry_for(&list["attached"], "topic", topic).expect("list row");
+    assert_eq!(
+        listed["archetype"].as_str(),
+        Some("VideoStream"),
+        "list reads the same verdict: {listed}"
+    );
+
+    // A RE-ATTACH of the streaming topic must not write the name guess back over
+    // the frame verdict. Nothing would replace it again: the poll thread stops
+    // classifying once a frame has resolved the topic.
+    let re = attach(&mut client, 5, "sensor_msgs/CompressedImage");
+    assert_eq!(re["ok"].as_bool(), Some(true), "re-attach: {re}");
+    assert_eq!(re["already_attached"].as_bool(), Some(true), "{re}");
+    assert_eq!(
+        re["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{re}"
+    );
+    assert_eq!(
+        re["archetype"].as_str(),
+        Some("VideoStream"),
+        "the re-attach reply names the frame verdict: {re}"
+    );
+    for id in 101..=110 {
+        let row = status_row(&mut client, id).expect("status row");
+        assert_eq!(
+            row["archetype"].as_str(),
+            Some("VideoStream"),
+            "a re-attach must not revert status to the name guess: {row}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A re-attach that pins a DIFFERENT schema is refused. Answering it would
+    // reply with the new name beside the kept frame verdict, while `status` and
+    // `list` keep the type the mirror was demanded at.
+    let changed = attach(&mut client, 6, "sensor_msgs/Image");
+    assert_eq!(
+        changed["ok"].as_bool(),
+        Some(false),
+        "changed pin: {changed}"
+    );
+    let err = changed["error"].as_str().expect("an error message");
+    for needle in [
+        topic,
+        "'sensor_msgs/CompressedImage'",
+        "'sensor_msgs/Image'",
+        "detach",
+    ] {
+        assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+    }
+    let row = status_row(&mut client, 7).expect("the tap survives the refusal");
+    assert_eq!(
+        row["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{row}"
+    );
+    assert_eq!(row["archetype"].as_str(), Some("VideoStream"), "{row}");
+    let list = client.request(r#"{"id":8,"method":"list"}"#);
+    let listed = entry_for(&list["attached"], "topic", topic).expect("list row");
+    assert_eq!(
+        listed["schema"].as_str(),
+        Some("sensor_msgs/CompressedImage"),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["archetype"].as_str(),
+        Some("VideoStream"),
+        "{listed}"
+    );
+    // The refused attach left the tap's pin alone: the original pin still
+    // re-attaches cleanly.
+    let again = attach(&mut client, 9, "sensor_msgs/CompressedImage");
+    assert_eq!(again["ok"].as_bool(), Some(true), "{again}");
+    assert_eq!(again["archetype"].as_str(), Some("VideoStream"), "{again}");
+
+    assert_eq!(
+        *plane.demands.lock().unwrap(),
+        vec![(
+            "go2".to_string(),
+            topic.to_string(),
+            <CompressedImage as ShmMessage>::SCHEMA_HASH,
+        )],
+        "exactly one demand, for the pinned CompressedImage type"
+    );
+    assert!(
+        plane.releases.lock().unwrap().is_empty(),
+        "the refusal released nothing"
+    );
+
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

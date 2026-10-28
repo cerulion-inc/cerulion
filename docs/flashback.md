@@ -77,13 +77,6 @@ window does not run elsewhere, and on other platforms the verb says so. The
 printed path is the name the capture reserves; if something already holds that
 name, an `_N` suffix is appended.
 
-Runtime faults and declared incidents can also trigger captures automatically.
-Per-trigger `CERULION_FLASHBACK_ON_<TRIGGER>` switches control those requests;
-all default on except `SILENT`, which covers routes that have never produced.
-See the [environment-variable reference](user-api.md#environment-variables) for
-the trigger names and defaults. Automatic requests pass through the capture
-gate's coalescing and rate limits; a manual request remains available.
-
 ### What a capture covers
 
 | | Default | Knob |
@@ -103,6 +96,32 @@ window plus the 15 s anchor cadence, because a capture covering `[T−15s, T+15s
 needs a checkpoint at or before its own start to be re-runnable from there.
 Shortening it below that would produce captures anchored *after* the thing that
 went wrong.
+
+## Captures the runtime takes on its own
+
+The runtime also requests a capture when it sees a fault or a declared
+incident. Each trigger has its own switch, `CERULION_FLASHBACK_ON_<TRIGGER>`,
+set to `on` or `off`:
+
+| Trigger | Fires when | Default |
+|---|---|---|
+| `WORKER_DEATH` | A worker process exits without being asked to. | on |
+| `PANIC_DISABLE` | A node is disabled after consecutive panics, or a panic poisons its entry mutex. The process stays alive and one node has stopped. | on |
+| `RUN_VANISHED` | The run this recorder is bound to disappears without announcing anything: a hard crash such as a segfault, an OOM kill or an abort. | on |
+| `ESTOP` | A human engages the e-stop over the Cerulion ops plane. A hardwired stop that never reaches the middleware fires nothing. | on |
+| `DECLARED` | A robot-side process declares an incident on `/__cerulion/flashback`, for example a bumper, a safety PLC, a domain e-stop topic or a grasp-failure detector. | on |
+| `STALL` | A topic that was streaming goes idle or reports no data, confirmed. Topics slower than the monitors' minimum rate are not judged. | on |
+| `RATE` | A topic's rate leaves the band around its learned baseline: below half of it or above double it. | on |
+| `SILENT` | A registered route has never produced. Off by default: a graph that registers routes which legitimately carry no data would capture on every healthy run. | off |
+
+An unrecognized value keeps the row's default and prints what you typed; it is
+not read as either `on` or `off`. The manual verb has no switch; to stop
+captures altogether, set `CERULION_FLASHBACK=off` (see
+[Turning it off](#turning-it-off)). Automatic requests pass through the capture
+gate's coalescing and rate limits, and a manual request stays available
+alongside them. The
+[environment-variable reference](user-api.md#environment-variables) lists the
+same switches.
 
 ---
 
