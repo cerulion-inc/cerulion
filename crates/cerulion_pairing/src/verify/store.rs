@@ -150,8 +150,9 @@ impl TrustStore {
     }
 
     /// Load and verify a store from disk. Fails with [`PairingError::TamperDetected`]
-    /// if the MAC does not verify. On Unix, the group and other permission bits of
-    /// a regular store file are cleared before it is read.
+    /// if the MAC does not verify. On Unix, when `path` itself is a regular file
+    /// with a single link, its group and other permission bits are cleared before
+    /// it is read; a symbolic link at `path` is read through unchanged.
     pub fn load(path: impl AsRef<Path>, mac_key: &[u8]) -> Result<Self, PairingError> {
         let bytes = read_private(path.as_ref())?;
         let inner = Self::decode(&bytes, mac_key)?;
@@ -1244,28 +1245,60 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Read the store file at `path`. On Unix, when the file is a regular file that
-/// group or other users can access, its group and other permission bits are
-/// cleared through the open handle before it is read, logged at `warn`. When
-/// clearing them fails, that is logged at `warn` and the read goes on.
+/// Read the store file at `path`. On Unix, when `path` is itself a regular file
+/// with a single link that group or other users can access, its group and other
+/// permission bits are cleared through the open handle before it is read, logged at
+/// `warn` (see `narrow_to_owner`; a symbolic link at `path` is read through and its
+/// target is not changed). When clearing them fails, that is logged at `warn` and
+/// the read goes on.
 fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+    #[cfg(unix)]
+    let at_path = std::fs::symlink_metadata(path).ok();
     let mut file = std::fs::File::open(path)?;
     #[cfg(unix)]
-    narrow_to_owner(&file, path);
+    narrow_to_owner(&file, path, at_path.as_ref());
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
-/// Clear the group and other permission bits of the open store `file`, when it
-/// is a regular file.
+/// Clear the group and other permission bits of the open store `file`.
+///
+/// `at_path` is the metadata of `path` itself, read before the open without
+/// following a link. The bits are cleared only when the open handle is the same
+/// device and inode as the regular file found at `path` when its metadata was
+/// read, and that file has a single link. A path that is a symbolic link or not
+/// a regular file, that shares its file with another name, that was replaced
+/// between the two reads, or whose metadata could not be read is read as usual
+/// and its mode is left alone, logged at `warn`.
 #[cfg(unix)]
-fn narrow_to_owner(file: &std::fs::File, path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = match file.metadata() {
-        Ok(meta) if meta.is_file() => meta.permissions().mode() & 0o7777,
-        Ok(_) => return,
+fn narrow_to_owner(file: &std::fs::File, path: &Path, at_path: Option<&std::fs::Metadata>) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let Some(at_path) = at_path else {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store's metadata could not be read before it was opened; its mode \
+             was not checked"
+        );
+        return;
+    };
+    if at_path.file_type().is_symlink() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path is a symbolic link; the mode of its target is left alone"
+        );
+        return;
+    }
+    if !at_path.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path is not a regular file; its mode is left alone"
+        );
+        return;
+    }
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
@@ -1275,6 +1308,22 @@ fn narrow_to_owner(file: &std::fs::File, path: &Path) {
             return;
         }
     };
+    if meta.dev() != at_path.dev() || meta.ino() != at_path.ino() {
+        tracing::warn!(
+            path = %path.display(),
+            "the trust store path changed while it was opened; its mode is left alone"
+        );
+        return;
+    }
+    if meta.nlink() != 1 {
+        tracing::warn!(
+            path = %path.display(),
+            links = meta.nlink(),
+            "the trust store file has more than one link; its mode is left alone"
+        );
+        return;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
     if mode & 0o077 == 0 {
         return;
     }
@@ -1694,6 +1743,102 @@ mod tests {
         test_store(&path).save(KEY).unwrap();
         TrustStore::load(&path, KEY).expect("the saved store loads");
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_store_is_read_through_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.store");
+        test_store(&target).save(KEY).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("trust.store");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        TrustStore::load(&link, KEY).expect("a symlinked store still loads");
+        assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_with_another_hard_link_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.store");
+        test_store(&first).save(KEY).unwrap();
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("trust.store");
+        std::fs::hard_link(&first, &path).unwrap();
+        TrustStore::load(&path, KEY).expect("a hard-linked store still loads");
+        assert_eq!(
+            mode_of(&first),
+            0o644,
+            "a file with two links keeps its mode"
+        );
+    }
+
+    #[cfg(unix)]
+    /// A FIFO at `path` with `mode`, made with the system `mkfifo`, and a handle
+    /// on it opened read-write so the open does not wait for a peer.
+    fn fifo_with_mode(path: &Path, mode: u32) -> std::fs::File {
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg(format!("{mode:o}"))
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed: {made}");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_store_path_is_not_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.store");
+        let file = fifo_with_mode(&path, 0o644);
+        let at_path = std::fs::symlink_metadata(&path).unwrap();
+        narrow_to_owner(&file, &path, Some(&at_path));
+        assert_eq!(mode_of(&path), 0o644, "a non-regular file keeps its mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_store_path_is_not_changed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("trust.store");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            TrustStore::load(&sub, KEY).is_err(),
+            "a directory is not a store"
+        );
+        assert_eq!(mode_of(&sub), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_that_is_not_the_file_at_the_path_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let opened = dir.path().join("opened");
+        let other = dir.path().join("other");
+        std::fs::write(&opened, b"x").unwrap();
+        std::fs::write(&other, b"y").unwrap();
+        std::fs::set_permissions(&opened, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let file = std::fs::File::open(&opened).unwrap();
+        let other_meta = std::fs::symlink_metadata(&other).unwrap();
+        narrow_to_owner(&file, &opened, Some(&other_meta));
+        assert_eq!(mode_of(&opened), 0o644, "a different inode is not changed");
+        let own_meta = std::fs::symlink_metadata(&opened).unwrap();
+        narrow_to_owner(&file, &opened, Some(&own_meta));
+        assert_eq!(mode_of(&opened), 0o600, "the same inode is narrowed");
     }
 
     #[test]
