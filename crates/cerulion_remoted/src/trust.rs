@@ -355,6 +355,9 @@ impl SharedTrust {
         let now_ns = self.clock.now_ns();
         let _writer = self.writer_lock();
         let guard = self.lock();
+        if guard.store.is_device_revoked(&key) {
+            return Err(TrustError::Pairing(PairingError::NotOwner));
+        }
         let account = guard
             .index
             .account_for(&key)
@@ -783,12 +786,19 @@ mod tests {
         shared
             .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
             .unwrap();
-        let blocker = dir.path().join("trust_store.tmp");
+        // A directory at the saved file's own path makes the rename onto it
+        // fail, whatever temp name the save picks; the real file is set aside
+        // first and restored before the reload.
+        let blocker = dir.path().join("trust_store");
+        let aside = dir.path().join("set_aside");
+        std::fs::rename(&blocker, &aside).unwrap();
         std::fs::create_dir(&blocker).unwrap();
         assert!(matches!(
             shared.set_allow_cloud(&[7; 32], false),
             Err(TrustError::Persist(_))
         ));
+        std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&aside, &blocker).unwrap();
         assert!(shared.allow_cloud(), "the live switch is unchanged");
         let reload_switch = || {
             reload(
@@ -798,7 +808,6 @@ mod tests {
             .allow_cloud()
         };
         assert!(reload_switch());
-        std::fs::remove_dir(&blocker).unwrap();
         shared.set_allow_cloud(&[7; 32], false).unwrap();
         assert!(!shared.allow_cloud());
         assert!(!reload_switch(), "a successful write persists");

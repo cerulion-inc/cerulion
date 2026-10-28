@@ -38,8 +38,7 @@ pub enum PairingSource {
     /// devices presents its roots-verified device certificate chain
     /// ([`crate::verify::TrustStore::verify_owner_certificate`]). No code and no
     /// user step: the certificate is the proof. The row carries the
-    /// certificate's principal, so a [`PrincipalKind::Cloud`] device stays
-    /// distinguishable from the owner's own devices.
+    /// certificate's principal, [`PrincipalKind::Cloud`] included.
     CertificatePresentation,
 }
 

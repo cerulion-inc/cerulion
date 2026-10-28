@@ -1390,6 +1390,31 @@ fn owner_grant_claim_flips_unclaimed_to_claimed_owner() {
 }
 
 #[test]
+fn a_cloud_device_certificate_cannot_claim_the_robot() {
+    let mut s = store();
+    let mut device_cert = make_device_cert(
+        pk(&sk(OWNER_DEVICE_SEED)),
+        acct(OWNER),
+        pk(&sk(10)),
+        Scope::OWNER_FULL,
+        wide_validity(),
+        ISSUED,
+    );
+    device_cert.principal_kind = PrincipalKind::Cloud;
+    let mut pres = owner_presentation(acct(OWNER));
+    pres.device_cert = device_cert.sign(&sk(10));
+    let err = s
+        .claim_by_owner_grant(&pres, &owner_peer_key(), T_NOW)
+        .unwrap_err();
+    assert!(matches!(err, PairingError::NotOwnerGrant), "got {err:?}");
+    assert!(!s.is_claimed());
+    assert!(s.access_rows().is_empty());
+    // The same presentation with a human device certificate claims.
+    s.claim_by_owner_grant(&owner_presentation(acct(OWNER)), &owner_peer_key(), T_NOW)
+        .unwrap();
+}
+
+#[test]
 fn owner_grant_claim_refused_on_already_claimed() {
     let mut s = store();
     s.claim_by_owner_grant(&owner_presentation(acct(OWNER)), &owner_peer_key(), T_NOW)

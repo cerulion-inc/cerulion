@@ -842,7 +842,8 @@ impl TrustStore {
     ///    authenticated peer and the grant bound to THIS robot + the device cert's
     ///    account. Any chain failure surfaces its precise [`PairingError`].
     /// 3. [`PairingError::NotOwnerGrant`] when the verified effective scope does not
-    ///    confer the OWNER role — only an OWNER-scoped grant may claim ownership.
+    ///    confer the OWNER role (only an OWNER-scoped grant may claim ownership),
+    ///    or when the device certificate names the Cloud principal.
     ///
     /// On success the ownership flips to `Claimed(owner)`, the owner `AccessRow`
     /// (scope = the verified effective scope, `source = PairingSource::OwnerGrant`,
@@ -863,6 +864,11 @@ impl TrustStore {
         // (device cert ∩ grant) must confer the OWNER role. A narrower grant
         // (operator/viewer) can never mint an owner — refuse loudly.
         if verified.scope().role != Role::OWNER {
+            return Err(PairingError::NotOwnerGrant);
+        }
+        // A Cloud principal is refused here; the owner row written below carries
+        // no expiry.
+        if verified.principal_kind() == crate::format::PrincipalKind::Cloud {
             return Err(PairingError::NotOwnerGrant);
         }
         let account = verified.account();
@@ -1424,8 +1430,8 @@ impl TrustStore {
 
 /// The expiry of a row written from a certificate: `expires_at_ns` for a human
 /// or machine principal; for a cloud principal the earlier of `expires_at_ns`
-/// and the certificate's `not_after` (so the row lapses with the certificate,
-/// and each renewed certificate presented extends it).
+/// and the certificate's `not_after`. Each certificate presented rewrites the
+/// row with its own `not_after`.
 fn row_expiry(
     principal: crate::format::PrincipalKind,
     cert_not_after_ns: u64,
