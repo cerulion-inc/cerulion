@@ -1270,3 +1270,43 @@ pub fn assert_single_bag(recordings: &Path) -> PathBuf {
     );
     bags.into_iter().next().unwrap()
 }
+
+/// Every `.mcap` directly under `dir`, sorted.
+pub fn mcaps(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mcap"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// The bag's FIRST rank-0 `STEP_BOUNDARY` record: its `step` is the number
+/// `bag play --resim` derives its resume point from, and its `fire_time_ns` is
+/// that step's gating-clock target, the `timestamp_ns` every frame published
+/// at that step carries.
+///
+/// This MIRRORS `replay_engine`'s `first_recorded_boundary` (a rank-0 walk of the
+/// same records) rather than deriving anything of its own: the whole point is to
+/// read the value the engine will read. Step zero means the recording begins at
+/// step 0 and needs no anchor; anything above it is a mid-run recording, which
+/// needs a complete anchor at `step - 1`.
+///
+/// The departure ring cannot be mistaken for rank 0: its records carry the
+/// `u32::MAX` sentinel, which `rank()` masks to `0x7FFF_FFFF`.
+pub fn first_rank0_boundary(bag: &Path) -> Option<TraceRingRecord> {
+    let reader = BagReader::open(bag).expect("open the bag");
+    let (msgs, _) = reader.recover_messages().expect("recover the bag");
+    msgs.into_iter()
+        .filter(|m| m.topic == cerulion_bag::SCHEDULER_TRACE_TOPIC)
+        .map(|m| TraceRingRecord::from_bytes(m.data[..40].try_into().expect("a 40-byte record")))
+        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.rank() == 0)
+}
+
+/// The step of [`first_rank0_boundary`].
+pub fn first_rank0_boundary_step(bag: &Path) -> Option<u64> {
+    first_rank0_boundary(bag).map(|r| r.step)
+}

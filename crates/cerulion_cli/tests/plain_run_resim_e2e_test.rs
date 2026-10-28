@@ -190,13 +190,15 @@ use cerulion_bagd::{
     RecordCoverage, TapSource, TappedTopic, CAPTURE_RECORDER_HEALTH_ATTACHMENT,
     RECORD_COVERAGE_ATTACHMENT,
 };
-use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::TransportManager;
 use serial_test::serial;
 
 mod mp_support;
-use mp_support::{dylib_file, fixture_cdylib, read_file, send_signal, ChildGuard};
+use mp_support::{
+    dylib_file, first_rank0_boundary_step, fixture_cdylib, mcaps, read_file, send_signal,
+    ChildGuard,
+};
 
 const PERIOD_FIXTURE: &str = "test_node_macro_period_cdylib";
 const RELAY_FIXTURE: &str = "test_node_macro_data_trigger_cdylib";
@@ -501,19 +503,6 @@ fn wait_for_log_line(child: &mut ChildGuard, path: &Path, needle: &str) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Every `.mcap` directly under `dir`, sorted.
-fn mcaps(dir: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mcap"))
-                .collect()
-        })
-        .unwrap_or_default();
-    out.sort();
-    out
 }
 
 /// SIGINT the run and require a clean exit.
@@ -1606,27 +1595,6 @@ fn await_the_worker_has_published(topic: &str, wanted: usize) {
         );
         std::thread::sleep(WORKER_STEPPED_POLL);
     }
-}
-
-/// The step of the bag's FIRST rank-0 `STEP_BOUNDARY` record — the number
-/// `bag play --resim` derives its resume point from.
-///
-/// This MIRRORS `replay_engine`'s `first_recorded_boundary` (a rank-0 walk of the
-/// same records) rather than deriving anything of its own: the whole point is to
-/// read the value the engine will read. Zero means the recording begins at step
-/// 0 and needs no anchor; anything above it is a mid-run recording, which needs
-/// a complete anchor at `step - 1`.
-///
-/// The departure ring cannot be mistaken for rank 0 — its records carry the
-/// `u32::MAX` sentinel, which `rank()` masks to `0x7FFF_FFFF`.
-fn first_rank0_boundary_step(bag: &Path) -> Option<u64> {
-    let reader = cerulion_bag::BagReader::open(bag).expect("open the bag");
-    let (msgs, _) = reader.recover_messages().expect("recover the bag");
-    msgs.into_iter()
-        .filter(|m| m.topic == cerulion_bag::SCHEDULER_TRACE_TOPIC)
-        .map(|m| TraceRingRecord::from_bytes(m.data[..40].try_into().expect("a 40-byte record")))
-        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.rank() == 0)
-        .map(|r| r.step)
 }
 
 /// The bag's own `__cerulion/run.json` — what the attaching recorder recorded

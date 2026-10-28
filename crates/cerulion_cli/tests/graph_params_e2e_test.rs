@@ -6,18 +6,24 @@
 //! byte; each of the
 //! three refusal classes exits non-zero from `graph validate` AND from
 //! `graph run` naming the node and the param; `node info` lists the declared
-//! params from the built library.
+//! params from the built library; a capture that resumes mid-run is refused
+//! when the node was rebuilt with a param the recording names no value for,
+//! and resumes on that param's value with `--allow-param-change`.
 //!
 //! The node is the prebuilt `test_node_macro_param_cdylib` fixture (a period
 //! node whose `cmd` is a function of its four params: `x = gain`,
 //! `y = offset`, `z = frame_id.len()` or `-1.0` when disabled; defaults
-//! `1.0`, `0`, `"base_link"`, `true`). Every expected frame below is a HAND
-//! ORACLE from that body, never a second run of the same code.
+//! `1.0`, `0`, `"base_link"`, `true`). The resume arm rebuilds it as
+//! `test_node_macro_param_added_cdylib`, the same node with one more param,
+//! `scale`, default `3.0` (`x = scale`, `y = gain + offset`). Every expected
+//! frame below is a HAND ORACLE from those bodies, never a second run of the
+//! same code.
 //!
 //! Prerequisite: `cargo build -p test_node_macro_param_cdylib -p
-//! test_node_macro_period_cdylib` (the harness panics with that instruction
-//! when a fixture is missing). `#[serial]` arms run on the default iceoryx2
-//! namespace; run this binary alone with `-- --test-threads=1`.
+//! test_node_macro_param_added_cdylib -p test_node_macro_period_cdylib`
+//! (the harness panics with that instruction when a fixture is missing).
+//! `#[serial]` arms run on the default iceoryx2 namespace; run this binary
+//! alone with `-- --test-threads=1`.
 //!
 //! The symbol-less library arms live at the loader seam
 //! (`cerulion_core/tests/cdylib_params_test.rs`): a library without
@@ -36,8 +42,8 @@ use serial_test::serial;
 
 mod mp_support;
 use mp_support::{
-    dylib_file, fixture_cdylib, read_file, signal_live_process, wait_for_bag, wait_for_bag_state,
-    ChildGuard, RECORDED_WINDOW_TIMEOUT,
+    dylib_file, first_rank0_boundary, fixture_cdylib, mcaps, read_file, signal_live_process,
+    wait_for_bag, wait_for_bag_state, ChildGuard, RECORDED_WINDOW_TIMEOUT,
 };
 
 const PARAM_FIXTURE: &str = "test_node_macro_param_cdylib";
@@ -94,24 +100,33 @@ fn build_workspace(root: &Path, types: &[(&str, &str)], graph_yaml: &str) {
         "[workspace]\nresolver = \"2\"\nmembers = []\n",
     )
     .unwrap();
+    for (node_type, fixture) in types {
+        stage_node(root, node_type, fixture);
+    }
+    std::fs::write(root.join("graphs/demo.yaml"), graph_yaml).unwrap();
+}
+
+/// Stage `fixture` as the build of node type `node_type`: its source as
+/// `nodes/<type>/src/lib.rs`, its prebuilt cdylib as `target/debug/lib<type>.*`.
+/// Staging over an earlier build is a REBUILD: the old library is removed
+/// first, so the new one is a new file rather than bytes written over a
+/// library a finished process had mapped.
+fn stage_node(root: &Path, node_type: &str, fixture: &str) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .join("test_fixtures");
-    for (node_type, fixture) in types {
-        std::fs::create_dir_all(root.join(format!("nodes/{node_type}/src"))).unwrap();
-        std::fs::copy(
-            fixtures.join(fixture).join("src/lib.rs"),
-            root.join(format!("nodes/{node_type}/src/lib.rs")),
-        )
-        .expect("copy fixture src");
-        std::fs::copy(
-            fixture_cdylib(fixture),
-            root.join("target/debug").join(dylib_file(node_type)),
-        )
-        .expect("copy fixture cdylib");
+    std::fs::create_dir_all(root.join(format!("nodes/{node_type}/src"))).unwrap();
+    std::fs::copy(
+        fixtures.join(fixture).join("src/lib.rs"),
+        root.join(format!("nodes/{node_type}/src/lib.rs")),
+    )
+    .expect("copy fixture src");
+    let lib = root.join("target/debug").join(dylib_file(node_type));
+    if lib.exists() {
+        std::fs::remove_file(&lib).expect("remove the earlier build");
     }
-    std::fs::write(root.join("graphs/demo.yaml"), graph_yaml).unwrap();
+    std::fs::copy(fixture_cdylib(fixture), &lib).expect("copy fixture cdylib");
 }
 
 /// Run `cerulion <args>` in `root` to completion: `(status, stdout, stderr)`.
@@ -131,9 +146,9 @@ fn cerulion(root: &Path, args: &[&str]) -> (ExitStatus, String, String) {
     )
 }
 
-/// Spawn `cerulion graph run demo --single-process [extra..]` with stdio to
-/// files; returns the guard and the stderr path.
-fn spawn_run(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf) {
+/// Spawn `cerulion graph run demo --single-process [extra..]` with `env` set
+/// and stdio to files; returns the guard and the stderr path.
+fn spawn_run(root: &Path, extra: &[&str], env: &[(&str, &str)]) -> (ChildGuard, PathBuf) {
     let stderr_path = root.join("run.stderr");
     let mut args = vec!["graph", "run", "demo", "--single-process"];
     args.extend_from_slice(extra);
@@ -146,6 +161,7 @@ fn spawn_run(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf) {
             "RUST_LOG",
             "cerulion=info,cerulion_cli_engine=info,cerulion_bagd=info",
         )
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::from(
             std::fs::File::create(root.join("run.stdout")).unwrap(),
@@ -169,14 +185,15 @@ fn vector3(frame: &[u8]) -> (f64, f64, f64) {
     (f(0), f(1), f(2))
 }
 
-/// Run `cerulion bag play <bag> --resim all --verify`, bounded.
-fn resim_verify(root: &Path, bag: &Path, stem: &str) -> (ExitStatus, String) {
+/// Run `cerulion bag play <bag> --resim all [extra..]`, bounded.
+fn resim(root: &Path, bag: &Path, extra: &[&str], stem: &str) -> (ExitStatus, String) {
     let err_path = root.join(format!("{stem}.stderr"));
     let mut child = ChildGuard::single_process(
         Command::new(env!("CARGO_BIN_EXE_cerulion"))
             .args(["bag", "play"])
             .arg(bag)
-            .args(["--resim", "all", "--verify"])
+            .args(["--resim", "all"])
+            .args(extra)
             .current_dir(root)
             .env_remove("CARGO_TARGET_DIR")
             .env("CERULION_NETWORK", "off")
@@ -208,7 +225,7 @@ fn two_instances_publish_their_own_params_and_the_recording_resims_with_the_reco
     let left = format!("/{prefix}/left/cmd");
     let right = format!("/{prefix}/right/cmd");
 
-    let (mut guard, stderr_path) = spawn_run(root, &["--record=recordings"]);
+    let (mut guard, stderr_path) = spawn_run(root, &["--record=recordings"], &[]);
     let bag = wait_for_bag(&root.join("recordings"), Duration::from_secs(60))
         .unwrap_or_else(|| panic!("no bag appeared; stderr:\n{}", read_file(&stderr_path)));
     wait_for_bag_state(
@@ -277,20 +294,294 @@ fn two_instances_publish_their_own_params_and_the_recording_resims_with_the_reco
 
     // The byte-exact re-execution verdict, and again after the workspace
     // file changed: the resim applies the RECORDED values.
-    let (status, err) = resim_verify(root, &bag, "resim1");
+    let (status, err) = resim(root, &bag, &["--verify"], "resim1");
     assert_eq!(status.code(), Some(0), "resim --verify must pass:\n{err}");
     std::fs::write(
         root.join("graphs/demo.yaml"),
         two_instances_yaml(&prefix).replace("gain: 2.5", "gain: 9.0"),
     )
     .unwrap();
-    let (status, err) = resim_verify(root, &bag, "resim2");
+    let (status, err) = resim(root, &bag, &["--verify"], "resim2");
     assert_eq!(
         status.code(),
         Some(0),
         "resim must use the recorded values, not the changed workspace file:\n{err}"
     );
     guard.finish().assert_clean();
+}
+
+/// [`PARAM_FIXTURE`] rebuilt with one more param, `scale`, default `3.0`:
+/// `cmd = (scale, gain + offset, frame_id.len())`.
+const ADDED_PARAM_FIXTURE: &str = "test_node_macro_param_added_cdylib";
+
+/// The resume arm's Flashback window and anchor cadence: short, so a capture
+/// taken a few seconds into the run begins past step 0 and carries an anchor
+/// at or before its first step.
+const RESUME_WINDOW_MS: &str = "1000";
+const RESUME_CADENCE_MS: &str = "250";
+
+/// Frames the resume arm waits for before it takes its capture: three seconds
+/// of the fixture's 20 ms period, three times [`RESUME_WINDOW_MS`]. A
+/// CONDITION rather than a sleep, so a loaded machine delays the capture
+/// rather than taking it too early.
+const RESUME_MID_RUN_FRAMES: usize = 150;
+
+/// How many run and capture attempts the resume arm makes to obtain a capture
+/// that begins mid-run. Whether a capture's first step is past step 0 is a
+/// race with the window's head trim, not a property of the rule under test,
+/// so it is retried, never weakened.
+const RESUME_ATTEMPTS: usize = 3;
+
+/// Every `Vector3` frame on `topic` in a finalized `bag`, in log order, with
+/// the `timestamp_ns` its wire header carries.
+fn stamped_vector3_frames(bag: &Path, topic: &str) -> Vec<(u64, (f64, f64, f64))> {
+    let reader = BagReader::open(bag).expect("open bag");
+    let (msgs, completeness) = reader.recover_messages().expect("recover");
+    assert!(completeness.is_finalized(), "{completeness:?}");
+    msgs.iter()
+        .filter(|m| m.topic == topic)
+        .map(|m| {
+            let header = WireHeader::read_from_buf(&m.data).expect("a frame starts with a header");
+            (header.timestamp_ns, vector3(&m.data))
+        })
+        .collect()
+}
+
+/// The param resume rule over the real binary and the cdylib FFI: the twin of
+/// the in-process
+/// `a_resume_refuses_a_param_value_the_recording_does_not_hold_unless_allowed`
+/// in `cerulion_cli_engine/tests/replay_engine_test.rs`.
+///
+/// The recording runs `cam0` at `gain: 2.0`, and a `cerulion flashback`
+/// capture of it begins mid-run, so its resim restores `cam0` from an anchor.
+/// A resim applies the RECORDED params, so no edit to the graph file can make
+/// a resumed `cam0` run `gain` on anything but 2.0. The arm edits the graph
+/// file to `gain: 4.0` after the capture, so every 2.0 below is the recorded
+/// value winning over the file, not the file agreeing with the recording, and
+/// the refusal's count of one shows the edit is not a difference the rule
+/// judges. What the rule judges is a value in force that the recording does
+/// not hold, so the node is rebuilt with one more param, `scale`, default 3.0,
+/// which the recording names no value for. The recorded `gain` still applies
+/// to the rebuilt node.
+///
+/// 1. The unchanged build resumes without the opt-in, on the recorded 2.0, so
+///    the rule does not refuse every resume.
+/// 2. The rebuilt node is refused with exit 2 and the one line for `scale`,
+///    before it writes a `--record-out` bag. The build declares every name the
+///    recording holds, so the refusal is the check the resume makes after the
+///    build, not the one for a param the build no longer declares. That check
+///    judges only a node the anchor carries a state blob for, so the refusal
+///    also shows the anchor carries one for `cam0`, a node whose fields are
+///    all params and one output port.
+/// 3. With `--allow-param-change` the rebuilt node resumes: its first resumed
+///    frame carries `scale` 3.0 beside the recorded `gain` 2.0.
+///
+/// Each resumed run begins at the capture's first recorded step: its first
+/// frame carries that step's clock target, read off the capture's trace, as
+/// its wire stamp. A run from step 0 or from a later step cannot.
+///
+/// Hand oracles from the two fixture bodies: `(gain, offset, frame_id.len())`
+/// is `(2.0, 0.0, 9.0)`, and `(scale, gain + offset, frame_id.len())` is
+/// `(3.0, 2.0, 9.0)`.
+#[test]
+#[serial]
+fn a_capture_resumed_on_a_build_that_added_a_param_is_refused_unless_allowed() {
+    let mut last_retry = String::new();
+    for attempt in 1..=RESUME_ATTEMPTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let prefix = format!("prmres{}{attempt}", std::process::id());
+        build_workspace(
+            root,
+            &[("cam", PARAM_FIXTURE)],
+            &one_node_yaml(&prefix, "cam", "    params:\n      gain: 2.0\n"),
+        );
+        let topic = format!("/{prefix}/cam0/cmd");
+        let flashbacks = root.join("flashbacks");
+        std::fs::create_dir_all(&flashbacks).unwrap();
+        let flashbacks_dir = flashbacks.to_str().expect("a UTF-8 temp path");
+
+        // RECORD, until the run is well past its first steps.
+        let (mut run, run_err) = spawn_run(
+            root,
+            &["--record=recordings"],
+            &[
+                ("CERULION_FLASHBACK_DIR", flashbacks_dir),
+                ("CERULION_FLASHBACK_WINDOW_MS", RESUME_WINDOW_MS),
+                ("CERULION_FLASHBACK_CADENCE_MS", RESUME_CADENCE_MS),
+            ],
+        );
+        let bag = wait_for_bag(&root.join("recordings"), Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("no bag appeared; stderr:\n{}", read_file(&run_err)));
+        wait_for_bag_state(
+            &bag,
+            "the run past its first steps",
+            RECORDED_WINDOW_TIMEOUT,
+            |snap| snap.frames_on(&topic) >= RESUME_MID_RUN_FRAMES,
+        );
+
+        // CAPTURE, through the operator's own verb, then stop the run.
+        let mut flash = ChildGuard::single_process(
+            Command::new(env!("CARGO_BIN_EXE_cerulion"))
+                .args(["flashback", "--note", "param resume probe"])
+                .current_dir(root)
+                .env_remove("CARGO_TARGET_DIR")
+                .env("CERULION_NETWORK", "off")
+                .env("CERULION_FLASHBACK_DIR", flashbacks_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(
+                    std::fs::File::create(root.join("flash.stdout")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(root.join("flash.stderr")).unwrap(),
+                ))
+                .spawn()
+                .expect("spawn cerulion flashback"),
+        );
+        let flash_status = flash
+            .wait_bounded(Duration::from_secs(180))
+            .expect("`cerulion flashback` never returned");
+        assert!(
+            flash_status.success(),
+            "`cerulion flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}",
+            read_file(&root.join("flash.stdout")),
+            read_file(&root.join("flash.stderr"))
+        );
+        signal_live_process(run.id(), libc::SIGINT);
+        let status = run
+            .wait_bounded(Duration::from_secs(60))
+            .expect("graph run did not exit after SIGINT");
+        assert!(
+            status.success(),
+            "Ctrl-C must exit 0, got {status:?}; stderr:\n{}",
+            read_file(&run_err)
+        );
+        run.finish().assert_clean();
+        let captures = mcaps(&flashbacks);
+        assert_eq!(
+            captures.len(),
+            1,
+            "exactly one capture in this run's own directory, got {captures:?}"
+        );
+        let capture = &captures[0];
+
+        let boundary = first_rank0_boundary(capture)
+            .expect("a capture of a `--record` run carries a rank-0 STEP_BOUNDARY");
+        if boundary.step == 0 {
+            last_retry = format!(
+                "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
+                 begins from start and resumes from no anchor"
+            );
+            eprintln!("{last_retry}");
+            continue;
+        }
+        // The clock the first resumed step runs at, and so the stamp of the
+        // first frame a resumed `cam0` publishes.
+        let first_step_stamp = boundary.fire_time_ns;
+        let captured = stamped_vector3_frames(capture, &topic);
+        assert!(!captured.is_empty(), "the capture holds no `{topic}` frame");
+        assert!(
+            captured.iter().all(|(_, f)| *f == (2.0, 0.0, 9.0)),
+            "the anchor's run published gain 2.0: {captured:?}"
+        );
+
+        // The graph file now names another gain. The capture supplies the
+        // graph, so every resim below must still run `cam0` on the recorded 2.0.
+        let graph_file = root.join("graphs/demo.yaml");
+        let edited = std::fs::read_to_string(&graph_file)
+            .expect("read the graph file")
+            .replace("gain: 2.0", "gain: 4.0");
+        assert!(
+            edited.contains("gain: 4.0") && !edited.contains("gain: 2.0"),
+            "the edit must move the file off the recorded gain:\n{edited}"
+        );
+        std::fs::write(&graph_file, edited).unwrap();
+
+        // 1. The unchanged build resumes on the recorded value, no opt-in.
+        let unchanged = root.join("unchanged.mcap");
+        let (status, err) = resim(
+            root,
+            capture,
+            &["--record-out", unchanged.to_str().unwrap()],
+            "unchanged",
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the build the recording ran resumes without the opt-in:\n{err}"
+        );
+        let frames = stamped_vector3_frames(&unchanged, &topic);
+        assert_eq!(
+            frames.first().map(|(stamp, _)| *stamp),
+            Some(first_step_stamp),
+            "the unchanged build resumes at the capture's first step {}:\n{err}",
+            boundary.step
+        );
+        assert!(
+            frames.iter().all(|(_, f)| *f == (2.0, 0.0, 9.0)),
+            "the resumed node runs on the recorded gain 2.0: {frames:?}"
+        );
+
+        // 2. The rebuilt node is refused, one line for `scale`, before any output.
+        stage_node(root, "cam", ADDED_PARAM_FIXTURE);
+        let refused = root.join("refused.mcap");
+        let (status, err) = resim(
+            root,
+            capture,
+            &["--record-out", refused.to_str().unwrap()],
+            "refused",
+        );
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "a param the recording holds no value for refuses the resume:\n{err}"
+        );
+        let expected = "this recording resumes from a mid-run anchor, and 1 param value(s) in \
+                        force differ from the ones the recording names. A param is not node \
+                        state: the resumed nodes run on the values in force, not on the \
+                        recorded ones.\n  \
+                        node 'cam0' param 'scale': recorded no value, current 3.0\n\
+                        Fix: resume with a build whose params match the recording, or pass \
+                        `--allow-param-change` to resume on the current values.";
+        assert!(err.contains(expected), "the refusal text:\n{err}");
+        assert!(
+            !refused.exists(),
+            "a refused resume writes no `--record-out` bag: {}",
+            refused.display()
+        );
+
+        // 3. The opt-in resumes the rebuilt node on the value in force.
+        let allowed = root.join("allowed.mcap");
+        let (status, err) = resim(
+            root,
+            capture,
+            &[
+                "--allow-param-change",
+                "--record-out",
+                allowed.to_str().unwrap(),
+            ],
+            "allowed",
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "`--allow-param-change` resumes on the current values:\n{err}"
+        );
+        let frames = stamped_vector3_frames(&allowed, &topic);
+        assert_eq!(
+            frames.first(),
+            Some(&(first_step_stamp, (3.0, 2.0, 9.0))),
+            "the first resumed tick, at the capture's first step {}, reads scale 3.0 and the \
+             recorded gain 2.0:\n{err}",
+            boundary.step
+        );
+        assert!(
+            frames.iter().all(|(_, f)| *f == (3.0, 2.0, 9.0)),
+            "every resumed tick reads scale 3.0 and gain 2.0: {frames:?}"
+        );
+        return;
+    }
+    panic!("no capture began mid-run in {RESUME_ATTEMPTS} attempts; last: {last_retry}");
 }
 
 /// Each refusal class, through BOTH verbs. `graph validate` reports it as a
@@ -334,7 +625,7 @@ fn graph_validate_and_graph_run_refuse_each_params_class_naming_node_and_param()
             "the report must carry the params line for {block:?}:\n{out}\n{err}"
         );
 
-        let (mut guard, stderr_path) = spawn_run(root, &["--no-validate"]);
+        let (mut guard, stderr_path) = spawn_run(root, &["--no-validate"], &[]);
         let status = guard
             .wait_bounded(Duration::from_secs(90))
             .expect("graph run must exit on its own after refusing the params");
@@ -382,7 +673,7 @@ fn native_params_on_a_ros2_entry_are_refused_even_under_no_validate() {
         "graph validate must name the entry and the fix:\n{out}\n{err}"
     );
 
-    let (mut guard, stderr_path) = spawn_run(root, &["--no-validate"]);
+    let (mut guard, stderr_path) = spawn_run(root, &["--no-validate"], &[]);
     let status = guard
         .wait_bounded(Duration::from_secs(90))
         .expect("graph run must exit on its own after refusing the entry");
