@@ -715,6 +715,12 @@ jobs:
       - name: Android e2e demand probe verdict self-test
         run: ./tools/scripts/test_android_e2e_probe_verdict.sh
 
+      # The emulator e2e reads its millisecond clock from bash 5's
+      # $EPOCHREALTIME, not GNU date. Its self-test needs no device, so it
+      # runs here on every pull request.
+      - name: Android e2e millisecond clock self-test
+        run: bash tools/scripts/android_emulator_e2e.sh self-test
+
       # Offline: the registry, the archives and the tag lookup are PATH shims,
       # so this runs here rather than in the release workflow, where the script
       # itself reads crates.io after an upload.

@@ -40,14 +40,77 @@ build() {
   gradle -p "$ROOT/crates/cerulion_android/android" assembleDebug ${GRADLE_ARGS:-}
 }
 
+# The run measures how long the graph and the app ran in milliseconds.
+# `date +%s%3N` is GNU only: BSD and macOS date print a literal N. Bash 5
+# keeps the time in $EPOCHREALTIME (whole seconds, the locale's radix
+# character, six digits of microseconds), so no external tool is needed.
+# The run already needs bash 4.3 or newer (`mapfile`, `${nums[-1]}`), and
+# require_ms_clock refuses an older bash at start-up with the fix.
+require_ms_clock() {
+  if (( BASH_VERSINFO[0] < 5 )); then
+    echo "FAIL millisecond clock: bash ${BASH_VERSION} has no \$EPOCHREALTIME; run this script with bash 5 or newer (on macOS: brew install bash, then run it with that bash)" >&2
+    exit 1
+  fi
+}
+# ms_from_epochrealtime VALUE: the milliseconds in one $EPOCHREALTIME value.
+ms_from_epochrealtime() {
+  if [[ ! "$1" =~ ^[0-9]+[^0-9][0-9]{6}$ ]]; then
+    echo "FAIL millisecond clock: unexpected \$EPOCHREALTIME value '$1'" >&2
+    exit 1
+  fi
+  local digits=${1//[!0-9]/}
+  printf '%s\n' "${digits%???}"
+}
+now_ms() {
+  ms_from_epochrealtime "$EPOCHREALTIME"
+}
+# self_test: the clock checks, with no device, cargo or adb.
+self_test() {
+  require_ms_clock
+  local got want input first second wall
+  while IFS='|' read -r input want; do
+    got=$(ms_from_epochrealtime "$input")
+    [[ "$got" == "$want" ]] ||
+      { echo "FAIL ms_from_epochrealtime $input: got '$got', want '$want'" >&2; exit 1; }
+  done <<'EOF'
+1730000000.123456|1730000000123
+1730000000,123456|1730000000123
+1730000000.000999|1730000000000
+1730000000.999999|1730000000999
+EOF
+  echo "PASS ms_from_epochrealtime: a dot and a comma radix give the same milliseconds"
+  for input in 1730000000123N 1730000000.12345 1730000000 '' .123456; do
+    if (ms_from_epochrealtime "$input") >/dev/null 2>&1; then
+      echo "FAIL ms_from_epochrealtime refuses '$input': it printed a value" >&2
+      exit 1
+    fi
+  done
+  echo "PASS ms_from_epochrealtime: refuses a malformed value"
+  first=$(now_ms)
+  second=$(now_ms)
+  wall=$(date +%s)
+  [[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ ]] ||
+    { echo "FAIL now_ms: not only digits: '$first' '$second'" >&2; exit 1; }
+  (( second >= first )) ||
+    { echo "FAIL now_ms: went back: $first then $second" >&2; exit 1; }
+  (( first / 1000 - wall <= 2 && wall - first / 1000 <= 2 )) ||
+    { echo "FAIL now_ms: $first ms is not within 2 s of date +%s ($wall s)" >&2; exit 1; }
+  echo "PASS now_ms: digits only, $first then $second, within 2 s of date +%s"
+}
+
 if [[ "${1:-}" == build ]]; then
   build
   exit 0
 fi
+if [[ "${1:-}" == self-test ]]; then
+  self_test
+  exit 0
+fi
 if [[ "${1:-}" != run ]]; then
-  echo "usage: $0 build|run" >&2
+  echo "usage: $0 build|run|self-test" >&2
   exit 2
 fi
+require_ms_clock
 
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/e2e.log") 2>&1
@@ -344,7 +407,7 @@ period_ms="$(sed -nE 's/.*period_ms[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
   "$ROOT/examples/basic_timer/nodes/timer/src/lib.rs" | head -1)"
 [[ "$period_ms" =~ ^[0-9]+$ && period_ms -gt 0 ]] ||
   fail "timer period" "could not read period_ms from the timer node"
-graph_started_ms="$(date +%s%3N)"
+graph_started_ms="$(now_ms)"
 device "cd '$DEV/basic_timer' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open; nohup '$DEV_CER' graph run basic_timer --record='$DEV/record' > '$DEV/graph.log' 2>&1 & echo \$! > '$GRAPH_PID'"
 started_graph=1
 sleep 2
@@ -382,7 +445,7 @@ assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
 wait_remote_dead "$GRAPH_PID"
 started_graph=0
-graph_stopped_ms="$(date +%s%3N)"
+graph_stopped_ms="$(now_ms)"
 bag_remote="$(device "find '$DEV/record' -type f -name '*.mcap' | head -1" | tr -d '\r')"
 [[ -n "$bag_remote" ]] || fail "recording file" "no MCAP was created"
 "${ADB[@]}" pull "$bag_remote" "$OUT/phase-a.mcap" >/dev/null
@@ -481,7 +544,7 @@ if ! grep -qx 'iceoryx2.toml' <<<"$leftover" || ! grep -qx 'cerulion-shm' <<<"$l
   fail "app start after kill" "the killed run left no files/iceoryx2.toml and files/cerulion-shm: ${leftover//$'\n'/ }"
 fi
 "${ADB[@]}" logcat -c
-open_started_ms="$(date +%s%3N)"
+open_started_ms="$(now_ms)"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
 open_list=
@@ -621,7 +684,7 @@ assert_node_rows() {
   pass "$label" "/app/timer/count and /app/relay/echo std_msgs/Int32, frames >= $floor"
 }
 stop_app "app stop" 1
-open_stopped_ms="$(date +%s%3N)"
+open_stopped_ms="$(now_ms)"
 pass "app stop" "stop=0"
 pull_bag "app bag finalized" "$app_bag" "$OUT/app.mcap"
 app_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app.mcap" 2>&1)" ||
@@ -638,7 +701,7 @@ assert_node_rows "app bag node frames" "$app_info" $((open_stopped_ms - open_sta
 
 # Restart in the same process: a new intent reaches the stopped activity,
 # which starts the runtime again with fresh nodes and a new recording.
-restart_started_ms="$(date +%s%3N)"
+restart_started_ms="$(now_ms)"
 device "am start -n '$APP/.MainActivity' --es lan_access open" >/dev/null
 deadline=$((SECONDS + 30))
 while (( SECONDS < deadline )); do
@@ -680,7 +743,7 @@ printf 'rc=%s\n%s\n' "$restart_rc" "$restart_echo" > "$OUT/restart-node-echo.txt
   fail "app restart same process" "timer echo rc=$restart_rc output=$restart_echo"
 assert_increasing "restart timer echo (rc=$restart_rc)" "$restart_values"
 stop_app "app restart stop" 2
-restart_stopped_ms="$(date +%s%3N)"
+restart_stopped_ms="$(now_ms)"
 pull_bag "app restart bag finalized" "$restart_bag" "$OUT/app-restart.mcap"
 restart_info="$("${HOST_ENV[@]}" "$HOST_CER" bag info "$OUT/app-restart.mcap" 2>&1)" ||
   fail "app restart bag info" "$restart_info"

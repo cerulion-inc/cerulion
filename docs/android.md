@@ -610,6 +610,16 @@ bash tools/scripts/android_emulator_e2e.sh build
 bash tools/scripts/android_emulator_e2e.sh run
 ```
 
+The `run` command needs bash 5 or newer: it reads its millisecond clock
+from bash's `$EPOCHREALTIME`, and it refuses an older bash at start-up. The
+macOS `/bin/bash` is 3.2, so on macOS install a newer bash (`brew install
+bash`) and run the script with it. `self-test` checks that clock with no
+device, cargo or adb:
+
+```sh
+bash tools/scripts/android_emulator_e2e.sh self-test
+```
+
 Set `CERULION_E2E_ABI=arm64-v8a` for an arm64 device.
 `CERULION_E2E_OUT` chooses the evidence directory (default
 `target/android-e2e`). The `build` command requires `ANDROID_NDK_HOME`,
