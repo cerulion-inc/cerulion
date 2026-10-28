@@ -305,7 +305,8 @@ impl Drop for Producers {
 }
 
 /// Spawn a continuous producer publishing `oracle_frame(seq)` for seq = 0,1,2,…
-/// on `topic` until `stop` is set. Returns the join handle.
+/// on `topic` until `stop` is set. Returns once its publisher exists (see
+/// [`spawn_producer_with`]).
 fn spawn_producer(
     manager: Arc<TransportManager>,
     topic: String,
@@ -323,10 +324,36 @@ fn spawn_producer_tagged(
     tag: Option<u8>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    spawn_producer_with(manager, topic, tag, Duration::ZERO, stop)
+}
+
+/// Spawn a producer that sleeps `start_delay` before it creates its publisher,
+/// and return only once that publisher exists on `manager`'s root.
+///
+/// The robot's demand handler OPENS the demanded topic's data service and never
+/// creates it, so a demand that reaches the robot before this thread has
+/// created the service is refused as an unknown topic. The connect client then
+/// creates no re-inject service for it, and the desk-local tap waits out its
+/// whole readiness budget on a root that lists nothing. Blocking here until the
+/// publisher exists puts that ordering on the producer's own readiness signal.
+/// The wait is bounded by the start delay plus [`STEP_TIMEOUT`]; a producer
+/// that misses it is left detached rather than joined, since joining a thread
+/// stuck in creation would trade this refusal for a hang.
+fn spawn_producer_with(
+    manager: Arc<TransportManager>,
+    topic: String,
+    tag: Option<u8>,
+    start_delay: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let named = topic.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(start_delay);
         let mut publisher = manager
             .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
             .expect("producer");
+        let _ = ready_tx.send(());
         let mut seq = 0u32;
         while !stop.load(Ordering::Relaxed) {
             let frame = match tag {
@@ -337,7 +364,21 @@ fn spawn_producer_tagged(
             seq = seq.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(5));
         }
-    })
+    });
+    match ready_rx.recv_timeout(start_delay + STEP_TIMEOUT) {
+        Ok(()) => handle,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the producer for {named} did not create its publisher within {:?}",
+            start_delay + STEP_TIMEOUT
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            panic!(
+                "the producer for {named} exited before creating its publisher; \
+                 its own panic is printed above"
+            )
+        }
+    }
 }
 
 /// Wait until `topic`'s re-injection service is LISTED on `manager`'s root,
@@ -347,9 +388,13 @@ fn spawn_producer_tagged(
 ///
 /// [`TransportManager::list_topics`] is the readiness read because it opens no
 /// port and registers this node with no service: it enumerates the root's static
-/// service configs. A retry loop around `create_data_only_subscriber` instead
-/// spends the one budget it has on the loopback handshake, and reports an empty
-/// collection where the stream was merely late.
+/// service configs. A service is listed once its static config is unlocked,
+/// before its creator has made the dynamic config, and an open in that window
+/// waits for it only up to iceoryx2's `creation_timeout`; a creator slower than
+/// that fails the attach. The attach is therefore retried until the same
+/// deadline, and the last attach error is returned with the attempt count. The
+/// listing gates the first attach, so a topic nobody created reports readiness,
+/// never an iceoryx2 open error.
 fn attach_tap_when_listed(
     manager: &TransportManager,
     topic: &str,
@@ -371,28 +416,62 @@ fn attach_tap_when_listed(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    manager
-        .create_data_only_subscriber(topic)
-        .map_err(|e| format!("the listed re-inject service for {topic} would not attach: {e}"))
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match manager.create_data_only_subscriber(topic) {
+            Ok(tap) => return Ok(tap),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "the listed re-inject service for {topic} would not attach in \
+                     {attempts} attempt(s) within {ready_budget:?}: {e}"
+                ))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 /// Attach the desk-local data-only tap on `topic` once its re-injection service
 /// is listed, then collect `n` full frames and their sequences. Blocking, so it
 /// runs under `spawn_blocking`.
+///
+/// The robot forwards frames while the desk is still accepting its streams, so
+/// the connect client's reader finds that backlog buffered on the stream and
+/// re-injects it back to back. A burst that lands while this tap sleeps between
+/// polls can fill its queue, and a full queue drops its oldest frame: a gap
+/// that is this observer's own overflow, not a loss in the re-inject path.
+/// A drop needs a full queue, and the tap reads all of a full queue before it
+/// next reads empty, so a run of at least the queue depth between two empty
+/// reads is the only place a drop can hide. Such a run restarts the
+/// collection; a gap in what remains is a real loss.
 fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
     let mut tap = match attach_tap_when_listed(manager, topic, TAP_READY_TIMEOUT) {
         Ok(tap) => tap,
         Err(reason) => panic!("{reason}"),
     };
     let budget = tap.max_borrowed_samples().max(1);
+    let depth = tap.buffer_size().max(1);
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(budget);
     let mut collected: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut since_empty = 0usize;
+    let mut restarts = 0usize;
     let deadline = Instant::now() + TAP_COLLECT_TIMEOUT;
     while collected.len() < n && Instant::now() < deadline {
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(3)),
-            Ok(_) => {
+            Ok(0) => {
+                since_empty = 0;
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            Ok(read) => {
+                since_empty += read;
+                if since_empty >= depth {
+                    restarts += 1;
+                    collected.clear();
+                    batch.clear();
+                    continue;
+                }
                 for sample in batch.drain(..) {
                     let seq = sample.wire_header().map(|h| h.sequence);
                     let frame = sample.payload().to_vec();
@@ -407,7 +486,8 @@ fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32
     }
     assert!(
         collected.len() >= n,
-        "collected only {} of {n} frames for {topic}",
+        "collected only {} of {n} frames for {topic} within {TAP_COLLECT_TIMEOUT:?} \
+         ({restarts} restart(s) after a run of {depth} or more frames between empty reads)",
         collected.len()
     );
     collected
@@ -514,11 +594,11 @@ async fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         .expect("desk join")
         .expect("run_connect ok");
     assert!(
-        summary
-            .per_topic
-            .iter()
-            .any(|s| s.topic == topic && s.reinjected >= n as u64),
-        "summary must report the re-injected topic: {:?}",
+        summary.per_topic.iter().any(|s| s.topic == topic
+            && s.reinjected >= n as u64
+            && s.rejected == 0
+            && s.reinject_failed == 0),
+        "summary must report the re-injected topic with nothing refused or failed: {:?}",
         summary.per_topic
     );
     let _ = bounded("robot join", robot).await;
@@ -1047,6 +1127,14 @@ async fn run_multi_topic(tag: &str, n: usize) -> (Vec<(u32, Vec<u8>)>, Vec<(u32,
         summary.per_topic.len(),
         2,
         "both topics streamed: {:?}",
+        summary.per_topic
+    );
+    assert!(
+        summary
+            .per_topic
+            .iter()
+            .all(|s| s.rejected == 0 && s.reinject_failed == 0),
+        "nothing refused or failed on either topic: {:?}",
         summary.per_topic
     );
     let _ = bounded("robot join", robot).await;
@@ -1935,6 +2023,28 @@ fn a_tap_on_an_unlisted_topic_reports_readiness_not_an_attach_failure() {
         !reason.contains("PublishSubscribeOpenError"),
         "the listing read must gate the attach: an attach-first order reports \
          iceoryx2's open error instead: {reason}"
+    );
+}
+
+/// A spawned producer's topic exists on the robot's root by the time the spawn
+/// returns, however late the thread creates its publisher, so a demand sent
+/// after it is not refused as an unknown topic.
+#[test]
+fn a_spawned_producer_exists_before_the_spawn_returns() {
+    let manager = test_manager("lateprod");
+    let topic = format!("/reinj/lateprod/{}", unique_id());
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer_with(
+        manager.clone(),
+        topic.clone(),
+        None,
+        Duration::from_millis(500),
+        producers.stop(),
+    ));
+    let listed = manager.list_topics().expect("topic listing");
+    assert!(
+        listed.iter().any(|t| t == &topic),
+        "the producer's service exists once the spawn returns: {listed:?}"
     );
 }
 
