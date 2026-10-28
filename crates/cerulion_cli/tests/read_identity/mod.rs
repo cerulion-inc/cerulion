@@ -688,26 +688,44 @@ fn ri_flush(id: &str, input: &str, reads: &mut Vec<[u64; 3]>) {
 #[allow(dead_code)]
 const RI_TIMED_TICKS: u32 = 4;
 
-/// The CPU this thread last ran on: field 39 of `/proc/thread-self/stat`,
-/// `u64::MAX` where the file is absent.
+/// Fields of one timed tick: index, entry and exit on the node's real clock,
+/// then [`ri_thread_snapshot`] at entry and at exit.
 #[allow(dead_code)]
-fn ri_cpu() -> u64 {
-    let text = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
-    // Fields after the parenthesised command name start at field 3.
-    text.rsplit_once(')')
+const RI_TIME_FIELDS: usize = 15;
+
+/// This thread's cumulative `[on-CPU ns, runqueue-wait ns, timeslices, CPU it
+/// last ran on, voluntary switches, involuntary switches]`, from
+/// `/proc/thread-self/{schedstat,stat,status}`. A field whose file is absent
+/// reads `u64::MAX`.
+#[allow(dead_code)]
+fn ri_thread_snapshot() -> [u64; 6] {
+    let mut out = [u64::MAX; 6];
+    let sched = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+    for (slot, word) in out[..3].iter_mut().zip(sched.split_whitespace()) {
+        *slot = word.parse().unwrap_or(u64::MAX);
+    }
+    // Field 39 of `stat` is the CPU; the fields after the parenthesised
+    // command name start at field 3.
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
+    if let Some(cpu) = stat
+        .rsplit_once(')')
         .and_then(|(_, rest)| rest.split_whitespace().nth(39 - 3))
         .and_then(|w| w.parse().ok())
-        .unwrap_or(u64::MAX)
-}
-
-/// This thread's `(on-CPU ns, runqueue-wait ns, timeslices)` from
-/// `/proc/thread-self/schedstat`, zeros where the file is absent.
-#[allow(dead_code)]
-fn ri_schedstat() -> [u64; 3] {
-    let text = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
-    let mut out = [0u64; 3];
-    for (slot, word) in out.iter_mut().zip(text.split_whitespace()) {
-        *slot = word.parse().unwrap_or(0);
+    {
+        out[3] = cpu;
+    }
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    for line in status.lines() {
+        let slot = if line.starts_with("voluntary_ctxt_switches:") {
+            4
+        } else if line.starts_with("nonvoluntary_ctxt_switches:") {
+            5
+        } else {
+            continue;
+        };
+        if let Some(v) = line.split_whitespace().nth(1).and_then(|w| w.parse().ok()) {
+            out[slot] = v;
+        }
     }
     out
 }
@@ -715,16 +733,15 @@ fn ri_schedstat() -> [u64; 3] {
 /// The relay's timed ticks, held outside the node's state so they never
 /// reach a captured or compared node state.
 #[allow(dead_code)]
-static RI_TIMES: std::sync::Mutex<Vec<[u64; 8]>> = std::sync::Mutex::new(Vec::new());
+static RI_TIMES: std::sync::Mutex<Vec<[u64; RI_TIME_FIELDS]>> = std::sync::Mutex::new(Vec::new());
 
 #[allow(dead_code)]
-fn ri_push_time(t: [u64; 8]) {
+fn ri_push_time(t: [u64; RI_TIME_FIELDS]) {
     RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()).push(t);
 }
 
 /// Write the relay's timed ticks as `<id>_<pid>_<k>.times`, one line per tick:
-/// `tick <index> <entry offset ns> <wall ns> <cpu ns> <runqueue wait ns> <slices>
-/// <cpu at entry> <cpu at exit>`.
+/// `tick` then the [`RI_TIME_FIELDS`] raw values, space separated.
 #[allow(dead_code)]
 fn ri_flush_times(id: &str) {
     use std::io::Write as _;
@@ -732,16 +749,16 @@ fn ri_flush_times(id: &str) {
         return;
     };
     let times = std::mem::take(&mut *RI_TIMES.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(first) = times.first().map(|t| t[1]) else {
+    if times.is_empty() {
         return;
-    };
+    }
     let mut out = String::new();
-    for mut t in times {
-        t[1] = t[1].saturating_sub(first);
-        out.push_str(&format!(
-            "tick {} {} {} {} {} {} {} {}\n",
-            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]
-        ));
+    for t in times {
+        out.push_str("tick");
+        for v in t {
+            out.push_str(&format!(" {v}"));
+        }
+        out.push('\n');
     }
     static K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let k = K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -821,8 +838,7 @@ impl RiRelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         let timed = ri_on() && self.tick_count < RI_TIMED_TICKS;
         let entry_ns = if timed { self.real_ns() } else { 0 };
-        let sched_entry = if timed { ri_schedstat() } else { [0; 3] };
-        let cpu_entry = if timed { ri_cpu() } else { 0 };
+        let entry = if timed { ri_thread_snapshot() } else { [0; 6] };
         if self.ri_sleep_every > 0 && u64::from(self.tick_count) % self.ri_sleep_every == 0 {
             ri_sleep(self.ri_sleep_us);
         }
@@ -836,18 +852,14 @@ impl RiRelayNode {
         self.out.z = ri_fold(r);
         if timed {
             let exit_ns = self.real_ns();
-            let sched_exit = ri_schedstat();
-            let cpu_exit = ri_cpu();
-            ri_push_time([
-                u64::from(self.tick_count - 1),
-                entry_ns,
-                exit_ns.saturating_sub(entry_ns),
-                sched_exit[0].saturating_sub(sched_entry[0]),
-                sched_exit[1].saturating_sub(sched_entry[1]),
-                sched_exit[2].saturating_sub(sched_entry[2]),
-                cpu_entry,
-                cpu_exit,
-            ]);
+            let exit = ri_thread_snapshot();
+            let mut t = [0u64; RI_TIME_FIELDS];
+            t[0] = u64::from(self.tick_count - 1);
+            t[1] = entry_ns;
+            t[2] = exit_ns;
+            t[3..9].copy_from_slice(&entry);
+            t[9..15].copy_from_slice(&exit);
+            ri_push_time(t);
         }
         Ok(())
     }
@@ -1688,6 +1700,9 @@ pub fn run_live(
     };
     let mut guard = ChildGuard::spawn_group_leader(&mut cmd)
         .unwrap_or_else(|e| panic!("RI_HARNESS: spawn graph run {graph}: {e}"));
+    let sampler = SAMPLE_UNIT_THREADS
+        .load(Ordering::Relaxed)
+        .then(|| UnitThreadSampler::start(guard.id(), dir.join(UNIT_THREAD_SAMPLES)));
     let start = std::time::Instant::now();
     while !ready() {
         if let Some(status) = guard.try_wait_noting().expect("RI_HARNESS: poll") {
@@ -1713,6 +1728,7 @@ pub fn run_live(
             logs()
         );
     }
+    drop(sampler);
     mp_support::send_signal(guard.id(), libc::SIGINT);
     let status = guard
         .wait_bounded(Duration::from_secs(90))
@@ -1733,6 +1749,119 @@ pub fn run_live(
         ready_ns,
         stop_ns,
     }
+}
+
+/// While set, [`run_live`] samples the executor-unit threads of the run's
+/// processes into [`UNIT_THREAD_SAMPLES`] in the run directory.
+pub static SAMPLE_UNIT_THREADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The file [`run_live`] writes unit-thread samples to, one line per change of
+/// a thread's state: `<real ns> <pid> <tid> <comm> <state> <wchan> <syscall>`,
+/// with `<syscall>` the first word of `/proc/<pid>/task/<tid>/syscall` and
+/// `-` for an unreadable file.
+pub const UNIT_THREAD_SAMPLES: &str = "unit_threads.samples";
+
+/// How often [`UnitThreadSampler`] reads each unit thread's state.
+const SAMPLE_PERIOD: Duration = Duration::from_micros(100);
+/// How often it looks for new processes under the run.
+const RESCAN_PERIOD: Duration = Duration::from_millis(20);
+/// How long it samples after the spawn.
+const SAMPLE_SPAN: Duration = Duration::from_secs(4);
+
+/// A thread sampling, on Linux, every `cerulion-unit-*` thread of every
+/// process under `root`: whenever a thread's (state, wchan, syscall) changes,
+/// one line goes to the samples file. It stops [`SAMPLE_SPAN`] after it starts
+/// or when dropped, and writes the file then.
+struct UnitThreadSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UnitThreadSampler {
+    fn start(root: u32, out: PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || sample_unit_threads(root, &out, &flag));
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for UnitThreadSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Every process under `root`, `root` included, through
+/// `/proc/<pid>/task/<pid>/children`.
+fn descendants(root: u32) -> Vec<u32> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let pid = out[i];
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            out.extend(text.split_whitespace().filter_map(|w| w.parse::<u32>().ok()));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn sample_unit_threads(root: u32, out: &Path, stop: &std::sync::atomic::AtomicBool) {
+    use std::fmt::Write as _;
+    let read = |p: String| std::fs::read_to_string(p).unwrap_or_default();
+    let begin = std::time::Instant::now();
+    let mut last_scan: Option<std::time::Instant> = None;
+    let mut threads: Vec<(u32, u32, String)> = Vec::new();
+    let mut last: BTreeMap<u32, String> = BTreeMap::new();
+    let mut lines = String::new();
+    while !stop.load(Ordering::Relaxed) && begin.elapsed() < SAMPLE_SPAN {
+        if last_scan.is_none_or(|t| t.elapsed() >= RESCAN_PERIOD) {
+            last_scan = Some(std::time::Instant::now());
+            threads.clear();
+            for pid in descendants(root) {
+                let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                    continue;
+                };
+                for task in tasks.flatten() {
+                    let Some(tid) = task.file_name().to_str().and_then(|t| t.parse().ok()) else {
+                        continue;
+                    };
+                    let comm = read(format!("/proc/{pid}/task/{tid}/comm")).trim().to_string();
+                    if comm.starts_with("cerulion-unit") {
+                        threads.push((pid, tid, comm));
+                    }
+                }
+            }
+        }
+        for (pid, tid, comm) in &threads {
+            let stat = read(format!("/proc/{pid}/task/{tid}/stat"));
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .unwrap_or("-")
+                .to_string();
+            let wchan = read(format!("/proc/{pid}/task/{tid}/wchan"));
+            let wchan = if wchan.is_empty() { "-".to_string() } else { wchan };
+            let syscall = read(format!("/proc/{pid}/task/{tid}/syscall"));
+            let syscall = syscall.split_whitespace().next().unwrap_or("-").to_string();
+            let key = format!("{state} {wchan} {syscall}");
+            if last.get(tid) != Some(&key) {
+                let _ = writeln!(lines, "{} {pid} {tid} {comm} {key}", cerulion_core::real_ns());
+                last.insert(*tid, key);
+            }
+        }
+        std::thread::sleep(SAMPLE_PERIOD);
+    }
+    let _ = std::fs::write(out, lines);
 }
 
 /// Why a recording is not fit to judge: frames the recorder lost

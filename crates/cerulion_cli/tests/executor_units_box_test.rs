@@ -972,11 +972,15 @@ fn first_fires(bag: &Path) -> Vec<FirstFire> {
         .collect()
 }
 
-/// Print the relay's timed ticks (`relay_*.times` under `live_dir`).
-fn print_relay_ticks(live_dir: &Path, rep: usize, placement: &str) {
+/// The relay's timed ticks (`relay_*.times` under `live_dir`): per tick
+/// `[index, entry ns, exit ns, entry snapshot (6), exit snapshot (6)]`, the
+/// snapshot being `[cpu ns, runqueue-wait ns, timeslices, cpu, voluntary
+/// switches, involuntary switches]`.
+fn relay_ticks(live_dir: &Path) -> Vec<Vec<u64>> {
     let Ok(entries) = std::fs::read_dir(live_dir) else {
-        return;
+        return Vec::new();
     };
+    let mut ticks = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("times") {
@@ -988,15 +992,58 @@ fn print_relay_ticks(live_dir: &Path, rep: usize, placement: &str) {
                 .skip(1)
                 .filter_map(|w| w.parse().ok())
                 .collect();
-            if let [tick, at, wall, cpu, wait, slices, cpu_entry, cpu_exit] = f[..] {
+            if f.len() == 15 {
+                ticks.push(f);
+            }
+        }
+    }
+    ticks.sort_by_key(|t| t[0]);
+    ticks
+}
+
+/// Print each timed tick's body (`RELAY_TICK`, entry to exit) and each gap
+/// between one tick's exit and the next tick's entry (`RELAY_GAP`), and, for
+/// every gap, the unit-thread samples taken inside it (`UNIT_THREAD`).
+fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &str) {
+    let ticks = relay_ticks(&run.live_dir);
+    let Some(first) = ticks.first().map(|t| t[1]) else {
+        eprintln!("RELAY_TICK rep={rep} placement={placement} no timed ticks were written");
+        return;
+    };
+    let d = |a: u64, b: u64| b.saturating_sub(a) / 1000;
+    let span = |label: &str, from: &[u64], to: &[u64], t0: u64, t1: u64, tick: u64| {
+        eprintln!(
+            "{label} rep={rep} placement={placement} tick={tick} at_us={} wall_us={} cpu_us={} \
+             runqueue_wait_us={} slices={} voluntary={} involuntary={} cpu_from={} cpu_to={}",
+            d(first, t0),
+            d(t0, t1),
+            d(from[0], to[0]),
+            d(from[1], to[1]),
+            to[2].saturating_sub(from[2]),
+            to[4].saturating_sub(from[4]),
+            to[5].saturating_sub(from[5]),
+            from[3],
+            to[3]
+        );
+    };
+    let samples = mp_support::read_file(&run.dir.path().join(read_identity::UNIT_THREAD_SAMPLES));
+    for (i, t) in ticks.iter().enumerate() {
+        span("RELAY_TICK", &t[3..9], &t[9..15], t[1], t[2], t[0]);
+        let Some(next) = ticks.get(i + 1) else {
+            continue;
+        };
+        span("RELAY_GAP", &t[9..15], &next[3..9], t[2], next[1], t[0]);
+        for line in samples.lines() {
+            let Some(at) = line.split_whitespace().next().and_then(|w| w.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if at >= t[2] && at <= next[1] {
                 eprintln!(
-                    "RELAY_TICK rep={rep} placement={placement} tick={tick} at_us={} \
-                     wall_us={} cpu_us={} runqueue_wait_us={} slices={slices} \
-                     cpu_at_entry={cpu_entry} cpu_at_exit={cpu_exit}",
-                    at / 1000,
-                    wall / 1000,
-                    cpu / 1000,
-                    wait / 1000
+                    "UNIT_THREAD rep={rep} placement={placement} gap_after_tick={} at_us={} {}",
+                    t[0],
+                    d(first, at),
+                    line.split_once(' ').map_or("", |(_, rest)| rest)
                 );
             }
         }
@@ -1012,16 +1059,29 @@ fn print_relay_ticks(live_dir: &Path, rep: usize, placement: &str) {
 ///
 /// ```text
 /// FIRST_FIRE rep=<r> placement=<p> rank=<k> node=<id> dur_us=<u> first_step_fires=<n>
-/// RELAY_TICK rep=<r> placement=<p> tick=<i> at_us=<u> wall_us=<u> cpu_us=<u> runqueue_wait_us=<u> slices=<n> cpu_at_entry=<c> cpu_at_exit=<c>
+/// RELAY_TICK rep=<r> placement=<p> tick=<i> at_us=<u> wall_us=<u> cpu_us=<u> runqueue_wait_us=<u> slices=<n> voluntary=<n> involuntary=<n> cpu_from=<c> cpu_to=<c>
+/// RELAY_GAP  (the same fields, from one tick's exit to the next tick's entry)
+/// UNIT_THREAD rep=<r> placement=<p> gap_after_tick=<i> at_us=<u> <pid> <tid> <comm> <state> <wchan> <syscall>
 /// ```
 ///
-/// `RELAY_TICK` times the relay's own tick body (its first four) and names the
-/// CPU it entered and left on, so a slow first fire splits into the node's own
-/// code and the framework around it.
+/// `RELAY_TICK` covers the relay's own tick body (its first four ticks) and
+/// `RELAY_GAP` what runs between two of them: the publish of the tick's
+/// output, the framework, and the next frame's refill. A gap with no CPU time
+/// and no runqueue wait is a blocked thread; the `UNIT_THREAD` samples inside
+/// it name where each unit thread was waiting.
 #[test]
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
+    /// Turns the unit-thread sampler on for this arm only.
+    struct Sampling;
+    impl Drop for Sampling {
+        fn drop(&mut self) {
+            read_identity::SAMPLE_UNIT_THREADS.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    read_identity::SAMPLE_UNIT_THREADS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _sampling = Sampling;
     let mut failures = Vec::new();
     for rep in 0..FIRST_FIRE_REPS {
         let mut relay = std::collections::BTreeMap::new();
@@ -1045,7 +1105,7 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
                     f.first_step_fires
                 );
             }
-            print_relay_ticks(&run.live_dir, rep, placement.label());
+            print_relay_ticks(&run, rep, placement.label());
             let r = fires
                 .iter()
                 .find(|f| f.node == "relay")
