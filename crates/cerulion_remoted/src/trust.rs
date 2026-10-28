@@ -665,14 +665,17 @@ mod tests {
             shared
                 .claim(&[7; 32], OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
                 .unwrap();
-            // A directory at the serializer's temp path deterministically fails
-            // writes without relying on uid-dependent permission behavior.
-            let blocker = if fail_store {
-                "trust_store.tmp"
+            // A directory at the saved file's own path makes the rename onto it
+            // fail, independent of the uid and of the temp name the save picks. The
+            // real file is set aside first and restored before the reload.
+            let blocked = dir.path().join(if fail_store {
+                "trust_store"
             } else {
-                "device_index.json.tmp"
-            };
-            std::fs::create_dir(dir.path().join(blocker)).unwrap();
+                "device_index.json"
+            });
+            let aside = dir.path().join("set_aside");
+            std::fs::rename(&blocked, &aside).unwrap();
+            std::fs::create_dir(&blocked).unwrap();
             let key = pubkey(&SigningKey::from_bytes(&[8; 32])).0;
             assert!(matches!(
                 shared.verify_owner_certificate_and_establish(
@@ -683,6 +686,8 @@ mod tests {
                 Err(TrustError::Persist(_))
             ));
             assert_eq!(shared.snapshot_for_key(&key).1, KeyAccess::Unpaired);
+            std::fs::remove_dir(&blocked).unwrap();
+            std::fs::rename(&aside, &blocked).unwrap();
             let loaded = reload(
                 &dir.path().join("trust_store"),
                 &dir.path().join("device_index.json"),

@@ -213,7 +213,6 @@ async fn a_valid_mac_without_the_registered_owner_binding_is_not_complete_state(
         if let Some(account) = account {
             index.bind(registered.endpoint_id, account);
         }
-        reserve_save_temp(&path).unwrap();
         index.save(&mac).unwrap();
         let before = snapshot(&dir);
         let error = provision(&config, NOW).unwrap_err().to_string();
@@ -237,7 +236,6 @@ async fn a_store_claimed_by_another_account_is_refused_even_with_the_owner_bindi
         .claim(AccountId([0x61; 32]), &secret, PrincipalKind::Human, NOW)
         .unwrap();
     let path = dir.join(TRUST_STORE_FILENAME);
-    reserve_save_temp(&path).unwrap();
     store.with_path(&path).save(&mac).unwrap();
     let before = snapshot(&dir);
     let error = provision(&config, NOW).unwrap_err().to_string();
@@ -246,6 +244,25 @@ async fn a_store_claimed_by_another_account_is_refused_even_with_the_owner_bindi
         "{error}"
     );
     assert_eq!(snapshot(&dir), before);
+}
+
+#[tokio::test]
+async fn provisioning_leaves_no_temporary_file_and_its_stores_are_owner_only() {
+    let (_temporary, config, _bundle) = setup();
+    provision(&config, NOW).unwrap();
+    let dir = config.state_root.join(REMOTED_SUBDIR);
+    let names: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.ends_with(".tmp")),
+        "{names:?}"
+    );
+    for name in [TRUST_STORE_FILENAME, DEVICE_INDEX_FILENAME] {
+        let mode = fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -382,9 +399,7 @@ async fn failed_state_steps_never_replace_files_or_publish_an_unclaimed_store() 
         TRUST_STORE_MAC_KEY_FILENAME,
         CHASSIS_SECRET_FILENAME,
         DEVICE_INDEX_FILENAME,
-        "device_index.json.tmp",
         TRUST_STORE_FILENAME,
-        ".trust_store.provision.tmp",
     ] {
         let dir = temporary
             .path()

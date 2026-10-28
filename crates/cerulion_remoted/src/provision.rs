@@ -223,18 +223,6 @@ mod unix {
         Ok(())
     }
 
-    // The existing serializers use this sibling temporary filename. Reserving it
-    // exclusively in our fresh private directory prevents link following and
-    // preserves mode 0600 when those serializers write and rename it.
-    fn reserve_save_temp(path: &Path) -> Result<(), RemotedError> {
-        let mut filename = path
-            .file_name()
-            .ok_or_else(|| refused("state file has no name"))?
-            .to_os_string();
-        filename.push(".tmp");
-        write_new(&path.with_file_name(filename), &[])
-    }
-
     fn decode<T: serde::de::DeserializeOwned>(encoded: &str) -> Result<T, RemotedError> {
         let bytes =
             hex::decode(encoded).map_err(|_| refused("registration artifact is not hex"))?;
@@ -353,10 +341,8 @@ mod unix {
             TRUST_STORE_MAC_KEY_FILENAME,
             CHASSIS_SECRET_FILENAME,
             DEVICE_INDEX_FILENAME,
-            "device_index.json.tmp",
             TRUST_STORE_FILENAME,
             ".trust_store.provision",
-            ".trust_store.provision.tmp",
         ] {
             match fs::symlink_metadata(dir.join(name)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -370,7 +356,6 @@ mod unix {
         // Persist and verify the CLAIMED store before the device index. The final
         // trust_store filename is the commit marker and does not exist yet.
         let pending = dir.join(".trust_store.provision");
-        reserve_save_temp(&pending)?;
         store
             .with_path(&pending)
             .save(mac)
@@ -379,7 +364,6 @@ mod unix {
         let loaded = TrustStore::load(&pending, mac).map_err(RemotedError::Store)?;
         verify_identity(&loaded, &expected)?;
         let index_path = dir.join(DEVICE_INDEX_FILENAME);
-        reserve_save_temp(&index_path)?;
         let mut index = DeviceAccountIndex::new().with_path(&index_path);
         index.bind(expected.endpoint_id, expected.owner_account);
         index.save(mac)?;
