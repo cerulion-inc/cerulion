@@ -57,7 +57,8 @@ use cerulion_core::codegen::{
 };
 use cerulion_core::wire::WireHeader;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+
+mod common;
 
 const HUGE: usize = 128 * 1024 * 1024;
 const LARGE: usize = 16 * 1024 * 1024;
@@ -79,45 +80,16 @@ fn next_lower(t: usize) -> Option<usize> {
 
 // ───────────────────────────── corpus + envelope ─────────────────────────────
 
-/// Every vendored `.msg`, parsed and nested-resolved as one set — the shape
+/// Every vendored message (each `.msg` and both parts of each `.srv`), parsed and nested-resolved as one set: the shape
 /// `build.rs` compiles, so "variable" here means what it means at codegen time.
 fn corpus() -> Vec<MessageSchema> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg");
-    let mut pkgs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    pkgs.sort();
-
     let mut schemas = Vec::new();
-    for pkg_dir in pkgs {
-        let pkg = pkg_dir
-            .file_name()
-            .expect("package dir name")
-            .to_string_lossy()
-            .replace('-', "_");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&pkg_dir)
-            .unwrap_or_else(|e| panic!("read {}: {e}", pkg_dir.display()))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "msg"))
-            .collect();
-        files.sort();
-        for f in files {
-            let name = f
-                .file_stem()
-                .expect("msg file stem")
-                .to_string_lossy()
-                .to_string();
-            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
-            // FAIL CLOSED: a file this walk cannot parse is a file whose
-            // envelope goes unmeasured.
-            let schema = parse_rosmsg(&text, &name, Some(&pkg))
-                .unwrap_or_else(|e| panic!("cannot parse vendored {pkg}/{name}: {e}"));
-            schemas.push(schema);
-        }
+    for ((pkg, name), text) in common::vendored_sources() {
+        // FAIL CLOSED: a file this walk cannot parse is a schema whose
+        // check goes unrun.
+        let schema = parse_rosmsg(&text, &name, Some(&pkg))
+            .unwrap_or_else(|e| panic!("cannot parse vendored {pkg}/{name}: {e}"));
+        schemas.push(schema);
     }
     resolve_fixed_nested(&mut schemas);
     schemas

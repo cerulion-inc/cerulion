@@ -19,7 +19,7 @@
 //! GENERATED OUTPUT, so it must be re-measured after a rebuild — reading
 //! `OUT_DIR` at compile time is what makes that automatic.
 //!
-//! **Without the generator's `big_array` emission, 9 of the 254 snapshot
+//! **Without the generator's `big_array` emission, 9 of the snapshot
 //! types have no serde.** Two of them are
 //! `autoware_perception_msgs/PredictedObjectKinematics` and
 //! `vision_msgs/ObjectHypothesisWithPose`, both transitively poisoned through
@@ -122,32 +122,34 @@ fn snapshot_struct_name(line: &str) -> Option<String> {
     }
 }
 
-/// Count the vendored `.msg` files — the INDEPENDENT enumeration.
+/// Count the vendored messages: the INDEPENDENT enumeration: one per
+/// `.msg` file and two per `.srv` file (its request and its response).
 ///
 /// Codegen emits exactly one `<Name>Snapshot` per schema, so this number and
 /// the walk's total must agree. Disagreement means the walk missed a generated
 /// file (e.g. a package's `.rs` skipped), which no "zero missing" assertion
 /// could catch.
 fn count_vendored_msg_files() -> usize {
-    fn recurse(dir: &Path, count: &mut usize) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| {
-            panic!(
-                "cannot read the vendored msg tree at {}: {e}",
-                dir.display()
-            )
-        }) {
+    fn recurse(dir: &Path, ext: &str, count: &mut usize) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read the vendored tree at {}: {e}", dir.display()))
+        {
             let path = entry.expect("read_dir entry").path();
-            if path.is_dir() {
-                recurse(&path, count);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("msg") {
+            let is_dir = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("cannot read the metadata of {}: {e}", path.display()))
+                .is_dir();
+            if is_dir {
+                recurse(&path, ext, count);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
                 *count += 1;
             }
         }
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg");
-    let mut count = 0;
-    recurse(&root, &mut count);
-    count
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (mut msgs, mut srvs) = (0, 0);
+    recurse(&crate_root.join("msg"), "msg", &mut msgs);
+    recurse(&crate_root.join("srv"), "srv", &mut srvs);
+    msgs + 2 * srvs
 }
 
 /// THE GATE: zero types without serde.
@@ -169,8 +171,8 @@ fn every_generated_snapshot_type_derives_serde() {
     assert_eq!(
         snapshots.len(),
         vendored,
-        "codegen emits one `<Name>Snapshot` per vendored `.msg`, so the walk \
-         ({} types) and the `.msg` tree ({vendored} files) must agree; a \
+        "codegen emits one `<Name>Snapshot` per vendored message, so the walk \
+         ({} types) and the `.msg` + `.srv` trees ({vendored} messages) must agree; a \
          shortfall means the walk skipped generated output",
         snapshots.len()
     );

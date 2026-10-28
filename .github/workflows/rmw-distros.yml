@@ -292,12 +292,13 @@ jobs:
           # arm64 bash BEFORE the real gate.
           bash tools/ci/rmw-distros/gate_selftest.sh </dev/null
 
-          # Scope on this emulated leg: build + nm symbol audit + the staged-
-          # library digest + 3 fresh-process rclpy exchanges (both directions) +
-          # the wrong-payload self-test. The in-process serial suite is skipped
+          # Scope on this emulated leg: build + nm symbol audit + the real-
+          # typesupport service part check + the staged-library digest + 3
+          # fresh-process rclpy exchanges (both directions) + the wrong-payload
+          # self-test. The in-process serial suite is skipped
           # (RMW_GATE_SKIP_SERIAL_SUITE=1); the POLICY line names the two tests
           # that drove the skip, so the gate reports what it judged.
-          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
+          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + real-typesupport part check + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
           echo "POLICY detail: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired breaches its per-hop drain budget under emulation (timing-sensitive)."
           echo "POLICY detail: rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it terminates the harness by SIGBUS under emulation (undiagnosed, under investigation)."
           bash tools/ci/rmw-distros/gate.sh foxy </dev/null

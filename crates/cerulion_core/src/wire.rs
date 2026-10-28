@@ -675,7 +675,13 @@ pub const fn align8(size: usize) -> usize {
 /// length-prefixed byte stream (name + wire fixed size + per-field
 /// name/type strings) through this primitive.
 pub const fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
+    fnv1a_fold(FNV_OFFSET, bytes)
+}
+
+/// Fold `bytes` into a running FNV-1a 64 `hash`, in a `const` context.
+/// Folding chunks one after another equals [`fnv1a_hash`] over their
+/// concatenation when the first fold starts from [`FNV_OFFSET`].
+pub(crate) const fn fnv1a_fold(mut hash: u64, bytes: &[u8]) -> u64 {
     let mut i = 0;
     while i < bytes.len() {
         hash ^= bytes[i] as u64;

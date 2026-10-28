@@ -221,41 +221,18 @@ mod tests {
         assert_eq!(srv.response.fields[1].field_type, FieldType::String);
     }
 
+    /// A real service's parts carry the qualified names ROS 2 gives them
+    /// (the part name is in the hash, so the two parts never share one).
+    /// The hash a ROS 2 peer announces for a part is checked against the
+    /// generated one in `crates/rmw_cerulion/tests/service_part_hash_test.rs`,
+    /// not here: this module parses both sides with the same `.msg` parser.
     #[test]
-    fn each_part_hashes_like_the_same_text_parsed_as_a_msg() {
-        // A service part is an ordinary message: its schema hash is the hash
-        // of the same text parsed as `<Name>_Request.msg` in the package.
-        let text = "string[] names\n---\nuint8[] types\n";
-        let srv = parse_rossrv(text, "GetTypes", Some("p"), FILE).unwrap();
-        let req = parse_rosmsg("string[] names\n", "GetTypes_Request", Some("p")).unwrap();
-        let resp = parse_rosmsg("uint8[] types\n", "GetTypes_Response", Some("p")).unwrap();
-        assert_eq!(srv.request.schema_hash(), req.schema_hash());
-        assert_eq!(srv.response.schema_hash(), resp.schema_hash());
+    fn a_std_srvs_part_carries_the_name_ros_2_gives_it() {
+        let text = "bool data\n---\nbool success\nstring message\n";
+        let srv = parse_rossrv(text, "SetBool", Some("std_srvs"), FILE).unwrap();
+        assert_eq!(srv.request.qualified_name(), "std_srvs/SetBool_Request");
+        assert_eq!(srv.response.qualified_name(), "std_srvs/SetBool_Response");
         assert_ne!(srv.request.schema_hash(), srv.response.schema_hash());
-    }
-
-    /// The qualified name `rmw_cerulion` gives a message from its rosidl
-    /// introspection: the package is the namespace up to the first `__`
-    /// (`std_srvs__srv` gives `std_srvs`), then `/`, then `message_name_`.
-    /// rosidl names the two parts of service `SetBool` `SetBool_Request`
-    /// and `SetBool_Response`.
-    fn rmw_side_schema(body: &str, namespace: &str, message_name: &str) -> MessageSchema {
-        let package = namespace.split("__").next().unwrap();
-        parse_rosmsg(body, message_name, Some(package)).unwrap()
-    }
-
-    #[test]
-    fn each_part_hashes_like_the_rmw_cerulion_peer_of_the_same_service() {
-        let request = "bool data\n";
-        let response = "bool success\nstring message\n";
-        let text = format!("{request}---\n{response}");
-        let srv = parse_rossrv(&text, "SetBool", Some("std_srvs"), FILE).unwrap();
-
-        let rmw_req = rmw_side_schema(request, "std_srvs__srv", "SetBool_Request");
-        let rmw_resp = rmw_side_schema(response, "std_srvs__srv", "SetBool_Response");
-        assert_eq!(rmw_req.qualified_name(), "std_srvs/SetBool_Request");
-        assert_eq!(srv.request.schema_hash(), rmw_req.schema_hash());
-        assert_eq!(srv.response.schema_hash(), rmw_resp.schema_hash());
     }
 
     #[test]

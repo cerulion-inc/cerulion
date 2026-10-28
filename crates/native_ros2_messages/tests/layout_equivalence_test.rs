@@ -7,55 +7,33 @@
 //! messages at runtime using `LayoutResolver`; native Cerulion nodes
 //! read the same topics through the generated structs. A single byte of
 //! divergence means cross-runtime misreads under a matching schema
-//! hash — so this test is EXHAUSTIVE over all 254 vendored schemas
+//! hash, so this test is EXHAUSTIVE over all 280 vendored schemas (every
+//! `.msg`, and the request and response of every `.srv`)
 //! (fixed sizes + schema hashes) plus `offset_of!` spot checks on the
 //! trickiest layouts (nested composition, padding, large arrays).
 //!
-//! The schema set is re-parsed from the same `msg/` tree the build
+//! The schema set is re-parsed from the same `msg/` and `srv/` trees the build
 //! script used — same pipeline, independent execution.
 
 use cerulion_core::codegen::layout::LayoutResolver;
 use cerulion_core::codegen::parse_rosmsg;
 use cerulion_core::message::ShmMessage;
-use std::fs;
 use std::mem::offset_of;
-use std::path::Path;
+
+mod common;
 
 fn build_resolver() -> LayoutResolver {
-    let msg_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("msg");
     let mut schemas = Vec::new();
-    let mut packages: Vec<_> = fs::read_dir(&msg_dir)
-        .expect("msg dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    packages.sort_by_key(|e| e.file_name());
-    for pkg_entry in packages {
-        let pkg = pkg_entry.file_name().to_string_lossy().replace('-', "_");
-        let mut files: Vec<_> = fs::read_dir(pkg_entry.path())
-            .expect("pkg dir")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "msg"))
-            .collect();
-        files.sort_by_key(|e| e.file_name());
-        for f in files {
-            let name = f
-                .path()
-                .file_stem()
-                .expect("stem")
-                .to_string_lossy()
-                .to_string();
-            let content = fs::read_to_string(f.path()).expect("read msg");
-            schemas.push(parse_rosmsg(&content, &name, Some(&pkg)).expect("parse"));
-        }
+    for ((pkg, name), content) in common::vendored_sources() {
+        schemas.push(parse_rosmsg(&content, &name, Some(&pkg)).expect("parse"));
     }
     // Guard the EXHAUSTIVE claim: a newly vendored .msg must extend the
     // assert_layout_matches list below, or this fails loudly instead of
     // the headline silently decaying.
     assert_eq!(
         schemas.len(),
-        254,
-        "vendored .msg count changed — extend the exhaustive layout list below"
+        280,
+        "vendored message count changed: extend the exhaustive layout list below"
     );
     let (resolver, warnings) = LayoutResolver::new(schemas);
     assert!(warnings.is_empty(), "resolution warnings: {warnings:?}");
@@ -356,6 +334,34 @@ fn computed_layout_matches_generated_constants_for_all_schemas() {
     assert_layout_matches!(r, autoware_planning_msgs, LaneletPrimitive);
     assert_layout_matches!(r, autoware_planning_msgs, LaneletSegment);
     assert_layout_matches!(r, autoware_planning_msgs, LaneletRoute);
+    // rcl_interfaces (parameter messages and services)
+    assert_layout_matches!(r, rcl_interfaces, FloatingPointRange);
+    assert_layout_matches!(r, rcl_interfaces, IntegerRange);
+    assert_layout_matches!(r, rcl_interfaces, ListParametersResult);
+    assert_layout_matches!(r, rcl_interfaces, Parameter);
+    assert_layout_matches!(r, rcl_interfaces, ParameterDescriptor);
+    assert_layout_matches!(r, rcl_interfaces, ParameterType);
+    assert_layout_matches!(r, rcl_interfaces, ParameterValue);
+    assert_layout_matches!(r, rcl_interfaces, SetParametersResult);
+    assert_layout_matches!(r, rcl_interfaces, DescribeParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, DescribeParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, GetParameterTypes_Request);
+    assert_layout_matches!(r, rcl_interfaces, GetParameterTypes_Response);
+    assert_layout_matches!(r, rcl_interfaces, GetParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, GetParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, ListParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, ListParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, SetParameters_Request);
+    assert_layout_matches!(r, rcl_interfaces, SetParameters_Response);
+    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomically_Request);
+    assert_layout_matches!(r, rcl_interfaces, SetParametersAtomically_Response);
+    // std_srvs
+    assert_layout_matches!(r, std_srvs, Empty_Request);
+    assert_layout_matches!(r, std_srvs, Empty_Response);
+    assert_layout_matches!(r, std_srvs, SetBool_Request);
+    assert_layout_matches!(r, std_srvs, SetBool_Response);
+    assert_layout_matches!(r, std_srvs, Trigger_Request);
+    assert_layout_matches!(r, std_srvs, Trigger_Response);
 }
 
 /// Field-offset spot checks via `offset_of!` on the trickiest layouts.

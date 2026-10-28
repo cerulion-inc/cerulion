@@ -1946,7 +1946,8 @@ impl Sample<'_> {
             }
             self.yaml.push_str(&f.name);
             self.yaml.push(':');
-            self.value(&f.field_type, schema.package.as_deref(), indent);
+            let cap = f.bounds.max_elements;
+            self.value(&f.field_type, schema.package.as_deref(), indent, cap);
         }
     }
 
@@ -1966,8 +1967,10 @@ impl Sample<'_> {
         Some((layout.qualified_name.clone(), schema.fields.is_empty()))
     }
 
-    /// One field value after its `key:`, to the end of its lines.
-    fn value(&mut self, ft: &FieldType, parent: Option<&str>, indent: usize) {
+    /// One field value after its `key:`, to the end of its lines. A dynamic
+    /// array holds two elements, or `cap` when its `T[<=N]` bound is lower,
+    /// so the sample stays a message the reader accepts.
+    fn value(&mut self, ft: &FieldType, parent: Option<&str>, indent: usize, cap: Option<usize>) {
         if let Some((q, empty)) = self.target(ft, parent) {
             if empty {
                 self.cdr.u8(0);
@@ -1980,8 +1983,9 @@ impl Sample<'_> {
         }
         let (element_type, count) = match ft {
             FieldType::DynamicArray { element_type } => {
-                self.cdr.u32(2);
-                (element_type.as_ref(), 2)
+                let count = cap.map_or(2, |bound| bound.min(2));
+                self.cdr.u32(count as u32);
+                (element_type.as_ref(), count)
             }
             FieldType::FixedArray {
                 element_type,

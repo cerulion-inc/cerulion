@@ -1194,14 +1194,14 @@ def check_shipped_text(root, files, phrases, ledger):
 # Class 6: work-state
 # ---------------------------------------------------------------------------
 
-# What the class never reads: raw benchmark evidence, the vendored message and
-# binding trees, lockfiles, the legal texts, and the gate's own scripts and data
+# What the class never reads: raw benchmark evidence, the vendored message,
+# service and binding trees, lockfiles, the legal texts, and the gate's own scripts and data
 # files (they spell the patterns in order to refuse them).
 WORKSTATE_EXCLUDE_RE = re.compile(
     r"^(?:docs/benchmarks/results/"
     r"|docs/legal/"
     r"|\.github/CLA/"
-    r"|crates/native_ros2_messages/(?:msg/|upstream_msg_manifest\.txt$)"
+    r"|crates/native_ros2_messages/(?:msg/|srv/|upstream_msg_manifest\.txt$)"
     r"|crates/rmw_cerulion/src/ffi/vendored_bindings\.rs$"
     r"|tools/scripts/(?:check_public_surface\.(?:py|sh)|leak_scan\.py|leak_scan_allow\.txt|public_surface_[a-z_]+\.txt|publish_preflight\.sh)$"
     r")|(?:^|/)(?:Cargo\.lock|LICENSE(?:-[A-Z0-9]+)?)$"
@@ -2440,6 +2440,7 @@ def self_test(out=sys.stdout):
                                                      ".github/CLA/individual.md", "LICENSE", "tools/scripts/check_public_surface.py",
                                                      "tools/scripts/check_public_surface.sh", "tools/scripts/leak_scan.py", WORKSTATE_FILE,
                                                      WORKSTATE_LEDGER_FILE, ALLOW_FILE, "crates/native_ros2_messages/msg/std_msgs/String.msg",
+                                                     "crates/native_ros2_messages/srv/std_srvs/Trigger.srv",
                                                      "crates/rmw_cerulion/src/ffi/vendored_bindings.rs"))
         and not any(WORKSTATE_EXCLUDE_RE.search(f) for f in ("crates/cerulion_core/src/lib.rs", "tools/scripts/check_agents_md.sh", "docs/benchmarks/README.md",
                                                              "crates/native_ros2_messages/src/lib.rs", "docs/page.md", "AGENTS.md", "benches/latency/bench.py")))

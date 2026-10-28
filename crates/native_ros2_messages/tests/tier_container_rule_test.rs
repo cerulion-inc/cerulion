@@ -57,7 +57,8 @@ use cerulion_core::codegen::{
     parse_rosmsg, resolve_fixed_nested, variable_schema_max_slice_len, FieldType, MessageSchema,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+
+mod common;
 
 // ─────────────────────────────── the waiver ───────────────────────────────
 
@@ -98,49 +99,17 @@ const WAIVED: &[(&str, &str, &str)] = &[(
 
 // ────────────────────────────── corpus loading ──────────────────────────────
 
-/// Every vendored `.msg`, parsed and nested-resolved as one set — the same
+/// Every vendored message (each `.msg` and both parts of each `.srv`), parsed and nested-resolved as one set: the same
 /// shape `build.rs` compiles, so "variable" here means what it means at
 /// codegen time.
 fn resolved_corpus() -> Vec<MessageSchema> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("msg");
-    let mut pkgs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    pkgs.sort();
-
     let mut schemas = Vec::new();
-    for pkg_dir in pkgs {
-        // Mirror build.rs's package-name sanitization.
-        let pkg = pkg_dir
-            .file_name()
-            .expect("package dir name")
-            .to_string_lossy()
-            .replace('-', "_");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&pkg_dir)
-            .unwrap_or_else(|e| panic!("read {}: {e}", pkg_dir.display()))
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "msg"))
-            .collect();
-        files.sort();
-        for f in files {
-            let name = f
-                .file_stem()
-                .expect("msg file stem")
-                .to_string_lossy()
-                .to_string();
-            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
-            // FAIL CLOSED: a file this walk cannot parse is a file whose
-            // container rule goes unchecked. `build.rs` parses the same set and
-            // escalates any warning to a build failure, so an unparseable file
-            // here means the corpus and the build disagree.
-            let schema = parse_rosmsg(&text, &name, Some(&pkg))
-                .unwrap_or_else(|e| panic!("cannot parse vendored {pkg}/{name}: {e}"));
-            schemas.push(schema);
-        }
+    for ((pkg, name), text) in common::vendored_sources() {
+        // FAIL CLOSED: a file this walk cannot parse is a schema whose
+        // check goes unrun.
+        let schema = parse_rosmsg(&text, &name, Some(&pkg))
+            .unwrap_or_else(|e| panic!("cannot parse vendored {pkg}/{name}: {e}"));
+        schemas.push(schema);
     }
     resolve_fixed_nested(&mut schemas);
     schemas

@@ -1,6 +1,6 @@
 # native_ros2_messages: internals
 
-The vendored ROS 2 `.msg` corpus and the build-time code generator that turns it into
+The vendored ROS 2 `.msg` and `.srv` corpus and the build-time code generator that turns it into
 zero-copy `ShmMessage` types. Two contracts live here: the **build pipeline** (how
 `.msg` text becomes generated Rust, deterministically) and the **upstream drift gate**
 (how the corpus is held true to the ROS 2 distros it was vendored from).
@@ -9,15 +9,21 @@ zero-copy `ShmMessage` types. Two contracts live here: the **build pipeline** (h
 
 `src/lib.rs` contains no types; it is `include!(concat!(env!("OUT_DIR"), "/ros2_msgs.rs"))`
 plus the embedded-registry include. All generated code lives in `OUT_DIR`; the edit
-unit is a `.msg` file under `msg/<pkg>/`, and `cargo build` regenerates everything.
+unit is a `.msg` file under `msg/<pkg>/` or a `.srv` file under `srv/<pkg>/`, and
+`cargo build` regenerates everything.
 
 Pipeline order (each stage feeds the next; the order is load-bearing):
 
 1. **Scan** `msg/<pkg>/*.msg` into per-package sets. An unreadable or non-UTF-8 file
    panics the build; a vendored input that silently vanished would let references
-   to it rebind through the bare-name fallback.
+   to it rebind through the bare-name fallback. Then **split** each
+   `srv/<pkg>/<Name>.srv` at its one `---` line (`split_rossrv`) and add the two
+   parts to the package set as `<Name>_Request` and `<Name>_Response`, exact source
+   text. From here on a service part IS a message: it is in the registry, parsed,
+   resolved, hashed and generated like any `.msg`. A part named like a vendored
+   `.msg`, or a service named like a message in its package, panics.
 2. **Emit `BUILTIN_MSGS`** (`msg_registry.rs`): the exact vendored `.msg` text frozen
-   at build time, one `(package, name, text)` tuple in sorted order. CLI schema
+   at build time (each service part included), one `(package, name, text)` tuple in sorted order. CLI schema
    introspection parses THIS text (not the `msg/` tree at CLI runtime), so a
    resolved layout can never skew from what the generated types compiled against.
 3. **Parse** each message via `parse_rosmsg` with its package name. The package is
@@ -32,7 +38,21 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
 5. **`generate_schema`** per schema, emitting three items per message: the unit
    marker (`pub struct <Name>;` carrying `impl ShmMessage`), the SHM-backed accessor
    `<Name>Shm`, and the heap-owned `<Name>Snapshot` replay/round-trip companion.
-6. **Module assembly**: one file per package plus `ros2_msgs.rs` re-exports.
+6. **Service markers**: per `.srv`, `generate_service_marker` emits one
+   `cerulion_core::__service_marker!` call. With `cerulion_core`'s `unstable-services`
+   feature on it declares `pub struct <Name>;` with
+   `impl cerulion_core::message::ServiceType` naming the two parts (`SERVICE_HASH`
+   comes from the trait default); with it off it expands to nothing. The feature is
+   read in `cerulion_core`, so a crate of generated code needs no feature of its own. In workspace
+   mode a marker is left out, with a cargo warning, when a part is not generated, when
+   a message takes the marker's name (`service_marker_conflict`), or when the workspace
+   replaces a part, or any message a part embeds at any depth, with a definition whose
+   fields or constants differ from the vendored one (`service_part_replaced`, checked
+   before nested resolution; each reference binds over the vendored corpus through the
+   resolver's own ladder, `NestedIndex::bind`, so the check and the layout agree on
+   which message a part embeds). An override of `rcl_interfaces/ParameterValue` so drops
+   the `GetParameters`, `SetParameters` and `SetParametersAtomically` markers.
+7. **Module assembly**: one file per package plus `ros2_msgs.rs` re-exports.
 
 Cross-package `use` edges are derived by `collect_field_deps`, which mirrors the
 runtime resolver's lookup precedence exactly (qualified > same-package > bare
@@ -171,10 +191,13 @@ value: a failure there is a wire-compatibility break. The two gates are
 deliberately separate: the bare-ref gate catches the CAUSE on any type; the wire
 pin catches the CONSEQUENCE on the measured set.
 
-## Adding or changing a `.msg`: checklist
+## Adding or changing a `.msg` or `.srv`: checklist
 
-1. Edit/add the file under `msg/<pkg>/`; `cargo build -p native_ros2_messages`.
-   A build panic is a bug in the new `.msg`.
+1. Edit/add the file under `msg/<pkg>/` (or `srv/<pkg>/`); `cargo build -p
+   native_ros2_messages`. A build panic is a bug in the new file. A `.srv` counts as
+   two messages in every step below (its request and its response). A new package
+   also needs an `IN_REPO_PACKAGES` entry, a `!source` line in the manifest and, for a
+   new upstream path, a `place`/`place_srv` line in the refresh script.
 2. Extend `layout_equivalence_test`: bump the hard corpus-count assert, add an
    `assert_layout_matches!` line, and add an `offset_of!` spot-check for complex
    fixed layouts.
@@ -196,10 +219,15 @@ pin catches the CONSEQUENCE on the measured set.
 | `roundtrip_test.rs` | Every schema round-trips `<Name>Snapshot` → SHM publish → `try_view` snapshot, over an isolated iceoryx2 `TestTransport` per test | no | none |
 | `schema_hash_pin_test.rs` | Generated `SCHEMA_HASH`/`WIRE_FIXED_SIZE` == values recomputed through the same parse→resolve pipeline (whole-corpus resolve is required: a recursively-fixed nested field folds the target's hash into the parent); plus the wire-capture hash pin (never re-bless) | no | none |
 | `upstream_drift_test.rs` | Corpus-vs-manifest adjudication (a pure `adjudicate` function driven by synthetic-input oracles), provenance cross-check, waiver scoping, the bare-ref zero-tolerance gate, and fail-closed behavior | no | none |
+| `service_types_test.rs` | Acceptance for the vendored services (`std_srvs`, the `rcl_interfaces` parameter services): each marker names its own request and response, part hashes pairwise distinct, constants and defaults on the generated types, a real `Trigger_Response` frame decoded by the `FrameWalker`, a serde round trip, and the markers a workspace override of an embedded message drops over the real corpus (the check that each `std_srvs` part hashes like the part `rmw_cerulion` announces for a ROS 2 peer is `crates/rmw_cerulion/tests/service_part_hash_test.rs`) | no | none |
 | `vendored_types_test.rs` | Acceptance for later-vendored packages (vision/radar/grid_map + the UUID dep): real loan/fill round-trips over `TestTransport`, pairwise-distinct hashes including bare-name twins across packages | no | none |
 | `generated_bindings_test.rs` | Package-qualified schema-hash linkage, rosidl scalar-default parity, and bool-array wire semantics, against the real generated bindings | no | none |
 | `max_slice_len_test.rs` | `MAX_SLICE_LEN` lands on the expected tier for representative schemas (NOT exhaustive; see checklist step 5) | no | none |
 | `stamp_helper_test.rs` | `builtin_interfaces/Time::from_ns` against hand-computed oracles; a seconds count past the `i32` horizon fires a `debug_assert!` in debug/test builds | no | none |
+
+The corpus walk the exhaustive tests share (`.msg` files plus both parts of every
+`.srv`) lives once in `tests/common/mod.rs`; it reads the files, not the generated
+registry, so it stays an independent enumeration.
 
 All binaries are parallel-safe within this crate: the transport-using tests build
 isolated per-test SHM roots via `TestTransport`; the rest are pure file-parse or

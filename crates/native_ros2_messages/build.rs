@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Build script for native_ros2_messages.
 //!
-//! Scans msg/ directory, parses .msg files, and generates Rust code.
+//! Scans the msg/ and srv/ directories, parses .msg and .srv files, and
+//! generates Rust code. A `.srv` file splits into two messages,
+//! `<Name>_Request` and `<Name>_Response`, that join the package's message
+//! set (and the embedded registry) exactly like vendored `.msg` files, plus
+//! a `<Name>` service marker.
 //!
 //! All collections are BTreeMap/sorted so the generated code is
 //! byte-identical across builds — codegen output ordering must be
 //! deterministic (Principle #7).
 
 use cerulion_core::codegen::{
-    generate_schema, parse_rosmsg, resolve_fixed_nested, FieldType, MessageSchema,
+    generate_schema, generate_service_marker, parse_rosmsg, parse_rossrv, resolve_fixed_nested,
+    service_marker_conflict, service_part_replaced, split_rossrv, srv_request_name,
+    srv_response_name, FieldType, MessageSchema, ServiceDefinition,
 };
 use cerulion_core::dynamic::SchemaSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -22,10 +28,46 @@ fn main() {
     // Collect all .msg files by package
     let mut packages: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
 
-    if msg_dir.exists() {
+    if corpus_root_exists(msg_dir) {
         collect_msg_files(msg_dir, &mut packages);
     }
     let vendored_packages: BTreeSet<String> = packages.keys().cloned().collect();
+
+    // Services: each `.srv` adds its request and response parts to the
+    // package's messages, under the names the service marker points at. A
+    // part that collides with a vendored `.msg` of the same name would let
+    // one silently replace the other, so it fails the build.
+    let srv_dir = Path::new("srv");
+    let mut services: BTreeMap<String, Vec<ServiceDefinition>> = BTreeMap::new();
+    if corpus_root_exists(srv_dir) {
+        for (package, srv_name, file, text) in collect_srv_files(srv_dir) {
+            let parts = split_rossrv(&text, &file).unwrap_or_else(|e| panic!("{e}"));
+            let service = parse_rossrv(&text, &srv_name, Some(&package), &file)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let messages = packages.entry(package.clone()).or_default();
+            for (part_name, part_text) in [
+                (srv_request_name(&srv_name), parts.request),
+                (srv_response_name(&srv_name), parts.response),
+            ] {
+                if messages.iter().any(|(n, _)| *n == part_name) {
+                    panic!("{file}: service part {package}/{part_name} collides with a vendored message of the same name");
+                }
+                messages.push((part_name, part_text.to_string()));
+            }
+            services.entry(package).or_default().push(service);
+        }
+    }
+    for (package, defs) in &services {
+        let messages = &packages[package];
+        for def in defs {
+            if messages.iter().any(|(n, _)| *n == def.name) {
+                panic!(
+                    "service marker {package}/{} collides with a message of the same name",
+                    def.name
+                );
+            }
+        }
+    }
 
     // Emit the embedded built-in message registry — the exact
     // vendored .msg text frozen at build time. `cerulion_cli_engine`'s
@@ -49,7 +91,9 @@ fn main() {
         registry_code.push_str("/// Embedded built-in ROS 2 message registry.\n");
         registry_code.push_str("///\n");
         registry_code.push_str("/// One `(package, message_name, raw_msg_text)` tuple per\n");
-        registry_code.push_str("/// vendored `.msg`, in ascending `(package, message_name)`\n");
+        registry_code.push_str("/// vendored message (each `.msg`, and the request and response\n");
+        registry_code
+            .push_str("/// part of each `.srv`), in ascending `(package, message_name)`\n");
         registry_code.push_str("/// order. `raw_msg_text` is the exact source frozen at build\n");
         registry_code.push_str("/// time (the same text this script parsed to generate the\n");
         registry_code.push_str("/// `ShmMessage` types), so schema introspection resolves wire\n");
@@ -102,8 +146,23 @@ fn main() {
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from);
     let workspace_mode = workspace.is_some();
+    // A service whose part, or a message a part embeds at any depth, the
+    // workspace replaces with another definition keeps the replacement as a
+    // message, but loses its marker: the marker would name a request or
+    // response whose wire type is no longer the standard one.
+    let mut replaced_services: BTreeSet<(String, String)> = BTreeSet::new();
     if let Some(root) = &workspace {
+        let vendored: Vec<MessageSchema> = all_schemas.values().flatten().cloned().collect();
         all_schemas = workspace_message_set(root, all_schemas);
+        for (package, defs) in &services {
+            for service in defs {
+                let in_set = |pkg: &str, name: &str| find_schema(&all_schemas, pkg, name);
+                if let Some(why) = service_part_replaced(service, &vendored, in_set) {
+                    println!("cargo:warning=workspace messages: {why}");
+                    replaced_services.insert((package.clone(), service.name.clone()));
+                }
+            }
+        }
     }
 
     // Nested-resolution prerequisite: resolve nested-reference fixedness across
@@ -223,13 +282,26 @@ fn main() {
             package_code.push_str(&format!("//! {} message types.\n", package));
         }
         package_code.push_str("//!\n");
-        package_code.push_str("//! Generated at build time from `.msg` files. Do not edit the\n");
+        let has_msg = vendored_packages.contains(package);
+        let has_srv = services.contains_key(package);
+        let files = match (has_msg, has_srv) {
+            (true, true) => "`.msg` and `.srv` files",
+            (false, true) => "`.srv` files",
+            _ => "`.msg` files",
+        };
+        package_code.push_str(&format!(
+            "//! Generated at build time from {files}. Do not edit the\n"
+        ));
         package_code.push_str("//! generated source: it is rewritten on every build.\n");
         package_code.push_str("//!\n");
-        if vendored_packages.contains(package) {
+        if has_msg || has_srv {
+            let dirs = match (has_msg, has_srv) {
+                (true, true) => format!("the `msg/{package}/` and `srv/{package}/` directories"),
+                (false, true) => format!("the `srv/{package}/` directory"),
+                _ => format!("the `msg/{package}/` directory"),
+            };
             package_code.push_str(&format!(
-                "//! Source: the `msg/{}/` directory of the `native_ros2_messages` crate.\n\n",
-                package
+                "//! Source: {dirs} of the `native_ros2_messages` crate.\n\n"
             ));
         } else {
             package_code
@@ -278,6 +350,32 @@ fn main() {
             package_code.push('\n');
         }
 
+        // A marker names its two parts and declares its own name, so it is
+        // emitted only when both parts are generated and no generated message
+        // takes the marker's name. The vendored corpus alone always passes
+        // (the checks at the top fail its build first); a workspace can drop
+        // a part (an override shadows a type it embeds), replace a part with
+        // another definition (checked above, before resolution) or declare a
+        // message of the marker's name, and then only this service is left out.
+        let generated_names: BTreeSet<&str> = generated
+            .iter()
+            .map(|(schema, _)| schema.name.as_str())
+            .collect();
+        for service in services.get(package).into_iter().flatten() {
+            if replaced_services.contains(&(package.clone(), service.name.clone())) {
+                continue;
+            }
+            if let Some(why) =
+                service_marker_conflict(service, |name| generated_names.contains(name))
+            {
+                println!("cargo:warning=workspace messages: {why}");
+                continue;
+            }
+            package_code.push_str(&format!("// === service {} ===\n", service.name));
+            package_code.push_str(&generate_service_marker(service));
+            package_code.push('\n');
+        }
+
         // Write package module
         let package_file = format!("{}/{}.rs", out_dir, module);
         fs::write(&package_file, &package_code).expect("Failed to write package file");
@@ -312,8 +410,9 @@ fn main() {
     let ros2_msgs_file = format!("{}/ros2_msgs.rs", out_dir);
     fs::write(&ros2_msgs_file, &ros2_msgs).expect("Failed to write ros2_msgs.rs");
 
-    // Tell Cargo to rerun if msg files change
+    // Tell Cargo to rerun if msg or srv files change
     println!("cargo:rerun-if-changed=msg/");
+    println!("cargo:rerun-if-changed=srv/");
 }
 
 /// `schema` as the generator must see it: a package-less YAML schema named
@@ -353,6 +452,19 @@ const ROOT_MODULE: &str = "__workspace_root";
 /// root. Every warning the set reports (a file it skipped, a built-in an
 /// override dropped) is printed for the build log, since the type a warning
 /// names is then absent from the generated crate.
+/// The schema `set` holds as `package/name`, under its bare name or, for a
+/// package-less YAML schema named `package/Name`, its qualified one.
+fn find_schema<'a>(
+    set: &'a BTreeMap<String, Vec<MessageSchema>>,
+    package: &str,
+    name: &str,
+) -> Option<&'a MessageSchema> {
+    let qualified = format!("{package}/{name}");
+    set.get(package)?
+        .iter()
+        .find(|s| s.name == name || s.name == qualified)
+}
+
 fn workspace_message_set(
     root: &Path,
     builtins: BTreeMap<String, Vec<MessageSchema>>,
@@ -740,37 +852,85 @@ fn collect_field_deps(
     }
 }
 
+/// The entries of `dir`, sorted. A directory or an entry that cannot be read
+/// fails the build: skipping it would drop its types from the corpus without
+/// a word.
+fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", dir.display(), e))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("failed to read an entry of {}: {}", dir.display(), e))
+                .path()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Whether a corpus root (`msg/`, `srv/`) is there. `Path::exists` reads an
+/// I/O error as "absent", which would build the crate without that whole
+/// tree, so only a root that is really missing reads as absent.
+fn corpus_root_exists(root: &Path) -> bool {
+    root.try_exists()
+        .unwrap_or_else(|e| panic!("failed to check for {}: {}", root.display(), e))
+}
+
+/// Whether a corpus entry is a directory. `Path::is_dir` reads a metadata
+/// error as "not a directory", which would drop a package without a word, so
+/// an entry whose metadata cannot be read fails the build.
+fn is_dir(path: &Path) -> bool {
+    fs::metadata(path)
+        .unwrap_or_else(|e| panic!("failed to read the metadata of {}: {}", path.display(), e))
+        .is_dir()
+}
+
 fn collect_msg_files(dir: &Path, packages: &mut BTreeMap<String, Vec<(String, String)>>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // This is a package directory
-                let package_name = path.file_name().unwrap().to_string_lossy().to_string();
-                let package_name = sanitize_package_name(&package_name);
-
-                if let Ok(msg_entries) = fs::read_dir(&path) {
-                    for msg_entry in msg_entries.flatten() {
-                        let msg_path = msg_entry.path();
-                        if msg_path.extension().is_some_and(|e| e == "msg") {
-                            let msg_name =
-                                msg_path.file_stem().unwrap().to_string_lossy().to_string();
-
-                            // Vendored inputs: an unreadable/non-UTF-8 .msg
-                            // must fail the build, not silently vanish.
-                            let content = fs::read_to_string(&msg_path).unwrap_or_else(|e| {
-                                panic!("failed to read {}: {}", msg_path.display(), e)
-                            });
-                            packages
-                                .entry(package_name.clone())
-                                .or_default()
-                                .push((msg_name, content));
-                        }
-                    }
-                }
+    for path in sorted_dir_paths(dir) {
+        if !is_dir(&path) {
+            continue;
+        }
+        // This is a package directory
+        let package_name = sanitize_package_name(&path.file_name().unwrap().to_string_lossy());
+        for msg_path in sorted_dir_paths(&path) {
+            if msg_path.extension().is_some_and(|e| e == "msg") {
+                let msg_name = msg_path.file_stem().unwrap().to_string_lossy().to_string();
+                // Vendored inputs: an unreadable/non-UTF-8 .msg must fail the
+                // build, not silently vanish.
+                let content = fs::read_to_string(&msg_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {}", msg_path.display(), e));
+                packages
+                    .entry(package_name.clone())
+                    .or_default()
+                    .push((msg_name, content));
             }
         }
     }
+}
+
+/// Every `srv/<pkg>/<Name>.srv` as `(package, name, file label, text)`, in
+/// sorted order. Like a `.msg`, an unreadable `.srv` fails the build.
+fn collect_srv_files(dir: &Path) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    let pkg_dirs = sorted_dir_paths(dir).into_iter().filter(|p| is_dir(p));
+    for pkg_dir in pkg_dirs {
+        let package = sanitize_package_name(&pkg_dir.file_name().unwrap().to_string_lossy());
+        let files = sorted_dir_paths(&pkg_dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "srv"));
+        for path in files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+            out.push((
+                package.clone(),
+                name.clone(),
+                format!("srv/{package}/{name}.srv"),
+                text,
+            ));
+        }
+    }
+    out
 }
 
 fn sanitize_package_name(name: &str) -> String {

@@ -1,7 +1,8 @@
 # Third-party notice for the vendored ROS 2 message definitions
 
-The `.msg` files in this directory are ROS 2 interface definitions taken from
-upstream ROS 2 packages. They are not Cerulion's own work and they are not
+The `.msg` files in this directory, and the `.srv` files in the crate's
+`srv/` directory, are ROS 2 interface definitions taken from upstream ROS 2
+packages. They are not Cerulion's own work and they are not
 covered by Cerulion's license. The Rust types generated from them at build
 time are part of Cerulion and are licensed under AGPL-3.0-only.
 
@@ -16,8 +17,8 @@ Full text: <https://www.apache.org/licenses/LICENSE-2.0>
 
 | Package | Upstream | Revision | Declared as |
 | --- | --- | --- | --- |
-| `action_msgs`, `builtin_interfaces`, `statistics_msgs` | [ros2/rcl_interfaces](https://github.com/ros2/rcl_interfaces) | `jazzy` | Apache License 2.0 |
-| `diagnostic_msgs`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `shape_msgs`, `std_msgs`, `trajectory_msgs`, `visualization_msgs` | [ros2/common_interfaces](https://github.com/ros2/common_interfaces) | `jazzy` | Apache License 2.0 |
+| `action_msgs`, `builtin_interfaces`, `rcl_interfaces`, `statistics_msgs` | [ros2/rcl_interfaces](https://github.com/ros2/rcl_interfaces) | `jazzy` | Apache License 2.0 |
+| `diagnostic_msgs`, `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `shape_msgs`, `std_msgs`, `std_srvs`, `trajectory_msgs`, `visualization_msgs` | [ros2/common_interfaces](https://github.com/ros2/common_interfaces) | `jazzy` | Apache License 2.0 |
 | `vision_msgs` | [ros-perception/vision_msgs](https://github.com/ros-perception/vision_msgs) | `jazzy` | Apache License 2.0 |
 | `radar_msgs` | [ros2-gbp/radar_msgs-release](https://github.com/ros2-gbp/radar_msgs-release) | `release/jazzy/radar_msgs/0.2.2-4` | Apache-2.0 |
 | `autoware_perception_msgs`, `autoware_planning_msgs` | [autowarefoundation/autoware_msgs](https://github.com/autowarefoundation/autoware_msgs) | `main` | Apache License 2.0 |
