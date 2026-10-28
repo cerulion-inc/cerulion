@@ -7415,7 +7415,11 @@ mod tests {
         let (topic_at, topic_over) = latch_topic_at_and_over_the_limit();
         let state = GetDemandState::default();
         drive_producer_latch_bounds(&state, &topic_at, &topic_over);
+        const REPEAT: &str = "demand GET refused for a wire header version mismatch (repeat)";
         logs_assert(|lines: &[&str]| {
+            // The repeats are `debug!`, compiled out of a release build:
+            // counted through the level gate, and pinned never loud.
+            crate::testing::never_loud(lines, REPEAT)?;
             let loud = lines
                 .iter()
                 .filter(|l| {
@@ -7424,18 +7428,18 @@ mod tests {
                 .count();
             let repeats = lines
                 .iter()
-                .filter(|l| {
-                    l.contains("DEBUG")
-                        && l.contains(
-                            "demand GET refused for a wire header version mismatch (repeat)",
-                        )
-                })
+                .filter(|l| l.contains("DEBUG") && l.contains(REPEAT))
                 .count();
             // Loud: step 1 (overflow latch) and step 2 (own key). Repeats:
             // the two step 3 refusals on the shared overflow latch.
-            match (loud, repeats) {
-                (2, 2) => Ok(()),
-                other => Err(format!("expected (2 loud, 2 repeats), got {other:?}")),
+            let expected = (2, crate::testing::debug_lines_expected(2));
+            if (loud, repeats) == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected (loud, repeats) {expected:?}, got {:?}",
+                    (loud, repeats)
+                ))
             }
         });
     }
@@ -7618,7 +7622,12 @@ mod tests {
         assert_eq!(state.wire_header_refused_ack_count(), 5);
         assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 4);
         assert_eq!(demander_latch_keys(&state).len(), 1);
+        const REPEAT: &str =
+            "demand refused by the producer for a wire header version mismatch (repeat)";
         logs_assert(|lines: &[&str]| {
+            // The repeats are `debug!`, compiled out of a release build:
+            // counted through the level gate, and pinned never loud.
+            crate::testing::never_loud(lines, REPEAT)?;
             let loud = lines
                 .iter()
                 .filter(|l| {
@@ -7627,19 +7636,18 @@ mod tests {
                 .count();
             let repeats = lines
                 .iter()
-                .filter(|l| {
-                    l.contains("DEBUG")
-                        && l.contains(
-                            "demand refused by the producer for a wire header version mismatch \
-                             (repeat)",
-                        )
-                })
+                .filter(|l| l.contains("DEBUG") && l.contains(REPEAT))
                 .count();
             // Loud: step 1 (overflow latch) and step 3 (own key). Repeats on
             // the shared overflow latch: steps 2, 4 and 8.
-            match (loud, repeats) {
-                (2, 3) => Ok(()),
-                other => Err(format!("expected (2 loud, 3 repeats), got {other:?}")),
+            let expected = (2, crate::testing::debug_lines_expected(3));
+            if (loud, repeats) == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected (loud, repeats) {expected:?}, got {:?}",
+                    (loud, repeats)
+                ))
             }
         });
     }
