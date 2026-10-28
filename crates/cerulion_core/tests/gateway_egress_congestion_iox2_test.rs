@@ -913,6 +913,85 @@ fn queued_frames_are_discarded_when_demand_ends() {
     );
 }
 
+/// A tap drain error drops the tap and leaves the frames it queued before;
+/// demand then ends while no tap is attached, and returns while a put waits
+/// on the stalled link. The frames queued before demand ended are discarded,
+/// not sent to the new demand.
+#[test]
+fn frames_queued_before_a_drain_error_are_discarded_when_demand_ends() {
+    let mut r = StallRig::new("drainerr", EgressReliability::Reliable, Some(4));
+    r.pause();
+    let offered = r.offer_until_stalled(4);
+    let before = r.stats();
+    assert_eq!(
+        (before.queued, before.in_flight),
+        (4, 1),
+        "PRECONDITION: a full queue behind a blocked put: {before:?}"
+    );
+    assert!(
+        r.gateway.fail_next_egress_drain_for_test(&r.topic),
+        "PRECONDITION: there was an egress tap to poison"
+    );
+    r.gateway
+        .drive_once()
+        .expect("drive survives a tap drain error");
+    assert!(
+        !r.gateway.active_tap_topics().contains(&r.topic),
+        "PRECONDITION: the drain error dropped the tap"
+    );
+    assert_eq!(
+        r.stats().queued,
+        4,
+        "PRECONDITION: the frames queued before the drain error are still queued"
+    );
+    let bridges = r.gateway.manager().bridge_manager_arc();
+    bridges.disable_bridge(&r.topic).expect("disable");
+    r.gateway.drive_once().expect("pass without demand");
+    assert!(
+        !bridges.is_enabled(&r.topic).expect("enabled?"),
+        "PRECONDITION: demand stayed off through the pass"
+    );
+    let ended = r.stats();
+    assert_eq!(
+        (ended.queued, ended.discarded),
+        (0, before.discarded + 4),
+        "a pass without demand empties the queue although no tap is attached: {ended:?}"
+    );
+    bridges.enable_bridge(&r.topic).expect("re-enable");
+    assert!(
+        bridges.is_enabled(&r.topic).expect("enabled?"),
+        "PRECONDITION: the topic is demanded again while the put waits"
+    );
+    r.resume();
+    drive_for(&mut r.gateway, Duration::from_millis(300));
+    r.settle();
+    let s = r.stats();
+    assert_eq!(
+        s.forwarded,
+        before.forwarded + 1,
+        "only the put under way is sent: {s:?}"
+    );
+    assert_eq!(accounted(&s), u64::from(offered), "{s:?}");
+    // Control: frames published under the new demand arrive.
+    assert!(
+        wait_until(10, || {
+            r.gateway.drive_once().expect("re-attach pass");
+            r.gateway.active_tap_topics().contains(&r.topic)
+        }),
+        "PRECONDITION: the tap re-attached under the new demand"
+    );
+    const AFTER: u32 = 2;
+    r.offer(offered, AFTER);
+    r.settle();
+    let mut want: Vec<u32> = (0..s.forwarded as u32).collect();
+    want.extend(offered..offered + AFTER);
+    assert_eq!(
+        r.got(),
+        want,
+        "no frame queued before demand ended arrives; frames after it returned do"
+    );
+}
+
 /// Closing LAN access while a put waits on a stalled link: the close returns
 /// only after that put has finished, and the frames still queued are
 /// discarded, counted, and never sent, even though the link moves again.

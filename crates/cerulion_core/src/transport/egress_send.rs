@@ -303,8 +303,9 @@ impl EgressLane {
         }
     }
 
-    /// Drop every queued frame, counting each as discarded. Called when demand
-    /// for the topic ends.
+    /// Drop every queued frame, counting each as discarded. Called on every
+    /// drive pass that finds the topic without demand and, through
+    /// [`EgressLanes::discard_all_queued`], when LAN access closes.
     pub(crate) fn discard_queued(&self) {
         let mut queue = self.lock_queue();
         queue.discarded += queue.frames.len() as u64;

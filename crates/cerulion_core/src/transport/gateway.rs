@@ -1710,11 +1710,12 @@ impl GatewayRuntime {
                 self.liveness.set_externally_observed(topic, false);
                 if self.taps.remove(topic).is_some() {
                     tracing::debug!(topic = %topic, "gateway egress tap detached — demand ended");
-                    // Nobody demands these frames any more; a later demand
-                    // starts from fresh frames, as a fresh tap does.
-                    if let Some(lane) = self.egress_lanes.get(topic) {
-                        lane.discard_queued();
-                    }
+                }
+                // Empties the send queue on every pass that reads the flag
+                // off, with or without a tap: a drain error drops the tap and
+                // leaves the frames the drive pass queued from it.
+                if let Some(lane) = self.egress_lanes.get(topic) {
+                    lane.discard_queued();
                 }
             }
         }
