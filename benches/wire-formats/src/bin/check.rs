@@ -32,10 +32,21 @@ fn main() {
     assert_eq!(fb_read_imu(&fbb.bytes()[..e - s], false), x);
     assert_eq!(capnp_read_imu(&cbuf.bytes()[..cflat.len()]), x);
     assert_eq!(pb_read_imu(&slot3[..pn]), x);
+    // The timed Cap'n Proto encode: decode the exact bytes it left in its
+    // slot, before the builder's drop re-zeroes them; twice in one slot, so
+    // the second build runs over the re-zeroed scratch.
     {
         let mut sc = AlignedBuf::new(4096);
-        let mut a = capnp::message::ScratchSpaceHeapAllocator::new(sc.bytes_mut());
-        assert_eq!(capnp_encode_imu(&mut a), cflat.len());
+        let mut cs = CapnpSlot::new(sc.bytes_mut());
+        for _ in 0..2 {
+            let (cn, got) = capnp_encode_imu_with(&mut cs, |t, seg| {
+                let b = capnp_message_bytes(t, seg);
+                let a = AlignedBuf::from_slice(&b);
+                assert_eq!(b, capnp_reference_imu());
+                capnp_read_imu(&a.bytes()[..b.len()])
+            });
+            assert_eq!((cn, got), (cflat.len(), x));
+        }
     }
     println!(
         "| (a) IMU sample, 96 B of content | {n} | {} | {} | {pn} | 0 |",
@@ -70,8 +81,34 @@ fn main() {
         assert_eq!(pb_read_image_bytes(&pbytes), x);
         {
             let mut sc = AlignedBuf::new(len);
-            let mut a = capnp::message::ScratchSpaceHeapAllocator::new(sc.bytes_mut());
-            assert_eq!(capnp_encode_image(&mut a, &src), cflat.len());
+            let mut cs = CapnpSlot::new(sc.bytes_mut());
+            for _ in 0..2 {
+                let (cn, got) = capnp_encode_image_with(&mut cs, &src, |t, seg| {
+                    let b = capnp_message_bytes(t, seg);
+                    assert_eq!(b, capnp_reference_image(&src));
+                    let a = AlignedBuf::from_slice(&b);
+                    let mut rd = &a.bytes()[..b.len()];
+                    let m = capnp::serialize::read_message_from_flat_slice_no_alloc(
+                        &mut rd,
+                        capnp_opts(),
+                    )
+                    .unwrap();
+                    let r = m.get_root::<wire_capnp::image::Reader>().unwrap();
+                    assert_eq!(r.get_data().unwrap(), &src.data[..]);
+                    assert_eq!(
+                        r.get_header()
+                            .unwrap()
+                            .get_frame_id()
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        FRAME_ID
+                    );
+                    assert_eq!(r.get_encoding().unwrap().to_str().unwrap(), src.encoding);
+                    capnp_read_image(&a.bytes()[..b.len()])
+                });
+                assert_eq!((cn, got), (cflat.len(), x));
+            }
         }
         // The payload bytes must be the source bytes in every format.
         let r = native_ros2_messages::sensor_msgs::ImageShm::from_bytes(&cer.bytes()[40..n]);
@@ -135,6 +172,26 @@ fn main() {
     assert_eq!(capnp_read_cloud(&cbuf.bytes()[..cflat.len()]), x);
     assert_eq!(pb_read_cloud_vec(&slot3[..pn]), x);
     assert_eq!(pb_read_cloud_bytes(&pbytes), x);
+    {
+        let mut sc = AlignedBuf::new(len);
+        let mut cs = CapnpSlot::new(sc.bytes_mut());
+        for _ in 0..2 {
+            let (cn, got) = capnp_encode_cloud_with(&mut cs, &src, |t, seg| {
+                let b = capnp_message_bytes(t, seg);
+                assert_eq!(b, capnp_reference_cloud(&src));
+                let a = AlignedBuf::from_slice(&b);
+                let mut rd = &a.bytes()[..b.len()];
+                let m =
+                    capnp::serialize::read_message_from_flat_slice_no_alloc(&mut rd, capnp_opts())
+                        .unwrap();
+                let r = m.get_root::<wire_capnp::point_cloud2::Reader>().unwrap();
+                assert_eq!(r.get_data().unwrap(), &src.data[..]);
+                assert_eq!(r.get_fields().unwrap().len(), 4);
+                capnp_read_cloud(&a.bytes()[..b.len()])
+            });
+            assert_eq!((cn, got), (cflat.len(), x));
+        }
+    }
     // The walker decodes the canonical PointField[] blob into 4 elements.
     let v = walker.walk_by_hash(&cer.bytes()[..n]).unwrap();
     match v.field("fields") {

@@ -555,15 +555,77 @@ pub fn fb_read_cloud(buf: &[u8], verify: bool) -> u64 {
 use capnp::message::{Builder as CBuilder, ReaderOptions, ScratchSpaceHeapAllocator};
 use wire_capnp::{image, imu_sample, point_cloud2};
 
-/// Builds into the scratch (the slot). Returns the message's flat
-/// serialized size (8-byte segment table + segments). The builder's drop
-/// re-zeroes the used words of the scratch, which Cap'n Proto needs before the
-/// next message is built in it; that cost is inside every timed iteration.
-pub fn capnp_encode_imu(alloc: &mut ScratchSpaceHeapAllocator<'_>) -> usize {
-    let mut m = CBuilder::new(alloc);
-    capnp_build_imu(&mut m);
-    assert_eq!(m.get_segments_for_output().len(), 1);
-    capnp::serialize::compute_serialized_size_in_words(&m) * 8
+/// A Cap'n Proto output slot. `table` is the slot's first 8 bytes, where the
+/// single-segment segment table goes; `alloc` is a `ScratchSpaceHeapAllocator`
+/// over the rest, so the one segment is built in place right after its table
+/// and the complete flat message is `slot[..8 + segment]`. The allocator is
+/// built once per slot: `ScratchSpaceHeapAllocator::new` zeroes the whole
+/// scratch (capnp message.rs:912-915), and the builder's drop re-zeroes only
+/// the used words, which Cap'n Proto needs before the next build in it
+/// (message.rs:957-975). That re-zero is inside every timed iteration.
+pub struct CapnpSlot<'a> {
+    table: &'a mut [u8],
+    alloc: ScratchSpaceHeapAllocator<'a>,
+}
+impl<'a> CapnpSlot<'a> {
+    pub fn new(slot: &'a mut [u8]) -> Self {
+        let (table, scratch) = slot.split_at_mut(8);
+        CapnpSlot {
+            table,
+            alloc: ScratchSpaceHeapAllocator::new(scratch),
+        }
+    }
+}
+
+/// Builds the message in the slot, writes its segment table (segment count
+/// minus one = 0, then the segment's length in words, both u32 LE) into the
+/// slot's first 8 bytes, and returns the flat message length. `inspect` gets
+/// the table and the segment while the builder is still alive, before its
+/// drop re-zeroes the segment.
+#[inline(always)]
+fn capnp_encode_in<'b, 's, R>(
+    s: &'b mut CapnpSlot<'s>,
+    build: impl FnOnce(&mut CBuilder<&'b mut ScratchSpaceHeapAllocator<'s>>),
+    inspect: impl FnOnce(&[u8], &[u8]) -> R,
+) -> (usize, R) {
+    let mut m = CBuilder::new(&mut s.alloc);
+    build(&mut m);
+    let segs = m.get_segments_for_output();
+    assert_eq!(segs.len(), 1, "single segment in the slot");
+    let seg = segs[0];
+    s.table[..4].copy_from_slice(&0u32.to_le_bytes());
+    s.table[4..8].copy_from_slice(&((seg.len() / 8) as u32).to_le_bytes());
+    let r = inspect(s.table, seg);
+    (8 + seg.len(), r)
+}
+
+/// The complete flat message an encode left in its slot, copied out of the
+/// `inspect` arguments. Asserts the segment starts right after the table, so
+/// the copy is the slot's own contiguous bytes.
+pub fn capnp_message_bytes(table: &[u8], seg: &[u8]) -> Vec<u8> {
+    assert_eq!(table.len(), 8);
+    assert_eq!(
+        table.as_ptr().wrapping_add(8),
+        seg.as_ptr(),
+        "segment follows its table"
+    );
+    let mut v = Vec::with_capacity(8 + seg.len());
+    v.extend_from_slice(table);
+    v.extend_from_slice(seg);
+    v
+}
+
+/// The timed encode: the complete flat message (segment table + segment) in
+/// the slot. Returns its length.
+pub fn capnp_encode_imu(s: &mut CapnpSlot<'_>) -> usize {
+    capnp_encode_in(s, capnp_build_imu, |_, _| ()).0
+}
+/// The same encode, with `inspect` run on the slot's bytes before the builder drops.
+pub fn capnp_encode_imu_with<R>(
+    s: &mut CapnpSlot<'_>,
+    inspect: impl FnOnce(&[u8], &[u8]) -> R,
+) -> (usize, R) {
+    capnp_encode_in(s, capnp_build_imu, inspect)
 }
 
 fn capnp_build_imu<A: capnp::message::Allocator>(m: &mut CBuilder<A>) {
@@ -585,15 +647,15 @@ fn capnp_build_imu<A: capnp::message::Allocator>(m: &mut CBuilder<A>) {
     }
 }
 
-pub fn capnp_encode_image(alloc: &mut ScratchSpaceHeapAllocator<'_>, src: &ImageSrc) -> usize {
-    let mut m = CBuilder::new(alloc);
-    capnp_build_image(&mut m, src);
-    assert_eq!(
-        m.get_segments_for_output().len(),
-        1,
-        "single segment in the slot"
-    );
-    capnp::serialize::compute_serialized_size_in_words(&m) * 8
+pub fn capnp_encode_image(s: &mut CapnpSlot<'_>, src: &ImageSrc) -> usize {
+    capnp_encode_in(s, |m| capnp_build_image(m, src), |_, _| ()).0
+}
+pub fn capnp_encode_image_with<R>(
+    s: &mut CapnpSlot<'_>,
+    src: &ImageSrc,
+    inspect: impl FnOnce(&[u8], &[u8]) -> R,
+) -> (usize, R) {
+    capnp_encode_in(s, |m| capnp_build_image(m, src), inspect)
 }
 
 fn capnp_build_image<A: capnp::message::Allocator>(m: &mut CBuilder<A>, src: &ImageSrc) {
@@ -616,15 +678,15 @@ fn capnp_build_image<A: capnp::message::Allocator>(m: &mut CBuilder<A>, src: &Im
     }
 }
 
-pub fn capnp_encode_cloud(alloc: &mut ScratchSpaceHeapAllocator<'_>, src: &CloudSrc) -> usize {
-    let mut m = CBuilder::new(alloc);
-    capnp_build_cloud(&mut m, src);
-    assert_eq!(
-        m.get_segments_for_output().len(),
-        1,
-        "single segment in the slot"
-    );
-    capnp::serialize::compute_serialized_size_in_words(&m) * 8
+pub fn capnp_encode_cloud(s: &mut CapnpSlot<'_>, src: &CloudSrc) -> usize {
+    capnp_encode_in(s, |m| capnp_build_cloud(m, src), |_, _| ()).0
+}
+pub fn capnp_encode_cloud_with<R>(
+    s: &mut CapnpSlot<'_>,
+    src: &CloudSrc,
+    inspect: impl FnOnce(&[u8], &[u8]) -> R,
+) -> (usize, R) {
+    capnp_encode_in(s, |m| capnp_build_cloud(m, src), inspect)
 }
 
 fn capnp_build_cloud<A: capnp::message::Allocator>(m: &mut CBuilder<A>, src: &CloudSrc) {
@@ -658,34 +720,52 @@ fn capnp_build_cloud<A: capnp::message::Allocator>(m: &mut CBuilder<A>, src: &Cl
     }
 }
 
-/// Flat serialized bytes (segment table + one segment) for the read inputs,
-/// built in a scratch slot exactly as the encode path builds them.
+/// The read inputs: the bytes the timed encode leaves in its slot, copied
+/// out before the builder drops.
 pub fn capnp_flat_imu() -> Vec<u8> {
+    let mut slot = AlignedBuf::new(4096);
+    let mut s = CapnpSlot::new(slot.bytes_mut());
+    capnp_encode_imu_with(&mut s, capnp_message_bytes).1
+}
+pub fn capnp_flat_image(src: &ImageSrc) -> Vec<u8> {
+    let mut slot = AlignedBuf::new(slot_len(src.data.len()));
+    let mut s = CapnpSlot::new(slot.bytes_mut());
+    capnp_encode_image_with(&mut s, src, capnp_message_bytes).1
+}
+pub fn capnp_flat_cloud(src: &CloudSrc) -> Vec<u8> {
+    let mut slot = AlignedBuf::new(slot_len(src.data.len()));
+    let mut s = CapnpSlot::new(slot.bytes_mut());
+    capnp_encode_cloud_with(&mut s, src, capnp_message_bytes).1
+}
+
+/// Cap'n Proto's own serializer output for the same content, built in a
+/// separate scratch and written by `serialize::write_message_to_words`.
+/// `check` asserts the bytes each timed encode leaves in its slot equal these.
+pub fn capnp_reference_imu() -> Vec<u8> {
     let mut scratch = AlignedBuf::new(4096);
-    let mut alloc = ScratchSpaceHeapAllocator::new(scratch.bytes_mut());
-    let mut m = CBuilder::new(&mut alloc);
+    let mut m = CBuilder::new(ScratchSpaceHeapAllocator::new(scratch.bytes_mut()));
     capnp_build_imu(&mut m);
     assert_eq!(m.get_segments_for_output().len(), 1);
     capnp::serialize::write_message_to_words(&m)
 }
-pub fn capnp_flat_image(src: &ImageSrc) -> Vec<u8> {
+pub fn capnp_reference_image(src: &ImageSrc) -> Vec<u8> {
     let mut scratch = AlignedBuf::new(slot_len(src.data.len()));
-    let mut alloc = ScratchSpaceHeapAllocator::new(scratch.bytes_mut());
-    let mut m = CBuilder::new(&mut alloc);
+    let mut m = CBuilder::new(ScratchSpaceHeapAllocator::new(scratch.bytes_mut()));
     capnp_build_image(&mut m, src);
     assert_eq!(m.get_segments_for_output().len(), 1);
     capnp::serialize::write_message_to_words(&m)
 }
-pub fn capnp_flat_cloud(src: &CloudSrc) -> Vec<u8> {
+pub fn capnp_reference_cloud(src: &CloudSrc) -> Vec<u8> {
     let mut scratch = AlignedBuf::new(slot_len(src.data.len()));
-    let mut alloc = ScratchSpaceHeapAllocator::new(scratch.bytes_mut());
-    let mut m = CBuilder::new(&mut alloc);
+    let mut m = CBuilder::new(ScratchSpaceHeapAllocator::new(scratch.bytes_mut()));
     capnp_build_cloud(&mut m, src);
     assert_eq!(m.get_segments_for_output().len(), 1);
     capnp::serialize::write_message_to_words(&m)
 }
 
-fn capnp_opts() -> ReaderOptions {
+/// Reader options for every Cap'n Proto read: the traversal limit raised to
+/// 64 Mi words, because the default would count the 6 MiB Data.
+pub fn capnp_opts() -> ReaderOptions {
     let mut o = ReaderOptions::new();
     o.traversal_limit_in_words(Some(64 << 20));
     o

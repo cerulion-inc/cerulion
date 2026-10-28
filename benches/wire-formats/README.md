@@ -29,7 +29,10 @@ Payloads are deterministic pseudo-random bytes, identical across formats.
   allocated once, the way a publisher writes into a shared-memory slot. Every
   format copies the payload exactly once. Per-message work a format needs to
   reuse the slot is inside the timed loop: FlatBuffers' `reset()` memset and
-  Cap'n Proto's re-zeroing of the used words.
+  Cap'n Proto's re-zeroing of the used words. Cap'n Proto builds its one
+  segment in the slot right after an 8-byte segment table, which the encode
+  also writes, so the slot holds the complete flat message; `check` decodes
+  those bytes before the builder's drop re-zeroes them.
 - **Read** (`read/*`): three scalar fields, plus the payload's length and
   first byte for (b) and (c), from bytes already in memory. Variants:
   - `cerulion_typed`: the receive-side gate (header, schema hash, size and

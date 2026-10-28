@@ -2,7 +2,6 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use capnp::message::ScratchSpaceHeapAllocator;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use wire_formats::*;
 
@@ -31,7 +30,7 @@ fn encode(c: &mut Criterion) {
     }
     {
         let mut sc = AlignedBuf::new(4096);
-        let mut a = ScratchSpaceHeapAllocator::new(sc.bytes_mut());
+        let mut a = CapnpSlot::new(sc.bytes_mut());
         g.bench_function("capnp", |b| {
             b.iter(|| black_box(capnp_encode_imu(black_box(&mut a))))
         });
@@ -59,7 +58,7 @@ fn encode(c: &mut Criterion) {
         }
         {
             let mut sc = AlignedBuf::new(len);
-            let mut a = ScratchSpaceHeapAllocator::new(sc.bytes_mut());
+            let mut a = CapnpSlot::new(sc.bytes_mut());
             g.bench_function("capnp", |b| {
                 b.iter(|| black_box(capnp_encode_image(&mut a, black_box(&src))))
             });
@@ -87,7 +86,7 @@ fn encode(c: &mut Criterion) {
     }
     {
         let mut sc = AlignedBuf::new(len);
-        let mut a = ScratchSpaceHeapAllocator::new(sc.bytes_mut());
+        let mut a = CapnpSlot::new(sc.bytes_mut());
         g.bench_function("capnp", |b| {
             b.iter(|| black_box(capnp_encode_cloud(&mut a, black_box(&src))))
         });
