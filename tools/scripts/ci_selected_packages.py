@@ -377,7 +377,7 @@ def read_metadata(source):
 # LIVE_ORACLE_MEASURED is False while a measurement is outstanding, and the live
 # arm then reports a miss rather than passing on numbers nobody measured.
 LIVE_ORACLE_MEASURED = True
-LIVE_MEMBER_COUNT = 78
+LIVE_MEMBER_COUNT = 79
 LIVE_ORACLE = {
     'cerulion_bag': (62, 7),
     'cerulion_cli': (1, 1),
@@ -386,7 +386,7 @@ LIVE_ORACLE = {
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (62, 48),
+    'native_ros2_messages': (62, 49),
 }
 
 

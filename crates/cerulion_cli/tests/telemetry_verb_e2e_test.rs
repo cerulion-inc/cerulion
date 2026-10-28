@@ -4,8 +4,12 @@
 //! `CERULION_HOME` in its own tempdir and clears every variable that could
 //! decide consent, so the machine's own settings never leak in. The key, where
 //! one is set, points at a reserved dead port or at the test's own loopback
-//! sink: nothing can be delivered anywhere else.
-#![cfg(feature = "telemetry")]
+//! sink: nothing can be delivered anywhere else. [`cerulion`] runs the binary
+//! with stderr on a pseudo-terminal, as a person at a shell does, because the
+//! first-run notice is shown only on a terminal; [`cerulion_piped`] runs it
+//! with a plain pipe. The CI variables are cleared too, so a CI runner's own
+//! `CI=true` never changes what a test sees.
+#![cfg(all(feature = "telemetry", unix))]
 
 use std::path::Path;
 use std::process::Command;
@@ -30,13 +34,67 @@ fn command(home: &Path, env: &[(&str, &str)], args: &[&str], cwd: &Path) -> Comm
         .env_remove("CERULION_TELEMETRY")
         .env_remove("POSTHOG_API_KEY")
         .env_remove("POSTHOG_HOST");
+    for name in cerulion_telemetry::ci::CI_ENV_VARS {
+        cmd.env_remove(name);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd
 }
 
+/// The binary with stderr on a pseudo-terminal (stdout stays a pipe).
 fn cerulion(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
+    use std::io::Read;
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut master, slave) = open_pty();
+    let mut cmd = command(home, env, args, cwd.path());
+    cmd.stderr(std::process::Stdio::from(slave));
+    let (chunks, received) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        // Ends on EOF or EIO, which a pty master reads once every copy of
+        // its slave is closed; `None` says the stream ended.
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if chunks.send(Some(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = chunks.send(None);
+    });
+    let out = cmd.output().expect("spawn cerulion");
+    // `cmd` holds the parent's copy of the slave: closing it lets the
+    // reader see the end once the child's copies are gone.
+    drop(cmd);
+    let mut stderr = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match received.recv_timeout(left) {
+            Ok(Some(chunk)) => stderr.extend(chunk),
+            Ok(None) => break,
+            Err(e) => panic!(
+                "the terminal never reached its end ({e}); read so far: {:?}",
+                String::from_utf8_lossy(&stderr)
+            ),
+        }
+    }
+    Out {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).replace("\r\n", "\n"),
+    }
+}
+
+/// The binary with stderr on a plain pipe, as under CI or a redirect.
+fn cerulion_piped(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
     let cwd = tempfile::tempdir().unwrap();
     let out = command(home, env, args, cwd.path())
         .output()
@@ -45,6 +103,43 @@ fn cerulion(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Out {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// Serializes [`open_pty`]: `ptsname` returns a static buffer.
+static PTY_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A pseudo-terminal pair: the master to read from, the slave to hand to
+/// the child as its stderr. The slave is opened close-on-exec in one call,
+/// so a test spawning on another thread can never inherit it and hold the
+/// terminal open; only the child that gets it as its stderr has a copy.
+fn open_pty() -> (std::fs::File, std::os::fd::OwnedFd) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let _turn = PTY_TURN.lock().unwrap_or_else(|p| p.into_inner());
+    let last = || std::io::Error::last_os_error();
+    // SAFETY: plain libc calls on descriptors this function owns; the
+    // `ptsname` buffer is read before the lock above is released.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "posix_openpt: {}", last());
+        let master = OwnedFd::from_raw_fd(master);
+        use std::os::fd::AsRawFd;
+        let fd = master.as_raw_fd();
+        // A master leaked to another child does not hold the terminal
+        // open (only slave copies do), so this need not be atomic.
+        assert_eq!(
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC),
+            0,
+            "{}",
+            last()
+        );
+        assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", last());
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", last());
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "ptsname: {}", last());
+        let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        assert!(slave >= 0, "open the slave: {}", last());
+        (std::fs::File::from(master), OwnedFd::from_raw_fd(slave))
     }
 }
 
@@ -145,7 +240,7 @@ fn the_notice_prints_once_and_only_when_a_key_could_send() {
     let args = ["graph", "list"];
     let keyless = cerulion(home.path(), &[], &args);
     assert!(
-        !keyless.stderr.contains("usage events"),
+        !keyless.stderr.contains("cerulion telemetry off"),
         "{}",
         keyless.stderr
     );
@@ -161,7 +256,11 @@ fn the_notice_prints_once_and_only_when_a_key_could_send() {
         first.stderr
     );
     let second = cerulion(home.path(), &key, &args);
-    assert!(!second.stderr.contains("usage events"), "{}", second.stderr);
+    assert!(
+        !second.stderr.contains("cerulion telemetry off"),
+        "{}",
+        second.stderr
+    );
     assert_eq!(
         first.code, second.code,
         "the notice never changes the exit code"
@@ -178,7 +277,222 @@ fn an_opted_out_machine_never_sees_the_notice() {
         ("POSTHOG_HOST", "http://127.0.0.1:1"),
     ];
     let out = cerulion(home.path(), &key, &["graph", "list"]);
-    assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn the_notice_is_one_short_line() {
+    let home = tempfile::tempdir().unwrap();
+    let key = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", "http://127.0.0.1:1"),
+    ];
+    let first = cerulion(home.path(), &key, &["graph", "list"]);
+    let lines: Vec<&str> = first
+        .stderr
+        .lines()
+        .filter(|l| l.contains("telemetry"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{}", first.stderr);
+    assert!(lines[0].chars().count() <= 120, "{:?}", lines[0]);
+    assert!(
+        !first.stderr.contains("\n\n"),
+        "no blank line follows the notice: {:?}",
+        first.stderr
+    );
+}
+
+#[test]
+fn a_run_without_a_terminal_shows_no_notice_and_sends_and_the_notice_waits_for_a_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let piped = cerulion_piped(home.path(), &sending(&sink), &["graph", "list"]);
+    assert!(
+        !piped.stderr.contains("cerulion telemetry off"),
+        "{}",
+        piped.stderr
+    );
+    let events = events_sent(&sink);
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["ci"], false, "{events:?}");
+    assert_eq!(run["distinct_id"], anon_id_in(home.path()), "{events:?}");
+    let tty = cerulion(home.path(), &sending(&sink), &["graph", "list"]);
+    assert!(
+        tty.stderr.contains("cerulion telemetry off"),
+        "the first run on a terminal prints the notice: {}",
+        tty.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+}
+
+#[test]
+fn a_ci_run_sends_without_a_notice_under_the_random_id_and_leaves_the_notice_owed() {
+    let home = tempfile::tempdir().unwrap();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    auth::seed_logged_in_at(home.path(), sub).unwrap();
+    let marker = home.path().join("telemetry_alias_pending");
+    std::fs::write(&marker, b"").unwrap();
+    let sink = sink();
+    let [key, host] = sending(&sink);
+    let ci = [key, host, ("GITHUB_ACTIONS", "true")];
+    // On a terminal and through a pipe alike: CI decides, not the terminal.
+    // One run at a time, so each batch is read before the next run sends.
+    for on_terminal in [true, false] {
+        let out = if on_terminal {
+            cerulion(home.path(), &ci, &["graph", "list"])
+        } else {
+            cerulion_piped(home.path(), &ci, &["graph", "list"])
+        };
+        assert!(
+            !out.stderr.contains("cerulion telemetry off"),
+            "{}",
+            out.stderr
+        );
+        let events = events_sent(&sink);
+        let run = the_one(&events, "cli_command_run");
+        assert_eq!(run["properties"]["ci"], true, "{events:?}");
+        assert_eq!(
+            run["properties"]["$process_person_profile"], false,
+            "{events:?}"
+        );
+        let id = run["distinct_id"].as_str().unwrap_or_default();
+        assert!(
+            id.starts_with("anon:"),
+            "a CI event is never the account's: {events:?}"
+        );
+        assert!(
+            named(&events, "$create_alias").is_empty(),
+            "a CI run joins nothing to an account: {events:?}"
+        );
+    }
+    assert!(marker.exists(), "the owed merge waits for a run outside CI");
+    let tty = cerulion(home.path(), &sending(&sink), &["graph", "list"]);
+    assert!(
+        tty.stderr.contains("cerulion telemetry off"),
+        "CI runs leave the notice owed: {}",
+        tty.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+}
+
+#[test]
+fn a_first_login_without_a_terminal_carries_and_merges_the_random_id() {
+    let home = tempfile::tempdir().unwrap();
+    let sink = sink();
+    let sub = "8d1f4e6c-0b2a-4c5d-9e7f-123456789abc";
+    let issuer = issuer(sub);
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+    ];
+    let out = cerulion_piped(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    let start = issuer
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    let anon = anon_id_in(home.path());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::json!({ "telemetry_anon_id": anon }),
+        "the login carries the random id"
+    );
+    let events = events_sent(&sink);
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(events.len(), 3, "alias, login and the command: {events:?}");
+    let login = the_one(&events, "cli_login_completed");
+    assert_eq!(login["distinct_id"], sub, "{events:?}");
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["distinct_id"], sub, "{events:?}");
+    assert_eq!(bound_account_in(home.path()), sub);
+    let aliases = named(&events, "$create_alias");
+    assert_eq!(aliases.len(), 1, "{events:?}");
+    assert_eq!(aliases[0]["properties"]["alias"], anon, "{events:?}");
+    assert_eq!(aliases[0]["distinct_id"], sub, "{events:?}");
+    assert!(!home.path().join("telemetry_alias_pending").exists());
+}
+
+#[test]
+fn a_ci_login_carries_no_id_joins_nothing_and_sends_under_the_random_id() {
+    let sink = sink();
+    let home = tempfile::tempdir().unwrap();
+    let notice = cerulion(home.path(), &sending(&sink), &["graph", "list"]);
+    assert!(
+        notice.stderr.contains("cerulion telemetry off"),
+        "{}",
+        notice.stderr
+    );
+    assert_nothing_sent(&sink, "the notice run sends nothing");
+    let issuer = issuer("8d1f4e6c-0b2a-4c5d-9e7f-123456789abc");
+    let env = [
+        ("POSTHOG_API_KEY", "k"),
+        ("POSTHOG_HOST", sink.url.as_str()),
+        ("CERULION_ACCOUNT_SERVICE", issuer.url.as_str()),
+        ("GITHUB_ACTIONS", "true"),
+    ];
+    let out = cerulion_piped(home.path(), &env, &["login"]);
+    assert_eq!(out.code, Some(0), "stderr={}", out.stderr);
+    let start = issuer
+        .starts
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("one device-start request");
+    assert!(!start.contains("telemetry_anon_id"), "{start}");
+    let events = events_sent(&sink);
+    assert!(named(&events, "$create_alias").is_empty(), "{events:?}");
+    let login = the_one(&events, "cli_login_completed");
+    let id = login["distinct_id"].as_str().unwrap_or_default();
+    assert!(id.starts_with("anon:"), "{events:?}");
+    assert_ne!(
+        id,
+        anon_id_in(home.path()),
+        "a CI run never sends under the stored id a later login could carry"
+    );
+    assert_eq!(login["properties"]["ci"], true, "{events:?}");
+    assert_eq!(
+        login["properties"]["$process_person_profile"], false,
+        "{events:?}"
+    );
+    assert!(!home.path().join("telemetry_alias_pending").exists());
+}
+
+#[test]
+fn every_off_spelling_of_cerulion_telemetry_turns_it_off() {
+    let home = tempfile::tempdir().unwrap();
+    for value in ["0", "false", "off", "no", "OFF"] {
+        let out = cerulion(
+            home.path(),
+            &[("CERULION_TELEMETRY", value)],
+            &["telemetry", "status"],
+        );
+        assert!(
+            out.stdout
+                .contains("telemetry: off (set by CERULION_TELEMETRY)"),
+            "CERULION_TELEMETRY={value}: {}",
+            out.stdout
+        );
+    }
+    let sink = sink();
+    let [key, host] = sending(&sink);
+    let out = cerulion(
+        home.path(),
+        &[key, host, ("CERULION_TELEMETRY", "no")],
+        &["graph", "list"],
+    );
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "an opted-out run shows no notice: {}",
+        out.stderr
+    );
+    assert_nothing_sent(&sink, "CERULION_TELEMETRY=no sends nothing");
 }
 
 /// A loopback `/batch` sink: answers every request `200 {}` and hands the
@@ -382,7 +696,11 @@ fn sent_after_notice(home: &Path, sink: &Sink) -> String {
     );
     assert_nothing_sent(sink, "the notice run sends nothing");
     let out = cerulion(home, &key, &["graph", "list"]);
-    assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "{}",
+        out.stderr
+    );
     sink.bodies
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("the second run delivers one batch")
@@ -416,6 +734,7 @@ fn a_hosted_account_is_the_distinct_id_and_only_allowlisted_props_leave() {
         "$lib_version",
         "app_version",
         "channel",
+        "ci",
         "duration_bucket",
         "env",
         "exit_code",
@@ -1627,7 +1946,11 @@ fn an_unreadable_consent_file_shows_no_notice_and_sends_nothing() {
         ("POSTHOG_HOST", sink.url.as_str()),
     ];
     let out = cerulion(home.path(), &key, &["graph", "list"]);
-    assert!(!out.stderr.contains("usage events"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("cerulion telemetry off"),
+        "{}",
+        out.stderr
+    );
     assert_nothing_sent(&sink, "an unreadable consent file sends nothing");
     let status = cerulion(home.path(), &[], &["telemetry", "status"]);
     assert_eq!(status.code, Some(0), "stderr={}", status.stderr);

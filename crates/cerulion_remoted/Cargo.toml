@@ -51,6 +51,8 @@ cerulion_link = { path = "../cerulion_link" }
 # makes `remoted` AGPL (already the case — it is robot-side). Pulls iceoryx2 +
 # zenoh; another reason `remoted` stays out of `default-members`.
 cerulion_core = { path = "../cerulion_core" }
+# Existing local metadata only; this edge must not enable the WAN plane.
+cerulion_netd = { workspace = true, default-features = false }
 # The mechanical ops service the ops ALPN routes into. The
 # PairingAuthorizer implements cerud's `authz::Authorizer` seam, so cerud's
 # server gates every verb through it.
@@ -74,7 +76,13 @@ tokio = { version = "1", default-features = false, features = [
     # backs `forward.rs`'s `Notify` (previously pulled only via feature unification —
     # now declared here, since remoted uses it directly).
     "sync",
+    "net",
+    "io-util",
 ] }
+# OS entropy is used only for provisioning MAC and recovery secrets.
+getrandom = "0.2"
+# Safe file opens use these platform constants without calling unsafe APIs.
+libc = "0.2"
 # Structured logging (never println! in library code). Cap release logging at
 # info, mirroring cerulion_core / cerud / cerulion_bagd.
 tracing = { version = "0.1.44", features = ["release_max_level_info"] }
