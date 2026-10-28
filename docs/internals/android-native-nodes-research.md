@@ -29,6 +29,29 @@ a graph whose node library was loaded also crashed with SIGSEGV in `pthread_key_
 So today the app refuses a `graph_yaml` that has native nodes (error code 5). What must change
 so native nodes run inside an Android app with desktop parity?
 
+## Outcome
+
+`main` uses option (a), not the (f) this note recommends. The app keeps `local-transport`
+and does not `dlopen` node libraries. The app's runtime crate depends on each node crate as a
+plain library (`default-features = false`) and lists the node types once with
+`cerulion_android::embed_nodes!`. The `JNI_OnLoad` that macro defines fills a process-wide
+registry (`W/crates/cerulion_android/src/nodes.rs`), and each graph start looks every YAML
+`type:` up there. One copy of `cerulion_core` is in the process and no node library is ever
+unloaded, so the two-registry frame loss and the stop crash below cannot occur. A start that
+sets `node_lib_dir` for a graph with native nodes is refused with error code 5
+(`refuse_node_lib_dir_in_process` in `W/crates/cerulion_android/src/runtime.rs`).
+
+The costs are the ones the (a) row lists: a node change needs an app rebuild, nothing loads
+at run time, and the parity is single-process only. Gates 2 and 3 below do not apply, because
+the transport stays in process and only one iceoryx2 config exists. The emulator lane
+(`W/tools/scripts/android_emulator_e2e.sh`, described in `../android.md`) covers gate 1: a
+stop and a new start in one process, and a start after `am force-stop`. It also checks that
+the app's domain logs no SELinux denial. `W/tools/scripts/android_jnilibs_gate.sh` checks
+that every `LOAD` segment of the app library is aligned to 16 KB. API 36 and a physical
+device are not part of the lane.
+
+The sections below record the research as it stood before this choice.
+
 ## Short answer
 
 Option (f): build the Android app **without** `local-transport`, use the same cross-process

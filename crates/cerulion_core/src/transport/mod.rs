@@ -59,6 +59,9 @@ pub mod service;
 pub(crate) mod shm_guard;
 mod shm_sample;
 pub mod subscriber;
+pub mod team_auth;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_ca;
 pub mod uds_write;
 pub mod wire_header_attribute;
 

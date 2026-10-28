@@ -16,8 +16,11 @@ categories = ["science::robotics", "os::android-apis"]
 # repository, so they stay out of the package.
 include = ["src/*.rs", "java/**", "Cargo.toml", "README.md", "LICENSE"]
 
+# A library only: an app links this crate into its own runtime library (the
+# `cdylib` that also links the app's graph nodes), so the app ships one
+# native library and no build makes a second runtime library.
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 cerulion_bag = { workspace = true }

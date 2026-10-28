@@ -1134,9 +1134,18 @@ mod tests {
         ))
         .unwrap();
 
+        // The Android sample's app runtime crate is its own workspace too, so
+        // it carries the same block: a patch does not reach across workspaces.
+        let android_runtime_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cerulion_android/android/runtime/Cargo.toml"
+        ))
+        .unwrap();
+
         assert_eq!(iceoryx2_patch(&checkout_manifest), root_patch);
         assert_eq!(iceoryx2_patch(&registry_manifest), root_patch);
         assert_eq!(iceoryx2_patch(&example_manifest), root_patch);
+        assert_eq!(iceoryx2_patch(&android_runtime_manifest), root_patch);
     }
 
     #[test]

@@ -279,6 +279,10 @@ pub struct CrossProcessWiring<'a> {
     /// the wait policy line. `None` on a single-process build, which holds that
     /// count at 0 and leaves the arming alone.
     pub(crate) sibling_consumed_topics: Option<&'a super::SiblingConsumedTopics>,
+    /// Per `(node id, input name)`, a queue depth the input's subscriber is
+    /// built at least as deep as. `None` on every build but a replay pass,
+    /// which builds a bag-fed input as deep as its recorded schedule fills it.
+    pub(crate) input_depth_floors: Option<&'a std::collections::BTreeMap<(String, String), usize>>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -289,6 +293,7 @@ impl<'a> CrossProcessWiring<'a> {
             credit_bindings: &[],
             sibling_topics: None,
             sibling_consumed_topics: None,
+            input_depth_floors: None,
         }
     }
 
@@ -305,6 +310,7 @@ impl<'a> CrossProcessWiring<'a> {
             credit_bindings: &[],
             sibling_topics: None,
             sibling_consumed_topics: None,
+            input_depth_floors: None,
         }
     }
 
@@ -321,6 +327,7 @@ impl<'a> CrossProcessWiring<'a> {
             credit_bindings,
             sibling_topics: None,
             sibling_consumed_topics: None,
+            input_depth_floors: None,
         }
     }
 
@@ -335,6 +342,28 @@ impl<'a> CrossProcessWiring<'a> {
     ) -> Self {
         self.sibling_consumed_topics = Some(topics);
         self
+    }
+
+    /// Build each named `(node id, input name)` subscriber at least `depth` deep,
+    /// above its declared `#[input(depth = N)]`, and raise its topic's buffer
+    /// ceiling to match. Chained onto one of the constructors above. A replay
+    /// pass names the bag-fed inputs whose recorded schedule holds more frames
+    /// at once than the declared depth; every other build leaves it unset.
+    pub fn with_input_depth_floors(
+        mut self,
+        floors: &'a std::collections::BTreeMap<(String, String), usize>,
+    ) -> Self {
+        self.input_depth_floors = Some(floors);
+        self
+    }
+
+    /// The depth `(node, input)`'s subscriber is built at: its declared depth,
+    /// or its floor when that is deeper.
+    // hot-path-alloc-ok-fn: cold: graph BUILD, once per consumer edge, before the first step
+    fn input_depth(&self, node: &str, input: &str, declared: usize) -> usize {
+        self.input_depth_floors
+            .and_then(|floors| floors.get(&(node.to_string(), input.to_string())))
+            .map_or(declared, |floor| declared.max(*floor))
     }
 
     /// Name the topics a SIBLING group PRODUCES for this worker, the inbound
@@ -4014,6 +4043,66 @@ impl GraphRuntime {
         recorded_topics: Option<&std::collections::HashSet<String>>,
         purpose: BuildPurpose,
     ) -> TransportResult<Self> {
+        Self::build_virtual(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            recorded_topics,
+            // Provisioning-override seam (burst-aware replay provisioning): empty for
+            // every plain build; the replay engine threads recording-derived
+            // per-topic buffer floors. This is a SINGLE-PROCESS path, so it
+            // never carries a cross-process credit binding.
+            CrossProcessWiring::requirements_only(provisioning_overrides),
+            purpose,
+        )
+    }
+
+    /// [`Self::build_with_schema_hashes`] with a whole [`CrossProcessWiring`] on
+    /// the VIRTUAL (deterministic `VirtualClock`) build path.
+    ///
+    /// The replay engine's per-pass build: the wiring carries the recording's
+    /// per-topic buffer floors (as
+    /// [`Self::build_with_schema_hashes_and_provisioning`] takes them) and, through
+    /// [`CrossProcessWiring::with_input_depth_floors`], the bag-fed inputs whose
+    /// subscribers must be built deeper than they declare. `cross_process`'s
+    /// validation options apply to the graph check.
+    pub fn build_with_schema_hashes_and_wiring(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<VirtualClock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        cross_process: CrossProcessWiring<'_>,
+    ) -> TransportResult<Self> {
+        Self::build_virtual(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            None,
+            cross_process,
+            BuildPurpose::Execution,
+        )
+    }
+
+    /// The shared body of the VIRTUAL-clock build entries.
+    // Eight parameters for the reason stated at
+    // `build_with_schema_hashes_provisioning_and_recorded`.
+    #[allow(clippy::too_many_arguments)]
+    // hot-path-alloc-ok-fn: cold: graph BUILD, runs once per process, before the first step
+    fn build_virtual(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<VirtualClock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        recorded_topics: Option<&std::collections::HashSet<String>>,
+        cross_process: CrossProcessWiring<'_>,
+        purpose: BuildPurpose,
+    ) -> TransportResult<Self> {
         // Run `validate_graph` at the
         // runtime build boundary, not just CLI-side. Direct library
         // callers (examples, tests, third-party embedders) skip the
@@ -4024,7 +4113,7 @@ impl GraphRuntime {
         // loudly. Matches the runtime-over-CLI architectural pattern
         // (enforce at the runtime API entry point, don't rely on the
         // CLI). The CLI's call is now redundant-but-harmless.
-        super::validation::validate_graph(&config)?;
+        super::validation::validate_graph_with(&config, cross_process.validation_options())?;
         // Upcast the simulated clock to `Arc<dyn Clock>` so
         // every NodeContext sees the same time source the scheduler uses.
         // This is the DETERMINISTIC build path: `VirtualClock` + a
@@ -4054,13 +4143,10 @@ impl GraphRuntime {
             // Recording provisioning seam:
             // `None` for every plain virtual build; the mp supervisor's PLANNING
             // build under `--record` threads the recorded set so the
-            // harvest carries the tap depths (see the fn doc above).
+            // harvest carries the tap depths (see
+            // `build_with_schema_hashes_provisioning_and_recorded`'s doc).
             recorded_topics,
-            // Provisioning-override seam (burst-aware replay provisioning): empty for
-            // every plain build; the replay engine threads recording-derived
-            // per-topic buffer floors. This is a SINGLE-PROCESS path, so it
-            // never carries a cross-process credit binding.
-            CrossProcessWiring::requirements_only(provisioning_overrides),
+            cross_process,
             purpose,
         )
     }
@@ -5691,7 +5777,15 @@ impl GraphRuntime {
         }
         for flow in topology.topics() {
             super::tf_static::check_listener_caps(&config, flow)?;
-            let max_depth = flow.consumers.iter().map(|c| c.depth).max().unwrap_or(0);
+            // The deepest subscriber this build opens on the topic: each
+            // consumer's declared depth, raised to its floor where the wiring
+            // names one.
+            let max_depth = flow
+                .consumers
+                .iter()
+                .map(|c| cross_process.input_depth(&c.node_id, &c.input, c.depth))
+                .max()
+                .unwrap_or(0);
             if max_depth > sub_buf {
                 // A raised ceiling multiplies every publisher
                 // pool on this topic (iceoryx2 sizes pools from the service
@@ -5851,7 +5945,10 @@ impl GraphRuntime {
             }
             topic_configs.insert(flow.topic.clone(), topic_config);
             for edge in &flow.consumers {
-                depth_by_input.insert((edge.node_id.clone(), edge.input.clone()), edge.depth);
+                depth_by_input.insert(
+                    (edge.node_id.clone(), edge.input.clone()),
+                    cross_process.input_depth(&edge.node_id, &edge.input, edge.depth),
+                );
             }
         }
         // Raise borrowed-sample headroom on snapshot-source topics.
@@ -7175,7 +7272,9 @@ impl GraphRuntime {
                 let topic = resolve_source(&config.prefix, &input.source);
                 let key = (node_def.id.clone(), input.name.clone());
                 // This input's iceoryx2 queue is its
-                // declared `#[input(depth = N)]` — the depth is REAL. The
+                // declared `#[input(depth = N)]`, or the wiring's deeper floor
+                // for it (`CrossProcessWiring::with_input_depth_floors`): the
+                // depth is REAL. The
                 // topology records a consumer edge for every node input
                 // from the SAME config this loop iterates, so a miss is
                 // unreachable-by-construction; expect loudly rather than

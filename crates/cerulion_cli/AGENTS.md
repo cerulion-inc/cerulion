@@ -10,22 +10,21 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
 - Never gate `Completions` or `Clean` behind `command_needs_identity` - a shell rc file
   and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
-- Multi-value flags use exact `num_args = N`, never a range - clap's default Append action
-  flattens repeated invocations into one Vec, making two partial ones indistinguishable from one
-  full one. Length guards run BEFORE any positional access.
-- Optional-value flags (`--record`, `--run`) use `require_equals` - load-bearing, not
-  style: a bare flag takes its default and the following words parse as positionals.
-- Path completion: clap auto-derives `ValueHint::AnyPath` for `PathBuf`-typed args; a
-  `String`-typed path arg completes NOTHING without an explicit `value_hint`. Every new
-  value-taking arg needs a completer/hint or a free-form inventory entry -
-  `src/completion_wiring_tests.rs` fails until you do, and for a path arg the fix is the hint.
+- Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
+  `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
+  telemetry, logging and the login gate.
+- Multi-value flags use exact `num_args = N`, never a range (clap's Append flattens repeats
+  into one Vec). Length guards run BEFORE any positional access.
+- Optional-value flags (`--record`, `--run`) use `require_equals`: a bare flag takes its
+  default and the following words parse as positionals.
+- A `String`-typed path arg completes NOTHING without a `value_hint` (`PathBuf` gets
+  `AnyPath`). Every new value arg needs a completer/hint or an inventory entry
+  (`src/completion_wiring_tests.rs`); for a path the fix is the hint.
 - New top-level verb: a `src/families/` module + a `FAMILIES` entry, not a
   `Commands` variant (cli.md §14)
-- Create verbs (`node|graph|schema create`) complete nothing - the existing
-  name set is what they reject.
+- Create verbs (`node|graph|schema create`) complete nothing.
 
 ## Testing
-
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
   drops fields in declaration order).
@@ -33,6 +32,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   construction (compile-time directory, no `TMPDIR`), so arms here pass `--report-only` only and the
   destructive proof lives in `cerulion_cli_engine`'s `sweep_dead_nodes_test.rs`
   (`tests/trace_inspect_and_clean_cli_test.rs`).
+- `account_offline_dispatch_test` (alone): offline listing and hostile-env completion make
+  no account request and no netd spawn, against positive-control sentinels.
 - E2E binaries drive the REAL binary; run each `#[serial]` one alone with
   `-- --test-threads=1`. Build fixtures first:
   - `replay_cli_test`: `cargo build -p test_node_macro_period_cdylib -p
@@ -45,11 +46,8 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
     `graph_params_e2e`: `period` + `param`. `graph_launch_args*`: `param` + `data_trigger`.
 
 ## Gotchas
-
-- Signal tests assert exit code EXACTLY 0: a signal-killed process reports `code()==None`, so 0
-  proves the handler drove a graceful shutdown, not a default-disposition kill. Don't loosen it.
-- Gateway-teardown tests require the gateway's own shutdown log line, not just
-  exit 0 + reaped - a reap alone passes kill-on-drop too.
+- Signal tests assert exit code EXACTLY 0 (a signal kill is `code()==None`). Gateway-teardown
+  tests also need the gateway's shutdown log line: a reap alone passes kill-on-drop too.
 - `mp_support::ChildGuard` has NO public field: `spawn_group_leader` if the child owns a
   subtree (workers, gateway, ros2 entry), else `single_process`; reap/poll via its METHODS
   (`wait_bounded`, `try_wait_noting`) so it notes live workers first, and it never caches an

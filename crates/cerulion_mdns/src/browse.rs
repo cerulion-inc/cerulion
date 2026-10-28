@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use cerulion_discovery::ladder::{DiscoveredPeer, DiscoveryRung};
+use cerulion_discovery::unencrypted_quic::{UdpRelTwin, UDP_REL_TXT_KEY};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use crate::CERULION_SERVICE_TYPE;
@@ -33,6 +34,10 @@ pub struct BrowseRungReport {
     /// mid-window, so `peers` may be partial: presence in `peers` is real,
     /// absence proves nothing.
     pub window_elapsed_cleanly: bool,
+    /// For each entry of `peers` whose record carried the
+    /// [`UDP_REL_TXT_KEY`] TXT key, the unencrypted QUIC locator for the same
+    /// address. A gateway sets that key only while `CERULION_UNENCRYPTED_QUIC=on`.
+    pub udp_rel: Vec<UdpRelTwin>,
 }
 
 impl BrowseRungReport {
@@ -40,6 +45,7 @@ impl BrowseRungReport {
         Self {
             peers,
             window_elapsed_cleanly: false,
+            udp_rel: Vec::new(),
         }
     }
 }
@@ -80,12 +86,10 @@ pub fn browse_rung_report(budget: Duration) -> BrowseRungReport {
                 let addrs: Vec<IpAddr> =
                     resolved.addresses.iter().map(|a| a.to_ip_addr()).collect();
                 let robot_txt = resolved.get_property_val_str("robot");
-                BrowseEvent::Resolved(peer_from_resolved(
-                    robot_txt,
-                    &resolved.fullname,
-                    &addrs,
-                    resolved.port,
-                ))
+                let peers =
+                    peer_from_resolved(robot_txt, &resolved.fullname, &addrs, resolved.port);
+                let twins = udp_rel_twins(&peers, resolved.get_property_val_str(UDP_REL_TXT_KEY));
+                BrowseEvent::Resolved(peers, twins)
             }
             Ok(_) => BrowseEvent::Other,
             Err(_) => BrowseEvent::NoEvent,
@@ -98,8 +102,9 @@ pub fn browse_rung_report(budget: Duration) -> BrowseRungReport {
 
 /// One receive of a browse window.
 enum BrowseEvent {
-    /// A resolved `_cerulion._tcp` record, mapped to its peers.
-    Resolved(Vec<DiscoveredPeer>),
+    /// A resolved `_cerulion._tcp` record, mapped to its peers and the
+    /// unencrypted QUIC locators it advertised for them.
+    Resolved(Vec<DiscoveredPeer>, Vec<UdpRelTwin>),
     /// Any other browse event.
     Other,
     /// The receive timed out or the daemon's sender disconnected.
@@ -121,6 +126,7 @@ fn drain_browse_window(
         return BrowseRungReport::partial(Vec::new());
     }
     let mut peers: Vec<DiscoveredPeer> = Vec::new();
+    let mut udp_rel: Vec<UdpRelTwin> = Vec::new();
     let deadline = now() + budget;
     loop {
         let current = now();
@@ -128,7 +134,10 @@ fn drain_browse_window(
             break;
         }
         match recv(deadline - current) {
-            BrowseEvent::Resolved(resolved) => peers.extend(resolved),
+            BrowseEvent::Resolved(resolved, twins) => {
+                peers.extend(resolved);
+                udp_rel.extend(twins);
+            }
             BrowseEvent::Other => {}
             BrowseEvent::NoEvent => break,
         }
@@ -139,11 +148,15 @@ fn drain_browse_window(
         tracing::warn!(
             "mDNS: the `_cerulion._tcp` browse daemon died mid-browse; robot discovery results may be PARTIAL; if an expected robot is missing, reach it directly with `--connect tcp/<host>:7683`"
         );
-        return BrowseRungReport::partial(peers);
+        return BrowseRungReport {
+            udp_rel,
+            ..BrowseRungReport::partial(peers)
+        };
     }
     BrowseRungReport {
         peers,
         window_elapsed_cleanly: true,
+        udp_rel,
     }
 }
 
@@ -196,6 +209,28 @@ fn peer_from_resolved(
         .collect()
 }
 
+/// The unencrypted QUIC locator for each of `peers` when the record's
+/// [`UDP_REL_TXT_KEY`] value is a nonzero port: `tcp/<addr>:<srv port>` to
+/// `udp/<addr>:<udp_rel>?rel=1`. Any other value yields none. Pure.
+fn udp_rel_twins(peers: &[DiscoveredPeer], udp_rel_txt: Option<&str>) -> Vec<UdpRelTwin> {
+    let Some(port) = udp_rel_txt
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p != 0)
+    else {
+        return Vec::new();
+    };
+    peers
+        .iter()
+        .filter_map(|peer| {
+            let (address, _) = peer.locator.strip_prefix("tcp/")?.rsplit_once(':')?;
+            Some(UdpRelTwin {
+                tcp: peer.locator.clone(),
+                udp_rel: format!("udp/{address}:{port}?rel=1"),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +271,7 @@ mod tests {
             || clock.get(),
             |remaining| {
                 clock.set(clock.get() + remaining);
-                BrowseEvent::Resolved(vec![peer("go2")])
+                BrowseEvent::Resolved(vec![peer("go2")], Vec::new())
             },
             || true,
         );
@@ -335,5 +370,41 @@ mod tests {
     fn peer_from_resolved_empty_addrs_yields_no_peers() {
         let peers = peer_from_resolved(Some("x"), "x._cerulion._tcp.local.", &[], 7683);
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn a_udp_rel_txt_port_yields_one_quic_twin_per_address() {
+        let addrs = [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 8)),
+        ];
+        let peers = peer_from_resolved(Some("multi"), "multi._cerulion._tcp.local.", &addrs, 7683);
+        assert_eq!(
+            udp_rel_twins(&peers, Some("7690")),
+            vec![
+                UdpRelTwin {
+                    tcp: "tcp/192.168.1.7:7683".to_string(),
+                    udp_rel: "udp/192.168.1.7:7690?rel=1".to_string(),
+                },
+                UdpRelTwin {
+                    tcp: "tcp/192.168.1.8:7683".to_string(),
+                    udp_rel: "udp/192.168.1.8:7690?rel=1".to_string(),
+                },
+            ]
+        );
+        let v6 = peer_from_resolved(
+            Some("v6"),
+            "v6._cerulion._tcp.local.",
+            &[IpAddr::V6("fe80::1".parse().unwrap())],
+            7683,
+        );
+        assert_eq!(
+            udp_rel_twins(&v6, Some("7683"))[0].udp_rel,
+            "udp/[fe80::1]:7683?rel=1"
+        );
+        // No key, a non-number, or port zero: no twins.
+        for txt in [None, Some(""), Some("yes"), Some("0"), Some("70000")] {
+            assert!(udp_rel_twins(&peers, txt).is_empty(), "{txt:?}");
+        }
     }
 }

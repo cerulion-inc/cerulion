@@ -462,7 +462,7 @@ Report vulnerabilities through the [security policy](.github/SECURITY.md). Cerul
 
 ## License
 
-[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link` and `cerulion_pairing` crates are MIT OR Apache-2.0; each manifest states its license.
+[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link`, `cerulion_ops_proto` and `cerulion_pairing` crates are MIT OR Apache-2.0; each manifest states its license.
 
 ## Citing Cerulion
 
