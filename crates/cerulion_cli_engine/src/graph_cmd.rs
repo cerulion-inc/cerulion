@@ -4054,6 +4054,8 @@ fn permissive_network_config() -> cerulion_core::TransportResult<cerulion_core::
         // The permissive default listens on tcp/ only and puts every topic
         // reliable.
         tls: None,
+        // The permissive default opens no team session.
+        auth: None,
         egress_qos: Vec::new(),
     })
 }
@@ -4118,8 +4120,8 @@ struct GatewayNetworkParams {
     listen_endpoints: Vec<String>,
     multicast_scouting: bool,
     gossip_scouting: bool,
-    /// `quic/` certificate files (`#[serde(default)]`: a handoff without the
-    /// field boots with none).
+    /// `quic/` and `tls/` certificate files (`#[serde(default)]`: a handoff
+    /// without the field boots with none).
     #[serde(default)]
     tls: Option<cerulion_core::NetworkTls>,
     /// Per-topic egress put policy (`#[serde(default)]`: a handoff without the
@@ -4156,6 +4158,9 @@ impl From<&GatewayNetworkParams> for cerulion_core::NetworkConfig {
             // this rebuild — the handoff carries identity exactly once.
             robot_identity: None,
             tls: p.tls.clone(),
+            // The handoff carries no team credentials (`spawn_gateway` refuses
+            // a config that sets them).
+            auth: None,
             egress_qos: p.egress_qos.clone(),
         }
     }
@@ -4546,6 +4551,14 @@ fn spawn_gateway(
     workspace_root: &Path,
     ix_config_json: Option<String>,
 ) -> CliResult<GatewayChild> {
+    // The handoff file carries no team credentials, so a team session would
+    // reach the child without its certificates or access policy.
+    if launch.network.auth.is_some() {
+        return Err(CliError::Validation(format!(
+            "graph run: the network gateway handoff for graph '{graph_name}' cannot carry team \
+             credentials yet; this run's network config sets them"
+        )));
+    }
     let handoff = GatewayHandoff {
         graph_name: graph_name.to_string(),
         robot: launch.robot.clone(),
@@ -23453,7 +23466,7 @@ nodes:
         assert!(lean.schema_hashes.is_empty());
     }
 
-    /// The `quic/` certificate files and the per-topic egress reliability ride
+    /// The `quic/` and `tls/` certificate files and the per-topic egress reliability ride
     /// the handoff into the gateway child's `NetworkConfig`, and a handoff
     /// written without either field rebuilds with none.
     #[test]

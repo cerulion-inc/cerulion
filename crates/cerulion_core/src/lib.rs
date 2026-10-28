@@ -839,6 +839,7 @@ pub use transport::network::{
 pub use transport::output_proxy::OutputProxy;
 pub use transport::publisher::CerulionPublisher;
 pub use transport::subscriber::{CerulionSubscriber, ReceivedMessage};
+pub use transport::team_auth::{NetworkAuth, TeamAnchors, TeamAuth, TeamAuthError};
 pub use transport::uds_write::{prepare_accepted_stream, write_line_bounded, UdsWriteOutcome};
 pub use transport::{
     ix_config_shm_identity_from_json, IceoryxShmIdentity, NetworkPosture, TopicRequirements,

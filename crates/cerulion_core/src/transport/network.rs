@@ -45,6 +45,7 @@ use super::gateway::is_reserved_topic;
 use super::publisher::CerulionPublisher;
 use super::run_artifacts;
 use super::run_registry;
+use super::team_auth::{NetworkAuth, TeamSession};
 use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
 use crate::wire::{WireHeader, WIRE_HEADER_VERSION};
@@ -259,6 +260,14 @@ pub struct NetworkConfig {
     /// `transport/link/tls/*` keys by `NetworkManager::build_zenoh_config`.
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
+    /// How the session authenticates its links. `Some(NetworkAuth::Team)` opens
+    /// a mutually authenticated team data session, and
+    /// `Some(NetworkAuth::TeamBundleLane)` the bundle session, a separate
+    /// session admitting only the bundle exchange; both use `quic/` and
+    /// `tls/` locators only (see [`crate::transport::team_auth`]) and cannot
+    /// be combined with [`Self::tls`]. `None` (the default) sets no
+    /// authentication of its own.
+    pub auth: Option<NetworkAuth>,
     /// Per-topic egress put policy. A topic listed with
     /// [`EgressReliability::BestEffort`] is put with zenoh's best-effort marker
     /// by [`NetworkManager::publish_to_network`]; every other topic is put
@@ -277,6 +286,7 @@ impl Default for NetworkConfig {
             bounded_connect: false,
             robot_identity: None,
             tls: None,
+            auth: None,
             egress_qos: Vec::new(),
         }
     }
@@ -5938,6 +5948,16 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// The zenoh `Config` this manager's session opens with.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::session`], for a config that cannot be built.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn zenoh_config_for_test(&self) -> TransportResult<zenoh::Config> {
+        self.build_zenoh_config()
+    }
+
     /// Build the zenoh `Config` from our `NetworkConfig`.
     fn build_zenoh_config(&self) -> TransportResult<zenoh::Config> {
         let mut config = zenoh::Config::default();
@@ -6011,8 +6031,29 @@ impl NetworkManager {
             .insert_json5("listen/endpoints", &listen_json)
             .map_err(|e| map_err("listen/endpoints", e))?;
 
-        if let Some(tls) = &self.config.tls {
-            apply_tls(&mut config, tls)?;
+        match (&self.config.auth, &self.config.tls) {
+            (Some(NetworkAuth::Team(_) | NetworkAuth::TeamBundleLane(_)), Some(_)) => {
+                return Err(TransportError::SessionCreation {
+                    reason: "a team session takes its certificates from the team credentials, \
+                             and certificate files are set as well; remove the graph tls: block \
+                             or the CERULION_NETD_TLS_* settings"
+                        .to_string(),
+                });
+            }
+            (Some(NetworkAuth::Team(team)), None) => team.apply(
+                &mut config,
+                &self.config.listen_endpoints,
+                &self.config.connect_endpoints,
+                TeamSession::Data,
+            )?,
+            (Some(NetworkAuth::TeamBundleLane(team)), None) => team.apply(
+                &mut config,
+                &self.config.listen_endpoints,
+                &self.config.connect_endpoints,
+                TeamSession::BundleLane,
+            )?,
+            (None, Some(tls)) => apply_tls(&mut config, tls)?,
+            (None, None) => {}
         }
 
         Ok(config)
@@ -6071,7 +6112,7 @@ fn apply_tls(config: &mut zenoh::Config, tls: &NetworkTls) -> TransportResult<()
     Ok(())
 }
 
-/// A `quic/` listener's certificate (the first CERTIFICATE block of the file)
+/// A `quic/` or `tls/` listener's certificate (the first CERTIFICATE block of the file)
 /// must not be marked `CA:TRUE`: the connecting side validates it with webpki,
 /// which rejects a CA certificate presented as the end entity
 /// (`CaUsedAsEndEntity`), and that failure surfaces only as a WARN in the
