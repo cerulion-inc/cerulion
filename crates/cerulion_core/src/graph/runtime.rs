@@ -5676,10 +5676,11 @@ impl GraphRuntime {
         let force_separate_discipline = drain_discipline_forces_separate();
         for node_def in &config.nodes {
             for output in &node_def.outputs {
-                if output.history_size > 0 {
-                    let topic = resolve_output_topic(&config.prefix, &node_def.id, output);
+                let topic = resolve_output_topic(&config.prefix, &node_def.id, output);
+                let history_size = super::tf_static::effective_history_size(&topic, output);
+                if history_size > 0 {
                     let entry = history_by_topic.entry(topic).or_insert(0);
-                    *entry = (*entry).max(output.history_size);
+                    *entry = (*entry).max(history_size);
                 }
             }
             if let Some(info) = entry_infos.get(&node_def.id) {
@@ -5775,6 +5776,7 @@ impl GraphRuntime {
             }
         }
         for flow in topology.topics() {
+            super::tf_static::check_listener_caps(&config, flow)?;
             // The deepest subscriber this build opens on the topic: each
             // consumer's declared depth, raised to its floor where the wiring
             // names one.
@@ -5920,21 +5922,28 @@ impl GraphRuntime {
                     .copied()
                     .unwrap_or(0)
             };
-            topic_configs.insert(
-                flow.topic.clone(),
-                TopicServiceConfig::for_topology(
-                    transport.default_topic_config(),
-                    max_depth,
-                    in_graph_subs,
-                    publisher_provisioning,
-                    // The topic's native history size (max
-                    // declared across its producing outputs; 0 if none). The
-                    // creator/precreate open arms iceoryx2 native history with
-                    // it; openers leave it uncalled.
-                    history_by_topic.get(&flow.topic).copied().unwrap_or(0),
-                    extra_event_listeners,
-                ),
+            let mut topic_config = TopicServiceConfig::for_topology(
+                transport.default_topic_config(),
+                max_depth,
+                in_graph_subs,
+                publisher_provisioning,
+                // The topic's native history size (max
+                // declared across its producing outputs; 0 if none). The
+                // creator/precreate open arms iceoryx2 native history with
+                // it; openers leave it uncalled.
+                history_by_topic.get(&flow.topic).copied().unwrap_or(0),
+                extra_event_listeners,
             );
+            // A consumer of `/tf_static` with no in-graph publisher may be the
+            // one that creates the topic (its graph starts first). It creates
+            // it with the latch history, on the create leg only, so a static
+            // publisher that starts later can open it; an owned topic already
+            // carries that history from its outputs.
+            if publisher_provisioning == PublisherProvisioning::External {
+                topic_config.create_history_floor =
+                    super::tf_static::listener_create_history(&flow.topic);
+            }
+            topic_configs.insert(flow.topic.clone(), topic_config);
             for edge in &flow.consumers {
                 depth_by_input.insert(
                     (edge.node_id.clone(), edge.input.clone()),
@@ -7021,10 +7030,12 @@ impl GraphRuntime {
                 // — open it OPEN-ONLY (`.open()`), making the pre-create
                 // load-bearing (a missing service fails loudly here instead
                 // of being masked by a lazy create).
+                // A `/tf_static` TFMessage output keeps at least one message.
+                let history_size = super::tf_static::effective_history_size(&topic, output);
                 let mut publisher = transport.create_publisher_on_existing_service(
                     &topic,
                     resolved_max_slice_len,
-                    output.history_size,
+                    history_size,
                     topic_config_of(&topic),
                 )?;
                 // History truncation:
@@ -7038,16 +7049,16 @@ impl GraphRuntime {
                 // of the H-sample history, the rest never delivered. Warn per
                 // shallow edge so the operator sees exactly what each consumer
                 // gets.
-                if output.history_size > 0 {
+                if history_size > 0 {
                     if let Some(flow) = topology.topic(&topic) {
                         for edge in &flow.consumers {
-                            if edge.depth < output.history_size {
+                            if edge.depth < history_size {
                                 tracing::warn!(
                                     topic = %topic,
                                     node = %edge.node_id,
                                     input = %edge.input,
                                     depth = edge.depth,
-                                    history_size = output.history_size,
+                                    history_size = history_size,
                                     "consumer input depth is below the topic's \
                                      history_size; iceoryx2 native history delivers this \
                                      consumer only its `depth` most-recent frames of the \
@@ -7064,10 +7075,24 @@ impl GraphRuntime {
                 // outstanding counters so every send mirrors into their
                 // queue-depth atomics. No-op unless the topic is all-block.
                 if let Some(counters) = pub_block_by_topic.get(&topic) {
-                    if output.history_size > 0 {
+                    // A latched `/tf_static` output with no `history_size`
+                    // keeps one message by default: its `history_size` is
+                    // already 0, so the remedy is the input policy, not that
+                    // setting.
+                    if super::tf_static::is_implicit_latch(&topic, output) {
                         tracing::warn!(
                             topic = %topic,
-                            history_size = output.history_size,
+                            history_size = history_size,
+                            "block topic is a latched static transform topic: it keeps its \
+                             last message for a late listener, and the outstanding mirror \
+                             does not track that kept message, so a late joiner's block \
+                             accounting may under-count. Static transforms are not a \
+                             stream: read this topic through a non-block input."
+                        );
+                    } else if history_size > 0 {
+                        tracing::warn!(
+                            topic = %topic,
+                            history_size = history_size,
                             "block topic also declares history_size > 0; the outstanding mirror \
                              does not track history-replayed frames, so a late joiner's block \
                              accounting may under-count. block topics are streams — prefer \

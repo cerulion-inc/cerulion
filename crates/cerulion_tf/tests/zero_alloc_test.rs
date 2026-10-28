@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Zero-allocation proof for every SE(3) operation, error paths included.
+//! Zero-allocation proof for every SE(3) operation and every tf buffer
+//! operation, error paths included.
 //!
-//! Frame lookups run inside node ticks, so the math they call must never
-//! touch the heap. A counting `#[global_allocator]` observes every
-//! allocation; the window counts only the thread that opened it, so libtest
-//! machinery on other threads cannot fail or mask the measurement. The last
-//! phase is the control: an allocation inside a window is counted, so a
-//! zero above is a real zero.
+//! Frame lookups run inside node ticks, so the math they call and the
+//! buffer they read must never touch the heap. A counting
+//! `#[global_allocator]` observes every allocation; the window counts only
+//! the thread that opened it, so libtest machinery on other threads cannot
+//! fail or mask the measurement. The last phase is the control: an
+//! allocation inside a window is counted, so a zero above is a real zero.
+//!
+//! Each buffer is built outside any window: its constructor is the one
+//! place it allocates. The first pass on a fresh buffer is measured, so frame
+//! registration and name interning, ring growth, expiry and overflow are
+//! inside a window; the repeat pass on the same buffer, which begins a new
+//! epoch and meets a full frame table and repeat refusals, is measured on
+//! its own. A static insert that clears a dynamic edge's
+//! history has its own window too, and so do the two refusals this buffer
+//! cannot reach: a name past the byte budget (its full frame table refuses
+//! first) and a handle from another buffer.
 //!
 //! ONE `#[test]` body on purpose: the window is process-global, and a second
 //! test in this binary could reset it mid-measurement.
 
-use cerulion_tf::{TfMathError, Transform, UnitQuaternion};
+use cerulion_tf::{EdgePolicy, TfBuffer, TfBufferConfig, TfError, Transform, UnitQuaternion};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::f64::consts::FRAC_1_SQRT_2;
+use std::fmt::Write as _;
 use std::hint::black_box;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 thread_local! {
     /// `true` only on the thread that opened the window. Const-init with a
@@ -109,26 +124,185 @@ fn every_operation() {
     // Every error arm.
     assert_eq!(
         UnitQuaternion::new(black_box(f64::NAN), 0.0, 0.0, 1.0),
-        Err(TfMathError::NonFiniteQuaternion)
+        Err(TfError::NonFiniteQuaternion)
     );
     assert!(matches!(
         UnitQuaternion::new(0.0, 0.0, 0.0, black_box(0.0)),
-        Err(TfMathError::DegenerateQuaternion { .. })
+        Err(TfError::DegenerateQuaternion { .. })
     ));
     assert_eq!(
         Transform::new(black_box([f64::INFINITY, 0.0, 0.0]), r),
-        Err(TfMathError::NonFiniteTranslation)
+        Err(TfError::NonFiniteTranslation)
     );
     let far = Transform::new(black_box([1e308, 0.0, 0.0]), UnitQuaternion::IDENTITY).unwrap();
-    assert_eq!(far.compose(&far), Err(TfMathError::NonFiniteTranslation));
+    assert_eq!(far.compose(&far), Err(TfError::NonFiniteTranslation));
     assert_eq!(
         a.interpolate(&b, black_box(f64::NAN)),
-        Err(TfMathError::FractionNotANumber)
+        Err(TfError::FractionNotANumber)
     );
     assert!(matches!(
         a.interpolate(&b, black_box(1.5)),
-        Err(TfMathError::FractionOutOfRange { .. })
+        Err(TfError::FractionOutOfRange { .. })
     ));
+}
+
+/// A frame id longer than any inline label: interned whole, with no limit.
+const LONG_ID: &str = "robot_0/camera_aligned_depth_to_color_frame_with_a_long_suffix";
+
+/// A buffer of 10 frames, a window of 1000 ns and rings of 3.
+fn small_buffer() -> TfBuffer {
+    TfBuffer::with_config(TfBufferConfig {
+        frames: NonZeroUsize::new(10).unwrap(),
+        retention: Duration::from_nanos(1_000),
+        ring_capacity: NonZeroUsize::new(3).unwrap(),
+        name_bytes: 128,
+        jump_limit: Duration::ZERO,
+    })
+}
+
+/// Every buffer operation, on a buffer of 10 frames with rings of 3 and a
+/// window of 1000 ns: inserts that add, replace, expire and overflow, a
+/// static edge, edge policies, an epoch, lookups of every shape, and every
+/// refusal but `NameBudgetFull` and `UnknownFrameId`, which the test body
+/// measures on a buffer of its own. The first pass on a fresh buffer
+/// registers frames and grows rings; run again on the same buffer, the
+/// repeat meets full rings, a full frame table and repeat refusals, so all
+/// are measured.
+fn every_buffer_operation(b: &mut TfBuffer) {
+    let shift = |x: f64| Transform::new([x, 0.0, 0.0], UnitQuaternion::IDENTITY).unwrap();
+    let turn = Transform::new(
+        [2.0, 0.0, 0.0],
+        UnitQuaternion::new(0.0, 0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2).unwrap(),
+    )
+    .unwrap();
+    b.begin_epoch();
+    b.set_edge_policy("odom", "base", EdgePolicy::Extrapolate { max_ns: 500 })
+        .unwrap();
+    // On a ring of 3, 400 overflows 100; 1300 expires 200; 300 is then
+    // replaced by a different value.
+    b.insert("odom", "base", black_box(100), shift(0.0))
+        .unwrap();
+    b.insert("odom", "base", 200, shift(1.0)).unwrap();
+    b.insert("odom", "base", 300, turn).unwrap();
+    b.insert("odom", "base", 400, shift(4.0)).unwrap();
+    b.insert("odom", "base", 1_300, shift(5.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
+    b.insert("odom", "base", 300, shift(3.0)).unwrap();
+    b.insert_static("base", "lidar", shift(0.17)).unwrap();
+    b.insert_static("base", LONG_ID, shift(0.05)).unwrap();
+    b.set_edge_policy("map", "x", EdgePolicy::HoldLast { max_age_ns: 10 })
+        .unwrap();
+    // A second tree, and a chain whose translations overflow when composed.
+    b.insert("x", "y", 0, shift(1.0)).unwrap();
+    b.insert("p", "q", 0, shift(1e308)).unwrap();
+    b.insert("q", "r", 0, shift(1e308)).unwrap();
+
+    black_box(b.lookup("odom", "base", black_box(400))).unwrap();
+    black_box(b.lookup("odom", "base", 850)).unwrap();
+    black_box(b.lookup("odom", "base", 1_700)).unwrap();
+    black_box(b.lookup("odom", "lidar", 350)).unwrap();
+    black_box(b.lookup("lidar", "odom", 350)).unwrap();
+    black_box(b.lookup("base", "lidar", 7)).unwrap();
+    black_box(b.lookup(LONG_ID, "lidar", 7)).unwrap();
+    let latest = black_box(b.lookup_latest("odom", "lidar")).unwrap();
+    black_box((latest.transform, latest.stamp_ns));
+    black_box(b.lookup("base", "base", 0)).unwrap();
+    black_box(b.lookup("/odom", "/base", 400)).unwrap();
+    let (odom, lidar) = (b.frame_id("odom").unwrap(), b.frame_id("lidar").unwrap());
+    black_box(b.lookup_ids(odom, lidar, 400)).unwrap();
+    black_box(b.lookup_latest_ids(lidar, odom)).unwrap();
+    black_box(b.lookup_latest("base", "lidar")).unwrap();
+    black_box(b.frame_name(odom));
+    black_box(b.edge("base"));
+    for edge in b.static_edges() {
+        black_box(edge);
+    }
+    black_box(b.contains_frame("odom"));
+    black_box((b.expired(), b.replacements(), b.epoch()));
+
+    // Every refusal, and its text through the buffer: the text is written
+    // into a fixed sink, so formatting it allocates nothing either.
+    let refusals = [
+        b.lookup("nope", "base", 300),
+        b.lookup("odom", "y", 0),
+        b.lookup("odom", "base", 1_801),
+        b.lookup("odom", "base", 299),
+        b.lookup("map", "x", 0),
+        b.lookup("p", "r", 0),
+    ];
+    let mut sink = Sink::default();
+    for refusal in &refusals {
+        let err = refusal.as_ref().unwrap_err();
+        write!(sink, "{}", b.describe(err)).unwrap();
+    }
+    assert!(matches!(refusals[0], Err(TfError::UnknownFrame { .. })));
+    assert!(matches!(refusals[1], Err(TfError::NoPath { .. })));
+    assert!(matches!(refusals[2], Err(TfError::NotYetAvailable { .. })));
+    assert!(matches!(refusals[3], Err(TfError::OutOfRange { .. })));
+    assert!(matches!(refusals[4], Err(TfError::EdgeEmpty { .. })));
+    assert!(matches!(refusals[5], Err(TfError::ChainMath { .. })));
+    assert_eq!(
+        b.insert("", "base", 0, shift(0.0)),
+        Err(TfError::EmptyFrameId)
+    );
+    assert!(matches!(
+        b.insert("base", "base", 0, shift(0.0)),
+        Err(TfError::SelfEdge { .. })
+    ));
+    assert!(matches!(
+        b.insert("map", "base", 0, shift(0.0)),
+        Err(TfError::SecondParent { .. })
+    ));
+    assert!(matches!(
+        b.insert("lidar", "odom", 0, shift(0.0)),
+        Err(TfError::Cycle { .. })
+    ));
+    assert!(matches!(
+        b.insert("odom", "base", 0, shift(0.0)),
+        Err(TfError::StampBeforeWindow { .. })
+    ));
+    // 10 000 is more than the window past the newest stamp, 1300.
+    let ahead = b.insert("odom", "base", 10_000, shift(0.0));
+    assert!(matches!(ahead, Err(TfError::StampTooFarAhead { .. })));
+    write!(sink, "{}", b.describe(ahead.as_ref().unwrap_err())).unwrap();
+    // Refused every time, on the first pass and on the repeat.
+    assert!(matches!(
+        b.insert("base", "lidar", 0, shift(0.0)),
+        Err(TfError::EdgeIsStatic { .. })
+    ));
+    assert!(matches!(
+        b.insert("z", "w", 0, shift(0.0)),
+        Err(TfError::FrameTableFull { .. })
+    ));
+    assert!(matches!(
+        b.insert_static("z", "w", shift(0.0)),
+        Err(TfError::FrameTableFull { .. })
+    ));
+}
+
+/// A fixed-size text sink: formatting into it never allocates.
+struct Sink {
+    bytes: [u8; 4_096],
+    len: usize,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self {
+            bytes: [0; 4_096],
+            len: 0,
+        }
+    }
+}
+
+impl std::fmt::Write for Sink {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let room = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        room.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 #[test]
@@ -144,6 +318,118 @@ fn every_operation_allocates_nothing_on_the_calling_thread() {
         during_math, 0,
         "the SE(3) operations allocated {during_math} time(s)"
     );
+
+    // Warm-up outside the window on a throwaway buffer, for the same
+    // first-touch reason as above.
+    every_buffer_operation(&mut small_buffer());
+
+    // The buffer's constructor is its one allocation site, outside the
+    // window. The first pass registers all 10 frames and interns their
+    // names, grows the rings from empty, overflows, expires and replaces,
+    // inside the window.
+    let mut buffer = small_buffer();
+    assert_eq!(buffer.frame_count(), 0);
+    ALLOC.open();
+    every_buffer_operation(&mut buffer);
+    let during_first_pass = ALLOC.close();
+    assert_eq!(
+        during_first_pass, 0,
+        "the first pass on a fresh tf buffer allocated {during_first_pass} time(s)"
+    );
+    assert_eq!(buffer.frame_count(), 10);
+    assert_eq!(
+        buffer.edge("base").unwrap().overflows,
+        1,
+        "400 overflows 100"
+    );
+    assert_eq!(buffer.expired(), 1, "1300 expires 200");
+    assert_eq!(buffer.replacements(), 1, "300 replaced once");
+
+    // The repeat pass clears the rings with an epoch, refills them and
+    // meets a full frame table and repeat refusals.
+    ALLOC.open();
+    every_buffer_operation(&mut buffer);
+    let during_repeat_pass = ALLOC.close();
+    assert_eq!(
+        during_repeat_pass, 0,
+        "the repeat pass on a full tf buffer allocated {during_repeat_pass} time(s)"
+    );
+    assert_eq!(buffer.frame_count(), 10);
+    assert_eq!(buffer.epoch(), 2);
+    let base = buffer.edge("base").unwrap();
+    assert_eq!(base.overflows, 2);
+    assert_eq!((base.window_refusals, base.jump_refusals), (2, 2));
+    assert_eq!(buffer.edge("lidar").unwrap().static_refusals, 2);
+
+    // A dynamic edge turned static: the static insert clears the ring.
+    let mut converted = TfBuffer::with_config(TfBufferConfig {
+        frames: NonZeroUsize::new(2).unwrap(),
+        ..TfBufferConfig::default()
+    });
+    let mount = Transform::new([0.17, 0.0, 0.11], UnitQuaternion::IDENTITY).unwrap();
+    ALLOC.open();
+    for stamp in [100u64, 200, 300] {
+        converted
+            .insert("base", "camera", black_box(stamp), mount)
+            .unwrap();
+    }
+    converted.insert_static("base", "camera", mount).unwrap();
+    black_box(converted.lookup("base", "camera", black_box(7))).unwrap();
+    let during_conversion = ALLOC.close();
+    assert_eq!(
+        during_conversion, 0,
+        "a dynamic edge turned static allocated {during_conversion} time(s)"
+    );
+    let edge = converted.edge("camera").expect("the converted edge");
+    assert!(edge.is_static);
+    assert_eq!(edge.samples, 0, "the static insert cleared the ring");
+    assert_eq!(converted.expired(), 3, "three cleared samples");
+
+    // The two refusals the full buffer above cannot reach: its new frames
+    // meet the full frame table before the name budget, and its handles
+    // are all its own. A buffer with a budget of 8 name bytes refuses a
+    // name past what is left, and refuses a handle another buffer issued.
+    let shift = Transform::new([1.0, 0.0, 0.0], UnitQuaternion::IDENTITY).unwrap();
+    let mut tight = TfBuffer::with_config(TfBufferConfig {
+        frames: NonZeroUsize::new(4).unwrap(),
+        name_bytes: 8,
+        ..TfBufferConfig::default()
+    });
+    tight.insert("odom", "base", 0, shift).unwrap();
+    let (odom, base) = (
+        tight.frame_id("odom").unwrap(),
+        tight.frame_id("base").unwrap(),
+    );
+    let foreign = buffer.frame_id("odom").unwrap();
+    let mut sink = Sink::default();
+    ALLOC.open();
+    let refusals = [
+        tight.insert("base", black_box("c"), 1, shift).unwrap_err(),
+        tight.insert_static("base", LONG_ID, shift).unwrap_err(),
+        tight.lookup_ids(black_box(foreign), base, 0).unwrap_err(),
+        tight
+            .lookup_latest_ids(odom, black_box(foreign))
+            .unwrap_err(),
+    ];
+    for refusal in &refusals {
+        write!(sink, "{}", tight.describe(refusal)).unwrap();
+    }
+    let during_unreached = ALLOC.close();
+    assert_eq!(
+        during_unreached, 0,
+        "the name budget and foreign handle refusals allocated {during_unreached} time(s)"
+    );
+    assert!(matches!(
+        refusals[0],
+        TfError::NameBudgetFull { left: 0, .. }
+    ));
+    assert!(matches!(
+        refusals[1],
+        TfError::NameBudgetFull { len, .. } if len == LONG_ID.len()
+    ));
+    assert!(matches!(refusals[2], TfError::UnknownFrameId { .. }));
+    assert!(matches!(refusals[3], TfError::UnknownFrameId { .. }));
+    assert_eq!(tight.frame_count(), 2, "a refused insert registers nothing");
 
     // Control: a real allocation inside a window is counted.
     ALLOC.open();

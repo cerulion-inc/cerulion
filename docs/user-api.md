@@ -1065,13 +1065,13 @@ A plain non-trigger `#[input]` is a latest-value read: when several frames arriv
 ```rust
 #[cerulion_node(period_ms = 10)]
 #[derive(Default)]
-pub struct TfBuffer {
+pub struct TfListener {
     #[input(accumulate, cap = 16)]
     tf: TFMessage,
 }
 
 #[cerulion_node_impl]
-impl TfBuffer {
+impl TfListener {
     fn tick(&mut self) -> Result<(), NodeError> {
         for frame in self.tf.iter() {
             let transforms = frame.transforms(); // read each frame like a plain input
@@ -1096,6 +1096,7 @@ impl TfBuffer {
 - **Node kinds.** The read works the same in an in-process node and in a node built as a cdylib and run by `cerulion graph run`, because the buffer lives inside the node itself.
 - **Refused combinations** (compile errors that list the accepted keys `cap = N`, `backpressure = drop_oldest` and `expect_within_ms = N`): `accumulate` with `trigger` (a trigger input already serves every frame, one fire per frame), with `backpressure = block` (block paces the producer instead of dropping at the cap), with `backpressure = sample(N)` (decimation drops the frames accumulate keeps), and with `depth` (use `cap`). A `cap` outside 1 to 64 and a `cap` without `accumulate` are refused too. The `cerulion` commands that read a node's source (`cerulion node info`, `cerulion graph run` and the others) refuse the same forms.
 - **Cost.** Each frame is copied once, into a slot the node reuses on every fire; once each slot has held a frame of the largest size the topic carries, the read allocates nothing.
+- **Transforms.** A `/tf` listener feeds the transforms it receives into a `cerulion_tf::TfBuffer` and reads it with `lookup(parent, child, time)`; see `docs/transforms.md`.
 
 ### `#[output(...)]` field attribute
 
@@ -1698,7 +1699,7 @@ nodes:
                                 #   field's Rust type. `pkg/Type`, `pkg::Type`, or a bare name
                                 #   for a schema in this workspace's `schemas/`
         max_slice_len: 134217728 # optional; falls back to <T>::MAX_SLICE_LEN, then 128 MiB + warn
-        history_size: 8         # optional; iceoryx2-native per-publisher history for late joiners (default 0; max 64 = MAX_CONSUMER_DEPTH: replays through consumer queues capped at that depth, so a larger history can't be delivered in full). Late joiners receive history even from a QUIESCENT producer that has stopped publishing (the runtime services them each live-loop iteration).
+        history_size: 8         # optional; iceoryx2-native per-publisher history for late joiners (default 0; max 64 = MAX_CONSUMER_DEPTH: replays through consumer queues capped at that depth, so a larger history can't be delivered in full). Late joiners receive history even from a QUIESCENT producer that has stopped publishing (the runtime services them each live-loop iteration). An output on `/tf_static` with schema `tf2_msgs/TFMessage` keeps at least 1 (latched) even when this is 0 or omitted; see `docs/transforms.md`.
 
   - id: detector
     type: detector

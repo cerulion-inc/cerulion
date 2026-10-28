@@ -41,6 +41,8 @@ pub(crate) mod sync_capture;
 // (the DrainWarnLatch sibling — pure state machine, mapped to tracing
 // levels in runtime.rs).
 pub mod tick_failure_latch;
+// `/tf_static` is latched: the default history and the listener cap check.
+pub(crate) mod tf_static;
 pub mod topology;
 pub mod validation;
 // WaitSet reactor (event multiplexer) + determinism

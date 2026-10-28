@@ -46,6 +46,30 @@ pub enum TransportError {
     /// Graph configuration or validation error.
     #[error("Graph validation error: {reason}")]
     GraphError { reason: String },
+    /// An in-graph consumer of `/tf_static` cannot hold what a late start
+    /// delivers: every `/tf_static` publisher in the graph keeps `depth`
+    /// messages, so a listener that starts after them receives `required`
+    /// messages at once, and its queue holds `cap`. Refused at graph load so
+    /// a dropped static transform is never silent.
+    #[error("{}", render_tf_static_cap(.node_id, .input, *.cap, *.required, *.limit, *.depth, .publishers))]
+    TfStaticCapTooSmall {
+        /// The consuming node.
+        node_id: String,
+        /// The consuming input.
+        input: String,
+        /// The input's queue depth (an accumulate input's `cap`).
+        cap: usize,
+        /// The publishers times `depth`: what a late start delivers.
+        required: usize,
+        /// The largest cap the topic allows.
+        limit: usize,
+        /// The messages each publisher keeps: the topic's history, which
+        /// every publisher of the topic shares (the deepest any output
+        /// declares, and at least 1).
+        depth: usize,
+        /// Every `/tf_static` output in the graph, as `node.output`.
+        publishers: Vec<String>,
+    },
     /// A node that matches its Sync trigger on capture time (`header.stamp`)
     /// has an input it cannot match that way: a trigger input whose schema
     /// carries no usable `header.stamp`, or a stamp location for an input that
@@ -596,6 +620,46 @@ fn render_unrepresentable_node_name(node_name: &str, cause: &NodeNameRefusal) ->
          graph's identity (its `name:` key, or the file or bag it was loaded from) — rename the \
          graph, or the bag, and re-run."
     )
+}
+
+/// Text of [`TransportError::TfStaticCapTooSmall`]: the listener, its cap,
+/// the publishers, and the fix, which depends on whether any cap within the
+/// topic's limit holds them all.
+fn render_tf_static_cap(
+    node_id: &str,
+    input: &str,
+    cap: usize,
+    required: usize,
+    limit: usize,
+    depth: usize,
+    publishers: &[String],
+) -> String {
+    let each = if depth == 1 { "message" } else { "messages" };
+    let head = format!(
+        "node '{node_id}' input '{input}' has cap {cap}, but /tf_static has {} publishers in \
+         this graph ({}) that keep {depth} {each} each, so a listener that starts after them \
+         receives {required}",
+        publishers.len(),
+        publishers.join(", ")
+    );
+    if required > limit {
+        // Lowering history_size helps only while a publisher keeps more
+        // than the one message a latched output always keeps.
+        let history = if depth > 1 {
+            ", or lower their history_size to 1"
+        } else {
+            ""
+        };
+        format!(
+            "{head}, more than the cap limit of {limit}: move static transforms into fewer \
+             publishers{history}"
+        )
+    } else {
+        format!(
+            "{head} and would drop static transforms: raise the input's cap to at least \
+             {required}"
+        )
+    }
 }
 
 /// Render [`TransportError::ExternalNodesInertAtLaunch`]

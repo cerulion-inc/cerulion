@@ -2,7 +2,7 @@
 
 Cerulion is a zero-copy, deterministic communication framework for real-time robotics:
 iceoryx2 shared memory locally, zenoh across machines, ROS 2 interop via `rmw_cerulion`.
-A Rust workspace (authoritative crate list: root `Cargo.toml`). The user-facing API - the
+A Rust workspace (crate list: root `Cargo.toml`). The user-facing API - the
 `#[cerulion_node]` macro, the `cerulion` CLI, graph/schema YAML (`docs/user-api.md`) - is a contract.
 Users build a WORKSPACE: ONE node type per `nodes/<type>/` crate, wiring ONLY in `graphs/*.yaml`,
 run by `cerulion` verbs. Examples, docs, rustdoc, README and the scaffold must show nothing else:
@@ -141,9 +141,9 @@ strictest clippy accepts (`if let` over `is_some()`+`unwrap()`).
 | CLI / Android | `cerulion_cli`*, `_cli_engine`*, `_cli_tui`, `_telemetry`, `cerulion_android` |
 | Recording: MCAP writer/reader + daemon | `cerulion_bag`*, `cerulion_bagd`* |
 | ROS 2 RMW layer (via `cerulion ros2 run/launch`) | `rmw_cerulion`* |
-| Network & discovery daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns` |
-| Local workspace engine daemon | `cerulion_wsd`* |
+| Network, discovery, workspace daemons | `cerulion_netd`*, `_dds`*, `_discovery`, `_mdns`, `_wsd`* |
 | Remote access / pairing / accounts | `cerulion_{connectd,remoted*,pairing,accountd,wire,wireclient,link}`, `cerud` |
+| Frame math, tf buffer | `cerulion_tf` |
 | Robot Context Protocol (MCP server) | `cerulion_rcpd`* |
 | Visualization (not in default-members) | `cerulion_viz`* (`lib/*`, `bin/cerulion_vizd`) |
 | Fixtures, benches, examples | `crates/test_fixtures/*`, `benches/`*, `examples/`* |

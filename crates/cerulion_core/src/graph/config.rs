@@ -926,6 +926,11 @@ pub struct OutputDef {
     /// a fresh subscriber is usually wrong and reserves SHM that goes
     /// unused.
     ///
+    /// An output on `/tf_static` with schema `tf2_msgs/TFMessage` is
+    /// latched: it keeps at least 1 even when this field is 0, and the
+    /// graph load checks that every in-graph `/tf_static` listener can
+    /// hold what the static publishers keep (see `graph::tf_static`).
+    ///
     /// # ROS2 mapping
     ///
     /// ROS2 splits this concept across two QoS policies:
