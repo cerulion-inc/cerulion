@@ -151,8 +151,13 @@ pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdCli
         let outcome = client.account_access_once(AccountAccessRequest::Install {
             snapshot: Box::new(snapshot.clone()),
         });
-        let error = outcome.as_ref().err().map(|e| e.to_string());
-        match classify_install_outcome(error.as_deref(), started.elapsed(), TRANSIENT_BUSY_WAIT) {
+        // The daemon's own message, not the client error's display text, which
+        // prefixes it. Other failures carry no daemon message and settle at once.
+        let daemon_message = match &outcome {
+            Err(cerulion_netd::ClientError::Netd { error, .. }) => Some(error.as_str()),
+            _ => None,
+        };
+        match classify_install_outcome(daemon_message, started.elapsed(), TRANSIENT_BUSY_WAIT) {
             BusyDecision::Settle | BusyDecision::GaveUp => {
                 outcome.map_err(access_error)?;
                 return Ok(client);

@@ -447,3 +447,26 @@ fn connection_and_hello_share_the_callers_deadline() {
     );
     peer.join().unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_bounded_connect_reaches_an_abstract_control_socket() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    let name = format!("cerulion-bounded-test-{}", std::process::id());
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let listener = UnixListener::bind_addr(&address).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(HELLO).unwrap();
+        let mut rest = Vec::new();
+        let _ = peer.read_to_end(&mut rest);
+    });
+    let path = PathBuf::from(&name);
+    // No filesystem socket has that name: the pathname branch cannot reach it.
+    assert!(connect_control(&path, deadline(), false).is_err());
+    let stream = connect_control(&path, deadline(), true).unwrap();
+    let client = NetdClient::finish_bounded_handshake(stream, path, deadline()).unwrap();
+    drop(client);
+    server.join().unwrap();
+}

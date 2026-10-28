@@ -23,6 +23,68 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use crate::account_access::{AccountAccessReply, AccountAccessRequest};
 use crate::protocol::{Request, Response, ServingSchemaSnapshot, MAX_REQUEST_LINE_BYTES};
 
+/// Connect to the control socket at `path` before `deadline`. With
+/// `abstract_namespace` the path bytes name an abstract socket, as the daemon
+/// binds it on Android, and the peer must be the same user.
+fn connect_control(
+    path: &std::path::Path,
+    deadline: Instant,
+    abstract_namespace: bool,
+) -> io::Result<UnixStream> {
+    remaining(deadline)?;
+    let address = if abstract_namespace {
+        abstract_address(path)?
+    } else {
+        socket2::SockAddr::unix(path)?
+    };
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&address, remaining(deadline)?)?;
+    // Some Unix backlog failure shapes can look writable without a peer.
+    // Require a completed connection before accepting a banner.
+    socket.peer_addr()?;
+    remaining(deadline)?;
+    let stream: UnixStream = socket.into();
+    if abstract_namespace {
+        same_user_peer(&stream)?;
+    }
+    Ok(stream)
+}
+
+/// The abstract-namespace address named by `path`'s bytes: a leading NUL byte
+/// and no terminator, the same address `SocketAddr::from_abstract_name` builds.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn abstract_address(path: &std::path::Path) -> io::Result<socket2::SockAddr> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut name = vec![0u8];
+    name.extend_from_slice(path.as_os_str().as_bytes());
+    socket2::SockAddr::unix(std::ffi::OsStr::from_bytes(&name))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn abstract_address(_path: &std::path::Path) -> io::Result<socket2::SockAddr> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "abstract control sockets exist only on Linux and Android",
+    ))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn same_user_peer(stream: &UnixStream) -> io::Result<()> {
+    if cerulion_hygiene::peer_is_same_user(stream)? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the control socket is served by a different user",
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn same_user_peer(_stream: &UnixStream) -> io::Result<()> {
+    Ok(())
+}
+
 const MAX_HELLO_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: usize = MAX_REQUEST_LINE_BYTES;
 
@@ -154,22 +216,12 @@ impl NetdClient {
         path: PathBuf,
         deadline: Instant,
     ) -> Result<Self, ClientError> {
-        let connect = || -> io::Result<UnixStream> {
-            remaining(deadline)?;
-            let address = socket2::SockAddr::unix(&path)?;
-            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-            socket.connect_timeout(&address, remaining(deadline)?)?;
-            // Some Unix backlog failure shapes can look writable without a peer.
-            // Require a completed connection before accepting a banner.
-            socket.peer_addr()?;
-            remaining(deadline)?;
-            Ok(socket.into())
-        };
-        let stream = connect().map_err(|source| ClientError::Connect {
-            socket: path.clone(),
-            attempt: ConnectAttempt::ExistingOnly,
-            source,
-        })?;
+        let stream = connect_control(&path, deadline, cerulion_hygiene::CONTROL_SOCKET_ABSTRACT)
+            .map_err(|source| ClientError::Connect {
+                socket: path.clone(),
+                attempt: ConnectAttempt::ExistingOnly,
+                source,
+            })?;
         Self::finish_bounded_handshake(stream, path, deadline)
     }
 

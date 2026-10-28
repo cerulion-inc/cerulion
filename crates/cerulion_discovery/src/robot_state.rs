@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 /// Never-renamed sibling lock shared by login writers and consistent readers.
 pub const AUTH_STORE_LOCK_FILE: &str = ".studio-auth.lock";
 
+/// The per-request timeout of the CLI's account-service HTTP calls, a session
+/// refresh among them. A refresh rotates the single-use refresh token at the
+/// service and publishes the new pair locally only after this exchange returns.
+pub const ACCOUNT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Resolve the login configuration directory using the shared home policy.
 pub fn config_dir() -> Option<PathBuf> {
     config_dir_from(

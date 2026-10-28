@@ -95,7 +95,7 @@ pub const EXIT_AUTH_REQUIRED: u8 = 7;
 const POLL_HARD_CAP: Duration = Duration::from_secs(600);
 
 /// Per-request HTTP timeout.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_TIMEOUT: Duration = cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT;
 
 /// Resolve the account-service base URL (env override → production default),
 /// trailing slash trimmed.

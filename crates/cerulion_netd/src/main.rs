@@ -80,7 +80,8 @@ ENVIRONMENT:
     CERULION_NETD_IDLE_GRACE_MS  Idle grace before self-exit, in ms (default 30000).
     CERULION_NETD_HARD_EXIT_MS   Deadline for graceful shutdown before the daemon
                                  HARD-exits (nonzero) to avoid a zombie, in ms
-                                 (default 5000).
+                                 (default 5000). A robot daemon adds
+                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S to it.
     CERULION_NETD_CONNECT        Zenoh locators to CONNECT to for remote robots
                                  the boot-time mDNS browse and the peer cache
                                  can't reach (comma/space separated).
@@ -407,9 +408,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // hard-exits within the deadline so the daemon can NEVER linger as a zombie
     // holding the socket (the production wedge). On the healthy path
     // shutdown() returns well within the deadline, `main` returns, and the process
-    // exits normally before the watchdog fires.
-    spawn_hard_exit_watchdog(resolve_hard_exit_timeout(
-        std::env::var(HARD_EXIT_ENV).ok().as_deref(),
+    // exits normally before the watchdog fires. The deadline includes the robot
+    // supervisor's stop grace, during which its shutdown can wait for a running
+    // revocation fetch.
+    let supervisor_grace = robot_supervisor.as_ref().map_or(
+        Duration::ZERO,
+        cerulion_netd::robot_supervisor::RobotSupervisor::stop_grace,
+    );
+    spawn_hard_exit_watchdog(shutdown_deadline(
+        resolve_hard_exit_timeout(std::env::var(HARD_EXIT_ENV).ok().as_deref()),
+        supervisor_grace,
     ));
     if let Some(supervisor) = robot_supervisor.as_mut() {
         supervisor.shutdown();
@@ -452,6 +460,13 @@ fn lifecycle_status_line(standing_gateway: bool) -> &'static str {
     } else {
         LIFECYCLE_DESK
     }
+}
+
+/// The watchdog deadline for a shutdown: the robot supervisor's stop grace
+/// (zero without a supervisor), during which its stop may wait for a running
+/// revocation fetch, plus the hard-exit deadline for the rest of teardown.
+fn shutdown_deadline(hard_exit: Duration, supervisor_grace: Duration) -> Duration {
+    hard_exit + supervisor_grace
 }
 
 /// Resolve the hard-exit deadline from a [`HARD_EXIT_ENV`] value (already
@@ -773,6 +788,7 @@ mod tests {
         assert!(USAGE.contains(daemon::IDLE_GRACE_ENV));
         // The hard-exit deadline knob is discoverable from --help.
         assert!(USAGE.contains(HARD_EXIT_ENV));
+        assert!(USAGE.contains(cerulion_netd::robot_supervisor::EPOCH_SYNC_STOP_GRACE_ENV));
         assert!(USAGE.contains(&format!(
             "{}={}",
             cerulion_discovery::unencrypted_quic::UNENCRYPTED_QUIC_ENV,
@@ -915,6 +931,19 @@ mod tests {
             resolve_hard_exit_timeout(Some("  1200  ")),
             Duration::from_millis(1200)
         );
+    }
+
+    #[test]
+    fn the_shutdown_deadline_outlasts_the_supervisor_stop_grace() {
+        let hard_exit = Duration::from_secs(5);
+        assert_eq!(shutdown_deadline(hard_exit, Duration::ZERO), hard_exit);
+        let grace = Duration::from_secs(35);
+        let deadline = shutdown_deadline(hard_exit, grace);
+        assert!(
+            deadline > grace,
+            "{deadline:?} must outlast the {grace:?} stop grace"
+        );
+        assert_eq!(deadline, grace + hard_exit);
     }
 
     #[test]

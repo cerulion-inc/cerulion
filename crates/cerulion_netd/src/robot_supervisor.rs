@@ -69,6 +69,7 @@ fn wait_while_running(running: &AtomicBool, delay: Duration) -> bool {
 pub struct RobotSupervisor {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    stop_grace: Duration,
 }
 
 impl RobotSupervisor {
@@ -78,6 +79,7 @@ impl RobotSupervisor {
         gateway: Arc<crate::GatewayEgressPlane>,
     ) -> io::Result<Self> {
         let worker_running = Arc::clone(&running);
+        let stop_grace = epoch_sync_stop_grace_from_env();
         let thread = std::thread::Builder::new()
             .name("netd-robot-supervisor".into())
             .spawn(move || {
@@ -85,7 +87,7 @@ impl RobotSupervisor {
                 while worker_running.load(Ordering::SeqCst) {
                     attempt += 1;
                     let started = Instant::now();
-                    let result = run(&worker_running, |eid| {
+                    let result = run(&worker_running, stop_grace, |eid| {
                         gateway
                             .refresh_robot_beacon(eid)
                             .map_err(|error| error.to_string())
@@ -122,7 +124,14 @@ impl RobotSupervisor {
         Ok(Self {
             running,
             thread: Some(thread),
+            stop_grace,
         })
+    }
+
+    /// The longest [`Self::shutdown`] waits for a running revocation fetch
+    /// ([`EPOCH_SYNC_STOP_GRACE_ENV`]).
+    pub fn stop_grace(&self) -> Duration {
+        self.stop_grace
     }
 
     /// Stop and reap the owned child before netd tears down its LAN plane.
@@ -190,6 +199,7 @@ fn validate_prepared(prepared: &Prepared, root: &Path) -> Result<(), String> {
 
 fn run(
     running: &AtomicBool,
+    stop_grace: Duration,
     refresh_facts: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     let root = cerulion_discovery::robot_state::resolve()
@@ -248,7 +258,7 @@ fn run(
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
     let period = epoch_sync_period_from_env();
-    let mut epoch_sync = EpochSync::new(cli, root.clone(), period, Instant::now());
+    let mut epoch_sync = EpochSync::new(cli, root.clone(), period, stop_grace, Instant::now());
     let result = supervise_server(
         &mut child,
         &mut epoch_sync,
@@ -256,6 +266,9 @@ fn run(
         &provisioned.endpoint_id,
         &refresh_facts,
     );
+    // Dropping the server child kills and reaps it, so the robot stops serving
+    // before the wait for a running fetch.
+    drop(child);
     epoch_sync.stop();
     result
 }
@@ -334,12 +347,63 @@ pub fn resolve_epoch_sync_period(env_value: Option<&str>) -> Duration {
 fn epoch_sync_period_from_env() -> Duration {
     resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref())
 }
+
+/// The environment variable setting how long a netd shutdown waits for a
+/// running revocation fetch to finish before stopping it, in whole seconds from
+/// 5 to 120. A longer wait lets a session refresh in flight publish its
+/// rotated token pair; it also lengthens a shutdown that lands during a fetch.
+/// A shutdown with no fetch running, or with one that ends sooner, does not
+/// wait. The robot server is stopped before this wait, and netd's hard-exit
+/// deadline (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
+pub const EPOCH_SYNC_STOP_GRACE_ENV: &str = "CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S";
+/// What the stop grace adds to one account HTTP exchange: the worker's local
+/// publication of the refreshed pair and its own exit after the exchange.
+const EPOCH_SYNC_STOP_MARGIN: Duration = Duration::from_secs(5);
+/// The default stop grace: one account HTTP exchange plus the margin.
+const DEFAULT_EPOCH_SYNC_STOP_GRACE: Duration = Duration::from_secs(
+    cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT.as_secs()
+        + EPOCH_SYNC_STOP_MARGIN.as_secs(),
+);
+/// The shortest accepted stop grace.
+const MIN_EPOCH_SYNC_STOP_GRACE: Duration = Duration::from_secs(5);
+/// The longest accepted stop grace: the bound on one whole fetch.
+const MAX_EPOCH_SYNC_STOP_GRACE: Duration = EPOCH_SYNC_DEADLINE;
+const _: () = assert!(
+    DEFAULT_EPOCH_SYNC_STOP_GRACE.as_secs() >= MIN_EPOCH_SYNC_STOP_GRACE.as_secs()
+        && DEFAULT_EPOCH_SYNC_STOP_GRACE.as_secs() <= MAX_EPOCH_SYNC_STOP_GRACE.as_secs()
+);
+
+/// The stop grace from an [`EPOCH_SYNC_STOP_GRACE_ENV`] value: whole seconds
+/// within the accepted range, else the default with a warning.
+pub fn resolve_epoch_sync_stop_grace(env_value: Option<&str>) -> Duration {
+    let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_EPOCH_SYNC_STOP_GRACE;
+    };
+    match value.parse::<u64>().map(Duration::from_secs) {
+        Ok(grace) if (MIN_EPOCH_SYNC_STOP_GRACE..=MAX_EPOCH_SYNC_STOP_GRACE).contains(&grace) => {
+            grace
+        }
+        _ => {
+            tracing::warn!(
+                value = ?value,
+                min_s = MIN_EPOCH_SYNC_STOP_GRACE.as_secs(),
+                max_s = MAX_EPOCH_SYNC_STOP_GRACE.as_secs(),
+                default_s = DEFAULT_EPOCH_SYNC_STOP_GRACE.as_secs(),
+                "{EPOCH_SYNC_STOP_GRACE_ENV} is not whole seconds within min_s..=max_s; using default_s"
+            );
+            DEFAULT_EPOCH_SYNC_STOP_GRACE
+        }
+    }
+}
+
+/// The stop grace this process's environment sets ([`EPOCH_SYNC_STOP_GRACE_ENV`]).
+fn epoch_sync_stop_grace_from_env() -> Duration {
+    resolve_epoch_sync_stop_grace(std::env::var(EPOCH_SYNC_STOP_GRACE_ENV).ok().as_deref())
+}
 /// The bound on one revocation fetch: above the worker's own worst case (a
 /// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
 /// access request), so the deadline never cuts a refresh in flight.
 const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
-/// How long shutdown waits for a running fetch before stopping it.
-const EPOCH_SYNC_STOP_GRACE: Duration = Duration::from_secs(5);
 /// The shortest gap between two fetches started by connection requests: caps
 /// the account-service load connecting keys can cause at 12 requests a minute.
 const EPOCH_EARLY_FETCH_GAP: Duration = Duration::from_secs(5);
@@ -371,6 +435,7 @@ struct EpochSync {
     cli: PathBuf,
     root: PathBuf,
     period: Duration,
+    stop_grace: Duration,
     child: Option<(OwnedChild, Instant)>,
     next: Instant,
     last_start: Option<Instant>,
@@ -378,11 +443,18 @@ struct EpochSync {
 }
 
 impl EpochSync {
-    fn new(cli: PathBuf, root: PathBuf, period: Duration, now: Instant) -> Self {
+    fn new(
+        cli: PathBuf,
+        root: PathBuf,
+        period: Duration,
+        stop_grace: Duration,
+        now: Instant,
+    ) -> Self {
         Self {
             cli,
             root,
             period,
+            stop_grace,
             child: None,
             next: now,
             last_start: None,
@@ -422,6 +494,7 @@ impl EpochSync {
     }
 
     fn start(&mut self, now: Instant) {
+        use std::os::unix::process::CommandExt;
         self.last_start = Some(now);
         let spawned = Command::new(&self.cli)
             .arg("robot-sync-epoch")
@@ -430,6 +503,9 @@ impl EpochSync {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            // Its own process group: a signal to netd's process group (a
+            // terminal Ctrl-C) does not reach the worker, so only `stop` ends it.
+            .process_group(0)
             .spawn();
         match spawned {
             Ok(child) => self.child = Some((OwnedChild(child), now + EPOCH_SYNC_DEADLINE)),
@@ -440,13 +516,14 @@ impl EpochSync {
         }
     }
 
-    /// Shutdown: give a running fetch [`EPOCH_SYNC_STOP_GRACE`] to finish, then
-    /// stop it (dropping the child kills and reaps it).
+    /// Shutdown: wait for a running fetch to exit, for at most the stop grace,
+    /// then stop it (dropping the child kills and reaps it). Returns as soon as
+    /// the worker exits, and at once when none is running.
     fn stop(&mut self) {
         let Some((mut child, _)) = self.child.take() else {
             return;
         };
-        let until = Instant::now() + EPOCH_SYNC_STOP_GRACE;
+        let until = Instant::now() + self.stop_grace;
         while Instant::now() < until {
             if !matches!(child.0.try_wait(), Ok(None)) {
                 return;

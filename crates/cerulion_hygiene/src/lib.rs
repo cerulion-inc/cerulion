@@ -479,6 +479,12 @@ pub fn read_pidfile(pidfile: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Whether control sockets live in the abstract namespace on this platform:
+/// Android, where the daemon's bind and [`connect_control_socket`] use the path
+/// bytes as an abstract name. An abstract socket has no file permissions, so a
+/// client connecting to one checks the peer is the same user.
+pub const CONTROL_SOCKET_ABSTRACT: bool = cfg!(target_os = "android");
+
 /// Connect to a control socket resolved by [`DaemonSocket::default_socket_path`].
 ///
 /// Android interprets the path bytes as an abstract-namespace socket name.

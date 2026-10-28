@@ -203,19 +203,44 @@ fn the_epoch_sync_period_is_read_from_the_environment() {
 }
 
 /// A stand-in worker: appends one line to `log` per run, exits with `code`.
-fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
+/// Write an executable shell script at `path` and return once it can be
+/// executed. A process forked by a concurrent test before its exec holds a copy
+/// of this write descriptor, and while it does, executing the script fails with
+/// ETXTBSY; a probe run (which exits before `body`) is retried until it starts.
+fn install_script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let log = dir.join("runs.log");
-    let script = dir.join("cerulion");
     std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
-            log.display()
-        ),
+        path,
+        format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}"),
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..500 {
+        match Command::new(path).env("CERULION_TEST_PROBE", "1").status() {
+            Ok(status) => {
+                assert!(
+                    status.success(),
+                    "probe run of {}: {status}",
+                    path.display()
+                );
+                return;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("probe run of {}: {error}", path.display()),
+        }
+    }
+    panic!("{} stayed busy for 5 s", path.display());
+}
+
+fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
+    let log = dir.join("runs.log");
+    let script = dir.join("cerulion");
+    install_script(
+        &script,
+        &format!("echo \"$@\" >> '{}'\nexit {code}\n", log.display()),
+    );
     (script, log)
 }
 
@@ -240,7 +265,13 @@ fn epoch_sync_fetches_at_start_then_each_period_and_early_on_request() {
     let root = dir.path().join("state");
     std::fs::create_dir_all(root.join("remoted")).unwrap();
     let t0 = Instant::now();
-    let mut sync = EpochSync::new(cli, root.clone(), DEFAULT_EPOCH_SYNC_PERIOD, t0);
+    let mut sync = EpochSync::new(
+        cli,
+        root.clone(),
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
     sync.poll(t0);
     settle(&mut sync, t0);
     assert_eq!(runs(&log), 1);
@@ -275,7 +306,13 @@ fn a_failing_epoch_sync_backs_off_and_keeps_trying() {
     let root = dir.path().join("state");
     std::fs::create_dir_all(root.join("remoted")).unwrap();
     let t0 = Instant::now();
-    let mut sync = EpochSync::new(cli, root.clone(), DEFAULT_EPOCH_SYNC_PERIOD, t0);
+    let mut sync = EpochSync::new(
+        cli,
+        root.clone(),
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
     sync.poll(t0);
     settle(&mut sync, t0);
     assert_eq!(sync.failures, 1);
@@ -295,14 +332,18 @@ fn a_failing_epoch_sync_backs_off_and_keeps_trying() {
 
 #[test]
 fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("cerulion");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install_script(&script, "exec sleep 30\n");
     let root = dir.path().join("state");
     let t0 = Instant::now();
-    let mut sync = EpochSync::new(script, root, DEFAULT_EPOCH_SYNC_PERIOD, t0);
+    let mut sync = EpochSync::new(
+        script,
+        root,
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
     sync.poll(t0);
     assert!(sync.child.is_some());
     sync.poll(t0 + EPOCH_SYNC_DEADLINE);
@@ -320,7 +361,13 @@ fn the_server_loop_runs_the_revocation_sync_while_the_server_lives() {
     let root = dir.path().join("state");
     std::fs::create_dir_all(root.join("remoted")).unwrap();
     let mut server = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
-    let mut sync = EpochSync::new(cli, root, DEFAULT_EPOCH_SYNC_PERIOD, Instant::now());
+    let mut sync = EpochSync::new(
+        cli,
+        root,
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        Instant::now(),
+    );
     let running = Arc::new(AtomicBool::new(true));
     let stopper = Arc::clone(&running);
     let watched = log.clone();
@@ -358,7 +405,7 @@ fn the_configured_epoch_sync_period_is_honoured() {
     std::fs::create_dir_all(root.join("remoted")).unwrap();
     let t0 = Instant::now();
     let period = Duration::from_secs(45);
-    let mut sync = EpochSync::new(cli, root, period, t0);
+    let mut sync = EpochSync::new(cli, root, period, DEFAULT_EPOCH_SYNC_STOP_GRACE, t0);
     sync.poll(t0);
     settle(&mut sync, t0);
     assert_eq!(runs(&log), 1);
@@ -367,4 +414,116 @@ fn the_configured_epoch_sync_period_is_honoured() {
     sync.poll(t0 + period);
     settle(&mut sync, t0 + period);
     assert_eq!(runs(&log), 2);
+}
+
+/// A stand-in worker that sleeps `secs`, then appends one line to `log`.
+fn slow_worker(dir: &Path, secs: u32) -> (PathBuf, PathBuf) {
+    let log = dir.join("runs.log");
+    let script = dir.join("cerulion");
+    install_script(
+        &script,
+        &format!("sleep {secs}\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+    );
+    (script, log)
+}
+
+#[test]
+fn the_epoch_sync_stop_grace_comes_from_its_setting_within_bounds() {
+    let secs = |v: Option<&str>| resolve_epoch_sync_stop_grace(v).as_secs();
+    let default = cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT.as_secs()
+        + EPOCH_SYNC_STOP_MARGIN.as_secs();
+    assert_eq!(DEFAULT_EPOCH_SYNC_STOP_GRACE.as_secs(), default);
+    assert_eq!(secs(None), default);
+    assert_eq!(secs(Some("")), default);
+    assert_eq!(secs(Some(" 60 ")), 60);
+    assert_eq!(secs(Some("5")), 5);
+    assert_eq!(secs(Some("120")), 120);
+    for bad in ["4", "121", "0", "-5", "5s", "abc"] {
+        assert_eq!(secs(Some(bad)), default, "{bad}");
+    }
+}
+
+#[test]
+fn stop_waits_for_a_fetch_still_running_after_five_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, log) = slow_worker(dir.path(), 6);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(
+        cli,
+        root,
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
+    sync.poll(t0);
+    assert!(sync.child.is_some());
+    let started = Instant::now();
+    sync.stop();
+    let waited = started.elapsed();
+    assert_eq!(runs(&log), 1, "the fetch finished instead of being killed");
+    assert!(waited < DEFAULT_EPOCH_SYNC_STOP_GRACE, "{waited:?}");
+}
+
+fn pgid_of(pid: u32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn the_fetch_worker_runs_in_its_own_process_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, _log) = slow_worker(dir.path(), 3);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(
+        cli,
+        root,
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        DEFAULT_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
+    sync.poll(t0);
+    let pid = sync.child.as_ref().unwrap().0 .0.id();
+    let worker_group = pgid_of(pid);
+    assert_eq!(
+        worker_group,
+        pid.to_string(),
+        "the worker leads its own group"
+    );
+    assert_ne!(worker_group, pgid_of(std::process::id()));
+    sync.stop();
+}
+
+#[test]
+fn stop_returns_once_the_worker_exits_and_at_once_with_none_running() {
+    let grace = DEFAULT_EPOCH_SYNC_STOP_GRACE;
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, log) = fake_worker(dir.path(), 0);
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(root.join("remoted")).unwrap();
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(cli, root, DEFAULT_EPOCH_SYNC_PERIOD, grace, t0);
+    let started = Instant::now();
+    sync.stop();
+    assert!(
+        started.elapsed() < grace / 10,
+        "idle stop {:?}",
+        started.elapsed()
+    );
+    sync.poll(t0);
+    assert!(sync.child.is_some());
+    let started = Instant::now();
+    sync.stop();
+    assert!(
+        started.elapsed() < grace / 10,
+        "stop {:?}",
+        started.elapsed()
+    );
+    assert_eq!(runs(&log), 1);
 }

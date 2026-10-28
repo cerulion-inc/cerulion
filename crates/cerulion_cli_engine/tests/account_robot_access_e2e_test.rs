@@ -492,3 +492,68 @@ fn a_listing_refreshes_the_listed_robots_revocation_epoch_into_the_dialed_routes
     drop(target);
     daemon.shutdown();
 }
+
+#[test]
+#[serial]
+fn a_listing_waits_out_a_busy_controller_and_installs() {
+    use cerulion_netd::account_access::{
+        AccountAccessReply, AccountAccessRequest, AccountAccessResponse, CONTROLLER_BUSY,
+    };
+    use cerulion_netd::protocol::{ErrorResponse, Hello, Request, Response};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+    let fixture = Fixture::new();
+    let listener = UnixListener::bind(fixture.socket()).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        writeln!(stream, "{}", Hello::new().to_json_line()).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut installs = 0;
+        loop {
+            let mut line = String::new();
+            if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+                return installs;
+            }
+            let Ok(Request::AccountAccess {
+                id,
+                action: AccountAccessRequest::Install { snapshot },
+            }) = serde_json::from_str(&line)
+            else {
+                return installs;
+            };
+            installs += 1;
+            let response = if installs == 1 {
+                Response::Error(ErrorResponse {
+                    id: Some(id),
+                    error: CONTROLLER_BUSY.into(),
+                    robot: None,
+                    topic: None,
+                })
+            } else {
+                Response::AccountAccess(AccountAccessResponse {
+                    id,
+                    account_access: AccountAccessReply::Installed {
+                        robot_count: snapshot.robots.len(),
+                    },
+                })
+            };
+            writeln!(stream, "{}", response.to_json_line()).unwrap();
+        }
+    });
+    let listing = account_robot_access::list().unwrap();
+    let installs = worker.join().unwrap();
+    assert_eq!(installs, 2, "the busy install was retried");
+    assert!(
+        !listing
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains(CONTROLLER_BUSY)),
+        "{:?}",
+        listing.diagnostic
+    );
+    assert_eq!(listing.rows.len(), 1);
+}
