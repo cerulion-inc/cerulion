@@ -29164,6 +29164,46 @@ fn a_step_that_took_more_frames_than_its_depth_replays_with_the_recorded_reads()
     });
 }
 
+/// **The MUTANT that restores the stand-down is caught by the late-relay
+/// oracle.**
+///
+/// `CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT` leaves the engine unable to build a
+/// bag-fed input deeper than it declares, which is the planner refusing the
+/// six-frame step as `queue_overflow` and the pass falling back to the
+/// recorded-clock window. The oracle must fail on the stand-down AND on the
+/// reads it costs.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_depth_stand_down_mutant_is_caught_by_the_late_relay_oracle() {
+    const MUTANT: &str = "CERULION_REPLAY_DEPTH_STAND_DOWN_MUTANT";
+    /// Disarms the mutant however the arm exits.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            std::env::remove_var(MUTANT);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bag = rq_bag(dir.path());
+
+    std::env::set_var(MUTANT, "1");
+    let _disarm = Disarm;
+    let outcome =
+        replay(&bag, rq_replay_factories, None, None).expect("the mutant replay still runs");
+
+    let why = rq_verdict(&outcome).expect_err("the oracle must catch the restored stand-down");
+    assert!(
+        why.contains("stood down") && why.contains("queue_overflow"),
+        "the oracle names the stand-down: {why}"
+    );
+    assert!(
+        why.contains("the replayed reads are not the recorded ones")
+            || why.contains("the produced frames diverged"),
+        "…and what the fallback cost: {why}"
+    );
+}
+
 // ===========================================================================
 // Report accuracy: the decline, the per-rank range, and
 // the fire-plan fold's own precondition
