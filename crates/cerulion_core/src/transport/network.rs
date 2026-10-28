@@ -949,11 +949,14 @@ const ACK_PEER_MAX_LEN: usize = super::mirror_registry::MAX_MIRROR_ROBOT_LEN;
 
 /// The longest key part (bytes) either demand wire header latch table stores:
 /// the replying peer name and the topic on the demander side, the demanded
-/// topic on the producer side. A peer chooses the reply key and the demand
-/// key, so a longer part is counted as overlong and never stored; its refusal
-/// is reported through the table's shared overflow latch instead. The same
-/// limit as the ack peer set's. Every real canonical topic is shorter
-/// (a local topic is at most 249 bytes), so no real key loses its own latch.
+/// topic on the producer side. The peer chooses the demander's peer name (the
+/// robot segment of the reply key) and the producer's topic (from the demand
+/// key); the demander's topic is its own ingress topic and shares the one rule
+/// so a key has one bound. A longer part is counted as overlong and never
+/// stored; its refusal is reported through the table's shared overflow latch
+/// instead. The same limit as the ack peer set's. Every real canonical topic
+/// is shorter (a local topic is at most 249 bytes), so no real key loses its
+/// own latch.
 const LATCH_KEY_PART_MAX_LEN: usize = ACK_PEER_MAX_LEN;
 
 /// Flood-suppression latches keyed per (stated version, topic) on the
@@ -7348,7 +7351,7 @@ mod tests {
         (topic_at, topic_over)
     }
 
-    /// T1's steps 1 to 4 against the producer gate, each refusal arm once
+    /// Steps 1 to 4 against the producer gate, each refusal arm once
     /// with an overlong topic and once at the limit.
     fn drive_producer_latch_bounds(state: &GetDemandState, topic_at: &str, topic_over: &str) {
         // Step 1: version 99 on an overlong topic is refused and counted,
@@ -7457,6 +7460,29 @@ mod tests {
         assert_eq!(first, (4, 3, vec![(Some(99), topic_at.clone())]));
     }
 
+    /// The topic length limit counts bytes, not characters: 128 two-byte
+    /// characters (256 bytes) keep their own latch, and one more byte
+    /// (257 bytes in 129 characters) is refused as overlong.
+    #[test]
+    fn the_producer_wire_header_latch_measures_a_multibyte_topic_in_bytes() {
+        let topic_at = "\u{e9}".repeat(128);
+        let topic_over = format!("/{}", "\u{e9}".repeat(128));
+        assert_eq!((topic_at.len(), topic_at.chars().count()), (256, 128));
+        assert_eq!((topic_over.len(), topic_over.chars().count()), (257, 129));
+        let state = GetDemandState::default();
+        assert_eq!(
+            state.wire_header_gate(&topic_over, Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(
+            state.wire_header_gate(&topic_at, Some(&[0x63, 0x00])),
+            Some(ACK_REFUSED_WIRE_HEADER)
+        );
+        assert_eq!(state.wire_header_refusal_count(), 2);
+        assert_eq!(state.wire_header_refusal_latch_overlong_count(), 1);
+        assert_eq!(producer_latch_keys(&state), vec![(Some(99), topic_at)]);
+    }
+
     /// The demander tallies each ack class into its own counter.
     #[tracing_test::traced_test]
     #[test]
@@ -7498,7 +7524,7 @@ mod tests {
             .collect()
     }
 
-    /// T2's steps 1 to 7 against the demander, every ack arm with an overlong
+    /// Steps 1 to 7 against the demander, every ack arm with an overlong
     /// peer or topic and one refusal with both parts at the limit.
     fn drive_demander_latch_bounds(
         state: &DemandGetState,
@@ -7651,6 +7677,27 @@ mod tests {
                 vec![(peer_at.clone(), topic_at.clone())],
                 vec!["go2".to_string(), peer_at.clone()],
             )
+        );
+    }
+
+    /// The peer name and topic length limits count bytes, not characters:
+    /// 128 two-byte characters (256 bytes) keep their own latch, and one more
+    /// byte (257 bytes in 129 characters) is refused as overlong.
+    #[test]
+    fn the_demander_wire_header_latch_measures_a_multibyte_peer_and_topic_in_bytes() {
+        let part_at = "\u{e9}".repeat(128);
+        let part_over = format!("{}r", "\u{e9}".repeat(128));
+        assert_eq!((part_at.len(), part_at.chars().count()), (256, 128));
+        assert_eq!((part_over.len(), part_over.chars().count()), (257, 129));
+        let state = DemandGetState::default();
+        state.record_ack(&part_over, "/a", ACK_REFUSED_WIRE_HEADER);
+        state.record_ack("go2", &part_over, ACK_REFUSED_WIRE_HEADER);
+        state.record_ack(&part_at, &part_at, ACK_REFUSED_WIRE_HEADER);
+        assert_eq!(state.wire_header_refused_ack_count(), 3);
+        assert_eq!(state.wire_header_refused_ack_latch_overlong_count(), 2);
+        assert_eq!(
+            demander_latch_keys(&state),
+            vec![(part_at.clone(), part_at.clone())]
         );
     }
 
