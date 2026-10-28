@@ -432,6 +432,53 @@ fn attach_tap_when_listed(
     }
 }
 
+/// Tap reads grouped into RUNS, a run being every frame read between two empty
+/// reads, and a frame accepted only once its run has closed short of `depth`.
+///
+/// The tap's queue drops its oldest frame only when it is full, and the tap
+/// reads every frame of a full queue before it next reads empty, so a run that
+/// reached `depth` frames is the only place a drop can hide. Until a run closes
+/// its length is unknown, so its frames stay pending; a run that closes at
+/// `depth` or more discards itself and everything accepted before it.
+struct RunGate<T> {
+    depth: usize,
+    run_len: usize,
+    run: Vec<T>,
+    accepted: Vec<T>,
+    restarts: usize,
+}
+
+impl<T> RunGate<T> {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            run_len: 0,
+            run: Vec::new(),
+            accepted: Vec::new(),
+            restarts: 0,
+        }
+    }
+
+    /// A non-empty read: `read` frames left the queue, `kept` of them carry a
+    /// wire header. The read count, not `kept`, measures the run.
+    fn on_read(&mut self, read: usize, kept: impl IntoIterator<Item = T>) {
+        self.run_len += read;
+        self.run.extend(kept);
+    }
+
+    /// An empty read closes the current run.
+    fn on_empty(&mut self) {
+        if self.run_len >= self.depth {
+            self.restarts += 1;
+            self.accepted.clear();
+            self.run.clear();
+        } else {
+            self.accepted.append(&mut self.run);
+        }
+        self.run_len = 0;
+    }
+}
+
 /// Attach the desk-local data-only tap on `topic` once its re-injection service
 /// is listed, then collect `n` full frames and their sequences. Blocking, so it
 /// runs under `spawn_blocking`.
@@ -441,56 +488,44 @@ fn attach_tap_when_listed(
 /// re-injects it back to back. A burst that lands while this tap sleeps between
 /// polls can fill its queue, and a full queue drops its oldest frame: a gap
 /// that is this observer's own overflow, not a loss in the re-inject path.
-/// A drop needs a full queue, and the tap reads all of a full queue before it
-/// next reads empty, so a run of at least the queue depth between two empty
-/// reads is the only place a drop can hide. Such a run restarts the
-/// collection; a gap in what remains is a real loss.
+/// [`RunGate`] accepts only frames from runs that closed short of the queue
+/// depth, so a gap in what it returns is a real loss.
 fn collect_frames(manager: &TransportManager, topic: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
     let mut tap = match attach_tap_when_listed(manager, topic, TAP_READY_TIMEOUT) {
         Ok(tap) => tap,
         Err(reason) => panic!("{reason}"),
     };
     let budget = tap.max_borrowed_samples().max(1);
-    let depth = tap.buffer_size().max(1);
+    let depth = tap.buffer_size();
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(budget);
-    let mut collected: Vec<(u32, Vec<u8>)> = Vec::new();
-    let mut since_empty = 0usize;
-    let mut restarts = 0usize;
+    let mut gate = RunGate::new(depth);
     let deadline = Instant::now() + TAP_COLLECT_TIMEOUT;
-    while collected.len() < n && Instant::now() < deadline {
+    while gate.accepted.len() < n && Instant::now() < deadline {
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
             Ok(0) => {
-                since_empty = 0;
+                gate.on_empty();
                 std::thread::sleep(Duration::from_millis(3));
             }
             Ok(read) => {
-                since_empty += read;
-                if since_empty >= depth {
-                    restarts += 1;
-                    collected.clear();
-                    batch.clear();
-                    continue;
-                }
-                for sample in batch.drain(..) {
-                    let seq = sample.wire_header().map(|h| h.sequence);
-                    let frame = sample.payload().to_vec();
-                    drop(sample);
-                    if let Some(s) = seq {
-                        collected.push((s, frame));
-                    }
-                }
+                let kept = batch.drain(..).filter_map(|sample| {
+                    let seq = sample.wire_header().map(|h| h.sequence)?;
+                    Some((seq, sample.payload().to_vec()))
+                });
+                gate.on_read(read, kept);
             }
             Err(_) => std::thread::sleep(Duration::from_millis(3)),
         }
     }
     assert!(
-        collected.len() >= n,
+        gate.accepted.len() >= n,
         "collected only {} of {n} frames for {topic} within {TAP_COLLECT_TIMEOUT:?} \
-         ({restarts} restart(s) after a run of {depth} or more frames between empty reads)",
-        collected.len()
+         ({} restart(s) after a run of {} or more frames between empty reads)",
+        gate.accepted.len(),
+        gate.restarts,
+        gate.depth
     );
-    collected
+    gate.accepted
 }
 
 /// The desk `ConnectConfig` dialing a robot at `daemon`, demanding `topics`.
@@ -2024,6 +2059,71 @@ fn a_tap_on_an_unlisted_topic_reports_readiness_not_an_attach_failure() {
         "the listing read must gate the attach: an attach-first order reports \
          iceoryx2's open error instead: {reason}"
     );
+}
+
+/// The overflow path a per-read counter misses: two frames, an empty read, then a
+/// burst that overflowed the queue during the sleep. Frames read from the burst
+/// before its run closes stay pending, so they never complete a collection
+/// across the gap; once the run closes at the queue depth, it and everything
+/// before it are discarded, and the next short run is accepted.
+#[test]
+fn the_run_gate_holds_a_run_until_it_closes_short_of_the_queue_depth() {
+    let mut gate = RunGate::new(16);
+    gate.on_read(2, [11u32, 12]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "a closed short run is accepted"
+    );
+
+    // The queue overflowed while the tap slept: it now holds 25..=40.
+    gate.on_read(2, [25, 26]);
+    gate.on_read(2, [27, 28]);
+    assert_eq!(
+        gate.accepted,
+        vec![11, 12],
+        "an open run is never accepted, so 6 frames cannot be reached across the gap"
+    );
+    for pair in (29..=40).collect::<Vec<u32>>().chunks(2) {
+        gate.on_read(pair.len(), pair.iter().copied());
+    }
+    gate.on_empty();
+    assert!(
+        gate.accepted.is_empty(),
+        "a run that reached the depth discards itself and all before it: {:?}",
+        gate.accepted
+    );
+    assert_eq!(gate.restarts, 1);
+
+    gate.on_read(1, [41]);
+    gate.on_empty();
+    gate.on_read(1, [42]);
+    gate.on_empty();
+    assert_eq!(
+        gate.accepted,
+        vec![41, 42],
+        "live runs after the burst are accepted"
+    );
+}
+
+/// A run one short of the depth cannot have overflowed and is kept whole; a
+/// header-less frame counts toward the run but is not returned.
+#[test]
+fn the_run_gate_keeps_a_run_below_the_depth_and_counts_unkept_reads() {
+    let mut gate = RunGate::new(4);
+    gate.on_read(3, [1u32, 2, 3]);
+    gate.on_empty();
+    assert_eq!(gate.accepted, vec![1, 2, 3]);
+    assert_eq!(gate.restarts, 0);
+
+    gate.on_read(4, [4, 5, 6]);
+    gate.on_empty();
+    assert_eq!(
+        gate.restarts, 1,
+        "four reads reach the depth even with three kept"
+    );
+    assert!(gate.accepted.is_empty());
 }
 
 /// A spawned producer's topic exists on the robot's root by the time the spawn
