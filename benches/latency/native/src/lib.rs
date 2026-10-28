@@ -339,7 +339,7 @@ pub fn fixed100_plan(rate_hz: u64) -> BenchPlan {
 /// rung is announced loudly — never a silent mixed-rate line); an
 /// exhausted ladder dumps NO `.bin` and a `did_not_sustain` sidecar —
 /// a latency number is never minted from a run that could not hold any
-/// rung (Principle #13).
+/// rung (no fake data).
 pub fn run_sized_bench<F>(payload_size: usize, mut run: F)
 where
     F: FnMut(&mut BenchPlan) -> Vec<u64>,

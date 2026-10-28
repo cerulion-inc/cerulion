@@ -170,7 +170,7 @@ machine hash comes from
 tools/scripts/benchmarks/lib/machine_hash.sh::compute_live_machine_hash: the
 repo-level single source of truth; never reimplemented here.
 
-No number is ever fabricated by this script (Principle #13: no fake data):
+No number is ever fabricated by this script (the no-fake-data rule):
 results/ ships empty, expected-ranges.yaml ships `hosts: {}`, and baselines
 are written only by `smoke --capture-baseline` from real measured p50s.
 """

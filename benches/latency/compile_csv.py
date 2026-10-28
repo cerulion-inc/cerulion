@@ -87,7 +87,7 @@ A cell that exhausted the ladder at a payload carries a `did_not_sustain`
 sidecar and NO `.bin`: the row is written EMPTY (payload + chrt +
 achieved_rate_hz=did_not_sustain, every stat cell blank, iterations 0)
 with a loud stderr note — a recorded no-latency outcome, never a fake
-number (Principle #13) and never a silent hole.
+number (no fake data) and never a silent hole.
 
 Cross-rep semantics:
 
@@ -931,7 +931,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         # fixed100 ladder exhausted in EVERY rep: the
                         # correct EMPTY row — payload + chrt +
                         # did_not_sustain, every stat cell blank. Loud,
-                        # and never a fabricated latency (Principle #13).
+                        # and never a fabricated latency (no fake data).
                         # The two drop columns are blank here for the same
                         # reason `loaned` is: this row describes no
                         # measured run, and the receipt that may exist

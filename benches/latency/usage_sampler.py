@@ -47,7 +47,7 @@ list under its mmap_lock, so a page-faulting target can be briefly
 delayed by the observer; that cost lands in the target's numbers, not
 the sampler's footer (another reason usage runs are companion runs,
 never headline latency rows). No number here is ever fabricated:
-unreadable = empty + counted, never zero (Principle #13).
+unreadable = empty + counted, never zero (no fake data).
 
 Docker cells (`--docker-name`): the sampler polls
 `docker inspect -f '{{.State.Pid}}'` (bounded by --docker-wait-s) for
@@ -307,7 +307,7 @@ def one_line(text: str) -> str:
     field does not merely truncate provenance — it emits a SECOND line
     that is not a comment, and one carrying five commas whose numeric
     fields happen to parse is read as a measurement nobody sampled
-    (Principle #13: never fabricate data).
+    (the no-fake-data rule: never fabricate data).
     Four fields carry text this module does not choose: `--label` and
     `--docker-name` come from the caller, `comm` is whatever a process
     called itself, and the cgroup dir comes from /proc.

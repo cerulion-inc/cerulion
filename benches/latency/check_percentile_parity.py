@@ -1704,7 +1704,7 @@ def check_one_line_encoder() -> int:
     The sidecar is line-oriented and plot_usage accepts any non-`#` line
     with 6 comma-separated fields as a measurement, so a line break in
     `--label` / `--docker-name` / a process's `comm` emits a row nobody
-    sampled (Principle #13). The encoder folds on `str.splitlines()`, the
+    sampled (no fake data). The encoder folds on `str.splitlines()`, the
     same function the reader splits on; these vectors pin that the fold
     covers the WHOLE of that set, not just CR/LF — the four exotic
     separators below are exactly what a hand-written escape would miss.
@@ -3929,7 +3929,7 @@ def _cell_level_contradiction_arm(td: str, dns_size: int) -> int:
     rc) takes the STRICT compile from rc 1 to rc 0 and ships a row whose
     achieved_rate_hz column reads did_not_sustain -- fabricated latency at
     a payload the ladder declared exhausted, in the DEFAULT mode, at exit 0
-    (Principle #13). Not the --allow-partial-only hazard the sibling arm's
+    (no fake data). Not the --allow-partial-only hazard the sibling arm's
     comments describe.
 
     rep1 is the real exhaustion (sidecar, no `.bin`); rep2 carries the
@@ -4999,8 +4999,8 @@ def _series_for_stem(stem: str, label=None, csv=None):
 def _write_synthetic_results(results_dir: Path, series) -> None:
     """Hand-shaped results CSVs (the parse_results_csv column contract)
     so plot_group can render on a host with no real sweep — the
-    NUMBERS are throwaway geometry, never a measurement (Principle
-    #13); the render exists only to observe the footnote block."""
+    NUMBERS are throwaway geometry, never a measurement (no fake
+    data); the render exists only to observe the footnote block."""
     for s in series:
         rows = ["payload_bytes,iterations,round_trip_p50_ns,"
                 "round_trip_p99_ns,achieved_rate_hz"]

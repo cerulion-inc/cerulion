@@ -29,7 +29,7 @@ Steady window: samples inside [t0 + 20% span, t1 − 5% span] — bring-up
 (graph build, discovery, container start) and teardown are excluded
 from the mean. Per-tick totals sum across the cell's sampled processes.
 
-PSS is ALL-OR-NOTHING (Principle #13): a summed PSS is correct only when
+PSS is ALL-OR-NOTHING (no fake data): a summed PSS is correct only when
 it covers the WHOLE process tree, so a cell's PSS is UNMEASURED — not a
 partial sum — unless (a) the sidecar's sampler_self footer is present
 with pss_denied=0 (a torn/killed sampler proves nothing about coverage)

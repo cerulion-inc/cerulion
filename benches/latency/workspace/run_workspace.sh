@@ -1816,7 +1816,7 @@ for SIZE in "${SIZES[@]}"; do
                 echo "!!! recorded in $(basename "$RATE_PATH"); plots annotate the point '@${ACHIEVED}Hz'." >&2
             fi
         else
-            # Ladder exhausted: NO latency is minted (Principle #13) —
+            # Ladder exhausted: NO latency is minted (no fake data) —
             # no .bin, a did_not_sustain sidecar, and the row renders
             # 'did not sustain' downstream.
             rm -f "$BIN_PATH"
