@@ -40,6 +40,10 @@
 //!   same as the same fixture recorded process per node, whose bag has the same
 //!   rank shape (an evicting stream is printed, not compared: a replay through
 //!   a real queue reproduces no eviction under any placement).
+//! * `a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes_under_load`:
+//!   the same comparison while busy-loop children (`CER_UNITS_LOAD_CHILDREN`,
+//!   default half the CPUs) hold the host's CPUs busy; it prints one
+//!   `UNDER_LOAD stressor=...` line naming the load.
 //! * `a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process`:
 //!   the three-rank chain recorded both ways; the relay's first fire co-hosted
 //!   must stay within a bound of its own-process twin. A first fire longer than
@@ -454,6 +458,71 @@ fn kind(v: &RowVerdict) -> &'static str {
 #[ignore = "box-only: real runs on a quiet Linux host"]
 #[serial]
 fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
+    replays_like_separate_processes("idle");
+}
+
+/// The comparison above with half the host's CPUs held busy for the whole
+/// arm, so the units' threads and the recorder compete for CPU time.
+#[test]
+#[ignore = "box-only: real runs on a Linux host, loaded by the arm itself"]
+#[serial]
+fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes_under_load() {
+    let _load = CpuStressor::start(stressor_children());
+    replays_like_separate_processes("loaded");
+}
+
+/// Busy-loop children for the under-load arm: `CER_UNITS_LOAD_CHILDREN`, else
+/// half the CPUs this process may run on (at least one).
+fn stressor_children() -> usize {
+    std::env::var("CER_UNITS_LOAD_CHILDREN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+        })
+}
+
+/// Child processes each spinning `while :; do :; done` in `sh`, unpinned,
+/// killed and reaped when the guard drops.
+struct CpuStressor {
+    children: Vec<std::process::Child>,
+}
+
+impl CpuStressor {
+    fn start(count: usize) -> Self {
+        let children = (0..count)
+            .map(|_| {
+                std::process::Command::new("sh")
+                    .args(["-c", "while :; do :; done"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("RI_HARNESS: spawn a busy-loop child")
+            })
+            .collect();
+        let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+        eprintln!(
+            "UNDER_LOAD stressor=sh_busy_loop children={count} cpus_available={cpus} pinned=no"
+        );
+        Self { children }
+    }
+}
+
+impl Drop for CpuStressor {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Record the fan-out and three-rank fixtures in one process group and with
+/// one process per node, resim both, and require every gap-free stream to
+/// judge the same under both placements. `leg` names the host condition in
+/// the printed lines.
+fn replays_like_separate_processes(leg: &str) {
     let mut compared = 0usize;
     let mut excess = 0usize;
     for fixture in [Fixture::FanOut, Fixture::Ranks3] {
@@ -471,7 +540,7 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
             let gaps = sequence_gaps(&run, &row.node, &row.input);
             let declared_gaps = sequence_gaps(&declared_run, &row.node, &row.input);
             eprintln!(
-                "UNITS_REPLAY fixture={} node={} input={} one_group_gaps={gaps} \
+                "UNITS_REPLAY leg={leg} fixture={} node={} input={} one_group_gaps={gaps} \
                  declared_gaps={declared_gaps} one_group_verdict={}",
                 fixture.name(),
                 row.node,
@@ -550,7 +619,9 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
             compared += 1;
         }
     }
-    eprintln!("UNITS_REPLAY_SUMMARY compared={compared} eviction_excess_streams={excess}");
+    eprintln!(
+        "UNITS_REPLAY_SUMMARY leg={leg} compared={compared} eviction_excess_streams={excess}"
+    );
     assert!(
         compared >= 3,
         "RI_HARNESS: only {compared} gap-free stream(s) were compared; the arm proves nothing"
