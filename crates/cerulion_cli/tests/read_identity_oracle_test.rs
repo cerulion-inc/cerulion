@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The read-identity oracle's own checks, on every platform: the judge
 //! against hand-built logs (its mutants included), the record reader's
-//! rules, and the harness workspace build (every generated node source
-//! compiles). Nothing here loads a node or runs a graph; the live and resim
-//! arms are in `read_identity_box_test`.
+//! rules, the fire-window check the slow-node arms run on every leg, and the
+//! harness workspace build (every generated node source compiles). Nothing
+//! here loads a node or runs a graph; the live and resim arms are in
+//! `read_identity_box_test`.
 
 mod det_scaffold;
 mod mp_support;
@@ -11,7 +12,8 @@ mod read_identity;
 mod scaffold_dir;
 
 use read_identity::{
-    judge_streams, payload_hash, read_from_bits, Floors, Read, ReadLog, RowVerdict,
+    check_fire_window, fire_window, judge_streams, payload_hash, read_from_bits, Floors, Read,
+    ReadLog, RowVerdict, WINDOW_PARTS,
 };
 
 /// The bit patterns a node records for the frame `(writer, seq, z)`.
@@ -313,4 +315,72 @@ fn the_harness_workspace_builds_every_node_type() {
         read_identity::write_graph(ws, &config);
         assert!(ws.graphs_dir.join(format!("{graph}.yaml")).exists());
     }
+}
+
+/// `(fire ns, latency ns)` samples: one fire every `period_ns` over
+/// `[from_ns, to_ns)`, each with a 10 us latency.
+fn fires_every(period_ns: u64, from_ns: u64, to_ns: u64) -> Vec<(u64, u64)> {
+    (from_ns..to_ns)
+        .step_by(period_ns as usize)
+        .map(|t| (t, 10_000))
+        .collect()
+}
+
+/// The measured window of these tests: 4 s, from 1 s on the clock.
+const W_FROM: u64 = 1_000_000_000;
+const W_TO: u64 = 5_000_000_000;
+const SLACK: u64 = 100_000_000;
+
+#[test]
+fn a_steady_window_passes_with_its_fires_in_every_part() {
+    let w = fire_window(
+        &fires_every(1_000_000, W_FROM, W_TO + 1),
+        W_FROM,
+        W_TO,
+        SLACK,
+    );
+    assert_eq!(w.fires, 4001);
+    assert_eq!(w.parts.iter().sum::<usize>(), w.fires);
+    assert!(w.parts.iter().all(|&n| n >= 1000), "{:?}", w.parts);
+    assert!(w.edges_ok);
+    assert!((w.rate_hz - 1000.25).abs() < 0.01, "{}", w.rate_hz);
+    assert_eq!((w.p50_ns, w.p99_ns), (10_000, 10_000));
+    assert_eq!(check_fire_window(&w, 2000), Ok(()));
+}
+
+#[test]
+fn an_empty_window_fails_at_any_floor() {
+    let w = fire_window(&[], W_FROM, W_TO, SLACK);
+    assert_eq!((w.fires, w.parts), (0, [0; WINDOW_PARTS]));
+    assert_eq!(w.p99_ns, u64::MAX);
+    for floor in [0, 1, 10, 2000] {
+        let err = check_fire_window(&w, floor).unwrap_err();
+        assert!(err.contains("0 fires"), "floor {floor}: {err}");
+    }
+}
+
+#[test]
+fn a_window_stalled_for_its_back_half_fails() {
+    let mid = W_FROM + (W_TO - W_FROM) / 2;
+    let w = fire_window(&fires_every(1_000_000, W_FROM, mid), W_FROM, W_TO, SLACK);
+    assert_eq!(w.fires, 2000, "the front half alone meets a 50% floor");
+    let err = check_fire_window(&w, 2000).unwrap_err();
+    assert!(err.contains("no fire in part 3 of 4"), "{err}");
+}
+
+#[test]
+fn a_window_under_its_floor_fails_even_with_every_part_covered() {
+    let w = fire_window(
+        &fires_every(1_000_000_000, W_FROM, W_TO),
+        W_FROM,
+        W_TO,
+        SLACK,
+    );
+    assert_eq!(w.parts, [1; WINDOW_PARTS]);
+    let err = check_fire_window(&w, 10).unwrap_err();
+    assert!(
+        err.contains("4 fires in the measured window, under the floor of 10"),
+        "{err}"
+    );
+    assert_eq!(check_fire_window(&w, 4), Ok(()));
 }

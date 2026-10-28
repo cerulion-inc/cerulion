@@ -515,6 +515,106 @@ pub fn judge(
 }
 
 // ===========================================================================
+// Fire windows: a node's fires over one measured window.
+// ===========================================================================
+
+/// The equal parts a measured window is split into; [`check_fire_window`]
+/// requires a fire in every one.
+pub const WINDOW_PARTS: usize = 4;
+
+/// One node's fires over the measured window `[from_ns, to_ns]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FireWindow {
+    pub from_ns: u64,
+    pub to_ns: u64,
+    /// Fires inside the window.
+    pub fires: usize,
+    /// `fires` over the window's length.
+    pub rate_hz: f64,
+    /// Latency percentiles of the fires inside the window; `u64::MAX` when
+    /// there are none.
+    pub p50_ns: u64,
+    pub p99_ns: u64,
+    /// The first and last fires inside the window lie within the edge slack
+    /// of its ends.
+    pub edges_ok: bool,
+    /// Fires in each of the window's [`WINDOW_PARTS`] equal parts.
+    pub parts: [usize; WINDOW_PARTS],
+}
+
+/// The [`FireWindow`] of `samples` (`(fire ns, latency ns)` per fire, any
+/// order) over `[from_ns, to_ns]`, with `edge_slack_ns` for
+/// [`FireWindow::edges_ok`]. Panics `RI_HARNESS:` when `to_ns <= from_ns`.
+pub fn fire_window(
+    samples: &[(u64, u64)],
+    from_ns: u64,
+    to_ns: u64,
+    edge_slack_ns: u64,
+) -> FireWindow {
+    assert!(
+        to_ns > from_ns,
+        "RI_HARNESS: an empty measured window [{from_ns}, {to_ns}]"
+    );
+    let mut inside: Vec<(u64, u64)> = samples
+        .iter()
+        .copied()
+        .filter(|(t, _)| *t >= from_ns && *t <= to_ns)
+        .collect();
+    inside.sort_unstable();
+    let len = to_ns - from_ns;
+    let mut parts = [0usize; WINDOW_PARTS];
+    for (t, _) in &inside {
+        let k = ((t - from_ns) as u128 * WINDOW_PARTS as u128 / len as u128) as usize;
+        parts[k.min(WINDOW_PARTS - 1)] += 1;
+    }
+    let edges_ok = inside
+        .first()
+        .is_some_and(|f| f.0 <= from_ns + edge_slack_ns)
+        && inside.last().is_some_and(|l| l.0 + edge_slack_ns >= to_ns);
+    let mut lat: Vec<u64> = inside.iter().map(|(_, l)| *l).collect();
+    lat.sort_unstable();
+    let pct = |p: f64| {
+        if lat.is_empty() {
+            return u64::MAX;
+        }
+        lat[((lat.len() - 1) as f64 * p).round() as usize]
+    };
+    FireWindow {
+        from_ns,
+        to_ns,
+        fires: inside.len(),
+        rate_hz: inside.len() as f64 / (len as f64 / 1e9),
+        p50_ns: pct(0.50),
+        p99_ns: pct(0.99),
+        edges_ok,
+        parts,
+    }
+}
+
+/// `Ok` when `w` holds at least `floor` fires (a floor of 0 counts as 1) and
+/// at least one fire in each of its [`WINDOW_PARTS`] parts. `Err` names the
+/// shortfall: an empty window, a count under the floor, or the first part
+/// with no fire (the node stalled there).
+pub fn check_fire_window(w: &FireWindow, floor: usize) -> Result<(), String> {
+    let floor = floor.max(1);
+    if w.fires < floor {
+        return Err(format!(
+            "{} fires in the measured window, under the floor of {floor}",
+            w.fires
+        ));
+    }
+    if let Some(k) = w.parts.iter().position(|&n| n == 0) {
+        return Err(format!(
+            "no fire in part {} of {WINDOW_PARTS} of the measured window (fires per part {:?}): \
+             the node stalled there",
+            k + 1,
+            w.parts
+        ));
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // Node types.
 // ===========================================================================
 
