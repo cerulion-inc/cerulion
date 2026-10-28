@@ -1073,6 +1073,9 @@ fn ros2_exit_code(
             return ExitCode::from(ros2_cmd::classify(&e));
         }
     };
+    if let Some(notice) = ros2_cmd::delivery_notice(&plan) {
+        eprintln!("{notice}");
+    }
     // exec() returns ONLY on failure — on success this process IS ros2 now.
     let err = ros2_cmd::exec_ros2(&plan);
     let code = ros2_cmd::classify(&err);
