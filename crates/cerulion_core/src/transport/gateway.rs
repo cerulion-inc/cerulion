@@ -749,6 +749,10 @@ pub struct GatewayRuntime {
     /// queue. The per-topic counters (forwarded, dropped,
     /// refused, failed, discarded) live on the lanes; see [`Self::egress_stats`].
     egress_lanes: EgressLanes,
+    /// The LAN access epoch read at the start of the current drive pass;
+    /// every frame the pass queues carries it. A pass that reads a newer
+    /// epoch first detaches every tap and empties every send queue.
+    pass_lan_epoch: u64,
     /// The periodic WARN (refused or failed) or INFO (best-effort drops) for
     /// topics whose egress lost frames, checked at the
     /// end of each drive pass (one clock read; a counter read every
@@ -1288,6 +1292,7 @@ impl GatewayRuntime {
             boot_topics,
             taps: HashMap::new(),
             egress_lanes: EgressLanes::new(),
+            pass_lan_epoch: 0,
             loss_report: LossReport::default(),
             forward_warn,
             attach_failures,
@@ -1527,6 +1532,17 @@ impl GatewayRuntime {
         // holds it.
         let manager = Arc::clone(&self.manager);
         let _egress_pass = manager.bridge_manager().egress_pass();
+        // Read before any flag load. Frames this pass queues carry this
+        // epoch; a sender puts a frame only while the epoch is unchanged.
+        let epoch = manager.bridge_manager().lan_epoch();
+        if epoch != self.pass_lan_epoch {
+            // LAN access closed since the last pass: every attached tap may
+            // hold frames published before the close, and every send queue
+            // frames queued before it. Detach the taps and empty the queues;
+            // a demanded topic re-attaches a fresh tap below.
+            self.detach_egress_after_lan_close();
+            self.pass_lan_epoch = epoch;
+        }
         // One bump per pass (Principle #3): the observable a
         // zero-demand CEILING is asserted on, and the only way to tell "paced by
         // the demand wait" from "spinning" without a profiler (the
@@ -2367,6 +2383,25 @@ impl GatewayRuntime {
         )
     }
 
+    /// Detach every egress tap and discard every queued egress frame, the
+    /// state a demand transition to "no demand" leaves for one topic, for all
+    /// topics at once.
+    // hot-path-alloc-ok-fn: once per LAN access close, not per frame.
+    fn detach_egress_after_lan_close(&mut self) {
+        let topics: Vec<String> = self.taps.keys().cloned().collect();
+        for topic in &topics {
+            self.taps.remove(topic);
+            self.liveness.set_externally_observed(topic, false);
+        }
+        self.egress_lanes.discard_all_queued();
+        if !topics.is_empty() {
+            tracing::debug!(
+                taps = topics.len(),
+                "gateway egress taps detached and send queues emptied after LAN access closed"
+            );
+        }
+    }
+
     /// Hand one drained wire frame to `topic`'s send queue. Returns `true`
     /// when the queue took it (a full best-effort queue takes it by dropping
     /// its oldest frame), `false` when a full reliable queue refused it, the
@@ -2376,7 +2411,7 @@ impl GatewayRuntime {
             return false;
         };
         matches!(
-            lane.enqueue(frame),
+            lane.enqueue(self.pass_lan_epoch, frame),
             EnqueueOutcome::Queued | EnqueueOutcome::ReplacedOldest
         )
     }

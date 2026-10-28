@@ -1073,3 +1073,89 @@ fn a_stalled_link_does_not_stall_a_topic_on_another_link() {
         "the slow topic's sender was still waiting on its link: {slow_during:?}"
     );
 }
+
+/// Frames published while the gateway had not yet drained them, then a LAN
+/// close and a reopen with the topic demanded again: none of them reaches the
+/// peer. Frames published after the reopen do, in order.
+#[test]
+fn frames_published_before_a_lan_close_never_reach_a_peer_after_a_reopen() {
+    const BEFORE: u32 = 3;
+    const AFTER: u32 = 3;
+    let mut r = StallRig::new("tapclose", EgressReliability::Reliable, Some(8));
+    // The tap holds these; no drive pass takes them off it.
+    publish_burst(&mut r.publisher, 0, BEFORE, STALL_LEN, Duration::ZERO);
+    let network = r.gateway.manager().network().expect("G has a network");
+    network.set_lan_access(cerulion_core::LanAccess::Paired);
+    network.set_lan_access(cerulion_core::LanAccess::Open);
+    let bridges = r.gateway.manager().bridge_manager_arc();
+    bridges.enable_bridge(&r.topic).expect("enable");
+    assert!(
+        bridges.is_enabled(&r.topic).expect("enabled?"),
+        "PRECONDITION: the topic is demanded again after the reopen"
+    );
+    drive_for(&mut r.gateway, Duration::from_millis(300));
+    r.offer(BEFORE, AFTER);
+    r.settle();
+    assert_eq!(
+        r.got(),
+        (BEFORE..BEFORE + AFTER).collect::<Vec<_>>(),
+        "only frames published after the reopen arrive"
+    );
+}
+
+/// A close that waits on a put already under way, while access reopens and
+/// the topic is demanded again before that put returns: the frames queued
+/// behind the put are discarded, not sent after the reopen.
+#[test]
+fn a_reopen_during_a_lan_close_does_not_release_frames_queued_before_it() {
+    let mut r = StallRig::new("reopen", EgressReliability::Reliable, Some(8));
+    r.pause();
+    let offered = r.offer_until_stalled(8);
+    let before = r.stats();
+    assert_eq!(
+        (before.queued, before.in_flight),
+        (8, 1),
+        "PRECONDITION: a full queue behind a blocked put: {before:?}"
+    );
+    let network = r.gateway.manager().network().expect("G has a network");
+    let bridges = r.gateway.manager().bridge_manager_arc();
+    let topic = r.topic.clone();
+    std::thread::scope(|scope| {
+        let closer = scope.spawn(|| network.set_lan_access(cerulion_core::LanAccess::Paired));
+        // The close has stored the flags; the put under way still holds the
+        // egress pass, so the close cannot return before the unpause below.
+        assert!(
+            wait_until(5, || bridges.is_lan_closed().unwrap_or(false)),
+            "PRECONDITION: the close started"
+        );
+        network.set_lan_access(cerulion_core::LanAccess::Open);
+        bridges.enable_bridge(&topic).expect("enable");
+        assert!(
+            bridges.is_enabled(&topic).expect("enabled?"),
+            "PRECONDITION: the topic is demanded again while the close waits"
+        );
+        r.proxy.paused.store(false, Ordering::Relaxed);
+        closer.join().expect("closer");
+    });
+    drive_for(&mut r.gateway, Duration::from_millis(500));
+    r.settle();
+    let s = r.stats();
+    assert_eq!(
+        s.forwarded,
+        before.forwarded + 1,
+        "only the put under way is sent: {s:?}"
+    );
+    assert!(s.discarded >= 8, "{s:?}");
+    assert_eq!(accounted(&s), u64::from(offered), "{s:?}");
+    // Control: the lane still delivers frames published after the reopen.
+    const AFTER: u32 = 2;
+    r.offer(offered, AFTER);
+    r.settle();
+    let mut want: Vec<u32> = (0..s.forwarded as u32).collect();
+    want.extend(offered..offered + AFTER);
+    assert_eq!(
+        r.got(),
+        want,
+        "no frame queued before the close arrives after it; frames after the reopen do"
+    );
+}

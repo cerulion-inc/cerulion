@@ -149,7 +149,9 @@ pub struct EgressTopicStats {
 /// from one to another in one step and a snapshot sees it in exactly one.
 #[derive(Debug)]
 struct LaneQueue {
-    frames: VecDeque<Vec<u8>>,
+    /// Each frame with the LAN access epoch
+    /// ([`TopicBridgeManager::lan_epoch`]) of the drive pass that queued it.
+    frames: VecDeque<(u64, Vec<u8>)>,
     closed: bool,
     in_flight: u64,
     forwarded: u64,
@@ -212,9 +214,10 @@ impl EgressLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Offer one frame. Never blocks on the sender thread: the lock is held
-    /// only for the queue operation.
-    pub(crate) fn enqueue(&self, frame: Vec<u8>) -> EnqueueOutcome {
+    /// Offer one frame, tagged with the LAN access epoch `epoch` of the drive
+    /// pass that drained it. Never blocks on the sender thread: the lock is
+    /// held only for the queue operation.
+    pub(crate) fn enqueue(&self, epoch: u64, frame: Vec<u8>) -> EnqueueOutcome {
         let mut queue = self.lock_queue();
         if queue.closed {
             queue.discarded += 1;
@@ -222,10 +225,10 @@ impl EgressLane {
         }
         let outcome = enqueue_decision(self.reliability, queue.frames.len(), self.capacity);
         match outcome {
-            EnqueueOutcome::Queued => queue.frames.push_back(frame),
+            EnqueueOutcome::Queued => queue.frames.push_back((epoch, frame)),
             EnqueueOutcome::ReplacedOldest => {
                 queue.frames.pop_front();
-                queue.frames.push_back(frame);
+                queue.frames.push_back((epoch, frame));
                 queue.dropped += 1;
             }
             EnqueueOutcome::Refused => queue.refused += 1,
@@ -320,10 +323,10 @@ impl EgressLane {
         self.ready.notify_all();
     }
 
-    /// The next frame to send, waiting while the lane is empty, and counted
-    /// in `in_flight` until [`Self::record_put`] or
+    /// The next frame to send with its LAN access epoch, waiting while the
+    /// lane is empty, and counted in `in_flight` until [`Self::record_put`] or
     /// [`Self::discard_in_flight`]. `None` once the lane is closed.
-    fn next_frame(&self) -> Option<Vec<u8>> {
+    fn next_frame(&self) -> Option<(u64, Vec<u8>)> {
         let mut queue = self.lock_queue();
         loop {
             if queue.closed {
@@ -413,22 +416,32 @@ impl EgressLane {
     }
 }
 
-/// The sender thread's loop: pop a frame, re-check demand under the
-/// egress-pass guard, put it, count the result.
+/// Whether a frame queued at LAN access epoch `frame_epoch` may be put now:
+/// the topic is demanded and LAN access has not closed since the frame was
+/// queued. Called with the egress-pass guard held.
+fn may_send(bridges: &TopicBridgeManager, flag: &AtomicBool, frame_epoch: u64) -> bool {
+    bridges.lan_epoch() == frame_epoch && flag.load(Ordering::Relaxed)
+}
+
+/// The sender thread's loop: pop a frame, re-check demand and the LAN access
+/// epoch under the egress-pass guard, put it, count the result.
 ///
 /// The guard is the same rendezvous a drive pass holds: closing LAN access
-/// stores every egress flag `false` and then takes the guard exclusively, so a
-/// put that started before the close finishes first and a frame popped after
-/// it sees the flag `false` and is discarded.
+/// stores every egress flag `false`, advances the LAN access epoch, and then
+/// takes the guard exclusively, so a put that started before the close
+/// finishes first, and a frame of this send queue popped after it is
+/// discarded, also when access has reopened and the topic is demanded again
+/// by then. Frames still in the egress tap are dropped by the gateway's next
+/// drive pass, which detaches every tap when it reads a newer epoch.
 fn run_sender(
     lane: Arc<EgressLane>,
     network: Arc<NetworkManager>,
     bridges: Arc<TopicBridgeManager>,
     flag: Arc<AtomicBool>,
 ) {
-    while let Some(frame) = lane.next_frame() {
+    while let Some((epoch, frame)) = lane.next_frame() {
         let _pass = bridges.egress_pass();
-        if !flag.load(Ordering::Relaxed) {
+        if !may_send(&bridges, &flag, epoch) {
             lane.discard_in_flight();
             continue;
         }
@@ -633,6 +646,13 @@ impl EgressLanes {
         self.lanes.get(topic).map(|h| &h.lane)
     }
 
+    /// Discard the queued frames of every lane, counting each as discarded.
+    pub(crate) fn discard_all_queued(&self) {
+        for handle in self.lanes.values() {
+            handle.lane.discard_queued();
+        }
+    }
+
     /// Open the topic's lane and start its sender thread, unless one is open.
     ///
     /// # Errors
@@ -699,13 +719,16 @@ impl Drop for EgressLanes {
 
 #[cfg(test)]
 mod tests {
+    use super::may_send;
     use super::{
         congestion_control_for, enqueue_decision, loss_increases, EgressLane, EgressStats,
         EgressTopicStats, EnqueueOutcome, LossReport, LOSS_REPORT_INTERVAL,
     };
     use crate::testing::count_at_exclusively;
+    use crate::transport::bridge::TopicBridgeManager;
     use crate::transport::carrier::EgressReliability::{BestEffort, Reliable};
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Instant;
     use tracing_test::traced_test;
@@ -757,17 +780,17 @@ mod tests {
     #[test]
     fn a_full_reliable_lane_refuses_loudly_and_counts() {
         let lane = EgressLane::new("/r/cam", Reliable, 2);
-        assert_eq!(lane.enqueue(frame(1)), EnqueueOutcome::Queued);
-        assert_eq!(lane.enqueue(frame(2)), EnqueueOutcome::Queued);
-        assert_eq!(lane.enqueue(frame(3)), EnqueueOutcome::Refused);
-        assert_eq!(lane.enqueue(frame(4)), EnqueueOutcome::Refused);
+        assert_eq!(lane.enqueue(0, frame(1)), EnqueueOutcome::Queued);
+        assert_eq!(lane.enqueue(0, frame(2)), EnqueueOutcome::Queued);
+        assert_eq!(lane.enqueue(0, frame(3)), EnqueueOutcome::Refused);
+        assert_eq!(lane.enqueue(0, frame(4)), EnqueueOutcome::Refused);
         let stats = lane.snapshot();
         assert_eq!(
             (stats.queued, stats.refused, stats.dropped, stats.forwarded),
             (2, 2, 0, 0)
         );
         assert_eq!(stats.send_queue, 2);
-        assert_eq!(lane.next_frame(), Some(frame(1)));
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(1)));
         let popped = lane.snapshot();
         assert_eq!(
             (popped.queued, popped.in_flight),
@@ -776,9 +799,9 @@ mod tests {
         );
         lane.record_put(Ok(()));
         assert_eq!(lane.snapshot().in_flight, 0);
-        assert_eq!(lane.enqueue(frame(5)), EnqueueOutcome::Queued);
-        assert_eq!(lane.next_frame(), Some(frame(2)));
-        assert_eq!(lane.next_frame(), Some(frame(5)));
+        assert_eq!(lane.enqueue(0, frame(5)), EnqueueOutcome::Queued);
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(2)));
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(5)));
         logs_assert(|lines: &[&str]| {
             let loud = count_at_exclusively(
                 lines,
@@ -802,14 +825,52 @@ mod tests {
     #[test]
     fn a_full_best_effort_lane_keeps_the_newest_and_counts_the_drop() {
         let lane = EgressLane::new("/r/scan", BestEffort, 2);
-        assert_eq!(lane.enqueue(frame(1)), EnqueueOutcome::Queued);
-        assert_eq!(lane.enqueue(frame(2)), EnqueueOutcome::Queued);
-        assert_eq!(lane.enqueue(frame(3)), EnqueueOutcome::ReplacedOldest);
-        assert_eq!(lane.enqueue(frame(4)), EnqueueOutcome::ReplacedOldest);
+        assert_eq!(lane.enqueue(0, frame(1)), EnqueueOutcome::Queued);
+        assert_eq!(lane.enqueue(0, frame(2)), EnqueueOutcome::Queued);
+        assert_eq!(lane.enqueue(0, frame(3)), EnqueueOutcome::ReplacedOldest);
+        assert_eq!(lane.enqueue(0, frame(4)), EnqueueOutcome::ReplacedOldest);
         let stats = lane.snapshot();
         assert_eq!((stats.queued, stats.dropped, stats.refused), (2, 2, 0));
-        assert_eq!(lane.next_frame(), Some(frame(3)));
-        assert_eq!(lane.next_frame(), Some(frame(4)));
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(3)));
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(4)));
+    }
+
+    /// A frame queued before LAN access closed is not put after access
+    /// reopens and the topic is demanded again; a frame queued after the
+    /// reopen is.
+    #[test]
+    fn a_frame_queued_before_a_lan_close_is_never_put_after_a_reopen() {
+        let bridges = TopicBridgeManager::new();
+        bridges.set_egress_allow_all().unwrap();
+        let flag = bridges.register_topic("/t").unwrap();
+        assert!(bridges.enable_bridge("/t").unwrap(), "demanded");
+        let lane = EgressLane::new("/t", Reliable, 4);
+        let before = bridges.lan_epoch();
+        lane.enqueue(before, frame(1));
+        assert!(
+            may_send(&bridges, &flag, before),
+            "control: sendable before the close"
+        );
+
+        bridges.set_lan_closed(true).unwrap();
+        bridges.set_lan_closed(false).unwrap();
+        assert!(bridges.enable_bridge("/t").unwrap(), "demanded again");
+        assert!(flag.load(Ordering::Relaxed), "demand is back");
+
+        let (epoch, popped) = lane.next_frame().unwrap();
+        assert_eq!(popped, frame(1));
+        assert!(
+            !may_send(&bridges, &flag, epoch),
+            "a frame queued before the close is discarded after the reopen"
+        );
+        let after = bridges.lan_epoch();
+        assert_ne!(after, before);
+        lane.enqueue(after, frame(2));
+        let (epoch, _) = lane.next_frame().unwrap();
+        assert!(
+            may_send(&bridges, &flag, epoch),
+            "a frame queued after the reopen is sent"
+        );
     }
 
     /// Ending demand discards what is queued; closing discards the rest,
@@ -818,19 +879,19 @@ mod tests {
     #[test]
     fn discarded_frames_are_counted() {
         let lane = EgressLane::new("/r/odom", Reliable, 4);
-        lane.enqueue(frame(1));
-        lane.enqueue(frame(2));
+        lane.enqueue(0, frame(1));
+        lane.enqueue(0, frame(2));
         lane.discard_queued();
         assert_eq!(lane.snapshot().discarded, 2);
         assert_eq!(lane.snapshot().queued, 0);
-        lane.enqueue(frame(3));
-        assert_eq!(lane.next_frame(), Some(frame(3)));
+        lane.enqueue(0, frame(3));
+        assert_eq!(lane.next_frame().map(|(_, f)| f), Some(frame(3)));
         lane.discard_in_flight();
         assert_eq!(lane.snapshot().in_flight, 0);
-        lane.enqueue(frame(4));
+        lane.enqueue(0, frame(4));
         lane.close();
-        assert_eq!(lane.next_frame(), None);
-        assert_eq!(lane.enqueue(frame(5)), EnqueueOutcome::Closed);
+        assert_eq!(lane.next_frame().map(|(_, f)| f), None);
+        assert_eq!(lane.enqueue(0, frame(5)), EnqueueOutcome::Closed);
         let stats = lane.snapshot();
         assert_eq!((stats.discarded, stats.refused, stats.queued), (5, 0, 0));
     }
@@ -839,8 +900,8 @@ mod tests {
     #[test]
     fn forwarded_counts_only_accepted_puts() {
         let lane = EgressLane::new("/r/odom", Reliable, 4);
-        lane.enqueue(frame(1));
-        lane.enqueue(frame(2));
+        lane.enqueue(0, frame(1));
+        lane.enqueue(0, frame(2));
         assert_eq!(lane.snapshot().forwarded, 0, "queuing is not forwarding");
         lane.next_frame();
         assert_eq!(
@@ -866,9 +927,9 @@ mod tests {
             let lane = EgressLane::new("/r/scan", BestEffort, 3);
             let mut pops = Vec::new();
             for tag in 0..10u8 {
-                lane.enqueue(frame(tag));
+                lane.enqueue(0, frame(tag));
                 if tag % 3 == 0 {
-                    pops.push(lane.next_frame());
+                    pops.push(lane.next_frame().map(|(_, f)| f));
                     lane.record_put(Ok(()));
                 }
             }
@@ -917,10 +978,10 @@ mod tests {
         table.insert(&lane);
         let mut report = LossReport::default();
         let t0 = Instant::now();
-        lane.enqueue(frame(1));
-        lane.enqueue(frame(2));
+        lane.enqueue(0, frame(1));
+        lane.enqueue(0, frame(2));
         report.tick(t0, &table);
-        lane.enqueue(frame(3));
+        lane.enqueue(0, frame(3));
         report.tick(t0, &table);
         report.tick(t0 + LOSS_REPORT_INTERVAL, &table);
         report.tick(t0 + LOSS_REPORT_INTERVAL * 2, &table);

@@ -3839,7 +3839,14 @@ impl NetworkManager {
     /// reopening permits demands but does not replay withheld announces.
     /// Once this call returns with [`LanAccess::Paired`], no gateway puts another
     /// frame until access reopens: closing waits out every drive pass and egress
-    /// put that started before it (after every lock here is released).
+    /// put that started before it (after every lock here is released). After a
+    /// reopen no gateway puts a frame it drained or queued before the close: the
+    /// close advances the LAN access epoch, a sender drops a queued frame of an
+    /// older epoch, and the next drive pass detaches every egress tap and empties
+    /// every send queue. A topic whose publisher keeps history delivers that
+    /// history to the fresh tap, as to any new demand. A drive pass that started
+    /// before the close and drains after a reopen tags its frames with the older
+    /// epoch, so they are dropped too.
     ///
     /// The posture gates ingress (LAN to local) too. Switching to
     /// [`LanAccess::Paired`] suspends every live ingress entry (see
