@@ -281,6 +281,13 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
          on node types with no library, so no node plugin loads; its 3 macOS arms passed",
     ),
     (
+        "crates/cerulion_cli/tests/serving_login_e2e_test.rs",
+        "spawns `graph run --single-process --no-validate` on a graph whose one node type \
+         has no library, and `ros2 attach`: every arm stops at the serving-login refusal or \
+         the missing-library error before any node plugin loads; its 4 macOS arms passed on \
+         Darwin 25 at a5295a22",
+    ),
+    (
         "crates/cerulion_cli/tests/telemetry_verb_e2e_test.rs",
         "spawns `graph run no_such_graph` in a workspace with no graphs: the run is \
          rejected before any node plugin loads, so no process asks for a second \

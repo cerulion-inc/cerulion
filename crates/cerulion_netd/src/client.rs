@@ -50,6 +50,8 @@ use cerulion_core::{CatalogReply, SchemaReply};
 
 use cerulion_core::{GatewayPlan, LanAccess, SchemaServing};
 
+mod bounded;
+
 use crate::convergence::{Converged, ConvergenceWait, WaitDecision, WaitOutcome};
 use crate::hygiene::{default_socket_path, SOCKET_ENV};
 use crate::protocol::{
@@ -379,6 +381,9 @@ fn warn_stale_daemon_once(daemon_protocol: u32) {
 /// Pure — oracle-tested.
 fn verb_compat_error(daemon_version: u32, req: &Request) -> Option<String> {
     let need = req.min_daemon_version();
+    if daemon_version < need && matches!(req, Request::AccountAccess { .. }) {
+        return Some(format!("the running cerulion-netd speaks protocol v{daemon_version}; account robot access requires v{need}. Upgrade and restart cerulion-netd."));
+    }
     if daemon_version >= need {
         None
     } else {
@@ -571,6 +576,8 @@ pub struct NetdClient {
     /// release / status), refusing a specific verb only when the daemon is older than
     /// THAT verb requires ([`Request::min_daemon_version`]).
     daemon_protocol: u32,
+    /// A partial or invalid bounded exchange may leave a reply in flight.
+    poisoned: bool,
 }
 
 impl NetdClient {
@@ -865,43 +872,10 @@ impl NetdClient {
             next_id: 1,
             socket_path: socket,
             daemon_protocol: 0,
+            poisoned: false,
         };
         let line = client.read_line()?;
-        let hello: Hello = serde_json::from_str(line.trim())
-            .map_err(|e| ClientError::Protocol(format!("unparseable hello banner: {e}")))?;
-        if hello.hello != HELLO_MARKER {
-            return Err(ClientError::Protocol(format!(
-                "unexpected banner marker '{}' (expected '{HELLO_MARKER}') — is this really \
-                 cerulion-netd?",
-                hello.hello
-            )));
-        }
-        // Accept any daemon whose vocabulary INCLUDES this consumer's
-        // baseline (demand/release/status = v1) — a NEWER daemon is a superset, and an
-        // OLDER-but-still-v1 daemon serves the baseline (so a v2 client keeps working
-        // against a pinned v1 daemon). Refuse ONLY a daemon too old for the baseline.
-        // Per-verb gating for the v2 egress verbs happens at the send site
-        // (`verb_compat_error`), so this is deliberately NOT a strict `!=` (which would
-        // wedge a v2 client against a v1 daemon it can fully serve, and vice versa).
-        if hello.protocol < CLIENT_MIN_DAEMON_VERSION {
-            return Err(ClientError::Protocol(format!(
-                "cerulion-netd speaks protocol v{} but this client needs at least v{CLIENT_MIN_DAEMON_VERSION} \
-                 for the demand/release control vocabulary (this client speaks v{PROTOCOL_VERSION}). \
-                 Upgrade cerulion-netd — it is older than this client can talk to.",
-                hello.protocol
-            )));
-        }
-        if hello.wire_header != cerulion_core::wire::WIRE_HEADER_VERSION {
-            return Err(ClientError::Protocol(format!(
-                "cerulion-netd re-injects frames with wire header version {} but this client \
-                 reads version {}, so every frame it delivered would be read at the wrong \
-                 offsets. The running daemon belongs to a different Cerulion release: stop it \
-                 (it restarts on next use) or install the same release for both.",
-                hello.wire_header,
-                cerulion_core::wire::WIRE_HEADER_VERSION
-            )));
-        }
-        client.daemon_protocol = hello.protocol;
+        client.daemon_protocol = validate_hello(&line)?;
         Ok(client)
     }
 
@@ -934,6 +908,15 @@ impl NetdClient {
             }
             other => other,
         }
+    }
+
+    /// One bounded account operation. Never respawns or retries implicitly.
+    /// The running daemon must support protocol v9; upgrade and restart it otherwise.
+    pub fn account_access_once(
+        &mut self,
+        action: crate::account_access::AccountAccessRequest,
+    ) -> Result<crate::account_access::AccountAccessReply, ClientError> {
+        self.account_access_until(action, Instant::now() + ROUNDTRIP_TIMEOUT)
     }
 
     /// One `demand` round-trip (see [`Self::demand`], which wraps this with the
@@ -970,6 +953,7 @@ impl NetdClient {
     /// and adopt its fresh stream/reader + reset `next_id`. The socket path is
     /// unchanged.
     fn reconnect(&mut self) -> Result<(), ClientError> {
+        self.ensure_usable()?;
         let fresh = Self::connect_or_spawn_at(self.socket_path.clone())?;
         self.stream = fresh.stream;
         self.reader = fresh.reader;
@@ -1661,6 +1645,7 @@ impl NetdClient {
     /// a v1 daemon that would fail to parse it; it surfaces a precise, actionable
     /// version error instead.
     fn round_trip(&mut self, req: &Request) -> Result<Response, ClientError> {
+        self.ensure_usable()?;
         if let Some(msg) = verb_compat_error(self.daemon_protocol, req) {
             return Err(ClientError::Protocol(msg));
         }
@@ -1672,6 +1657,7 @@ impl NetdClient {
 
     /// Write one NDJSON line + newline.
     fn write_line(&mut self, line: &str) -> Result<(), ClientError> {
+        self.ensure_usable()?;
         writeln!(self.stream, "{line}").map_err(ClientError::Io)?;
         self.stream.flush().map_err(ClientError::Io)
     }
@@ -1679,6 +1665,7 @@ impl NetdClient {
     /// Read one line (a full NDJSON record). A clean EOF (the daemon closed the
     /// connection) is an I/O error, never a silent empty read.
     fn read_line(&mut self) -> Result<String, ClientError> {
+        self.ensure_usable()?;
         let mut line = String::new();
         let n = self.reader.read_line(&mut line).map_err(ClientError::Io)?;
         if n == 0 {
@@ -1862,6 +1849,45 @@ impl NetdEventClient {
             Err(e) => Err(ClientError::Io(e)),
         }
     }
+}
+
+/// One Hello interpretation shared by the legacy and deadline-bound constructors.
+fn validate_hello(line: &str) -> Result<u32, ClientError> {
+    let hello: Hello = serde_json::from_str(line.trim())
+        .map_err(|e| ClientError::Protocol(format!("unparseable hello banner: {e}")))?;
+    if hello.hello != HELLO_MARKER {
+        return Err(ClientError::Protocol(format!(
+            "unexpected banner marker '{}' (expected '{HELLO_MARKER}'); is this really \
+             cerulion-netd?",
+            hello.hello
+        )));
+    }
+    // Accept any daemon whose vocabulary INCLUDES this consumer's
+    // baseline (demand/release/status = v1): a NEWER daemon is a superset, and an
+    // OLDER-but-still-v1 daemon serves the baseline (so a v2 client keeps working
+    // against a pinned v1 daemon). Refuse ONLY a daemon too old for the baseline.
+    // Per-verb gating for the v2 egress verbs happens at the send site
+    // (`verb_compat_error`), so this is deliberately NOT a strict `!=` (which would
+    // wedge a v2 client against a v1 daemon it can fully serve, and vice versa).
+    if hello.protocol < CLIENT_MIN_DAEMON_VERSION {
+        return Err(ClientError::Protocol(format!(
+            "cerulion-netd speaks protocol v{} but this client needs at least v{CLIENT_MIN_DAEMON_VERSION} \
+             for the demand/release control vocabulary (this client speaks v{PROTOCOL_VERSION}). \
+             Upgrade cerulion-netd: it is older than this client can talk to.",
+            hello.protocol
+        )));
+    }
+    if hello.wire_header != cerulion_core::wire::WIRE_HEADER_VERSION {
+        return Err(ClientError::Protocol(format!(
+            "cerulion-netd re-injects frames with wire header version {} but this client \
+             reads version {}, so every frame it delivered would be read at the wrong \
+             offsets. The running daemon belongs to a different Cerulion release: stop it \
+             (it restarts on next use) or install the same release for both.",
+            hello.wire_header,
+            cerulion_core::wire::WIRE_HEADER_VERSION
+        )));
+    }
+    Ok(hello.protocol)
 }
 
 /// Try to connect to the control socket. A [`io::ErrorKind::NotFound`] /

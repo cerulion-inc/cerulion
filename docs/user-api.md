@@ -3424,7 +3424,7 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_CONNECT` / `CERULION_VIZD_CONNECT` | Comma/whitespace-separated zenoh locators to dial (`tcp/192.168.123.99:7683`). Each is where the corresponding verb's `--connect` is threaded when that command STARTS its daemon: `cerulion viz --connect` into the vizd one, a demanding consumer's `--connect` into the netd one. |
 | `CERULION_NETD_LISTEN` / `CERULION_VIZD_LISTEN` | Comma/whitespace-separated zenoh locators to bind (`tcp/0.0.0.0:7447`). The `--listen` counterpart of the row above, threaded the same way. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase

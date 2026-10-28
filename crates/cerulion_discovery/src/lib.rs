@@ -45,4 +45,5 @@
 
 pub mod ladder;
 pub mod peer_cache;
+pub mod robot_state;
 pub mod unencrypted_quic;

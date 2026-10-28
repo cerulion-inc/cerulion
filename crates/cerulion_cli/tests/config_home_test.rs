@@ -20,6 +20,11 @@ fn resolved() -> Vec<(&'static str, Option<PathBuf>)> {
     let layout = auth::identity_layout();
     let mut out = vec![
         ("config dir", auth::cerulion_config_dir()),
+        (
+            "robot state config dir",
+            cerulion_discovery::robot_state::config_dir(),
+        ),
+        ("robot-state", cerulion_discovery::robot_state::resolve()),
         ("auth.json", auth::auth_json_path()),
         ("device.cert", auth::device_cert_path()),
         (
@@ -64,6 +69,8 @@ fn epoch_dir_next_to(key_file: Option<&Path>) -> Option<PathBuf> {
 fn expected(dir: &Path) -> Vec<(&'static str, Option<PathBuf>)> {
     let mut out = vec![
         ("config dir", Some(dir.to_path_buf())),
+        ("robot state config dir", Some(dir.to_path_buf())),
+        ("robot-state", Some(dir.join("robot-state"))),
         ("auth.json", Some(dir.join("auth.json"))),
         ("device.cert", Some(dir.join("device.cert"))),
         ("identity/device.key", Some(dir.join("identity/device.key"))),
@@ -88,6 +95,7 @@ fn cerulion_home_moves_every_machine_file_and_unset_means_dot_cerulion() {
     // environment while it changes.
     std::env::set_var("HOME", home.path());
     std::env::remove_var("CERULION_EPOCH_DIR");
+    std::env::remove_var("CERULION_STATE_ROOT");
 
     // Overridden: everything moves into CERULION_HOME, verbatim.
     std::env::set_var("CERULION_HOME", rig.path());
@@ -124,6 +132,7 @@ const ALLOWED: &[&str] = &[
     // without that dependency, pinned by the assertions above.
     "crates/cerulion_core/src/transport/run_registry.rs",
     "crates/cerulion_discovery/src/peer_cache.rs",
+    "crates/cerulion_discovery/src/robot_state.rs",
     "crates/cerulion_telemetry/src/consent.rs",
     // Not config: daemon sockets prefer XDG_RUNTIME_DIR and a per-daemon
     // variable before `$HOME/.cerulion`.

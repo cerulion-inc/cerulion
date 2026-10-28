@@ -29,6 +29,7 @@ use crate::authorizer::{AcceptDecision, PairingAuthorizer};
 use crate::clock::RemotedClock;
 use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
+use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
@@ -162,6 +163,8 @@ pub async fn serve_endpoint(
     let shared =
         SharedTrust::new_with_clock(trust_store, device_index, mac_key, access_clock.clone());
     let classify = Arc::new(PairingAuthorizer::from_shared(shared.clone()));
+    let shared_for_pull = shared.clone();
+    let pull_clock = access_clock.clone();
     // The wire plane's epoch-sync sink gets the SAME live handle + the SAME
     // trusted clock the accept gate and the access list run on, so a desk-pushed
     // epoch is authoritative everywhere at once.
@@ -176,7 +179,7 @@ pub async fn serve_endpoint(
         shared,
         lease,
         sessions,
-        RemotedClock::wall(),
+        access_clock.clone(),
         &config.receipt_file,
         config.log_root.clone(),
         "cerulion-remoted",
@@ -198,7 +201,8 @@ pub async fn serve_endpoint(
     let robot = cerulion_core::graph::robot_identity_from_env();
     let base = match manager {
         Some(m) => WirePlane::with_manager(robot, m),
-        None => WirePlane::lazy(robot),
+        None => WirePlane::lazy(robot)
+            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
     };
     //
     // Install the epoch-sync sink on the SAME plane (this line is the wiring
@@ -219,7 +223,44 @@ pub async fn serve_endpoint(
         "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
     );
 
-    serve_with_wire(endpoint, classify, Some(ops), Some(wire), shutdown).await
+    // The robot's own revocation fetch: the supervisor's sync worker leaves
+    // fetched epochs in the state directory, applied here on a poll. Started
+    // only after every fallible plane is built, and owned by a guard that
+    // aborts it however this future ends (an error, a cancelled future, a
+    // normal return).
+    let pull = config.store_file.parent().map(|dir| {
+        let recheck = crate::epoch_pull::key_recheck_from_env();
+        Arc::new(
+            EpochPull::new(dir, shared_for_pull.clone(), pull_clock.clone()).with_recheck(recheck),
+        )
+    });
+    let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
+    let served =
+        serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
+    poller.stop().await;
+    served
+}
+
+/// A spawned task aborted when this guard drops.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Abort the task and wait for it to end. A blocking step it already
+    /// started (one file apply) runs to completion first.
+    async fn stop(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Assert the loaded trust store belongs to THIS device: the endpoint id (the
@@ -276,6 +317,20 @@ pub async fn serve_with_wire(
     wire: Option<Arc<WirePlane>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
+    serve_with_epoch_pull(endpoint, classify, ops, wire, None, shutdown).await
+}
+
+/// [`serve_with_wire`] that also tells `pull` about every accepted key, so a
+/// key not seen recently requests an early revocation fetch
+/// ([`EpochPull::note_accept`]).
+pub async fn serve_with_epoch_pull(
+    endpoint: &Endpoint,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    pull: Option<Arc<EpochPull>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -292,6 +347,9 @@ pub async fn serve_with_wire(
                         break;
                     }
                     Ok(Some(a)) => {
+                        if let Some(pull) = &pull {
+                            pull.note_accept(a.remote_id.as_bytes());
+                        }
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();
@@ -357,7 +415,8 @@ pub async fn handle_accepted_with_wire(
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
 ) {
-    let decision = classify.classify_accept(&accepted.alpn, accepted.remote_id.as_bytes());
+    let (decision, unpaired) = classify
+        .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
     tracing::info!(
         remote_id = %accepted.remote_id,
         alpn = %String::from_utf8_lossy(&accepted.alpn),
@@ -383,7 +442,7 @@ pub async fn handle_accepted_with_wire(
     // ── The wire-ALPN dispatch arm ──────────────────────────
     if matches!(decision, AcceptDecision::WireAdmit) {
         if let Some(plane) = wire {
-            crate::wire::serve_wire_connection(accepted.connection, plane).await;
+            crate::wire::serve_wire_connection(accepted.connection, plane, classify).await;
             return;
         }
         // WireAdmit but no wire plane wired (ops-only builds + the
@@ -395,7 +454,7 @@ pub async fn handle_accepted_with_wire(
     // the QUIC handshake then stalls must not hold this task + connection forever.
     match tokio::time::timeout(
         HANDSHAKE_DEADLINE,
-        report_decision(&accepted.connection, &decision),
+        report_decision(&accepted.connection, &decision, unpaired),
     )
     .await
     {
@@ -425,17 +484,62 @@ pub async fn handle_accepted_with_wire(
 async fn report_decision(
     connection: &Connection,
     decision: &AcceptDecision,
+    unpaired: bool,
 ) -> Result<(), LinkError> {
     let (mut send, mut recv) = accept_frame_stream(connection).await?;
     // Drain the peer's hello (its presence is what fired accept_bi).
     let _ = read_frame(&mut recv, MAX_HELLO_LEN).await?;
     // The decision is small structured JSON; serialization cannot fail for it.
-    let bytes = serde_json::to_vec(decision).unwrap_or_default();
+    let bytes = admission_payload(decision, unpaired);
     write_frame(&mut send, &bytes).await?;
     let _ = send.finish();
     // Hold the connection until the peer finishes (EOF) so the reply is delivered.
     let _ = read_frame(&mut recv, MAX_HELLO_LEN).await;
     Ok(())
+}
+
+fn admission_payload(decision: &AcceptDecision, unpaired: bool) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Reply<'a> {
+        #[serde(flatten)]
+        decision: &'a AcceptDecision,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admission_code: Option<&'static str>,
+    }
+    let admission_code =
+        (unpaired && matches!(decision, AcceptDecision::Refuse { .. })).then_some("unpaired");
+    serde_json::to_vec(&Reply {
+        decision,
+        admission_code,
+    })
+    .expect("admission reply contains only JSON-compatible fields")
+}
+
+#[cfg(test)]
+mod admission_reply_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_explicit_unpaired_refusal_carries_the_retry_code() {
+        let refused = AcceptDecision::Refuse {
+            reason: "access refused".into(),
+        };
+        assert_eq!(
+            admission_payload(&refused, true),
+            br#"{"decision":"refuse","reason":"access refused","admission_code":"unpaired"}"#,
+        );
+        for decision in [
+            refused,
+            AcceptDecision::WireAdmit,
+            AcceptDecision::OpsBootstrapOnly,
+        ] {
+            let reply = admission_payload(&decision, false);
+            let value: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+            assert!(value.get("admission_code").is_none());
+        }
+        let admitted = admission_payload(&AcceptDecision::WireAdmit, true);
+        assert_eq!(admitted, br#"{"decision":"wire_admit"}"#);
+    }
 }
 
 /// Load the device key, trust store, and device→account side-map from disk.
