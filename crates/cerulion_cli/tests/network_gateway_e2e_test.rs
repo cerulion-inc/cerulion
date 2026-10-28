@@ -336,11 +336,9 @@ fn spawn_graph_run(
     netd_sock: &Path,
     extra: &[&str],
 ) -> (ChildGuard, PathBuf, PathBuf) {
-    let login_home = if network_off {
-        root.join("never-logged-in")
-    } else {
-        serving_login_support::expired_login(root)
-    };
+    // The command-wide login gate is on for this child, so every arm needs a
+    // saved login: the offline fixture (an expired session with logged_in_ever).
+    let login_home = serving_login_support::expired_login(root);
     let stdout_path = root.join(format!("{graph}.stdout"));
     let stderr_path = root.join(format!("{graph}.stderr"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
