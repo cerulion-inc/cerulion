@@ -1708,6 +1708,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     )
     .unwrap();
     emit_type_name_lint_allow(out, &shm_name);
+    writeln!(out, "#[repr(C)]").unwrap();
     writeln!(out, "pub struct {shm_name}<'a> {{").unwrap();
     writeln!(
         out,
@@ -1769,16 +1770,6 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     )
     .unwrap();
     writeln!(out, "    len: usize,").unwrap();
-    writeln!(
-        out,
-        "    /// Per-tick writer state (cursor, written bitset, per-field starts)."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    state: ::cerulion_core::shm_runtime::WriterState<{n_var}>,"
-    )
-    .unwrap();
     writeln!(out, "    /// Lazily-allocated heap fallback buffer.").unwrap();
     writeln!(out, "    ///").unwrap();
     writeln!(
@@ -1845,48 +1836,18 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     .unwrap();
     writeln!(
         out,
-        "    /// source it cannot read in place (not 8-aligned, or shorter than the"
+        "    /// source it cannot read in place (not aligned to `READ_ALIGN`, or shorter"
     )
     .unwrap();
     writeln!(
         out,
-        "    /// fixed section plus offset table). `None` for an in-place read and"
+        "    /// than the fixed section plus offset table). `None` for an in-place read"
     )
     .unwrap();
-    writeln!(out, "    /// for every writer.").unwrap();
+    writeln!(out, "    /// and for every writer.").unwrap();
     writeln!(
         out,
         "    __cer_read_copy: ::std::option::Option<::std::vec::Vec<u64>>,"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// Hard ceiling on the payload (max_slice_len minus"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// the 40-byte WireHeader). Read by the spill helper to decide"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// between `PayloadTooLarge` (no rescue possible) and lazy"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// allocation. Set at `from_bytes_mut` time from the publisher's"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    /// `MaxSliceLen::get() - WireHeader::SIZE as u32`."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "    max_capacity: ::cerulion_core::wire::MaxPayloadCapacity,"
     )
     .unwrap();
     writeln!(out, "    /// Topic name as `Arc<str>`. Used to").unwrap();
@@ -1988,18 +1949,63 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     )
     .unwrap();
     // Write-only diagnostic proxy members, one per VARIABLE field,
-    // named exactly after the field. `<Name>Shm<'a>` is a plain (NON-repr(C))
-    // wrapper, so adding zero-sized fields changes neither its SHM layout nor
-    // any derive. Plain field resolution finds these proxies BEFORE the
-    // `DerefMut` to `<Name>FixedSection`, so an un-rewritten variable-field
-    // access (`self.<port>.<f>[i]`, `+= …`) lands on the proxy and produces a
-    // codegen-authored diagnostic instead of a bare `no field <f>` error. See
+    // named exactly after the field. `<Name>Shm<'a>` is a wrapper around the
+    // SHM bytes, not their layout, so adding zero-sized fields changes neither
+    // the SHM layout nor any derive. Plain field resolution finds these
+    // proxies BEFORE the `DerefMut` to `<Name>FixedSection`, so an
+    // un-rewritten variable-field access (`self.<port>.<f>[i]`, `+= …`) lands
+    // on the proxy and produces a codegen-authored diagnostic instead of a
+    // bare `no field <f>` error. See
     // `generate_variable_field_proxies`.
     emit_proxy_field_decls(out, schema);
     // Per complex-nested variable field, the lazily-allocated
     // staging slot backing the `self.<port>.<f>.<leaf> = …` / `with_<f>`
     // nested-writer sugar. Private; `None` until first touch.
     emit_staged_field_decls(out, schema);
+    // The fields made of 4-byte values (`state`, `max_capacity`) go last.
+    // `#[repr(C)]` keeps the declared order, so none of them sits next to a
+    // pointer-sized slot that drop reads back (`overflow`, `__cer_read_copy`,
+    // the staging slots).
+    writeln!(
+        out,
+        "    /// Per-tick writer state (cursor, written bitset, per-field starts)."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    state: ::cerulion_core::shm_runtime::WriterState<{n_var}>,"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// Hard ceiling on the payload (max_slice_len minus"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// the 40-byte WireHeader). Read by the spill helper to decide"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// between `PayloadTooLarge` (no rescue possible) and lazy"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// allocation. Set at `from_bytes_mut` time from the publisher's"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// `MaxSliceLen::get() - WireHeader::SIZE as u32`."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    max_capacity: ::cerulion_core::wire::MaxPayloadCapacity,"
+    )
+    .unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 
@@ -2999,26 +3005,70 @@ fn generate_var_shm_from_bytes(out: &mut String, schema: &MessageSchema, shm_nam
     .unwrap();
     writeln!(
         out,
-        "        let (ptr, len, __cer_read_copy) = if bytes.len() >= table_end && bytes.as_ptr().align_offset(Self::READ_ALIGN) == 0 {{"
+        "        if bytes.len() >= table_end && bytes.as_ptr().align_offset(Self::READ_ALIGN) == 0 {{"
     )
     .unwrap();
     writeln!(
         out,
-        "            (bytes.as_ptr() as *mut u8, bytes.len(), ::std::option::Option::None)"
+        "            Self::__cer_reader_at(bytes.as_ptr() as *mut u8, bytes.len(), ::std::option::Option::None)"
     )
     .unwrap();
     writeln!(out, "        }} else {{").unwrap();
     writeln!(
         out,
-        "            let mut copy = ::cerulion_core::shm_runtime::aligned_read_copy(bytes, table_end);"
+        "            Self::__cer_from_bytes_copied(bytes, table_end)"
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    // The copy fallback sits out of line so the in-place path above stays a
+    // single branch into the struct literal.
+    writeln!(
+        out,
+        "    /// `from_bytes` for a source it cannot read in place: reads from an owned"
     )
     .unwrap();
     writeln!(
         out,
-        "            (copy.as_mut_ptr() as *mut u8, bytes.len().max(table_end), ::std::option::Option::Some(copy))"
+        "    /// 8-aligned copy of `bytes`, zero-padded to `table_end`."
     )
     .unwrap();
-    writeln!(out, "        }};").unwrap();
+    writeln!(out, "    #[cold]").unwrap();
+    writeln!(out, "    #[inline(never)]").unwrap();
+    writeln!(
+        out,
+        "    fn __cer_from_bytes_copied(bytes: &'a [u8], table_end: usize) -> Self {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        let mut copy = ::cerulion_core::shm_runtime::aligned_read_copy(bytes, table_end);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Self::__cer_reader_at(copy.as_mut_ptr() as *mut u8, bytes.len().max(table_end), ::std::option::Option::Some(copy))"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// The reader-side value over `len` readable bytes at `ptr`, which point"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// into the `'a` source or into `__cer_read_copy`."
+    )
+    .unwrap();
+    writeln!(out, "    #[inline(always)]").unwrap();
+    writeln!(
+        out,
+        "    fn __cer_reader_at(ptr: *mut u8, len: usize, __cer_read_copy: ::std::option::Option<::std::vec::Vec<u64>>) -> Self {{"
+    )
+    .unwrap();
     // The proxy fields below carry `#[deprecated]`; the
     // constructor's OWN struct-literal inits must stay warning-free.
     // `#[allow(deprecated)]` on the let statement is the tightest stable
