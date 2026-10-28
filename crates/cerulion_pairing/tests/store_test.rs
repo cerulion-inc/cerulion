@@ -131,9 +131,13 @@ fn atomic_write_leaves_no_temp_file() {
     let s = store().with_path(&path);
     s.save(MAC_KEY).unwrap();
     assert!(path.exists());
-    // The `<name>.tmp` sibling must have been renamed away.
-    let tmp = dir.path().join("trust.store.tmp");
-    assert!(!tmp.exists(), "atomic write should leave no .tmp behind");
+    // The save's temporary sibling has been renamed away: the directory holds
+    // only the store.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("trust.store")]);
 }
 
 #[test]
