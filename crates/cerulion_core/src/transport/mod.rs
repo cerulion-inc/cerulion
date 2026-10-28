@@ -2799,14 +2799,6 @@ impl TransportManager {
             // iceoryx2's defaults intentionally — no custom config file is needed.
             crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 
-            // Pre-warm the reader-side topic sentinel
-            // so the first subscriber `try_view` does not allocate inside
-            // the zero-alloc critical section. The OnceLock inside
-            // `read_only_topic` allocates once on first call; doing it
-            // here (during one-time transport init) keeps `Arc::clone` as
-            // the only cost on the subscriber hot path.
-            let _ = crate::message::read_only_topic();
-
             // Every node this manager builds runs on a config with
             // iceoryx2's automatic dead-node cleanup DISABLED (the same-PID cdylib
             // reap defeat — see disable_auto_dead_node_cleanup). The shared-config
@@ -2931,11 +2923,6 @@ impl TransportManager {
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
         crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 
-        // Mirror of `init()`: pre-warm the
-        // reader-side topic sentinel so zero-alloc tests using a
-        // per-test SHM root start from a primed OnceLock state.
-        let _ = crate::message::read_only_topic();
-
         // Fallible here too. `init_for_test` already returns a
         // `TransportResult`, so the `.expect()` bought nothing — and a test
         // fixture minting a hostile name is exactly where the refusal has to be
@@ -3036,11 +3023,6 @@ impl TransportManager {
         crate::fd_limit::raise_open_file_limit();
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
         crate::iceoryx_logger::init_iceoryx_log_level_from_env();
-
-        // Mirror of `init()` / `init_for_test()` — pre-warm the reader-side topic
-        // sentinel so a subscriber `try_view` on this detached manager does not
-        // allocate inside the zero-alloc critical section.
-        let _ = crate::message::read_only_topic();
 
         // This constructor was ALREADY fallible here — it is the
         // precedent the two `.expect()` sites should have followed. It now goes
