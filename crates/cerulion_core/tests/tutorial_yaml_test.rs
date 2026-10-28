@@ -49,17 +49,11 @@ use tracing_test::traced_test;
 /// do not auto-derive from the markdown (see module doc-comment).
 const TUTORIAL_GRAPH_YAML: &str = r#"prefix: demo
 nodes:
-  # LIDAR sensor: periodic at 10 Hz — policy declared on the macro side
-  # by `#[cerulion_node(period_ms = 100)]` in Step 3a.
   - id: lidar_sensor
     type: lidar_sensor
     outputs:
       - name: scan
         schema: sensor_msgs/LaserScan
-        max_slice_len: 8192
-
-  # Safety controller: data-triggered — policy declared on the macro
-  # side by `#[input(trigger)] scan: LaserScan` in Step 3b.
   - id: safety_controller
     type: safety_controller
     inputs:
@@ -68,9 +62,6 @@ nodes:
     outputs:
       - name: cmd_vel
         schema: geometry_msgs/Vector3
-
-  # Drive base: data-triggered — policy declared on the macro side by
-  # `#[input(trigger)] cmd_vel: Vector3` in Step 3c.
   - id: drive_base
     type: drive_base
     inputs:
@@ -132,9 +123,8 @@ fn tutorial_yaml_parses_validates_and_matches_oracle() {
         "LaserScan schema is load-bearing — Step 3a tick body uses LaserScan fixed-field accessors"
     );
     assert_eq!(
-        lidar_scan.max_slice_len,
-        Some(8192),
-        "the snapshot's 8192-byte cap is sized for ~314 rays * 4B + headroom"
+        lidar_scan.max_slice_len, None,
+        "tutorial omits max_slice_len for LaserScan; the schema supplies its shared-memory budget"
     );
 
     // ---- safety_controller: 1 input, 1 output ----
@@ -332,17 +322,22 @@ fn duplicate_node_id_fails_validation() {
 
 #[test]
 fn undersized_max_slice_len_fails_validation() {
-    // Tutorial documents max_slice_len: 8192 for LaserScan. If a
-    // future edit drops the value below WireHeader::SIZE (32B), the
-    // validator must reject — the WireHeader alone wouldn't fit.
-    let yaml_with_small_slice =
-        TUTORIAL_GRAPH_YAML.replace("        max_slice_len: 8192", "        max_slice_len: 8");
+    // An explicit override below WireHeader::SIZE (40B) cannot fit the header.
+    let yaml_with_small_slice = r#"prefix: demo
+nodes:
+  - id: lidar_sensor
+    type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
+        max_slice_len: 8
+"#;
     assert!(
         yaml_with_small_slice.contains("max_slice_len: 8\n"),
-        "test fixture builder failed to set max_slice_len to 8"
+        "test fixture must set max_slice_len to 8"
     );
 
-    let config = parse_graph_raw(&yaml_with_small_slice).expect("parse succeeds");
+    let config = parse_graph_raw(yaml_with_small_slice).expect("parse succeeds");
     let err = validate_graph(&config).expect_err("validate must reject undersized slice");
     let reason = match err {
         TransportError::GraphError { reason } => reason,
@@ -354,8 +349,8 @@ fn undersized_max_slice_len_fails_validation() {
     );
     // Pin the actionable numerics so a future error-message reword
     // can't silently drop the diagnostic that tells the user what to
-    // fix. Validator format (see validation.rs:81-87): "node 'lidar_sensor'
-    // output 'scan' max_slice_len (8) must be > WireHeader::SIZE (40)".
+    // fix. Validator format (see graph/validation.rs): "node 'lidar_sensor'
+    // output 'scan' max_slice_len (8) must be >= WireHeader::SIZE (40)".
     assert!(
         reason.contains("(8)"),
         "error must report the bad value `(8)` for actionable diagnostics; got: {reason}"
@@ -416,42 +411,34 @@ fn schema_separator_normalization_canonicalizes_double_colon() {
 //
 // `validate_graph` rejects two outputs that resolve to the same
 // full topic path (`{prefix}/{node_id}/{output_name}`). The
-// tutorial's three outputs are distinct, but a future doc edit
-// could inadvertently collide them (e.g. by adding a second
-// output to drive_base that shadows a sibling). This test
-// inserts a colliding output and confirms the validator catches it.
+// fixture gives lidar_sensor two scan outputs and confirms the
+// validator catches the collision.
 // ============================================================================
 
 #[test]
 fn duplicate_output_topic_fails_validation() {
-    // Splice a second `scan` output onto lidar_sensor so both
-    // resolve to the same topic path
-    // (`/demo/lidar_sensor/scan`). The derived form
-    // `/{prefix}/{node_id}/{output_name}` collides when two outputs
-    // on the same node share `name`.
-    //
-    // Splicing on `max_slice_len: 8192\n` (unique in the tutorial)
-    // anchors the insertion point precisely without false-matching
-    // safety_controller's `scan` input port.
-    let yaml_with_dup_output = TUTORIAL_GRAPH_YAML.replace(
-        "        max_slice_len: 8192\n",
-        "        max_slice_len: 8192\n      - name: scan\n        schema: sensor_msgs/LaserScan\n        max_slice_len: 8192\n",
-    );
-    // Sanity: exactly 2 output-flavored `scan` entries (the
-    // original + the splice). Match the full output-block
-    // signature `name: scan\n        schema:` so the count is
-    // unaffected by safety_controller's `scan` input port
-    // (which sits at the same indentation but is followed by
-    // `source:` rather than `schema:`).
+    // Both outputs resolve to /demo/lidar_sensor/scan despite valid slice caps.
+    let yaml_with_dup_output = r#"prefix: demo
+nodes:
+  - id: lidar_sensor
+    type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
+        max_slice_len: 8192
+      - name: scan
+        schema: sensor_msgs/LaserScan
+        max_slice_len: 8192
+"#;
     assert_eq!(
         yaml_with_dup_output
             .matches("      - name: scan\n        schema: sensor_msgs/LaserScan\n")
             .count(),
         2,
-        "test fixture builder must produce exactly 2 output entries named `scan` on lidar_sensor"
+        "test fixture must contain exactly 2 output entries named `scan` on lidar_sensor"
     );
 
-    let config = parse_graph_raw(&yaml_with_dup_output).expect("parse succeeds");
+    let config = parse_graph_raw(yaml_with_dup_output).expect("parse succeeds");
     let err = validate_graph(&config).expect_err("validate must reject duplicate output topic");
     let reason = match err {
         TransportError::GraphError { reason } => reason,
