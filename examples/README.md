@@ -58,7 +58,15 @@ RUSTUP_TOOLCHAIN=<release> cerulion node build <node>
 ```
 
 `cerulion node build` warns, and continues, when the `rustc` on your `PATH`
-reports a different release. See
+reports a different release.
+
+A release name is enough only for a stable compiler installed through rustup.
+The loader compares the release and the commit hash, and a nightly release such
+as `1.99.0-nightly` does not name its dated rustup toolchain, while a custom or
+distribution compiler can differ from the official one at the same release. For
+a nightly, beta, custom or distribution compiler, select the exact compiler
+installation that built the CLI, or rebuild the CLI and your nodes together with
+one compiler. See
 [Build nodes with the compiler that built the CLI](../docs/install.md#build-nodes-with-the-compiler-that-built-the-cli).
 
 ## The process layout on the first run
