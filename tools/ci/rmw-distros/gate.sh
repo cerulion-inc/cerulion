@@ -389,8 +389,9 @@ case "$expect" in
                 rpassed=$(printf '%s\n' "$rsum" | awk '{print $4}'); rfailed=$(printf '%s\n' "$rsum" | awk '{print $6}')
                 case "$rpassed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable passed count: $rsum"; exit 1 ;; esac
                 case "$rfailed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable failed count: $rsum"; exit 1 ;; esac
-                [ "$rc_replay" -eq 0 ] && [ "$rfailed" -eq 0 ] && [ "$rpassed" -eq 1 ] \
-                    || { echo "GATE FAIL: $distro replay '$name' rc=$rc_replay: $rsum"; exit 1; }
+                if [ "$rc_replay" -ne 0 ] || [ "$rfailed" -ne 0 ] || [ "$rpassed" -ne 1 ]; then
+                    echo "GATE FAIL: $distro replay '$name' rc=$rc_replay: $rsum"; exit 1
+                fi
                 grep -qE "^test ${name} \.\.\. ok$" "$rplain" || { echo "GATE FAIL: $distro replay '$name' passed but its own '^test ${name} ... ok' line is absent (rule 37)"; exit 1; }
                 echo "REPLAY OK ($distro): $bin $name"
                 replay_ok=$((replay_ok + 1))
