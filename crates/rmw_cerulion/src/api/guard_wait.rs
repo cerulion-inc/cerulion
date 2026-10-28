@@ -482,6 +482,13 @@ pub(crate) fn create_guard_condition_raw() -> *mut ffi::rmw_guard_condition_t {
         data: Box::into_raw(state) as *mut std::os::raw::c_void,
         context: std::ptr::null_mut(),
     });
+    // Delivery log / replay: guards are named `gc#n` in creation order.
+    crate::replay::on_entity(
+        crate::replay::log::EntityKind::Guard,
+        gc.data as usize,
+        "",
+        "",
+    );
     Box::into_raw(gc)
 }
 
@@ -492,6 +499,7 @@ pub(crate) unsafe fn destroy_guard_condition_raw(gc: *mut ffi::rmw_guard_conditi
     if gc.is_null() {
         return;
     }
+    crate::replay::on_entity_destroyed((*gc).data as usize);
     drop(Box::from_raw((*gc).data as *mut GuardConditionState));
     drop(Box::from_raw(gc));
 }
@@ -589,6 +597,11 @@ pub struct WaitSetData {
     /// call (buffer reused across calls and iterations). Never contended:
     /// one wait per set at a time is the rcl contract.
     fd_set: Mutex<FdWakeSet>,
+    /// Delivery log / replay only: the index + 1 of the first thread that
+    /// waited on this wait set (0 = none yet). A second thread waiting here
+    /// is the rclcpp MultiThreadedExecutor mark (`replay::detect`). Never
+    /// touched with recording and replay off.
+    replay_owner: std::sync::atomic::AtomicU32,
     /// PER-CALL: a listener drain failed during this `rmw_wait`, so the fd
     /// path is untrustworthy for the rest of the call (an fd that cannot be
     /// drained may stay readable and would re-fire every block). Reset at
@@ -2043,6 +2056,64 @@ unsafe fn spin_for_ready(
 /// (the rcl_wait contract — see [`WaitSetData`]).
 #[no_mangle]
 pub unsafe extern "C" fn rmw_wait(
+    subscriptions: *mut ffi::rmw_subscriptions_t,
+    guard_conditions: *mut ffi::rmw_guard_conditions_t,
+    services: *mut ffi::rmw_services_t,
+    clients: *mut ffi::rmw_clients_t,
+    events: *mut ffi::rmw_events_t,
+    wait_set: *mut ffi::rmw_wait_set_t,
+    wait_timeout: *const ffi::rmw_time_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live wait.
+    if !crate::replay::active() {
+        return rmw_wait_live(
+            subscriptions,
+            guard_conditions,
+            services,
+            clients,
+            events,
+            wait_set,
+            wait_timeout,
+        );
+    }
+    ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
+        if wait_set.is_null()
+            || !ffi::is_our_identifier((*wait_set).implementation_identifier)
+            || (*wait_set).data.is_null()
+        {
+            return RMW_RET_INVALID_ARGUMENT;
+        }
+        let ws = &*((*wait_set).data as *const WaitSetData);
+        crate::replay::wait(
+            crate::replay::WaitArrays {
+                subscriptions,
+                guard_conditions,
+                services,
+                clients,
+            },
+            events,
+            &ws.replay_owner,
+            wait_timeout,
+            || {
+                rmw_wait_live(
+                    subscriptions,
+                    guard_conditions,
+                    services,
+                    clients,
+                    events,
+                    wait_set,
+                    wait_timeout,
+                )
+            },
+        )
+    })
+}
+
+/// The live `rmw_wait`: readiness from the transport, the caller's timeout.
+///
+/// # Safety
+/// Same contract as [`rmw_wait`].
+unsafe fn rmw_wait_live(
     subscriptions: *mut ffi::rmw_subscriptions_t,
     guard_conditions: *mut ffi::rmw_guard_conditions_t,
     services: *mut ffi::rmw_services_t,

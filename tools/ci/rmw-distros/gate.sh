@@ -90,6 +90,10 @@ rmw_get_servers_info_by_service"
 # info calls (Lyrical, rmw/service_endpoint_info_array.h).
 pre_lyrical_absent_symbols="rmw_get_clients_info_by_service
 rmw_get_servers_info_by_service"
+# Exact-replay tests (rmw_replay_*_test.rs, each #[ignore]'d, run by name below in a fresh process):
+# runtime-tested on Humble only, the distro they were measured on; every other row compile-checks
+# them as part of its serial suite build and skips the run, saying so.
+replay_runtime_distros="humble"
 # No row is `refuse` today; the arm stays for the next distro that starts there, so its two inputs
 # carry inert defaults rather than being unset under `set -u`. The arm REFUSES those defaults
 # (refuse_row_pinned): an errors=0 or empty-marker row would pass vacuously.
@@ -324,6 +328,64 @@ case "$expect" in
         grep -q -F "$GATE_WRONG_SENTINEL" "$splain" || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the injected literal ($GATE_WRONG_SENTINEL) never appears in the exchange's failure output; the RED is not a proven payload mismatch"; echo "-- output tail:"; tail -n 40 "$splain"; exit 1; }
         echo "GATE SELF-TEST PASS (2a): $distro wrong payload ($GATE_WRONG_SENTINEL) crossed the exchange and the oracle REJECTED it ($s_fail failed; the literal is in the collected values)"
         rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        # ===================================================================
+        # EXACT REPLAY (rmw_replay_*_test.rs): one ROS 2 process recorded with
+        # the delivery log and replayed alone, judged by its own callback log and
+        # the rmw's verdict file. Each named test runs in its OWN cargo
+        # invocation and must report exactly `1 passed; 0 failed` with its own
+        # `test <name> ... ok` line (rule 37). The rclcpp arms need
+        # demo_nodes_cpp, which ros-base does not ship: installed here.
+        # -------------------------------------------------------------------
+        case " $replay_runtime_distros " in
+        *" $distro "*)
+            if [ ! -x "/opt/ros/$distro/lib/demo_nodes_cpp/talker" ]; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "ros-$distro-demo-nodes-cpp" >/dev/null 2>&1 \
+                    || { echo "GATE FAIL: $distro replay - could not install ros-$distro-demo-nodes-cpp"; exit 1; }
+            fi
+            REPLAY_TIMEOUT="${REPLAY_TIMEOUT:-900}"
+            REPLAY_EXPECTED=9
+            replay_ok=0
+            for spec in \
+                rmw_replay_rclpy_probe_test:the_mixer_replays_byte_identical_five_times \
+                rmw_replay_rclpy_probe_test:a_wall_clock_read_is_named_as_the_divergence \
+                rmw_replay_rclcpp_probe_test:the_rclcpp_listener_replays_every_take_in_order \
+                rmw_replay_rclcpp_probe_test:the_rclcpp_wall_timer_talker_is_named \
+                rmw_replay_refusal_test:an_rclpy_multithreaded_executor_is_refused_and_a_single_thread_is_not \
+                rmw_replay_refusal_test:both_variables_set_is_refused_by_name \
+                rmw_replay_refusal_test:a_log_of_another_process_is_refused \
+                rmw_replay_token_test:two_executors_on_two_threads_replay_identically \
+                rmw_replay_token_test:a_callback_blocked_on_the_other_executor_trips_the_watchdog; do
+                bin="${spec%%:*}"; name="${spec#*:}"
+                rlog="/tmp/rmw_replay_${distro}_${name}.log"
+                echo "== rmw exact replay on $distro: $bin $name (fresh process, --ignored) =="
+                timeout --kill-after=30 "$REPLAY_TIMEOUT" \
+                    env RMW_IMPLEMENTATION=rmw_cerulion \
+                        AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                        LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                    cargo test --locked -p rmw_cerulion --release --test "$bin" -- \
+                        --ignored --test-threads=1 --exact "$name" 2>&1 | tee "$rlog"
+                rc_replay=${PIPESTATUS[0]}
+                rclpy_timed_out "$rc_replay" "$distro" "replay '$name'" "$REPLAY_TIMEOUT" && exit 1
+                rplain="${rlog}.plain"; strip_ansi "$rlog" > "$rplain"
+                if crashed "$rplain"; then echo "GATE FAIL: $distro replay '$name' crashed or its target did not compile (rc=$rc_replay)"; exit 1; fi
+                rsum="$(grep -E '^test result: ' "$rplain" | tail -n 1)"
+                [ -n "$rsum" ] || { echo "GATE FAIL: $distro replay '$name' printed NO 'test result:' summary (rc=$rc_replay)"; tail -n 40 "$rplain"; exit 1; }
+                rpassed=$(printf '%s\n' "$rsum" | awk '{print $4}'); rfailed=$(printf '%s\n' "$rsum" | awk '{print $6}')
+                case "$rpassed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable passed count: $rsum"; exit 1 ;; esac
+                case "$rfailed" in ''|*[!0-9]*) echo "GATE FAIL: $distro replay '$name' - unparseable failed count: $rsum"; exit 1 ;; esac
+                [ "$rc_replay" -eq 0 ] && [ "$rfailed" -eq 0 ] && [ "$rpassed" -eq 1 ] \
+                    || { echo "GATE FAIL: $distro replay '$name' rc=$rc_replay: $rsum"; exit 1; }
+                grep -qE "^test ${name} \.\.\. ok$" "$rplain" || { echo "GATE FAIL: $distro replay '$name' passed but its own '^test ${name} ... ok' line is absent (rule 37)"; exit 1; }
+                echo "REPLAY OK ($distro): $bin $name"
+                replay_ok=$((replay_ok + 1))
+            done
+            [ "$replay_ok" -eq "$REPLAY_EXPECTED" ] || { echo "GATE FAIL: $distro ran $replay_ok/$REPLAY_EXPECTED replay tests (rule 37)"; exit 1; }
+            echo "GATE PASS (exact replay): $distro ran $replay_ok/$REPLAY_EXPECTED replay tests, each in a fresh process"
+            ;;
+        *)
+            echo "== exact-replay runtime tests SKIPPED on $distro: runtime-tested on [$replay_runtime_distros] only; the test targets compiled with the serial suite =="
+            ;;
+        esac
         # ===================================================================
         ;;
     refuse)

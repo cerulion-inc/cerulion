@@ -1096,6 +1096,102 @@ with rmw-specific additions:
   caller's rcutils allocator, and every allocation-failure path rolls back cleanly
   (`RMW_RET_BAD_ALLOC`, zeroed out-params, every prior allocation freed exactly once).
 
+## Delivery log and replay gate
+
+`src/replay/` records one process's deliveries and replays the process against
+them (user page: `docs/ros2_replay.md`). `CERULION_RMW_DELIVERY_LOG=<dir>` and
+`CERULION_RMW_REPLAY=<file>` select the mode once per process, at the first rmw
+call (`replay::mode()`, a `OnceLock<Mode>`); setting both, an unwritable log
+directory, a log of another process and a log marked not replayable all resolve to
+`Mode::Refused`, which `rmw_init` returns as `RMW_RET_ERROR` with the reason on
+stderr and on rcl's error channel.
+
+**Cost when off.** Every hooked entry point (`rmw_wait`, every take entry, every
+publish, `send_request`/`send_response`, the five graph queries, entity create and
+destroy, `rmw_init`, `rmw_shutdown`, `rmw_create_node`) branches on `Mode::Off`
+first: one `OnceLock` load (an acquire load and a compare once initialized), then
+the unchanged live body (`rmw_wait_live`, `take_impl_live`, `publish_impl`, ...).
+The capture points inside the live paths (`capture_take_body` where a take has
+decoded a body, `capture_frame_output`/`capture_output_body` right before a send)
+read one relaxed `AtomicBool` (`HOOKS_ON`, set only when the mode resolves to
+record or replay) and return; only then do they read the thread-local flag a
+recorded or replayed call arms. Nothing is copied, hashed or allocated otherwise.
+
+**Entities.** Each subscription, publisher, service, client and guard condition is
+registered at creation, keyed by its `data` pointer (what `rmw_wait`'s arrays
+carry), and named stably for the life of the program: `sub:<topic>#n`,
+`pub:<topic>#n`, `srv:<name>#n`, `cli:<name>#n` (n counts earlier entities of that
+kind and name) and `gc#n` (guard creation order, node graph guards included). A
+replay maps each live entity to the recorded one by name. Threads get an index in
+the order they first reach a hook; a replaying thread is mapped to the recorded
+thread whose first wait attached the same entities.
+
+**Record.** `rmw_wait` records the attached and ready entity ids, the return and
+the timeout rcl passed. Every take records the entity, return, `taken`, the wire
+sequence, the source and received timestamps (requests and responses: the request
+id) and the payload BODY (the wire header, which carries the wall-clock stamp, is
+not part of it): the copying, adopted, loaned and sequence takes all capture at
+their decode point. Every output records a 64-bit FNV-1a of the body it sends and
+the return. Graph answers record the query, the name and the answer. The writer
+(`log::LogWriter`, under one mutex) mints the order key `k`, so file order is `k`
+order; it writes through `cerulion_bag::BagWriter` on four channels (`rdl/process`,
+`rdl/waits`, `rdl/deliveries`, `rdl/outputs`), chunks of 1 MiB, the process
+header flushed as its own first chunk (a log torn inside a chunk reads every
+whole record before the tear). `rmw_shutdown` flushes; an `atexit` handler
+writes the trailer, the `rdl/process.json` attachment and the summary. A write
+error is logged once at error level, marks the log incomplete, and counts every
+later record as dropped.
+
+**Serving units** (`gate::Schedule`). A recorded window is served as one unit per
+taken entity, in take order, with the never-taken ready entities (guards) on the
+last unit; a timeout or empty window is one unit with its return; a window in
+which a `/clock` take precedes another take is served as its recorded set, because
+rcl decides a ROS-time timer's readiness from the clock at `rcl_wait`, and a split
+after the time jump would add a timer check live rcl never made. Units are ordered
+by their take's `k`. A replayed `rmw_wait` nulls every slot whose recorded entity
+is not in its unit, consumes the trigger of each kept guard (counting the ones not
+triggered live), never probes the transport, and returns the recorded code at once.
+
+**Token and watchdog** (`gate::Gate`). A served thread holds the token until it
+calls `rmw_wait` again; a thread is served only when the token is free and the head
+unit is its own. A waiter that sees no rmw progress for 5 s reports the holder (the
+entity of its last served take, its node and window) and writes a `watchdog`
+verdict; it keeps waiting.
+
+**Takes and outputs on replay.** A take pops the entity's next recorded take,
+checks it against the thread's recorded take order (a different order is an input
+mismatch), and decodes the recorded body with the entity's own bridge into the
+caller's message, filling the message info or request header from the record.
+Subscriptions created under replay offer no loans, so rclcpp takes by copy, and a
+loaned take answers `RMW_RET_UNSUPPORTED`. Outputs still go out on the transport;
+their hashes feed the oracle.
+
+**Oracle** (`oracle::Oracle`). A segment is the outputs a thread makes between two
+of its rmw events; its anchor is the recorded event's `k`. A take opens a segment;
+the first unit of a window opens the window's segment, later units continue it.
+At each anchor change the replayed segment is compared with the recorded one
+(`(entity, hash, len, payload present, return)` per output, `/rosout` excluded, and
+a thread's construction-time outputs before its first rmw event counted, not
+compared: rclpy's construction `/parameter_events` stamp is wall time).
+The first difference with every input matched so far is the culprit; differences
+after an input mismatch are counted as inherited. Outputs of threads that never
+wait are counted off-window and not compared. The verdict
+(`<log>.verdict.json`, written atomically) is written when the schedule is
+exhausted, on a refusal or a watchdog report, and at exit if none was written;
+outputs after the log's end are not compared. It holds no time or pid, so two
+replays that behave the same write the same bytes.
+
+**Detection** (`detect::Detector`). An rclcpp `MultiThreadedExecutor` shows as a
+second thread waiting on one wait set (`WaitSetData::replay_owner`); an rclpy one
+as a take from a thread that never waits while another thread waits. Recording
+marks the log not replayable (an `rdl/process` record, flushed) and warns once;
+replay refuses at `rmw_init`, or, detected live, fails `rmw_wait` with
+`RMW_RET_ERROR`.
+
+**ABI.** No new export, no FFI signature change, no error-code change and no
+cdylib-loader symbol: `CERULION_ABI_VERSION` is unchanged and the Humble export
+table stays at 112 (`rmw_absent_export_table_test`).
+
 ## Test map
 
 | Test file | What it pins | Serial? | Prereq fixtures |
@@ -1132,6 +1228,11 @@ with rmw-specific additions:
 | `tests/rmw_slice_ceiling_e2e_test.rs` | The per-type slice ceiling GOVERNS the negotiated iceoryx2 buffer on the rmw path: the oracle is the LOAN VERDICT (an over-ceiling `rmw_publish` fails, an under-ceiling one delivers), which the pre-ceiling blanket would have passed | yes; own binary (`#[traced_test]`) | none |
 | `tests/rmw_wait_pingpong_discriminator_test.rs` | The ping-pong discriminator for the event-driven wait: two wait sets on two threads in the bench's exact shape, spin ON and OFF, per-round wake-mode tally + RTT distribution | yes; `--test-threads=1` and `--nocapture`; the same-core Linux arm is `--ignored` | none |
 | `tests/rmw_wait_spin_test.rs` | `rmw_wait` spin behaviour with the shared spin knob set to `u64::MAX`: the clamped budget keeps zero-timeout waits immediate, mid-wait wakes landing, and no core pinned past the cap | yes; `#[serial]` + `--test-threads=1` (process env) | none |
+| `src/replay/` unit tests (lib binary) | The delivery log codec (every record round-trips; truncation, trailing bytes, other versions and a hostile id count refused), a finished log reading back in `k` order and complete, a log torn inside a chunk reading every whole record before the tear and incomplete, the serving schedule (take-order splits with guards on the last unit, the `/clock` set rule, timeouts, two threads interleaving by take `k`), the token over two real threads, the watchdog firing after 5 s with the holder named, per-entity take serving with out-of-order takes named, graph answers, the oracle (identical, `/rosout` excluded, culprit vs inherited, a missing output naming the recorded publisher, construction-time outputs counted, never compared), both multi-threaded marks, the env refusal, identity checks, entity naming | no | none |
+| `tests/rmw_replay_rclpy_probe_test.rs` | `#[ignore]`, real rclpy processes: the probe `mixer` recorded on the clockpub/talker graph replays alone 140/140 `/out` byte-identical and in callback order 5/5 with byte-identical `identical` verdicts; with `MIXER_WALLCLOCK=1` the verdict names node `mixer`, topic `/out`, inputs matched, 2/2 | run by name, one fresh process each (`gate.sh`, Humble) | ROS 2 + staged `.so`, `tests/fixtures/replay_probe/` |
+| `tests/rmw_replay_rclcpp_probe_test.rs` | `#[ignore]`, the stock `demo_nodes_cpp` executables: `listener` recorded under `talker` replays alone with the same `I heard` lines in order and an `identical` verdict; the wall-timer `talker` replayed alone is named at node `talker`, topic `/chatter` | as above | ROS 2 + staged `.so` + `demo_nodes_cpp` |
+| `tests/rmw_replay_refusal_test.rs` | `#[ignore]`: `mixer --mt` (rclpy MultiThreadedExecutor) records a not-replayable log and its replay exits nonzero naming `MultiThreadedExecutor` and `mixer`, verdict `refused`, while the single-threaded control replays `identical`; both variables set refused naming both; a log replayed under another command line refused naming the field | as above | ROS 2 + staged `.so`, fixtures |
+| `tests/rmw_replay_token_test.rs` | `#[ignore]`: `two_exec.py` (two single-threaded executors on two threads) replays both nodes' callback logs identical 2/2; with `--block` the watchdog names `sub:/left#0` of node `right` within 10 s | as above | ROS 2 + staged `.so`, fixtures |
 | `tests/rmw_absent_export_table_test.rs` | The per-distro absent-export table as a gate: every `extern "C"` `rmw_*` export guarded by a capability cfg is read out of `src/`, mapped to the era its capability arrived in through `era_check::CAPABILITY_MIN_ERA`, and the set a distro lacks is compared with that row's hand-typed `absent_symbols` in `tools/ci/rmw-distros/gate.sh` in BOTH directions, so a new guarded export fails until every older row names it and a stale row fails until it drops the name; both parsers are pinned by hand-written source and gate snippets with hand-written readings (a negated guard, a compound guard, a cfg whose reach a code line ends, the fallback arm), both comparison directions are pinned on a fixture era table, a guard shape the reader does not interpret is a REFUSAL naming the export and the attribute rather than an unguarded export (the comparison alone is blind to it, which the compound arm pins), the refusal is driven at the WALK level too over a source directory the test writes (one file with a compound guard one directory down from one with a recognised guard, against a recognised-only control), so an aggregation that dropped the refusal list cannot read as no finding, and the tree arm refuses a vacuous read (an export-count floor plus at least one non-empty derived set) | no (pure text, no transport) | none |
 
 Traced-suite conventions: `#[traced_test]` installs the process-global tracing

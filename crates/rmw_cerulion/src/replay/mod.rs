@@ -1,0 +1,1769 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Exact replay of one ROS 2 process: the delivery log and the replay gate.
+//!
+//! `CERULION_RMW_DELIVERY_LOG=<dir>` RECORDS what this process consumed, in
+//! the order it consumed it, into `<dir>/<exe>-<pid>.rdl.mcap`: every take
+//! (plain, loaned, sequence and adopted subscription takes, service requests
+//! and client responses, with the payload body), every `rmw_wait` return (the
+//! ready entities, the return code, the timeout rcl passed), every graph-query
+//! answer, and a 64-bit FNV-1a hash of every output.
+//!
+//! `CERULION_RMW_REPLAY=<file>` REPLAYS one recorded process against its log:
+//! each `rmw_wait` reports the recorded readiness (see [`gate`]) without
+//! probing the transport or waiting for wall time, each take is served from
+//! the log and decoded by the same bridge, and each output's hash is compared
+//! segment by segment with the recording (see [`oracle`]). The result is
+//! written to `<file>.verdict.json`.
+//!
+//! Setting both variables is refused. A multi-threaded executor is refused by
+//! name ([`detect`]). With neither variable set every hook costs one
+//! `OnceLock` load: [`mode`] is initialized at the first rmw call and every
+//! hook site branches on [`Mode::Off`] before doing anything else.
+//!
+//! The user page is `docs/ros2_replay.md`; the internals are the "Delivery
+//! log and replay gate" section of `docs/internals/rmw.md`.
+
+pub(crate) mod detect;
+pub(crate) mod gate;
+pub(crate) mod log;
+pub(crate) mod oracle;
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::Duration;
+
+use crate::ffi::{self, rmw_ret_t, RMW_RET_ERROR, RMW_RET_TIMEOUT};
+use crate::runtime::GuardConditionState;
+
+use detect::Detector;
+use gate::{Gate, GraphAnswers, Schedule, TakeQueues, Turn};
+use log::{
+    EntityId, EntityKind, EntityRec, GraphQuery, GraphRec, LoadedLog, LogEnding, LogWriter,
+    OutputKind, OutputRec, ProcessHeader, Record, TakeKind, TakeRec, WaitRec, LOG_SUFFIX,
+    RECORD_VERSION,
+};
+use oracle::{EntityNames, Oracle, Out, Verdict, WatchdogReport, UNKNOWN_ENTITY};
+
+/// Record this process's deliveries into a log in this directory.
+pub const DELIVERY_LOG_ENV: &str = "CERULION_RMW_DELIVERY_LOG";
+/// Replay this process against this delivery log.
+pub const REPLAY_ENV: &str = "CERULION_RMW_REPLAY";
+/// The verdict file's suffix, appended to the log path.
+pub const VERDICT_SUFFIX: &str = ".verdict.json";
+
+/// How long a replayed `rmw_wait` with nothing left to serve sleeps before it
+/// returns `RMW_RET_TIMEOUT`, so a spinning executor does not burn a core.
+const IDLE_AFTER_LOG: Duration = Duration::from_millis(20);
+
+/// What this process does with its deliveries.
+pub(crate) enum Mode {
+    /// Neither variable set: every hook is one branch.
+    Off,
+    Record(Box<Recorder>),
+    Replay(Box<Player>),
+    /// A requested record or replay that cannot run: `rmw_init` refuses with
+    /// this message.
+    Refused(String),
+}
+
+static MODE: OnceLock<Mode> = OnceLock::new();
+
+/// Set once, when the mode resolves to record or replay. The capture points
+/// inside the live take and send paths read this relaxed atomic before they
+/// touch any thread-local, so with recording and replay off they cost one
+/// plain load.
+static HOOKS_ON: AtomicBool = AtomicBool::new(false);
+
+/// The process's mode, resolved from the environment on first use.
+#[inline]
+pub(crate) fn mode() -> &'static Mode {
+    MODE.get_or_init(Mode::from_env)
+}
+
+/// Whether any hook has work to do.
+#[inline]
+pub(crate) fn active() -> bool {
+    !matches!(mode(), Mode::Off)
+}
+
+/// What the two variables ask for. Pure, so the refusal is testable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Requested {
+    Off,
+    Record(PathBuf),
+    Replay(PathBuf),
+}
+
+/// Resolve the two variables (an empty value counts as unset).
+pub(crate) fn requested(
+    record: Option<OsString>,
+    replay: Option<OsString>,
+) -> Result<Requested, String> {
+    let record = record.filter(|v| !v.is_empty());
+    let replay = replay.filter(|v| !v.is_empty());
+    match (record, replay) {
+        (None, None) => Ok(Requested::Off),
+        (Some(dir), None) => Ok(Requested::Record(PathBuf::from(dir))),
+        (None, Some(file)) => Ok(Requested::Replay(PathBuf::from(file))),
+        (Some(_), Some(_)) => Err(format!(
+            "rmw_cerulion: {DELIVERY_LOG_ENV} and {REPLAY_ENV} are both set; a process either \
+             records its deliveries or replays a log, never both. Unset one."
+        )),
+    }
+}
+
+impl Mode {
+    fn from_env() -> Mode {
+        let req = requested(
+            std::env::var_os(DELIVERY_LOG_ENV),
+            std::env::var_os(REPLAY_ENV),
+        );
+        let req = match req {
+            Ok(Requested::Off) => return Mode::Off,
+            Ok(r) => r,
+            Err(e) => {
+                crate::runtime::install_tracing();
+                return Mode::Refused(e);
+            }
+        };
+        // Errors from here on must reach a foreign host's stderr.
+        crate::runtime::install_tracing();
+        HOOKS_ON.store(true, Ordering::Release);
+        match req {
+            Requested::Off => Mode::Off,
+            Requested::Record(dir) => match Recorder::start(&dir) {
+                Ok(r) => Mode::Record(Box::new(r)),
+                Err(e) => Mode::Refused(e),
+            },
+            Requested::Replay(file) => match Player::load(&file) {
+                Ok(p) => Mode::Replay(Box::new(p)),
+                Err(e) => {
+                    write_verdict_file(&file, &refused_verdict(&file, &e));
+                    Mode::Refused(e)
+                }
+            },
+        }
+    }
+}
+
+// ===========================================================================
+// Threads
+// ===========================================================================
+
+static NEXT_THREAD: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static THREAD: Cell<u32> = const { Cell::new(u32::MAX) };
+    static WAITED: Cell<bool> = const { Cell::new(false) };
+    static TAKE_ARMED: Cell<bool> = const { Cell::new(false) };
+    static TAKE_CAPTURE: RefCell<TakeCapture> = const {
+        RefCell::new(TakeCapture { have: false, seq: 0, source_ts: 0, body: Vec::new() })
+    };
+    static OUTPUT_ARMED: Cell<bool> = const { Cell::new(false) };
+    static OUTPUT_CAPTURE: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
+}
+
+/// This thread's index: the order in which threads first reached a hook.
+fn thread_ix() -> u32 {
+    THREAD.with(|t| {
+        let v = t.get();
+        if v != u32::MAX {
+            return v;
+        }
+        let n = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
+        t.set(n);
+        n
+    })
+}
+
+/// Arms one capture flag for the life of the guard, so a live call that
+/// unwinds (into its entry point's `ffi_guard`) never leaves it armed.
+struct Armed(&'static std::thread::LocalKey<Cell<bool>>);
+
+impl Armed {
+    fn new(flag: &'static std::thread::LocalKey<Cell<bool>>) -> Armed {
+        flag.with(|a| a.set(true));
+        Armed(flag)
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        self.0.with(|a| a.set(false));
+    }
+}
+
+struct TakeCapture {
+    have: bool,
+    seq: i64,
+    source_ts: i64,
+    body: Vec<u8>,
+}
+
+/// Called by every take path at the point it has decoded a payload body:
+/// copies the body for the delivery log while a recorded take is in flight on
+/// this thread. One thread-local flag read otherwise.
+#[inline]
+pub(crate) fn capture_take_body(body: &[u8], seq: i64, source_ts: i64) {
+    if !HOOKS_ON.load(Ordering::Relaxed) || !TAKE_ARMED.with(Cell::get) {
+        return;
+    }
+    TAKE_CAPTURE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.have = true;
+        c.seq = seq;
+        c.source_ts = source_ts;
+        c.body.clear();
+        c.body.extend_from_slice(body);
+    });
+}
+
+/// Whether an output's body hash is wanted on this thread right now (a
+/// recorded or replayed output is in flight). One thread-local flag read.
+#[inline]
+pub(crate) fn output_capture_armed() -> bool {
+    HOOKS_ON.load(Ordering::Relaxed) && OUTPUT_ARMED.with(Cell::get)
+}
+
+/// Called by every output path with the payload body it is about to send:
+/// hashes it while a recorded or replayed output is in flight on this thread.
+/// One thread-local flag read otherwise.
+#[inline]
+pub(crate) fn capture_output_body(body: &[u8]) {
+    if !output_capture_armed() {
+        return;
+    }
+    OUTPUT_CAPTURE.with(|c| c.set(Some((log::fnv1a(body), body.len() as u32))));
+}
+
+// ===========================================================================
+// Entities
+// ===========================================================================
+
+#[derive(Clone, Debug)]
+struct Ent {
+    id: EntityId,
+    /// Replay: the recorded entity of the same stable name.
+    rec: Option<EntityId>,
+    name: String,
+    topic: String,
+    node: String,
+}
+
+#[derive(Default)]
+struct Registry {
+    by_key: HashMap<usize, Ent>,
+    per_name: HashMap<String, u32>,
+    next_id: EntityId,
+    guards: u32,
+    nodes: Vec<String>,
+}
+
+impl Registry {
+    /// Name and register a new entity; returns it.
+    fn add(&mut self, kind: EntityKind, key: usize, topic: &str, node: &str) -> Ent {
+        let name = if kind == EntityKind::Guard {
+            let n = self.guards;
+            self.guards += 1;
+            format!("gc#{n}")
+        } else {
+            let base = format!("{}:{}", kind.prefix(), topic);
+            let c = self.per_name.entry(base.clone()).or_insert(0);
+            let full = format!("{base}#{c}");
+            *c += 1;
+            full
+        };
+        let ent = Ent {
+            id: self.next_id,
+            rec: None,
+            name,
+            topic: topic.to_string(),
+            node: node.to_string(),
+        };
+        self.next_id += 1;
+        self.by_key.insert(key, ent.clone());
+        ent
+    }
+}
+
+/// The four entity arrays of one `rmw_wait` call.
+#[derive(Clone, Copy)]
+pub(crate) struct WaitArrays {
+    pub subscriptions: *mut ffi::rmw_subscriptions_t,
+    pub guard_conditions: *mut ffi::rmw_guard_conditions_t,
+    pub services: *mut ffi::rmw_services_t,
+    pub clients: *mut ffi::rmw_clients_t,
+}
+
+impl WaitArrays {
+    /// Visit every slot (subscriptions, guards, services, clients, in array
+    /// order) with its current handle.
+    ///
+    /// # Safety
+    /// The rmw_wait contract: each array is valid for its count.
+    unsafe fn for_each_slot(&self, mut f: impl FnMut(EntityKind, *mut *mut std::ffi::c_void)) {
+        if !self.subscriptions.is_null() {
+            let a = &*self.subscriptions;
+            for i in 0..a.subscriber_count {
+                f(EntityKind::Subscription, a.subscribers.add(i));
+            }
+        }
+        if !self.guard_conditions.is_null() {
+            let a = &*self.guard_conditions;
+            for i in 0..a.guard_condition_count {
+                f(EntityKind::Guard, a.guard_conditions.add(i));
+            }
+        }
+        if !self.services.is_null() {
+            let a = &*self.services;
+            for i in 0..a.service_count {
+                f(EntityKind::Service, a.services.add(i));
+            }
+        }
+        if !self.clients.is_null() {
+            let a = &*self.clients;
+            for i in 0..a.client_count {
+                f(EntityKind::Client, a.clients.add(i));
+            }
+        }
+    }
+
+    /// The registered entities in the arrays' non-null slots.
+    unsafe fn entities(&self, reg: &Registry) -> Vec<Ent> {
+        let mut v = Vec::new();
+        self.for_each_slot(|_, slot| {
+            let h = *slot;
+            if !h.is_null() {
+                if let Some(e) = reg.by_key.get(&(h as usize)) {
+                    v.push(e.clone());
+                }
+            }
+        });
+        v
+    }
+
+    unsafe fn null_all(&self) {
+        self.for_each_slot(|_, slot| *slot = std::ptr::null_mut());
+    }
+}
+
+/// Null every event slot (this implementation produces no events).
+unsafe fn null_events(events: *mut ffi::rmw_events_t) {
+    if !events.is_null() {
+        let evs = &mut *events;
+        for i in 0..evs.event_count {
+            *evs.events.add(i) = std::ptr::null_mut();
+        }
+    }
+}
+
+// ===========================================================================
+// Process identity
+// ===========================================================================
+
+fn live_cmdline() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    if let Ok(b) = std::fs::read("/proc/self/cmdline") {
+        return b
+            .split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+    }
+    std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// FNV-1a 64 of the file this code was loaded from, hex.
+fn library_digest() -> String {
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const std::os::raw::c_char,
+        dli_fbase: *mut std::ffi::c_void,
+        dli_sname: *const std::os::raw::c_char,
+        dli_saddr: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> std::os::raw::c_int;
+    }
+    let mut info = DlInfo {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    // SAFETY: dladdr fills `info` for an address inside a mapped object; the
+    // address is this function's own.
+    let ok = unsafe { dladdr(library_digest as *const std::ffi::c_void, &mut info) };
+    if ok == 0 || info.dli_fname.is_null() {
+        return "unknown".to_string();
+    }
+    // SAFETY: dladdr returned a NUL-terminated path owned by the loader.
+    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    let Ok(path) = path.to_str() else {
+        return "unknown".to_string();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => format!("{:016x}", log::fnv1a(&bytes)),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn live_header() -> ProcessHeader {
+    ProcessHeader {
+        format: RECORD_VERSION,
+        cmdline: live_cmdline(),
+        ros_distro: std::env::var("ROS_DISTRO").unwrap_or_default(),
+        built_for: crate::era::built_for().to_string(),
+        library_digest: library_digest(),
+        pid: std::process::id(),
+    }
+}
+
+/// Refuse a replay whose recorded process is not this one. Pure.
+pub(crate) fn check_identity(recorded: &ProcessHeader, live: &ProcessHeader) -> Result<(), String> {
+    let mut diffs = Vec::new();
+    if recorded.cmdline != live.cmdline {
+        diffs.push(format!(
+            "command line: recorded `{}`, this process `{}`",
+            recorded.cmdline.join(" "),
+            live.cmdline.join(" ")
+        ));
+    }
+    if recorded.ros_distro != live.ros_distro {
+        diffs.push(format!(
+            "ROS_DISTRO: recorded '{}', this process '{}'",
+            recorded.ros_distro, live.ros_distro
+        ));
+    }
+    if recorded.built_for != live.built_for {
+        diffs.push(format!(
+            "rmw_cerulion built for: recorded '{}', this library '{}'",
+            recorded.built_for, live.built_for
+        ));
+    }
+    if recorded.library_digest != live.library_digest {
+        diffs.push(format!(
+            "rmw_cerulion library digest: recorded {}, this library {}",
+            recorded.library_digest, live.library_digest
+        ));
+    }
+    if diffs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "rmw_cerulion replay refused: the log was recorded by a different process ({})",
+            diffs.join("; ")
+        ))
+    }
+}
+
+/// A short label for a process in messages: its command line.
+fn process_label(cmdline: &[String]) -> String {
+    let mut s = cmdline.join(" ");
+    if s.len() > 200 {
+        let mut cut = 200;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
+}
+
+/// The refusal message for a multi-threaded executor.
+fn mt_message(cmdline: &[String], nodes: &[String], detail: &str) -> String {
+    format!(
+        "ros2 process {} (nodes {}): MultiThreadedExecutor, not replayable ({detail})",
+        process_label(cmdline),
+        if nodes.is_empty() {
+            "none".to_string()
+        } else {
+            nodes.join(", ")
+        }
+    )
+}
+
+/// The log file stem: the executable's name, or the script's for an
+/// interpreter (`python3 mixer.py` logs as `mixer`).
+fn log_stem(cmdline: &[String]) -> String {
+    let base = |s: &str| {
+        Path::new(s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let mut stem = cmdline.first().map(|s| base(s)).unwrap_or_default();
+    if stem.starts_with("python") {
+        if let Some(script) = cmdline.get(1).filter(|a| !a.starts_with('-')) {
+            stem = base(script);
+            if let Some(s) = stem.strip_suffix(".py") {
+                stem = s.to_string();
+            }
+        }
+    }
+    let clean: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "process".to_string()
+    } else {
+        clean
+    }
+}
+
+// ===========================================================================
+// atexit
+// ===========================================================================
+
+static AT_EXIT: Once = Once::new();
+
+extern "C" fn at_exit() {
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(m) = MODE.get() {
+            match m {
+                Mode::Record(r) => r.finish(),
+                Mode::Replay(p) => p.finish(),
+                _ => {}
+            }
+        }
+    });
+}
+
+fn register_at_exit() {
+    extern "C" {
+        fn atexit(cb: extern "C" fn()) -> std::os::raw::c_int;
+    }
+    AT_EXIT.call_once(|| {
+        // SAFETY: registers a plain `extern "C"` function with libc.
+        if unsafe { atexit(at_exit) } != 0 {
+            tracing::error!(
+                "rmw_cerulion delivery log: atexit registration failed; the log is closed only \
+                 at rmw_shutdown flushes and reads as incomplete"
+            );
+        }
+    });
+}
+
+// ===========================================================================
+// Hooks called by the rmw entry points
+// ===========================================================================
+
+/// `rmw_init`: refuse a requested record or replay that cannot run.
+pub(crate) fn on_init() -> Result<(), String> {
+    match mode() {
+        Mode::Off => Ok(()),
+        Mode::Refused(e) => Err(e.clone()),
+        Mode::Record(_) | Mode::Replay(_) => {
+            register_at_exit();
+            Ok(())
+        }
+    }
+}
+
+/// `rmw_shutdown`: flush what is recorded; write the replay verdict so far.
+pub(crate) fn on_shutdown() {
+    match mode() {
+        Mode::Record(r) => r.flush(),
+        Mode::Replay(p) => p.write_verdict_if_unwritten(),
+        _ => {}
+    }
+}
+
+/// `rmw_create_node`: record the node; on replay, refuse a node the recording
+/// did not create at this point.
+pub(crate) fn on_node(name: &str, namespace: &str) -> Result<(), String> {
+    match mode() {
+        Mode::Record(r) => {
+            r.node(name, namespace);
+            Ok(())
+        }
+        Mode::Replay(p) => p.node(name, namespace),
+        _ => Ok(()),
+    }
+}
+
+/// An entity was created. `key` is its `data` pointer (what `rmw_wait`'s
+/// arrays carry).
+pub(crate) fn on_entity(kind: EntityKind, key: usize, topic: &str, node: &str) {
+    match mode() {
+        Mode::Record(r) => r.entity(kind, key, topic, node),
+        Mode::Replay(p) => p.entity(kind, key, topic, node),
+        _ => {}
+    }
+}
+
+/// An entity is being destroyed.
+pub(crate) fn on_entity_destroyed(key: usize) {
+    let reg = match mode() {
+        Mode::Record(r) => &r.registry,
+        Mode::Replay(p) => &p.registry,
+        _ => return,
+    };
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_key
+        .remove(&key);
+}
+
+/// `rmw_wait` with recording or replay on.
+///
+/// # Safety
+/// The rmw_wait contract (see `rmw_wait`).
+pub(crate) unsafe fn wait(
+    arrays: WaitArrays,
+    events: *mut ffi::rmw_events_t,
+    owner: &AtomicU32,
+    timeout: *const ffi::rmw_time_t,
+    live: impl FnOnce() -> rmw_ret_t,
+) -> rmw_ret_t {
+    match mode() {
+        Mode::Record(r) => r.wait(arrays, owner, timeout, live),
+        Mode::Replay(p) => p.wait(arrays, events, owner),
+        _ => live(),
+    }
+}
+
+/// What a take does under recording or replay.
+pub(crate) enum TakeAction<'a> {
+    /// Take live.
+    Live,
+    /// Take live and record it.
+    Record(&'a Recorder),
+    /// Serve this recorded take (`None`: nothing to serve, report not taken).
+    Serve(Option<TakeRec>),
+    /// Refused (a multi-threaded executor detected during replay).
+    Refuse,
+}
+
+/// Decide a take of `kind` on the entity `key`.
+pub(crate) fn take_action(key: usize, kind: TakeKind) -> TakeAction<'static> {
+    match mode() {
+        Mode::Record(r) => TakeAction::Record(r),
+        Mode::Replay(p) => match p.serve_take(key, kind) {
+            Ok(rec) => TakeAction::Serve(rec),
+            Err(()) => TakeAction::Refuse,
+        },
+        _ => TakeAction::Live,
+    }
+}
+
+/// The metadata of a take the live path produced.
+pub(crate) struct TakeMeta {
+    pub taken: bool,
+    pub received_ts: i64,
+    /// Requests and responses: the request id the live take reported.
+    pub request: Option<(i64, [u8; 16], i64)>,
+}
+
+impl Recorder {
+    /// Run the live take with body capture armed, then record it.
+    pub(crate) fn take(
+        &self,
+        key: usize,
+        kind: TakeKind,
+        live: impl FnOnce() -> rmw_ret_t,
+        meta: impl FnOnce(rmw_ret_t) -> TakeMeta,
+    ) -> rmw_ret_t {
+        TAKE_CAPTURE.with(|c| c.borrow_mut().have = false);
+        let ret = {
+            let _armed = Armed::new(&TAKE_ARMED);
+            live()
+        };
+        let m = meta(ret);
+        let thread = thread_ix();
+        if let Some(d) = self.detector.on_take(thread, WAITED.with(Cell::get)) {
+            self.mark_not_replayable(&d);
+        }
+        let entity = self.entity_id(key);
+        let (seq, source_ts, body) = TAKE_CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            if m.taken && c.have {
+                (c.seq, c.source_ts, std::mem::take(&mut c.body))
+            } else {
+                (0, 0, Vec::new())
+            }
+        });
+        let (seq, guid, source_ts) = match m.request {
+            Some((s, g, ts)) => (s, g, ts),
+            None => (seq, [0u8; 16], source_ts),
+        };
+        let rec = TakeRec {
+            k: 0,
+            thread,
+            entity,
+            kind,
+            ret,
+            taken: m.taken,
+            seq,
+            source_ts,
+            received_ts: m.received_ts,
+            guid,
+            body,
+        };
+        self.append(Record::Take(rec));
+        ret
+    }
+}
+
+/// An output under recording or replay: `live` runs the real send with the
+/// body hash captured.
+pub(crate) fn output(key: usize, kind: OutputKind, live: impl FnOnce() -> rmw_ret_t) -> rmw_ret_t {
+    let m = mode();
+    if matches!(m, Mode::Off | Mode::Refused(_)) {
+        return live();
+    }
+    OUTPUT_CAPTURE.with(|c| c.set(None));
+    let ret = {
+        let _armed = Armed::new(&OUTPUT_ARMED);
+        live()
+    };
+    let captured = OUTPUT_CAPTURE.with(Cell::take);
+    let (has_payload, hash, len) = match captured {
+        Some((h, l)) => (true, h, l),
+        None => (false, 0, 0),
+    };
+    match m {
+        Mode::Record(r) => {
+            let rec = OutputRec {
+                k: 0,
+                thread: thread_ix(),
+                entity: r.entity_id(key),
+                kind,
+                ret,
+                has_payload,
+                len,
+                hash,
+            };
+            r.append(Record::Output(rec));
+        }
+        Mode::Replay(p) => p.output(
+            key,
+            Out {
+                entity: UNKNOWN_ENTITY,
+                hash,
+                len,
+                has_payload,
+                ret,
+            },
+        ),
+        _ => {}
+    }
+    ret
+}
+
+/// A graph query under recording or replay: `live` computes the live answer.
+pub(crate) fn graph(
+    query: GraphQuery,
+    name: &str,
+    live: impl FnOnce() -> (rmw_ret_t, u64),
+) -> (rmw_ret_t, u64) {
+    match mode() {
+        Mode::Record(r) => {
+            let (ret, answer) = live();
+            r.append(Record::Graph(GraphRec {
+                k: 0,
+                thread: thread_ix(),
+                query,
+                name: name.to_string(),
+                ret,
+                answer,
+            }));
+            (ret, answer)
+        }
+        Mode::Replay(p) => p.graph(query, name, live),
+        _ => live(),
+    }
+}
+
+/// Whether a subscription created now may offer loaned takes. Replay serves
+/// takes from the log by copy, so it turns loans off (rclcpp then uses the
+/// copying take, with the same message delivered).
+pub(crate) fn subscription_loans_allowed() -> bool {
+    !matches!(mode(), Mode::Replay(_))
+}
+
+/// A serialized take bypasses the bridge, so the delivery log cannot record
+/// what it delivered: recording marks the log not replayable.
+pub(crate) fn report_serialized_take(topic: &str) {
+    if let Mode::Record(r) = mode() {
+        r.mark_not_replayable(&format!(
+            "a serialized take on {topic} (the delivery log records decoded takes only)"
+        ));
+    }
+}
+
+// ===========================================================================
+// Recorder
+// ===========================================================================
+
+/// The record side.
+pub(crate) struct Recorder {
+    header: ProcessHeader,
+    writer: Mutex<LogWriter>,
+    registry: Mutex<Registry>,
+    detector: Detector,
+    not_replayable: AtomicBool,
+}
+
+impl Recorder {
+    fn start(dir: &Path) -> Result<Recorder, String> {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "rmw_cerulion: {DELIVERY_LOG_ENV}={}: cannot create the directory: {e}",
+                dir.display()
+            )
+        })?;
+        let header = live_header();
+        let stem = format!("{}-{}", log_stem(&header.cmdline), header.pid);
+        // Process ids repeat (every container starts its own at 1), so an
+        // existing log is never overwritten: the next free `.<n>` is taken.
+        let mut claimed = None;
+        for n in 0..1000u32 {
+            let path = if n == 0 {
+                dir.join(format!("{stem}{LOG_SUFFIX}"))
+            } else {
+                dir.join(format!("{stem}.{n}{LOG_SUFFIX}"))
+            };
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    claimed = Some((path, file));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "rmw_cerulion: {DELIVERY_LOG_ENV}: cannot create {}: {e}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        let (path, file) = claimed.ok_or_else(|| {
+            format!(
+                "rmw_cerulion: {DELIVERY_LOG_ENV}: {stem}{LOG_SUFFIX} and 999 numbered siblings                  already exist in {}",
+                dir.display()
+            )
+        })?;
+        let writer = LogWriter::with_file(&path, file, &header)
+            .map_err(|e| format!("rmw_cerulion: {DELIVERY_LOG_ENV}: {e}"))?;
+        tracing::info!(log = %path.display(), "rmw_cerulion: recording deliveries");
+        Ok(Recorder {
+            header,
+            writer: Mutex::new(writer),
+            registry: Mutex::new(Registry::default()),
+            detector: Detector::default(),
+            not_replayable: AtomicBool::new(false),
+        })
+    }
+
+    fn append(&self, rec: Record) -> u64 {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(rec)
+    }
+
+    fn flush(&self) {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush();
+    }
+
+    fn finish(&self) {
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let trailer = w.finish();
+        if !trailer.complete || trailer.dropped > 0 {
+            tracing::error!(
+                log = %w.path().display(),
+                dropped = trailer.dropped,
+                error = w.failed().unwrap_or("unknown"),
+                "rmw_cerulion delivery log closed INCOMPLETE"
+            );
+        }
+    }
+
+    fn node(&self, name: &str, namespace: &str) {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .push(name.to_string());
+        self.append(Record::Node {
+            k: 0,
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        });
+    }
+
+    fn entity(&self, kind: EntityKind, key: usize, topic: &str, node: &str) {
+        let ent = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(kind, key, topic, node);
+        self.append(Record::Entity(EntityRec {
+            k: 0,
+            id: ent.id,
+            kind,
+            name: ent.name,
+            topic: ent.topic,
+            node: ent.node,
+        }));
+    }
+
+    fn entity_id(&self, key: usize) -> EntityId {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_key
+            .get(&key)
+            .map(|e| e.id)
+            .unwrap_or(UNKNOWN_ENTITY)
+    }
+
+    fn mark_not_replayable(&self, detail: &str) {
+        if self.not_replayable.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let nodes = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .clone();
+        let reason = mt_message(&self.header.cmdline, &nodes, detail);
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        w.append(Record::NotReplayable {
+            k: 0,
+            reason: reason.clone(),
+        });
+        w.flush();
+        tracing::warn!(
+            log = %w.path().display(),
+            "rmw_cerulion delivery log marked NOT REPLAYABLE: {reason}"
+        );
+    }
+
+    unsafe fn wait(
+        &self,
+        arrays: WaitArrays,
+        owner: &AtomicU32,
+        timeout: *const ffi::rmw_time_t,
+        live: impl FnOnce() -> rmw_ret_t,
+    ) -> rmw_ret_t {
+        let thread = thread_ix();
+        WAITED.with(|w| w.set(true));
+        if let Some(d) = self.detector.on_wait(owner, thread) {
+            self.mark_not_replayable(&d);
+        }
+        let attached: Vec<EntityId> = {
+            let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            arrays.entities(&reg).iter().map(|e| e.id).collect()
+        };
+        let timeout_ns = if timeout.is_null() {
+            -1
+        } else {
+            let t = &*timeout;
+            (t.sec as i128 * 1_000_000_000 + t.nsec as i128).min(i64::MAX as i128) as i64
+        };
+        let ret = live();
+        let ready: Vec<EntityId> = {
+            let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            arrays.entities(&reg).iter().map(|e| e.id).collect()
+        };
+        self.append(Record::Wait(WaitRec {
+            k: 0,
+            thread,
+            ret,
+            timeout_ns,
+            attached,
+            ready,
+        }));
+        ret
+    }
+}
+
+// ===========================================================================
+// Player
+// ===========================================================================
+
+struct PlayState {
+    takes: TakeQueues,
+    graph: GraphAnswers,
+    oracle: Oracle,
+    /// Live thread → recorded thread.
+    thread_map: HashMap<u32, u32>,
+    claimed: HashSet<u32>,
+    node_cursor: usize,
+    guards_not_triggered: usize,
+    refused: Option<String>,
+    watchdog: Option<WatchdogReport>,
+    verdict_written: bool,
+    exhausted: bool,
+    /// Each recorded thread's last served take: the callback a stalled token
+    /// holder is in.
+    last_take: HashMap<u32, EntityId>,
+}
+
+/// The replay side.
+pub(crate) struct Player {
+    path: PathBuf,
+    header: ProcessHeader,
+    ending: LogEnding,
+    schedule: Schedule,
+    gate: Gate,
+    registry: Mutex<Registry>,
+    detector: Detector,
+    rec_by_name: HashMap<String, EntityRec>,
+    rec_nodes: Vec<(String, String)>,
+    /// Each recorded thread's first attached set (maps a replaying thread to
+    /// the recorded one at its first wait).
+    first_attached: HashMap<u32, Vec<EntityId>>,
+    state: Mutex<PlayState>,
+}
+
+fn refused_verdict(log: &Path, why: &str) -> Verdict {
+    Verdict {
+        verdict: "refused".to_string(),
+        process: process_label(&live_cmdline()),
+        log: log.display().to_string(),
+        log_complete: false,
+        windows_recorded: 0,
+        units_recorded: 0,
+        units_served: 0,
+        windows_served_as_sets: 0,
+        windows_split: 0,
+        segments_compared: 0,
+        segments_divergent: 0,
+        segments_inherited: 0,
+        outputs_compared: 0,
+        outputs_excluded: 0,
+        outputs_before_first_event: 0,
+        outputs_off_window: 0,
+        guards_not_triggered_live: 0,
+        culprit: None,
+        input_mismatch: None,
+        watchdog: None,
+        refused: Some(why.to_string()),
+    }
+}
+
+/// The verdict file of a log.
+pub(crate) fn verdict_path(log: &Path) -> PathBuf {
+    let mut s = log.as_os_str().to_os_string();
+    s.push(VERDICT_SUFFIX);
+    PathBuf::from(s)
+}
+
+fn write_verdict_file(log: &Path, v: &Verdict) {
+    let path = verdict_path(log);
+    let tmp = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let mut bytes = serde_json::to_vec_pretty(v).unwrap_or_default();
+    bytes.push(b'\n');
+    let res = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = res {
+        tracing::error!(
+            verdict = %path.display(),
+            error = %e,
+            "rmw_cerulion replay: cannot write the verdict file"
+        );
+    }
+}
+
+impl Player {
+    fn load(path: &Path) -> Result<Player, String> {
+        let log = LoadedLog::read(path).map_err(|e| format!("rmw_cerulion replay refused: {e}"))?;
+        let live = live_header();
+        check_identity(&log.header, &live)?;
+        let mut waits = Vec::new();
+        let mut takes = Vec::new();
+        let mut graphs = Vec::new();
+        let mut rec_by_name = HashMap::new();
+        let mut rec_nodes = Vec::new();
+        let mut names = EntityNames::default();
+        for r in &log.records {
+            match r {
+                Record::Wait(w) => waits.push(w.clone()),
+                Record::Take(t) => takes.push(t.clone()),
+                Record::Graph(g) => graphs.push(g.clone()),
+                Record::Entity(e) => {
+                    names.name.insert(e.id, e.name.clone());
+                    names.topic.insert(e.id, e.topic.clone());
+                    names.node.insert(e.id, e.node.clone());
+                    rec_by_name.insert(e.name.clone(), e.clone());
+                }
+                Record::Node {
+                    name, namespace, ..
+                } => rec_nodes.push((name.clone(), namespace.clone())),
+                Record::NotReplayable { reason, .. } => {
+                    return Err(format!(
+                        "rmw_cerulion replay refused: {reason} (the log {} is marked not \
+                         replayable)",
+                        path.display()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let clock_subs: HashSet<EntityId> = rec_by_name
+            .values()
+            .filter(|e| e.kind == EntityKind::Subscription && e.topic == "/clock")
+            .map(|e| e.id)
+            .collect();
+        let schedule = Schedule::build(&waits, &takes, &clock_subs);
+        let mut first_attached = HashMap::new();
+        for w in &schedule.windows {
+            first_attached
+                .entry(w.thread)
+                .or_insert_with(|| w.attached.clone());
+        }
+        let gate = Gate::new(&schedule);
+        let oracle = Oracle::new(&log.records, names);
+        tracing::info!(
+            log = %path.display(),
+            windows = schedule.windows.len(),
+            units = schedule.units.len(),
+            "rmw_cerulion: replaying deliveries"
+        );
+        Ok(Player {
+            path: path.to_path_buf(),
+            header: log.header,
+            ending: log.ending,
+            gate,
+            registry: Mutex::new(Registry::default()),
+            detector: Detector::default(),
+            rec_by_name,
+            rec_nodes,
+            first_attached,
+            state: Mutex::new(PlayState {
+                takes: TakeQueues::new(&takes),
+                graph: GraphAnswers::new(&graphs),
+                oracle,
+                thread_map: HashMap::new(),
+                claimed: HashSet::new(),
+                node_cursor: 0,
+                guards_not_triggered: 0,
+                refused: None,
+                watchdog: None,
+                verdict_written: false,
+                exhausted: false,
+                last_take: HashMap::new(),
+            }),
+            schedule,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PlayState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node(&self, name: &str, namespace: &str) -> Result<(), String> {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .push(name.to_string());
+        let mut st = self.lock();
+        let i = st.node_cursor;
+        st.node_cursor += 1;
+        let ok = self
+            .rec_nodes
+            .get(i)
+            .is_some_and(|(n, ns)| n == name && ns == namespace);
+        if ok {
+            return Ok(());
+        }
+        let why = match self.rec_nodes.get(i) {
+            Some((n, ns)) => format!(
+                "rmw_cerulion replay refused: node {} is node {i} of this process, the recording's \
+                 node {i} is {}",
+                join_node(namespace, name),
+                join_node(ns, n)
+            ),
+            None => format!(
+                "rmw_cerulion replay refused: node {} is node {i} of this process; the recording \
+                 created only {} nodes",
+                join_node(namespace, name),
+                self.rec_nodes.len()
+            ),
+        };
+        self.refuse(&mut st, why.clone());
+        Err(why)
+    }
+
+    fn entity(&self, kind: EntityKind, key: usize, topic: &str, node: &str) {
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let ent = reg.add(kind, key, topic, node);
+        let rec = self.rec_by_name.get(&ent.name).map(|r| r.id);
+        if let Some(e) = reg.by_key.get_mut(&key) {
+            e.rec = rec;
+        }
+    }
+
+    fn rec_of(&self, key: usize) -> Option<(EntityId, String)> {
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.by_key
+            .get(&key)
+            .map(|e| (e.rec.unwrap_or(UNKNOWN_ENTITY), e.name.clone()))
+    }
+
+    /// Refuse the rest of the replay: logged once, verdict written.
+    fn refuse(&self, st: &mut PlayState, why: String) {
+        if st.refused.is_some() {
+            return;
+        }
+        tracing::error!("{why}");
+        let _ = ffi::rcutils_set_error_state_best_effort(&why);
+        st.refused = Some(why);
+        self.write_verdict(st);
+    }
+
+    /// Map a live thread to a recorded one (at its first wait, by the set of
+    /// entities it waits on; before any wait, by thread index).
+    fn map_thread(
+        &self,
+        st: &mut PlayState,
+        live: u32,
+        attached: Option<&[EntityId]>,
+    ) -> Option<u32> {
+        if let Some(r) = st.thread_map.get(&live) {
+            return Some(*r);
+        }
+        let pick = match attached {
+            Some(att) => {
+                let att: HashSet<EntityId> = att.iter().copied().collect();
+                let mut best: Option<(usize, u32)> = None;
+                let mut threads: Vec<&u32> = self.first_attached.keys().collect();
+                threads.sort();
+                for t in threads {
+                    if st.claimed.contains(t) {
+                        continue;
+                    }
+                    let rec: HashSet<EntityId> = self.first_attached[t].iter().copied().collect();
+                    let overlap = rec.intersection(&att).count();
+                    if rec == att {
+                        best = Some((usize::MAX, *t));
+                        break;
+                    }
+                    if overlap > 0 && best.is_none_or(|(b, _)| overlap > b) {
+                        best = Some((overlap, *t));
+                    }
+                }
+                best.map(|(_, t)| t)
+            }
+            None => Some(live).filter(|t| !st.claimed.contains(t)),
+        };
+        if let Some(rec) = pick {
+            st.claimed.insert(rec);
+            st.thread_map.insert(live, rec);
+            st.oracle.map_thread(live, rec);
+        }
+        pick
+    }
+
+    unsafe fn wait(
+        &self,
+        arrays: WaitArrays,
+        events: *mut ffi::rmw_events_t,
+        owner: &AtomicU32,
+    ) -> rmw_ret_t {
+        null_events(events);
+        let live = thread_ix();
+        WAITED.with(|w| w.set(true));
+        self.gate.note_progress();
+        let detected = self.detector.on_wait(owner, live);
+        let ents = {
+            let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            arrays.entities(&reg)
+        };
+        let rec_thread = {
+            let mut st = self.lock();
+            if let Some(d) = detected {
+                let nodes = self.live_nodes();
+                let why = mt_message(&self.header.cmdline, &nodes, &d);
+                self.refuse(&mut st, format!("rmw_cerulion replay refused: {why}"));
+            }
+            if st.refused.is_some() {
+                drop(st);
+                arrays.null_all();
+                return RMW_RET_ERROR;
+            }
+            let attached: Vec<EntityId> = ents.iter().filter_map(|e| e.rec).collect();
+            let mapped = self.map_thread(&mut st, live, Some(&attached));
+            if mapped.is_none() {
+                st.oracle.input_mismatch(
+                    format!("thread {live} waits, and the recording has no thread that waits on its entities"),
+                    None,
+                );
+            }
+            mapped
+        };
+        let Some(rec_thread) = rec_thread else {
+            arrays.null_all();
+            std::thread::sleep(IDLE_AFTER_LOG);
+            return RMW_RET_TIMEOUT;
+        };
+        let turn = self
+            .gate
+            .wait_turn(rec_thread, |stall| self.on_stall(stall));
+        match turn {
+            Turn::Serve(i) => {
+                let unit = &self.schedule.units[i];
+                let window = &self.schedule.windows[unit.window];
+                let mut st = self.lock();
+                if unit.first {
+                    st.oracle.event(live, window.k);
+                }
+                // Apply the recorded readiness by entity, never probing live.
+                let mut attached_rec: HashSet<EntityId> = HashSet::new();
+                let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                let mut not_triggered = 0usize;
+                arrays.for_each_slot(|kind, slot| {
+                    let h = *slot;
+                    if h.is_null() {
+                        return;
+                    }
+                    let rec = reg.by_key.get(&(h as usize)).and_then(|e| e.rec);
+                    let keep = rec.is_some_and(|r| unit.ready.contains(&r));
+                    if let Some(r) = rec {
+                        attached_rec.insert(r);
+                    }
+                    if !keep {
+                        *slot = std::ptr::null_mut();
+                    } else if kind == EntityKind::Guard {
+                        let state = &*(h as *const GuardConditionState);
+                        if !state.triggered.swap(false, Ordering::AcqRel) {
+                            not_triggered += 1;
+                        }
+                        if let Some(d) = &state.doorbell {
+                            d.drain();
+                        }
+                    }
+                });
+                drop(reg);
+                st.guards_not_triggered += not_triggered;
+                if let Some(missing) = unit.ready.iter().find(|r| !attached_rec.contains(r)) {
+                    let (name, _) = st.oracle.describe(*missing);
+                    st.oracle.input_mismatch(
+                        format!(
+                            "window {} reports {name} ready, and this wait does not attach it",
+                            unit.window
+                        ),
+                        Some(rec_thread),
+                    );
+                }
+                unit.ret
+            }
+            Turn::NoMore | Turn::Exhausted => {
+                if turn == Turn::Exhausted {
+                    let mut st = self.lock();
+                    if !st.exhausted {
+                        st.exhausted = true;
+                        st.oracle.close_all();
+                        self.write_verdict(&mut st);
+                    }
+                }
+                arrays.null_all();
+                std::thread::sleep(IDLE_AFTER_LOG);
+                RMW_RET_TIMEOUT
+            }
+        }
+    }
+
+    fn live_nodes(&self) -> Vec<String> {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .clone()
+    }
+
+    fn on_stall(&self, stall: gate::Stall) {
+        let unit = &self.schedule.units[stall.unit];
+        let mut st = self.lock();
+        // The holder is inside the callback of its last served take; with no
+        // take yet, inside whatever its unit released.
+        let (entity, node) = st
+            .last_take
+            .get(&stall.holder_thread)
+            .or(unit.ready.first())
+            .map(|e| st.oracle.describe(*e))
+            .unwrap_or_else(|| ("<no entity>".to_string(), String::new()));
+        let report = WatchdogReport {
+            holder_thread: stall.holder_thread,
+            entity: entity.clone(),
+            node: node.clone(),
+            window: unit.window,
+            waiting_thread: stall.waiting_thread,
+        };
+        tracing::error!(
+            holder_thread = stall.holder_thread,
+            waiting_thread = stall.waiting_thread,
+            window = unit.window,
+            "rmw_cerulion replay WATCHDOG: thread {} has held the replay token for {}s with no rmw \
+             progress since it was served window {} ({entity}, node '{node}'); a callback is \
+             blocked on something the replay cannot serve (another executor's thread waits for \
+             this one). The replay cannot continue.",
+            stall.holder_thread,
+            gate::WATCHDOG.as_secs(),
+            unit.window,
+        );
+        if st.watchdog.is_none() {
+            st.watchdog = Some(report);
+            self.write_verdict(&mut st);
+        }
+    }
+
+    fn serve_take(&self, key: usize, kind: TakeKind) -> Result<Option<TakeRec>, ()> {
+        let live = thread_ix();
+        self.gate.note_progress();
+        let mut st = self.lock();
+        if let Some(d) = self.detector.on_take(live, WAITED.with(Cell::get)) {
+            let nodes = self.live_nodes();
+            let why = mt_message(&self.header.cmdline, &nodes, &d);
+            self.refuse(&mut st, format!("rmw_cerulion replay refused: {why}"));
+        }
+        if st.refused.is_some() {
+            return Err(());
+        }
+        let rec_thread = self.map_thread(&mut st, live, None);
+        let Some((entity, name)) = self.rec_of(key) else {
+            st.oracle
+                .input_mismatch("a take from an unregistered entity".to_string(), rec_thread);
+            return Ok(None);
+        };
+        if entity == UNKNOWN_ENTITY {
+            st.oracle.input_mismatch(
+                format!("a take from {name}, which the recording does not have"),
+                rec_thread,
+            );
+            return Ok(None);
+        }
+        let served = st.takes.serve(rec_thread, entity, kind, &name);
+        if let Some(m) = served.mismatch {
+            st.oracle.input_mismatch(m, rec_thread);
+        }
+        if let Some(r) = &served.rec {
+            st.oracle.event(live, r.k);
+            if let Some(t) = rec_thread {
+                st.last_take.insert(t, entity);
+            }
+        }
+        Ok(served.rec)
+    }
+
+    /// A served take could not be decoded into the caller's message.
+    pub(crate) fn decode_failed(&self, what: &str) {
+        let mut st = self.lock();
+        st.oracle
+            .input_mismatch(format!("a recorded payload failed to decode: {what}"), None);
+    }
+
+    fn output(&self, key: usize, mut out: Out) {
+        let live = thread_ix();
+        self.gate.note_progress();
+        if let Some((rec, _)) = self.rec_of(key) {
+            out.entity = rec;
+        }
+        let mut st = self.lock();
+        if st.exhausted {
+            return;
+        }
+        st.oracle.output(live, out);
+    }
+
+    fn graph(
+        &self,
+        query: GraphQuery,
+        name: &str,
+        live: impl FnOnce() -> (rmw_ret_t, u64),
+    ) -> (rmw_ret_t, u64) {
+        self.gate.note_progress();
+        let mut st = self.lock();
+        match st.graph.next(query, name) {
+            Some(r) => (r.ret, r.answer),
+            None => {
+                st.oracle.input_mismatch(
+                    format!("a {query:?} query on {name} beyond the recording"),
+                    None,
+                );
+                drop(st);
+                live()
+            }
+        }
+    }
+
+    fn verdict(&self, st: &PlayState) -> Verdict {
+        let o = &st.oracle;
+        let served = self.gate.served();
+        let total = self.schedule.units.len();
+        let complete = self.ending == LogEnding::Complete;
+        let verdict = if st.refused.is_some() {
+            "refused"
+        } else if st.watchdog.is_some() {
+            "watchdog"
+        } else if o.culprit.is_some() {
+            "diverged"
+        } else if o.input_mismatch.is_some() {
+            "input_mismatch"
+        } else if served < total {
+            "replay_stopped_early"
+        } else if !complete {
+            "log_exhausted_early"
+        } else {
+            "identical"
+        };
+        Verdict {
+            verdict: verdict.to_string(),
+            process: process_label(&self.header.cmdline),
+            log: self.path.display().to_string(),
+            log_complete: complete,
+            windows_recorded: self.schedule.windows.len(),
+            units_recorded: total,
+            units_served: served,
+            windows_served_as_sets: self.schedule.set_served_windows,
+            windows_split: self.schedule.split_windows,
+            segments_compared: o.segments_compared,
+            segments_divergent: o.segments_divergent,
+            segments_inherited: o.segments_inherited,
+            outputs_compared: o.outputs_compared,
+            outputs_excluded: o.outputs_excluded,
+            outputs_before_first_event: o.outputs_before_first_event,
+            outputs_off_window: o.outputs_off_window,
+            guards_not_triggered_live: st.guards_not_triggered,
+            culprit: o.culprit.clone(),
+            input_mismatch: o.input_mismatch.clone(),
+            watchdog: st.watchdog.clone(),
+            refused: st.refused.clone(),
+        }
+    }
+
+    fn write_verdict(&self, st: &mut PlayState) {
+        let v = self.verdict(st);
+        match v.verdict.as_str() {
+            "diverged" => {
+                if let Some(c) = &v.culprit {
+                    tracing::error!(
+                        "rmw_cerulion replay DIVERGED: process `{}`, node '{}', topic {}: window {} \
+                         (after delivery index {}) inputs matched, outputs differ (output {} of {} \
+                         recorded, {} replayed). Verdict: {}",
+                        v.process,
+                        c.node,
+                        c.topic,
+                        c.window,
+                        c.delivery,
+                        c.output_index,
+                        c.recorded_outputs,
+                        c.replayed_outputs,
+                        verdict_path(&self.path).display()
+                    );
+                }
+            }
+            "input_mismatch" => {
+                if let Some(m) = &v.input_mismatch {
+                    tracing::error!(
+                        "rmw_cerulion replay INPUT MISMATCH: process `{}`: {}. Verdict: {}",
+                        v.process,
+                        m.what,
+                        verdict_path(&self.path).display()
+                    );
+                }
+            }
+            other => tracing::info!(
+                verdict = other,
+                file = %verdict_path(&self.path).display(),
+                "rmw_cerulion replay verdict written"
+            ),
+        }
+        write_verdict_file(&self.path, &v);
+        st.verdict_written = true;
+    }
+
+    fn write_verdict_if_unwritten(&self) {
+        let mut st = self.lock();
+        if !st.verdict_written {
+            st.oracle.close_all();
+            self.write_verdict(&mut st);
+        }
+    }
+
+    fn finish(&self) {
+        self.write_verdict_if_unwritten();
+    }
+}
+
+fn join_node(namespace: &str, name: &str) -> String {
+    if namespace.ends_with('/') {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
+/// A take served from the log could not be decoded into the caller's
+/// message: an input mismatch (the caller then returns `RMW_RET_ERROR`).
+pub(crate) fn served_decode_failed(what: &str) {
+    if let Mode::Replay(p) = mode() {
+        p.decode_failed(what);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neither_variable_is_off_and_both_are_refused_by_name() {
+        assert_eq!(requested(None, None), Ok(Requested::Off));
+        assert_eq!(
+            requested(Some("".into()), Some("".into())),
+            Ok(Requested::Off),
+            "an empty value counts as unset"
+        );
+        assert_eq!(
+            requested(Some("/tmp/d".into()), None),
+            Ok(Requested::Record("/tmp/d".into()))
+        );
+        assert_eq!(
+            requested(None, Some("/tmp/f".into())),
+            Ok(Requested::Replay("/tmp/f".into()))
+        );
+        let e = requested(Some("/tmp/d".into()), Some("/tmp/f".into())).unwrap_err();
+        assert!(
+            e.contains(DELIVERY_LOG_ENV) && e.contains(REPLAY_ENV),
+            "{e}"
+        );
+    }
+
+    fn header() -> ProcessHeader {
+        ProcessHeader {
+            format: RECORD_VERSION,
+            cmdline: vec!["python3".into(), "mixer.py".into()],
+            ros_distro: "humble".into(),
+            built_for: "humble".into(),
+            library_digest: "abc".into(),
+            pid: 1,
+        }
+    }
+
+    #[test]
+    fn identity_matches_on_everything_but_the_pid() {
+        let mut live = header();
+        live.pid = 999;
+        assert_eq!(check_identity(&header(), &live), Ok(()));
+    }
+
+    #[test]
+    fn identity_mismatches_are_refused_and_named() {
+        let mut live = header();
+        live.cmdline.push("--wallclock".into());
+        live.ros_distro = "jazzy".into();
+        live.library_digest = "def".into();
+        let e = check_identity(&header(), &live).unwrap_err();
+        assert!(e.contains("command line"), "{e}");
+        assert!(
+            e.contains("ROS_DISTRO: recorded 'humble', this process 'jazzy'"),
+            "{e}"
+        );
+        assert!(e.contains("library digest"), "{e}");
+        assert!(!e.contains("built for"), "{e}");
+    }
+
+    #[test]
+    fn the_log_stem_names_the_script_for_an_interpreter() {
+        let s = |v: &[&str]| log_stem(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            s(&["/usr/bin/python3", "/x/mixer.py", "--ros-args"]),
+            "mixer"
+        );
+        assert_eq!(s(&["/opt/ros/humble/lib/demo_nodes_cpp/talker"]), "talker");
+        assert_eq!(s(&["python3", "-c", "x"]), "python3");
+        assert_eq!(s(&[]), "process");
+        assert_eq!(s(&["a b"]), "a_b");
+    }
+
+    #[test]
+    fn the_multithreaded_refusal_names_the_process_and_its_nodes() {
+        let m = mt_message(
+            &["python3".into(), "mixer.py".into()],
+            &["mixer".into()],
+            "detail",
+        );
+        assert_eq!(
+            m,
+            "ros2 process python3 mixer.py (nodes mixer): MultiThreadedExecutor, not replayable \
+             (detail)"
+        );
+    }
+
+    #[test]
+    fn entities_are_named_stably_per_kind_and_topic() {
+        let mut r = Registry::default();
+        assert_eq!(
+            r.add(EntityKind::Subscription, 1, "/a", "n").name,
+            "sub:/a#0"
+        );
+        assert_eq!(
+            r.add(EntityKind::Subscription, 2, "/a", "n").name,
+            "sub:/a#1"
+        );
+        assert_eq!(r.add(EntityKind::Publisher, 3, "/a", "n").name, "pub:/a#0");
+        assert_eq!(r.add(EntityKind::Guard, 4, "", "").name, "gc#0");
+        assert_eq!(r.add(EntityKind::Guard, 5, "", "").name, "gc#1");
+        assert_eq!(r.by_key[&3].id, 2);
+    }
+
+    #[test]
+    fn the_verdict_path_appends_to_the_log_path() {
+        assert_eq!(
+            verdict_path(Path::new("/d/mixer-1.rdl.mcap")),
+            PathBuf::from("/d/mixer-1.rdl.mcap.verdict.json")
+        );
+    }
+
+    #[test]
+    fn captures_are_inert_unless_armed() {
+        capture_take_body(b"abc", 1, 2);
+        TAKE_CAPTURE.with(|c| assert!(!c.borrow().have));
+        capture_output_body(b"abc");
+        OUTPUT_CAPTURE.with(|c| assert!(c.get().is_none()));
+        {
+            // Armed but with the hooks off (this test binary's mode is Off):
+            // still inert.
+            let _armed = Armed::new(&OUTPUT_ARMED);
+            capture_output_body(b"abc");
+            OUTPUT_CAPTURE.with(|c| assert!(c.get().is_none()));
+            HOOKS_ON.store(true, Ordering::Relaxed);
+            capture_output_body(b"abc");
+            HOOKS_ON.store(false, Ordering::Relaxed);
+        }
+        assert!(!OUTPUT_ARMED.with(Cell::get), "the guard disarms on drop");
+        assert_eq!(
+            OUTPUT_CAPTURE.with(Cell::take),
+            Some((log::fnv1a(b"abc"), 3))
+        );
+    }
+}

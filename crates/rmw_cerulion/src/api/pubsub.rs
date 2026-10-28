@@ -26,6 +26,8 @@ use crate::ffi::{
     self, rmw_ret_t, RMW_RET_BAD_ALLOC, RMW_RET_ERROR, RMW_RET_INVALID_ARGUMENT, RMW_RET_OK,
     RMW_RET_UNSUPPORTED,
 };
+use crate::replay::log::{EntityKind, GraphQuery, OutputKind, TakeKind, TakeRec};
+use crate::replay::{TakeAction, TakeMeta};
 use crate::runtime::{
     self, GraphRegistry, PublisherData, PublisherInner, SubscriptionData, SubscriptionInner,
 };
@@ -855,6 +857,13 @@ pub unsafe extern "C" fn rmw_create_publisher(
             &data_ref.topic,
             data_ref.bridge.schema_hash(),
         );
+        // Delivery log / replay: the publisher's stable name (`pub:<topic>#n`).
+        crate::replay::on_entity(
+            EntityKind::Publisher,
+            (*ptr).data as usize,
+            &data_ref.topic,
+            &(*((*node).data as *const runtime::NodeData)).name,
+        );
         ptr
     })
 }
@@ -873,6 +882,7 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
         if !ffi::is_our_identifier((*publisher).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*publisher).data as usize);
         // All fallible/registry work happens through a BORROW first; the
         // Box::from_raw + frees are the final infallible block, so a
         // caught panic can never leave the rmw handle dangling.
@@ -1128,11 +1138,45 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
     })
 }
 
+/// Delivery log / replay: hash the body of the frame about to be sent (the
+/// wire header, which carries the wall-clock timestamp, is not part of it).
+/// One thread-local flag read when no recorded or replayed output is in
+/// flight.
+#[inline]
+fn capture_frame_output(frame: &[u8]) {
+    if !crate::replay::output_capture_armed() {
+        return;
+    }
+    let end = WireHeader::read_from_buf(frame)
+        .map(|h| h.total_size as usize)
+        .filter(|&n| (WireHeader::SIZE..=frame.len()).contains(&n))
+        .unwrap_or(frame.len());
+    crate::replay::capture_output_body(frame.get(WireHeader::SIZE..end).unwrap_or(&[]));
+}
+
 /// # Safety
 /// rmw ABI contract: `ros_message` points at a valid message of the
 /// publisher's type.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publish(
+    publisher: *const ffi::rmw_publisher_t,
+    ros_message: *const c_void,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_impl(publisher, ros_message, allocation);
+    }
+    crate::replay::output((*publisher).data as usize, OutputKind::Publish, || {
+        publish_impl(publisher, ros_message, allocation)
+    })
+}
+
+/// The live `rmw_publish`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish`].
+unsafe fn publish_impl(
     publisher: *const ffi::rmw_publisher_t,
     ros_message: *const c_void,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
@@ -1194,6 +1238,7 @@ pub unsafe extern "C" fn rmw_publish(
                     return RMW_RET_ERROR;
                 }
             }
+            capture_frame_output(&frame);
             match inner.publisher.publish_raw(&frame) {
                 Ok(_recipients) => {
                     // Native history: TRANSIENT_LOCAL
@@ -1308,6 +1353,7 @@ pub unsafe extern "C" fn rmw_publish(
                     return RMW_RET_ERROR;
                 }
             }
+            capture_frame_output(loan.bytes_mut());
             match inner.publisher.send_raw_loan(loan) {
                 Ok(_recipients) => {
                     inner.publisher.check_subscriber_events();
@@ -1754,7 +1800,8 @@ unsafe fn publish_windowed_loan(
             // where the fill placed it; the remainder is documented
             // gap/slack over OS-defined SHM bytes, and consumers slice on
             // `total_size`.
-            let sealed = loan.assume_init_shm_defined();
+            let mut sealed = loan.assume_init_shm_defined();
+            capture_frame_output(sealed.bytes_mut());
             if armed {
                 // The window's quarantine extent outlives the frame until
                 // the pool re-issues this slot (retire-on-reuse in
@@ -1903,6 +1950,7 @@ unsafe fn publish_copy_of_slot_struct(
             return RMW_RET_ERROR;
         }
     }
+    capture_frame_output(copy_loan.bytes_mut());
     match inner.publisher.send_raw_loan(copy_loan) {
         Ok(_recipients) => {
             inner.publisher.check_subscriber_events();
@@ -1926,6 +1974,24 @@ unsafe fn publish_copy_of_slot_struct(
 /// this publisher.
 #[no_mangle]
 pub unsafe extern "C" fn rmw_publish_loaned_message(
+    publisher: *const ffi::rmw_publisher_t,
+    ros_message: *mut c_void,
+    allocation: *mut ffi::rmw_publisher_allocation_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live publish.
+    if !crate::replay::active() || publisher.is_null() {
+        return publish_loaned_impl(publisher, ros_message, allocation);
+    }
+    crate::replay::output((*publisher).data as usize, OutputKind::Publish, || {
+        publish_loaned_impl(publisher, ros_message, allocation)
+    })
+}
+
+/// The live `rmw_publish_loaned_message`.
+///
+/// # Safety
+/// Same contract as [`rmw_publish_loaned_message`].
+unsafe fn publish_loaned_impl(
     publisher: *const ffi::rmw_publisher_t,
     ros_message: *mut c_void,
     _allocation: *mut ffi::rmw_publisher_allocation_t,
@@ -2003,6 +2069,7 @@ pub unsafe extern "C" fn rmw_publish_loaned_message(
             step_tag: cerulion_core::wire::StepTag::UNTAGGED,
         };
         header.write_to_buf(&mut loan.bytes_mut()[..WireHeader::SIZE]);
+        capture_frame_output(loan.bytes_mut());
 
         // Native history: no Cerulion-side ring push.
         // `send_raw_loan` retains the frame natively in the iceoryx2
@@ -2123,12 +2190,19 @@ pub unsafe extern "C" fn rmw_publisher_count_matched_subscriptions(
         // ALL processes. The local registry only sees this process — which
         // breaks cross-process readiness checks (rclcpp wait-for-matched,
         // rcl_action availability).
-        let count = match runtime::runtime() {
-            Ok(rt) => rt.transport.topic_subscriber_count(&data.topic),
-            Err(_) => 0,
-        };
-        *subscription_count = count;
-        RMW_RET_OK
+        let (ret, count) = crate::replay::graph(
+            GraphQuery::PublisherMatchedSubscriptions,
+            &data.topic,
+            || {
+                let n = match runtime::runtime() {
+                    Ok(rt) => rt.transport.topic_subscriber_count(&data.topic),
+                    Err(_) => 0,
+                };
+                (RMW_RET_OK, n as u64)
+            },
+        );
+        *subscription_count = count as usize;
+        ret
     })
 }
 
@@ -2481,7 +2555,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // included, which is why the read-only loan contract is documented
         // beside the fixed-type rule — and Jazzy additionally gates on
         // `ROS_DISABLE_LOANED_MESSAGES=0`, above the rmw.
-        rmw_sub.can_loan_messages = can_loan_take;
+        // A replay serves takes from the delivery log by copy, so it offers
+        // no loans (rclcpp then takes through the copying path, which
+        // delivers the same message).
+        rmw_sub.can_loan_messages = can_loan_take && crate::replay::subscription_loans_allowed();
         let ptr = Box::into_raw(rmw_sub);
         // Registry mutation last (see rmw_create_publisher).
         {
@@ -2524,6 +2601,13 @@ pub unsafe extern "C" fn rmw_create_subscription(
             };
             let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
             GraphRegistry::add_endpoint(&mut graph.subscriptions, &data_ref.topic, record);
+            // Delivery log / replay: the stable name (`sub:<topic>#n`).
+            crate::replay::on_entity(
+                EntityKind::Subscription,
+                (*ptr).data as usize,
+                &data_ref.topic,
+                &node_data.name,
+            );
         }
         runtime::notify_graph_change();
         ptr
@@ -2544,6 +2628,7 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
         if !ffi::is_our_identifier((*subscription).implementation_identifier) {
             return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
         }
+        crate::replay::on_entity_destroyed((*subscription).data as usize);
         // Borrow first, free last (see rmw_destroy_publisher).
         {
             let data = &*((*subscription).data as *const SubscriptionData);
@@ -2602,6 +2687,86 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
 }
 
 unsafe fn take_impl(
+    subscription: *const ffi::rmw_subscription_t,
+    ros_message: *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    // Recording and replay off: one `OnceLock` load, then the live take.
+    if !crate::replay::active() {
+        return take_impl_live(subscription, ros_message, taken, message_info);
+    }
+    if subscription.is_null() || ros_message.is_null() || taken.is_null() {
+        return RMW_RET_INVALID_ARGUMENT;
+    }
+    if !ffi::is_our_identifier((*subscription).implementation_identifier) {
+        return ffi::RMW_RET_INCORRECT_RMW_IMPLEMENTATION;
+    }
+    let key = (*subscription).data as usize;
+    match crate::replay::take_action(key, TakeKind::Message) {
+        TakeAction::Live => take_impl_live(subscription, ros_message, taken, message_info),
+        TakeAction::Record(r) => r.take(
+            key,
+            TakeKind::Message,
+            || take_impl_live(subscription, ros_message, taken, message_info),
+            |_| message_take_meta(*taken, message_info),
+        ),
+        TakeAction::Serve(rec) => {
+            let data = &*((*subscription).data as *const SubscriptionData);
+            serve_recorded_message(data, rec, ros_message, taken, message_info)
+        }
+        TakeAction::Refuse => RMW_RET_ERROR,
+    }
+}
+
+/// What a live message take reported, for the delivery log.
+unsafe fn message_take_meta(taken: bool, message_info: *const ffi::rmw_message_info_t) -> TakeMeta {
+    TakeMeta {
+        taken,
+        received_ts: if taken && !message_info.is_null() {
+            (*message_info).received_timestamp
+        } else {
+            0
+        },
+        request: None,
+    }
+}
+
+/// Replay: deliver a recorded take into the caller's message, decoded by the
+/// subscription's own bridge, with the message info the live take produced.
+unsafe fn serve_recorded_message(
+    data: &SubscriptionData,
+    rec: Option<TakeRec>,
+    ros_message: *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    *taken = false;
+    let Some(rec) = rec else {
+        return RMW_RET_OK;
+    };
+    if rec.taken {
+        if !data.bridge.unflatten(&rec.body, ros_message) {
+            crate::replay::served_decode_failed(&data.topic);
+            return RMW_RET_ERROR;
+        }
+        *taken = true;
+        if !message_info.is_null() {
+            // The same fill as the live take, from the recorded values.
+            let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
+            info.source_timestamp = rec.source_ts;
+            info.received_timestamp = rec.received_ts;
+            super::stamp_sequence_numbers(&mut info, rec.seq as u64);
+            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            info.from_intra_process = false;
+            *message_info = info;
+        }
+    }
+    rec.ret
+}
+
+/// The live take.
+unsafe fn take_impl_live(
     subscription: *const ffi::rmw_subscription_t,
     ros_message: *mut c_void,
     taken: *mut bool,
@@ -2722,6 +2887,11 @@ unsafe fn take_impl(
         if data.bridge.unflatten(msg.payload(), ros_message) {
             took = true;
             info_out = Some((header.timestamp_ns, header.sequence as u64));
+            crate::replay::capture_take_body(
+                msg.payload(),
+                header.sequence as i64,
+                header.timestamp_ns as i64,
+            );
             crate::decode_failure_latch::report_decode_success(
                 &data.decode_failures,
                 crate::decode_failure_latch::DecodeSite::Subscription,
@@ -3112,6 +3282,8 @@ unsafe fn take_adopted(
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
+    // Delivery log: the body this take decodes (kept only if it is taken).
+    crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
 
     // The PRE-WRITE frame gate. Both decodes below walk
     // the type's members writing as they go and bail at the first entry they
@@ -3920,6 +4092,8 @@ unsafe fn take_loaned_impl(
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
+    // Delivery log: the body this take hands out (kept only if it is taken).
+    crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
     let loaned_ptr: *mut c_void = if let Some(mut shadow) = shadow {
         // FORGED shape. The bridge validates the frame (entries in bounds,
         // element-multiple lengths, element-aligned forge targets) and
@@ -4115,8 +4289,35 @@ pub unsafe extern "C" fn rmw_take_loaned_message(
     _allocation: *mut ffi::rmw_subscription_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
-        take_loaned_impl(subscription, loaned_message, taken, std::ptr::null_mut())
+        take_loaned_replayable(subscription, loaned_message, taken, std::ptr::null_mut())
     })
+}
+
+/// The loaned take under the delivery log: recorded like a copying take;
+/// refused (`RMW_RET_UNSUPPORTED`, the caller falls back to the copying take)
+/// during a replay, whose subscriptions offer no loans.
+unsafe fn take_loaned_replayable(
+    subscription: *const ffi::rmw_subscription_t,
+    loaned_message: *mut *mut c_void,
+    taken: *mut bool,
+    message_info: *mut ffi::rmw_message_info_t,
+) -> rmw_ret_t {
+    match crate::replay::mode() {
+        crate::replay::Mode::Record(r) => {
+            if subscription.is_null() || taken.is_null() {
+                return RMW_RET_INVALID_ARGUMENT;
+            }
+            let key = (*subscription).data as usize;
+            r.take(
+                key,
+                TakeKind::Message,
+                || take_loaned_impl(subscription, loaned_message, taken, message_info),
+                |_| message_take_meta(*taken, message_info),
+            )
+        }
+        crate::replay::Mode::Replay(_) => RMW_RET_UNSUPPORTED,
+        _ => take_loaned_impl(subscription, loaned_message, taken, message_info),
+    }
 }
 
 /// # Safety
@@ -4130,7 +4331,7 @@ pub unsafe extern "C" fn rmw_take_loaned_message_with_info(
     _allocation: *mut ffi::rmw_subscription_allocation_t,
 ) -> rmw_ret_t {
     ffi::ffi_guard(ffi::RMW_RET_ERROR, || unsafe {
-        take_loaned_impl(subscription, loaned_message, taken, message_info)
+        take_loaned_replayable(subscription, loaned_message, taken, message_info)
     })
 }
 
@@ -4215,12 +4416,19 @@ pub unsafe extern "C" fn rmw_subscription_count_matched_publishers(
         // action's feedback/status topics (with a
         // process-local registry alone, cross-process action clients would never see
         // the server).
-        let count = match runtime::runtime() {
-            Ok(rt) => rt.transport.topic_publisher_count(&data.topic),
-            Err(_) => 0,
-        };
-        *publisher_count = count;
-        RMW_RET_OK
+        let (ret, count) = crate::replay::graph(
+            GraphQuery::SubscriptionMatchedPublishers,
+            &data.topic,
+            || {
+                let n = match runtime::runtime() {
+                    Ok(rt) => rt.transport.topic_publisher_count(&data.topic),
+                    Err(_) => 0,
+                };
+                (RMW_RET_OK, n as u64)
+            },
+        );
+        *publisher_count = count as usize;
+        ret
     })
 }
 
