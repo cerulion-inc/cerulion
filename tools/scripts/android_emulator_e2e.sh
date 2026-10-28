@@ -22,6 +22,10 @@ build() {
   # The direct data demand probe runs on the host, beside the host CLI.
   cargo build -p android_e2e_demand_probe
   cargo ndk -t "$ABI" --platform 30 build -p cerulion_cli -p cerulion_netd
+  # The remote metadata probe runs on the device beside its netd. It is a
+  # separate invocation: the example builds with cerulion_remoted's dev
+  # dependencies, whose features must not reach the CLI and netd binaries.
+  cargo ndk -t "$ABI" --platform 30 build -p cerulion_remoted --example android_e2e_remoted_probe
   (cd "$ROOT/examples/basic_timer" && cargo ndk -t "$ABI" --platform 30 build)
   # The app ships ONE native library: the sample runtime library, which
   # links cerulion_android and the graph's nodes. `cargo ndk -o` would also
@@ -134,6 +138,7 @@ HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run" RUST_LOG=wa
 HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"
+DEV_REMOTED_PROBE="$DEV/android_e2e_remoted_probe"
 GRAPH_PID="$DEV/graph.pid"
 NETD_PID="$DEV/netd.pid"
 CHECKS=0
@@ -243,6 +248,24 @@ run_probe() {
   verdict="$("$SCRIPT_DIR/android_e2e_probe_verdict.sh" "$expect" "$APP_IDENTITY" "$out")" ||
     fail "$label" "$verdict"
   pass "$label" "$verdict"
+}
+# run_remoted_probe LABEL FILE WANT ARG...: one run of the remote metadata
+# probe on the device, with the device netd's environment and working
+# directory (so it resolves the same control socket and shared-memory
+# namespace). It serves the `cerulion-remoted` wire plane and sends a catalog
+# and a schema request over loopback iroh; each answer is read from the netd
+# serving snapshot through the deadline-bounded control connect. A pass needs
+# exit code 0 and a fact line matching WANT.
+run_remoted_probe() {
+  local label=$1 file=$2 want=$3 rc=0 out fact
+  shift 3
+  out="$(device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open RUST_LOG=warn; timeout 150 '$DEV_REMOTED_PROBE' $*" 2>&1)" || rc=$?
+  out="${out//$'\r'/}"
+  printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
+  (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
+  fact="$(grep '^remoted_probe ' <<<"$out" || true)"
+  [[ "$fact" =~ ^${want}$ ]] || fail "$label" "expected '$want', output=$out"
+  pass "$label" "${fact#remoted_probe }"
 }
 # host_netd_pids: the pids of the live host processes named cerulion-netd. A
 # zombie is dead: it holds no socket and answers nothing, so it is left out.
@@ -382,6 +405,7 @@ device "export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CE
 device "mkdir -p '$DEV/home/.cerulion' && printf '%s' '{\"account_id\":\"00112233-4455-4677-8899-aabbccddeeff\",\"session_token\":\"e2e-expired-session\",\"refresh_token\":\"e2e-offline-refresh\",\"expires_at_ns\":0,\"logged_in_ever\":true}' > '$DEV/home/.cerulion/auth.json' && chmod 600 '$DEV/home/.cerulion/auth.json'"
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion" "$DEV_CER" >/dev/null
 "${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/cerulion-netd" "$DEV_NETD" >/dev/null
+"${ADB[@]}" push "$ROOT/target/$TRIPLE/debug/examples/android_e2e_remoted_probe" "$DEV_REMOTED_PROBE" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/Cargo.toml" "$DEV/basic_timer/Cargo.toml" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/graphs" "$DEV/basic_timer/graphs" >/dev/null
 "${ADB[@]}" push "$ROOT/examples/basic_timer/nodes" "$DEV/basic_timer/nodes" >/dev/null
@@ -393,7 +417,7 @@ mapfile -t node_libs < <(
 while IFS= read -r lib; do
   "${ADB[@]}" push "$lib" "$DEV/basic_timer/target/$TRIPLE/debug/" >/dev/null
 done < <(printf '%s\n' "${node_libs[@]}")
-device "chmod 755 '$DEV_CER' '$DEV_NETD'"
+device "chmod 755 '$DEV_CER' '$DEV_NETD' '$DEV_REMOTED_PROBE'"
 pass "device push" "node_libraries=${#node_libs[@]}"
 
 device "cd '$DEV' && export HOME='$DEV/home' TMPDIR='$DEV/tmp' CERULION_SHM_DIR='$DEV/shm' CERULION_LOGIN_GATE=off CERULION_LAN_ACCESS=open CERULION_ACCOUNT_SERVICE=http://127.0.0.1:1 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683; nohup '$DEV_NETD' > '$DEV/netd.log' 2>&1 & echo \$! > '$NETD_PID'"
@@ -447,6 +471,14 @@ printf 'rc=%s\n%s\n' "$host_echo_rc" "$host_echo_output" > "$OUT/host-echo.txt"
   fail "host echo" "rc=$host_echo_rc output=$host_echo_output"
 host_values="$(printf '%s\n' "$host_echo_output" | numeric_values)"
 assert_increasing "host echo (rc=$host_echo_rc)" "$host_values"
+# Remote metadata through the robot's local netd while the graph serves the
+# timer topic: the catalog names it std_msgs/Int32 from netd's snapshot (a
+# topic binding or the wire-hash binding of its frames), the schema reply names
+# a type for it too (a builtin, so no custom closure), and no socket file
+# exists at the control path, so the reads came over the abstract namespace.
+run_remoted_probe "remoted catalog and schema" remoted-probe-served.txt \
+  'remoted_probe mode=served topic=/basic_timer/timer/count catalog_rows=[0-9]+ catalog_schema=std_msgs/Int32 schema_reply=builtin control_socket=abstract' \
+  served /basic_timer/timer/count std_msgs/Int32
 device "test -s '$GRAPH_PID' && kill -INT \$(cat '$GRAPH_PID')" >/dev/null 2>&1 || true
 wait_remote_dead "$GRAPH_PID"
 started_graph=0
@@ -469,6 +501,10 @@ pass "phase A bag" "frames=$bag_frames floor=$floor schema=$bag_schema"
 device "test -s '$NETD_PID' && kill -TERM \$(cat '$NETD_PID')" >/dev/null 2>&1
 wait_remote_dead "$NETD_PID"
 started_netd=0
+# With the device netd stopped, both reads fail and name the missing daemon.
+run_remoted_probe "remoted reads without netd" remoted-probe-absent.txt \
+  'remoted_probe mode=absent topic=/basic_timer/timer/count catalog=refused schema=refused' \
+  absent /basic_timer/timer/count
 "${ADB[@]}" forward --remove tcp:7683 >/dev/null
 added_forward=0
 

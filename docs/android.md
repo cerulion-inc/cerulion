@@ -593,6 +593,18 @@ the probe must refuse each bad argument and a connect endpoint its session
 cannot open, with exit code 1 and no report.
 `tools/scripts/android_e2e_probe_verdict.sh` decides each verdict, and
 `tools/scripts/test_android_e2e_probe_verdict.sh` tests it.
+The lane also reads remote metadata on the device. While the CLI graph runs
+beside the device's `cerulion-netd`, a device probe
+(`crates/cerulion_remoted/examples/android_e2e_remoted_probe.rs`) serves the
+`cerulion-remoted` wire plane and sends it a catalog and a schema request from
+a paired endpoint over loopback. The robot answers both from the netd serving
+snapshot, read through the deadline-bounded control connect: the catalog must
+name `/basic_timer/timer/count` as `std_msgs/Int32`, the schema reply must
+name a type for the topic too (a builtin, so no custom closure), and no file
+may exist at the control socket path,
+because netd binds an abstract socket on Android. After the device netd stops,
+both requests must fail with an error that says the local network daemon
+cannot be reached.
 The lane also checks the sample app's linked graph nodes:
 
 - the APK carries exactly one native library, `libcerulion_sample_runtime.so`,
@@ -635,7 +647,9 @@ The run writes `e2e.log`, `logcat.txt`, the paired and open runs' logcat
 (`logcat-paired.txt`, `logcat-open.txt`), device logs, the output and exit
 code of every echo (device and host timer, paired and open heartbeat, the
 app's timer and relay), the report of every demand probe run
-(`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), and the pulled
+(`*-demand-probe*.txt`, `open-schema-mismatch-probe.txt`), the report of
+both remote metadata probe runs (`remoted-probe-served.txt`,
+`remoted-probe-absent.txt`), and the pulled
 MCAP files (`phase-a.mcap`, `app.mcap`, `app-restart.mcap`) there. The script
 needs a dedicated device: it refuses to start while a `cerulion` or
 `cerulion-netd` process is running, and clears only its own directory
