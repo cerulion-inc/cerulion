@@ -954,7 +954,8 @@ impl BarrierShared {
     /// time-bounded (20µs on every kernel-wake tier —
     /// Linux and Android futex AND macOS os_sync - 150µs only on the macOS sleep-recheck
     /// fallback; `CERULION_BARRIER_SPIN_US` overrides,
-    /// `=0` kills it back to a 50-iteration spin — see `barrier_spin_budget`);
+    /// `=0` restores the 50-iteration pre-block spin on Linux and Android,
+    /// but skips spinning on macOS - see `barrier_spin_budget`);
     /// it is spin-then-block, never a busy-spin. (The earlier CPU monitor-wait
     /// park was measured NOT
     /// to observe the cross-process store — aarch64 WFE is event-stream-bound
@@ -999,7 +1000,8 @@ impl BarrierShared {
     /// **No busy-spin:** the pre-block spin is hard-bounded (the tier-resolved
     /// default budget — 20µs on the kernel-wake tiers, 150µs on the macOS
     /// sleep-recheck fallback — or a few hundred ns under
-    /// the `=0` kill switch); the block is a real kernel sleep (futex on Linux and Android,
+    /// the `=0` kill switch on Linux and Android, no spin on macOS); the block
+    /// is a real kernel sleep (futex on Linux and Android,
     /// os_sync on macOS ≥ 14.4). On an older macOS or another target without a
     /// kernel-wake primitive the
     /// ladder is: the SAME time-bounded boundary spin (phase 1, absorbing the
@@ -1208,7 +1210,9 @@ impl BarrierShared {
     /// default-on, tier-resolved - 20µs on the kernel-wake tiers (Linux and Android futex,
     /// macOS os_sync), 150µs on the macOS sleep-recheck fallback;
     /// `CERULION_BARRIER_SPIN_US=0` is the kill switch
-    /// that restores the 50-iter loop). Busy-polls the generation SENSE
+    /// that restores the 50-iteration pre-block spin on Linux and Android;
+    /// on macOS it skips spinning and goes straight to os_sync or the
+    /// sleep-recheck fallback). Busy-polls the generation SENSE
     /// (`Acquire` loads + `spin_loop` hints) until it opens (`true`) or
     /// `spin_deadline` passes (`false` — the caller falls through to the
     /// unchanged `FUTEX_WAIT` block). The hot loop is LOAD-ONLY: the
@@ -2124,8 +2128,9 @@ const MAX_BARRIER_SPIN_US: u64 = 100_000;
 /// `(applied_us, was_garbage)`. Unset / empty → the caller's `default_us`
 /// (the tier-resolved default — [`default_barrier_spin_us`]; a PARAMETER
 /// since the os_sync tier landed so both macOS tier defaults are oracle-testable); `"0"` → 0
-/// (the explicit KILL SWITCH — restores the pure 50-iter + kernel-block
-/// behavior); any other non-negative integer → that number (override);
+/// (the explicit KILL SWITCH - restores the 50-iteration pre-block spin before
+/// the futex wait on Linux and Android; on macOS, no spin before os_sync or
+/// the sleep-recheck fallback); any other non-negative integer → that number (override);
 /// garbage → the default, flagged `was_garbage = true` so the caller warns
 /// LOUDLY (house rule: loud over silent). Extracted so the parse contract is
 /// oracle-testable without env mutation (the cached reader is
@@ -2155,8 +2160,9 @@ fn parse_barrier_spin_us(raw: Option<&str>, default_us: u64) -> (u64, bool) {
 /// boundary spin (one spin per `wait`, then chunked sleep-rechecks).
 ///
 /// `CERULION_BARRIER_SPIN_US` is the kill switch / override: `=0` disables
-/// the time-bounded spin entirely (the earlier pure 50-iter + futex
-/// behavior); `=N` overrides the budget — CLAMPED to
+/// the time-bounded spin entirely (Linux and Android retain the 50-iteration
+/// pre-block spin before the futex wait; macOS skips spinning and goes straight
+/// to os_sync or the sleep-recheck fallback); `=N` overrides the budget - CLAMPED to
 /// [`MAX_BARRIER_SPIN_US`] (100ms) with a loud `tracing::warn!` above that;
 /// unset/empty → the default; garbage → the default with ONE loud
 /// `tracing::warn!`. All warns are emitted once per process from
