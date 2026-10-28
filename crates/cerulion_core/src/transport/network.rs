@@ -261,9 +261,11 @@ pub struct NetworkConfig {
     /// `None` (the default) sets none of them.
     pub tls: Option<NetworkTls>,
     /// How the session authenticates its links. `Some(NetworkAuth::Team)` opens
-    /// a mutually authenticated team data session, and
-    /// `Some(NetworkAuth::TeamBundleLane)` the bundle session, a separate
-    /// session admitting only the bundle exchange; both use `quic/` and
+    /// a mutually authenticated team data session,
+    /// `Some(NetworkAuth::TeamCrossGeneration)` the data session with the
+    /// other live generation during a rotation, and
+    /// `Some(NetworkAuth::TeamBundleLane)` the bundle session admitting only
+    /// the bundle exchange; each uses `quic/` and
     /// `tls/` locators only (see [`crate::transport::team_auth`]) and cannot
     /// be combined with [`Self::tls`]. `None` (the default) sets no
     /// authentication of its own.
@@ -6032,7 +6034,14 @@ impl NetworkManager {
             .map_err(|e| map_err("listen/endpoints", e))?;
 
         match (&self.config.auth, &self.config.tls) {
-            (Some(NetworkAuth::Team(_) | NetworkAuth::TeamBundleLane(_)), Some(_)) => {
+            (
+                Some(
+                    NetworkAuth::Team(_)
+                    | NetworkAuth::TeamCrossGeneration(_)
+                    | NetworkAuth::TeamBundleLane(_),
+                ),
+                Some(_),
+            ) => {
                 return Err(TransportError::SessionCreation {
                     reason: "a team session takes its certificates from the team credentials, \
                              and certificate files are set as well; remove the graph tls: block \
@@ -6045,6 +6054,12 @@ impl NetworkManager {
                 &self.config.listen_endpoints,
                 &self.config.connect_endpoints,
                 TeamSession::Data,
+            )?,
+            (Some(NetworkAuth::TeamCrossGeneration(team)), None) => team.apply(
+                &mut config,
+                &self.config.listen_endpoints,
+                &self.config.connect_endpoints,
+                TeamSession::Cross,
             )?,
             (Some(NetworkAuth::TeamBundleLane(team)), None) => team.apply(
                 &mut config,

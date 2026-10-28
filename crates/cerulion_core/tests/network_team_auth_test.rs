@@ -17,6 +17,10 @@
 //!   exchange only;
 //! - a leaf a retired CA signed with a current-generation robot name fails the
 //!   data session, while a data session that anchors the retired CA admits it;
+//! - a leaf the next generation's CA signed with a current-generation robot
+//!   name fails the data session in both directions and links but carries
+//!   nothing on the cross-generation session, while a genuine next-generation
+//!   robot exchanges frames with a current one over the cross sessions;
 //! - a viewer gateway pulls a robot topic, and a robot gateway that dials an
 //!   operator pulls the operator's topic, through the full demand path;
 //! - a `tcp/`, `udp/...?rel=1` or `#`-config locator fails the open naming
@@ -27,6 +31,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use cerulion_core::transport::team_auth::access_control;
 use cerulion_core::transport::test_ca::TestTeam;
 use cerulion_core::{NetworkAuth, NetworkConfig, NetworkManager, NetworkTls, TeamAuth, WireHeader};
 use cerulion_pairing::team::TeamRole;
@@ -397,7 +402,7 @@ fn the_previous_generation_gets_the_bundle_session_only() {
             .expect_err("no lane anchors")
             .to_string();
         assert!(
-            err.contains("needs a retired or next generation CA"),
+            err.contains("needs a retired CA or the next or previous generation's CA"),
             "{err}"
         );
 
@@ -518,10 +523,7 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
         let mut config = m.zenoh_config_for_test().unwrap();
         let roots = format!(
             "\"{}\"",
-            TestTeam::pem_base64(
-                "CERTIFICATE",
-                &[g2.ca_der(), &g2.next_ca_der(), g1.ca_der()]
-            )
+            TestTeam::pem_base64("CERTIFICATE", &[g2.ca_der(), g1.ca_der()])
         );
         config
             .insert_json5("transport/link/tls/root_ca_certificate_base64", &roots)
@@ -567,6 +569,182 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
             "{link}: a dialer anchoring the retired CA accepts it"
         );
         drop(forged_listener);
+    }
+}
+
+fn cross_manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> NetworkManager {
+    NetworkManager::new(NetworkConfig {
+        listen_endpoints: listen,
+        connect_endpoints: connect,
+        auth: Some(NetworkAuth::TeamCrossGeneration(auth)),
+        ..NetworkConfig::default()
+    })
+}
+
+/// A raw session from `m`'s config with `policy` (the session's generated
+/// policy) plus one rule that declares subscribers to any peer. A peer of any
+/// name then routes puts to it, and its ingress rules decide what arrives.
+fn declaring_to_any(m: &NetworkManager, policy: serde_json::Value) -> zenoh::Session {
+    let mut config = m.zenoh_config_for_test().expect("config builds");
+    let mut acl = policy;
+    acl["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "test_declare_to_any",
+            "permission": "allow",
+            "flows": ["egress"],
+            "messages": ["declare_subscriber"],
+            "key_exprs": ["cerulion_w2/**"],
+        }));
+    acl["subjects"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "id": "test_any" }));
+    acl["policies"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "test_policy_any",
+            "rules": ["test_declare_to_any"],
+            "subjects": ["test_any"],
+        }));
+    config
+        .insert_json5("access_control", &acl.to_string())
+        .unwrap();
+    zenoh::open(config).wait().expect("session opens")
+}
+
+/// The next generation's CA key mints `robot.g2` for a key of its own. A g2
+/// robot's data session refuses that leaf in both directions; its
+/// cross-generation session, which anchors the next CA, links it and denies
+/// every message, since `robot.g2` is not a next-generation name. A genuine
+/// g3 robot, rotated and holding g2 as its previous generation, exchanges
+/// frames with the g2 robot over the cross sessions.
+#[test]
+fn a_next_ca_cannot_claim_a_current_generation_name() {
+    let g2 = TestTeam::new("acme", 1).rotated();
+    let g3 = g2.rotated();
+    let attacker_key = g2.machine_key(7);
+    let forged = g3.forged_leaf(2, TeamRole::Robot, &attacker_key);
+    for link in LINKS {
+        let robot = g2.machine(TeamRole::Robot, 1);
+
+        // 1. The data listener refuses the forged leaf at the handshake.
+        let (data, data_locator) = listen(link, robot.clone());
+        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &data_locator);
+        assert!(
+            !raw_linked(&attacker, Duration::from_secs(3)),
+            "{link}: the data session refuses a leaf the next CA signed"
+        );
+        assert_eq!(
+            raw_deliver(&attacker, data.session().unwrap(), Duration::from_secs(2)),
+            0,
+            "{link}"
+        );
+        // Control: the robot's frames reach a genuine g2 viewer that dials the
+        // same data listener.
+        let viewer = manager(g2.machine(TeamRole::Viewer, 2), vec![], vec![data_locator]);
+        assert!(
+            deliver(&data, &viewer, "/team/telemetry", Duration::from_secs(10)) > 0,
+            "{link}: control, the data session carries g2 traffic"
+        );
+
+        // 2. The cross listener links the forged leaf (its chain is valid)
+        // and drops its puts, even with subscribers declared to any peer.
+        let cross_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let cross_m = cross_manager(robot.clone(), vec![cross_locator.clone()], vec![]);
+        let cross = declaring_to_any(&cross_m, robot.cross_access_control().unwrap());
+        // The forged dialer's own data anchors (g2) verify the robot's g2 leaf.
+        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &cross_locator);
+        assert!(
+            raw_linked(&attacker, Duration::from_secs(10)),
+            "{link}: the cross session completes the handshake with a next-CA chain"
+        );
+        assert_eq!(
+            raw_deliver(&attacker, &cross, Duration::from_secs(5)),
+            0,
+            "{link}: and denies every put from a current-generation name"
+        );
+        // Control: the same forged dialer against a cross session whose
+        // policy names generation 2 instead (the policy a data session has)
+        // gets its put through, so the 0 above is the name mismatch.
+        let wrong_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let wrong_m = cross_manager(robot.clone(), vec![wrong_locator.clone()], vec![]);
+        let wrong = declaring_to_any(&wrong_m, access_control(robot.team(), 2));
+        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &wrong_locator);
+        assert!(
+            raw_deliver(&attacker, &wrong, Duration::from_secs(10)) > 0,
+            "{link}: control, a cross session naming g2 takes the forged robot's put"
+        );
+        // Control: a genuine g3 robot's raw put reaches the same cross
+        // session, and the frame path works both ways over the cross pair.
+        let g3_robot = g3.machine_after_rotation(TeamRole::Robot, 4);
+        let g3_m = cross_manager(g3_robot.clone(), vec![], vec![cross_locator]);
+        let mut g3_config = g3_m.zenoh_config_for_test().unwrap();
+        g3_config
+            .insert_json5("access_control/enabled", "false")
+            .unwrap();
+        let g3_raw = zenoh::open(g3_config).wait().unwrap();
+        assert!(
+            raw_deliver(&g3_raw, &cross, Duration::from_secs(10)) > 0,
+            "{link}: control, a g3 robot's put reaches the g2 cross session"
+        );
+        let pair_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let old_side = cross_manager(robot.clone(), vec![pair_locator.clone()], vec![]);
+        old_side.session().unwrap();
+        let new_side = cross_manager(g3_robot, vec![], vec![pair_locator]);
+        assert!(
+            deliver(
+                &old_side,
+                &new_side,
+                "/team/telemetry",
+                Duration::from_secs(10)
+            ) > 0,
+            "{link}: g2 frames reach the rotated g3 robot"
+        );
+        assert!(
+            deliver(
+                &new_side,
+                &old_side,
+                "/team/cmd_vel",
+                Duration::from_secs(10)
+            ) > 0,
+            "{link}: and g3 frames reach the g2 robot"
+        );
+
+        // 3. The other direction: a forged listener. The robot's data dialer
+        // refuses it; its cross dialer links and gets no frame from it.
+        let forged_locator = format!("{link}/127.0.0.1:{}", free_port());
+        let forged_listener = forged_session(
+            g2.machine(TeamRole::Viewer, 7),
+            &forged,
+            vec![forged_locator.clone()],
+            vec![],
+        );
+        let data_dialer = manager(robot.clone(), vec![], vec![forged_locator.clone()]);
+        assert!(
+            !linked(&data_dialer, Duration::from_secs(3)),
+            "{link}: a robot's data dialer refuses a listener the next CA signed"
+        );
+        let forged_dialer_locator = forged_locator.clone();
+        let cross_dialer_m = cross_manager(robot.clone(), vec![], vec![forged_locator]);
+        let cross_dialer = declaring_to_any(&cross_dialer_m, robot.cross_access_control().unwrap());
+        assert!(
+            raw_linked(&cross_dialer, Duration::from_secs(10)),
+            "{link}: the cross dialer completes the handshake"
+        );
+        assert_eq!(
+            raw_deliver(&forged_listener, &cross_dialer, Duration::from_secs(5)),
+            0,
+            "{link}: and drops every put from the forged listener"
+        );
+        let wrong_dialer_m = cross_manager(robot.clone(), vec![], vec![forged_dialer_locator]);
+        let wrong_dialer = declaring_to_any(&wrong_dialer_m, access_control(robot.team(), 2));
+        assert!(
+            raw_deliver(&forged_listener, &wrong_dialer, Duration::from_secs(10)) > 0,
+            "{link}: control, a cross dialer naming g2 takes the forged listener's put"
+        );
     }
 }
 
