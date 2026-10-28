@@ -107,7 +107,33 @@ impl TestTeam {
             issuing_ca_der: &self.ca_der,
             retired: &self.retired,
             next_ca_der: next,
+            previous_ca_der: None,
         }
+    }
+
+    /// Team credentials for machine `machine` in `role` on a rotated
+    /// machine during the overlap: this generation, the previous generation
+    /// (the first retired one) as the other live generation, and the older
+    /// retired generations.
+    ///
+    /// # Panics
+    ///
+    /// When this generation retired none.
+    pub fn machine_after_rotation(&self, role: TeamRole, machine: u8) -> TeamAuth {
+        let key = self.machine_key(machine);
+        let leaf = self.leaf(role, &key);
+        let (previous, older) = self.retired.split_first().expect("a previous generation");
+        TeamAuth::new(
+            &key,
+            &leaf,
+            TeamAnchors {
+                issuing_ca_der: &self.ca_der,
+                retired: older,
+                next_ca_der: None,
+                previous_ca_der: Some(&previous.ca_der),
+            },
+        )
+        .expect("valid test credentials")
     }
 
     /// A leaf for `key` in `role`, issued now.
