@@ -14,11 +14,13 @@
 //! pending call is dropped.
 //!
 //! Requests arrive on two queues. The urgent queue carries the e-stop and is
-//! read before the normal queue on every pass of the loop, so an e-stop frame
-//! is published within one pass (about a millisecond) whatever else is
+//! read before the normal queue on every pass of the loop, and drained again
+//! after a normal request is taken and before it is published, so an e-stop
+//! frame is published within one pass (about a millisecond) whatever else is
 //! pending. A latch-gated call (every mutating tool) is published only while
 //! the shared e-stop latch is clear; the check runs immediately before the
-//! publish.
+//! publish. A latch-gated call whose caller stopped waiting is never
+//! published.
 //!
 //! Because the calls topic is an input the graph consumes, a `--record` bag
 //! holds every published call, and `cerulion bag play --resim all --verify`
@@ -171,19 +173,32 @@ impl Journal {
         Self::submit(&self.normal, call_id, frame, timeout, !latch_gated).await
     }
 
-    /// Publish the e-stop call ahead of everything queued, latch or not, and
-    /// wait for the graph's answer.
+    /// Queue the e-stop call on the urgent queue, which is read ahead of
+    /// everything else, latch or not. The call is queued when this returns;
+    /// the returned future waits for the graph's answer.
     ///
     /// # Errors
     ///
-    /// [`JournalError`] when the call is not published or not answered.
-    pub async fn urgent(
+    /// The future yields [`JournalError`] when the call is not published or
+    /// not answered.
+    pub fn urgent(
         &self,
         call_id: u64,
         frame: String,
         timeout: Duration,
-    ) -> Result<Value, JournalError> {
-        Self::submit(&self.urgent, call_id, frame, timeout, true).await
+    ) -> impl std::future::Future<Output = Result<Value, JournalError>> + Send + 'static {
+        let (reply, answer) = oneshot::channel();
+        let queued = self.urgent.send(CallRequest {
+            call_id,
+            frame,
+            timeout,
+            bypass_latch: true,
+            reply,
+        });
+        async move {
+            queued.map_err(|_| JournalError::Stopped)?;
+            answer.await.map_err(|_| JournalError::Stopped)?
+        }
     }
 
     async fn submit(
@@ -233,6 +248,36 @@ struct Ports {
     newest: NewestState,
     latch: Arc<AtomicBool>,
     pending: BTreeMap<u64, Pending>,
+}
+
+/// What [`Ports::publish`] does with one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Publish the frame.
+    Publish,
+    /// Answer [`JournalError::Estopped`]; nothing is published.
+    Refuse,
+    /// The caller stopped waiting (its MCP request was cancelled); nothing is
+    /// published or answered.
+    Drop,
+}
+
+/// The gate for a request: a `bypass_latch` request (estop, read tools) is
+/// always published. A latch-gated one is refused while `latch` is closed,
+/// and dropped when `reply_closed` says its caller is gone. The latch is read
+/// first: a latch seen open after an `estop_clear` opened it was opened after
+/// that clear took `call_lock`, which a cancelled call had already released,
+/// so the cancel is visible to `reply_closed`.
+fn gate(bypass_latch: bool, latch: &AtomicBool, reply_closed: impl FnOnce() -> bool) -> Gate {
+    if bypass_latch {
+        Gate::Publish
+    } else if latch.load(Ordering::SeqCst) {
+        Gate::Refuse
+    } else if reply_closed() {
+        Gate::Drop
+    } else {
+        Gate::Publish
+    }
 }
 
 /// The smallest `std_msgs/String` payload a reader can be built over: the
@@ -330,6 +375,12 @@ impl Ports {
             if !busy {
                 match normal.try_recv() {
                     Ok(request) => {
+                        // An urgent request queued before this one was taken
+                        // (an estop queued inside the latch lock ahead of a
+                        // clear) is published first.
+                        while let Ok(first) = urgent.try_recv() {
+                            self.publish(first);
+                        }
                         self.publish(request);
                         busy = true;
                     }
@@ -347,9 +398,15 @@ impl Ports {
     }
 
     fn publish(&mut self, request: CallRequest) {
-        if !request.bypass_latch && self.latch.load(Ordering::SeqCst) {
-            let _ = request.reply.send(Err(JournalError::Estopped));
-            return;
+        match gate(request.bypass_latch, &self.latch, || {
+            request.reply.is_closed()
+        }) {
+            Gate::Publish => {}
+            Gate::Refuse => {
+                let _ = request.reply.send(Err(JournalError::Estopped));
+                return;
+            }
+            Gate::Drop => return,
         }
         let topic = self.calls_topic.clone();
         let fail = |reason: String| JournalError::Publish { topic, reason };
@@ -436,7 +493,34 @@ impl Ports {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_string;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{decode_string, gate, Gate};
+
+    #[test]
+    fn a_cancelled_gated_call_is_dropped_and_an_estop_or_read_is_not() {
+        let open = AtomicBool::new(false);
+        let closed = AtomicBool::new(true);
+        let (live_tx, _live_rx) = tokio::sync::oneshot::channel::<()>();
+        let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(gone_rx);
+        let live = || live_tx.is_closed();
+        let gone = || gone_tx.is_closed();
+        assert_eq!(gate(false, &open, live), Gate::Publish);
+        assert_eq!(
+            gate(false, &open, gone),
+            Gate::Drop,
+            "a cancelled call is dropped"
+        );
+        assert_eq!(gate(false, &closed, live), Gate::Refuse);
+        assert_eq!(gate(false, &closed, gone), Gate::Refuse);
+        assert_eq!(
+            gate(true, &open, gone),
+            Gate::Publish,
+            "a cancelled estop still publishes"
+        );
+        assert_eq!(gate(true, &closed, gone), Gate::Publish);
+    }
 
     /// A 16-byte window of a zeroed buffer starting `skew` bytes past an
     /// 8-byte boundary.

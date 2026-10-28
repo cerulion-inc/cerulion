@@ -54,6 +54,9 @@
 #if defined(CERULION_HAS_QOS_STRING_CONVERSIONS_H)
 #include "rmw/qos_string_conversions.h" // Galactic+
 #endif
+#if defined(CERULION_HAS_SERVICE_ENDPOINT_INFO_ARRAY_H)
+#include "rmw/service_endpoint_info_array.h" // Lyrical+
+#endif
 
 #include "rosidl_runtime_c/message_type_support_struct.h"
 #include "rosidl_runtime_c/service_type_support_struct.h"

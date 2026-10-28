@@ -445,19 +445,28 @@ fn a_catalog_push_is_delivered_by_a_wake_not_the_read_timeout() {
 /// publish regardless of subscription — which would wake every idle `topic echo`
 /// connection on the machine for an event it did not ask for and cannot act on, and
 /// would make the positive arm above pass for the wrong reason.
+///
+/// The SUBSCRIBED connection's own wake is not counted on: a push that lands
+/// while its handler is between waits (just back from a read timeout) is drained
+/// and delivered at the loop top with no wait ending on the waker, so its
+/// contribution is 0 or 1 and a fixed settle cannot tell which. The control
+/// therefore holds TWO idle connections that never subscribe: a waker poked for
+/// every connection ends both their waits, so it reads at least 2 whatever the
+/// subscriber contributed, while a correct daemon reads at most 1.
 #[test]
 fn an_unsubscribed_connection_is_never_woken_by_a_catalog_push() {
     let (netd, _dir, sock, announce) = start_daemon("wknosub");
     // ONE subscriber — the watch thread only starts on the first subscription, so a
     // daemon with nobody subscribed can never publish and the control would be
-    // vacuous. This connection is the one that legitimately gets woken.
+    // vacuous.
     let (mut sub, _) = Client::connect(&sock);
     sub.subscribe(1);
-    // A SECOND connection that deliberately never subscribes.
+    // TWO connections that deliberately never subscribe.
     let (mut quiet, _) = Client::connect(&sock);
+    let (mut quiet2, _) = Client::connect(&sock);
     assert!(
-        wait_until(|| netd.active_connections() >= 2, Duration::from_secs(10)),
-        "both connections must be registered before the push"
+        wait_until(|| netd.active_connections() >= 3, Duration::from_secs(10)),
+        "all three connections must be registered before the push"
     );
 
     announce.push_alive("go2", Some("/odom"));
@@ -466,21 +475,31 @@ fn an_unsubscribed_connection_is_never_woken_by_a_catalog_push() {
         .expect("the SUBSCRIBED connection receives the push");
     assert_eq!(push.event, CATALOG_CHANGED_EVENT);
     assert_eq!(netd.catalog_version(), 1, "exactly one published change");
-    // Settle past the coalescing window so a second poke, if the implementation made
-    // one, would have arrived.
-    std::thread::sleep(Duration::from_millis(300));
+    // Settle on the handlers' own progress rather than a fixed sleep: every handler
+    // ends a wait at least once per `CONN_READ_TIMEOUT`, and a poked one ends its
+    // wait at once, so two passes per connection past the push leaves a stray poke
+    // nowhere to hide on a slow host. The ceiling only catches a stalled daemon.
+    let passes = netd.conn_read_loop_iterations();
+    assert!(
+        wait_until(
+            || netd.conn_read_loop_iterations() >= passes + 6,
+            Duration::from_secs(10)
+        ),
+        "the three connection handlers must keep going round their loops after the push"
+    );
 
-    assert_eq!(
-        netd.conn_push_wakes(),
-        1,
-        "EXACTLY the subscribed connection was woken — a waker poked for every \
-         connection would wake every idle `topic echo` on the machine for an event it \
-         never asked for, and would make the positive arm above pass for the wrong \
-         reason"
+    let wakes = netd.conn_push_wakes();
+    assert!(
+        wakes <= 1,
+        "only the subscribed connection may be woken, got {wakes} wakes. A waker poked \
+         for every connection would wake every idle `topic echo` on the machine for an \
+         event it never asked for, and would make the positive arm above pass for the \
+         wrong reason"
     );
     assert!(
-        quiet.next_push(Duration::from_millis(200)).is_none(),
-        "and the unsubscribed connection receives nothing unsolicited (the watch is opt-in)"
+        quiet.next_push(Duration::from_millis(200)).is_none()
+            && quiet2.next_push(Duration::from_millis(200)).is_none(),
+        "and the unsubscribed connections receive nothing unsolicited (the watch is opt-in)"
     );
 }
 

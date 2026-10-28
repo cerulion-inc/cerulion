@@ -11,6 +11,7 @@
 //! | `tcp/<host>:<port>` | TCP, the default |
 //! | `quic/<host>:<port>` | QUIC over TLS 1.3; needs [`NetworkTls`] files |
 //! | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection |
+//! | `tls/<host>:<port>` | TLS 1.3 over TCP; reads the same [`NetworkTls`] files as `quic/` |
 //! | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication |
 //!
 //! `?mixed_rel=1` asks zenoh 1.10 for one QUIC connection carrying two links: a
@@ -134,6 +135,9 @@ pub enum Carrier {
         /// The endpoint's `mixed_rel` value.
         mixed_rel: MixedRel,
     },
+    /// `tls/`: TLS 1.3 over TCP. zenoh reads its certificates from the same
+    /// `transport/link/tls` section as `quic/`.
+    Tls,
     /// `udp/...?rel=1`: QUIC with encryption and peer authentication off.
     UnsecureQuic {
         /// The endpoint's `mixed_rel` value.
@@ -169,7 +173,7 @@ impl Carrier {
 /// # Errors
 ///
 /// A human-readable reason when the scheme is not one this build compiles
-/// (`tcp`, `quic`, `udp`), the address is empty, or `rel` / `mixed_rel` carry a
+/// (`tcp`, `quic`, `tls`, `udp`), the address is empty, or `rel` / `mixed_rel` carry a
 /// value zenoh would refuse at session open.
 // hot-path-alloc-ok-fn: graph-load validation of the network block, never frame delivery.
 pub fn classify_locator(locator: &str) -> Result<Carrier, String> {
@@ -217,6 +221,15 @@ pub fn classify_locator(locator: &str) -> Result<Carrier, String> {
             Ok(Carrier::Tcp)
         }
         "quic" => Ok(Carrier::Quic { mixed_rel: mixed }),
+        "tls" => {
+            if mixed != MixedRel::Off {
+                return Err(format!(
+                    "locator '{locator}' sets mixed_rel on a tls/ carrier; mixed reliability \
+                     exists only on quic/ and udp/...?rel=1"
+                ));
+            }
+            Ok(Carrier::Tls)
+        }
         "udp" => match rel {
             Some("1") => Ok(Carrier::UnsecureQuic { mixed_rel: mixed }),
             None | Some("0") if mixed == MixedRel::Off => Ok(Carrier::Udp),
@@ -228,13 +241,9 @@ pub fn classify_locator(locator: &str) -> Result<Carrier, String> {
                 "locator '{locator}' sets rel={other}; zenoh accepts rel=0 or rel=1"
             )),
         },
-        "tls" => Err(format!(
-            "locator '{locator}' names the tls/ carrier, which this build does not compile; \
-             use quic/ for an encrypted link or tcp/"
-        )),
         other => Err(format!(
             "locator '{locator}' names the '{other}' carrier, which this build does not \
-             compile; the carriers are tcp/, quic/ and udp/"
+             compile; the carriers are tcp/, quic/, tls/ and udp/"
         )),
     }
 }
@@ -277,6 +286,8 @@ mod tests {
             })
         );
         assert_eq!(classify_locator("udp/10.0.0.3:7684"), Ok(Carrier::Udp));
+        assert_eq!(classify_locator("tls/10.0.0.2:7447"), Ok(Carrier::Tls));
+        assert_eq!(classify_locator("tls/h:1?mixed_rel=0"), Ok(Carrier::Tls));
         // An explicit `mixed_rel=0` is what zenoh ignores, so it is accepted
         // on every carrier.
         assert_eq!(classify_locator("tcp/h:1?mixed_rel=0"), Ok(Carrier::Tcp));
@@ -294,6 +305,7 @@ mod tests {
     fn only_mixed_reliability_quic_has_a_datagram_link() {
         for (loc, want) in [
             ("tcp/h:1", false),
+            ("tls/h:1", false),
             ("quic/h:1", false),
             ("quic/h:1?mixed_rel=0", false),
             ("quic/h:1?mixed_rel=1", true),
@@ -320,7 +332,7 @@ mod tests {
             ("tcp/h:1?mixed_rel=1", "tcp/ carrier"),
             ("udp/h:1?mixed_rel=1", "plain udp/"),
             ("udp/h:1?rel=2", "rel=2"),
-            ("tls/h:1", "tls/ carrier"),
+            ("tls/h:1?mixed_rel=1", "tls/ carrier"),
             ("ws/h:1", "'ws' carrier"),
         ] {
             let err = classify_locator(loc).expect_err(loc);

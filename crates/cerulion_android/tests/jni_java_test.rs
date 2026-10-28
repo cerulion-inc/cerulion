@@ -1,31 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Runs the Java JNI oracle against a previously built host cdylib.
+//! Runs the Java JNI oracle against a host build of the sample app's
+//! runtime library, the one library Java loads in an app.
+//!
+//! Build it first, then point `CERULION_APP_RUNTIME_LIB` at it:
+//!
+//! ```sh
+//! cargo build --manifest-path crates/cerulion_android/android/runtime/Cargo.toml -p cerulion_sample_runtime
+//! CERULION_APP_RUNTIME_LIB=$PWD/crates/cerulion_android/android/runtime/target/debug/libcerulion_sample_runtime.so \
+//!   cargo test -p cerulion_android --test jni_java_test -- --ignored
+//! ```
+//!
+//! On macOS the library ends in `.dylib`, and the run needs a short `TMPDIR`
+//! (for example `TMPDIR=/tmp`): the runtime keeps its iceoryx2 files under
+//! the files directory, and under the long default macOS temporary path the
+//! first publisher fails with `ResourceCreationFailed`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::tempdir;
 
-fn target_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
+/// The library file and the name Java's `System.loadLibrary` takes for it.
+fn runtime_library() -> (PathBuf, String) {
+    let library = std::env::var_os("CERULION_APP_RUNTIME_LIB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+        .expect("set CERULION_APP_RUNTIME_LIB to the host build of libcerulion_sample_runtime");
+    assert!(
+        library.is_file(),
+        "{} is not a file; build the runtime library first: cargo build --manifest-path crates/cerulion_android/android/runtime/Cargo.toml -p cerulion_sample_runtime",
+        library.display()
+    );
+    let stem = library
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("a UTF-8 library file name");
+    let name = stem
+        .strip_prefix("lib")
+        .expect("a library file name starts with lib")
+        .to_string();
+    (library, name)
 }
 
 #[test]
-#[ignore = "needs a JDK on PATH and the host cdylib built"]
+#[ignore = "needs a JDK on PATH and the host build of the sample runtime library"]
 fn java_api_matches_hand_written_oracle() {
-    let target_dir = target_dir();
-    let library = target_dir.join("debug/libcerulion_android.so");
-    assert!(
-        library.is_file(),
-        "build the host cdylib first: cargo build -p cerulion_android"
-    );
+    let (library, library_name) = runtime_library();
+    let library_dir = library.parent().expect("library directory").to_path_buf();
 
     let classes = tempdir().expect("Java class output directory");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let java_api = manifest_dir.join("java/com/cerulion/android/CerulionRuntime.java");
     let smoke = manifest_dir.join("tests/java/JniSmoke.java");
+    let graph = manifest_dir.join("android/app/src/main/assets/graph.yaml");
     let javac = Command::new("javac")
         .arg("-d")
         .arg(classes.path())
@@ -41,15 +67,13 @@ fn java_api_matches_hand_written_oracle() {
 
     let files_dir = tempdir().expect("JNI files directory");
     let java = Command::new("java")
-        .arg(format!(
-            "-Djava.library.path={}",
-            target_dir.join("debug").display()
-        ))
+        .arg(format!("-Djava.library.path={}", library_dir.display()))
         .arg("-cp")
         .arg(classes.path())
         .arg("JniSmoke")
         .arg(files_dir.path())
-        .arg("cerulion_android")
+        .arg(&library_name)
+        .arg(&graph)
         .output()
         .expect("run Java JNI smoke test");
     assert!(
@@ -58,19 +82,22 @@ fn java_api_matches_hand_written_oracle() {
         String::from_utf8_lossy(&java.stderr)
     );
 
+    assert_eq!(library_name, "cerulion_sample_runtime");
     let expected = "\
 status-before-load=call CerulionRuntime.loadLibrary(<your runtime library>) first
 load-again=no-exception
-load-other=CerulionRuntime is bound to libcerulion_android.so
+load-other=CerulionRuntime is bound to libcerulion_sample_runtime.so
 status-before-init=uninitialized
 init-bad=3
 init-ok=0
-linked-nodes=true
+linked-nodes=[\"printer\",\"relay\",\"timer\"]
 publish-before-start=4
 start-invalid=0 state=failed error=3
 start-ok=0 state=running
 publish=0
 publish-unknown=8
-stop=0 state=stopped";
+stop=0 state=stopped
+start-graph=0 state=running nodes=3
+stop-graph=0 state=stopped";
     assert_eq!(String::from_utf8_lossy(&java.stdout).trim(), expected);
 }

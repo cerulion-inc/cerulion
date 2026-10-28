@@ -1,3 +1,4 @@
 .gradle/
 **/build/
 app/src/main/jniLibs/
+runtime/target/

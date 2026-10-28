@@ -2590,6 +2590,14 @@ impl GatewayRuntime {
         self.get_demand_state.wire_header_refusal_count()
     }
 
+    /// Observable state (Principle #3): demand GETs the producer queryable
+    /// refused for the wire header whose demanded topic was longer than 256
+    /// bytes, so their log lines share the overflow latch instead of their own.
+    pub fn demand_wire_header_refusal_latch_overlong_count(&self) -> u64 {
+        self.get_demand_state
+            .wire_header_refusal_latch_overlong_count()
+    }
+
     /// Observable state (Principle #3): cumulative GET-expiry disables the reconciler
     /// thread applied (a topic released because its last GET aged past the TTL
     /// AND liveliness was also absent — the composition rule).
@@ -2638,6 +2646,17 @@ impl GatewayRuntime {
         self.demand_get_state
             .as_ref()
             .map(|s| s.wire_header_refused_ack_count())
+            .unwrap_or(0)
+    }
+
+    /// Observable state (Principle #3): "refused:wire-header" (or legacy
+    /// grant) acks the DEMANDER received whose peer name or topic was longer
+    /// than 256 bytes, so their log lines share the overflow latch instead of
+    /// their own. `0` on a pure-egress gateway.
+    pub fn demand_wire_header_refused_ack_latch_overlong_count(&self) -> u64 {
+        self.demand_get_state
+            .as_ref()
+            .map(|s| s.wire_header_refused_ack_latch_overlong_count())
             .unwrap_or(0)
     }
 

@@ -101,11 +101,13 @@ default + gateway, the discovery ladder, and pairing.
   authorizer does not disable it. Choose the posture at startup with
   `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
   mode, the robot identity announcement remains, but topic announce tokens are
-  withheld, so topic
-  names are not exposed on the LAN. The mDNS beacon remains available when the
-  first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
+  withheld, so the topics this robot publishes are not named on the LAN. A
+  gateway that receives topics from the network still names each of those
+  topics in its demand queries on the LAN. The mDNS beacon remains available
+  when the first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
   access after a paired start does not replay topic announcements withheld
-  while paired.
+  while paired; an Android app started with open access announces its
+  registered topics when its start completes.
 
 A refused catalog is not an empty catalog: topic resolution names the robot,
 states that its topics were not searched, and recommends
@@ -273,6 +275,57 @@ The alternative is a per-run gateway child, and which child you get matters:
   VERBATIM: no synthesized port, no bind ladder, and a stolen port fails the boot
   loudly. It beacons only if one of those locators is a parseable `tcp/` endpoint.
   Your config is the truth, so give it the port you want advertised.
+
+### Unencrypted QUIC first (opt-in)
+
+`CERULION_UNENCRYPTED_QUIC=on` in `cerulion-netd`'s environment, on the robot
+and on the machines that dial it, moves netd's links from `tcp/` to zenoh's
+unencrypted QUIC carrier, `udp/<host>:<port>?rel=1`, where both ends allow it:
+
+- **Listen.** Every `tcp/<host>:<port>` in `CERULION_NETD_LISTEN` also listens
+  on `udp/<host>:<port>?rel=1`. The port number is the same; TCP and UDP ports
+  are separate.
+- **Advertise.** The mDNS record gains the TXT key `udp_rel=<port>`.
+- **Dial.** At start-up netd checks, over UDP, every discovered peer that
+  advertises `udp_rel` and answered the usual TCP reachability check, and every
+  `CERULION_NETD_CONNECT` locator written as
+  `udp/<host>:<port>?rel=1`. A peer that answers is dialled over QUIC. One that
+  does not is dialled over `tcp/` on the same host and port, and netd logs one
+  warning that starts `QUIC FALLBACK:`, naming the QUIC locator, the reason (the
+  UDP port is closed, or no QUIC answer within the bound) and the TCP locator.
+  netd lists one locator per peer address, so zenoh does not dial one address
+  over both carriers at once, unless `CERULION_NETD_CONNECT` itself lists both.
+
+Explicit `tcp/` connect locators are used as written, and peers taken from
+`~/.cerulion/peers.json` stay on `tcp/`. Only the exact value `on` turns the
+setting on; any other value leaves it off and logs a warning naming the value.
+
+The check waits at most `CERULION_NETD_QUIC_PROBE_TIMEOUT_MS` (default 1000,
+the first loss timeout QUIC itself uses before it has measured a round trip).
+A closed port answers at once, so the full wait is paid only where UDP is
+dropped without an answer, once per peer address each time netd starts, with every
+address checked at the same time. Raise it only for a path whose round trip is above
+about 300 ms. Values above 6000 are treated as 6000, with a warning: netd opens
+its control socket only after the check and its own start-up, and a command
+that starts netd waits 10 seconds for that socket.
+
+**This QUIC is not encrypted and does not authenticate the peer**, the same as
+`tcp/`. What it changes is congestion control: a Linux TCP connection that idles
+longer than one retransmission timeout restarts from its initial window, so a
+large message sent about once a second pays several extra round trips, while
+the QUIC stack has no idle reset, so the same message over `udp/...?rel=1`
+does not start each send from the initial window. The difference grows with the
+round trip and the message size. Cross-host figures will be added once they are
+measured on a natively built robot.
+
+Limits: the check runs once, when netd starts. A peer that appears later, or a
+QUIC link that later stops passing UDP, is not checked again until netd
+restarts. A peer that answers only over UDP fails the TCP reachability check
+and is not dialled. With `CERULION_MULTICAST_SCOUTING=on`, peers found by
+scouting are dialled by zenoh itself, over whichever locator it picks. The
+per-run gateway child and a graph's `network:` block do not read the setting;
+a `network:` block names `udp/<host>:<port>?rel=1` itself when it
+wants this carrier.
 
 ## The gateway
 
@@ -522,7 +575,34 @@ locator string is the whole choice. TCP stays the default.
 | `tcp/<host>:<port>` | TCP | nothing |
 | `quic/<host>:<port>` | QUIC over TLS 1.3, one stream per priority | `tls` files |
 | `quic/<host>:<port>?mixed_rel=1` | the same, plus a datagram link on the same connection and port | `tls` files |
+| `tls/<host>:<port>` | TLS 1.3 over TCP, for a path where UDP does not get through | the same `tls` files as `quic/` |
 | `udp/<host>:<port>?rel=1;mixed_rel=1` | QUIC with NO encryption and NO peer authentication | a WireGuard overlay that supplies both |
+
+**TCP after idle on Linux.** With `net.ipv4.tcp_slow_start_after_idle`
+nonzero, the Linux default, the congestion window of a TCP connection that
+sends nothing for longer than one retransmission timeout decays toward its
+initial size, so each large message sent at a low rate pays a few extra round
+trips. The cost grows with the path's round-trip time: small on a LAN, large
+across a wide-area link. The window belongs to the sending host, and the
+`quic/` carrier's congestion controller has no idle reset. Measured 2026-10-26
+over a 31 ms wide-area path with a 301 KB message: at 1 Hz, `tcp/` 164.8 ms
+p50 / 257.7 ms p99 and `quic/` 79.3 / 107.5 ms; at 30 Hz both about 63 ms p50.
+
+`graph run`, `node run` and `ros2 attach` log this once per run, when the run
+sends topics off the machine over `tcp/` from a host where the sysctl is
+nonzero:
+
+- through a per-run gateway (a `network:` block, or an unreachable
+  `cerulion-netd`) whose locators include `tcp/`: a warning that names them;
+- through the shared `cerulion-netd` session: an info line, since every
+  networked run registers there whether or not a remote peer subscribes.
+
+The fixes are `sysctl -w net.ipv4.tcp_slow_start_after_idle=0` on the sending
+host, kept in a file under `/etc/sysctl.d/`, or `quic/` on both ends: a
+`network:` block with `quic/` locators, their `tls:` files and an `egress:`
+list. The sysctl is per network namespace; the run reads it in its own. A
+`cerulion-netd` started with only `quic/` locators still gets the info line,
+because the run cannot see netd's locators. Other hosts never log it.
 
 Both ends of a link use the same spelling. `mixed_rel=auto` is accepted and
 lets the peer decide, which is why it does not satisfy a `best_effort` topic
@@ -592,12 +672,13 @@ network:
       private_key: /etc/cerulion/robot.key
   ```
 - **`tls`**: absolute paths to PEM files, read when the gateway opens its
-  session (a missing file fails the open, naming the path). A `quic/` listener
-  needs `certificate` and `private_key`; a `quic/` connect needs `root_ca`,
+  session (a missing file fails the open, naming the path). A `quic/` or
+  `tls/` listener needs `certificate` and `private_key`; a `quic/` or `tls/`
+  connect needs `root_ca`,
   the certificate(s) the peer's certificate chains to. A self-signed peer
   certificate can be its own `root_ca` (ECDSA P-256 and Ed25519 keys both
   work) when it is NOT marked as a CA: `openssl req -x509` marks it
-  `CA:TRUE` by default, and a `quic/` listener refuses to open with such a
+  `CA:TRUE` by default, and a `quic/` or `tls/` listener refuses to open with such a
   certificate, naming the file and the fix. Mint it as an end entity:
 
   ```sh
@@ -618,7 +699,8 @@ network:
   `CERULION_NETD_TLS_PRIVATE_KEY`, beside `CERULION_NETD_CONNECT` /
   `CERULION_NETD_LISTEN`.
 - **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
-  port only (a graph listening on `quic/` alone is not advertised), and
+  port (plus `udp_rel=<port>` under `CERULION_UNENCRYPTED_QUIC=on`, below; a
+  graph listening on `quic/` alone is not advertised), and
   `topic list --connect` takes `<carrier>/<host>:<port>` with no `?` metadata
   and probes it over TCP before it uses it, so it cannot reach a QUIC-only
   robot. Reach one through `CERULION_NETD_CONNECT` or a graph's `connect:`.
@@ -708,13 +790,15 @@ Every rejection names the offending topic or setting and states the fix:
 5. **No lists under `disabled`.**
 6. **No duplicates within a list** (a bare name and a map naming the same
    topic are duplicates).
-7. **Known carrier**: `tcp/`, `quic/` or `udp/`, with `rel` / `mixed_rel`
-   values zenoh accepts. `tls/` is refused: this build does not compile it.
-8. **`quic/` has its files**: `certificate` + `private_key` for a `quic/`
-   listener, `root_ca` for a `quic/` connect; absolute paths only.
-9. **No inert `tls` setting**: `root_ca` without a `quic/` connect locator,
-   or `certificate` / `private_key` without a `quic/` listen locator, is
-   refused (each is read only by that side).
+7. **Known carrier**: `tcp/`, `quic/`, `tls/` or `udp/`, with `rel` /
+   `mixed_rel` values zenoh accepts (`mixed_rel` only on `quic/` and
+   `udp/...?rel=1`).
+8. **`quic/` and `tls/` have their files**: `certificate` + `private_key` for
+   a `quic/` or `tls/` listener, `root_ca` for a `quic/` or `tls/` connect;
+   absolute paths only.
+9. **No inert `tls` setting**: `root_ca` without a `quic/` or `tls/` connect
+   locator, or `certificate` / `private_key` without a `quic/` or `tls/`
+   listen locator, is refused (each is read only by that side).
 10. **Best effort needs a datagram link**: a `best_effort` topic, and a
     `default_reliability: best_effort`, each need a `mixed_rel=1` QUIC
     locator (not `auto`) in `listen` or `connect`; without one the topics
@@ -1022,7 +1106,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":8,"wire_header":2}
+{"hello":"cerulion-netd","protocol":9,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
 

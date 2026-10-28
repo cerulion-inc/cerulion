@@ -194,6 +194,17 @@ pub enum PairingError {
     #[error("presented grant does not confer the owner role (an OWNER-scoped grant is required to claim ownership)")]
     NotOwnerGrant,
 
+    /// An owner device certificate cannot authorize the owner's stored scope.
+    #[error("owner device certificate does not cover the existing owner access scope")]
+    OwnerCertificateScopeInsufficient,
+    /// An owner certificate cannot renew a finite, expired access row.
+    #[error("the existing owner access row has expired")]
+    OwnerAccessExpired,
+    /// A code pairing named the robot's owner account; it would replace the
+    /// owner's access row with the code-pairing scope.
+    #[error("code pairing cannot bind the robot's owner account")]
+    CodePairOwnerAccount,
+
     // ---- owner-signed access grant ---------------------------------------
     /// An owner-signed [`crate::format::AccessGrant`] was presented whose owner
     /// device cert binds an account that is NOT this robot's claimed owner — only

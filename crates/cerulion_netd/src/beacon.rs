@@ -147,6 +147,20 @@ pub fn plan_gateway_beacon(cfg: Option<&NetworkConfig>) -> BeaconDecision {
     }
 }
 
+/// The `udp_rel` TXT port the beacon publishes: the first LAN-dialable
+/// `udp/...?rel=1` listen port while `CERULION_UNENCRYPTED_QUIC=on`, else
+/// `None`, so with the opt-in off the record is unchanged even when a listen
+/// list happens to name such a locator. PURE.
+pub fn advertised_udp_rel_port(
+    cfg: Option<&NetworkConfig>,
+    switch: cerulion_discovery::unencrypted_quic::UnencryptedQuic,
+) -> Option<u16> {
+    if switch == cerulion_discovery::unencrypted_quic::UnencryptedQuic::Off {
+        return None;
+    }
+    cerulion_mdns::udp_rel_port_from_listen_endpoints(&cfg?.listen_endpoints)
+}
+
 /// WHERE a [`GatewayBeacon`]'s advertise step lands. Chosen at CONSTRUCTION, so
 /// the production call chain carries no runtime switch a variant could hide in.
 ///
@@ -174,9 +188,16 @@ enum BeaconAdvertiser {
 impl BeaconAdvertiser {
     /// Perform the advertise. `Ok(None)` means it was deliberately NOT performed
     /// (the [`Suppressed`](BeaconAdvertiser::Suppressed) arm) — never a failure.
-    fn advertise(&self, robot: &str, port: u16) -> Result<Option<MdnsAdvertiseGuard>, MdnsError> {
+    fn advertise(
+        &self,
+        robot: &str,
+        port: u16,
+        udp_rel_port: Option<u16>,
+    ) -> Result<Option<MdnsAdvertiseGuard>, MdnsError> {
         match self {
-            Self::Mdns => cerulion_mdns::advertise_gateway(robot, port).map(Some),
+            Self::Mdns => {
+                cerulion_mdns::advertise_gateway_with_udp_rel(robot, port, udp_rel_port).map(Some)
+            }
             Self::Suppressed => Ok(None),
         }
     }
@@ -220,6 +241,15 @@ struct BeaconState {
 }
 
 impl GatewayBeacon {
+    /// Refresh an existing advertisement after automatic robot startup.
+    pub fn refresh_robot_facts(&self, expected_eid: &str) -> Result<bool, MdnsError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.guard.as_mut() {
+            Some(guard) => guard.refresh_robot_facts(expected_eid),
+            None => Ok(false),
+        }
+    }
+
     /// A beacon that has not yet been raised. Advertises for REAL when its
     /// decision says to.
     pub fn new() -> Self {
@@ -276,7 +306,11 @@ impl GatewayBeacon {
         state.decision = Some(decision.clone());
         match decision {
             BeaconDecision::Advertise { robot, port } => {
-                match self.advertiser.advertise(&robot, port) {
+                let udp_rel_port = advertised_udp_rel_port(
+                    cfg,
+                    cerulion_discovery::unencrypted_quic::unencrypted_quic_from_env_quiet(),
+                );
+                match self.advertiser.advertise(&robot, port, udp_rel_port) {
                     Ok(Some(g)) => {
                         tracing::info!(
                             robot = %robot,
@@ -441,6 +475,26 @@ mod tests {
             robot_identity: identity.map(str::to_string),
             ..NetworkConfig::default()
         }
+    }
+
+    #[test]
+    fn the_udp_rel_port_is_advertised_only_with_the_opt_in_on() {
+        use cerulion_discovery::unencrypted_quic::UnencryptedQuic;
+        let both = cfg(Some("go2"), &["tcp/0.0.0.0:7683", "udp/0.0.0.0:7683?rel=1"]);
+        assert_eq!(
+            advertised_udp_rel_port(Some(&both), UnencryptedQuic::On),
+            Some(7683)
+        );
+        assert_eq!(
+            advertised_udp_rel_port(Some(&both), UnencryptedQuic::Off),
+            None
+        );
+        let tcp_only = cfg(Some("go2"), &["tcp/0.0.0.0:7683"]);
+        assert_eq!(
+            advertised_udp_rel_port(Some(&tcp_only), UnencryptedQuic::On),
+            None
+        );
+        assert_eq!(advertised_udp_rel_port(None, UnencryptedQuic::On), None);
     }
 
     /// THE oracle, both directions in ONE body: the ROBOT shape advertises its

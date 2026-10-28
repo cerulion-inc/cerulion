@@ -210,6 +210,20 @@ which a TAB press must not do.";
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Internal login-gated first-serve registration worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    BootstrapRobot {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
+    /// Internal robot-side revocation sync worker.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    RobotSyncEpoch {
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        state_root: PathBuf,
+    },
     /// Workspace management
     Workspace {
         #[command(subcommand)]
@@ -446,9 +460,9 @@ pub enum Commands {
         /// ceremony window, and it authorizes durable enrollment.
         #[arg(long, value_name = "CODE")]
         code: Option<String>,
-        /// The account (64-char hex) this pairing is FOR. When omitted, a
-        /// self-account is derived from the desk device key (a desk with a
-        /// keypair and no Cerulion account).
+        /// The account (64-char hex) a code pairing binds. It must be the desk's
+        /// self-account (the public half of its device key), the value used when
+        /// omitted; any other value is refused.
         #[arg(long, value_name = "HEX")]
         account: Option<String>,
         /// The access-list label the robot stores on its pairing row (so the
@@ -500,9 +514,10 @@ pub enum Commands {
     /// Show or change usage telemetry consent.
     ///
     /// Release builds send coarse, content-free usage events (which verb ran,
-    /// its exit code and a duration bucket; never arguments, paths or data).
-    /// `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` also turn it off. Builds
-    /// without a telemetry key send nothing. See `docs/telemetry.md`.
+    /// how it ended, coarse durations and counts; never arguments, paths or
+    /// data). `DO_NOT_TRACK=1` and `CERULION_TELEMETRY=0` (or `false`, `off`,
+    /// `no`) also turn it off. Builds without a telemetry key send nothing.
+    /// See `docs/telemetry.md`.
     Telemetry {
         #[command(subcommand)]
         action: TelemetryAction,
@@ -670,6 +685,10 @@ impl Commands {
     pub fn log_verb_class(&self) -> VerbLogClass {
         use VerbLogClass::{LongRunning, OneShot};
         match self {
+            #[cfg(unix)]
+            Commands::BootstrapRobot { .. } => OneShot,
+            #[cfg(unix)]
+            Commands::RobotSyncEpoch { .. } => OneShot,
             // ── Long-running / runtime verbs: keep the `info` default ──
             Commands::Graph { action } => match action {
                 // Runtime loops: the live run, the live profiler, and the
