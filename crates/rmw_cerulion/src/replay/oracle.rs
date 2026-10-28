@@ -120,7 +120,8 @@ pub(crate) struct WatchdogReport {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Verdict {
     /// `identical`, `diverged`, `input_mismatch`, `log_exhausted_early`,
-    /// `replay_stopped_early`, `watchdog` or `refused`.
+    /// `replay_stopped_early`, `watchdog` or `refused`; `running` until the
+    /// replay writes one of those.
     pub verdict: String,
     pub process: String,
     pub log: String,

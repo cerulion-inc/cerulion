@@ -9,6 +9,8 @@
 #   MIXER_RAW=1        also subscribes /a with raw=True (a serialized take)
 #   MIXER_EXIT_AFTER_A=N exits after its Nth /a callback (set on a replay only:
 #                      the recording's later takes are never made)
+#   MIXER_HANG_AFTER_A=N blocks forever in its Nth /a callback (set on a replay
+#                      only: the test kills it there)
 import hashlib, os, sys, threading, time
 import rclpy
 from rclpy.node import Node
@@ -19,6 +21,7 @@ WALL = os.environ.get("MIXER_WALLCLOCK") == "1"
 SIDE = os.environ.get("MIXER_SIDE_THREAD") == "1"
 RAW = os.environ.get("MIXER_RAW") == "1"
 EXIT_AFTER_A = int(os.environ.get("MIXER_EXIT_AFTER_A", "0"))
+HANG_AFTER_A = int(os.environ.get("MIXER_HANG_AFTER_A", "0"))
 
 
 class Mixer(Node):
@@ -53,6 +56,8 @@ class Mixer(Node):
         self.a_seen = getattr(self, "a_seen", 0) + 1
         if EXIT_AFTER_A and self.a_seen >= EXIT_AFTER_A:
             raise SystemExit(0)
+        if HANG_AFTER_A and self.a_seen >= HANG_AFTER_A:
+            time.sleep(3600)
 
     def tick(self):
         now = self.get_clock().now().nanoseconds

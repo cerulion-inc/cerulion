@@ -185,6 +185,18 @@ impl Run {
         stop_child(&mut child)
     }
 
+    /// SIGKILL a child (no handler, no atexit runs), then reap it.
+    pub fn kill(&mut self, name: &str) -> ExitStatus {
+        let i = self
+            .children
+            .iter()
+            .position(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no child {name}"));
+        let (_, mut child) = self.children.remove(i);
+        let _ = child.kill();
+        child.wait().expect("reap the killed child")
+    }
+
     /// Wait for a child to exit by itself (bounded), then return its status.
     pub fn wait_exit(&mut self, name: &str, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
@@ -441,7 +453,15 @@ pub fn replay(
     env.extend(node_env.iter().cloned());
     run.spawn(name, &node_argv, &env, &out);
     let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline && !verdict.exists() && run.running(name) {
+    // The replay writes a `running` verdict when it starts; wait for the
+    // one it writes when the log is used up (or for the process to exit).
+    let settled = |p: &Path| {
+        std::fs::read(p)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["verdict"] != "running")
+    };
+    while Instant::now() < deadline && !settled(&verdict) && run.running(name) {
         std::thread::sleep(Duration::from_millis(50));
     }
     // The verdict is written once the log is exhausted; give the process a

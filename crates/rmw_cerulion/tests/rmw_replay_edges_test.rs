@@ -19,6 +19,10 @@
 //!   then replayed with `MIXER_EXIT_AFTER_A=40`, so the replay exits after
 //!   its 40th `/a` callback and never makes the recording's later takes.
 //!   The verdict is not `identical` and counts the takes not replayed.
+//! - `a_killed_replay_never_leaves_an_earlier_verdict`: after an `identical`
+//!   replay, a second replay of the same log blocks in its 5th `/a`
+//!   callback (`MIXER_HANG_AFTER_A=5`) and is killed with SIGKILL. The
+//!   verdict file says `running`, not the earlier `identical`.
 //! - `an_rclpy_service_pair_replays_identically_on_both_sides`: `svc.py
 //!   server` and `svc.py client` are recorded together on ROS time, then each
 //!   is replayed alone: every request and response callback matches the
@@ -276,6 +280,53 @@ fn a_replay_that_stops_taking_is_never_identical() {
         "REPLAY stops taking: {} with {not_replayed} takes not replayed ({recorded_a} /a recorded, 40 replayed)",
         v["verdict"]
     );
+}
+
+#[test]
+#[ignore = "needs ROS 2 with librmw_cerulion.so staged; see replay_harness"]
+fn a_killed_replay_never_leaves_an_earlier_verdict() {
+    preconditions();
+    let mut run = Run::new("killed");
+    let rec = record_probe(&mut run, "mixer", mixer(), &[], "mixer", 1000);
+    replay(&mut run, "mixer", mixer(), &[], &rec.log, "rep1");
+    assert_eq!(
+        verdict(&rec.log)["verdict"],
+        "identical",
+        "the first replay"
+    );
+    let out = run.path("rep2");
+    run.spawn(
+        "mixer",
+        &mixer(),
+        &[
+            ("MIXER_HANG_AFTER_A", "5".to_string()),
+            ("CERULION_RMW_REPLAY", rec.log.display().to_string()),
+        ],
+        &out,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let a_taken = |out: &PathBuf| {
+        callbacks(&out.join("mixer.jsonl"))
+            .iter()
+            .filter(|(cb, _)| cb == "a")
+            .count()
+    };
+    while a_taken(&out) < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replay never reached its 5th /a callback: {}",
+            stderr_of(&out, "mixer")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let st = run.kill("mixer");
+    assert!(!st.success(), "killed: {st:?}");
+    let v = verdict(&rec.log);
+    assert_eq!(
+        v["verdict"], "running",
+        "a killed replay leaves `running`, never the earlier verdict: {v:#}"
+    );
+    println!("REPLAY killed: verdict `running` after SIGKILL ({st:?})");
 }
 
 fn svc(role: &str) -> Vec<String> {

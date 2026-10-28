@@ -23,14 +23,14 @@ Topic recording (`cerulion bag record`) can run at the same time. The two record
 
 ## What recording costs
 
-With neither variable set, each rmw call pays one check. While recording, each take copies its payload into the log and each output is hashed byte by byte (64-bit FNV-1a) on the calling thread, so the cost grows with message size. Round trip on one Linux host (ROS 2 Humble, rclcpp ping-pong over `rmw_cerulion` shared memory, 100 Hz, 2,000 samples per size):
+With neither variable set, each rmw call pays one check. While recording, each take copies its payload into the log and each output is hashed byte by byte (64-bit FNV-1a) on the calling thread, so the cost grows with message size. Round trip on one Linux host (ROS 2 Humble, rclcpp ping-pong over `rmw_cerulion` shared memory, 100 Hz, 2,000 samples per size). The not-recording column is the build before recording support, the median of 4 to 7 runs; with recording support built in and off, p10 matches it within 0.4 µs at every size. The recording columns are the median of 2 runs:
 
 | payload | p50 not recording | p50 recording | p99 recording |
 |---|---|---|---|
-| 64 B | 14 µs | 16 µs | 62 µs |
-| 16 KiB | 16 µs | 48 µs | 0.5 ms |
-| 64 KiB | 21 µs | 146 µs | 1.1 ms |
-| 1 MiB | 165 µs | 3.0 ms | 5.2 ms |
+| 64 B | 14 µs | 16 µs | 57 µs |
+| 16 KiB | 16 µs | 48 µs | 0.55 ms |
+| 64 KiB | 21 µs | 148 µs | 1.2 ms |
+| 1 MiB | 166 µs | 3.0 ms | 4.4 ms |
 
 The log also grows by every payload taken. Record a process whose large topics run at a few Hz; a 1 MiB topic at camera rate spends most of a 30 Hz frame on recording. Hashing a sample of each large payload, or a faster hash, and moving the body copy off the calling thread are the planned ways to cut this.
 
@@ -44,7 +44,9 @@ Replay one recorded process, alone, with the same command it was recorded with:
 cerulion ros2 run --replay-deliveries ./logs/my_node-4242.rdl.mcap my_pkg my_node --ros-args -p use_sim_time:=true
 ```
 
-or `CERULION_RMW_REPLAY=<log>` on any launch path. The verdict is written to `<log>.verdict.json` once the log is used up; stop the process after that (Ctrl-C). Nothing else needs to run: no talker, no clock, no robot. `ros2 launch` has no replay flag, because a replay is one process.
+or `CERULION_RMW_REPLAY=<log>` on any launch path. When the replay starts, `<log>.verdict.json` says `running`; the real verdict replaces it once the log is used up, so stop the process after the file no longer says `running` (Ctrl-C). A replay that crashes or is killed leaves `running`, never an earlier replay's verdict. Nothing else needs to run: no talker, no clock, no robot.
+
+A replay really publishes. The replayed process sends its outputs on the transport as it did live, and through `cerulion-netd` they can reach other hosts. Do not replay a controller or a driver where a live robot, or anything that acts on its topics, can receive them: replay on a machine of its own, or on one where no live node runs and `cerulion-netd` is stopped or started with `CERULION_NETD_NETWORK=off`. `ros2 launch` has no replay flag, because a replay is one process.
 
 ## The verdict
 
@@ -57,6 +59,7 @@ or `CERULION_RMW_REPLAY=<log>` on any launch path. The verdict is written to `<l
 | `replay_stopped_early` | the process exited before it was served every recorded window; `takes_not_replayed` counts the recorded deliveries it never took |
 | `watchdog` | a callback held the replay for 5 s without progress, waiting on another thread the replay cannot run (see the conditions below), or the last callback never returned to `rmw_wait`; `watchdog.entity` and `node` name it |
 | `refused` | the process is not replayable; `refused` says why and `refused_at` says when: `start` (at `rmw_init` or node creation, before the node ran), `run` (the replay stopped serving when it saw the cause) or `end` (the process ran to the end, and some of its outputs could not be compared) |
+| `running` | the replay has started and has not written its verdict yet; a replay that crashed or was killed leaves this |
 
 A divergence is also printed on stderr when the verdict is written, for example:
 
@@ -71,7 +74,7 @@ Outputs are compared as a 64-bit FNV-1a hash of each payload, one segment at a t
 Replay reproduces the recorded run when all of these hold for the process:
 
 1. **C1** Every thread that runs callbacks is a single-threaded executor thread that calls `rmw_wait`. Several single-threaded executors on several threads are fine: the replay serves their windows and takes in the recorded order and lets one thread run at a time. That includes rclcpp's clock thread, which takes `/clock` on its own executor when `use_sim_time` is set: while recording, a `/clock` update and another thread's timer check are kept apart (each waits at most 5 ms for the other), so the recorded order is one the replay can serve.
-2. **C2** No node logic reads the wall or steady clock. Use ROS time (`use_sim_time`, with `/clock` recorded); a wall timer (`create_wall_timer`) or a `time.time_ns()` read diverges, and the verdict names it.
+2. **C2** No node logic reads the wall or steady clock. Use ROS time (`use_sim_time`, with `/clock` recorded); a wall timer (`create_wall_timer`) or a `time.time_ns()` read can diverge, and when it changes an output the verdict names it; a wall-clock read that changes no output in the recorded span replays as `identical`.
 3. **C3** Random numbers are seeded or absent.
 4. **C4** No callback blocks on work another thread owns. If one does, the watchdog names it. The watchdog also fires, after 5 s, when the thread of the last recorded callback leaves its executor without calling `rmw_wait` again (for example after `spin_until_future_complete`) and the process stays up while another executor thread still waits; that verdict is `watchdog` although the outputs matched.
 5. **C5** No input reaches the node outside the rmw: no sockets, devices, files it reads during the run, or shared memory of its own.

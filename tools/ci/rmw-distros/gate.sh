@@ -349,7 +349,7 @@ case "$expect" in
                     || { echo "GATE FAIL: $distro replay - could not install colcon for the rclcpp replay fixture"; exit 1; }
             fi
             REPLAY_TIMEOUT="${REPLAY_TIMEOUT:-900}"
-            REPLAY_EXPECTED=18
+            REPLAY_EXPECTED=19
             replay_ok=0
             for spec in \
                 rmw_replay_rclpy_probe_test:the_mixer_replays_byte_identical_five_times \
@@ -368,6 +368,7 @@ case "$expect" in
                 rmw_replay_edges_test:a_publishing_thread_outside_every_executor_is_refused \
                 rmw_replay_edges_test:a_serialized_take_is_refused_under_its_own_name \
                 rmw_replay_edges_test:a_replay_that_stops_taking_is_never_identical \
+                rmw_replay_edges_test:a_killed_replay_never_leaves_an_earlier_verdict \
                 rmw_replay_edges_test:an_rclpy_service_pair_replays_identically_on_both_sides \
                 rmw_replay_edges_test:the_rclcpp_add_two_ints_pair_replays_identically_on_both_sides; do
                 bin="${spec%%:*}"; name="${spec#*:}"

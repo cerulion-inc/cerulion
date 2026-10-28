@@ -1391,7 +1391,7 @@ impl Player {
             units = schedule.units.len(),
             "rmw_cerulion: replaying deliveries"
         );
-        Ok(Player {
+        let player = Player {
             path: path.to_path_buf(),
             header: log.header,
             ending: log.ending,
@@ -1423,7 +1423,19 @@ impl Player {
                 final_checked: false,
             }),
             schedule,
-        })
+        };
+        player.write_running();
+        Ok(player)
+    }
+
+    /// Before the replay starts: a `running` verdict replaces any earlier
+    /// one, so a replay that dies before it writes its own (a crash, an
+    /// abort, SIGKILL) never leaves a previous run's verdict in place.
+    fn write_running(&self) {
+        let st = self.lock();
+        let mut v = self.verdict(&st);
+        v.verdict = "running".to_string();
+        write_verdict_file(&self.path, &v);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PlayState> {
