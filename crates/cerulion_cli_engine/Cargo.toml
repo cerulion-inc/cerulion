@@ -21,8 +21,6 @@ include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 workspace = true
 
 [features]
-# Forwards cerulion_core's oracle mutants (see that crate's feature).
-oracle-mutants = ["cerulion_core/oracle-mutants"]
 # Exposes the forge-shaped `auth::seed_logged_in_at` test-provisioning
 # helper (writes a logged-in-ever auth.json). NOT enabled by default, so a shipped
 # binary linking this lib carries no one-call "mint a passing login gate" surface;
@@ -38,7 +36,8 @@ test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
 # show its oracle catches it. Off by default and in every release build; only an
 # explicit `cargo test -p cerulion_cli_engine --features oracle-mutants` builds them.
-oracle-mutants = []
+# It also turns on cerulion_core's own mutant seams (`crate::oracle_mutant`).
+oracle-mutants = ["cerulion_core/oracle-mutants"]
 
 [dependencies]
 cerulion_core = { workspace = true }
