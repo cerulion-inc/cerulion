@@ -91,6 +91,7 @@ pub mod forward;
 mod local_schema;
 pub mod ops;
 pub mod pairing_verbs;
+mod private_file;
 pub mod provision;
 pub mod tap;
 pub mod trust;
