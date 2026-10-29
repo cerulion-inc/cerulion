@@ -18,12 +18,11 @@ pub mod error;
 pub mod nodes;
 /// Synchronous runtime lifecycle and status types.
 pub mod runtime;
-/// App subscriptions read with `poll`.
-pub mod subscribe;
 
 mod host;
 mod jni;
 mod log;
+mod subscribe;
 
 /// Embedded runtime API and observable status types.
 pub use config::{LanAccessConfig, LogLevelConfig};

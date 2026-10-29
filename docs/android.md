@@ -365,15 +365,21 @@ if (code == CerulionRuntime.OK) {
 Only `OK` appends to the builder. A subscription's queue holds `depth`
 messages; when it is full, the oldest message is dropped. `status` counts
 each subscription under `subscribed`: `polled` messages `poll` returned,
-`dropped` messages the full queue dropped, and `undecodable` messages `poll`
-refused with `DECODE`. A dropped message is counted from the gap in its
-publisher's message sequence, so a message dropped before the first one the
-subscription receives from that publisher is not counted. A message that
+`dropped` messages missing from a publisher's message sequence, which is the
+full queue dropping its oldest (or a frame the transport could not read),
+and `undecodable` messages `poll` refused with `DECODE`. A dropped message
+is counted from the gap in its publisher's message sequence, so a message
+dropped before the first one the subscription receives from that publisher
+is not counted. A message that
 does not decode, for example one of another schema, is still taken off the
 queue, so the next poll reads the one after it. The runtime creates every
 subscription before the graph runs, so it receives the first message a node
 sends. A subscription can read a graph output, an app `publish` topic, or a
-topic another publisher in the process sends.
+topic another publisher in the process sends; a start logs a warning for a
+subscribe topic that is neither an app `publish` topic nor a graph output,
+because a misspelled topic polls `EMPTY` forever. `poll` reads a run that
+is `running`, and also one that is `finished` or `failed`, until `stop`, so
+the last messages of a graph that ended can still be read.
 
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and

@@ -141,6 +141,8 @@ public final class JniSmoke {
         System.out.println("load-other="
                 + illegalState(() -> CerulionRuntime.loadLibrary("other_runtime")));
         System.out.println("status-before-init=" + state(CerulionRuntime.status()));
+        System.out.println("codes=" + CerulionRuntime.DECODE + "," + CerulionRuntime.EMPTY
+                + "," + CerulionRuntime.RECEIVE);
         System.out.println("init-bad=" + CerulionRuntime.init(args[0] + "/missing", "jni-test"));
         System.out.println("init-ok=" + CerulionRuntime.init(args[0], "jni-test"));
         String initStatus = CerulionRuntime.status();
@@ -171,7 +173,7 @@ public final class JniSmoke {
         System.out.println("poll-unknown=" + poll("/jni/missing"));
         System.out.println("poll-null-out=" + CerulionRuntime.poll("/jni/heartbeat", null));
         System.out.println("poll-null-topic=" + CerulionRuntime.poll(null, new StringBuilder()));
-        for (String data : new String[] {"a", "b", "c"}) {
+        for (String data : new String[] {"a", "b", "ç"}) {
             CerulionRuntime.publish("/jni/heartbeat", "{\"data\":\"" + data + "\"}");
         }
         System.out.println("poll-overflow=" + poll("/jni/heartbeat") + ", " + poll("/jni/heartbeat")

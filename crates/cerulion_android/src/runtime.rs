@@ -731,29 +731,24 @@ impl EmbeddedRuntime {
     /// Take the oldest message of the subscription on `topic` and return it
     /// as JSON object text, or `None` when its queue is empty. A message that
     /// does not decode is still taken: the error is DECODE and the next poll
-    /// reads the message after it.
+    /// reads the message after it. A run that finished or failed keeps its
+    /// subscriptions until `stop`, so their last messages can still be read.
     pub fn poll(&mut self, topic: &str) -> Result<Option<&str>, EmbedError> {
-        if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
+        let started = matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Running | RuntimeState::Finished | RuntimeState::Failed
+        );
+        let Some(run) = self.run.as_mut().filter(|_| started) else {
             return Err(EmbedError::BadState(
-                "poll requires a running runtime".to_string(),
+                "poll requires a started runtime".to_string(),
             ));
-        }
-        let subscription = self
-            .run
-            .as_mut()
-            .and_then(|run| run.subscriptions.get_mut(topic))
-            .ok_or_else(|| {
-                EmbedError::UnknownTopic(format!("unknown subscribe topic '{topic}'"))
-            })?;
-        let mut counts = SubscriptionCounts::default();
-        let result = subscription.poll(&mut counts);
-        if counts != SubscriptionCounts::default() {
-            let mut status = lock_status(&self.status);
-            if let Some(total) = status.subscribed.get_mut(topic) {
-                total.polled += counts.polled;
-                total.dropped += counts.dropped;
-                total.undecodable += counts.undecodable;
-            }
+        };
+        let subscription = run.subscriptions.get_mut(topic).ok_or_else(|| {
+            EmbedError::UnknownTopic(format!("unknown subscribe topic '{topic}'"))
+        })?;
+        let (counts, result) = subscription.poll();
+        if let Some(total) = lock_status(&self.status).subscribed.get_mut(topic) {
+            *total = counts;
         }
         result
     }
@@ -1713,14 +1708,24 @@ fn resolve_subscribe(
                 .map(|output| ("a graph output declares", output.schema.as_str()))
         })
     });
-    if let Some((producer, schema)) = published
-        .chain(produced)
+    let producers = published.chain(produced).collect::<Vec<_>>();
+    if let Some((producer, schema)) = producers
+        .iter()
         .find(|(_, schema)| !schema.is_empty() && *schema != subscribe.schema)
     {
         return Err(EmbedError::InvalidArgument(format!(
             "subscribe topic '{}' has schema '{}', but {producer} '{schema}'",
             subscribe.topic, subscribe.schema
         )));
+    }
+    if producers.is_empty() {
+        // Another publisher in the process may send it, so this is allowed;
+        // a misspelled topic would otherwise poll EMPTY with no sign.
+        tracing::warn!(
+            topic = %subscribe.topic,
+            schema = %subscribe.schema,
+            "subscribe topic is neither an app publish topic nor a graph output"
+        );
     }
     Ok(ResolvedSubscribe {
         topic: subscribe.topic.clone(),

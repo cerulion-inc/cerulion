@@ -90,7 +90,9 @@ public final class CerulionRuntime {
      * start or stop is in flight, so retry. {@link #DECODE} means the message
      * did not decode; it was still taken, so the next poll reads the one
      * after it. A full queue drops its oldest message; {@link #status()}
-     * counts it under {@code subscribed}.
+     * counts it under {@code subscribed}. A run whose state is
+     * {@code finished} or {@code failed} can still be polled until
+     * {@link #stop()}.
      */
     public static int poll(String topic, StringBuilder out) {
         ensureLoaded();

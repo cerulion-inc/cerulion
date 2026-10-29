@@ -790,11 +790,14 @@ mod tests {
             assert_eq!(poll_on(&host, "/topic"), (codes::BUSY, None));
         }
         *lock_lifecycle(&host.lifecycle) = Lifecycle::Idle;
+        // A running state with no run behind it has no subscription to
+        // read: still BAD_STATE. UNKNOWN_TOPIC on a real run is pinned by
+        // `embedded_subscribe_poll_test`.
         host.runtime
             .lock()
             .expect("runtime lock")
             .mark_running_for_test();
-        assert_eq!(poll_on(&host, "/missing"), (codes::UNKNOWN_TOPIC, None));
+        assert_eq!(poll_on(&host, "/missing"), (codes::BAD_STATE, None));
         assert!(host.lifecycle.try_lock().is_ok());
     }
 

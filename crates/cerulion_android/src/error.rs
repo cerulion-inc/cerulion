@@ -137,14 +137,16 @@ mod tests {
             (EmbedError::Decode(String::new()), 14),
             (EmbedError::Receive(String::new()), 16),
         ];
+        // EMPTY (15) is a poll outcome, not an error: no variant carries
+        // it, and with it the codes run 1 to 16 without a gap.
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
+        actual.push(codes::EMPTY);
         actual.sort_unstable();
-        assert_eq!(actual, [(1..=14).collect::<Vec<_>>(), vec![16]].concat());
+        assert_eq!(actual, (1..=16).collect::<Vec<_>>());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }
         assert_eq!(codes::OK, 0);
-        // EMPTY is a poll outcome, not an error: no variant carries it.
         assert_eq!(codes::EMPTY, 15);
     }
 }

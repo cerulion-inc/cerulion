@@ -17,7 +17,8 @@ use crate::error::EmbedError;
 pub struct SubscriptionCounts {
     /// Messages `poll` returned.
     pub polled: u64,
-    /// Messages the full queue dropped before a poll took them.
+    /// Messages missing from a publisher's sequence: the full queue dropped
+    /// them before a poll took them, or the transport could not read them.
     pub dropped: u64,
     /// Messages `poll` took off the queue and refused with `DECODE`.
     pub undecodable: u64,
@@ -28,8 +29,9 @@ pub(crate) struct Subscription {
     subscriber: CerulionSubscriber,
     layout: WireLayout,
     drops: DropCounter,
+    counts: SubscriptionCounts,
     /// Reused JSON buffer: cleared per poll, its capacity kept.
-    json: Vec<u8>,
+    json: String,
 }
 
 impl Subscription {
@@ -38,35 +40,44 @@ impl Subscription {
             subscriber,
             layout,
             drops: DropCounter::default(),
-            json: Vec::new(),
+            counts: SubscriptionCounts::default(),
+            json: String::new(),
         }
     }
 
     /// Take the oldest queued message and decode it into JSON text, or
-    /// return `None` when the queue is empty. `counts` gains what this poll
-    /// took, dropped or refused.
-    pub(crate) fn poll(
-        &mut self,
-        counts: &mut SubscriptionCounts,
-    ) -> Result<Option<&str>, EmbedError> {
+    /// return `None` when the queue is empty. Returns the subscription's
+    /// counts after this poll with the result.
+    pub(crate) fn poll(&mut self) -> (SubscriptionCounts, Result<Option<&str>, EmbedError>) {
+        let taken = self.take();
+        (
+            self.counts,
+            taken.map(|taken| taken.then_some(self.json.as_str())),
+        )
+    }
+
+    /// Take one message into `json`; `false` when the queue is empty.
+    fn take(&mut self) -> Result<bool, EmbedError> {
         let Some(sample) = self
             .subscriber
             .try_receive_one_owned()
             .map_err(|error| EmbedError::Receive(error.to_string()))?
         else {
-            return Ok(None);
+            return Ok(false);
         };
         if let Some(header) = sample.wire_header() {
-            counts.dropped += self.drops.observe(sample.origin(), header.sequence);
+            self.counts.dropped += self.drops.observe(sample.origin(), header.sequence);
         }
-        if let Err(error) = decode_json_into(&self.layout, sample.payload(), &mut self.json) {
-            counts.undecodable += 1;
-            return Err(error);
+        match decode_json_into(&self.layout, sample.payload(), &mut self.json) {
+            Ok(()) => {
+                self.counts.polled += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                self.counts.undecodable += 1;
+                Err(error)
+            }
         }
-        counts.polled += 1;
-        std::str::from_utf8(&self.json)
-            .map(Some)
-            .map_err(|error| EmbedError::Decode(error.to_string()))
     }
 }
 
@@ -175,5 +186,22 @@ mod tests {
         assert_eq!(drops.streams.len(), MAX_STREAMS);
         assert_eq!(drops.observe(0, 3), 1, "publisher 0 kept its baseline");
         assert_eq!(drops.observe(1, 5), 0, "publisher 1 lost its baseline");
+    }
+
+    #[test]
+    fn a_repeated_sequence_and_the_half_range_boundary() {
+        let mut drops = DropCounter::default();
+        drops.observe(7, 5);
+        assert_eq!(drops.observe(7, 5), 0, "the same message again");
+        assert_eq!(
+            drops.observe(7, 5 + u32::MAX / 2),
+            u64::from(u32::MAX / 2 - 1)
+        );
+        let base = 5 + u32::MAX / 2;
+        assert_eq!(
+            drops.observe(7, base.wrapping_add(u32::MAX / 2 + 1)),
+            0,
+            "more than half the range ahead reads as behind"
+        );
     }
 }

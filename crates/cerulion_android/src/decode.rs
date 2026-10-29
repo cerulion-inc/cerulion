@@ -25,12 +25,20 @@ pub(crate) fn unsupported_field(layout: &WireLayout) -> Option<(&str, &FieldType
 /// Decode one wire frame (header first) into JSON object text in `out`.
 ///
 /// `out` is cleared and reused, so a per-subscription buffer keeps its
-/// capacity across polls.
+/// capacity across polls. On an error it is left empty.
 pub fn decode_json_into(
     layout: &WireLayout,
     frame: &[u8],
-    out: &mut Vec<u8>,
+    out: &mut String,
 ) -> Result<(), EmbedError> {
+    let mut bytes = std::mem::take(out).into_bytes();
+    write_object(layout, frame, &mut bytes)?;
+    *out = String::from_utf8(bytes)
+        .map_err(|error| EmbedError::Decode(error.utf8_error().to_string()))?;
+    Ok(())
+}
+
+fn write_object(layout: &WireLayout, frame: &[u8], out: &mut Vec<u8>) -> Result<(), EmbedError> {
     let view = FrameView::with_layout(layout, frame)
         .map_err(|error| EmbedError::Decode(error.to_string()))?;
     out.clear();
@@ -162,9 +170,9 @@ mod tests {
     }
 
     fn decode(layout: &WireLayout, frame: &[u8]) -> Result<String, EmbedError> {
-        let mut out = Vec::new();
+        let mut out = String::new();
         decode_json_into(layout, frame, &mut out)?;
-        Ok(String::from_utf8(out).expect("decoded JSON is UTF-8"))
+        Ok(out)
     }
 
     #[test]
@@ -185,11 +193,11 @@ mod tests {
     #[test]
     fn every_publish_type_round_trips_to_hand_written_json() {
         let layout = layout(
-            "bool flag\nint8 a\nuint8 b\nint16 c\nuint16 d\nint32 e\nuint32 f\nint64 g\nuint64 h\nfloat32 x\nfloat64 y\nstring name\nuint8[] blob\n",
+            "bool flag\nint8 a\nuint8 b\nint16 c\nuint16 d\nint32 e\nuint32 f\nint64 g\nuint64 h\nfloat32 x\nfloat64 y\nfloat32 tenth\nstring name\nuint8[] blob\n",
             "Everything",
             "test_msgs",
         );
-        let json = r#"{"flag":true,"a":-128,"b":255,"c":-32768,"d":65535,"e":-2147483648,"f":4294967295,"g":-9223372036854775808,"h":18446744073709551615,"x":1.5,"y":-0.25,"name":"tab\t\"q\" é","blob":[0,1,255]}"#;
+        let json = r#"{"flag":true,"a":-128,"b":255,"c":-32768,"d":65535,"e":-2147483648,"f":4294967295,"g":-9223372036854775808,"h":18446744073709551615,"x":1.5,"y":-0.25,"tenth":0.1,"name":"tab\t\"q\" é","blob":[0,1,255]}"#;
         let frame = encode_json(&layout, json, 256, 0, 0).unwrap();
         assert_eq!(decode(&layout, &frame).unwrap(), json);
     }
@@ -315,13 +323,16 @@ mod tests {
         let layout = layout("string data\n", "String", "std_msgs");
         let long = encode_json(&layout, r#"{"data":"a longer message"}"#, 64, 1, 1).unwrap();
         let short = encode_json(&layout, r#"{"data":"x"}"#, 64, 2, 2).unwrap();
-        let mut out = Vec::new();
+        let mut out = String::new();
         decode_json_into(&layout, &long, &mut out).unwrap();
         let first = out.clone();
         decode_json_into(&layout, &short, &mut out).unwrap();
-        assert_eq!(out, br#"{"data":"x"}"#);
+        assert_eq!(out, r#"{"data":"x"}"#);
         decode_json_into(&layout, &long, &mut out).unwrap();
         assert_eq!(out, first);
+        // A frame that fails leaves the buffer empty, never a partial object.
+        decode_json_into(&layout, &long[..WireHeader::SIZE], &mut out).unwrap_err();
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -337,6 +348,22 @@ mod tests {
         assert_eq!(
             unsupported_field(&array).map(|(name, _)| name),
             Some("values")
+        );
+    }
+
+    /// Fixed-size fields come first, then strings and byte arrays, each
+    /// group in schema order, as the guide says.
+    #[test]
+    fn writes_fixed_size_fields_before_strings_and_bytes() {
+        let layout = layout(
+            "string a\nint32 b\nuint8[] c\nbool d\n",
+            "Mixed",
+            "test_msgs",
+        );
+        let frame = encode_json(&layout, r#"{"a":"s","b":2,"c":[3],"d":true}"#, 64, 0, 0).unwrap();
+        assert_eq!(
+            decode(&layout, &frame).unwrap(),
+            r#"{"b":2,"d":true,"a":"s","c":[3]}"#
         );
     }
 }

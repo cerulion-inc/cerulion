@@ -196,7 +196,7 @@ fn overflow_drops_the_oldest_and_counts_them(runtime: &mut EmbeddedRuntime, topi
 }
 
 /// A frame of another schema on a subscribed topic is consumed, refused
-/// with DECODE and counted; the next poll is empty.
+/// with DECODE and counted; the next poll reads the frame after it.
 fn a_frame_of_another_schema_is_consumed_and_counted(runtime: &mut EmbeddedRuntime, pid: u32) {
     let topic = format!("/poll_{pid}/foreign");
     let config = json!({
@@ -204,21 +204,33 @@ fn a_frame_of_another_schema_is_consumed_and_counted(runtime: &mut EmbeddedRunti
     })
     .to_string();
     runtime.start(&config).expect("a subscription-only start");
-    let string = schemas_layout(VECTOR3);
-    let frame = cerulion_android::encode::encode_json(&string, r#"{"x":1.0}"#, 64, 0, 0)
+    let vector = schemas_layout(VECTOR3);
+    let frame = cerulion_android::encode::encode_json(&vector, r#"{"x":1.0}"#, 64, 0, 0)
         .expect("a Vector3 frame");
     let slot = MaxSliceLen::try_new((WireHeader::SIZE + 64) as u32).expect("slot");
     let mut foreign = TransportManager::get()
         .expect("transport manager")
         .create_publisher(&topic, slot, 0)
         .expect("a foreign publisher");
-    foreign.publish_raw(&frame).expect("publish the frame");
+    let string = schemas_layout("std_msgs/String");
+    let after = cerulion_android::encode::encode_json(&string, r#"{"data":"after"}"#, 64, 0, 1)
+        .expect("a String frame");
+    foreign
+        .publish_raw(&frame)
+        .expect("publish the Vector3 frame");
+    foreign
+        .publish_raw(&after)
+        .expect("publish the String frame");
     let error = runtime
         .poll(&topic)
         .expect_err("a Vector3 frame on a String topic");
     assert_eq!(error.code(), codes::DECODE);
+    assert_eq!(
+        poll(runtime, &topic).as_deref(),
+        Some(r#"{"data":"after"}"#)
+    );
     assert_eq!(poll(runtime, &topic), None);
-    assert_eq!(counts(runtime, &topic), (0, 0, 1));
+    assert_eq!(counts(runtime, &topic), (1, 0, 1));
     drop(foreign);
     runtime.stop().expect("stop the subscription-only run");
 }
