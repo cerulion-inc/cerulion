@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use cerulion_core::transport::carrier::classify_locator;
 use cerulion_core::LanAccess;
 use serde::Deserialize;
 
@@ -16,9 +17,13 @@ pub struct EmbeddedConfig {
     pub graph_yaml: Option<String>,
     /// Directory containing native node shared libraries.
     pub node_lib_dir: Option<PathBuf>,
-    /// Network listen endpoints; an empty list keeps transport local-only.
+    /// Network listen endpoints; with an empty `connect` as well, the
+    /// transport stays local-only.
     #[serde(default)]
     pub listen: Vec<String>,
+    /// `tcp/` locators of peers the app dials; an empty list dials none.
+    #[serde(default)]
+    pub connect: Vec<String>,
     /// Optional MCAP recording configuration.
     pub record: Option<RecordConfig>,
     /// App-created publishers.
@@ -229,6 +234,15 @@ impl EmbeddedConfig {
                 )));
             }
         }
+        let mut unique = BTreeSet::new();
+        for locator in &self.connect {
+            validate_connect_locator(locator)?;
+            if !unique.insert(locator.as_str()) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "duplicate connect locator '{locator}'"
+                )));
+            }
+        }
         if let Some(egress) = &self.egress {
             validate_topics(egress, "egress")?;
             let mut unique = BTreeSet::new();
@@ -254,6 +268,55 @@ pub fn validate_robot_name(robot_name: &str) -> Result<(), EmbedError> {
         return Err(EmbedError::InvalidArgument(
             "robot name must be 1..=63 ASCII letters, digits, '_' or '-'".into(),
         ));
+    }
+    Ok(())
+}
+
+/// A `connect` entry must be a well-formed `tcp/<host>:<port>` locator: a
+/// `quic/` or `tls/` peer needs certificate files the config does not carry,
+/// and a typo in the host or port would otherwise be dialed in the background
+/// forever without a sign.
+fn validate_connect_locator(locator: &str) -> Result<(), EmbedError> {
+    let invalid =
+        |reason: &str| EmbedError::InvalidArgument(format!("connect locator '{locator}' {reason}"));
+    let Some((carrier, rest)) = locator.split_once('/') else {
+        return Err(invalid("has no carrier: write it as 'tcp/<host>:<port>'"));
+    };
+    if carrier != "tcp" {
+        return Err(invalid("is not a tcp/ locator; the app dials tcp/ only"));
+    }
+    classify_locator(locator)
+        .map_err(|reason| EmbedError::InvalidArgument(format!("connect {reason}")))?;
+    // The address ends where zenoh's metadata (`?`) or config (`#`) begins.
+    let address = rest.split(['?', '#']).next().unwrap_or_default();
+    let (host, port) = match address.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((host, tail)) => (host, tail.strip_prefix(':')),
+            None => (bracketed, None),
+        },
+        None => match address.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (address, None),
+        },
+    };
+    let Some(port) = port else {
+        return Err(invalid("has no port: write it as 'tcp/<host>:<port>'"));
+    };
+    if host.is_empty() {
+        return Err(invalid("has no host: write it as 'tcp/<host>:<port>'"));
+    }
+    // The dial resolves a link-local scope by number only, never by name.
+    if let Some((_, scope)) = host.split_once('%') {
+        if scope.is_empty() || !scope.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid(&format!(
+                "has IPv6 scope '{scope}'; the scope is the interface number"
+            )));
+        }
+    }
+    if !port.parse::<u16>().is_ok_and(|port| port != 0) {
+        return Err(invalid(&format!(
+            "has port '{port}'; a port is a number from 1 to 65535"
+        )));
     }
     Ok(())
 }
@@ -493,6 +556,118 @@ mod tests {
             (
                 r#"{"egress":["/same","/same"]}"#,
                 "duplicate egress topic '/same'",
+            ),
+        ] {
+            let error = EmbeddedConfig::parse(raw)
+                .unwrap()
+                .validate_paths(Path::new("/tmp"))
+                .unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+            assert_eq!(error.to_string(), message, "{raw}");
+        }
+    }
+
+    #[test]
+    fn connect_is_empty_unless_set_and_keeps_its_order() {
+        assert!(EmbeddedConfig::parse("{}").unwrap().connect.is_empty());
+        let parsed =
+            EmbeddedConfig::parse(r#"{"connect":["tcp/127.0.0.1:7690","tcp/10.0.0.2:7683"]}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.connect,
+            vec![
+                "tcp/127.0.0.1:7690".to_string(),
+                "tcp/10.0.0.2:7683".to_string()
+            ]
+        );
+        parsed.validate_paths(Path::new("/tmp")).unwrap();
+        // A host name, a bracketed IPv6 address and the end ports of the
+        // range are well-formed too.
+        for locator in [
+            "tcp/desk.local:1",
+            "tcp/[::1]:65535",
+            "tcp/[fe80::1%2]:7690",
+        ] {
+            let json = serde_json::json!({ "connect": [locator] }).to_string();
+            EmbeddedConfig::parse(&json)
+                .unwrap()
+                .validate_paths(Path::new("/tmp"))
+                .unwrap_or_else(|error| panic!("{locator}: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_a_connect_value_that_is_not_a_list_of_locators() {
+        for raw in [
+            r#"{"connect":null}"#,
+            r#"{"connect":"tcp/127.0.0.1:7690"}"#,
+            r#"{"connect":[7690]}"#,
+            r#"{"connect":[null]}"#,
+            r#"{"connects":[]}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
+    }
+
+    /// The app dials over TCP only: a `quic/` or `tls/` peer needs
+    /// certificate files the config does not carry, so such a locator, a
+    /// malformed one or a duplicate is a start error before the process
+    /// transport is built.
+    #[test]
+    fn rejects_malformed_non_tcp_and_duplicate_connect_locators() {
+        for (raw, message) in [
+            (
+                r#"{"connect":["127.0.0.1:7690"]}"#,
+                "connect locator '127.0.0.1:7690' has no carrier: write it as 'tcp/<host>:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/"]}"#,
+                "connect locator 'tcp/' has no address after 'tcp/'",
+            ),
+            (
+                r#"{"connect":["quic/10.0.0.2:7683"]}"#,
+                "connect locator 'quic/10.0.0.2:7683' is not a tcp/ locator; the app dials tcp/ only",
+            ),
+            (
+                r#"{"connect":["tls/10.0.0.2:7683"]}"#,
+                "connect locator 'tls/10.0.0.2:7683' is not a tcp/ locator; the app dials tcp/ only",
+            ),
+            (
+                r#"{"connect":["udp/10.0.0.2:7683"]}"#,
+                "connect locator 'udp/10.0.0.2:7683' is not a tcp/ locator; the app dials tcp/ only",
+            ),
+            (
+                r#"{"connect":["tcp/10.0.0.2"]}"#,
+                "connect locator 'tcp/10.0.0.2' has no port: write it as 'tcp/<host>:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/:7690"]}"#,
+                "connect locator 'tcp/:7690' has no host: write it as 'tcp/<host>:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/desk.local:abc"]}"#,
+                "connect locator 'tcp/desk.local:abc' has port 'abc'; a port is a number from 1 to 65535",
+            ),
+            (
+                r#"{"connect":["tcp/desk.local:0"]}"#,
+                "connect locator 'tcp/desk.local:0' has port '0'; a port is a number from 1 to 65535",
+            ),
+            (
+                r#"{"connect":["tcp/desk.local:65536"]}"#,
+                "connect locator 'tcp/desk.local:65536' has port '65536'; a port is a number from 1 to 65535",
+            ),
+            (
+                r#"{"connect":["tcp/[fe80::1%en0]:7690"]}"#,
+                "connect locator 'tcp/[fe80::1%en0]:7690' has IPv6 scope 'en0'; the scope is the interface number",
+            ),
+            (
+                r#"{"connect":["tcp/10.0.0.2:7683?mixed_rel=1"]}"#,
+                "connect locator 'tcp/10.0.0.2:7683?mixed_rel=1' sets mixed_rel on a tcp/ carrier; mixed reliability exists only on quic/ and udp/...?rel=1",
+            ),
+            (
+                r#"{"connect":["tcp/127.0.0.1:7690","tcp/127.0.0.1:7690"]}"#,
+                "duplicate connect locator 'tcp/127.0.0.1:7690'",
             ),
         ] {
             let error = EmbeddedConfig::parse(raw)

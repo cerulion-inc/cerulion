@@ -36,7 +36,13 @@ use crate::encode::encode_json_into;
 use crate::error::{codes, EmbedError};
 use crate::subscribe::{Subscription, SubscriptionCounts};
 
-type ProcessTransportIdentity = (Vec<String>, String);
+/// The listen endpoints, connect locators and robot name the first start
+/// fixed for the process.
+struct ProcessTransportIdentity {
+    listen: Vec<String>,
+    connect: Vec<String>,
+    robot: String,
+}
 
 static PROCESS_TRANSPORT_IDENTITY: OnceLock<Mutex<Option<ProcessTransportIdentity>>> =
     OnceLock::new();
@@ -51,8 +57,8 @@ static GATEWAY_OWNED: AtomicBool = AtomicBool::new(false);
 /// announcements and bridge flags carry no owner. A gateway start resets
 /// all of them to the quiescent baseline (see [`quiesce`]), which is correct
 /// only when no other runtime has a live gateway on that manager, so a
-/// second runtime with listen endpoints is refused while one holds this
-/// lease.
+/// second runtime with listen endpoints or connect locators is refused while
+/// one holds this lease.
 struct GatewayLease(());
 
 impl GatewayLease {
@@ -62,7 +68,7 @@ impl GatewayLease {
             .map(|_| Self(()))
             .map_err(|_| {
                 EmbedError::BadState(
-                    "another embedded runtime in this process owns the network gateway; stop it before starting a runtime with listen endpoints".to_string(),
+                    "another embedded runtime in this process owns the network gateway; stop it before starting a runtime with listen endpoints or connect locators".to_string(),
                 )
             })
     }
@@ -503,7 +509,9 @@ struct StartPlan {
     recorded_topics: Option<HashSet<String>>,
     recorded_graph_topics: Option<HashSet<String>>,
     listen: Vec<String>,
-    /// `egress` is set but `listen` is empty, so no gateway reads the list.
+    connect: Vec<String>,
+    /// `egress` is set but `listen` and `connect` are empty, so no gateway
+    /// reads the list.
     inert_egress: bool,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
@@ -617,7 +625,7 @@ impl EmbeddedRuntime {
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
-            .and_then(|plan| Ok((self.transport_manager(&plan.listen)?, plan)));
+            .and_then(|plan| Ok((self.transport_manager(&plan.listen, &plan.connect)?, plan)));
         let (manager, mut plan) = match planned {
             Ok(planned) => planned,
             Err(error) => {
@@ -924,9 +932,11 @@ impl EmbeddedRuntime {
                 .collect()
         });
 
-        // Only a start with listen endpoints builds the gateway and changes
-        // manager-wide LAN state; a listen-less start leaves both alone.
-        let gateway = (!config.listen.is_empty()).then(|| {
+        // Only a start with listen endpoints or connect locators builds the
+        // gateway and changes manager-wide LAN state; a start with neither
+        // leaves both alone.
+        let networked = !config.listen.is_empty() || !config.connect.is_empty();
+        let gateway = networked.then(|| {
             let extra = publishes
                 .iter()
                 .map(|publish| TopicSchema {
@@ -979,8 +989,9 @@ impl EmbeddedRuntime {
             subscribes,
             recorded_topics,
             recorded_graph_topics,
-            inert_egress: config.egress.is_some() && config.listen.is_empty(),
+            inert_egress: config.egress.is_some() && !networked,
             listen: config.listen,
+            connect: config.connect,
             gateway,
             recorder,
         })
@@ -1032,16 +1043,30 @@ impl EmbeddedRuntime {
         })
     }
 
-    fn transport_manager(&self, listen: &[String]) -> Result<Arc<TransportManager>, EmbedError> {
+    fn transport_manager(
+        &self,
+        listen: &[String],
+        connect: &[String],
+    ) -> Result<Arc<TransportManager>, EmbedError> {
         let identity = PROCESS_TRANSPORT_IDENTITY.get_or_init(|| Mutex::new(None));
         let mut identity = identity.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some((existing_listen, existing_robot)) = identity.as_ref() {
-            if existing_listen != listen {
+        let fixed = || ProcessTransportIdentity {
+            listen: listen.to_vec(),
+            connect: connect.to_vec(),
+            robot: self.robot_name.clone(),
+        };
+        if let Some(existing) = identity.as_ref() {
+            if existing.listen != listen {
                 return Err(EmbedError::BadState(
                     "network listen endpoints are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
                 ));
             }
-            if existing_robot != &self.robot_name {
+            if existing.connect != connect {
+                return Err(EmbedError::BadState(
+                    "network connect locators are fixed for the process lifetime by the first start; restart the app process to change them".to_string(),
+                ));
+            }
+            if existing.robot != self.robot_name {
                 return Err(EmbedError::BadState(
                     "the transport identity (robot name) is fixed for the process lifetime by the first start; restart the app process to change it".to_string(),
                 ));
@@ -1051,18 +1076,22 @@ impl EmbeddedRuntime {
         // Another party may have initialized the process manager first
         // (before any runtime start); it carries no runtime identity yet.
         // Reusing it silently would drop this start's network config, so
-        // only a listen-less start may share it.
+        // only a start with no listen endpoints and no connect locators may
+        // share it.
         if let Ok(existing) = TransportManager::get() {
-            if !listen.is_empty() {
+            if !listen.is_empty() || !connect.is_empty() {
                 return Err(EmbedError::Network(
-                    "the process transport manager is already initialized without this start's network listen endpoints; initialize it through the embedded runtime or restart the app process".to_string(),
+                    "the process transport manager is already initialized without this start's network listen endpoints or connect locators; initialize it through the embedded runtime or restart the app process".to_string(),
                 ));
             }
-            *identity = Some((listen.to_vec(), self.robot_name.clone()));
+            *identity = Some(fixed());
             return Ok(existing);
         }
-        let network = (!listen.is_empty()).then(|| NetworkConfig {
+        // A peer that is not up yet does not fail the start: the session
+        // dials each connect locator again in the background until it answers.
+        let network = (!listen.is_empty() || !connect.is_empty()).then(|| NetworkConfig {
             listen_endpoints: listen.to_vec(),
+            connect_endpoints: connect.to_vec(),
             robot_identity: Some(self.robot_name.clone()),
             ..NetworkConfig::default()
         });
@@ -1079,7 +1108,7 @@ impl EmbeddedRuntime {
         if let Some(network) = manager.network() {
             network.set_lan_access(LanAccess::Paired);
         }
-        *identity = Some((listen.to_vec(), self.robot_name.clone()));
+        *identity = Some(fixed());
         Ok(manager)
     }
 
@@ -1211,7 +1240,7 @@ impl Run {
     fn shutdown(&mut self) -> (Option<RecorderSummary>, Option<EmbedError>) {
         // Close LAN access before any join: a join that blocks must not
         // leave an open gateway serving LAN peers. Only the gateway owner
-        // may: a listen-less runtime sharing the manager leaves the owner's
+        // may: a runtime with no gateway sharing the manager leaves the owner's
         // posture alone.
         if self.ownership.is_some() {
             if let Some(network) = self.manager.network() {
@@ -1626,15 +1655,16 @@ fn commit(
     }
     if plan.inert_egress {
         tracing::warn!(
-            "egress is set but listen is empty: this start builds no gateway, so the list has \
-             no effect"
+            "egress is set but listen and connect are empty: this start builds no gateway, so \
+             the list has no effect"
         );
     }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
-    // closes its slot, so a beacon raised after it stopped is dropped.
+    // closes its slot, so a beacon raised after it stopped is dropped. A
+    // gateway that only dials has no port to announce.
     if let Some(gateway) = &plan.gateway {
-        if gateway.mdns {
+        if gateway.mdns && !plan.listen.is_empty() {
             let beacon = advertise_beacon(robot, &plan.listen);
             if let Some(worker) = &run.gateway {
                 drop(install_beacon(&worker.beacon, status, beacon));
@@ -2054,11 +2084,12 @@ mod tests {
 
     /// A process-global transport manager another party initialized (no
     /// runtime identity latched) must not be silently reused by a start that
-    /// asked for network listen endpoints - that start's listen config would
-    /// be dropped. Assert the clear error, then that a listen-less start MAY
-    /// share it (which latches the identity for the rest of the binary).
+    /// asked for network listen endpoints or connect locators - that start's
+    /// network config would be dropped. Assert the clear error for each, then
+    /// that a start with neither MAY share it (which latches the identity for
+    /// the rest of the binary).
     #[test]
-    fn an_existing_transport_manager_without_network_refuses_a_listen_start() {
+    fn an_existing_transport_manager_without_network_refuses_a_listen_or_connect_start() {
         let temp = tempfile::tempdir().expect("temporary files directory");
         let runtime =
             EmbeddedRuntime::new(temp.path().to_path_buf(), "tm_reuse_test".into()).unwrap();
@@ -2070,19 +2101,22 @@ mod tests {
         });
         // If some earlier test latched an identity this still exercises the
         // same contract: an existing manager the start cannot configure.
-        let error = match runtime.transport_manager(&["tcp/127.0.0.1:7447".to_string()]) {
-            Ok(_) => panic!("a listen start cannot reuse an unconfigured manager"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, EmbedError::Network(_) | EmbedError::BadState(_)),
-            "expected a clear failure, got {error}"
-        );
-        // A listen-less start may share it (latches identity last).
+        let locator = ["tcp/127.0.0.1:7447".to_string()];
+        for (listen, connect) in [(&locator[..], &[][..]), (&[][..], &locator[..])] {
+            let error = match runtime.transport_manager(listen, connect) {
+                Ok(_) => panic!("a networked start cannot reuse an unconfigured manager"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, EmbedError::Network(_) | EmbedError::BadState(_)),
+                "expected a clear failure, got {error}"
+            );
+        }
+        // A start with neither may share it (latches identity last).
         if TransportManager::get().is_ok() && PROCESS_TRANSPORT_IDENTITY.get().is_none() {
             runtime
-                .transport_manager(&[])
-                .expect("a listen-less start shares the existing manager");
+                .transport_manager(&[], &[])
+                .expect("a start with no listen and no connect shares the existing manager");
         }
     }
 
@@ -2202,6 +2236,7 @@ mod tests {
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
             inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
@@ -2741,6 +2776,7 @@ nodes:
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
             inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
@@ -2796,6 +2832,7 @@ nodes:
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            connect: Vec::new(),
             inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {

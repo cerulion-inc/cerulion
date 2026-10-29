@@ -16,7 +16,7 @@ use tempfile::tempdir;
 
 const TOPIC: &str = "/logcat_egress/state";
 
-const INERT_EGRESS: &str = "cerulion_android::runtime: egress is set but listen is empty: this start builds no gateway, so the list has no effect";
+const INERT_EGRESS: &str = "cerulion_android::runtime: egress is set but listen and connect are empty: this start builds no gateway, so the list has no effect";
 
 #[derive(Clone, Default)]
 struct FakeSink(Arc<Mutex<Vec<(LogPriority, String)>>>);
