@@ -100,6 +100,10 @@ Known limits:
 - **Platforms:** 64-bit Linux and macOS only (`README.md` line 84; `introspection_cpp.rs` lines 172 to 176). No Windows. The released rmw library is Linux only (x86_64 and arm64, built on Ubuntu 24.04); the macOS run in section 2 used a library built by hand against RoboStack headers, which no package ships.
 - **Two vendored message types hash-skew against a stock Jazzy robot** (`control_msgs/PidState`, `control_msgs/SteeringControllerStatus`; `docs/internals/native-ros2-messages.md` lines 145 to 148); resolving the schema from the robot through the attach wire rung is the remedy.
 
+### Exact replay of one process
+
+`rmw_cerulion` can record what one ROS 2 process consumed and replay that process alone against the recording, with a verdict that names the first divergent node, topic and window (`docs/ros2_replay.md`). It is runtime-tested on Humble only (rclpy nodes, rclcpp nodes on ROS time with the clock thread, and the stock `demo_nodes_cpp` executables); Foxy, Jazzy and Lyrical builds compile the same code. Single-threaded executors only: a multi-threaded executor is refused by name where the rmw can see it (not an rclcpp `MultiThreadedExecutor` whose callbacks finish in microseconds, which runs as one thread), and loaned takes are turned off during a replay. Five graph queries are answered from the recording; the others are answered live.
+
 ## Claims without a retained artifact
 
 Some runs cited above have no artifact in this repository: the four ROS 2 regression lanes, the distro guard, the Go2 attach, the macOS arm demonstration and the Foxy fault. Every row that rests on one says so.

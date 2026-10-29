@@ -30,6 +30,13 @@ test-seams = []
 
 [dependencies]
 cerulion_core = { path = "../cerulion_core" }
+# The delivery log (`src/replay/`) is an MCAP file written and read by the
+# bag crate's writer and reader (crash-readable chunks, a torn tail recovers to
+# the last complete chunk). It adds no iceoryx2 dependency of its own.
+cerulion_bag = { path = "../cerulion_bag" }
+# The delivery log's process header, trailer and replay verdict are JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 # The .so runs inside FOREIGN processes (move_group, rviz) that install
 # no Rust tracing subscriber — without one, every tracing::error! in
