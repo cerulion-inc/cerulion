@@ -16012,7 +16012,9 @@ impl GraphRuntime {
         }
         // The members' event queues are emptied once every member of this
         // walk has fired, still inside the step; each fire read the frame its
-        // drain froze.
+        // drain froze. A frame a publisher outside the graph puts on a
+        // member's queue after that member's drain loses its wake event here,
+        // and the member's next call, one per step, drains it.
         for call in &calls_now[range_after] {
             if let DrainSource::Unified { listener_idx } =
                 self.data_trigger_bindings[call.binding].drain
@@ -18848,7 +18850,7 @@ impl GraphRuntime {
         //             a `TriggerSubscriber::Ipc`) via `try_receive` (UNCHANGED
         //             path, timestamps scratch, warn-suppression, per-ts
         //             `signal_input_received` + `signal_data`).
-        //   `Unified` , drain the node's BODY subscriber through the node
+        //   `Unified`, drain the node's BODY subscriber through the node
         //             lock (`drain_trigger_input`), which freezes the
         //             surviving sample for the tick's later `try_view` (one
         //             receive per hop instead of two), and returns
@@ -18996,7 +18998,8 @@ impl GraphRuntime {
             }
             DrainSource::Unified { listener_idx } => {
                 // The multi-process free-run fix: drain the standalone
-                // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step,
+                // `ListenerOnly`'s NOTIFICATION queue here (or in the caller,
+                // when `empty_listener` is false), INSIDE the step,
                 // exact parity with the Separate arm, whose
                 // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
                 // runs the listener policy on ITS listener after a drain that
@@ -19104,8 +19107,8 @@ impl GraphRuntime {
                 // Gated on the node's CURRENT pending count,
                 // because on THIS path a pop is not the same thing as an
                 // arrival. `drain_trigger_input` returns `(1, head_ts)` for
-                // a RE-OFFER of a head no tick has taken yet (Principle #6
-                //, a fire that was deferred, or whose tick collapsed
+                // a RE-OFFER of a head no tick has taken yet (Principle #6,
+                // a fire that was deferred, or whose tick collapsed
                 // before reaching the read, must not lose its signal), and
                 // a deferred node consumes nothing: `decide_node` runs its
                 // `throttle_ms` / `block` pre-fire check at the TOP and
