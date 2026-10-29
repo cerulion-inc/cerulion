@@ -245,6 +245,17 @@ pub enum ChainBar {
         written_at_level: usize,
         head_level: usize,
     },
+    /// A node reads one of the consumer's outputs as a latest value at a level
+    /// after the chain head's level and at or before the consumer's own. The
+    /// consumer is called when the head's level ends, so that reader's
+    /// snapshot would see a frame the queued path publishes only after it.
+    EarlyLatestValueReader {
+        output_topic: String,
+        reader: String,
+        reader_level: usize,
+        consumer_level: usize,
+        head_level: usize,
+    },
     /// Extending the chain would pass [`MAX_FUSED_CHAIN_NODES`]. The consumer
     /// starts a new chain instead.
     LengthCeiling { ceiling: usize },
@@ -307,6 +318,7 @@ impl ChainBar {
             Self::ConsumerThrottled { .. } => "throttle",
             Self::BlockInvolved { .. } => "block-involved",
             Self::LateContextInput { .. } => "late-context-input",
+            Self::EarlyLatestValueReader { .. } => "early-latest-value-reader",
             Self::LengthCeiling { .. } => "length-ceiling",
             Self::LevelUnknown { .. } => "level-unknown",
             Self::LevelNotAdjacent { .. } => "level-not-adjacent",
@@ -392,6 +404,16 @@ impl std::fmt::Display for ChainBar {
             } => write!(
                 f,
                 "the consumer reads '{input}' as a latest value and '{written_by}' writes it at level {written_at_level}, at or after the chain head's level {head_level}"
+            ),
+            Self::EarlyLatestValueReader {
+                output_topic,
+                reader,
+                reader_level,
+                consumer_level,
+                head_level,
+            } => write!(
+                f,
+                "'{reader}' reads the consumer's output '{output_topic}' as a latest value at level {reader_level}, after the chain head's level {head_level} and at or before the consumer's level {consumer_level}"
             ),
             Self::LengthCeiling { ceiling } => write!(
                 f,
@@ -981,6 +1003,7 @@ fn assemble_chains(
                     levels,
                     topology,
                 )
+                .or_else(|| early_reader_bar(&consumer, head_level, trigger_edges, levels, topology))
             };
             if let Some(bar) = cut {
                 edges[idx].bar = Some(bar);
@@ -1050,6 +1073,51 @@ fn late_context_bar(
     None
 }
 
+/// The reader rule for one candidate consumer: does a node read one of its
+/// outputs as a latest value at a level in `(head_level, consumer_level]`?
+///
+/// A fused consumer is called when its head's level ends. A latest-value
+/// reader at or below the head's level has frozen its inputs by then, and one
+/// above the consumer's level freezes them after the consumer's level, when
+/// the queued path has published too; a reader in between would freeze the
+/// called consumer's frame one level early.
+///
+/// Reports the FIRST offending reader in topic order.
+fn early_reader_bar(
+    consumer: &str,
+    head_level: usize,
+    trigger_edges: &TriggerEdges,
+    levels: &Levels,
+    topology: &GraphTopology,
+) -> Option<ChainBar> {
+    let consumer_level = levels.level_of(consumer)?;
+    for flow in topology.topics() {
+        if !flow.producers.iter().any(|p| p == consumer) {
+            continue;
+        }
+        for reader in &flow.consumers {
+            if trigger_edges.is_triggering(&reader.node_id, &flow.topic) {
+                continue;
+            }
+            let Some(reader_level) = levels.level_of(&reader.node_id) else {
+                return Some(ChainBar::LevelUnknown {
+                    node: reader.node_id.clone(),
+                });
+            };
+            if reader_level > head_level && reader_level <= consumer_level {
+                return Some(ChainBar::EarlyLatestValueReader {
+                    output_topic: flow.topic.clone(),
+                    reader: reader.node_id.clone(),
+                    reader_level,
+                    consumer_level,
+                    head_level,
+                });
+            }
+        }
+    }
+    None
+}
+
 // ==========================================================================
 // The resolved decision: does this graph ask for fused chains?
 // ==========================================================================
@@ -1096,7 +1164,8 @@ impl FusionSource {
 /// environment in one build could disagree, and a decision that varied within
 /// a build would make a replay a different program.
 ///
-/// NOTHING in the executor consumes this yet.
+/// When it is on, the graph build turns every census chain into chain calls
+/// (see [`GraphRuntime::chain_calls_made`](crate::graph::GraphRuntime::chain_calls_made)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionDecision {
     enabled: bool,
@@ -1155,12 +1224,23 @@ pub fn resolve_fusion() -> FusionDecision {
 
 /// The behaviour an unset seam gets.
 ///
-/// `false` while no execution path fuses anything: a build with the seam
-/// unset must behave byte-identically to one made before the seam existed.
-/// It becomes `true` once a fused run and a queued run of one graph are proved
-/// to produce identical traces, which is what earns fusion the right to be the
-/// default.
+/// `false`: a build with the seam unset runs every hop through the level loop.
+/// `tests/chain_call_identity_test.rs` compares a chain-called run of one
+/// graph with its queued run, fire trace, read log and frames, entry for
+/// entry; that comparison holding is the condition for turning this on.
 const FUSE_CHAINS_DEFAULT: bool = false;
+
+/// Under the `oracle-mutants` feature, setting this variable makes a chain
+/// call write its trace entries into the shared trace when it fires, instead
+/// of at the member's position in its own level.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_CALL_INLINE_TRACE_MUTANT_ENV: &str = "CERULION_CHAIN_CALL_INLINE_TRACE_MUTANT";
+
+/// Under the `oracle-mutants` feature, setting this variable makes a chain
+/// call skip the member's own dequeue and fire it once on whatever its input
+/// last held.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV: &str = "CERULION_CHAIN_CALL_SKIP_DEQUEUE_MUTANT";
 
 /// Log the fusion decision and the census it would apply to, once per graph
 /// build.
@@ -1178,7 +1258,8 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
     tracing::info!(
         enabled = decision.enabled(),
         decided_by = decision.source().label(),
-        "chain fusion: the decision is resolved; no execution path consumes it yet"
+        "chain fusion: the decision is resolved; when enabled, every chain member is called \
+         from the step thread when its chain head's level ends"
     );
     tracing::info!(
         chains = census.chains().len(),
