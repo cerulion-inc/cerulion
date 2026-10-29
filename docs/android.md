@@ -336,11 +336,16 @@ nodes:
 Each `CerulionRuntime.publish("/myapp/taps", ...)` call is one frame on the
 node's input. A trigger input (`#[input(trigger)]`) ticks the node once per
 frame, in publish order; a burst larger than the input's `depth` (default 10)
-drops its oldest frames. On an app topic that is not recorded, a `depth` above
-16 fails the start. A plain `#[input]` on a `period_ms` node holds the
-latest frame: the node produces nothing until the first publish, and then
-reads the newest value on each tick. The runtime creates every `publish` topic
-with room for a node that holds its latest value, so both kinds of input start.
+drops its oldest frames. The runtime creates each `publish` topic with a queue
+as deep as the deepest graph input that reads it, so any `depth` a node can
+declare, up to 64, holds that many frames, recorded or not. A node that
+reports a deeper input fails the start before the app creates any topic:
+`status` reports `state` `failed` with `last_error.code` 5 and a message that
+names the input, its depth and the limit of 64. A plain `#[input]` on a
+`period_ms` node holds the latest frame: the node produces nothing until the
+first publish, and then reads the newest value on each tick. The runtime
+creates every `publish` topic with room for a node that holds its latest
+value, so both kinds of input start.
 
 To read a node's output in the app, list the topic under `subscribe` and
 call `CerulionRuntime.poll`. It takes the oldest message off the
