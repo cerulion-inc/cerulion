@@ -35,12 +35,13 @@ paired desk with observe access can:
 - read the per-topic counters (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
-A desk cannot write a topic on the robot or send it a command over the remote
-plane. No verb on `cerulion/wire/2` takes a frame from the desk, and the robot
-never reads a data stream from the desk. The `teleop` and `deploy` verbs are
-classified but have no handler. The ops protocol (`cerulion/ops/1`) runs the
-verbs the robot has registered, such as `inventory`, `log-tail`, `restart` and
-`engage-estop`; none of them carries topic data. The only desk to robot topic
+A desk cannot write a topic on the robot or send it teleop commands over the
+remote plane. No verb on `cerulion/wire/2` takes a frame from the desk, and the
+robot never reads a data stream from the desk. The `teleop` and `deploy` verbs
+are classified but have no handler. The ops protocol (`cerulion/ops/1`) does run
+the verbs the robot has registered, such as `inventory`, `log-tail`, `restart`
+and `engage-estop`, for a desk with the access each one needs; none of them
+carries topic data. The only desk to robot topic
 path today is LAN ingress (an `ingress:` block in a graph), which proves no
 identity per peer and is closed when `CERULION_LAN_ACCESS=paired`.
 

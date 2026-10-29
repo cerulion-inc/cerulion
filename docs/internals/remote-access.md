@@ -234,9 +234,10 @@ identity, so per-peer LAN authorization, with each LAN peer's identity bound to
 its pairing key, is not supported yet. The paired remote plane
 binds each session to its pairing key over an authenticated transport and
 authorizes each peer and each demanded topic, with revocation. It carries the
-observe direction only (robot to desk topic data). The command direction is
+observe direction only (robot to desk topic data). The teleop command direction is
 classified (`teleop` needs `CAP_TELEOP`) but has no handler, so a desk cannot
-command a robot over it yet.
+teleoperate a robot over it yet. The ops protocol still runs the verbs the
+robot registers (for example `restart` and `engage-estop`).
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
