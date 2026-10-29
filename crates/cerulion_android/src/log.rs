@@ -219,20 +219,54 @@ mod logcat {
 }
 
 /// Set the filter of the installed subscriber; a no-op while none is.
-pub(crate) fn set_level(level: LogLevelConfig) {
-    if let Some(handle) = LEVEL.get() {
+///
+/// Dropping the returned change puts the previous filter back, so a start
+/// that fails after setting its level leaves the level it found; a start
+/// that succeeds calls [`LevelChange::keep`].
+pub(crate) fn set_level(level: LogLevelConfig) -> LevelChange {
+    let previous = LEVEL.get().and_then(|handle| {
+        let previous = handle.clone_current();
         apply(handle, level);
+        previous
+    });
+    LevelChange { previous }
+}
+
+/// A level set by [`set_level`], undone on drop unless kept.
+#[must_use = "dropping it puts the previous level back"]
+pub(crate) struct LevelChange {
+    previous: Option<LevelFilter>,
+}
+
+impl LevelChange {
+    /// Keep the new level.
+    pub(crate) fn keep(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for LevelChange {
+    fn drop(&mut self) {
+        if let (Some(previous), Some(handle)) = (self.previous, LEVEL.get()) {
+            reload(handle, previous);
+        }
     }
 }
 
 fn apply(handle: &LevelHandle, level: LogLevelConfig) {
-    let filter = match level {
-        LogLevelConfig::Error => LevelFilter::ERROR,
-        LogLevelConfig::Warn => LevelFilter::WARN,
-        LogLevelConfig::Info => LevelFilter::INFO,
-        LogLevelConfig::Debug => LevelFilter::DEBUG,
-        LogLevelConfig::Trace => LevelFilter::TRACE,
-    };
+    reload(
+        handle,
+        match level {
+            LogLevelConfig::Error => LevelFilter::ERROR,
+            LogLevelConfig::Warn => LevelFilter::WARN,
+            LogLevelConfig::Info => LevelFilter::INFO,
+            LogLevelConfig::Debug => LevelFilter::DEBUG,
+            LogLevelConfig::Trace => LevelFilter::TRACE,
+        },
+    );
+}
+
+fn reload(handle: &LevelHandle, filter: LevelFilter) {
     // `reload` fails only once the subscriber is dropped; the global one
     // never is, and a scoped test subscriber outlives every call.
     let _ = handle.reload(filter);

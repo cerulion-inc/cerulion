@@ -151,17 +151,39 @@ fn a_start_refused_while_running_leaves_the_level_unchanged() {
 }
 
 #[test]
-fn a_start_refused_after_its_path_checks_still_sets_the_level() {
+fn a_start_refused_after_its_path_checks_puts_the_previous_level_back() {
     let (_serial, sink) = sink();
     run_once(json!({ "log_level": "warn" })).expect("start at warn");
     let refused = run_once(json!({ "log_level": "error", "graph_yaml": "nodes: [" }))
         .expect_err("a graph that does not parse is refused");
     assert_eq!(refused.code(), codes::GRAPH);
     sink.take();
+    tracing::info!(target: "app", "info after a graph refusal");
     tracing::warn!(target: "app", "warn after a graph refusal");
-    tracing::error!(target: "app", "error after a graph refusal");
-    assert_eq!(texts(&sink.take()), ["app: error after a graph refusal"]);
+    assert_eq!(texts(&sink.take()), ["app: warn after a graph refusal"]);
     run_once(json!({})).expect("reset to info for the other tests");
+}
+
+#[test]
+fn a_refused_second_runtime_leaves_the_running_owner_level() {
+    let (_serial, sink) = sink();
+    let config =
+        |level: &str| json!({ "listen": ["tcp/127.0.0.1:0"], "log_level": level }).to_string();
+    let owner_dir = tempdir().unwrap();
+    let mut owner = EmbeddedRuntime::new(owner_dir.path().to_path_buf(), ROBOT.into()).unwrap();
+    owner
+        .start(&config("info"))
+        .expect("the owner starts at info");
+    let second_dir = tempdir().unwrap();
+    let mut second = EmbeddedRuntime::new(second_dir.path().to_path_buf(), ROBOT.into()).unwrap();
+    let refused = second
+        .start(&config("error"))
+        .expect_err("a second gateway runtime cannot share the owner's gateway");
+    assert_eq!(refused.code(), codes::BAD_STATE);
+    sink.take();
+    tracing::info!(target: "app", "owner info after the refusal");
+    assert_eq!(texts(&sink.take()), ["app: owner info after the refusal"]);
+    owner.stop().expect("stop the owner");
 }
 
 /// A value whose `Debug` logs a line of its own.
