@@ -140,6 +140,8 @@ pub fn parse_recorded_graph(yaml: &str, origin: &str) -> TransportResult<GraphCo
 /// The document with every node's `fuse:` key translated, and one warning;
 /// `None` when no node carries the key (or the document is not YAML, which
 /// the typed parse then reports).
+// hot-path-alloc-ok-fn: runs once per replay, on the recorded graph document,
+// before the replayed graph is built.
 fn translate_retired_fuse_key(yaml: &str, origin: &str) -> Option<String> {
     #[cfg(feature = "oracle-mutants")]
     {
