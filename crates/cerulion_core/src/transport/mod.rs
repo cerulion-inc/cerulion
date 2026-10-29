@@ -204,7 +204,7 @@ pub(crate) const ICEORYX2_DEFAULT_BORROWED_SAMPLES: usize = 2;
 /// latest(1) + receive-transient(1) = 3 — one above the iceoryx2 default
 /// of 2. Defined as `default + 1` so the "held + latest + transient =
 /// default + 1" rationale is self-documenting (and tracks the default if it
-/// ever changes — guarded by the drift-guard test). Armed as an open
+/// ever changes, guarded by the drift-guard test). Armed as an open
 /// requirement ONLY on snapshot-source topics (see
 /// [`TopicServiceConfig::subscriber_max_borrowed_samples`]); a topic the
 /// graph owns is CREATED at it as a floor. Public so a runtime that creates a
