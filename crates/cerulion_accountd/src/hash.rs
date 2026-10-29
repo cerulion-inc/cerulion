@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Token hashing. We persist only the SHA-256 hash of every opaque token
 //! (session / refresh / device / magic-link), never the plaintext — a database
-//! read never yields a usable credential.
+//! read never yields a usable credential. A rotated pair is also derived under a
+//! key held only in memory ([`crate::session::derive_rotated_pair`]), so the
+//! per-rotation salt stored beside the hashes does not change that.
 
 use sha2::{Digest, Sha256};
 

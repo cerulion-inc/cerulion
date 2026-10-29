@@ -14,6 +14,7 @@ use cerulion_accountd::{
 const NOW: u64 = 1_000_000_000_000;
 const FUTURE: u64 = NOW + 600_000_000_000; // now + 10 min
 const SEC: u64 = 1_000_000_000;
+const SALT: [u8; 32] = [0x5A; 32];
 
 const ACCT_A: [u8; 32] = [0xAA; 32];
 const ACCT_B: [u8; 32] = [0xBB; 32];
@@ -330,16 +331,25 @@ fn rotate_session_is_guarded_on_revoked_and_the_old_refresh_hash() {
 
     // WRONG old refresh hash → the CAS misses → false (the #4 single-use guard).
     assert!(!db
-        .rotate_session(&id, "WRONG-OLD-HASH", "ns", "nr", FUTURE, FUTURE)
+        .rotate_session(
+            &id,
+            "WRONG-OLD-HASH",
+            "ns",
+            "nr",
+            FUTURE,
+            FUTURE,
+            NOW,
+            &SALT
+        )
         .unwrap());
 
     // Correct id + correct old hash + not revoked → true (rotates once).
     assert!(db
-        .rotate_session(&id, "refr-h", "ns", "nr", FUTURE, FUTURE)
+        .rotate_session(&id, "refr-h", "ns", "nr", FUTURE, FUTURE, NOW, &SALT)
         .unwrap());
     // The old hash is now dead — replaying it → false (rotation is single-use).
     assert!(!db
-        .rotate_session(&id, "refr-h", "ns2", "nr2", FUTURE, FUTURE)
+        .rotate_session(&id, "refr-h", "ns2", "nr2", FUTURE, FUTURE, NOW, &SALT)
         .unwrap());
 
     // REVOKED guard (#3): a revoked session cannot rotate even with the right hash.
@@ -348,9 +358,87 @@ fn rotate_session_is_guarded_on_revoked_and_the_old_refresh_hash() {
         .unwrap();
     assert!(db.revoke_session_by_token_hash("s2").unwrap());
     assert!(
-        !db.rotate_session(&id2, "r2", "ns", "nr", FUTURE, FUTURE)
+        !db.rotate_session(&id2, "r2", "ns", "nr", FUTURE, FUTURE, NOW, &SALT)
             .unwrap(),
         "a revoked session must never rotate (a concurrent revoke is not clobbered)"
+    );
+}
+
+// ============================================================================
+// refresh reuse window: the rotation record + the single-replay CAS
+// ============================================================================
+
+#[test]
+fn a_rotation_records_the_replaced_token_and_its_replay_is_spent_once() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .insert_session("user-1", "sess-h", "refr-h", FUTURE, FUTURE, NOW)
+        .unwrap();
+    // Never rotated: nothing is replayable.
+    assert!(db.previous_rotation("refr-h").unwrap().is_none());
+
+    let rotated_at = NOW + 3 * SEC;
+    assert!(db
+        .rotate_session(
+            &id,
+            "refr-h",
+            "ns",
+            "nr",
+            FUTURE,
+            FUTURE + SEC,
+            rotated_at,
+            &SALT
+        )
+        .unwrap());
+    let prev = db
+        .previous_rotation("refr-h")
+        .unwrap()
+        .expect("the replaced token names its rotation");
+    assert_eq!(prev.id, id);
+    assert_eq!(prev.user_id, "user-1");
+    assert_eq!(prev.session_token_hash, "ns");
+    assert_eq!(prev.refresh_token_hash, "nr");
+    assert_eq!(prev.session_expires_at_ns, FUTURE);
+    assert_eq!(prev.rotated_at_ns, rotated_at);
+    assert_eq!(prev.reuse_salt, SALT);
+
+    // The one replay: the first claim wins, the second loses.
+    assert!(!db.claim_refresh_reuse(&id, "WRONG").unwrap());
+    assert!(db.claim_refresh_reuse(&id, "refr-h").unwrap());
+    assert!(!db.claim_refresh_reuse(&id, "refr-h").unwrap());
+
+    // The next rotation replaces the record and re-arms ONE replay for ITS
+    // replaced token only.
+    assert!(db
+        .rotate_session(
+            &id,
+            "nr",
+            "ns2",
+            "nr2",
+            FUTURE,
+            FUTURE,
+            rotated_at + SEC,
+            &[7; 32]
+        )
+        .unwrap());
+    assert!(db.previous_rotation("refr-h").unwrap().is_none());
+    assert!(!db.claim_refresh_reuse(&id, "refr-h").unwrap());
+    assert!(db.claim_refresh_reuse(&id, "nr").unwrap());
+}
+
+#[test]
+fn a_revoked_session_is_never_replayed() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .insert_session("user-1", "sess-h", "refr-h", FUTURE, FUTURE, NOW)
+        .unwrap();
+    assert!(db
+        .rotate_session(&id, "refr-h", "ns", "nr", FUTURE, FUTURE, NOW, &SALT)
+        .unwrap());
+    assert!(db.revoke_session_by_token_hash("ns").unwrap());
+    assert!(
+        !db.claim_refresh_reuse(&id, "refr-h").unwrap(),
+        "a revoke must close the reuse window"
     );
 }
 
