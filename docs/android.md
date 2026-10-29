@@ -365,9 +365,10 @@ if (code == CerulionRuntime.OK) {
 Only `OK` appends to the builder. A subscription's queue holds `depth`
 messages; when it is full, the oldest message is dropped. `status` counts
 each subscription under `subscribed`: `polled` messages `poll` returned,
-`dropped` messages missing from a publisher's message sequence, which is the
-full queue dropping its oldest, and `undecodable` messages `poll` refused
-with `DECODE`. A frame too short for its wire header is skipped by the
+`dropped` messages missing from a publisher's message sequence, most often
+the full queue dropping its oldest, and also a send that failed after the
+publisher numbered it, and `undecodable` messages `poll` refused with
+`DECODE`. A frame too short for its wire header is skipped by the
 transport with a logged warning before `poll` sees it. It is never counted
 as `undecodable`, but when its publisher numbered it, the gap it leaves
 adds 1 to `dropped` at the next message from that publisher. A dropped message
