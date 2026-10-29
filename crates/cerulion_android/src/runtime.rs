@@ -1731,6 +1731,31 @@ fn resolve_subscribe(
             subscribe.topic, subscribe.schema
         )));
     }
+    // The graph text can name one schema while the node sends another (the
+    // build only warns), so check the hash the node itself reports too.
+    if let Some(graph) = graph {
+        for node in &graph.config.nodes {
+            let Some(info) = graph.infos.get(&node.id) else {
+                continue;
+            };
+            for output in node.outputs.iter().filter(|output| {
+                resolve_output_topic(&graph.config.prefix, &node.id, output) == subscribe.topic
+            }) {
+                let sent = info
+                    .output_meta()
+                    .iter()
+                    .find(|meta| meta.name == output.name)
+                    .map(|meta| meta.schema_hash);
+                // 0 is a node that reports no hash for the output.
+                if sent.is_some_and(|hash| hash != 0 && hash != layout.schema_hash) {
+                    return Err(EmbedError::InvalidArgument(format!(
+                        "subscribe topic '{}' has schema '{}', but node '{}' sends output '{}' with another schema",
+                        subscribe.topic, subscribe.schema, node.id, output.name
+                    )));
+                }
+            }
+        }
+    }
     Ok(ResolvedSubscribe {
         topic: subscribe.topic.clone(),
         schema: subscribe.schema.clone(),

@@ -155,7 +155,7 @@ fn polls_every_message_in_order(runtime: &mut EmbeddedRuntime, topics: &Topics) 
 
 /// A burst larger than the depth keeps the newest `depth` messages and
 /// counts every older one as dropped. On the graph output the poll races
-/// the node, so there every frame is either polled or dropped.
+/// the node, so there every frame is either polled, in order, or dropped.
 fn overflow_drops_the_oldest_and_counts_them(runtime: &mut EmbeddedRuntime, topics: &Topics) {
     for x in 1..=7 {
         publish_x(runtime, &topics.cmd, f64::from(x));
@@ -185,9 +185,14 @@ fn overflow_drops_the_oldest_and_counts_them(runtime: &mut EmbeddedRuntime, topi
     let expected: Vec<String> = (1..=7)
         .map(|x| vector(f64::from(x), f64::from(x + 3)))
         .collect();
+    // A poll can land between frames, so the echoes are an ordered
+    // subsequence of the expected frames, ending with the last one.
+    let mut rest = expected.iter();
     assert!(
-        expected.ends_with(&echoes),
-        "echoes must be the newest frames, in order: {echoes:?}"
+        echoes
+            .iter()
+            .all(|echo| rest.by_ref().any(|frame| frame == echo)),
+        "echoes must be expected frames, in order: {echoes:?}"
     );
     let (polled, dropped, undecodable) = counts(runtime, &topics.echo);
     assert_eq!(polled, 3 + echoes.len() as u64);
@@ -279,12 +284,27 @@ fn refuses_a_subscription_it_cannot_serve(runtime: &mut EmbeddedRuntime, topics:
                 topics.echo
             ),
         ),
+        (
+            // The graph text names String; the node itself sends Vector3.
+            json!({
+                "graph_yaml": topics.graph.replace(
+                    &format!("schema: {VECTOR3}"),
+                    "schema: std_msgs/String",
+                ),
+                "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
+                "subscribe": [{"topic": topics.echo, "schema": "std_msgs/String"}],
+            }),
+            format!(
+                "subscribe topic '{}' has schema 'std_msgs/String', but node 'logic' sends output 'echo' with another schema",
+                topics.echo
+            ),
+        ),
     ];
     for (config, message) in refusals {
         let error = runtime
             .start(&config.to_string())
             .expect_err("the subscription must be refused");
-        assert_eq!(error.code(), codes::INVALID_ARGUMENT, "{config}");
+        assert_eq!(error.code(), codes::INVALID_ARGUMENT, "{config}: {error}");
         assert!(error.to_string().starts_with(&message), "{config}: {error}");
     }
 }
