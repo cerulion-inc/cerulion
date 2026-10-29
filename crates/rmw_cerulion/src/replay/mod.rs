@@ -1175,7 +1175,8 @@ impl Recorder {
         w.flush();
         tracing::warn!(
             log = %w.path().display(),
-            "rmw_cerulion delivery log marked NOT REPLAYABLE: {reason}"
+            reason = %reason,
+            "rmw_cerulion delivery log marked NOT REPLAYABLE"
         );
     }
 
@@ -1807,13 +1808,13 @@ impl Player {
             holder_thread = stall.holder_thread,
             waiting_thread = stall.waiting_thread,
             window = unit.window,
-            "rmw_cerulion replay WATCHDOG: thread {} has held the replay token for {}s with no rmw \
-             progress since it was served window {} ({entity}, node '{node}'); a callback is \
-             blocked on something the replay cannot serve (another executor's thread waits for \
-             this one). The replay cannot continue.",
-            stall.holder_thread,
-            gate::WATCHDOG.as_secs(),
-            unit.window,
+            entity = %entity,
+            node = %node,
+            stalled_s = gate::WATCHDOG.as_secs(),
+            "rmw_cerulion replay WATCHDOG: the holder thread has held the replay token with no \
+             rmw progress since it was served the window; a callback is blocked on something \
+             the replay cannot serve (another executor's thread waits for this one). The \
+             replay cannot continue."
         );
         if st.watchdog.is_none() {
             st.watchdog = Some(report);
