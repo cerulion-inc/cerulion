@@ -1221,6 +1221,61 @@ pub fn auto_partition(
     isolated: &BTreeSet<String>,
     budget_ns: u64,
 ) -> TransportResult<AutoPartition> {
+    auto_partition_with_options(
+        config,
+        entry_infos,
+        trigger_edges,
+        costs,
+        isolated,
+        budget_ns,
+        AutoPartitionOptions::default(),
+    )
+}
+
+/// Choices [`auto_partition_with_options`] takes beyond the costs and the
+/// budget. The default is [`auto_partition`]'s result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoPartitionOptions {
+    /// Put every linear chain ([`chain_colocation_seeds`]) in one group
+    /// before the cost-driven fusions, whatever the budget, the edge costs or
+    /// a zero rate say. For a run whose processes execute their nodes in
+    /// executor units (the free run on the real clock): the units split a
+    /// chain again inside its process where the profile does not show a merge
+    /// safe, so the budget is applied by the units there.
+    pub keep_linear_chains: bool,
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes
+/// [`auto_partition_with_options`] ignore
+/// [`AutoPartitionOptions::keep_linear_chains`].
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_SEED_MUTANT_ENV: &str = "CERULION_CHAIN_SEED_MUTANT";
+
+fn chain_seed_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(CHAIN_SEED_MUTANT_ENV).is_some()
+    }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
+    }
+}
+
+/// [`auto_partition`] with [`AutoPartitionOptions`].
+///
+/// # Errors
+///
+/// As [`auto_partition`].
+pub fn auto_partition_with_options(
+    config: &GraphConfig,
+    entry_infos: &IndexMap<String, NodeInfo>,
+    trigger_edges: &TriggerEdges,
+    costs: &PartitionCosts,
+    isolated: &BTreeSet<String>,
+    budget_ns: u64,
+    options: AutoPartitionOptions,
+) -> TransportResult<AutoPartition> {
     // `isolated` names the online profiler's UNDER-SAMPLED
     // nodes. An isolated node (a) SKIPS the missing-cost error below (it carries
     // NO fabricated cost — Principle #13), (b) is never a fusion candidate
@@ -1437,20 +1492,22 @@ pub fn auto_partition(
         );
     }
 
-    // Keep every linear chain in one group, after the `block` seeds and
-    // before the greedy loop, so a chain the loop would split is already one
-    // group the loop treats as asking for nothing.
-    seed_linear_chains(
-        &mut uf,
-        &chain_colocation_seeds(entry_infos, &topo, trigger_edges),
-        &node_ids,
-        &id_to_idx,
-        config,
-        entry_infos,
-        trigger_edges,
-        &topo,
-        &global_levels,
-    )?;
+    // With `keep_linear_chains`, every linear chain is one group after the
+    // `block` seeds and before the greedy loop, so a chain the loop would split
+    // is already one group the loop treats as asking for nothing.
+    if options.keep_linear_chains && !chain_seed_mutant() {
+        seed_linear_chains(
+            &mut uf,
+            &chain_colocation_seeds(entry_infos, &topo, trigger_edges),
+            &node_ids,
+            &id_to_idx,
+            config,
+            entry_infos,
+            trigger_edges,
+            &topo,
+            &global_levels,
+        )?;
+    }
 
     let mut fusions: Vec<FusionRecord> = Vec::new();
     let mut rejections: Vec<FusionRejection> = Vec::new();
@@ -1573,7 +1630,8 @@ pub fn auto_partition(
     })
 }
 
-/// The linear chains the cost-aware partitioner keeps in one group: every path
+/// The linear chains the cost-aware partitioner keeps in one group under
+/// [`AutoPartitionOptions::keep_linear_chains`]: every path
 /// of chain links ([`crate::graph::chain::linear_links`], the predicates the
 /// fusion census and the executor units share), head first, each with at least
 /// two nodes.
@@ -3505,11 +3563,15 @@ mod block_colocation_tests {
         );
     }
 
-    /// The partitioner never splits a linear chain across groups: a chain
-    /// whose edges the greedy loop would refuse (rate 0, over budget) is one
-    /// group, and a fan-out sibling off the chain keeps its own.
+    /// For a run in executor units (`keep_linear_chains`), the partitioner
+    /// never splits a linear chain across groups: a chain whose edges the
+    /// greedy loop would refuse (rate 0, over budget) is one group, and a
+    /// fan-out sibling off the chain keeps its own. Without the option the same
+    /// graph is process per node, as the cost model alone decides.
+    /// `CERULION_CHAIN_SEED_MUTANT` (`oracle-mutants`) ignores the option, and
+    /// this arm must then fail.
     #[test]
-    fn a_linear_chain_is_never_split_across_groups() {
+    fn a_linear_chain_in_a_unit_run_is_never_split_across_groups() {
         let config = config_of(vec![
             node("src", vec![], vec![out("a"), out("b")]),
             node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
@@ -3540,8 +3602,26 @@ mod block_colocation_tests {
             edge_rate_mhz: BTreeMap::new(),
             hop: HopCosts::platform_default(),
         };
-        let out =
+        let plain =
             auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1).expect("derive");
+        assert_eq!(
+            plain.groups.len(),
+            4,
+            "without the option a rate-0 graph is process per node: {:?}",
+            plain.groups
+        );
+        let out = auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &costs,
+            &BTreeSet::new(),
+            1,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive");
         let group_of = |id: &str| {
             out.groups
                 .iter()

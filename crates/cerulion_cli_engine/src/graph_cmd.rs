@@ -5986,6 +5986,17 @@ pub fn graph_run(
     // above. (`graph profile` never routes through this function — see the
     // explicit local-only profile arm in `resolve_run_network`'s docs.)
 
+    // The execution mode is read from the environment exactly once per run,
+    // HERE, and the result threaded to every reader below.
+    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
+    // value to "unset" and skips the garbage warn every other unrecognised
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
+    let raw_execution_mode =
+        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
+    let keep_linear_chains = run_keeps_linear_chains(time_source, execution_mode_request);
+
     // The auto-partition PRE-FLIGHT — derive the partition
     // and persist only with `--yes`. The run proceeds with the
     // RETURNED config (derived groups installed for the persisted AND
@@ -6005,7 +6016,7 @@ pub fn graph_run(
         // that already carries exactly the derived partition needs no
         // write, so that run proceeds.
         let refuse_save = consent.assume_yes && wiring_overridden;
-        let pre = crate::partition_emit::run_auto_partition_preflight(
+        let pre = crate::partition_emit::run_auto_partition_preflight_with(
             workspace_root,
             graph_name,
             config,
@@ -6017,6 +6028,7 @@ pub fn graph_run(
                 lenient_costs: !consent.auto_partition,
                 assume_yes: consent.assume_yes && !refuse_save,
             },
+            cerulion_core::graph::AutoPartitionOptions { keep_linear_chains },
         )?;
         if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
         {
@@ -6049,15 +6061,6 @@ pub fn graph_run(
     // and that process runs its nodes in executor units: when they split, the
     // run goes through the supervisor with ONE process group holding every
     // node, so one worker process hosts all the units.
-    // The execution mode is read from the environment exactly once per run,
-    // HERE, and the result threaded to every reader below.
-    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
-    // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never a recognised
-    // spelling, so it takes the garbage arm and is printed under `got=`.
-    let raw_execution_mode =
-        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
     let single_process_in_units = single_process
         && single_process_hosts_units(
             workspace_root,
@@ -13438,7 +13441,7 @@ pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> 
     )?;
     let derived = !config.has_process_groups();
     let config = if derived {
-        crate::partition_emit::run_auto_partition_preflight(
+        crate::partition_emit::run_auto_partition_preflight_with(
             workspace_root,
             graph_name,
             config,
@@ -13446,6 +13449,10 @@ pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> 
             &crate::partition_emit::PreflightOptions {
                 lenient_costs: true,
                 assume_yes: false,
+            },
+            // `graph plan` shows a free run, whose processes run units.
+            cerulion_core::graph::AutoPartitionOptions {
+                keep_linear_chains: true,
             },
         )?
         .config
@@ -17016,6 +17023,44 @@ fn parse_execution_mode_env(
         Some("lockstep") => (Some(crate::multiprocess::ExecutionMode::Lockstep), false),
         Some("free_run") => (Some(crate::multiprocess::ExecutionMode::FreeRun), false),
         Some(_) => (None, true),
+    }
+}
+
+/// Whether the partitioner keeps every linear chain in one group for this run:
+/// a run on the real clock, on unix, outside the lockstep mode, whose
+/// processes execute their nodes in executor units.
+fn run_keeps_linear_chains(
+    time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
+) -> bool {
+    time_source == TimeSource::Real
+        && cfg!(unix)
+        && !matches!(
+            execution_mode_request,
+            Some(crate::multiprocess::ExecutionMode::Lockstep)
+        )
+}
+
+#[cfg(test)]
+mod chain_keeping_tests {
+    use super::*;
+
+    /// Chains are kept whole only for a run whose processes run executor
+    /// units: the real clock outside the lockstep mode.
+    #[test]
+    fn only_a_free_run_on_the_real_clock_keeps_linear_chains() {
+        use crate::multiprocess::ExecutionMode;
+        assert_eq!(run_keeps_linear_chains(TimeSource::Real, None), cfg!(unix));
+        assert_eq!(
+            run_keeps_linear_chains(TimeSource::Real, Some(ExecutionMode::FreeRun)),
+            cfg!(unix)
+        );
+        assert!(!run_keeps_linear_chains(
+            TimeSource::Real,
+            Some(ExecutionMode::Lockstep)
+        ));
+        assert!(!run_keeps_linear_chains(TimeSource::Virtual, None));
+        assert!(!run_keeps_linear_chains(TimeSource::External, None));
     }
 }
 
@@ -31263,7 +31308,7 @@ nodes:
             .find("let refuse_save = consent.assume_yes && wiring_overridden;")
             .expect("the save gate must be computed from --yes and the wiring judgement");
         let preflight = body
-            .find("run_auto_partition_preflight(")
+            .find("run_auto_partition_preflight_with(")
             .expect("the pre-flight must still be there");
         assert!(
             gate < preflight,

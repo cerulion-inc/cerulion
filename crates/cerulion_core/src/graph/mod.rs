@@ -80,12 +80,13 @@ pub use params::{
     ParamType, ParamValue, ParamValues,
 };
 pub use partition::{
-    auto_partition, baseline_process_per_node, block_colocation_seeds, chain_colocation_seeds,
-    compress_group_level_assignments, creditable_split_block_edges, derive_default_budget_ns,
-    derive_fire_targets, derive_fire_targets_from_observations, derive_process_groups,
-    harvest_costs, validate_partition, validate_process_groups, AutoPartition, BlockColocationSeed,
-    CreditableSplitEdge, FireTargetPolicy, FusionRecord, HopCosts, PartitionCosts, ProcessGroup,
-    ProfileResult, WarmupObservation, REMEDY_CO_LOCATE, REMEDY_SINGLE_PROCESS,
+    auto_partition, auto_partition_with_options, baseline_process_per_node, block_colocation_seeds,
+    chain_colocation_seeds, compress_group_level_assignments, creditable_split_block_edges,
+    derive_default_budget_ns, derive_fire_targets, derive_fire_targets_from_observations,
+    derive_process_groups, harvest_costs, validate_partition, validate_process_groups,
+    AutoPartition, AutoPartitionOptions, BlockColocationSeed, CreditableSplitEdge,
+    FireTargetPolicy, FusionRecord, HopCosts, PartitionCosts, ProcessGroup, ProfileResult,
+    WarmupObservation, REMEDY_CO_LOCATE, REMEDY_SINGLE_PROCESS,
 };
 pub use runtime::{
     build_trigger_edges, compute_gateway_plan, validate_network_ingress, BuildPurpose,
