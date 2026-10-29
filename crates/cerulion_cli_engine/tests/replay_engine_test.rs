@@ -39259,3 +39259,369 @@ fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
         lockstep.err().map(|e| (e.exit_code(), e.to_string()))
     );
 }
+
+/// A single-rank, capture-shaped bag: [`write_bag_with_coordination`]'s
+/// attachments plus the Flashback manifest declaring `covered_through_ns` as
+/// `anchor.resim_covered_through_ns`, the value a capture's recorder derives
+/// from the last boundary its trace carries.
+fn write_capture_shaped_bag(
+    rec: &Recording,
+    trace: &[TraceRingRecord],
+    path: &std::path::Path,
+    covered_through_ns: u64,
+) {
+    let topics: Vec<TopicSchema> = rec
+        .messages
+        .keys()
+        .map(|t| TopicSchema {
+            topic: t.clone(),
+            schema_name: VECTOR3_SCHEMA.to_string(),
+            schema_hash: 0,
+            wire_fixed_size: 24,
+        })
+        .collect();
+    let mut w = BagWriter::create(path, BagWriterConfig::default(), &topics).unwrap();
+    w.write_chunk(|c| {
+        let max_len = rec.messages.values().map(Vec::len).max().unwrap_or(0);
+        for k in 0..max_len {
+            for (topic, frames) in &rec.messages {
+                let Some(frame) = frames.get(k) else { continue };
+                let hdr = WireHeader::read_from_buf(frame);
+                let (seq, ts) = hdr.map(|h| (h.sequence, h.timestamp_ns)).unwrap_or((0, 0));
+                c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
+            }
+        }
+        for (i, r) in trace.iter().enumerate() {
+            c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    w.write_attachment(
+        "graph.yaml",
+        "application/yaml",
+        0,
+        0,
+        rec.graph_yaml.as_bytes(),
+    )
+    .unwrap();
+    let mut manifest = serde_json::json!({
+        "rank": 0,
+        "generation": 0,
+        "node_ids": rec.node_ids,
+    });
+    if let Some(inputs) = &rec.input_names {
+        manifest["inputs"] = serde_json::json!(inputs);
+    }
+    w.write_attachment(
+        "__cerulion/trace_manifest_rank0.json",
+        "application/json",
+        0,
+        0,
+        &serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    w.write_attachment(
+        "__cerulion/recorder.json",
+        "application/json",
+        0,
+        0,
+        &production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+    )
+    .unwrap();
+    w.write_attachment(
+        "__cerulion/flashback.json",
+        "application/json",
+        0,
+        0,
+        &serde_json::to_vec(&serde_json::json!({
+            "anchor": { "resim_covered_through_ns": covered_through_ns }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    w.finalize().unwrap();
+}
+
+/// The last STEP_BOUNDARY target `trace` carries.
+fn capture_last_boundary_target(trace: &[TraceRingRecord]) -> u64 {
+    trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .map(|r| r.fire_time_ns)
+        .next_back()
+        .expect("the trace carries a boundary")
+}
+
+/// A CAPTURE CUT BETWEEN AN OUTPUT AND ITS READ RECORD, replayed both ways.
+///
+/// A capture of a live run reads its trace, then drains its frames. The
+/// scheduler pushes a node's FIRE after its tick publishes and that level's
+/// READ_OUTCOME records at the level's end, so a trace read between the two
+/// holds the relay's last fire and not the read behind it, while the frames
+/// drained afterwards hold the relay's output for that step.
+///
+/// LEG 1 builds that capture as a recorder that carries its trace as read
+/// writes it: every frame of the run, the trace without the last step's
+/// read, and the covered range ending at the last boundary. The gated replay
+/// drives the last step, finds no recorded read for the relay's consult, and
+/// exits 6.
+///
+/// LEG 2 passes the same trace through the recorder's end cut
+/// (`cerulion_bagd::end_at_last_complete_step`), which ends it at the last
+/// step the next boundary proves, and declares the range the cut trace backs.
+/// The replay verifies clean (exit 0), and the last step's frames are reported
+/// as trailing the range rather than compared.
+#[test]
+#[serial]
+fn a_capture_cut_between_an_output_and_its_read_exits_6_and_the_end_cut_replays_it_clean() {
+    let steps = 6;
+    const LAST_STEP: u64 = 5;
+    let rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
+    let relay_topic = rec
+        .messages
+        .keys()
+        .find(|t| t.ends_with("relay/out"))
+        .expect("the relay's output topic is recorded")
+        .clone();
+    assert_eq!(
+        rec.messages[&relay_topic].len(),
+        steps,
+        "PRECONDITION: the relay published at every step, the last included"
+    );
+    let snapshot: Vec<TraceRingRecord> = rec
+        .trace
+        .iter()
+        .copied()
+        .filter(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == LAST_STEP))
+        .collect();
+    assert!(
+        snapshot
+            .iter()
+            .any(|r| r.record_type == RECORD_TYPE_FIRE && r.step == LAST_STEP)
+            && snapshot
+                .iter()
+                .any(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == LAST_STEP),
+        "PRECONDITION: the cut trace holds the last step's boundary and fires"
+    );
+    assert_eq!(
+        rec.trace.len() - snapshot.len(),
+        1,
+        "PRECONDITION: exactly the last step's one read record is behind the cut"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // LEG 1: the capture as carried before the end cut.
+    let uncut = dir.path().join("capture_cut_mid_step.mcap");
+    write_capture_shaped_bag(
+        &rec,
+        &snapshot,
+        &uncut,
+        capture_last_boundary_target(&snapshot),
+    );
+    let outcome = replay(&uncut, source_relay_factories, None, None)
+        .expect("an inconsistent capture is a verdict, never a refusal");
+    let v = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("the gate's finding reaches the verdict");
+    assert_eq!(v.unmet.len(), 1, "{v:?}");
+    assert_eq!(v.unmet[0].cause, "unplanned_consult");
+    assert_eq!(v.unmet[0].node_id, "relay");
+    assert_eq!(v.unmet[0].step, LAST_STEP);
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        6,
+        "the capture holds an output whose read it does not: {outcome:?}"
+    );
+
+    // LEG 2: the same trace through the recorder's end cut.
+    let complete = cerulion_bagd::end_at_last_complete_step(snapshot.iter().copied());
+    assert_eq!(complete.steps_cut, 1, "one rank, one final step");
+    assert_eq!(
+        complete.cut,
+        snapshot.iter().filter(|r| r.step == LAST_STEP).count(),
+        "the cut removes exactly the last step's records"
+    );
+    assert!(complete.cut > 0);
+    assert!(complete.records.iter().all(|r| r.step < LAST_STEP));
+    assert_eq!(
+        kind6_records(&Recording {
+            trace: complete.records.clone(),
+            ..rec.clone()
+        })
+        .len(),
+        steps - 1,
+        "every kept step keeps its read"
+    );
+    let cut = dir.path().join("capture_end_cut.mcap");
+    write_capture_shaped_bag(
+        &rec,
+        &complete.records,
+        &cut,
+        capture_last_boundary_target(&complete.records),
+    );
+    let outcome =
+        replay(&cut, source_relay_factories, None, None).expect("the end-cut capture replays");
+    assert!(outcome.passed, "the end-cut capture verifies: {outcome:?}");
+    assert_eq!(
+        cerulion_cli_engine::resim_cmd::resim_exit_code(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            true
+        ),
+        0,
+        "{outcome:?}"
+    );
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture-shaped bag reports its covered range");
+    assert_eq!(
+        covered.through_ns,
+        capture_last_boundary_target(&complete.records)
+    );
+    assert_eq!(
+        covered.trailing_frames.get(&relay_topic).copied(),
+        Some(1),
+        "the relay's last-step output trails the range rather than being compared: {covered:?}"
+    );
+}
+
+/// A CAPTURE WHOSE FINAL STEP TIES ITS PREDECESSOR'S TARGET, through the end cut.
+///
+/// Equal consecutive targets are legal (a 0-delta step), and a data-triggered
+/// node fires on one like on any other step, so the final step's frame carries
+/// the same stamp as the step before it. The end cut removes the final step
+/// because no next boundary proves it; its frame stays in the bag. A covered
+/// range ending at the kept step's target then holds that frame, and the replay,
+/// which never drives the removed step, reports it missing.
+///
+/// HAND ORACLE. Five steps stamped 5, 10, 15, 20 and 20 ms; the relay publishes
+/// once per step at its step's target. The end cut removes every step at the
+/// final target (steps 3 and 4), so the range ends at 15 ms, the two 20 ms relay
+/// frames trail it, and the three steps the trace carries verify clean.
+#[test]
+#[serial]
+fn a_capture_whose_final_step_ties_its_predecessors_target_replays_clean_through_the_end_cut() {
+    const STEPS: usize = 5;
+    let deltas = [DELTA_MS, DELTA_MS, DELTA_MS, DELTA_MS, 0];
+    let per_step: Vec<f64> = (0..STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    let rec = record_reference_impl(
+        ext_graph_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive::singles(RW_EXT_TOPIC, per_step)],
+        &deltas,
+        16,
+        true,
+    );
+    let out_topic = "/xr/relay/out";
+    let tie = rw_target_at(&rec, 4);
+    assert_eq!(
+        rw_target_at(&rec, 3),
+        tie,
+        "PRECONDITION: the final step ties its predecessor's target"
+    );
+    assert_eq!(
+        rw_values_at(&rec, out_topic, tie).len(),
+        2,
+        "PRECONDITION: the relay published at both tied steps, so the removed step's \
+         frame shares the kept step's stamp"
+    );
+
+    let complete = cerulion_bagd::end_at_last_complete_step(rec.trace.iter().copied());
+    let through = capture_last_boundary_target(&complete.records);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("capture_end_cut_tie.mcap");
+    write_capture_shaped_bag(&rec, &complete.records, &bag, through);
+    let outcome =
+        replay(&bag, ext_relay_factories, None, None).expect("the end-cut capture replays");
+    assert!(
+        outcome.passed,
+        "a capture whose final step ties its predecessor verifies clean: {:?}",
+        outcome.violations
+    );
+    assert_eq!(
+        through,
+        rw_target_at(&rec, 2),
+        "the range ends at step 2's target, below the tie"
+    );
+    assert!(
+        complete.records.iter().all(|r| r.step <= 2),
+        "every step at the final target is removed: {:?}",
+        complete.records.iter().map(|r| r.step).collect::<Vec<_>>()
+    );
+    assert_eq!(complete.steps_cut, 2, "steps 3 and 4 are removed");
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture-shaped bag reports its covered range");
+    assert_eq!(covered.through_ns, through);
+    assert_eq!(
+        covered.trailing_frames.get(out_topic).copied(),
+        Some(2),
+        "both tied relay frames trail the range: {covered:?}"
+    );
+}
+
+/// Why a rank with no complete step DECLINES the resume claim.
+///
+/// A two-rank from-start capture under free run whose peer's trace held only its
+/// first boundary when the trace was read, while the frames read afterwards hold
+/// the peer's step 1 output. The end cut removes the peer's every record. A
+/// covered range folded over the ranks that kept a boundary is rank 0's, 15 ms,
+/// and the peer's 10 ms frame sits inside it with no boundary of its own rank to
+/// match, so the replay refuses the bag as inconsistent. No declared range can
+/// avoid that (the reader raises a lower declaration to the same fold), which is
+/// why the recorder marks such a capture not resimmable rather than declaring a
+/// range for it.
+#[test]
+#[serial]
+fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_unproven.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| {
+            // The snapshot: the peer's first boundary only.
+            per_rank[1].retain(|r| r.step == 0);
+            // The recorder's end cut over both ranks' records.
+            let all: Vec<TraceRingRecord> = per_rank.concat();
+            let complete = cerulion_bagd::end_at_last_complete_step(all);
+            for (rank, stream) in per_rank.iter_mut().enumerate() {
+                *stream = complete
+                    .records
+                    .iter()
+                    .copied()
+                    .filter(|r| r.rank() == rank as u32)
+                    .collect();
+            }
+            assert!(
+                per_rank[1].is_empty(),
+                "PRECONDITION: the end cut leaves the peer nothing"
+            );
+        },
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+    let refused = replay(&bag, mp_slow_b_factories, None, None);
+    match &refused {
+        Err(ReplayError::RecordingInconsistent { .. }) => {}
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+}

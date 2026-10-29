@@ -586,6 +586,12 @@ impl FlashbackPlane {
     ///
     /// The snapshot was taken from the capture's own frame floor, so the trace
     /// it carries and the frames it carries begin at the same instant.
+    ///
+    /// The snapshot's END is cut first, at the last step each rank finished
+    /// recording ([`crate::trace_window::end_at_last_complete_step`]): the
+    /// snapshot can stop inside a step, after a node's output frame was
+    /// published and before its read record reached the ring, and the frames
+    /// read after it then hold an output whose read the trace does not.
     pub(crate) fn select_trace(
         &self,
         snapshot: &[cerulion_core::trace_ring::TraceRingRecord],
@@ -593,8 +599,13 @@ impl FlashbackPlane {
         node_ids: &std::collections::BTreeMap<u32, Vec<String>>,
     ) -> crate::trace_window::TrimmedTrace {
         let held = lock_trace(&self.trace);
-        let mut trimmed =
-            crate::trace_window::trim_to_anchor(snapshot.iter().copied(), anchor_steps, node_ids);
+        let complete = crate::trace_window::end_at_last_complete_step(snapshot.iter().copied());
+        let mut trimmed = crate::trace_window::trim_to_anchor(
+            complete.records.into_iter(),
+            anchor_steps,
+            node_ids,
+        );
+        trimmed.record_end_cut(complete.cut, complete.steps_cut, &complete.bounded_ranks);
         // The trim reads `target(S-1)` off the anchor step's own
         // boundary record ON ITS WAY PAST — which only works while that record
         // is among the ones the FRAME floor offers it. A boundary drained a pass
@@ -656,12 +667,19 @@ impl FlashbackPlane {
     /// passing `u64::MAX` would discard everything. "There is no anchor" is a
     /// third thing, so it gets its own function rather than a sentinel a reader
     /// has to decode.
+    ///
+    /// Its END is cut at the last step each rank finished recording, exactly
+    /// as [`select_trace`](Self::select_trace) cuts it: a from-start capture is
+    /// replayed from this trace too, and its final step can be as unfinished.
     pub(crate) fn select_trace_untrimmed(
         &self,
         snapshot: &[cerulion_core::trace_ring::TraceRingRecord],
         node_ids: &std::collections::BTreeMap<u32, Vec<String>>,
     ) -> crate::trace_window::TrimmedTrace {
-        crate::trace_window::keep_all(snapshot.iter().copied(), node_ids)
+        let complete = crate::trace_window::end_at_last_complete_step(snapshot.iter().copied());
+        let mut kept = crate::trace_window::keep_all(complete.records.into_iter(), node_ids);
+        kept.record_end_cut(complete.cut, complete.steps_cut, &complete.bounded_ranks);
+        kept
     }
 
     /// Roll the anchor retention forward, protecting an active capture's floor.
@@ -1684,13 +1702,20 @@ pub(crate) struct CaptureHandoff {
     /// avoid mis-stating it is the wrong repair. It is NOT the trace verdict.
     pub trace_rings_configured: usize,
     /// Trace records THIS capture's trim discarded as belonging to
-    /// steps before the resume.
+    /// steps before the resume, plus those its end cut removed as belonging to
+    /// a rank's final, unfinished step.
     ///
     /// Carried for the verdict alone. With a configured ring and nothing
     /// carried, this is what separates "the trim discarded every record it was
     /// offered" from "there was nothing to discard" — two different facts about
     /// the run, with two different things for an operator to look at.
     pub trace_records_trimmed_away: usize,
+    /// Steps THIS capture's end cut removed, summed over the ranks that carried
+    /// a step boundary (each rank's final step and every step before it at the
+    /// same target), and the records they held. Rendered as `trace_end_cut`.
+    pub trace_end_cut_steps: usize,
+    /// See [`trace_end_cut_steps`](Self::trace_end_cut_steps).
+    pub trace_end_cut_records: usize,
     /// Trace records THIS capture's byte ceiling took.
     ///
     /// The third cause, for the same reason as the second: an absence the
@@ -1872,12 +1897,14 @@ pub(crate) const HANDOFF_TRACE_NONE_NOT_CARRIED: &str =
 /// The retention HELD records and this capture's TRIM discarded all of them.
 ///
 /// A distinct fact with a distinct remedy: the records exist, they simply all
-/// belong to steps before the resume point, so no step boundary past the anchor
-/// was found and no resume could be derived.
+/// belong to steps before the resume point, or to the final step the trace had
+/// not finished recording at the close (the end cut), so no complete step past
+/// the anchor was found and no resume could be derived.
 pub(crate) const HANDOFF_TRACE_NONE_TRIMMED_AWAY: &str =
     "none: this recorder holds this run's trace ring(s) and retained records, but every one of \
-     them belonged to a step before this capture's anchor — the trim found no step boundary past \
-     it, so no resume point could be derived. So this capture can be VIEWED but not re-executed.";
+     them belonged to a step before this capture's anchor or to the final step the trace had not \
+     finished recording: the trim found no complete step past it, so no resume point could be \
+     derived. So this capture can be VIEWED but not re-executed.";
 
 /// The retention's BYTE CEILING took them.
 ///
@@ -1955,7 +1982,8 @@ impl CaptureHandoff {
              \"trace_attach\":{},\
              \"trace_ring_records\":{},\
              \"trace_laps\":{},\
-             \"trace_rings_configured\":{}}}",
+             \"trace_rings_configured\":{},\
+             \"trace_end_cut\":\"{}\"}}",
             esc(slot(self.graph_yaml, HANDOFF_GRAPH_ABSENT)),
             esc(slot(self.env_json, HANDOFF_ENV_ABSENT)),
             esc(slot(self.recorder_json, HANDOFF_RECORDER_ABSENT)),
@@ -1976,9 +2004,33 @@ impl CaptureHandoff {
             self.trace_ring_records,
             self.trace_laps,
             self.trace_rings_configured,
+            esc(&self.trace_end_cut()),
+        )
+    }
+
+    /// The sentence `trace_end_cut` renders: how many final steps the capture's
+    /// end cut removed, and why.
+    fn trace_end_cut(&self) -> String {
+        if self.trace_end_cut_steps == 0 {
+            return HANDOFF_TRACE_END_CUT_NONE.to_string();
+        }
+        format!(
+            "{} step(s) removed from the end of the trace ({} scheduler-trace record(s)): at the \
+             close the trace held no next step boundary proving each rank's last step complete, \
+             so a node output in it could lack the read record that caused it, and any step \
+             sharing that last step's gating-clock target went with it, because their frames \
+             carry one stamp. Each rank's \
+             trace ends at the step before them (none, if no step past the anchor remained); the \
+             removed steps' frames stay in this capture, stamped at their own step's target.",
+            self.trace_end_cut_steps, self.trace_end_cut_records
         )
     }
 }
+
+/// `trace_end_cut` when no rank carried a step boundary, so there was no final
+/// step to remove.
+pub(crate) const HANDOFF_TRACE_END_CUT_NONE: &str =
+    "none: no rank's trace carried a step boundary, so no final step was removed.";
 
 pub(crate) struct CaptureManifest<'a> {
     /// What the gate recorded.
@@ -2923,6 +2975,8 @@ mod tests {
             // The ordinary shape — nothing trimmed away, nothing
             // evicted, so the absence arm is the nothing-was-there one.
             trace_records_trimmed_away: 0,
+            trace_end_cut_steps: 0,
+            trace_end_cut_records: 0,
             trace_records_truncated: 0,
             // No drain ran in this fixture — see the fields' docs
             // for why `None` is not the same claim as `from_start`.
@@ -4892,6 +4946,8 @@ mod tests {
                     // The ordinary shape — nothing trimmed away, nothing
                     // evicted, so the absence arm is the nothing-was-there one.
                     trace_records_trimmed_away: 0,
+                    trace_end_cut_steps: 0,
+                    trace_end_cut_records: 0,
                     trace_records_truncated: 0,
                     // No drain ran in this fixture — see the fields' docs
                     // for why `None` is not the same claim as `from_start`.
@@ -4982,12 +5038,14 @@ mod tests {
                     rec(3, RECORD_TYPE_FIRE, 3_000),
                 ],
             );
-            // …and the resumed window, drained above it.
+            // …and the resumed window, drained above it, with step 5's
+            // boundary proving step 4 complete (the end cut removes step 5).
             held.push(
                 20 * MS,
                 vec![
                     rec(4, RECORD_TYPE_STEP_BOUNDARY, 4_000),
                     rec(4, RECORD_TYPE_FIRE, 4_000),
+                    rec(5, RECORD_TYPE_STEP_BOUNDARY, 5_000),
                 ],
             );
         }
@@ -5016,6 +5074,104 @@ mod tests {
         // widening of what the capture carries.
         assert_eq!(trimmed.records.len(), 2);
         assert_eq!(trimmed.first_recorded_step, Some(4));
+    }
+
+    /// THE CAPTURE-END CUT, through the selection the close calls.
+    ///
+    /// The retention a close snapshots can end inside a step: here step 7 holds
+    /// its boundary, the ticker's FIRE and the relay's FIRE (pushed after the
+    /// relay's tick published its output frame), and not the relay's level-end
+    /// READ_OUTCOME. Carried as is, a gated replay drives step 7, finds no
+    /// recorded read for the relay's consult, and exits 6 over a frame the
+    /// capture holds. Both selections must end the trace at step 6, the last
+    /// step the snapshot proves, and report the cut.
+    #[test]
+    fn select_trace_ends_a_capture_cut_between_an_output_and_its_read_at_the_last_complete_step() {
+        use cerulion_core::trace_ring::{
+            TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+        };
+        const MS: u64 = 1_000_000;
+        let rec = |step: u64, kind: u32, node_idx: u32| TraceRingRecord {
+            step,
+            fire_time_ns: if kind == RECORD_TYPE_READ_OUTCOME {
+                step
+            } else {
+                step * 1_000
+            },
+            duration_ns: 0,
+            node_idx,
+            global_level: 0,
+            record_type: kind,
+            reserved: 0,
+        };
+        let whole = |step: u64| {
+            vec![
+                rec(step, RECORD_TYPE_STEP_BOUNDARY, 0),
+                rec(step, RECORD_TYPE_FIRE, 0),
+                rec(step, RECORD_TYPE_FIRE, 1),
+                rec(step, RECORD_TYPE_READ_OUTCOME, 1),
+            ]
+        };
+        let unfinished = [
+            rec(7, RECORD_TYPE_STEP_BOUNDARY, 0),
+            rec(7, RECORD_TYPE_FIRE, 0),
+            rec(7, RECORD_TYPE_FIRE, 1),
+        ];
+
+        let plane = FlashbackPlane::new(settings(std::path::PathBuf::from("/tmp/fb-endcut")), None);
+        {
+            let shared = plane.trace();
+            let mut held = lock_trace(&shared);
+            let mut first = whole(4);
+            first.extend(whole(5));
+            held.push(20 * MS, first);
+            let mut last = whole(6);
+            last.extend(unfinished.iter().copied());
+            held.push(30 * MS, last);
+        }
+        let snapshot = plane.snapshot_trace_from(20 * MS);
+        assert!(
+            snapshot
+                .iter()
+                .any(|r| r.step == 7 && r.record_type == RECORD_TYPE_FIRE && r.node_idx == 1)
+                && !snapshot
+                    .iter()
+                    .any(|r| r.step == 7 && r.record_type == RECORD_TYPE_READ_OUTCOME),
+            "PRECONDITION: the snapshot holds the relay's step-7 fire and not its read"
+        );
+        let nodes = std::collections::BTreeMap::from([(
+            0,
+            vec!["ticker".to_string(), "relay".to_string()],
+        )]);
+
+        // Mid-run: anchored at step 4, resume from 5.
+        let trimmed = plane.select_trace(
+            &snapshot,
+            &std::collections::BTreeMap::from([(0, 4)]),
+            &nodes,
+        );
+        let mut want = whole(5);
+        want.extend(whole(6));
+        assert_eq!(
+            trimmed.records, want,
+            "the capture carries the proven steps past the anchor and nothing of step 7"
+        );
+        assert_eq!(trimmed.tail_cut, unfinished.len());
+        assert_eq!(trimmed.discarded, whole(4).len());
+        assert_eq!(
+            trimmed.last_boundary_target_ns,
+            Some(6_000),
+            "the covered range ends at step 6's target, so step 7's frames trail it"
+        );
+
+        // From start: no anchor, the same end.
+        let untrimmed = plane.select_trace_untrimmed(&snapshot, &nodes);
+        let mut want_all = whole(4);
+        want_all.extend(whole(5));
+        want_all.extend(whole(6));
+        assert_eq!(untrimmed.records, want_all);
+        assert_eq!(untrimmed.tail_cut, unfinished.len());
+        assert_eq!(untrimmed.last_boundary_target_ns, Some(6_000));
     }
 
     #[test]
@@ -5062,6 +5218,8 @@ mod tests {
                         trace_records_carried: carried,
                         trace_rings_configured: configured,
                         trace_records_trimmed_away: trimmed_away,
+                        trace_end_cut_steps: 0,
+                        trace_end_cut_records: 0,
                         trace_records_truncated: truncated,
                         // No drain ran in this fixture — see the fields' docs
                         // for why `None` is not the same claim as `from_start`.
@@ -5251,6 +5409,8 @@ mod tests {
                     // The ordinary shape — nothing trimmed away, nothing
                     // evicted, so the absence arm is the nothing-was-there one.
                     trace_records_trimmed_away: 0,
+                    trace_end_cut_steps: 0,
+                    trace_end_cut_records: 0,
                     trace_records_truncated: 0,
                     // No drain ran in this fixture — see the fields' docs
                     // for why `None` is not the same claim as `from_start`.
