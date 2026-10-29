@@ -151,7 +151,7 @@ fn a_start_refused_while_running_leaves_the_level_unchanged() {
 }
 
 #[test]
-fn a_start_refused_after_its_path_checks_puts_the_previous_level_back() {
+fn a_graph_that_does_not_parse_leaves_the_level_unchanged() {
     let (_serial, sink) = sink();
     run_once(json!({ "log_level": "warn" })).expect("start at warn");
     let refused = run_once(json!({ "log_level": "error", "graph_yaml": "nodes: [" }))
@@ -161,6 +161,33 @@ fn a_start_refused_after_its_path_checks_puts_the_previous_level_back() {
     tracing::info!(target: "app", "info after a graph refusal");
     tracing::warn!(target: "app", "warn after a graph refusal");
     assert_eq!(texts(&sink.take()), ["app: warn after a graph refusal"]);
+    run_once(json!({})).expect("reset to info for the other tests");
+}
+
+#[test]
+fn a_start_that_fails_in_its_build_puts_the_previous_level_back() {
+    let (_serial, sink) = sink();
+    run_once(json!({ "log_level": "warn" })).expect("start at warn");
+    let temp = tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("bags")).unwrap();
+    std::fs::write(temp.path().join("bags/taken.mcap"), b"").unwrap();
+    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
+    let refused = runtime
+        .start(
+            &json!({
+                "listen": ["tcp/127.0.0.1:0"],
+                "log_level": "error",
+                "publish": [{ "topic": "/logcat/heartbeat", "schema": "std_msgs/String" }],
+                "record": { "file": "taken.mcap" }
+            })
+            .to_string(),
+        )
+        .expect_err("the build refuses a recording file that already exists");
+    assert_eq!(refused.code(), codes::RECORDER, "{refused}");
+    sink.take();
+    tracing::info!(target: "app", "info after a build failure");
+    tracing::warn!(target: "app", "warn after a build failure");
+    assert_eq!(texts(&sink.take()), ["app: warn after a build failure"]);
     run_once(json!({})).expect("reset to info for the other tests");
 }
 

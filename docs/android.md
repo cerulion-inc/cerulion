@@ -537,11 +537,11 @@ writes nothing to logcat, and `log_level` has no effect.
 
 The `log_level` start key sets the lowest level written, `info` unless set.
 Each start sets it again, so a start without the key returns to `info`. A
-start sets it as soon as its config parses and passes its path checks, so
-the start's own lines use it; a start that fails after that puts the
-previous level back. A start refused because the runtime is already
-starting, running or stopping, or whose config fails to parse or fails its
-path checks, never changes it. A release build of the app library keeps only `info` and
+start sets it just before it builds the graph and its components, so the
+lines of that build use it, and a start that fails after that puts the
+previous level back. A start refused earlier, for example because the
+runtime is already running or its config fails to parse or its path checks,
+never changes it. A release build of the app library keeps only `info` and
 above: its `debug` and `trace` lines are compiled out, whatever `log_level`
 says.
 

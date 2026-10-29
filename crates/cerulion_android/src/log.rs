@@ -5,7 +5,7 @@
 //! every enabled event to logcat under one tag, unless the app installed its
 //! own subscriber first. The start config's `log_level` sets its filter.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{reload, Registry};
@@ -19,8 +19,8 @@ use {
 
 use crate::config::LogLevelConfig;
 
-/// The filter handle of the installed subscriber; unset while none is.
-static LEVEL: OnceLock<LevelHandle> = OnceLock::new();
+/// The level filter of the installed subscriber; unset while none is.
+static LEVEL: OnceLock<Levels> = OnceLock::new();
 
 type LevelHandle = reload::Handle<LevelFilter, Registry>;
 
@@ -174,7 +174,7 @@ pub fn install_with_sink(sink: impl LogSink) -> bool {
         return false;
     }
     // Only the one successful global install reaches this line.
-    let _ = LEVEL.set(handle);
+    let _ = LEVEL.set(Levels::new(handle));
     true
 }
 
@@ -225,32 +225,68 @@ mod logcat {
 /// Dropping the returned change puts the previous filter back, so a start
 /// that fails after setting its level leaves the level it found; a start
 /// that succeeds calls [`LevelChange::keep`].
-pub(crate) fn set_level(level: LogLevelConfig) -> LevelChange {
-    let previous = LEVEL.get().and_then(|handle| {
-        let previous = handle.clone_current();
-        apply(handle, level);
-        previous
-    });
-    LevelChange { previous }
+pub(crate) fn set_level(level: LogLevelConfig) -> Option<LevelChange<'static>> {
+    LEVEL.get().map(|levels| levels.set(level))
+}
+
+/// A level filter whose changes count up, so an undo can tell whether a
+/// later change came after it.
+struct Levels {
+    handle: LevelHandle,
+    /// The number of the last change; held while a change or an undo runs.
+    last: Mutex<u64>,
+}
+
+impl Levels {
+    #[cfg(any(target_os = "android", test, feature = "test-helpers"))]
+    fn new(handle: LevelHandle) -> Self {
+        Self {
+            handle,
+            last: Mutex::new(0),
+        }
+    }
+
+    fn set(&self, level: LogLevelConfig) -> LevelChange<'_> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        *last += 1;
+        let previous = self.handle.clone_current();
+        apply(&self.handle, level);
+        LevelChange {
+            levels: self,
+            number: *last,
+            previous,
+        }
+    }
 }
 
 /// A level set by [`set_level`], undone on drop unless kept.
+///
+/// The undo puts the previous filter back only while no later change was
+/// made: a start that fails after another start set its own level leaves
+/// that level.
 #[must_use = "dropping it puts the previous level back"]
-pub(crate) struct LevelChange {
+pub(crate) struct LevelChange<'a> {
+    levels: &'a Levels,
+    number: u64,
     previous: Option<LevelFilter>,
 }
 
-impl LevelChange {
+impl LevelChange<'_> {
     /// Keep the new level.
     pub(crate) fn keep(mut self) {
         self.previous = None;
     }
 }
 
-impl Drop for LevelChange {
+impl Drop for LevelChange<'_> {
     fn drop(&mut self) {
-        if let (Some(previous), Some(handle)) = (self.previous, LEVEL.get()) {
-            reload(handle, previous);
+        let last = self
+            .levels
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let (Some(previous), true) = (self.previous, *last == self.number) {
+            reload(&self.levels.handle, previous);
         }
     }
 }
@@ -383,5 +419,43 @@ mod tests {
             kept <= LINE_CAPACITY,
             "kept {kept} bytes after a 64 KiB line"
         );
+    }
+
+    /// The lines a debug, an info and an error line leave in `sink` at the
+    /// current level.
+    fn written(sink: &FakeSink) -> Vec<String> {
+        sink.0.lock().unwrap().clear();
+        tracing::debug!(target: "app", "debug");
+        tracing::info!(target: "app", "info");
+        tracing::error!(target: "app", "error");
+        sink.lines().into_iter().map(|(_, line)| line).collect()
+    }
+
+    #[test]
+    fn a_start_that_fails_after_a_later_start_kept_its_level_leaves_that_level() {
+        let sink = FakeSink::default();
+        let (subscriber, handle) = subscriber(sink.clone());
+        let levels = Levels::new(handle);
+        tracing::subscriber::with_default(subscriber, || {
+            let first = levels.set(LogLevelConfig::Debug);
+            let second = levels.set(LogLevelConfig::Error);
+            second.keep();
+            drop(first);
+            assert_eq!(written(&sink), ["app: error"]);
+        });
+    }
+
+    #[test]
+    fn a_later_start_that_fails_puts_back_the_level_of_the_start_before_it() {
+        let sink = FakeSink::default();
+        let (subscriber, handle) = subscriber(sink.clone());
+        let levels = Levels::new(handle);
+        tracing::subscriber::with_default(subscriber, || {
+            let first = levels.set(LogLevelConfig::Debug);
+            let second = levels.set(LogLevelConfig::Error);
+            drop(second);
+            first.keep();
+            assert_eq!(written(&sink), ["app: debug", "app: info", "app: error"]);
+        });
     }
 }
