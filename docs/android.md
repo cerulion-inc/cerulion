@@ -455,6 +455,7 @@ The configuration keys are:
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
+| `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 
 Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
@@ -512,6 +513,37 @@ The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:
 recordings are stored in `files/bags/`, and custom schemas are read from
 `files/schemas/`.
+
+### Logs in logcat
+
+The runtime's own `tracing` lines, and those of every node linked into the
+app library, go to logcat under the tag `Cerulion`:
+
+```sh
+adb logcat -s Cerulion
+```
+
+Each line reads `<target>: <message> <field>=<value>...`, for example
+`cerulion_android::runtime: mDNS beacon registered port=7683`; span fields
+are not included. An `error` line has logcat priority `E`, `warn` has `W`,
+`info` has `I`, `debug` has `D` and `trace` has `V`.
+
+`embed_nodes!` installs the logcat subscriber when Java loads the library,
+so a node registration error reaches logcat too; `CerulionRuntime.init`
+installs it when the load did not. To keep your own `tracing` subscriber,
+write your own `JNI_OnLoad`, set your subscriber there as the global
+default, then call `cerulion_android::nodes::register`. The runtime then
+writes nothing to logcat, and `log_level` has no effect.
+
+The `log_level` start key sets the lowest level written, `info` unless set.
+Each start sets it again, so a start without the key returns to `info`. A
+start sets it just before it builds the graph and its components, so the
+lines of that build use it, and a start that fails after that puts the
+previous level back. A start refused earlier, for example because the
+runtime is already running or its config fails to parse or fails its path
+checks, never changes it. A release build of the app library keeps only `info` and
+above: its `debug` and `trace` lines are compiled out, whatever `log_level`
+says.
 
 ## Discovery and access
 
@@ -665,6 +697,7 @@ The lane also checks the sample app's linked graph nodes:
   second, finalized recording with both topics;
 - a start after `am force-stop` succeeds in a new process over the files the
   killed process left;
+- a `tracing` line from the runtime reaches logcat under the `Cerulion` tag;
 - no SELinux denial is logged for the app's domain in any run.
 
 Run it locally with a booted API 30 emulator:
@@ -741,8 +774,9 @@ abstract socket access depend on process ownership and SELinux policy. Native
 node libraries are built on a host and retain their target-triple directory
 when copied to a device. An Android app runs only the graph nodes linked into
 its native library, cannot run a graph with `process_groups` (error code 5),
-cannot host the paired remote plane, and cannot run `cerulion viz`. A `tracing`
-line logged by a node in an app does not reach logcat. A `cerulion topic list`
-run on the device cannot see an app's topics; read them from a host through
-the app's gateway. Emulator networking does not pass multicast to the host, so
-test mDNS from a physical device or from the device itself.
+cannot host the paired remote plane, and cannot run `cerulion viz`. A line
+logged through the `log` crate instead of `tracing` does not reach logcat. A
+`cerulion topic list` run on the device cannot see an app's topics; read them
+from a host through the app's gateway. Emulator networking does not pass
+multicast to the host, so test mDNS from a physical device or from the device
+itself.
