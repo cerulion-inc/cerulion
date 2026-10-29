@@ -30,16 +30,29 @@ const VECTOR3: &str = "geometry_msgs/Vector3";
 const FIRES_PAST_CAP: usize = 500;
 /// Frames published before the test waits for their echoes.
 const BURST: usize = 4;
-/// The fire after which the test reads the clock. A fire's time is read when
-/// its step begins, so the cut sits this many bursts before the first kept
-/// fire: a step that began before the cut has long ended when that fire runs.
-const CUT_AT_FIRE: usize = FIRES_PAST_CAP - 25 * BURST;
+/// Fires published in the run.
+const TOTAL: usize = PRODUCTION_TRACE_LIMIT + FIRES_PAST_CAP;
+/// Fires between a clock cut and the fire it bounds. A fire's time is read
+/// when its step begins, so a cut sits this many fires before that fire: a
+/// step that began before the cut has long ended when that fire runs.
+const CUT_MARGIN: usize = 25 * BURST;
+/// The test reads the clock once this fire has echoed and before it
+/// publishes the next frame. The oldest kept fire (`FIRES_PAST_CAP + 1`)
+/// must come later, so the trace dropped at least this many oldest fires.
+const FIRST_CUT_FIRE: usize = FIRES_PAST_CAP - CUT_MARGIN;
+/// The same for the newest kept fire (`TOTAL`): it must come later, so the
+/// trace dropped fewer than `CUT_MARGIN` of the newest fires.
+const LAST_CUT_FIRE: usize = TOTAL - CUT_MARGIN;
+// A cut is read between bursts, so each cut fire ends a burst.
+const _: () = assert!(FIRES_PAST_CAP > CUT_MARGIN);
+const _: () = assert!(FIRST_CUT_FIRE.is_multiple_of(BURST) && LAST_CUT_FIRE.is_multiple_of(BURST));
 
 /// What the trace kept at the end of the run.
 struct KeptTrace {
     len: usize,
     nodes_other_than_logic: usize,
     oldest_fire_ns: u64,
+    newest_fire_ns: u64,
 }
 
 #[test]
@@ -74,6 +87,7 @@ nodes:
             len: trace.len(),
             nodes_other_than_logic: trace.iter().filter(|e| &*e.node_id != "logic").count(),
             oldest_fire_ns: trace.first().map_or(0, |e| e.fire_time_ns),
+            newest_fire_ns: trace.last().map_or(0, |e| e.fire_time_ns),
         };
         kept_tx.send(kept).expect("send the kept trace");
     });
@@ -93,15 +107,13 @@ nodes:
         .expect("transport manager")
         .create_subscriber(&echo_topic)
         .expect("subscribe to the relay output");
-    let total = PRODUCTION_TRACE_LIMIT + FIRES_PAST_CAP;
     let mut published = 0usize;
     let mut fires = 0usize;
-    // Taken once fire `CUT_AT_FIRE` has echoed and before any later frame is
-    // published: every kept fire is later.
-    let mut cut_ns = None;
+    let mut first_cut_ns = None;
+    let mut last_cut_ns = None;
     let deadline = Instant::now() + Duration::from_secs(120);
-    while fires < total {
-        let burst = BURST.min(total - published);
+    while fires < TOTAL {
+        let burst = BURST.min(TOTAL - published);
         for _ in 0..burst {
             published += 1;
             runtime
@@ -127,8 +139,11 @@ nodes:
                 })
                 .expect("wait for relay output");
         }
-        if fires == CUT_AT_FIRE {
-            cut_ns = Some(real_ns());
+        if fires == FIRST_CUT_FIRE {
+            first_cut_ns = Some(real_ns());
+        }
+        if fires == LAST_CUT_FIRE {
+            last_cut_ns = Some(real_ns());
         }
     }
     runtime.stop().expect("stop the graph");
@@ -139,14 +154,21 @@ nodes:
         .expect("the graph thread reports its trace on exit");
     assert_eq!(
         kept.len, PRODUCTION_TRACE_LIMIT,
-        "{total} fires must leave exactly the graph run cap in the trace"
+        "{TOTAL} fires must leave exactly the graph run cap in the trace"
     );
     assert_eq!(kept.nodes_other_than_logic, 0);
-    let cut_ns = cut_ns.expect("the cut was taken");
-    // Both bounds, so a fire time on another clock than `real_ns` fails.
+    let first_cut_ns = first_cut_ns.expect("the first cut was taken");
+    let last_cut_ns = last_cut_ns.expect("the last cut was taken");
+    // Each fire time has a lower and an upper bound, so a fire time on another
+    // clock than `real_ns` fails.
     assert!(
-        cut_ns < kept.oldest_fire_ns && kept.oldest_fire_ns <= end_ns,
-        "the trace must keep the newest fires: oldest kept {} not in ({cut_ns}, {end_ns}]",
+        first_cut_ns < kept.oldest_fire_ns && kept.oldest_fire_ns <= end_ns,
+        "the trace must drop the oldest fires: oldest kept {} not in ({first_cut_ns}, {end_ns}]",
         kept.oldest_fire_ns
+    );
+    assert!(
+        last_cut_ns < kept.newest_fire_ns && kept.newest_fire_ns <= end_ns,
+        "the trace must keep the last fires: newest kept {} not in ({last_cut_ns}, {end_ns}]",
+        kept.newest_fire_ns
     );
 }
