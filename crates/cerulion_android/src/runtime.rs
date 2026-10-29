@@ -324,6 +324,11 @@ impl Status {
 #[cfg(any(test, feature = "test-helpers"))]
 type BeforeCommitHook = Box<dyn FnOnce(&TransportManager) + Send>;
 
+/// A hook a test runs on the graph thread, with the execution trace the
+/// run kept, once the graph loop has returned.
+#[cfg(any(test, feature = "test-helpers"))]
+type GraphExitHook = Box<dyn FnOnce(&[cerulion_core::TraceEntry]) + Send>;
+
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
 /// Dropping it stops and joins whatever is still running.
 pub struct EmbeddedRuntime {
@@ -335,6 +340,8 @@ pub struct EmbeddedRuntime {
     run: Option<Run>,
     #[cfg(any(test, feature = "test-helpers"))]
     before_commit: Option<BeforeCommitHook>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    graph_exit: Option<GraphExitHook>,
 }
 
 /// Every component one start owns. A start fills it step by step; the
@@ -507,6 +514,8 @@ struct StartPlan {
     inert_egress: bool,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    graph_exit: Option<GraphExitHook>,
 }
 
 struct GatewayStartPlan {
@@ -547,6 +556,8 @@ impl EmbeddedRuntime {
             run: None,
             #[cfg(any(test, feature = "test-helpers"))]
             before_commit: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            graph_exit: None,
         })
     }
 
@@ -573,6 +584,22 @@ impl EmbeddedRuntime {
         hook: impl FnOnce(&TransportManager) + Send + 'static,
     ) {
         self.before_commit = Some(Box::new(hook));
+    }
+
+    /// TEST SEAM: run `hook` once, for the next start's graph, on the graph
+    /// thread after its loop returns and its exit is recorded, with the
+    /// execution trace that run kept. `stop()` joins the graph thread, so the
+    /// hook has run when it returns. The first start that gets past its plan
+    /// takes the hook; when that start spawns no graph thread (no graph, or a
+    /// failure before the spawn), the hook is dropped unrun. A start refused
+    /// before its plan leaves the hook for the next start.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_graph_exit_hook_for_test(
+        &mut self,
+        hook: impl FnOnce(&[cerulion_core::TraceEntry]) + Send + 'static,
+    ) {
+        self.graph_exit = Some(Box::new(hook));
     }
 
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
@@ -625,6 +652,10 @@ impl EmbeddedRuntime {
                 return Err(error);
             }
         };
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            plan.graph_exit = self.graph_exit.take();
+        }
         // Set just before the build, so the build's lines use it. A start
         // refused before this point never touches the process-wide level; a
         // later failure (another runtime owns the gateway, a recording file
@@ -983,6 +1014,8 @@ impl EmbeddedRuntime {
             listen: config.listen,
             gateway,
             recorder,
+            #[cfg(any(test, feature = "test-helpers"))]
+            graph_exit: None,
         })
     }
 
@@ -1367,6 +1400,10 @@ fn build_into(
             plan.recorded_graph_topics.as_ref(),
         )
         .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        // The trace keeps the newest fires up to `graph run`'s default
+        // `--trace-limit`, so the trace of a graph that runs for days stops
+        // growing.
+        graph_runtime.set_trace_limit(cerulion_cli_engine::graph_cmd::PRODUCTION_TRACE_LIMIT);
         graph_runtime.set_live_transport(Arc::clone(&manager));
         // The graph thread takes the runtime: status keeps this reader.
         lock_status(status).node_failures =
@@ -1474,6 +1511,8 @@ fn build_into(
         let thread_ready = Arc::clone(&ready);
         let thread_status = Arc::clone(status);
         let thread_gate = Arc::clone(&run.commit_gate);
+        #[cfg(any(test, feature = "test-helpers"))]
+        let graph_exit = plan.graph_exit.take();
         let thread = thread::Builder::new()
             .name("cerulion-graph".to_string())
             .spawn(move || {
@@ -1494,6 +1533,10 @@ fn build_into(
                 {
                     let _commit = lock_gate(&thread_gate);
                     record_graph_exit(&thread_status, &thread_running, &result);
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = graph_exit {
+                    hook(graph_runtime.trace());
                 }
                 result
             })
@@ -2214,6 +2257,7 @@ mod tests {
                 mdns: false,
             }),
             recorder: Some(recorder),
+            graph_exit: None,
         }
     }
 
@@ -2753,6 +2797,7 @@ nodes:
                 mdns: false,
             }),
             recorder: None,
+            graph_exit: None,
         };
 
         let result = commit(&mut run, &plan, &status, "t");
@@ -2808,6 +2853,7 @@ nodes:
                 mdns: false,
             }),
             recorder: None,
+            graph_exit: None,
         };
         let mut run = Run::empty(Arc::clone(&manager));
 
