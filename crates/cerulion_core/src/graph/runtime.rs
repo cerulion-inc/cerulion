@@ -3041,6 +3041,35 @@ pub(crate) struct LevelPlan {
     pub rest_walk: crate::scheduler::RestWalk,
 }
 
+/// A shared reader of a graph's tick panic records, taken with
+/// [`GraphRuntime::node_tick_panic_records`].
+///
+/// It reads the same records as [`GraphRuntime::node_tick_panics`], and it
+/// keeps reading them while another thread owns the runtime (for example one
+/// running [`GraphRuntime::run_live`]) and after the runtime is dropped.
+/// Clones share the records.
+#[derive(Clone)]
+pub struct NodeTickPanicRecords {
+    records: Arc<IndexMap<String, Arc<Mutex<Option<String>>>>>,
+}
+
+impl NodeTickPanicRecords {
+    /// Every node whose tick panicked so far, in graph order:
+    /// `(node_id, first panic reason)`. See
+    /// [`GraphRuntime::node_tick_panics`] for what counts as a panic.
+    // hot-path-alloc-ok-fn: cold: a status or report read, never on a fire
+    pub fn snapshot(&self) -> Vec<(String, String)> {
+        self.records
+            .iter()
+            .filter_map(|(id, rec)| {
+                rec.lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|reason| (id.clone(), reason.clone())))
+            })
+            .collect()
+    }
+}
+
 /// The `(wall, gating)` clock pair read at `run_live` entry — see
 /// [`GraphRuntime::live_pace_anchor`].
 #[derive(Clone, Copy, Debug)]
@@ -3067,9 +3096,10 @@ pub struct GraphRuntime {
     /// RESUMED so scheduler semantics are unchanged) or on the structural
     /// [`TransportError::NodeTickPanicked`] variant (cdylib FFI codes 2/3).
     /// Read post-run via [`GraphRuntime::node_tick_panics`] (the replay
-    /// engine's exit-3 detection seam). Deterministic tick `Err`s never
-    /// land here.
-    tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>>,
+    /// engine's exit-3 detection seam), or while the graph runs through
+    /// [`GraphRuntime::node_tick_panic_records`]. Deterministic tick `Err`s
+    /// never land here.
+    tick_panic_records: NodeTickPanicRecords,
     /// Per-node FATAL records (first message wins), one per node in graph
     /// order. Written by the node's tick callback when the tick returned a
     /// `NodeErrorKind::Fatal` error; read via [`GraphRuntime::node_fatal_errors`].
@@ -9222,7 +9252,9 @@ impl GraphRuntime {
             sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
-            tick_panic_records,
+            tick_panic_records: NodeTickPanicRecords {
+                records: Arc::new(tick_panic_records),
+            },
             fatal_records,
             nodes,
             data_trigger_bindings,
@@ -15840,16 +15872,19 @@ impl GraphRuntime {
     /// The replay engine reads this after the replay loop to map a crashed
     /// candidate to exit 3 (root cause) instead of letting the missing
     /// output masquerade as an exit-1 data regression.
-    // hot-path-alloc-ok-fn: cold: teardown/report harvest — once per graph, at shutdown
     pub fn node_tick_panics(&self) -> Vec<(String, String)> {
-        self.tick_panic_records
-            .iter()
-            .filter_map(|(id, rec)| {
-                rec.lock()
-                    .ok()
-                    .and_then(|slot| slot.as_ref().map(|reason| (id.clone(), reason.clone())))
-            })
-            .collect()
+        self.tick_panic_records.snapshot()
+    }
+
+    /// A shared reader of the records [`Self::node_tick_panics`] reads.
+    ///
+    /// Take it before moving the runtime to the thread that runs the graph:
+    /// it reads each panic as the tick callback records it, and keeps
+    /// reading after the runtime is dropped.
+    pub fn node_tick_panic_records(&self) -> NodeTickPanicRecords {
+        // hot-path-alloc-ok: not a heap allocation: the clone is one `Arc`
+        // refcount bump, taken before the run, never on a fire
+        self.tick_panic_records.clone()
     }
 
     /// Every node stopped by a `NodeError::Fatal` from its tick during this
