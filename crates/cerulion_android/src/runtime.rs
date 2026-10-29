@@ -13,11 +13,12 @@ use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
 use cerulion_core::dynamic::{SchemaSet, WireLayout};
 use cerulion_core::graph::{
-    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, GraphTopology, NodeDef,
-    NodeEntry, NodeInfo, NodeTickPanicRecords,
+    parse_graph, resolve_ingress_schema_hash, resolve_output_topic, DylibNodeEntry, GraphConfig,
+    GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords,
 };
 use cerulion_core::transport::gateway::{
-    GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
+    GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
+    TopicSchema,
 };
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::transport::{
@@ -94,17 +95,31 @@ pub fn gateway_owned_for_test() -> bool {
 /// no other runtime can start a gateway before the reset is done.
 struct GatewayOwnership {
     manager: Arc<TransportManager>,
+    /// The ingress topics this run's gateway bridges. The gateway leaves
+    /// each bridge registered on the manager when it stops, so the release
+    /// unregisters them before a later start registers its own. A topic
+    /// another user of the manager bridged before the lease is left out: the
+    /// gateway cannot register it, and the release must not take it away.
+    ingress: Vec<String>,
     // Declared last: fields drop in declaration order, so the lease is
     // released after everything else this hold owns.
     _lease: GatewayLease,
 }
 
 impl GatewayOwnership {
-    fn acquire(manager: &Arc<TransportManager>) -> Result<Self, EmbedError> {
+    fn acquire(manager: &Arc<TransportManager>, ingress: Vec<String>) -> Result<Self, EmbedError> {
         let lease = GatewayLease::acquire()?;
         quiesce(manager);
+        let ingress = match manager.network() {
+            Some(network) => ingress
+                .into_iter()
+                .filter(|topic| !network.is_ingress_registered(topic))
+                .collect(),
+            None => ingress,
+        };
         Ok(Self {
             manager: Arc::clone(manager),
+            ingress,
             _lease: lease,
         })
     }
@@ -113,6 +128,25 @@ impl GatewayOwnership {
 impl Drop for GatewayOwnership {
     fn drop(&mut self) {
         quiesce(&self.manager);
+        release_ingress(&self.manager, &self.ingress);
+    }
+}
+
+/// Unregister each ingress bridge in `topics` and take the topic out of the
+/// manager's demand GETs. A topic with no bridge (a build that failed before
+/// the gateway registered it) is skipped. Logs a failure and never returns
+/// one, so it can run on every teardown path.
+fn release_ingress(manager: &TransportManager, topics: &[String]) {
+    let Some(network) = manager.network() else {
+        return;
+    };
+    for topic in topics {
+        network.remove_ingress_demand_keepalive(topic);
+        if network.is_ingress_registered(topic) {
+            if let Err(error) = manager.unregister_ingress_topic(topic) {
+                tracing::warn!(topic = %topic, error = %error, "could not release an ingress bridge");
+            }
+        }
     }
 }
 
@@ -524,10 +558,24 @@ struct StartPlan {
     /// `egress` is set but `listen` and `connect` are empty, so no gateway
     /// reads the list.
     inert_egress: bool,
+    /// `ingress` is set, but the start builds no gateway or the gateway is
+    /// paired, so no LAN frame reaches the listed topics.
+    inert_ingress: Option<InertIngress>,
+    /// Number of `ingress` topics, for the inert-ingress warning.
+    ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
     #[cfg(any(test, feature = "test-helpers"))]
     graph_exit: Option<GraphExitHook>,
+}
+
+/// Why the `ingress` list of a start lets no LAN frame in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InertIngress {
+    /// `listen` and `connect` are empty: the start builds no gateway.
+    NoGateway,
+    /// `lan_access` is `paired`: the gateway opens no ingress bridge.
+    Paired,
 }
 
 struct GatewayStartPlan {
@@ -944,6 +992,21 @@ impl EmbeddedRuntime {
                 )));
             }
         }
+        // Resolved under every posture, so a misdeclared topic fails the
+        // first start and not only the first `open` one.
+        let ingress = config
+            .ingress
+            .iter()
+            .map(|topic| {
+                resolve_ingress(
+                    topic,
+                    &publishes,
+                    &graph_topic_set,
+                    &input_depths,
+                    graph_inputs.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>, EmbedError>>()?;
 
         // The recorded-topic set is resolved BEFORE the graph
         // build so the runtime can provision the tap raise at service
@@ -977,6 +1040,9 @@ impl EmbeddedRuntime {
         // gateway and changes manager-wide LAN state; a start with neither
         // leaves both alone.
         let networked = !config.listen.is_empty() || !config.connect.is_empty();
+        let lan_access = LanAccess::from(config.lan_access);
+        let inert_ingress = inert_ingress(!ingress.is_empty(), networked, lan_access);
+        let ingress_topics = ingress.len();
         let gateway = networked.then(|| {
             let extra = publishes
                 .iter()
@@ -1008,10 +1074,17 @@ impl EmbeddedRuntime {
                         GatewayEgressPolicy::AllowList,
                     ),
                     announce,
-                    ingress: Vec::new(),
+                    // Under `paired` the gateway opens no ingress bridge at
+                    // all: no LAN subscriber, no demand token and no demand
+                    // GET exists for a topic, so no frame can reach it.
+                    ingress: if lan_access == LanAccess::Open {
+                        ingress
+                    } else {
+                        Vec::new()
+                    },
                 },
                 serving,
-                lan_access: LanAccess::from(config.lan_access),
+                lan_access,
                 mdns: config.mdns,
             }
         });
@@ -1031,6 +1104,8 @@ impl EmbeddedRuntime {
             recorded_topics,
             recorded_graph_topics,
             inert_egress: config.egress.is_some() && !networked,
+            inert_ingress,
+            ingress_topics,
             listen: config.listen,
             connect: config.connect,
             gateway,
@@ -1409,7 +1484,13 @@ fn build_into(
     //    run's serving before the constructor records any runtime hash;
     //    a first start seeds the surface through the constructor.
     if let Some(gateway) = &plan.gateway {
-        run.ownership = Some(GatewayOwnership::acquire(&manager)?);
+        let ingress = gateway
+            .plan
+            .ingress
+            .iter()
+            .map(|entry| entry.topic.clone())
+            .collect();
+        run.ownership = Some(GatewayOwnership::acquire(&manager, ingress)?);
         if let Some(live) = manager
             .network()
             .and_then(|network| network.query_surface_serving_handles())
@@ -1707,6 +1788,19 @@ fn commit(
             "subscribe topic is neither an app publish topic nor a graph output"
         );
     }
+    match plan.inert_ingress {
+        None => {}
+        Some(InertIngress::NoGateway) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but listen and connect are empty: this start builds no gateway, so \
+             no LAN frame reaches the ingress topics"
+        ),
+        Some(InertIngress::Paired) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but lan_access is paired: the gateway refuses every frame a LAN \
+             peer publishes into the ingress topics"
+        ),
+    }
     if plan.inert_egress {
         tracing::warn!(
             "egress is set but listen and connect are empty: this start builds no gateway, so \
@@ -1876,6 +1970,54 @@ fn resolve_subscribe(
         layout: layout.clone(),
         depth: subscribe.depth,
         produced_in_run: !producers.is_empty(),
+    })
+}
+
+/// Why a start's `ingress` list lets no LAN frame in, or `None` when it
+/// does: the gateway takes LAN frames only when the start builds one (a
+/// `listen` endpoint or a `connect` locator) and its posture is `open`.
+fn inert_ingress(
+    has_ingress: bool,
+    networked: bool,
+    lan_access: LanAccess,
+) -> Option<InertIngress> {
+    match (has_ingress, networked, lan_access) {
+        (false, _, _) | (true, true, LanAccess::Open) => None,
+        (true, false, _) => Some(InertIngress::NoGateway),
+        (true, true, LanAccess::Paired) => Some(InertIngress::Paired),
+    }
+}
+
+/// Resolve one `ingress` topic to the schema hash its frames are checked
+/// against: the hash the graph inputs that read it declare. A topic with
+/// another writer in the run, or one no graph input reads, fails the start.
+fn resolve_ingress(
+    topic: &str,
+    publishes: &[ResolvedPublish],
+    graph_topics: &HashSet<&str>,
+    input_depths: &BTreeMap<String, usize>,
+    graph: Option<&GraphInputs>,
+) -> Result<GatewayIngressEntry, EmbedError> {
+    if publishes.iter().any(|publish| publish.topic == topic) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is a publish topic; a topic has one writer"
+        )));
+    }
+    if graph_topics.contains(topic) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is a graph output; graph topics are single-writer"
+        )));
+    }
+    let Some(graph) = graph.filter(|_| input_depths.contains_key(topic)) else {
+        return Err(EmbedError::InvalidArgument(format!(
+            "ingress topic '{topic}' is not read by any graph input"
+        )));
+    };
+    let schema_hash = resolve_ingress_schema_hash(topic, &graph.config, &graph.infos)
+        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+    Ok(GatewayIngressEntry {
+        topic: topic.to_string(),
+        schema_hash,
     })
 }
 
@@ -2341,6 +2483,8 @@ mod tests {
             listen: Vec::new(),
             connect: Vec::new(),
             inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -2379,7 +2523,7 @@ mod tests {
         let _serial = gateway_test_lock();
         let manager = local_manager("lease_order");
         let mut run = Run::empty(Arc::clone(&manager));
-        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
+        run.ownership = Some(GatewayOwnership::acquire(&manager, Vec::new()).expect("lease"));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         run.recorder = Some(RecorderWorker {
@@ -3002,7 +3146,7 @@ nodes:
         let _serial = gateway_test_lock();
         let manager = network_manager("halfbuilt");
         let mut run = Run::empty(Arc::clone(&manager));
-        run.ownership = Some(GatewayOwnership::acquire(&manager).expect("lease"));
+        run.ownership = Some(GatewayOwnership::acquire(&manager, Vec::new()).expect("lease"));
         let network = manager.network().expect("network");
         network.set_lan_access(LanAccess::Open);
         let flag = manager
@@ -3019,6 +3163,97 @@ nodes:
             "a failed gateway construction must not leave its bridge enabled"
         );
         assert_baseline(&manager);
+    }
+
+    /// Hand oracle over every input: only a start with ingress topics, a
+    /// gateway and the `open` posture takes LAN frames.
+    #[test]
+    fn ingress_takes_lan_frames_only_with_a_gateway_that_is_open() {
+        for (has_ingress, networked, lan_access, expected) in [
+            (false, false, LanAccess::Paired, None),
+            (false, false, LanAccess::Open, None),
+            (false, true, LanAccess::Paired, None),
+            (false, true, LanAccess::Open, None),
+            (
+                true,
+                false,
+                LanAccess::Paired,
+                Some(InertIngress::NoGateway),
+            ),
+            (true, false, LanAccess::Open, Some(InertIngress::NoGateway)),
+            (true, true, LanAccess::Paired, Some(InertIngress::Paired)),
+            (true, true, LanAccess::Open, None),
+        ] {
+            assert_eq!(
+                inert_ingress(has_ingress, networked, lan_access),
+                expected,
+                "ingress={has_ingress} networked={networked} {lan_access:?}"
+            );
+        }
+    }
+
+    /// A gateway that failed after it registered an ingress bridge and its
+    /// demand GET leaves both on the manager. The teardown releases each
+    /// topic of the run's ingress list, and skips one the gateway never
+    /// registered.
+    #[test]
+    fn a_half_built_gateway_teardown_releases_its_ingress_bridges() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("halfingress");
+        let registered = "/half_built/ingress";
+        let never_registered = "/half_built/unregistered";
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership = Some(
+            GatewayOwnership::acquire(
+                &manager,
+                vec![registered.to_string(), never_registered.to_string()],
+            )
+            .expect("lease"),
+        );
+        let network = manager.network().expect("network");
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register an ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(registered)
+            .expect("demand the ingress topic");
+        assert!(network.is_ingress_registered(registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+
+        let (_, error) = run.shutdown();
+
+        assert!(error.is_none(), "{error:?}");
+        assert!(!network.is_ingress_registered(registered));
+        assert!(!network.is_ingress_registered(never_registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
+        assert_baseline(&manager);
+        // A topic another user bridged before the lease keeps its bridge
+        // and its demand GET through this run's teardown.
+        let foreign = "/half_built/foreign";
+        manager
+            .register_run_ingress_topic(foreign, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("another user's ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(foreign)
+            .expect("another user's demand GET");
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership =
+            Some(GatewayOwnership::acquire(&manager, vec![foreign.to_string()]).expect("lease"));
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+        assert!(network.is_ingress_registered(foreign));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+        network.remove_ingress_demand_keepalive(foreign);
+        manager
+            .unregister_ingress_topic(foreign)
+            .expect("release the other user's bridge");
+        // The released topic registers again, as the next start does.
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register the released topic again");
+        manager
+            .unregister_ingress_topic(registered)
+            .expect("release it");
     }
 
     /// The commit holds the run's commit gate, not the status lock, from its
@@ -3073,6 +3308,8 @@ nodes:
             listen: Vec::new(),
             connect: Vec::new(),
             inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3130,6 +3367,8 @@ nodes:
             listen: Vec::new(),
             connect: Vec::new(),
             inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,

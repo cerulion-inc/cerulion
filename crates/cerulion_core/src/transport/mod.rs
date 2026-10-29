@@ -4125,8 +4125,8 @@ impl TransportManager {
     /// within one pass once the transport is back. Call it once per demanded topic,
     /// right after `register_ingress_topic`. Idempotent + start-once.
     ///
-    /// A gateway (which boots its OWN demand-GET loop from its fixed ingress list)
-    /// never calls this — the manager's single loop slot is used by exactly one role.
+    /// A gateway adds its ingress topics to the same set at boot, so the
+    /// manager's one loop demands both.
     ///
     /// # Errors
     ///

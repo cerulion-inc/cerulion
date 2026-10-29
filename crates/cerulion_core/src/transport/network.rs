@@ -1138,12 +1138,17 @@ impl GetDemandState {
 /// Principle-#3 accessors.
 #[derive(Default)]
 pub struct DemandGetState {
-    /// canonical ingress topics to demand each pass (fixed at gateway boot).
+    /// canonical ingress topics to demand each pass.
     topics: Mutex<Vec<String>>,
     /// producer robot identities harvested from the announce space - targets the
     /// EXPLICIT GETs. Empty ⇒ the WILDCARD fallback (`cerulion_q/*/demand{topic}`,
     /// which intersects every producer's `cerulion_q/{robot}/**` queryable).
     identities: Mutex<BTreeSet<String>>,
+    /// Bumped, under the `identities` lock, each time the last topic leaves
+    /// and the identities are forgotten. A pass records it before its harvest
+    /// query and stores what it harvested only if it is unchanged, so a pass
+    /// of an earlier demand lifecycle cannot refill the forgotten set.
+    identity_epoch: AtomicU64,
     /// cumulative demand-GET passes run.
     passes: AtomicU64,
     /// cumulative replies acking "enabled".
@@ -1173,20 +1178,12 @@ pub struct DemandGetState {
 }
 
 impl DemandGetState {
-    /// Build a demander state for a fixed set of canonical ingress topics.
-    pub fn from_topics(topics: Vec<String>) -> Self {
-        Self {
-            topics: Mutex::new(topics),
-            ..Default::default()
-        }
-    }
-
     /// Add a canonical ingress topic to the DYNAMIC demand set (idempotent -
     /// a duplicate is a no-op). The background demand-GET loop re-reads the topic
     /// set every pass, so a topic added while the loop runs is demanded on the very
     /// next pass. This is the seam that lets a PURE-INGRESS demander
     /// (`cerulion-netd`) grow its keepalive set as consumers demand new mirrors,
-    /// versus the gateway's fixed boot set ([`Self::from_topics`]).
+    /// and a gateway add its ingress topics at boot.
     pub fn add_topic(&self, canonical: String) {
         let mut topics = self
             .topics
@@ -1200,12 +1197,59 @@ impl DemandGetState {
     /// Remove a canonical ingress topic from the DYNAMIC demand set (a
     /// mirror's last consumer left, the bridge is torn down). The loop stops
     /// GETting it on the next pass. A topic that was never present is a no-op.
+    /// Removing the last topic also forgets the harvested producer
+    /// identities: the next user of the set (a gateway started again on the
+    /// same manager) starts from the wildcard GET and harvests its own peers,
+    /// so a peer that left is never the only one asked.
     pub fn remove_topic(&self, canonical: &str) {
         let mut topics = self
             .topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         topics.retain(|t| t != canonical);
+        if topics.is_empty() {
+            let mut identities = self
+                .identities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            identities.clear();
+            self.identity_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The identity epoch a pass records before its harvest query.
+    fn identity_epoch(&self) -> u64 {
+        self.identity_epoch.load(Ordering::Acquire)
+    }
+
+    /// Store the producer identities a harvest started at `epoch` learned,
+    /// leaving out `self_identity`. Dropped whole when the identities were
+    /// forgotten since `epoch`: they belong to an earlier demand lifecycle.
+    fn record_harvest(
+        &self,
+        epoch: u64,
+        robots: impl IntoIterator<Item = String>,
+        self_identity: Option<&str>,
+    ) {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.identity_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        // Belt and suspenders: NEVER demand from OURSELVES. A Strict gateway
+        // announces its own identity, so the harvest would otherwise learn
+        // self and emit a `cerulion_q/{self}/demand{...}` self-query every
+        // pass - including for its own INGRESS topics, which the grant-side
+        // self-ingress guard already refuses without warning. Dropping self
+        // here avoids the wasted self round-trip entirely (the wildcard-`*`
+        // fallback residual stays covered by that grant-side guard).
+        identities.extend(
+            robots
+                .into_iter()
+                .filter(|robot| self_identity != Some(robot.as_str())),
+        );
     }
 
     /// Observable state (Principle #3): the number of canonical topics currently demanded.
@@ -2897,25 +2941,14 @@ fn run_demand_get_pass_on_session(
     //    working direction). The producer announces its egress topics + a bare
     //    identity token, so this learns the producer's robot chunk. A failure is
     //    non-fatal - the wildcard fallback still reaches every producer.
+    let epoch = demand_state.identity_epoch();
     match query_announce_entries(session, DEMAND_IDENTITY_WINDOW) {
         Ok(entries) => {
-            let mut ids = demand_state
-                .identities
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (robot, _topic) in entries {
-                // Belt and suspenders: NEVER demand from OURSELVES. A
-                // Strict gateway announces its own identity, so the harvest would
-                // otherwise learn self and emit a `cerulion_q/{self}/demand{...}`
-                // self-query every pass - including for its own INGRESS topics,
-                // which the grant-side self-ingress guard already refuses without
-                // warning. Dropping self here avoids the wasted self round-trip
-                // entirely (the wildcard-`*` fallback residual stays covered by
-                // that grant-side guard).
-                if self_identity != Some(robot.as_str()) {
-                    ids.insert(robot);
-                }
-            }
+            demand_state.record_harvest(
+                epoch,
+                entries.into_iter().map(|(robot, _topic)| robot),
+                self_identity,
+            );
         }
         Err(e) => tracing::debug!(
             error = %e,
@@ -3573,9 +3606,11 @@ pub struct NetworkManager {
     reconciler: Mutex<BgThreadState>,
     /// Queryable inversion: the DEMANDER-side background DEMAND-GET loop
     /// thread's lifecycle state - re-issues demand GETs every
-    /// `DEMAND_GET_INTERVAL` for every registered ingress topic. Started by
-    /// [`Self::start_demand_get_loop`] (once, from the gateway); stopped by
-    /// `stop_bg_thread` in [`Drop`].
+    /// `DEMAND_GET_INTERVAL` for every topic of the demand set it was started
+    /// over. Started by [`Self::start_demand_get_loop`] once per manager,
+    /// through the first gateway boot with ingress or the first
+    /// [`Self::ensure_ingress_demand_keepalive`]; stopped by `stop_bg_thread`
+    /// in [`Drop`].
     demand_get: Mutex<BgThreadState>,
     /// The unified query surface: the PRODUCER-side retained verb-dispatched
     /// QUERYABLE (`cerulion_q/{robot}/**`) - serves both the `demand` verb
@@ -3692,19 +3727,15 @@ pub struct NetworkManager {
     /// demand. `None` on a manager that is not a gateway (no probe installed) —
     /// both paths then serve registered topics only.
     permissive_probe: Mutex<Option<Arc<PermissiveShmProbe>>>,
-    /// The DYNAMIC demand set for a PURE-INGRESS demander's self-heal
-    /// keepalive loop (`cerulion-netd`). A gateway builds its OWN
-    /// [`DemandGetState`] from its fixed boot ingress list and passes it to
-    /// [`Self::start_demand_get_loop`]; a pure-ingress demander instead calls
-    /// [`Self::ensure_ingress_demand_keepalive`] per demanded topic, which grows
-    /// THIS shared set and start-once-drives the SAME loop over it. Both share the
-    /// manager's single `demand_get` thread slot (start-once, idempotent), and a
-    /// manager is only ever ONE role - a gateway (fixed set) or a pure-ingress
-    /// demander (this dynamic set) - so they never contend. The self-heal is the
-    /// dialer→accepter demand GET (the wire direction that survives a
-    /// strict connect-only link AND re-crosses after a restarted robot gateway
-    /// reconnects), which the gateway-only wiring never started for the
-    /// pure-ingress netd path (the silent-black-hole root cause).
+    /// The manager's one DYNAMIC demand set, read by the single `demand_get`
+    /// loop. A pure-ingress demander (`cerulion-netd`) adds each demanded
+    /// topic through [`Self::ensure_ingress_demand_keepalive`]; a gateway adds
+    /// its ingress topics the same way at boot, and whoever stops the gateway
+    /// removes them with [`Self::remove_ingress_demand_keepalive`]. So a later
+    /// gateway on the same manager is demanded its own topics. The demand GET
+    /// is the dialer→accepter query (the wire direction that survives a strict
+    /// connect-only link AND re-crosses after a restarted robot gateway
+    /// reconnects).
     ingress_demand_state: Arc<DemandGetState>,
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
@@ -5592,8 +5623,10 @@ impl NetworkManager {
     ///
     /// Lifecycle mirrors [`Self::start_demand_reconciler`]: a dedicated
     /// `"cerulion-demand-get"` thread stopped by `stop_bg_thread` at
-    /// [`Drop`]. IDEMPOTENT - one loop per gateway. An empty `topics` set skips
-    /// the thread (a pure-egress gateway has no ingress to demand).
+    /// [`Drop`]. IDEMPOTENT - one loop per manager: a call while the loop
+    /// runs leaves it on the state it started with and ignores
+    /// `demand_state`. An empty `topics` set skips the thread (a pure-egress
+    /// gateway has no ingress to demand).
     ///
     /// # Errors
     ///
@@ -5625,7 +5658,7 @@ impl NetworkManager {
                 reason: "demand-get loop state mutex poisoned".to_string(),
             })?;
         if state.handle.is_some() {
-            // Already running - one loop per gateway (idempotent).
+            // Already running - one loop per manager (idempotent).
             return Ok(());
         }
 
@@ -5669,10 +5702,10 @@ impl NetworkManager {
 
     /// Register `topic` in the DYNAMIC demand-keepalive set and ensure the
     /// background demand-GET loop is running over it - the PURE-INGRESS demander's
-    /// self-heal wiring (`cerulion-netd`). A gateway starts its own loop from a
-    /// fixed boot set ([`Self::start_demand_get_loop`]); a pure-ingress demander
-    /// (which only ever calls [`crate::transport::TransportManager::register_ingress_topic`],
-    /// never boots a gateway) instead calls THIS per demanded topic so the
+    /// self-heal wiring (`cerulion-netd`), and a gateway's for its ingress
+    /// topics at boot. A pure-ingress demander (which only ever calls
+    /// [`crate::transport::TransportManager::register_ingress_topic`], never
+    /// boots a gateway) calls THIS per demanded topic so the
     /// re-affirming GET keepalive runs - the dialer→accepter query that
     /// (a) crosses a strict connect-only link the demand-token declaration cannot,
     /// and (b) RE-AFFIRMS egress within one pass after a restarted robot gateway's
@@ -5697,6 +5730,13 @@ impl NetworkManager {
         // and the running loop re-reads the grown topic set every pass - so the
         // newly-added topic is demanded on the very next pass without a restart.
         self.start_demand_get_loop(Arc::clone(&self.ingress_demand_state))
+    }
+
+    /// The DYNAMIC demand-keepalive set itself: the topics and counters the
+    /// manager's one demand-GET loop reads once a keepalive or a gateway
+    /// started it.
+    pub(crate) fn ingress_demand_state(&self) -> Arc<DemandGetState> {
+        Arc::clone(&self.ingress_demand_state)
     }
 
     /// Remove `topic` from the DYNAMIC demand-keepalive set (its mirror's
@@ -7177,6 +7217,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // Queryable inversion - pure oracle tests (no transport, no clock)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn demand_get_forgets_its_peers_once_its_last_topic_leaves() {
+        // A later user of the manager's demand set (a gateway started again)
+        // must not GET only the peers an earlier one learned: with no
+        // identity the pass falls back to the wildcard that reaches any peer.
+        let state = DemandGetState::default();
+        state.add_topic("/run_one/a".to_string());
+        state.add_topic("/run_one/b".to_string());
+        state
+            .identities
+            .lock()
+            .unwrap()
+            .insert("departed_desk".to_string());
+
+        state.remove_topic("/run_one/a");
+        assert_eq!(
+            state.identities.lock().unwrap().len(),
+            1,
+            "a topic is still demanded, so its peers stay"
+        );
+
+        // A pass that started its harvest before the reset finishes after it.
+        let in_flight = state.identity_epoch();
+        state.remove_topic("/run_one/b");
+        assert!(state.identities.lock().unwrap().is_empty());
+        state.record_harvest(in_flight, ["departed_desk".to_string()], None);
+        assert!(
+            state.identities.lock().unwrap().is_empty(),
+            "a harvest of the earlier lifecycle does not refill the set"
+        );
+        state.add_topic("/run_two/c".to_string());
+        assert_eq!(
+            demand_get_selectors("/run_two/c", &state.identities.lock().unwrap()),
+            vec![cerulion_q::demand_selector("*", "/run_two/c")]
+        );
+        // A harvest of the new lifecycle is stored, without our own name.
+        state.record_harvest(
+            state.identity_epoch(),
+            ["new_desk".to_string(), "self".to_string()],
+            Some("self"),
+        );
+        assert_eq!(
+            *state.identities.lock().unwrap(),
+            BTreeSet::from(["new_desk".to_string()])
+        );
+    }
 
     /// `demand_get_selectors` - WILDCARD when no identity is
     /// harvested (reaches every producer's `cerulion_q/{robot}/**` queryable),

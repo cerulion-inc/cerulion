@@ -39,6 +39,11 @@ pub struct EmbeddedConfig {
     /// topic once `lan_access` is `open`, an empty list sends none.
     #[serde(default, deserialize_with = "deserialize_egress")]
     pub egress: Option<Vec<String>>,
+    /// Graph input topics a LAN peer may publish into once `lan_access` is
+    /// `open`; each frame must carry the schema hash of the inputs that read
+    /// the topic. Empty unless set.
+    #[serde(default)]
+    pub ingress: Vec<String>,
     /// Raise the `_cerulion._tcp` mDNS beacon while the gateway listens on TCP.
     #[serde(default = "default_mdns")]
     pub mdns: bool,
@@ -252,6 +257,15 @@ impl EmbeddedConfig {
                         "duplicate egress topic '{topic}'"
                     )));
                 }
+            }
+        }
+        validate_topics(&self.ingress, "ingress")?;
+        let mut unique = BTreeSet::new();
+        for topic in &self.ingress {
+            if !unique.insert(topic.as_str()) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "duplicate ingress topic '{topic}'"
+                )));
             }
         }
         Ok(())
@@ -587,6 +601,62 @@ mod tests {
             (
                 r#"{"egress":["/same","/same"]}"#,
                 "duplicate egress topic '/same'",
+            ),
+        ] {
+            let error = EmbeddedConfig::parse(raw)
+                .unwrap()
+                .validate_paths(Path::new("/tmp"))
+                .unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+            assert_eq!(error.to_string(), message, "{raw}");
+        }
+    }
+
+    #[test]
+    fn ingress_is_empty_unless_set_and_keeps_its_order() {
+        assert!(EmbeddedConfig::parse("{}").unwrap().ingress.is_empty());
+        let parsed = EmbeddedConfig::parse(r#"{"ingress":["/desk/cmd","/desk/goal"]}"#).unwrap();
+        assert_eq!(
+            parsed.ingress,
+            vec!["/desk/cmd".to_string(), "/desk/goal".to_string()]
+        );
+        parsed.validate_paths(Path::new("/tmp")).unwrap();
+    }
+
+    /// An `ingress` value that is not a list of strings is a start error.
+    #[test]
+    fn rejects_an_ingress_value_that_is_not_a_list_of_topics() {
+        for raw in [
+            r#"{"ingress":null}"#,
+            r#"{"ingress":"/desk/cmd"}"#,
+            r#"{"ingress":[1]}"#,
+            r#"{"ingress":[null]}"#,
+            r#"{"ingress":{"topics":[]}}"#,
+            r#"{"ingres":[]}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_reserved_and_duplicate_ingress_topics() {
+        for (raw, message) in [
+            (
+                r#"{"ingress":["relative"]}"#,
+                "ingress topic 'relative' must be canonical and start with '/'",
+            ),
+            (
+                r#"{"ingress":["/bad//topic"]}"#,
+                "ingress topic '/bad//topic' must be canonical and start with '/'",
+            ),
+            (
+                r#"{"ingress":["/__cerulion/x"]}"#,
+                "ingress topic '/__cerulion/x' is under the reserved __cerulion/ prefix",
+            ),
+            (
+                r#"{"ingress":["/same","/same"]}"#,
+                "duplicate ingress topic '/same'",
             ),
         ] {
             let error = EmbeddedConfig::parse(raw)

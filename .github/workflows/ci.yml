@@ -1613,6 +1613,9 @@ jobs:
       - name: local-transport trace cap tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_trace_cap_test -- --test-threads=1
+      - name: local-transport LAN ingress tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test lan_ingress_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -2711,6 +2714,9 @@ jobs:
       - name: cerulion_android LAN connect integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_connect_test -- --test-threads=1
+      - name: cerulion_android LAN ingress integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test lan_ingress_test -- --test-threads=1
       - name: cerulion_android LAN ownership tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1

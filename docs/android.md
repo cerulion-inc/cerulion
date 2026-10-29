@@ -522,6 +522,7 @@ The configuration keys are:
 | `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
+| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` no frame gets in. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon, and neither do `connect` locators. Defaults to `true`. Android passes multicast to the app only while it holds a `WifiManager.MulticastLock`, which needs the `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission; see [Discovery and access](#discovery-and-access). |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 
@@ -704,8 +705,9 @@ non-empty `listen` or `connect` returns `BAD_STATE`; stop the first runtime
 before starting it.
 App publish topics must not collide with graph output topics because graph
 topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
-The gateway does not forward incoming topics to the app, so `subscribe`
-reads topics of the app's own process. JSON publishing and polling support
+`subscribe` reads topics of the app's own process: the gateway forwards no
+incoming topic to the app except the `ingress` topics, which go to the graph
+inputs that read them. JSON publishing and polling support
 only the field types listed above.
 
 ### Choose which topics leave the device
@@ -734,6 +736,53 @@ with its schema and liveness, so a desk can see that `/app/notes` exists but
 cannot receive it. A start with `egress` and an empty `listen` and `connect`
 builds no gateway, so the list has no effect and the start logs a warning.
 
+### Let a LAN peer publish into the graph
+
+A graph input can read a topic that a desk or another device publishes. Give
+the input an absolute `source:`, list the topic in `ingress`, and set
+`"lan_access": "open"`:
+
+```json
+{
+  "listen": ["tcp/127.0.0.1:7683"],
+  "lan_access": "open",
+  "graph_yaml": "<a graph whose input reads source: /desk/cmd>",
+  "ingress": ["/desk/cmd"]
+}
+```
+
+The gateway checks each frame against the schema hash of the graph inputs
+that read the topic. A frame with another schema hash is dropped, and the
+first drop of a series logs a warning. A frame with the right hash
+reaches the inputs as a frame of an app publisher does. A desk sends such a
+topic from a graph that lists it under `network: egress:` (see
+[The egress/ingress model](networking.md#the-egressingress-model)), and the
+app demands it from the desk as a graph run does.
+
+Each `ingress` topic must be read by at least one graph input that declares
+its schema, as a `#[cerulion_node]` input does, and the inputs that declare a
+schema must declare the same one. An input that declares none, as a node
+entry written by hand can, is not checked against the others and gets the
+frames the declared schema lets in. The topic must be neither a graph output
+nor a publish topic, because a topic has one writer. A start that breaks one of
+these rules fails with error code 3, or with error code 5 for a schema no input
+declares or the inputs do not agree on, and the error names the topic.
+
+Under `"paired"` the gateway opens no ingress: it subscribes to no `ingress`
+topic on the LAN and demands none, so it refuses every frame a LAN peer
+publishes, and the start logs a warning. A start with `ingress` and an empty
+`listen` and `connect` builds no gateway, so the list has no effect and the
+start logs a warning too.
+
+Ingress has no sender identity. Under `open`, any host that reaches the
+gateway can publish into every `ingress` topic, and the app cannot tell one
+host from another. An app does not host the paired remote plane, the plane
+that checks who sends (see [remote access](remote_plane.md)). Keep the list to
+the topics a desk must write. For a desk on USB, keep the listener on the
+loopback address, as the next section shows. The recording does not hold the
+frames of an `ingress` topic: `record.topics` takes graph outputs and publish
+topics only.
+
 ### Reach a desk over USB with adb forward
 
 The configuration above listens on the device's loopback address only. Use it
@@ -741,7 +790,7 @@ to serve a desk on USB without opening the app to the Wi-Fi network: no host on
 the network can reach `127.0.0.1` on the device, and a loopback endpoint raises
 no mDNS beacon, so `mdns_advertised` reads `false` and the app is not announced
 either. Other processes on the device can still reach a loopback listener, so
-keep the `egress` list to the topics the desk needs. On the desk:
+keep the `egress` and `ingress` lists to the topics the desk needs. On the desk:
 
 ```sh
 adb forward tcp:7683 tcp:7683
@@ -766,10 +815,11 @@ example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
 ```
 
 With an empty `listen` the app opens no port of its own and raises no beacon.
-The `lan_access` posture and the `egress` list apply to a desk the app dials as
-they do to a desk that dials the app: under `paired` the desk's catalog request
-and topic demands are refused, and under `open` only the listed topics are
-sent. A desk that is not listening yet does not fail the start; the app
+The `lan_access` posture and the `egress` and `ingress` lists apply to a desk
+the app dials as they do to a desk that dials the app: under `paired` the
+desk's catalog request and topic demands are refused and no frame it publishes
+gets in, and under `open` only the `egress` topics are sent and only the
+`ingress` topics take its frames. A desk that is not listening yet does not fail the start; the app
 dials it again in the background, a few seconds apart. The app dials `tcp/`
 locators only. Like `listen`, `connect` is fixed for the process lifetime by the
 first start.
