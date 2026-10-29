@@ -2125,8 +2125,12 @@ impl LivenessRecord {
 }
 
 /// The shared snapshot table: canonical topic → its observation record. The
-/// observer (on the gateway drive thread) is the sole writer; the catalog serve
-/// (on the zenoh callback thread) reads it. Cheap to clone (one `Arc`).
+/// running gateway's observer (on its drive thread) is the only writer of
+/// records; a gateway rebuilt under a latched query surface records into the
+/// same table ([`SchemaServingHandles`](super::gateway::SchemaServingHandles)),
+/// and a host restart's `replace` or `serve_nothing` clears it while no
+/// gateway drives. The catalog serve (on the zenoh callback thread) reads it. Cheap to clone (one
+/// `Arc`).
 pub type LivenessTable = Arc<Mutex<HashMap<String, LivenessRecord>>>;
 
 /// Read one topic's liveness out of a shared table as of `now_ns`. `None` for an
@@ -2300,13 +2304,36 @@ impl TopicLivenessObserver {
     /// Build an observer with an explicit tap budget and enable flag (the test
     /// seam and the construction point for a caller that resolves the switch
     /// itself).
+    pub fn with_budget(manager: Arc<TransportManager>, budget: usize, enabled: bool) -> Self {
+        // hot-path-alloc-ok: cold — one table per observer, built at boot.
+        let table = Arc::new(Mutex::new(HashMap::new()));
+        Self::build(manager, table, budget, enabled)
+    }
+
+    /// Build an observer, enabled per [`LIVENESS_ENV`], that records into
+    /// `table` rather than a fresh one: a gateway rebuilt under a query
+    /// surface an earlier gateway latched must write the table that surface
+    /// reads.
+    pub(crate) fn recording_into(manager: Arc<TransportManager>, table: LivenessTable) -> Self {
+        Self::build(
+            manager,
+            table,
+            DEFAULT_LIVENESS_TAP_BUDGET,
+            liveness_enabled_from_env(),
+        )
+    }
+
     // hot-path-alloc-ok-fn: cold: the observer is CONSTRUCTED once, at gateway boot; these are
     // its empty tap/observation tables
-    pub fn with_budget(manager: Arc<TransportManager>, budget: usize, enabled: bool) -> Self {
+    fn build(
+        manager: Arc<TransportManager>,
+        table: LivenessTable,
+        budget: usize,
+        enabled: bool,
+    ) -> Self {
         Self {
             manager,
-            // hot-path-alloc-ok: cold — one table per gateway, built at boot.
-            table: Arc::new(Mutex::new(HashMap::new())),
+            table,
             taps: HashMap::new(),
             tracked: HashSet::new(),
             // hot-path-alloc-ok: cold — the reusable canonical sweep order,
