@@ -30,6 +30,10 @@ pub struct EmbeddedConfig {
     /// Who may reach the app's topics over the LAN; `paired` unless set.
     #[serde(default)]
     pub lan_access: LanAccessConfig,
+    /// The only topics the gateway sends to a LAN peer; absent sends every
+    /// topic once `lan_access` is `open`, an empty list sends none.
+    #[serde(default, deserialize_with = "deserialize_egress")]
+    pub egress: Option<Vec<String>>,
     /// Raise the `_cerulion._tcp` mDNS beacon while the gateway listens on TCP.
     #[serde(default = "default_mdns")]
     pub mdns: bool,
@@ -115,6 +119,15 @@ pub struct SubscribeConfig {
     /// defaults to 10, the default depth of a node input.
     #[serde(default = "default_subscribe_depth")]
     pub depth: usize,
+}
+
+/// A present `egress` key must hold a list: `null` is refused, never read
+/// as the absent key that sends every topic.
+fn deserialize_egress<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 fn default_subscribe_depth() -> usize {
@@ -214,6 +227,17 @@ impl EmbeddedConfig {
                     "depth for '{}' must be at least 1",
                     subscribe.topic
                 )));
+            }
+        }
+        if let Some(egress) = &self.egress {
+            validate_topics(egress, "egress")?;
+            let mut unique = BTreeSet::new();
+            for topic in egress {
+                if !unique.insert(topic.as_str()) {
+                    return Err(EmbedError::InvalidArgument(format!(
+                        "duplicate egress topic '{topic}'"
+                    )));
+                }
             }
         }
         Ok(())
@@ -417,6 +441,67 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate_paths(Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn egress_is_absent_unless_set_and_an_empty_list_stays_empty() {
+        assert_eq!(EmbeddedConfig::parse("{}").unwrap().egress, None);
+        assert_eq!(
+            EmbeddedConfig::parse(r#"{"egress":[]}"#).unwrap().egress,
+            Some(Vec::new())
+        );
+        let parsed = EmbeddedConfig::parse(r#"{"egress":["/app/state","/app/pose"]}"#).unwrap();
+        assert_eq!(
+            parsed.egress,
+            Some(vec!["/app/state".to_string(), "/app/pose".to_string()])
+        );
+    }
+
+    /// An `egress` value that is not a list of strings is a start error,
+    /// never the allow-all of an absent key.
+    #[test]
+    fn rejects_an_egress_value_that_is_not_a_list_of_topics() {
+        for raw in [
+            r#"{"egress":null}"#,
+            r#"{"egress":"/app/state"}"#,
+            r#"{"egress":[1]}"#,
+            r#"{"egress":[null]}"#,
+            r#"{"egress":{"topics":[]}}"#,
+            r#"{"egress":true}"#,
+            r#"{"egres":[]}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_reserved_and_duplicate_egress_topics() {
+        for (raw, message) in [
+            (
+                r#"{"egress":["relative"]}"#,
+                "egress topic 'relative' must be canonical and start with '/'",
+            ),
+            (
+                r#"{"egress":["/bad//topic"]}"#,
+                "egress topic '/bad//topic' must be canonical and start with '/'",
+            ),
+            (
+                r#"{"egress":["/__cerulion/x"]}"#,
+                "egress topic '/__cerulion/x' is under the reserved __cerulion/ prefix",
+            ),
+            (
+                r#"{"egress":["/same","/same"]}"#,
+                "duplicate egress topic '/same'",
+            ),
+        ] {
+            let error = EmbeddedConfig::parse(raw)
+                .unwrap()
+                .validate_paths(Path::new("/tmp"))
+                .unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+            assert_eq!(error.to_string(), message, "{raw}");
+        }
     }
 
     #[test]
