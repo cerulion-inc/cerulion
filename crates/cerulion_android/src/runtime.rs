@@ -13,8 +13,8 @@ use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
 use cerulion_core::dynamic::{SchemaSet, WireLayout};
 use cerulion_core::graph::{
-    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, GraphTopology, NodeEntry,
-    NodeTickPanicRecords,
+    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, GraphTopology, NodeDef,
+    NodeEntry, NodeInfo, NodeTickPanicRecords,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
@@ -1076,6 +1076,7 @@ impl EmbeddedRuntime {
             let info = entry
                 .info()
                 .map_err(|error| EmbedError::Graph(error.to_string()))?;
+            check_declared_outputs_listed(node, &info)?;
             infos.insert(node.id.clone(), info);
             factories.insert(node.id.clone(), entry);
         }
@@ -1876,6 +1877,31 @@ fn resolve_subscribe(
         depth: subscribe.depth,
         produced_in_run: !producers.is_empty(),
     })
+}
+
+/// Fail the start when `node` declares an output its graph entry does not
+/// list.
+///
+/// The graph creates a publisher only for each output the YAML lists, so a
+/// node has none for an output it declares and the YAML leaves out. The
+/// refusal applies to every node: a `#[cerulion_node]` node would otherwise
+/// fail every tick before its body runs, and the graph would report running
+/// while it does nothing. The first such output, in the node's declaration
+/// order, is named.
+fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<(), EmbedError> {
+    let unlisted = info
+        .output_names()
+        .iter()
+        .find(|declared| !node.outputs.iter().any(|listed| listed.name == **declared));
+    match unlisted {
+        None => Ok(()),
+        Some(output) => Err(EmbedError::Graph(format!(
+            "node '{}' output '{output}': the node declares this output and the graph does \
+             not list it, so the node has no publisher for it; add `- name: {output}` with \
+             its `schema:` under the node's `outputs:`",
+            node.id
+        ))),
+    }
 }
 
 /// The deepest queue the graph's inputs declare on each topic they read.
@@ -2795,6 +2821,117 @@ nodes:
         );
         // 64 itself is the limit, not past it.
         assert!(input_depths_by_topic(&depth_graph(64, 64)).is_ok());
+    }
+
+    /// The one node of a graph whose entry lists `outputs` (YAML text).
+    fn node_listing(outputs: &str) -> NodeDef {
+        let config = parse_graph(&format!(
+            "prefix: outputs
+nodes:
+  - id: logic
+    type: relay
+{outputs}"
+        ))
+        .expect("parse the outputs graph");
+        config.nodes.into_iter().next().expect("one node")
+    }
+
+    fn declaring(outputs: &[&str]) -> NodeInfo {
+        NodeInfo::from_names(
+            Vec::new(),
+            outputs.iter().map(|name| name.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn a_node_whose_declared_outputs_are_all_listed_starts() {
+        let both = node_listing(
+            "    outputs:
+      - name: echo
+        schema: geometry_msgs/Vector3
+      - name: state
+        schema: geometry_msgs/Vector3
+        topic: /app/state
+",
+        );
+        // Listed in another order, and with a topic of its own: the name is
+        // what binds an output.
+        assert!(check_declared_outputs_listed(&both, &declaring(&["state", "echo"])).is_ok());
+        // A node that declares no output needs no `outputs:`.
+        assert!(check_declared_outputs_listed(&node_listing(""), &declaring(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_declared_output_the_graph_does_not_list_is_refused_by_node_and_output() {
+        let error = check_declared_outputs_listed(&node_listing(""), &declaring(&["echo"]))
+            .expect_err("an unlisted output is refused");
+        let EmbedError::Graph(message) = &error else {
+            panic!("expected a graph error, got: {error}");
+        };
+        assert_eq!(
+            message,
+            "node 'logic' output 'echo': the node declares this output and the graph does not \
+             list it, so the node has no publisher for it; add `- name: echo` with its \
+             `schema:` under the node's `outputs:`"
+        );
+    }
+
+    #[test]
+    fn the_first_unlisted_output_in_declaration_order_is_named() {
+        let listed = node_listing(
+            "    outputs:
+      - name: b
+        schema: geometry_msgs/Vector3
+",
+        );
+        // Two runs on the same input name the same output in the same words.
+        for _ in 0..2 {
+            let error = check_declared_outputs_listed(&listed, &declaring(&["c", "b", "a"]))
+                .expect_err("two unlisted outputs are refused");
+            assert_eq!(
+                error.to_string(),
+                "node 'logic' output 'c': the node declares this output and the graph does \
+                 not list it, so the node has no publisher for it; add `- name: c` with its \
+                 `schema:` under the node's `outputs:`"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_listed_name_that_matches_exactly_lists_an_output() {
+        // A different case, a longer name and a shorter name each leave
+        // `echo` unlisted.
+        for listed in ["Echo", "echo_raw", "ech"] {
+            let node = node_listing(&format!(
+                "    outputs:
+      - name: {listed}
+        schema: geometry_msgs/Vector3
+"
+            ));
+            let error = check_declared_outputs_listed(&node, &declaring(&["echo"]))
+                .expect_err("names match exactly");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("node 'logic' output 'echo': "),
+                "listed {listed}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_output_the_node_does_not_declare_is_not_refused_here() {
+        // An extra listed output only creates a publisher the node never
+        // writes, so it is accepted.
+        let extra = node_listing(
+            "    outputs:
+      - name: echo
+        schema: geometry_msgs/Vector3
+      - name: spare
+        schema: geometry_msgs/Vector3
+",
+        );
+        assert!(check_declared_outputs_listed(&extra, &declaring(&["echo"])).is_ok());
     }
 
     #[test]
