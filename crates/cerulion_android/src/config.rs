@@ -24,6 +24,9 @@ pub struct EmbeddedConfig {
     /// App-created publishers.
     #[serde(default)]
     pub publish: Vec<PublishConfig>,
+    /// App subscriptions, read with `poll`.
+    #[serde(default)]
+    pub subscribe: Vec<SubscribeConfig>,
     /// Who may reach the app's topics over the LAN; `paired` unless set.
     #[serde(default)]
     pub lan_access: LanAccessConfig,
@@ -100,6 +103,24 @@ pub struct PublishConfig {
     pub max_payload_bytes: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Configuration for one app subscription.
+pub struct SubscribeConfig {
+    /// Canonical absolute topic name.
+    pub topic: String,
+    /// Qualified message schema name.
+    pub schema: String,
+    /// Messages the subscription queue holds before it drops the oldest;
+    /// defaults to 10, the default depth of a node input.
+    #[serde(default = "default_subscribe_depth")]
+    pub depth: usize,
+}
+
+fn default_subscribe_depth() -> usize {
+    cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH
+}
+
 fn default_mdns() -> bool {
     true
 }
@@ -167,6 +188,31 @@ impl EmbeddedConfig {
                 return Err(EmbedError::InvalidArgument(format!(
                     "max_payload_bytes for '{}' must be 1..=1048576",
                     publish.topic
+                )));
+            }
+        }
+        validate_topics(
+            &self
+                .subscribe
+                .iter()
+                .map(|item| item.topic.clone())
+                .collect::<Vec<_>>(),
+            "subscribe.topic",
+        )?;
+        let mut unique = BTreeSet::new();
+        for subscribe in &self.subscribe {
+            if !unique.insert(subscribe.topic.as_str()) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "duplicate subscribe topic '{}'",
+                    subscribe.topic
+                )));
+            }
+            // The upper bound is the transport's queue ceiling, checked
+            // where the subscription is created.
+            if subscribe.depth == 0 {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "depth for '{}' must be at least 1",
+                    subscribe.topic
                 )));
             }
         }
@@ -371,5 +417,62 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate_paths(Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn subscribe_entries_parse_with_a_default_depth_of_10() {
+        let parsed = EmbeddedConfig::parse(
+            r#"{"subscribe":[{"topic":"/app/state","schema":"std_msgs/String"},{"topic":"/app/pose","schema":"geometry_msgs/Vector3","depth":3}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.subscribe.len(), 2);
+        assert_eq!(parsed.subscribe[0].topic, "/app/state");
+        assert_eq!(parsed.subscribe[0].schema, "std_msgs/String");
+        assert_eq!(parsed.subscribe[0].depth, 10);
+        assert_eq!(parsed.subscribe[1].depth, 3);
+        assert!(EmbeddedConfig::parse("{}").unwrap().subscribe.is_empty());
+        parsed.validate_paths(Path::new("/tmp")).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_misspelled_subscribe_key() {
+        for raw in [
+            r#"{"subscribe":[{"topic":"/a","schema":"std_msgs/String","queue_depth":3}]}"#,
+            r#"{"subscribe":[{"topic":"/a"}]}"#,
+            r#"{"subscribe":[{"topic":"/a","schema":"std_msgs/String","depth":-1}]}"#,
+            r#"{"subscriptions":[]}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_duplicate_and_zero_depth_subscriptions() {
+        for (raw, message) in [
+            (
+                r#"{"subscribe":[{"topic":"relative","schema":"std_msgs/String"}]}"#,
+                "subscribe.topic topic 'relative' must be canonical and start with '/'",
+            ),
+            (
+                r#"{"subscribe":[{"topic":"/__cerulion/x","schema":"std_msgs/String"}]}"#,
+                "subscribe.topic topic '/__cerulion/x' is under the reserved __cerulion/ prefix",
+            ),
+            (
+                r#"{"subscribe":[{"topic":"/same","schema":"std_msgs/String"},{"topic":"/same","schema":"std_msgs/String"}]}"#,
+                "duplicate subscribe topic '/same'",
+            ),
+            (
+                r#"{"subscribe":[{"topic":"/x","schema":"std_msgs/String","depth":0}]}"#,
+                "depth for '/x' must be at least 1",
+            ),
+        ] {
+            let error = EmbeddedConfig::parse(raw)
+                .unwrap()
+                .validate_paths(Path::new("/tmp"))
+                .unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+            assert_eq!(error.to_string(), message, "{raw}");
+        }
     }
 }
