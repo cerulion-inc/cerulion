@@ -39,7 +39,7 @@
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole: 24, all of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 26, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
 //!
 //! A process-per-arm runner shortens that list, it does not empty it. The process
@@ -241,6 +241,13 @@ const CHILD_SPAWN_BINARY: &str = "CARGO_BIN_EXE_cerulion";
 const SUPPORT_MODULE: &str = "crates/cerulion_cli/tests/mp_support/mod.rs";
 const SUPPORT_SPAWN_HELPERS: &[&str] = &["spawn_mp_record", "spawn_graph_run_graph"];
 
+/// The read-identity harness module and its launchers that spawn `graph run`: a
+/// file that declares the module and names one of them, as a whole word, however
+/// it imports it, is reached through it.
+const READ_IDENTITY_MODULE: &str = "crates/cerulion_cli/tests/read_identity/mod.rs";
+const READ_IDENTITY_DECL: &str = "mod read_identity;";
+const READ_IDENTITY_SPAWN_HELPERS: &[&str] = &["record_live", "run_live"];
+
 /// Reached by the derivation and deliberately NOT waived, as `(path, why)`.
 ///
 /// The derivation selects every binary that can reach a plugin load, which is wider
@@ -309,14 +316,16 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 24 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Four of the 24,
-/// `ros2_graph_e2e_test`, `network_gateway_e2e_test`, `mp_supervisor_box_test` and
-/// `mp_live_determinism_box_test`, are in the set BY THE RULE rather than by
-/// measurement: no run has observed them failing. Of those four, every arm of
-/// `mp_supervisor_box_test` is `#[ignore]`d, and every arm of
+/// THE COVERAGE THIS COSTS, stated once: 26 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Six of the 26,
+/// `ros2_graph_e2e_test`, `network_gateway_e2e_test`, `mp_supervisor_box_test`,
+/// `mp_live_determinism_box_test`, `read_identity_box_test` and
+/// `slow_does_not_block_box_test`, are in the set BY THE RULE rather than by
+/// measurement: no run has observed them failing. Of those six, every arm of
+/// `mp_supervisor_box_test`, `read_identity_box_test` and
+/// `slow_does_not_block_box_test` is `#[ignore]`d, and every arm of
 /// `mp_live_determinism_box_test` but one pure check of its verdict function, so
-/// neither loads a plugin under `cargo test` on any platform; the other two carry no
+/// none of the four loads a plugin under `cargo test` on any platform; the other two carry no
 /// platform `cfg` and no `ignore`, so why they have not been observed failing is not
 /// established here. The cure is an upstream release carrying the fix, or the pinned
 /// fork carrying a patch for it; nothing in this repository can shorten the list.
@@ -398,11 +407,19 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
+        "crates/cerulion_cli/tests/read_identity_box_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
         "crates/cerulion_cli/tests/ros2_graph_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
         "crates/cerulion_cli/tests/signal_matrix_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/slow_does_not_block_box_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
@@ -750,6 +767,12 @@ fn the_whole_binary_inventory_equals_the_two_route_walk() {
          below resolves nothing and every file that spawns only through it would walk \
          out of the inventory. Re-derive the helper list."
     );
+    let read_identity = read_at(READ_IDENTITY_MODULE);
+    assert!(
+        read_identity.contains(CHILD_SPAWN_BINARY) && leads_an_argv_with_graph_run(&read_identity),
+        "{READ_IDENTITY_MODULE} no longer holds a `graph run` spawn, so its launchers in \
+         READ_IDENTITY_SPAWN_HELPERS resolve nothing. Re-derive the helper list."
+    );
     let mut found: Vec<String> = Vec::new();
     for crate_dir in ["cerulion_cli", "cerulion_cli_engine"] {
         let dir = workspace_root()
@@ -777,7 +800,11 @@ fn the_whole_binary_inventory_equals_the_two_route_walk() {
             let in_process = src.contains(IN_PROCESS_CDYLIB_LOAD);
             let own_child = src.contains(CHILD_SPAWN_BINARY) && leads_an_argv_with_graph_run(&src);
             let via_support = SUPPORT_SPAWN_HELPERS.iter().any(|h| src.contains(h));
-            if in_process || own_child || via_support {
+            let via_read_identity = src.contains(READ_IDENTITY_DECL)
+                && READ_IDENTITY_SPAWN_HELPERS
+                    .iter()
+                    .any(|h| mentions_ident(&src, h));
+            if in_process || own_child || via_support || via_read_identity {
                 found.push(rel);
             }
         }
