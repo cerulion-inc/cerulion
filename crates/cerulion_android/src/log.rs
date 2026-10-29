@@ -417,9 +417,9 @@ mod tests {
     fn a_large_line_does_not_keep_its_buffer_after_it_is_written() {
         let large = "x".repeat(64 * 1024);
         let lines = capture(LogLevelConfig::Info, || {
-            tracing::info!(target: "app", "{large}");
+            tracing::info!(target: "app", value = %large, "large");
         });
-        assert_eq!(lines[0].1.len(), "app: ".len() + large.len());
+        assert_eq!(lines[0].1.len(), "app: large value=".len() + large.len());
         let kept = LINE.with(|line| line.borrow().capacity());
         assert!(
             kept <= LINE_CAPACITY,
