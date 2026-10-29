@@ -2690,6 +2690,9 @@ jobs:
       - name: cerulion_android schema restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+      - name: cerulion_android catalog restart integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_catalog_restart_test -- --test-threads=1
       - name: cerulion_android gateway exclusivity integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
