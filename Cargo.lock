@@ -1261,6 +1261,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "test_node_macro_period_cdylib",
+ "test_node_macro_period_input_cdylib",
  "test_node_macro_relay_rlib",
  "thiserror 2.0.17",
  "toml",

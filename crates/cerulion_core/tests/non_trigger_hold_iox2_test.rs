@@ -1966,7 +1966,7 @@ fn stamped_borrow_requirement_raises_created_service_above_the_borrow_floor() {
     let mgr = ext_test_manager_with_clock("pos", Arc::clone(&clock));
 
     // The supervisor's harvested stamp — borrow 5, STRICTLY above the create-side
-    // floor (3 == SUBSCRIBER_MAX_BORROWED_HELD; pub(crate), literal here), so
+    // floor (3 == SUBSCRIBER_MAX_BORROWED_HELD, a hand-written oracle here), so
     // the created value below cannot be explained by the floor.
     let mut overrides: std::collections::BTreeMap<String, cerulion_core::TopicRequirements> =
         std::collections::BTreeMap::new();
@@ -2046,7 +2046,7 @@ fn without_stamp_cross_group_snapshot_consumer_builds_on_the_borrow_floor() {
         build_producer_via_worker_path(&mgr, Arc::clone(&clock), prefix, "neg_bar", None);
 
     // (1) DIRECT borrow-floor pin: the created service reads borrow 3 (== the
-    // SUBSCRIBER_MAX_BORROWED_HELD; pub(crate), literal here). Reverting
+    // SUBSCRIBER_MAX_BORROWED_HELD, a hand-written oracle here). Reverting
     // the floor drops this to the iceoryx2 default 2 and the consumer
     // open below fails.
     assert_eq!(
@@ -2633,7 +2633,7 @@ fn producer_graph_first_then_snapshot_consumer_builds_and_holds() {
 
 /// DRIFT-GUARD: a producer-only OWNED topic — no consumer, no
 /// snapshot source, no cross-group stamp — is created at the borrow FLOOR
-/// (3 == `SUBSCRIBER_MAX_BORROWED_HELD`; `pub(crate)`, literal here) purely from
+/// (3 == `SUBSCRIBER_MAX_BORROWED_HELD`, a hand-written oracle here) purely from
 /// the CREATE leg (`create_borrowed_samples` at the open site — the open
 /// requirement stays None). Without the floor an owned topic with no snapshot consumer
 /// is created at the iceoryx2 default 2; a floor revert makes this read 2.

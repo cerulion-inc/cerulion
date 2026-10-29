@@ -1601,6 +1601,9 @@ jobs:
       - name: local-transport linked node tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_linked_nodes_test -- --test-threads=1
+      - name: local-transport app topic to linked node tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -2705,6 +2708,9 @@ jobs:
       - name: cerulion_android linked node integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
+      - name: cerulion_android app topic to linked node integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test

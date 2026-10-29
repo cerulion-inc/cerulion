@@ -204,10 +204,14 @@ pub(crate) const ICEORYX2_DEFAULT_BORROWED_SAMPLES: usize = 2;
 /// latest(1) + receive-transient(1) = 3 — one above the iceoryx2 default
 /// of 2. Defined as `default + 1` so the "held + latest + transient =
 /// default + 1" rationale is self-documenting (and tracks the default if it
-/// ever changes — guarded by the drift-guard test). Set ONLY on
-/// snapshot-source topics (see
-/// [`TopicServiceConfig::subscriber_max_borrowed_samples`]).
-pub(crate) const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
+/// ever changes — guarded by the drift-guard test). Armed as an open
+/// requirement ONLY on snapshot-source topics (see
+/// [`TopicServiceConfig::subscriber_max_borrowed_samples`]); a topic the
+/// graph owns is CREATED at it as a floor. Public so a runtime that creates a
+/// topic before the graph that reads it (the Android embedded runtime's app
+/// publishers) can create it at the same floor through
+/// [`TopicServiceConfig::create_borrow_floor`].
+pub const SUBSCRIBER_MAX_BORROWED_HELD: usize = ICEORYX2_DEFAULT_BORROWED_SAMPLES + 1;
 
 /// Drift-guard hook (test-only): iceoryx2's LIVE create-default
 /// `max_subscribers` for a publish-subscribe service — the subscriber cap a
@@ -976,9 +980,13 @@ pub struct TopicServiceConfig {
     /// peak is the held-loan count — above the iceoryx2 default of
     /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` (2). It differs from the
     /// owned-topic floor (which is keyed on [`PublisherProvisioning`] and pinned
-    /// at `SUBSCRIBER_MAX_BORROWED_HELD` = 3 — both pub(crate) consts, unlinked
-    /// for the same rustdoc reason) in both trigger and value, so it is
-    /// its own knob rather than a special case folded into that rule.
+    /// at [`SUBSCRIBER_MAX_BORROWED_HELD`] = 3) in both trigger and value, so it
+    /// is its own knob rather than a special case folded into that rule.
+    ///
+    /// Also set by the Android embedded runtime on every app publisher, at
+    /// [`SUBSCRIBER_MAX_BORROWED_HELD`]: the app creates its topics before the
+    /// graph builds, so a graph node that holds an app topic as a latest-value
+    /// input needs the topic created at the owned-topic floor.
     ///
     /// A floor at or below the iceoryx2 default is a no-op (`None`-equivalent);
     /// `None` (the default everywhere) changes nothing.

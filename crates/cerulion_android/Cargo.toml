@@ -57,6 +57,7 @@ tempfile = "3"
 # Node crates linked as plain libraries, the way an app runtime library links
 # its nodes: `default-features = false` leaves the C exports out.
 test_node_macro_period_cdylib = { path = "../test_fixtures/test_node_macro_period_cdylib", default-features = false }
+test_node_macro_period_input_cdylib = { path = "../test_fixtures/test_node_macro_period_input_cdylib", default-features = false }
 test_node_macro_relay_rlib = { path = "../test_fixtures/test_node_macro_relay_rlib" }
 zenoh = { version = "1", default-features = false, features = ["transport_tcp"] }
 
