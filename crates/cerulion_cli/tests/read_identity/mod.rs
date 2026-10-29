@@ -1189,6 +1189,7 @@ impl Fixture {
         let input = |name: &str, source: String| InputDef {
             name: name.to_string(),
             source,
+            ..Default::default()
         };
         let node = |id: &str,
                     ty: &str,
@@ -1350,6 +1351,7 @@ pub fn node_def(
             .map(|(name, source)| InputDef {
                 name: (*name).to_string(),
                 source: (*source).to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs
