@@ -39,12 +39,14 @@ fn period_node(id: &str, node_type: &str) -> String {
     )
 }
 
-/// Two panicking nodes (`first`, `second`) and one healthy node (`steady`).
+/// Two panicking nodes (`zeta`, `alpha`, in that graph order, so the list
+/// order is neither name nor panic order by chance) and one healthy node
+/// (`steady`).
 fn panic_graph(prefix: &str) -> String {
     format!(
         "prefix: {prefix}\nnodes:\n{}{}{}",
-        period_node("first", "test_node_macro_period_panic_cdylib"),
-        period_node("second", "test_node_macro_period_panic_cdylib"),
+        period_node("zeta", "test_node_macro_period_panic_cdylib"),
+        period_node("alpha", "test_node_macro_period_panic_cdylib"),
         period_node("steady", "test_node_macro_period_cdylib"),
     )
 }
@@ -79,7 +81,7 @@ fn wait_for_failures(runtime: &EmbeddedRuntime, wanted: usize) -> Vec<NodeFailur
 
 /// The hand-written oracle: both panicking nodes, in graph order.
 fn expected_failures() -> Vec<NodeFailure> {
-    ["first", "second"]
+    ["zeta", "alpha"]
         .iter()
         .map(|node_id| NodeFailure {
             node_id: (*node_id).to_string(),
@@ -119,8 +121,8 @@ fn panics_reported_while_running(runtime: &mut EmbeddedRuntime, prefix: &str) ->
     assert_eq!(
         status_json["node_failures"],
         json!([
-            {"node_id": "first", "message": PANIC_MESSAGE},
-            {"node_id": "second", "message": PANIC_MESSAGE},
+            {"node_id": "zeta", "message": PANIC_MESSAGE},
+            {"node_id": "alpha", "message": PANIC_MESSAGE},
         ])
     );
 
@@ -159,6 +161,13 @@ fn status_reports_contained_node_tick_panics_while_the_graph_runs() {
     let second_run = panics_reported_while_running(&mut runtime, &format!("panic_two_{pid}"));
     assert_eq!(first_run, second_run);
     runtime.stop().expect("stop the second panic graph");
+
+    // A start refused before its config parsed leaves the report as it was.
+    let error = runtime
+        .start("{not json")
+        .expect_err("unparsable config must be refused");
+    assert_eq!(error.code(), codes::INVALID_ARGUMENT);
+    assert_eq!(node_failures(&runtime), expected_failures());
 
     // A start that is refused after its config parsed still clears the
     // earlier run's report: the failure is the start's, not a node's.

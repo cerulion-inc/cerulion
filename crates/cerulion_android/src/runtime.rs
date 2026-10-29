@@ -177,8 +177,8 @@ pub struct NodeFailure {
 /// Read while the graph runs: [`Self::list`] and the status JSON read the
 /// graph runtime's records at the time of the read. A clone keeps the list
 /// as it was when cloned, so a cloned [`Status`] is a snapshot. The records
-/// stay readable after `stop`; the next start with a valid config clears
-/// them, also when that start then fails.
+/// stay readable after `stop`; the next start whose config parses and
+/// passes its path checks clears them, also when that start then fails.
 #[derive(Default)]
 pub struct NodeFailures {
     source: FailureSource,

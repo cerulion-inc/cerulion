@@ -503,8 +503,9 @@ snapshot can look like this:
 as an object with the node's graph `node_id` and its first panic `message`.
 The runtime contains the panic: that node does not run again, the rest of
 the graph keeps running, and `state` stays `running`. A node is listed once.
-The list stays readable after `stop`. The next `start` with a valid config
-clears it, also when that start then fails. A node that returns an error
+The list stays readable after `stop`. The next `start` whose config parses
+and passes its path checks clears it, also when that start then fails, for
+example on a node type that is not linked. A node that returns an error
 from its tick is not listed.
 
 The `recorder` summary is available after stop and includes message, channel,

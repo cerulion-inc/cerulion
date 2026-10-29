@@ -21,8 +21,9 @@ use cerulion_core::prelude::*;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 
-/// Publishes its tick number in `out.x`; panics on tick `panic_at`
-/// (0 = never panics).
+/// Publishes its tick number in `out.x`; panics on tick `panic_at`, and
+/// from tick `error_at` on returns an error instead, `Fatal` when `fatal`
+/// (0 = never).
 #[cerulion_node(period_ms = 5)]
 #[derive(Default)]
 struct Producer {
@@ -30,6 +31,8 @@ struct Producer {
     out: Vector3,
     n: u32,
     panic_at: u32,
+    error_at: u32,
+    fatal: bool,
 }
 #[cerulion_node_impl]
 impl Producer {
@@ -37,6 +40,14 @@ impl Producer {
         self.n += 1;
         if self.panic_at != 0 && self.n >= self.panic_at {
             panic!("encoder lost at tick {}", self.n);
+        }
+        if self.error_at != 0 && self.n >= self.error_at {
+            let message = format!("encoder lost at tick {}", self.n);
+            return Err(if self.fatal {
+                NodeError::Fatal(message)
+            } else {
+                NodeError::Logic(message)
+            });
         }
         self.out.x = self.n as f64;
         Ok(())
@@ -63,17 +74,29 @@ fn producer(id: &str) -> NodeDef {
 
 /// A graph of producers `(id, panic_at)`, in this order.
 fn build(producers: &[(&str, u32)]) -> GraphRuntime {
+    build_with(
+        producers
+            .iter()
+            .map(|(id, panic_at)| {
+                (
+                    *id,
+                    Producer {
+                        panic_at: *panic_at,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A graph of producers `(id, state)`, in this order.
+fn build_with(producers: Vec<(&str, Producer)>) -> GraphRuntime {
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     let mut nodes = Vec::new();
-    for (id, panic_at) in producers {
+    for (id, state) in producers {
         nodes.push(producer(id));
-        factories.insert(
-            (*id).to_string(),
-            Box::new(ProducerEntry::with_state(Producer {
-                panic_at: *panic_at,
-                ..Default::default()
-            })),
-        );
+        factories.insert(id.to_string(), Box::new(ProducerEntry::with_state(state)));
     }
     let config = GraphConfig {
         level_assignments: None,
@@ -136,21 +159,41 @@ fn a_handle_taken_before_the_run_reads_each_panic_as_it_is_recorded() {
 }
 
 #[test]
-fn records_list_in_graph_order_not_in_panic_order() {
-    let mut rt = build(&[("left", 5), ("steady", 0), ("right", 3)]);
+fn records_list_in_graph_order_not_in_panic_or_name_order() {
+    // Graph order is zulu, steady, alpha: neither the panic order (alpha
+    // first) nor the name order (alpha first).
+    let mut rt = build(&[("zulu", 5), ("steady", 0), ("alpha", 3)]);
     let handle = rt.node_tick_panic_records();
     step(&mut rt, 3);
     assert_eq!(
         records(&handle),
-        owned(&[("right", "encoder lost at tick 3")])
+        owned(&[("alpha", "encoder lost at tick 3")])
     );
     step(&mut rt, 2);
     assert_eq!(
         records(&handle),
         owned(&[
-            ("left", "encoder lost at tick 5"),
-            ("right", "encoder lost at tick 3"),
+            ("zulu", "encoder lost at tick 5"),
+            ("alpha", "encoder lost at tick 3"),
         ])
+    );
+}
+
+#[test]
+fn a_tick_that_returns_an_error_is_not_recorded_as_a_panic() {
+    let failing = |fatal| Producer {
+        error_at: 2,
+        fatal,
+        ..Default::default()
+    };
+    let mut rt = build_with(vec![("logic", failing(false)), ("fatal", failing(true))]);
+    let handle = rt.node_tick_panic_records();
+    step(&mut rt, 5);
+    assert!(records(&handle).is_empty(), "{:?}", records(&handle));
+    assert_eq!(
+        rt.node_fatal_errors(),
+        owned(&[("fatal", "Fatal error: encoder lost at tick 2")]),
+        "the fatal error is reported apart from the panics"
     );
 }
 
