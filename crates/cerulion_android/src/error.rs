@@ -20,7 +20,7 @@ pub mod codes {
     pub const NETWORK: i32 = 6;
     /// Recording setup or execution failed.
     pub const RECORDER: i32 = 7;
-    /// Requested publish topic is not configured.
+    /// Requested publish or subscribe topic is not configured.
     pub const UNKNOWN_TOPIC: i32 = 8;
     /// JSON values could not be encoded.
     pub const ENCODE: i32 = 9;
@@ -33,6 +33,12 @@ pub mod codes {
     pub const PANIC: i32 = 12;
     /// The OS refused to create a worker thread; retry later.
     pub const SPAWN: i32 = 13;
+    /// A received frame could not be decoded into JSON; it was consumed.
+    pub const DECODE: i32 = 14;
+    /// The subscription queue holds no message.
+    pub const EMPTY: i32 = 15;
+    /// The transport refused to create a subscription or receive from it.
+    pub const RECEIVE: i32 = 16;
 }
 
 #[derive(Debug, Error)]
@@ -59,8 +65,8 @@ pub enum EmbedError {
     /// Recorder setup or execution failed.
     #[error("{0}")]
     Recorder(String),
-    /// The requested publish topic is not configured.
-    #[error("unknown publish topic '{0}'")]
+    /// The requested publish or subscribe topic is not configured.
+    #[error("{0}")]
     UnknownTopic(String),
     /// Publish JSON could not be encoded.
     #[error("{0}")]
@@ -77,6 +83,12 @@ pub enum EmbedError {
     /// The OS refused to create a worker thread.
     #[error("{0}")]
     Spawn(String),
+    /// A received frame could not be decoded into JSON.
+    #[error("{0}")]
+    Decode(String),
+    /// The transport refused to create a subscription or receive from it.
+    #[error("{0}")]
+    Receive(String),
 }
 
 impl EmbedError {
@@ -96,6 +108,8 @@ impl EmbedError {
             Self::Busy(_) => codes::BUSY,
             Self::Panic(_) => codes::PANIC,
             Self::Spawn(_) => codes::SPAWN,
+            Self::Decode(_) => codes::DECODE,
+            Self::Receive(_) => codes::RECEIVE,
         }
     }
 }
@@ -120,13 +134,19 @@ mod tests {
             (EmbedError::Busy(String::new()), 11),
             (EmbedError::Panic(String::new()), 12),
             (EmbedError::Spawn(String::new()), 13),
+            (EmbedError::Decode(String::new()), 14),
+            (EmbedError::Receive(String::new()), 16),
         ];
+        // EMPTY (15) is a poll outcome, not an error: no variant carries
+        // it, and with it the codes run 1 to 16 without a gap.
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
+        actual.push(codes::EMPTY);
         actual.sort_unstable();
-        assert_eq!(actual, (1..=13).collect::<Vec<_>>());
+        assert_eq!(actual, (1..=16).collect::<Vec<_>>());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }
         assert_eq!(codes::OK, 0);
+        assert_eq!(codes::EMPTY, 15);
     }
 }

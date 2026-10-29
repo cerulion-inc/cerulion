@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::strings::JNIString;
 use jni::sys::{jint, jstring};
 use jni::JNIEnv;
@@ -82,6 +82,42 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish(
                 return Err(codes::ENCODE);
             }
             java_string(&mut env, &json)
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePoll(
+    mut env: JNIEnv,
+    _class: JClass,
+    topic: JString,
+    out: JObject,
+) -> jint {
+    guarded_code(|| {
+        let topic = match java_string(&mut env, &topic) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+        if out.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        // The message is appended while the host holds the runtime lock,
+        // because it borrows the subscription's buffer.
+        crate::host::poll_with(&topic, |json| {
+            let appended = env.new_string(json).and_then(|text| {
+                env.call_method(
+                    &out,
+                    "append",
+                    "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                    &[JValue::Object(&text)],
+                )
+            });
+            match appended {
+                Ok(_) => codes::OK,
+                // Out of memory: the Java exception is pending and is what
+                // the caller sees when this call returns.
+                Err(_) => codes::PANIC,
+            }
         })
     })
 }

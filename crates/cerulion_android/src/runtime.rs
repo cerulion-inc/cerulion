@@ -34,6 +34,7 @@ use serde::Serialize;
 use crate::config::{validate_robot_name, EmbeddedConfig};
 use crate::encode::encode_json_into;
 use crate::error::{codes, EmbedError};
+use crate::subscribe::{Subscription, SubscriptionCounts};
 
 type ProcessTransportIdentity = (Vec<String>, String);
 
@@ -286,6 +287,8 @@ pub struct Status {
     pub record_path: Option<String>,
     /// Successful publish count by topic.
     pub published: BTreeMap<String, u64>,
+    /// Poll counts by subscribed topic.
+    pub subscribed: BTreeMap<String, SubscriptionCounts>,
     /// Recorder totals, available after stop.
     pub recorder: Option<RecorderSummary>,
     /// Most recent runtime error.
@@ -308,6 +311,7 @@ impl Status {
             mdns_advertised: false,
             record_path: None,
             published: BTreeMap::new(),
+            subscribed: BTreeMap::new(),
             recorder: None,
             last_error: None,
             node_failures: NodeFailures::default(),
@@ -340,6 +344,7 @@ struct Run {
     gateway: Option<GatewayWorker>,
     recorder: Option<RecorderWorker>,
     publishers: BTreeMap<String, PublisherState>,
+    subscriptions: BTreeMap<String, Subscription>,
     /// Only `ownership` must drop after the workers: `shutdown` takes it
     /// last, and its own fields release the lease after the reset.
     ownership: Option<GatewayOwnership>,
@@ -471,6 +476,15 @@ struct ResolvedPublish {
     max_payload_bytes: usize,
 }
 
+struct ResolvedSubscribe {
+    topic: String,
+    schema: String,
+    layout: WireLayout,
+    depth: usize,
+    /// An app publisher or a graph output of this run produces the topic.
+    produced_in_run: bool,
+}
+
 struct GraphInputs {
     config: GraphConfig,
     factories: indexmap::IndexMap<String, Box<dyn NodeEntry>>,
@@ -484,6 +498,7 @@ struct StartPlan {
     nodes: usize,
     schemas: SchemaSet,
     publishes: Vec<ResolvedPublish>,
+    subscribes: Vec<ResolvedSubscribe>,
     recorded_topics: Option<HashSet<String>>,
     recorded_graph_topics: Option<HashSet<String>>,
     listen: Vec<String>,
@@ -592,6 +607,7 @@ impl EmbeddedRuntime {
             status.mdns_advertised = false;
             status.record_path = None;
             status.published.clear();
+            status.subscribed.clear();
             status.recorder = None;
             status.last_error = None;
             status.node_failures = NodeFailures::default();
@@ -657,7 +673,7 @@ impl EmbeddedRuntime {
             .run
             .as_ref()
             .and_then(|run| run.publishers.get(topic))
-            .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
         Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
     }
 
@@ -679,7 +695,7 @@ impl EmbeddedRuntime {
             .run
             .as_mut()
             .and_then(|run| run.publishers.get_mut(topic))
-            .ok_or_else(|| EmbedError::UnknownTopic(topic.to_string()))?;
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
         let timestamp = cerulion_core::clock::real_ns();
         let sequence = state.sequence;
         encode_json_into(
@@ -713,6 +729,31 @@ impl EmbeddedRuntime {
         let mut status = lock_status(&self.status);
         *status.published.entry(topic.to_string()).or_default() += 1;
         Ok(sequence)
+    }
+
+    /// Take the oldest message of the subscription on `topic` and return it
+    /// as JSON object text, or `None` when its queue is empty. A message that
+    /// does not decode is still taken: the error is DECODE and the next poll
+    /// reads the message after it. A graph that finished keeps the run's
+    /// subscriptions until `stop`, so its last messages can still be read.
+    pub fn poll(&mut self, topic: &str) -> Result<Option<&str>, EmbedError> {
+        let readable = matches!(
+            lock_status(&self.status).state,
+            RuntimeState::Running | RuntimeState::Finished
+        );
+        let Some(run) = self.run.as_mut().filter(|_| readable) else {
+            return Err(EmbedError::BadState(
+                "poll requires a running or finished runtime".to_string(),
+            ));
+        };
+        let subscription = run.subscriptions.get_mut(topic).ok_or_else(|| {
+            EmbedError::UnknownTopic(format!("unknown subscribe topic '{topic}'"))
+        })?;
+        let (counts, result) = subscription.poll();
+        if let Some(total) = lock_status(&self.status).subscribed.get_mut(topic) {
+            *total = counts;
+        }
+        result
     }
 
     /// Return the shared runtime status handle.
@@ -804,6 +845,12 @@ impl EmbeddedRuntime {
                     max_payload_bytes: publish.max_payload_bytes,
                 })
             })
+            .collect::<Result<Vec<_>, EmbedError>>()?;
+
+        let subscribes = config
+            .subscribe
+            .iter()
+            .map(|subscribe| resolve_subscribe(subscribe, &schemas, &config, graph_inputs.as_ref()))
             .collect::<Result<Vec<_>, EmbedError>>()?;
 
         let graph_topics = graph_inputs
@@ -912,6 +959,7 @@ impl EmbeddedRuntime {
             graph: graph_inputs,
             schemas,
             publishes,
+            subscribes,
             recorded_topics,
             recorded_graph_topics,
             listen: config.listen,
@@ -1131,6 +1179,7 @@ impl Run {
             gateway: None,
             recorder: None,
             publishers: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             ownership: None,
             manager,
             commit_gate: Arc::new(Mutex::new(())),
@@ -1190,6 +1239,7 @@ impl Run {
             .take()
             .and_then(|recorder| recorder.stop(&mut first_error));
         self.publishers.clear();
+        self.subscriptions.clear();
         // Resets the manager to the quiescent baseline, then frees the lease.
         drop(self.ownership.take());
         (summary, first_error)
@@ -1307,6 +1357,10 @@ fn build_into(
     } else {
         None
     };
+
+    // 3b. App subscriptions, after every topic this run produces exists and
+    //     before any producer runs, so the first frame lands in the queue.
+    create_subscriptions(&plan.subscribes, &manager, &mut run.subscriptions)?;
 
     // 4. The recorder runs before any producer, as `armed_before_producers`
     //    requires.
@@ -1527,6 +1581,11 @@ fn commit(
         }
         status.graph = plan.graph_name.clone();
         status.nodes = plan.nodes;
+        status.subscribed = plan
+            .subscribes
+            .iter()
+            .map(|subscribe| (subscribe.topic.clone(), SubscriptionCounts::default()))
+            .collect();
         status.listen = plan.listen.clone();
         status.lan_access = plan
             .gateway
@@ -1536,6 +1595,16 @@ fn commit(
             .recorder
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
+    }
+    // Another publisher in the process may send such a topic, so it is
+    // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
+    // Logged once the start goes ahead, at its own level.
+    for subscribe in plan.subscribes.iter().filter(|item| !item.produced_in_run) {
+        tracing::warn!(
+            topic = %subscribe.topic,
+            schema = %subscribe.schema,
+            "subscribe topic is neither an app publish topic nor a graph output"
+        );
     }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
@@ -1593,6 +1662,107 @@ fn create_publishers(
         );
     }
     Ok(())
+}
+
+fn create_subscriptions(
+    config: &[ResolvedSubscribe],
+    manager: &TransportManager,
+    subscriptions: &mut BTreeMap<String, Subscription>,
+) -> Result<(), EmbedError> {
+    let topic_config = manager.default_topic_config();
+    for item in config {
+        if item.depth > topic_config.subscriber_max_buffer_size {
+            return Err(EmbedError::InvalidArgument(format!(
+                "depth {} for '{}' exceeds the subscription queue limit {}",
+                item.depth, item.topic, topic_config.subscriber_max_buffer_size
+            )));
+        }
+        let subscriber = manager
+            .create_subscriber_with_buffers(&item.topic, topic_config, item.depth)
+            .map_err(|error| EmbedError::Receive(error.to_string()))?;
+        subscriptions.insert(
+            item.topic.clone(),
+            Subscription::new(subscriber, item.layout.clone()),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a `subscribe` entry against the schemas, and refuse one that
+/// could never decode: a schema with a field poll cannot read, or a topic
+/// the app or the graph produces under another schema.
+fn resolve_subscribe(
+    subscribe: &crate::config::SubscribeConfig,
+    schemas: &SchemaSet,
+    config: &EmbeddedConfig,
+    graph: Option<&GraphInputs>,
+) -> Result<ResolvedSubscribe, EmbedError> {
+    let layout = schemas.layout(&subscribe.schema).ok_or_else(|| {
+        EmbedError::InvalidArgument(format!("unknown subscribe schema '{}'", subscribe.schema))
+    })?;
+    if let Some((name, field_type)) = crate::decode::unsupported_field(layout) {
+        return Err(EmbedError::InvalidArgument(format!(
+            "subscribe schema '{}' field {name} has type {field_type:?}, which poll does not support",
+            subscribe.schema
+        )));
+    }
+    let published = config
+        .publish
+        .iter()
+        .filter(|publish| publish.topic == subscribe.topic)
+        .map(|publish| ("the app publishes", publish.schema.as_str()));
+    let produced = graph.into_iter().flat_map(|graph| {
+        graph.config.nodes.iter().flat_map(|node| {
+            node.outputs
+                .iter()
+                .filter(|output| {
+                    resolve_output_topic(&graph.config.prefix, &node.id, output) == subscribe.topic
+                })
+                .map(|output| ("a graph output declares", output.schema.as_str()))
+        })
+    });
+    let producers = published.chain(produced).collect::<Vec<_>>();
+    if let Some((producer, schema)) = producers
+        .iter()
+        .find(|(_, schema)| !schema.is_empty() && *schema != subscribe.schema)
+    {
+        return Err(EmbedError::InvalidArgument(format!(
+            "subscribe topic '{}' has schema '{}', but {producer} '{schema}'",
+            subscribe.topic, subscribe.schema
+        )));
+    }
+    // The graph text can name one schema while the node sends another (the
+    // build only warns), so check the hash the node itself reports too.
+    if let Some(graph) = graph {
+        for node in &graph.config.nodes {
+            let Some(info) = graph.infos.get(&node.id) else {
+                continue;
+            };
+            for output in node.outputs.iter().filter(|output| {
+                resolve_output_topic(&graph.config.prefix, &node.id, output) == subscribe.topic
+            }) {
+                let sent = info
+                    .output_meta()
+                    .iter()
+                    .find(|meta| meta.name == output.name)
+                    .map(|meta| meta.schema_hash);
+                // 0 is a node that reports no hash for the output.
+                if sent.is_some_and(|hash| hash != 0 && hash != layout.schema_hash) {
+                    return Err(EmbedError::InvalidArgument(format!(
+                        "subscribe topic '{}' has schema '{}', but node '{}' sends output '{}' with another schema",
+                        subscribe.topic, subscribe.schema, node.id, output.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(ResolvedSubscribe {
+        topic: subscribe.topic.clone(),
+        schema: subscribe.schema.clone(),
+        layout: layout.clone(),
+        depth: subscribe.depth,
+        produced_in_run: !producers.is_empty(),
+    })
 }
 
 /// Wait for bagd's ready marker. A recorder that exits first is joined here
@@ -2004,6 +2174,7 @@ mod tests {
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
@@ -2541,6 +2712,7 @@ nodes:
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
@@ -2594,6 +2766,7 @@ nodes:
             nodes: 0,
             schemas,
             publishes: Vec::new(),
+            subscribes: Vec::new(),
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),

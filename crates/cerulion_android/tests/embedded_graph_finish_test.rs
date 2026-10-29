@@ -24,7 +24,8 @@ fn config(node_lib_dir: &Path, prefix: &str, file: &str, topic: &str) -> String 
         "graph_yaml": graph_yaml,
         "node_lib_dir": node_lib_dir,
         "record": {"file": file},
-        "publish": [{"topic": topic, "schema": "std_msgs/String"}]
+        "publish": [{"topic": topic, "schema": "std_msgs/String"}],
+        "subscribe": [{"topic": format!("/{prefix}/ticker/cmd"), "schema": "geometry_msgs/Vector3"}]
     })
     .to_string()
 }
@@ -68,6 +69,12 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         runtime.publish(&topic, r#"{"data":"too late"}"#),
         Err(EmbedError::BadState(_))
     ));
+    // The node's last output is still in the subscription until stop.
+    let output = format!("/{prefix}/ticker/cmd");
+    assert_eq!(
+        runtime.poll(&output).expect("poll a finished run"),
+        Some(r#"{"x":0.0,"y":0.0,"z":0.0}"#)
+    );
 
     let summary = runtime
         .stop()
@@ -77,6 +84,10 @@ fn graph_shutdown_finishes_and_can_be_stopped_and_restarted() {
         status_handle.lock().expect("status lock").state,
         RuntimeState::Stopped
     );
+    assert!(matches!(
+        runtime.poll(&output),
+        Err(EmbedError::BadState(_))
+    ));
     assert!(summary.channels > 0);
     assert!(status_handle
         .lock()

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Embedded runtime and JNI support for Android applications.
 //!
-//! Publishing parses JSON and allocates; this is an app-side convenience path, not the zero-copy node path.
+//! Publishing parses JSON and polling builds JSON text; both allocate. They
+//! are an app-side convenience path, not the zero-copy node path.
 
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 /// Runtime configuration and input validation.
 pub mod config;
+/// Wire-frame-to-JSON decoding for app subscriptions.
+pub mod decode;
 /// JSON-to-wire-frame encoding for app publishers.
 pub mod encode;
 /// Stable error types and error-code constants.
@@ -19,6 +22,7 @@ pub mod runtime;
 mod host;
 mod jni;
 mod log;
+mod subscribe;
 
 /// Embedded runtime API and observable status types.
 pub use config::{LanAccessConfig, LogLevelConfig};
@@ -31,6 +35,7 @@ pub use log::{install_with_sink as install_log_sink_for_test, LogPriority, LogSi
 pub use runtime::{
     EmbeddedRuntime, NodeFailure, NodeFailures, RecorderSummary, RuntimeState, Status,
 };
+pub use subscribe::SubscriptionCounts;
 
 /// Link graph node types into the app library.
 ///

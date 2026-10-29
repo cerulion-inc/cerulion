@@ -25,7 +25,7 @@ and `cerulion_dds`.
 | wsd | Yes | Yes | Android control sockets use the abstract namespace. |
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
-| App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade. |
+| App embedding | No | Yes | `cerulion_android` exposes the Java and JNI facade: publish into topics and poll subscribed topics as JSON. |
 | Native nodes in an embedded app runtime | Not applicable | Yes | Link the node crates into the app's native library and list them with `cerulion_android::embed_nodes!`. Nodes are not loaded from separate libraries in an app. |
 | local-transport | Yes | Yes | It is for one app process and not for process groups. |
 | Robust mutexes | Yes | No | Android cannot recover a lock held by an exited process. |
@@ -337,6 +337,54 @@ latest frame: the node produces nothing until the first publish, and then
 reads the newest value on each tick. The runtime creates every `publish` topic
 with room for a node that holds its latest value, so both kinds of input start.
 
+To read a node's output in the app, list the topic under `subscribe` and
+call `CerulionRuntime.poll`. It takes the oldest message off the
+subscription's queue without waiting and appends it to a `StringBuilder` as
+the same JSON object text `publish` takes:
+
+```json
+{
+  "graph_yaml": "<the text of graph.yaml>",
+  "publish": [{"topic": "/myapp/taps", "schema": "geometry_msgs/Vector3"}],
+  "subscribe": [{"topic": "/myapp/logic/state", "schema": "geometry_msgs/Vector3", "depth": 10}]
+}
+```
+
+```java
+StringBuilder message = new StringBuilder();
+int code = CerulionRuntime.poll("/myapp/logic/state", message);
+if (code == CerulionRuntime.OK) {
+    JSONObject state = new JSONObject(message.toString()); // {"x":1.5,"y":0.0,"z":2.0}
+} else if (code == CerulionRuntime.EMPTY) {
+    // No new message: poll again later, for example on the next frame.
+} else if (code == CerulionRuntime.BUSY) {
+    // A start, a stop, or another publish or poll is in flight: retry.
+}
+```
+
+Only `OK` appends to the builder. A subscription's queue holds `depth`
+messages; when it is full, the oldest message is dropped. `status` counts
+each subscription under `subscribed`: `polled` messages `poll` returned,
+`dropped` messages missing from a publisher's message sequence, most often
+the full queue dropping its oldest, and also a send that failed after the
+publisher numbered it, and `undecodable` messages `poll` refused with
+`DECODE`. A frame too short for its wire header is skipped by the
+transport with a logged warning before `poll` sees it. It is never counted
+as `undecodable`, but when its publisher numbered it, the gap it leaves
+adds 1 to `dropped` at the next message from that publisher. A dropped message
+is counted from the gap in its publisher's message sequence, so a message
+dropped before the first one the subscription receives from that publisher
+is not counted. A message that
+does not decode, for example one of another schema, is still taken off the
+queue, so the next poll reads the one after it. The runtime creates every
+subscription before the graph runs, so it receives the first message a node
+sends. A subscription can read a graph output, an app `publish` topic, or a
+topic another publisher in the process sends; a start logs a warning for a
+subscribe topic that is neither an app `publish` topic nor a graph output,
+because a misspelled topic polls `EMPTY` forever. `poll` reads a run that
+is `running`, and also one that is `finished`, until `stop`, so the last
+messages of a graph that ended can still be read.
+
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and
 `cerulion topic list --connect tcp/127.0.0.1:7683`. A `cerulion topic list`
@@ -453,6 +501,7 @@ The configuration keys are:
 | `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
+| `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
@@ -469,14 +518,27 @@ The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
 parsed. This allows for escaped strings, byte arrays, field names, and
 whitespace while bounding the input size.
 
+Subscribe schemas follow the same rules and must have only the field types
+publish supports; a schema with a nested message or an array other than
+bytes is rejected with error code 3. `depth` defaults to 10 and must be from
+1 to 16. Duplicate subscribe topics are rejected, and so is a subscribe topic
+the app publishes or the graph outputs under a different schema. `poll`
+writes the fixed-size fields first and then the strings and byte arrays,
+each group in schema order. `Bytes` reads as an array of integers, a
+`StringFixed(n)` value ends at its first NUL byte, and a NaN or infinite
+float reads as `null`.
+
 The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `2 ALREADY_INITIALIZED`, `3 INVALID_ARGUMENT`, `4 BAD_STATE`, `5 GRAPH`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
-`11 BUSY`, `12 PANIC`, and `13 SPAWN`.
+`11 BUSY`, `12 PANIC`, `13 SPAWN`, `14 DECODE`, `15 EMPTY`, and
+`16 RECEIVE`. `EMPTY` is the `poll` result for an empty queue, not an
+error. `RECEIVE` means the transport refused to create a subscription (from
+`start`, in `last_error`) or to receive from one (from `poll`).
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
-`lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`,
-`last_error`, and `node_failures`. State is `idle`, `starting`, `running`,
+`lan_access`, `mdns_advertised`, `record_path`, `published`, `subscribed`,
+`recorder`, `last_error`, and `node_failures`. State is `idle`, `starting`, `running`,
 `stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
@@ -494,6 +556,7 @@ snapshot can look like this:
   "mdns_advertised": true,
   "record_path": null,
   "published": {"/app/heartbeat": 2},
+  "subscribed": {},
   "recorder": null,
   "last_error": null,
   "node_failures": []
@@ -618,8 +681,9 @@ time owns the gateway: while it runs, another runtime's start with a non-empty
 `listen` returns `BAD_STATE`; stop the first runtime before starting it.
 App publish topics must not collide with graph output topics because graph
 topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
-The gateway does not forward incoming topics to the app. JSON publishing
-supports only the field types listed above.
+The gateway does not forward incoming topics to the app, so `subscribe`
+reads topics of the app's own process. JSON publishing and polling support
+only the field types listed above.
 
 ## Single-process apps
 
