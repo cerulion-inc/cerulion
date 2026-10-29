@@ -13,8 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use cerulion_android::runtime::NodeFailure;
-use cerulion_android::{EmbeddedRuntime, RuntimeState};
+use cerulion_android::{codes, EmbeddedRuntime, NodeFailure, RuntimeState};
 use cerulion_core::transport::TransportManager;
 use serde_json::json;
 use tempfile::tempdir;
@@ -161,7 +160,21 @@ fn status_reports_contained_node_tick_panics_while_the_graph_runs() {
     assert_eq!(first_run, second_run);
     runtime.stop().expect("stop the second panic graph");
 
-    // A start clears the earlier run's report: a healthy graph reports none.
+    // A start that is refused after its config parsed still clears the
+    // earlier run's report: the failure is the start's, not a node's.
+    let unlinked = panic_graph(&format!("refused_{pid}"))
+        .replace("type: test_node_macro_period_cdylib", "type: unlinked_node");
+    let error = runtime
+        .start(&json!({"graph_yaml": unlinked}).to_string())
+        .expect_err("an unlinked node type must be refused");
+    assert_eq!(error.code(), codes::GRAPH);
+    let status = runtime.status_handle().lock().unwrap().clone();
+    assert_eq!(status.state, RuntimeState::Failed, "{status:?}");
+    assert!(status.node_failures.list().is_empty(), "{status:?}");
+    let status_json = serde_json::to_value(&*runtime.status_handle().lock().unwrap()).unwrap();
+    assert_eq!(status_json["node_failures"], json!([]));
+
+    // A healthy graph reports none.
     let prefix = format!("healthy_{pid}");
     start(&mut runtime, &healthy_graph(&prefix));
     assert!(frames_delivered(&format!("/{prefix}/steady/cmd"), 6) >= 6);

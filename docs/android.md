@@ -475,8 +475,8 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `recorder`,
-`last_error`, and `node_failures`. State is `idle`, `starting`, `running`, `stopping`, `finished`,
-`stopped`, or `failed`; `last_error` is null or an object with a stable code and
+`last_error`, and `node_failures`. State is `idle`, `starting`, `running`,
+`stopping`, `finished`, `stopped`, or `failed`; `last_error` is null or an object with a stable code and
 message. `finished` means a graph ended on its own after a node requested
 shutdown. Call `stop` to finalize its recording, then start again. Before
 initialization, the state is `uninitialized`. With recording disabled, a
@@ -503,8 +503,9 @@ snapshot can look like this:
 as an object with the node's graph `node_id` and its first panic `message`.
 The runtime contains the panic: that node does not run again, the rest of
 the graph keeps running, and `state` stays `running`. A node is listed once.
-The list stays readable after `stop` and is cleared by the next `start`. A
-node that returns an error from its tick is not listed.
+The list stays readable after `stop`. The next `start` with a valid config
+clears it, also when that start then fails. A node that returns an error
+from its tick is not listed.
 
 The `recorder` summary is available after stop and includes message, channel,
 byte, per-topic, and output-path totals. App files are private to the app:

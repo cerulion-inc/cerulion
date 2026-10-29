@@ -136,6 +136,25 @@ fn a_handle_taken_before_the_run_reads_each_panic_as_it_is_recorded() {
 }
 
 #[test]
+fn records_list_in_graph_order_not_in_panic_order() {
+    let mut rt = build(&[("left", 5), ("steady", 0), ("right", 3)]);
+    let handle = rt.node_tick_panic_records();
+    step(&mut rt, 3);
+    assert_eq!(
+        records(&handle),
+        owned(&[("right", "encoder lost at tick 3")])
+    );
+    step(&mut rt, 2);
+    assert_eq!(
+        records(&handle),
+        owned(&[
+            ("left", "encoder lost at tick 5"),
+            ("right", "encoder lost at tick 3"),
+        ])
+    );
+}
+
+#[test]
 fn a_handle_keeps_reading_after_the_runtime_is_dropped() {
     let mut rt = build(&[("left", 2)]);
     let handle = rt.node_tick_panic_records();

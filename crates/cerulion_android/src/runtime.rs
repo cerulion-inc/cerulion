@@ -177,7 +177,8 @@ pub struct NodeFailure {
 /// Read while the graph runs: [`Self::list`] and the status JSON read the
 /// graph runtime's records at the time of the read. A clone keeps the list
 /// as it was when cloned, so a cloned [`Status`] is a snapshot. The records
-/// stay readable after `stop` and are cleared by the next start.
+/// stay readable after `stop`; the next start with a valid config clears
+/// them, also when that start then fails.
 #[derive(Default)]
 pub struct NodeFailures {
     source: FailureSource,
@@ -226,7 +227,8 @@ impl Clone for NodeFailures {
 
 impl PartialEq for NodeFailures {
     fn eq(&self, other: &Self) -> bool {
-        self.list() == other.list()
+        // Two reads of one live view could straddle a new panic.
+        std::ptr::eq(self, other) || self.list() == other.list()
     }
 }
 
