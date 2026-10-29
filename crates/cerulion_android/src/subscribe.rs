@@ -18,7 +18,9 @@ pub struct SubscriptionCounts {
     /// Messages `poll` returned.
     pub polled: u64,
     /// Messages missing from a publisher's sequence: the full queue dropped
-    /// them before a poll took them, or the transport could not read them.
+    /// them before a poll took them. A frame whose wire header the
+    /// transport cannot read is skipped, with a logged warning, before poll
+    /// sees it, and is counted nowhere.
     pub dropped: u64,
     /// Messages `poll` took off the queue and refused with `DECODE`.
     pub undecodable: u64,

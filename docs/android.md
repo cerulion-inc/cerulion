@@ -366,8 +366,10 @@ Only `OK` appends to the builder. A subscription's queue holds `depth`
 messages; when it is full, the oldest message is dropped. `status` counts
 each subscription under `subscribed`: `polled` messages `poll` returned,
 `dropped` messages missing from a publisher's message sequence, which is the
-full queue dropping its oldest (or a frame the transport could not read),
-and `undecodable` messages `poll` refused with `DECODE`. A dropped message
+full queue dropping its oldest, and `undecodable` messages `poll` refused
+with `DECODE`. A frame too short for its wire header is skipped by the
+transport with a logged warning before `poll` sees it, so it reads as
+neither. A dropped message
 is counted from the gap in its publisher's message sequence, so a message
 dropped before the first one the subscription receives from that publisher
 is not counted. A message that
