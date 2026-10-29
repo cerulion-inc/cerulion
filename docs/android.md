@@ -368,10 +368,13 @@ int code = CerulionRuntime.publishStamped(
 ```
 
 A stamp in the past is taken as is. A negative stamp returns
-`INVALID_ARGUMENT` (3) at once. Otherwise `publishStamped` first checks what
-`publish` checks and returns the same codes, and then a stamp more than one
-second ahead of the runtime clock returns `INVALID_ARGUMENT` (3). A refused
-call sends nothing.
+`INVALID_ARGUMENT` (3) at once. Otherwise `publishStamped` first checks the
+runtime state and the topic as `publish` does, with the same codes. Then a
+stamp more than one second ahead of the runtime clock returns
+`INVALID_ARGUMENT` (3). This check runs before the message is encoded, so a
+message that is not valid and also carries a stamp too far ahead can return
+`INVALID_ARGUMENT` where `publish` returns `ENCODE`. A refused call sends
+nothing.
 
 To read a node's output in the app, list the topic under `subscribe` and
 call `CerulionRuntime.poll`. It takes the oldest message off the
