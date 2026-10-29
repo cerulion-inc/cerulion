@@ -35,7 +35,17 @@ public final class JniSmoke {
             return "missing";
         }
         start += marker.length();
-        int end = status.charAt(start) == '['
+        char first = status.charAt(start);
+        if (first == '{') {
+            int depth = 0;
+            int end = start;
+            do {
+                char c = status.charAt(end++);
+                depth += c == '{' ? 1 : c == '}' ? -1 : 0;
+            } while (depth > 0);
+            return status.substring(start, end);
+        }
+        int end = first == '['
                 ? status.indexOf(']', start) + 1
                 : status.indexOf(',', start);
         return status.substring(start, end);
@@ -92,6 +102,28 @@ public final class JniSmoke {
         throw new AssertionError("timed out waiting for the host lifecycle to settle");
     }
 
+    private static final int EMPTY = 15;
+
+    // Poll once; print the code, and the message when there is one.
+    private static String poll(String topic) {
+        StringBuilder out = new StringBuilder();
+        int code = CerulionRuntime.poll(topic, out);
+        return out.length() == 0 ? Integer.toString(code) : code + " " + out;
+    }
+
+    // Poll until a message arrives: a graph output lands after the node ticks.
+    private static String pollMessage(String topic) throws Exception {
+        for (int attempt = 0; attempt < 500; attempt++) {
+            StringBuilder out = new StringBuilder();
+            int code = CerulionRuntime.poll(topic, out);
+            if (code != EMPTY && code != BUSY) {
+                return code + " " + out;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("timed out waiting for a message on " + topic);
+    }
+
     private static String illegalState(Runnable call) {
         try {
             call.run();
@@ -115,6 +147,7 @@ public final class JniSmoke {
         System.out.println("linked-nodes=" + field(initStatus, "linked_nodes"));
         System.out.println("publish-before-start="
                 + CerulionRuntime.publish("/jni/heartbeat", "{\"data\":\"before\"}"));
+        System.out.println("poll-before-start=" + poll("/jni/heartbeat"));
 
         int invalidStart = CerulionRuntime.start("{");
         String invalidStatus = waitForState("failed");
@@ -123,7 +156,9 @@ public final class JniSmoke {
                 + " error=" + errorCode(invalidStatus));
 
         String config = "{\"publish\":[{\"topic\":\"/jni/heartbeat\","
-                + "\"schema\":\"std_msgs/String\"}]}";
+                + "\"schema\":\"std_msgs/String\"}],"
+                + "\"subscribe\":[{\"topic\":\"/jni/heartbeat\","
+                + "\"schema\":\"std_msgs/String\",\"depth\":2}]}";
         int validStart = whenSettled(() -> CerulionRuntime.start(config));
         String runningStatus = waitForState("running");
         System.out.println("start-ok=" + validStart + " state=" + state(runningStatus));
@@ -131,6 +166,17 @@ public final class JniSmoke {
                 "/jni/heartbeat", "{\"data\":\"hello\"}")));
         System.out.println("publish-unknown=" + whenSettled(() -> CerulionRuntime.publish(
                 "/jni/missing", "{\"data\":\"hello\"}")));
+        System.out.println("poll=" + poll("/jni/heartbeat"));
+        System.out.println("poll-empty=" + poll("/jni/heartbeat"));
+        System.out.println("poll-unknown=" + poll("/jni/missing"));
+        System.out.println("poll-null-out=" + CerulionRuntime.poll("/jni/heartbeat", null));
+        System.out.println("poll-null-topic=" + CerulionRuntime.poll(null, new StringBuilder()));
+        for (String data : new String[] {"a", "b", "c"}) {
+            CerulionRuntime.publish("/jni/heartbeat", "{\"data\":\"" + data + "\"}");
+        }
+        System.out.println("poll-overflow=" + poll("/jni/heartbeat") + ", " + poll("/jni/heartbeat")
+                + ", " + poll("/jni/heartbeat"));
+        System.out.println("subscribed=" + field(CerulionRuntime.status(), "subscribed"));
 
         int stop = whenSettled(CerulionRuntime::stop);
         String stoppedStatus = waitForState("stopped");
@@ -139,11 +185,14 @@ public final class JniSmoke {
         // The sample app's graph: every node type in it is linked into the
         // loaded library, so the start reaches running with all three nodes.
         String graph = new String(Files.readAllBytes(Paths.get(args[2])), StandardCharsets.UTF_8);
-        String graphConfig = "{\"graph_yaml\":" + jsonString(graph) + "}";
+        String graphConfig = "{\"graph_yaml\":" + jsonString(graph)
+                + ",\"subscribe\":[{\"topic\":\"/app/relay/echo\","
+                + "\"schema\":\"std_msgs/Int32\"}]}";
         int graphStart = whenSettled(() -> CerulionRuntime.start(graphConfig));
         String graphStatus = waitForState("running");
         System.out.println("start-graph=" + graphStart + " state=" + state(graphStatus)
                 + " nodes=" + field(graphStatus, "nodes"));
+        System.out.println("poll-graph=" + pollMessage("/app/relay/echo"));
         int graphStop = whenSettled(CerulionRuntime::stop);
         String graphStopped = waitForState("stopped");
         System.out.println("stop-graph=" + graphStop + " state=" + state(graphStopped));

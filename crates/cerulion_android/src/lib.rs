@@ -18,6 +18,8 @@ pub mod error;
 pub mod nodes;
 /// Synchronous runtime lifecycle and status types.
 pub mod runtime;
+/// App subscriptions read with `poll`.
+pub mod subscribe;
 
 mod host;
 mod jni;
@@ -34,6 +36,7 @@ pub use log::{install_with_sink as install_log_sink_for_test, LogPriority, LogSi
 pub use runtime::{
     EmbeddedRuntime, NodeFailure, NodeFailures, RecorderSummary, RuntimeState, Status,
 };
+pub use subscribe::SubscriptionCounts;
 
 /// Link graph node types into the app library.
 ///

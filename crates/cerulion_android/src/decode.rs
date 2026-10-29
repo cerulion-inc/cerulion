@@ -6,6 +6,22 @@ use cerulion_core::dynamic::{FrameView, WireLayout};
 
 use crate::error::EmbedError;
 
+/// The first field of `layout` whose type poll cannot decode (a nested
+/// message or a non-byte array), or `None` when every field is flat.
+pub(crate) fn unsupported_field(layout: &WireLayout) -> Option<(&str, &FieldType)> {
+    let fixed = layout
+        .fixed_fields
+        .iter()
+        .map(|field| (field.name.as_str(), &field.field_type));
+    let variable = layout
+        .variable_fields
+        .iter()
+        .map(|field| (field.name.as_str(), &field.field_type));
+    fixed
+        .chain(variable)
+        .find(|(_, field_type)| !crate::encode::is_flat(field_type))
+}
+
 /// Decode one wire frame (header first) into JSON object text in `out`.
 ///
 /// `out` is cleared and reused, so a per-subscription buffer keeps its
@@ -306,5 +322,21 @@ mod tests {
         assert_eq!(out, br#"{"data":"x"}"#);
         decode_json_into(&layout, &long, &mut out).unwrap();
         assert_eq!(out, first);
+    }
+
+    #[test]
+    fn names_the_first_field_poll_cannot_decode() {
+        let flat = layout("bool a\nstring b\nuint8[] c\n", "Flat", "test_msgs");
+        assert!(unsupported_field(&flat).is_none());
+        let nested = layout("geometry_msgs/Point point\n", "Pose", "geometry_msgs");
+        assert_eq!(
+            unsupported_field(&nested).map(|(name, _)| name),
+            Some("point")
+        );
+        let array = layout("int32 ok\nfloat64[] values\n", "Values", "test_msgs");
+        assert_eq!(
+            unsupported_field(&array).map(|(name, _)| name),
+            Some("values")
+        );
     }
 }

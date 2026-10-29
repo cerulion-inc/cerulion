@@ -20,7 +20,7 @@ pub mod codes {
     pub const NETWORK: i32 = 6;
     /// Recording setup or execution failed.
     pub const RECORDER: i32 = 7;
-    /// Requested publish topic is not configured.
+    /// Requested publish or subscribe topic is not configured.
     pub const UNKNOWN_TOPIC: i32 = 8;
     /// JSON values could not be encoded.
     pub const ENCODE: i32 = 9;
@@ -37,6 +37,8 @@ pub mod codes {
     pub const DECODE: i32 = 14;
     /// The subscription queue holds no message.
     pub const EMPTY: i32 = 15;
+    /// The transport refused to receive from a subscription.
+    pub const RECEIVE: i32 = 16;
 }
 
 #[derive(Debug, Error)]
@@ -63,8 +65,8 @@ pub enum EmbedError {
     /// Recorder setup or execution failed.
     #[error("{0}")]
     Recorder(String),
-    /// The requested publish topic is not configured.
-    #[error("unknown publish topic '{0}'")]
+    /// The requested publish or subscribe topic is not configured.
+    #[error("{0}")]
     UnknownTopic(String),
     /// Publish JSON could not be encoded.
     #[error("{0}")]
@@ -84,6 +86,9 @@ pub enum EmbedError {
     /// A received frame could not be decoded into JSON.
     #[error("{0}")]
     Decode(String),
+    /// The transport refused to receive from a subscription.
+    #[error("{0}")]
+    Receive(String),
 }
 
 impl EmbedError {
@@ -104,6 +109,7 @@ impl EmbedError {
             Self::Panic(_) => codes::PANIC,
             Self::Spawn(_) => codes::SPAWN,
             Self::Decode(_) => codes::DECODE,
+            Self::Receive(_) => codes::RECEIVE,
         }
     }
 }
@@ -129,10 +135,11 @@ mod tests {
             (EmbedError::Panic(String::new()), 12),
             (EmbedError::Spawn(String::new()), 13),
             (EmbedError::Decode(String::new()), 14),
+            (EmbedError::Receive(String::new()), 16),
         ];
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
         actual.sort_unstable();
-        assert_eq!(actual, (1..=14).collect::<Vec<_>>());
+        assert_eq!(actual, [(1..=14).collect::<Vec<_>>(), vec![16]].concat());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }

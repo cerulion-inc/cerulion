@@ -19,6 +19,7 @@ public final class CerulionRuntime {
     public static final int SPAWN = 13;
     public static final int DECODE = 14;
     public static final int EMPTY = 15;
+    public static final int RECEIVE = 16;
 
     private static String loadedLibrary;
 
@@ -80,6 +81,22 @@ public final class CerulionRuntime {
         return nativePublish(topic, json);
     }
 
+    /**
+     * Take the oldest message of a {@code subscribe} topic without waiting
+     * and append it to {@code out} as JSON object text, for example
+     * {@code {"data":"hello"}}. Returns {@link #OK} after appending, or
+     * {@link #EMPTY} when the queue holds no message; any other value is a
+     * stable error code, and only {@link #OK} appends. {@link #BUSY} means a
+     * start or stop is in flight, so retry. {@link #DECODE} means the message
+     * did not decode; it was still taken, so the next poll reads the one
+     * after it. A full queue drops its oldest message; {@link #status()}
+     * counts it under {@code subscribed}.
+     */
+    public static int poll(String topic, StringBuilder out) {
+        ensureLoaded();
+        return nativePoll(topic, out);
+    }
+
     /** Return the latest JSON status snapshot without waiting for runtime work. */
     public static String status() {
         ensureLoaded();
@@ -101,6 +118,8 @@ public final class CerulionRuntime {
     private static native int nativeStart(String configJson);
 
     private static native int nativePublish(String topic, String json);
+
+    private static native int nativePoll(String topic, StringBuilder out);
 
     private static native String nativeStatus();
 
