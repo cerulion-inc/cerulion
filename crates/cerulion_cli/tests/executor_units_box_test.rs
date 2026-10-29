@@ -296,7 +296,9 @@ fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
 fn the_unit_collapse_mutant_is_caught() {
     let ws = read_identity::workspace();
     let base = baseline(&ws);
-    let mutant = run_leg(&ws, "mutant",
+    let mutant = run_leg(
+        &ws,
+        "mutant",
         Slow::DropOldest(SLOW_SLEEP_US),
         &[(
             cerulion_cli_engine::multiprocess::UNIT_COLLAPSE_MUTANT_ENV,
@@ -393,7 +395,9 @@ fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
 fn the_unprofiled_merge_mutant_is_caught() {
     let ws = read_identity::workspace();
     let base = baseline(&ws);
-    let mutant = run_chain_leg(&ws, "merge_mutant",
+    let mutant = run_chain_leg(
+        &ws,
+        "merge_mutant",
         &[(
             cerulion_core::graph::executor::MERGE_MUTANT_ENV,
             Path::new("1"),
@@ -481,9 +485,7 @@ fn stressor_children() -> usize {
     std::env::var("CER_UNITS_LOAD_CHILDREN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
-        })
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)))
 }
 
 /// Child processes each spinning `while :; do :; done` in `sh`, unpinned,
@@ -909,6 +911,12 @@ fn a_late_relay_with_one_process_per_node_replay_probe() {
     }
 }
 
+/// Set, the first-fire arm samples the executor-unit threads of each run
+/// (`UNIT_THREAD` lines). The sampler reads `/proc` every 100 us for the
+/// unit threads, which only the one-group run has, so a bounded run leaves
+/// it unset.
+const SAMPLE_THREADS_ENV: &str = "CER_UNITS_SAMPLE_THREADS";
+
 /// Runs of each placement the first-fire arm records.
 const FIRST_FIRE_REPS: usize = 3;
 /// The co-hosted first fire may take at most this many times its
@@ -931,7 +939,11 @@ struct FirstFire {
 fn first_fires(bag: &Path) -> Vec<FirstFire> {
     let reader = cerulion_bag::BagReader::open(bag).expect("RI_HARNESS: open the bag");
     let mut fires: std::collections::BTreeMap<u32, Vec<(u64, u64)>> = Default::default();
-    for m in reader.messages().expect("RI_HARNESS: walk the bag").flatten() {
+    for m in reader
+        .messages()
+        .expect("RI_HARNESS: walk the bag")
+        .flatten()
+    {
         if m.topic != cerulion_bag::SCHEDULER_TRACE_TOPIC {
             continue;
         }
@@ -1038,7 +1050,10 @@ fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &s
         };
         span("RELAY_GAP", &t[9..15], &next[3..9], t[2], next[1], t[0]);
         for line in samples.lines() {
-            let Some(at) = line.split_whitespace().next().and_then(|w| w.parse::<u64>().ok())
+            let Some(at) = line
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<u64>().ok())
             else {
                 continue;
             };
@@ -1071,8 +1086,9 @@ fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &s
 /// `RELAY_TICK` covers the relay's own tick body (its first four ticks) and
 /// `RELAY_GAP` what runs between two of them: the publish of the tick's
 /// output, the framework, and the next frame's refill. A gap with no CPU time
-/// and no runqueue wait is a blocked thread; the `UNIT_THREAD` samples inside
-/// it name where each unit thread was waiting.
+/// and no runqueue wait is a blocked thread; with `CER_UNITS_SAMPLE_THREADS`
+/// set, the `UNIT_THREAD` samples inside it name where each unit thread was
+/// waiting.
 #[test]
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
@@ -1085,7 +1101,8 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
             read_identity::SAMPLE_UNIT_THREADS.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    read_identity::SAMPLE_UNIT_THREADS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let sampling = std::env::var_os(SAMPLE_THREADS_ENV).is_some();
+    read_identity::SAMPLE_UNIT_THREADS.store(sampling, std::sync::atomic::Ordering::Relaxed);
     let _sampling = Sampling;
     let mut failures = Vec::new();
     for rep in 0..FIRST_FIRE_REPS {
@@ -1146,8 +1163,9 @@ fn the_descriptor_presize_mutant_is_caught() {
         cerulion_cli_engine::graph_cmd::DESCRIPTOR_PRESIZE_MUTANT_ENV,
         "1",
     );
-    let caught =
-        std::panic::catch_unwind(a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process);
+    let caught = std::panic::catch_unwind(
+        a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process,
+    );
     std::env::remove_var(cerulion_cli_engine::graph_cmd::DESCRIPTOR_PRESIZE_MUTANT_ENV);
     let message = match caught {
         Ok(()) => panic!("the first-fire probe passed with the descriptor pre-size skipped"),

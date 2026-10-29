@@ -1821,7 +1821,10 @@ fn descendants(root: u32) -> Vec<u32> {
         let pid = out[i];
         let path = format!("/proc/{pid}/task/{pid}/children");
         if let Ok(text) = std::fs::read_to_string(path) {
-            out.extend(text.split_whitespace().filter_map(|w| w.parse::<u32>().ok()));
+            out.extend(
+                text.split_whitespace()
+                    .filter_map(|w| w.parse::<u32>().ok()),
+            );
         }
         i += 1;
     }
@@ -1848,7 +1851,9 @@ fn sample_unit_threads(root: u32, out: &Path, stop: &std::sync::atomic::AtomicBo
                     let Some(tid) = task.file_name().to_str().and_then(|t| t.parse().ok()) else {
                         continue;
                     };
-                    let comm = read(format!("/proc/{pid}/task/{tid}/comm")).trim().to_string();
+                    let comm = read(format!("/proc/{pid}/task/{tid}/comm"))
+                        .trim()
+                        .to_string();
                     if comm.starts_with("cerulion-unit") {
                         threads.push((pid, tid, comm));
                     }
@@ -1863,12 +1868,20 @@ fn sample_unit_threads(root: u32, out: &Path, stop: &std::sync::atomic::AtomicBo
                 .unwrap_or("-")
                 .to_string();
             let wchan = read(format!("/proc/{pid}/task/{tid}/wchan"));
-            let wchan = if wchan.is_empty() { "-".to_string() } else { wchan };
+            let wchan = if wchan.is_empty() {
+                "-".to_string()
+            } else {
+                wchan
+            };
             let syscall = read(format!("/proc/{pid}/task/{tid}/syscall"));
             let syscall = syscall.split_whitespace().next().unwrap_or("-").to_string();
             let key = format!("{state} {wchan} {syscall}");
             if last.get(tid) != Some(&key) {
-                let _ = writeln!(lines, "{} {pid} {tid} {comm} {key}", cerulion_core::real_ns());
+                let _ = writeln!(
+                    lines,
+                    "{} {pid} {tid} {comm} {key}",
+                    cerulion_core::real_ns()
+                );
                 last.insert(*tid, key);
             }
         }

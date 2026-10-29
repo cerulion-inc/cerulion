@@ -597,15 +597,19 @@ pub enum PresizeOutcome {
 /// The call opens `/dev/null`, duplicates it with `F_DUPFD_CLOEXEC` to the
 /// lowest free descriptor at or above the target (which grows the table to
 /// cover it, and never replaces a descriptor that is open), and closes both.
-/// A soft limit raised later does not shrink the table. Call it after
-/// [`raise_open_file_limit`] so the target uses the raised limit.
+/// Lowering the soft limit later does not shrink the table. Call it after
+/// [`raise_open_file_limit`] so the target uses the raised limit. The target
+/// is also kept below `getdtablesize()`, above which `fcntl` refuses the
+/// duplicate with `EINVAL` (macOS caps it at `kern.maxfilesperproc`).
 #[cfg(unix)]
 pub fn presize_descriptor_table() -> PresizeOutcome {
     let soft = match current_open_file_limit() {
         Ok(limit) => limit.soft,
         Err(errno) => return PresizeOutcome::Failed { errno },
     };
-    let Some(target) = presize_target(soft) else {
+    // SAFETY: `getdtablesize` reads a process limit and touches no memory.
+    let table_max = u64::try_from(unsafe { libc::getdtablesize() }).unwrap_or(0);
+    let Some(target) = presize_target(soft.min(table_max)) else {
         return PresizeOutcome::NoRoom;
     };
     let Ok(target_fd) = libc::c_int::try_from(target) else {
@@ -956,25 +960,36 @@ mod tests {
         );
     }
 
-    /// The pre-size leaves the table reaching its target and holds no
-    /// descriptor afterwards. On Linux the table size is read back from
-    /// `FDSize` in `/proc/self/status`.
+    /// The pre-size leaves the table reaching its target and closes the
+    /// duplicate it made. On Linux the table size is read back from `FDSize`
+    /// in `/proc/self/status`.
     #[cfg(unix)]
     #[test]
-    fn the_presize_grows_the_table_and_leaves_no_descriptor_open() {
+    fn the_presize_grows_the_table_and_closes_its_duplicate() {
         let soft = current_open_file_limit().expect("RLIMIT_NOFILE").soft;
-        let target = presize_target(soft).expect("the test process has room above fd 0");
-        let open_before = std::fs::read_dir("/dev/fd").map(|d| d.count()).ok();
+        // SAFETY: `getdtablesize` reads a process limit and touches no memory.
+        let table_max = u64::try_from(unsafe { libc::getdtablesize() }).unwrap_or(0);
+        let target =
+            presize_target(soft.min(table_max)).expect("the test process has room above fd 0");
         let outcome = presize_descriptor_table();
-        assert!(
-            matches!(
-                outcome,
-                PresizeOutcome::Presized { highest } if highest >= target
-            ) || outcome == PresizeOutcome::AlreadyLarge { target },
-            "{outcome:?} for target {target}"
+        let highest = match outcome {
+            PresizeOutcome::Presized { highest } => highest,
+            PresizeOutcome::AlreadyLarge { target: t } if t == target => return,
+            other => panic!("{other:?} for target {target}"),
+        };
+        assert!(highest >= target, "duplicated to {highest}, below {target}");
+        // The duplicate was closed: its number is no open descriptor.
+        let fd = libc::c_int::try_from(highest).expect("a descriptor number");
+        // SAFETY: `F_GETFD` reads a descriptor's flags and touches no memory.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            rc, -1,
+            "descriptor {highest} is still open after the pre-size"
         );
-        let open_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).ok();
-        assert_eq!(open_before, open_after, "the pre-size left a descriptor open");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
         #[cfg(target_os = "linux")]
         {
             let status = std::fs::read_to_string("/proc/self/status").expect("status");

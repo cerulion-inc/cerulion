@@ -7176,10 +7176,10 @@ pub fn graph_run_worker_host(
     // The unit threads below share this process's descriptor table, and an
     // open that grows a shared table waits for an RCU grace period. The table
     // is sized here, before those threads start.
-    if !descriptor_presize_skipped_by_mutant() {
-        #[cfg(unix)]
-        {
-            let _ = cerulion_core::fd_limit::raise_open_file_limit();
+    #[cfg(unix)]
+    {
+        let _ = cerulion_core::fd_limit::raise_open_file_limit();
+        if !descriptor_presize_skipped_by_mutant() {
             let _ = cerulion_core::fd_limit::presize_descriptor_table();
         }
     }

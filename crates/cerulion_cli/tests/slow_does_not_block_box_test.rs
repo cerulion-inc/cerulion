@@ -18,8 +18,9 @@
 //! equal parts, and a fire-count floor. A full-rate leg (BASELINE, and SLOW in
 //! either arm) needs half the fires its reference rate gives over the window
 //! (the 1 kHz pacer for BASELINE, the measured baseline rate for SLOW); the
-//! leg that slows the fast node (CONTROL) needs [`SLOWED_MIN_FIRES`]. An empty or stalled leg fails `RI_HARNESS:`, so it
-//! never reads as "cut" or "held".
+//! leg that slows the fast node (CONTROL) needs [`SLOWED_MIN_FIRES`]. An
+//! empty or stalled leg fails `RI_HARNESS:`, so it never reads as "cut" or
+//! "held".
 //!
 //! ## The arms
 //!
