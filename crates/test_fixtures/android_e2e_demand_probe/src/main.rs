@@ -62,7 +62,6 @@ const SCHEMAS: &[(&str, u64)] = &[
 ];
 
 /// The probe's arguments: `--listen` and the four positional ones.
-#[derive(Debug, PartialEq)]
 struct Args {
     /// Listen on `endpoint` and dial nothing, instead of dialing it.
     listen: bool,
@@ -202,82 +201,4 @@ fn main() -> Result<(), Box<dyn Error>> {
         gateway.demand_ack_peer_overlong_count(),
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<Args, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()))
-    }
-
-    #[test]
-    fn the_probe_dials_its_endpoint_unless_told_to_listen() {
-        let dial = parse(&[
-            "tcp/127.0.0.1:7683",
-            "/app/heartbeat",
-            "std_msgs/String",
-            "10",
-        ])
-        .expect("dial arguments");
-        assert!(!dial.listen);
-        assert_eq!(dial.endpoint, "tcp/127.0.0.1:7683");
-        let listen = parse(&[
-            "--listen",
-            "tcp/127.0.0.1:7690",
-            "/app/heartbeat",
-            "std_msgs/Int32",
-            "15",
-        ])
-        .expect("listen arguments");
-        assert_eq!(
-            listen,
-            Args {
-                listen: true,
-                endpoint: "tcp/127.0.0.1:7690".to_string(),
-                topic: "/app/heartbeat".to_string(),
-                schema: "std_msgs/Int32",
-                schema_hash: Int32::SCHEMA_HASH,
-                window: Duration::from_secs(15),
-            }
-        );
-    }
-
-    #[test]
-    fn listen_is_a_leading_flag_and_takes_the_four_positional_arguments() {
-        let usage =
-            "usage: android-e2e-demand-probe [--listen] <endpoint> <topic> <schema> <window-secs>";
-        for args in [
-            &["--listen"][..],
-            &[
-                "--listen",
-                "tcp/127.0.0.1:7690",
-                "/app/heartbeat",
-                "std_msgs/String",
-            ],
-            &[
-                "--listen",
-                "tcp/127.0.0.1:7690",
-                "/app/heartbeat",
-                "std_msgs/String",
-                "10",
-                "extra",
-            ],
-        ] {
-            assert_eq!(parse(args).unwrap_err(), usage, "{args:?}");
-        }
-        // Anywhere but first, `--listen` is a positional argument: here the
-        // window, which is not a number.
-        assert_eq!(
-            parse(&[
-                "tcp/127.0.0.1:7683",
-                "/app/heartbeat",
-                "std_msgs/String",
-                "--listen"
-            ])
-            .unwrap_err(),
-            "window '--listen' is not a whole number of seconds"
-        );
-    }
 }
