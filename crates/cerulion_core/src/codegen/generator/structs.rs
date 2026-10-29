@@ -1962,10 +1962,10 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     // staging slot backing the `self.<port>.<f>.<leaf> = …` / `with_<f>`
     // nested-writer sugar. Private; `None` until first touch.
     emit_staged_field_decls(out, schema);
-    // The fields made of 4-byte values (`state`, `max_capacity`) go last.
-    // `#[repr(C)]` keeps the declared order, so none of them sits next to a
-    // pointer-sized slot that drop reads back (`overflow`, `__cer_read_copy`,
-    // the staging slots).
+    // `state` (whose `cursor` and `field_starts` are `u32`s) and
+    // `max_capacity` (a `u32`) go last. `#[repr(C)]` keeps the declared
+    // order, so both follow every pointer-sized slot that drop reads back
+    // (`overflow`, `__cer_read_copy`, `topic`, the staging slots).
     writeln!(
         out,
         "    /// Per-tick writer state (cursor, written bitset, per-field starts)."

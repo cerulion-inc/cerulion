@@ -2551,15 +2551,26 @@ fn a_fixed_string_array_default_builds_owned_strings() {
 
 /// The body of the generated `pub fn from_bytes(bytes: &'a [u8])`, up to its
 /// closing brace.
+/// The function that builds the reader value: `from_bytes` and its copy
+/// fallback `__cer_from_bytes_copied` both return `Self::__cer_reader_at(..)`.
 fn reader_constructor_body(code: &str) -> &str {
-    let start = code
-        .find("pub fn from_bytes(bytes: &'a [u8]) -> Self {")
-        .expect("variable schema emits a reader constructor");
-    let rest = &code[start..];
-    let end = rest
-        .find("\n    }\n")
-        .expect("reader constructor body ends");
-    &rest[..end]
+    let fn_body = |sig: &str| -> &str {
+        let start = code
+            .find(sig)
+            .expect("variable schema emits the reader function");
+        let rest = &code[start..];
+        &rest[..rest.find("\n    }\n").expect("reader function body ends")]
+    };
+    for caller in [
+        "pub fn from_bytes(bytes: &'a [u8]) -> Self {",
+        "fn __cer_from_bytes_copied(bytes: &'a [u8], table_end: usize) -> Self {",
+    ] {
+        assert!(
+            fn_body(caller).contains("Self::__cer_reader_at("),
+            "{caller} must build its reader through __cer_reader_at"
+        );
+    }
+    fn_body("fn __cer_reader_at(")
 }
 
 #[test]
