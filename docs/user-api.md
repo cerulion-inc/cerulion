@@ -2962,6 +2962,36 @@ Node-side logs go straight to `stderr`, **bypassing any host-side subscriber's f
 
 The framework's subscriber is installed **first**, at node init, before any of your node code runs, so it wins. Do **not** install your own global `tracing` default inside node code (e.g. `tracing_subscriber::fmt::init()` in `init()` panics on "global default already set", which fails the node load); use `RUST_LOG` to control output instead. A global default that genuinely pre-exists node init (e.g. installed by a link-time constructor) is respected; the framework's install is then a no-op.
 
+### Throttled and once-only logs
+
+A tick that logs every time it sees a problem floods the console in a fast loop. Each level has two variants, exported from `cerulion_core::prelude`:
+
+| Macro | Emits | ROS 2 name |
+|---|---|---|
+| `error_throttle!`, `warn_throttle!`, `info_throttle!`, `debug_throttle!`, `trace_throttle!` | At most once per period of graph time at this call site. | `RCLCPP_ERROR_THROTTLE`, `RCLCPP_WARN_THROTTLE`, `RCLCPP_INFO_THROTTLE`, `RCLCPP_DEBUG_THROTTLE` |
+| `error_once!`, `warn_once!`, `info_once!`, `debug_once!`, `trace_once!` | The first time this call site runs on this node instance. | `RCLCPP_ERROR_ONCE`, `RCLCPP_WARN_ONCE`, `RCLCPP_INFO_ONCE`, `RCLCPP_DEBUG_ONCE` |
+
+ROS 2 has no trace level, so the `trace_` variants have no ROS 2 name. A ROS 2 `FATAL` maps to the `error_` variants.
+
+```rust
+use std::time::Duration;
+
+fn tick(&mut self) -> Result<(), NodeError> {
+    let missed = self.missed;
+    warn_throttle!(self, Duration::from_secs(1), missed, "counts missed");
+    info_once!(self, "first count received");
+    Ok(())
+}
+```
+
+The first argument is the node (`self`), in `tick`, `init`, `shutdown` or an `#[on_event]` handler. A throttle takes a `std::time::Duration` next; a bare number is a compile error, because it has no unit. Everything after that is exactly what the plain `tracing` macro takes (`target:`, fields, a format string), and an emitted line has the same level, target and fields as `tracing::warn!` written at that line, so `RUST_LOG` filters it the same way.
+
+**Graph time, not wall time.** A throttle reads the node's own clock, the one `self.now_ns()` reads. The first call at a site emits; a later call emits when at least one period of graph time has passed since the last emitted line (a call exactly at the period end emits). If the clock goes back, that call does not emit and the period starts again from the earlier time. A zero period follows the same rule, so on a clock that only moves forward every call emits. Under `--time-source virtual`, and when `cerulion bag play --resim` re-executes a recording from its first step, the pattern of emitted and suppressed lines is a function of graph time only, so two runs emit at the same calls and suppress the same calls. The macros decide only whether a call emits: what an emitted line says comes from its arguments in that run. The throttle and once state is part of the node's checkpoint, so a resim from a mid-run checkpoint continues each site's state from the checkpoint: a once line printed before the anchor does not print again, and a throttle window open at the anchor stays open. A runtime filter such as `RUST_LOG` decides only whether a permitted line is printed. The throttle and once state follow graph time whatever the filter says, so the pattern does not depend on the filter, and a once line that is filtered out when it runs is not printed later.
+
+**State.** A once site emits once per node instance: two instances of one node type in a graph each print their own line, and a pause and resume does not print it again. A call site inside a loop is one site; two call sites with different ids never share state. Each site has a stable id fixed at compile time from its module, file name, line, column, macro name and arguments, so a checkpoint names the same site in every run. Only the file name is part of the id, not its directory, so a build in another directory, or one that remaps its source paths, keeps the same ids. Two files that `include!` puts in one module share an id only when their file name, line, column, macro name and arguments all match. Two calls of the same log macro with the same arguments that one invocation of your own macro produces count as one site. The state is a fixed table inside each node instance, so nothing grows. The table holds 64 distinct throttle and once call sites per node instance. A site past 64 on one instance keeps no state: every call to it prints, as the plain macro does. The first time in the process that a site finds no entry, it logs one `error` that names its file, line and module; later calls of that site that find no entry, on any instance, log nothing. A checkpoint entry counts toward the 64 only once its site runs after the checkpoint is restored, so entries of sites you have since edited or removed never take the room of your current sites. On an instance that runs more than 64 distinct sites, which sites keep state after a checkpoint restore follows the order they run in after the restore. No site ever shares state with another site or another instance.
+
+**Cost.** A suppressed call does not evaluate or format its arguments and allocates nothing, so these macros are safe in a hot tick. A level the build compiles out (a release build removes `debug` and `trace`) does no work at all: no clock read, no state, no table slot. They log through the same node-side subscriber as the plain macros (see [Node (cdylib) logs](#node-cdylib-logs)).
+
 ### Live-loop tuning
 
 Live-run tuning knobs read by `cerulion graph run` (and its multi-process

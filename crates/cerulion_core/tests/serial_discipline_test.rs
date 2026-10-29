@@ -198,6 +198,16 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
          root; also a process-global counting allocator",
     ),
     (
+        "log_sites_test",
+        "default-namespace manager: builds its in-process graph with `GraphRuntime::build` \
+         on the shared root",
+    ),
+    (
+        "log_sites_zero_alloc_test",
+        "default-namespace manager: builds its graph with `GraphRuntime::build` on the shared \
+         root; also a process-global counting allocator",
+    ),
+    (
         "adaptive_sizing_iceoryx2_test",
         "default-namespace manager: probes pool sizing on the shared root",
     ),

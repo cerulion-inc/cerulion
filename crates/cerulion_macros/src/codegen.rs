@@ -1014,6 +1014,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             __cer_inline_safe_of(&self.inner)
         }
 
+        // The probe asks one question: is a lock in the captured state held
+        // right now? `false` skips the WHOLE anchor (no node is captured or
+        // restored from it), never this node alone. The accumulate buffers and
+        // the log-site table that `capture_state` appends hold no lock (the
+        // table is atomics only), so they can never answer `false`, and the
+        // user's fields are the only part that needs probing.
         fn cer_probe(&self) -> bool {
             ::cerulion_core::state::CerulionState::cer_probe(&self.inner)
         }
@@ -1036,9 +1042,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 );
             }
             // The user's fields, then the node's accumulate buffers (which
-            // write nothing for a node without an accumulate input).
+            // write nothing for a node without an accumulate input), then its
+            // throttle and once log state (nothing for a node whose log sites
+            // never ran).
             ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
                 .and_then(|()| self.__cer_accumulators.capture(out))
+                .and_then(|()| self.inner.__cer_rt.log_sites.capture(out))
                 .map_err(|e| {
                 ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
@@ -1055,6 +1064,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             let mut cursor = ::cerulion_core::state::StateCursor::new(payload);
             ::cerulion_core::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
                 .and_then(|()| self.__cer_accumulators.restore(&mut cursor))
+                .and_then(|()| self.inner.__cer_rt.log_sites.restore(&mut cursor))
                 .map_err(|e| ::cerulion_core::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
@@ -3292,6 +3302,7 @@ fn gen_cdylib(
                                         &mut out,
                                     )
                                     .and_then(|()| node.__cer_accumulators.capture(&mut out))
+                                    .and_then(|()| node.inner.__cer_rt.log_sites.capture(&mut out))
                                 }),
                             ) {
                                 ::std::result::Result::Ok(o) => o,
@@ -3414,6 +3425,9 @@ fn gen_cdylib(
                                         &mut cursor,
                                     )
                                     .and_then(|()| node.__cer_accumulators.restore(&mut cursor))
+                                    .and_then(|()| {
+                                        node.inner.__cer_rt.log_sites.restore(&mut cursor)
+                                    })
                                 }),
                             );
                             let decoded = match decoded {

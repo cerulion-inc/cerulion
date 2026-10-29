@@ -288,4 +288,15 @@ pub enum StateError {
         /// What disagreed.
         reason: String,
     },
+
+    /// The throttle and once log section of a node's state
+    /// (`graph::log_sites`) is not one a capture writes: it repeats or
+    /// misorders an entry, or holds more entries than a node instance keeps.
+    /// Bytes that do not open the section at all are
+    /// [`StateError::TrailingBytes`], the field-list drift signal.
+    #[error("log site state cannot be restored: {reason}")]
+    LogSiteRestore {
+        /// What disagreed.
+        reason: String,
+    },
 }
