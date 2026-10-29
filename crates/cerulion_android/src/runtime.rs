@@ -376,6 +376,9 @@ pub struct EmbeddedRuntime {
     files_dir: PathBuf,
     robot_name: String,
     status: Arc<Mutex<Status>>,
+    /// The runtime's clock: the graph runs on it and app publishes take
+    /// their wire stamp from it.
+    clock: Arc<dyn Clock>,
     /// The committed run. A start builds its run off to the side and stores
     /// it here only once the commit succeeds.
     run: Option<Run>,
@@ -506,6 +509,8 @@ impl Drop for RecordingReservation {
 
 struct PublisherState {
     publisher: CerulionPublisher,
+    /// The run's clock: each frame takes its wire stamp from it.
+    clock: Arc<dyn Clock>,
     layout: WireLayout,
     max_payload_bytes: usize,
     sequence: u32,
@@ -565,6 +570,8 @@ struct StartPlan {
     ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
+    /// The clock the graph runs on and app frames are stamped from.
+    clock: Arc<dyn Clock>,
     #[cfg(any(test, feature = "test-helpers"))]
     graph_exit: Option<GraphExitHook>,
 }
@@ -613,6 +620,7 @@ impl EmbeddedRuntime {
             files_dir,
             status: Arc::new(Mutex::new(Status::new(robot_name.clone()))),
             robot_name,
+            clock: Arc::new(RealClock),
             run: None,
             #[cfg(any(test, feature = "test-helpers"))]
             before_commit: None,
@@ -632,6 +640,14 @@ impl EmbeddedRuntime {
             ));
         }
         self.start_accepted(config_json)
+    }
+
+    /// TEST SEAM: run every later start on `clock` in place of the real
+    /// monotonic clock. A running start keeps the clock it started on.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
     }
 
     /// TEST SEAM: run `hook` once, on the next start, after every component
@@ -790,7 +806,7 @@ impl EmbeddedRuntime {
             .as_mut()
             .and_then(|run| run.publishers.get_mut(topic))
             .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
-        let timestamp = cerulion_core::clock::real_ns();
+        let timestamp = state.clock.now_ns();
         let sequence = state.sequence;
         encode_json_into(
             &state.layout,
@@ -1110,6 +1126,7 @@ impl EmbeddedRuntime {
             connect: config.connect,
             gateway,
             recorder,
+            clock: Arc::clone(&self.clock),
             #[cfg(any(test, feature = "test-helpers"))]
             graph_exit: None,
         })
@@ -1504,12 +1521,13 @@ fn build_into(
         &plan.publishes,
         &manager,
         plan.recorded_topics.as_ref(),
+        &plan.clock,
         &mut run.publishers,
     )?;
 
     // 3. The graph, built but not yet running.
     let graph_runtime = if let Some(inputs) = plan.graph.as_mut() {
-        let clock: Arc<dyn Clock> = Arc::new(RealClock);
+        let clock = Arc::clone(&plan.clock);
         let schema_hashes = schema_hash_map(&plan.schemas);
         let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
             inputs.config.clone(),
@@ -1826,6 +1844,7 @@ fn create_publishers(
     config: &[ResolvedPublish],
     manager: &TransportManager,
     recorded_topics: Option<&HashSet<String>>,
+    clock: &Arc<dyn Clock>,
     publishers: &mut BTreeMap<String, PublisherState>,
 ) -> Result<(), EmbedError> {
     for item in config {
@@ -1861,6 +1880,7 @@ fn create_publishers(
             item.topic.clone(),
             PublisherState {
                 publisher,
+                clock: Arc::clone(clock),
                 layout: item.layout.clone(),
                 max_payload_bytes: item.max_payload_bytes,
                 sequence: 0,
@@ -2485,6 +2505,7 @@ mod tests {
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
+            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3310,6 +3331,7 @@ nodes:
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
+            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3369,6 +3391,7 @@ nodes:
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
+            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
