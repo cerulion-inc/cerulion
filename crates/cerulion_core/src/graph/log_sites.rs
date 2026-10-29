@@ -82,8 +82,8 @@
 //!
 //! # Cost
 //!
-//! A suppressed call is a few atomic loads (acquire for the table lookup,
-//! relaxed for the state word) and one clock read (throttle only). It does
+//! A suppressed call is a few acquire loads (the table lookup and the state
+//! word) and one clock read (throttle only). It does
 //! not format or evaluate its message arguments, and it allocates nothing. A
 //! level the build compiles out (a release build removes `debug` and `trace`)
 //! costs nothing: the call does not read the clock, keeps no state and takes
@@ -640,16 +640,21 @@ pub fn throttle_permits(rt: &CerNodeRuntimeFields, site: &LogSite, period: Durat
     let Some(word) = site.word(&rt.log_sites) else {
         return true;
     };
+    // The saved time is loaded BEFORE the clock is read. A time another thread
+    // saves after this load makes the exchange below fail, so it never reads
+    // as the clock going back. The Acquire pairs with that thread's Release
+    // exchange: a saved time this load sees was read from the clock before
+    // this call reads it.
+    let old = word.load(Ordering::Acquire);
     let now = rt.clock.now_ns().min(LATEST);
     let period_ns = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
-    let old = word.load(Ordering::Relaxed);
     match throttle_step(decode(old), now, period_ns) {
         ThrottleStep::Suppress => false,
         step => {
             // A lost race means another thread of this instance took this
             // window first: it emits, this call does not.
             let won = word
-                .compare_exchange(old, encode(now), Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(old, encode(now), Ordering::Release, Ordering::Relaxed)
                 .is_ok();
             won && step == ThrottleStep::Emit
         }
@@ -910,6 +915,89 @@ mod tests {
     fn a_maximal_period_never_emits_twice() {
         assert_eq!(throttle_step(Some(0), u64::MAX - 1, u64::MAX), Suppress);
         assert_eq!(throttle_step(Some(1), u64::MAX, u64::MAX), Suppress);
+    }
+
+    /// The site the overlapping-call test drives, from both of its calls.
+    static RACED_SITE: super::LogSite =
+        super::LogSite::new("raced.rs", 1, 1, "raced", "warn_throttle(raced)");
+    const RACED_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+    /// The `racer_at` value that means no second call is due.
+    const NO_RACER: u64 = u64::MAX;
+
+    /// A hand clock whose next read can first run a second throttle call at
+    /// [`RACED_SITE`], at its own later time. That is a second thread of the
+    /// same instance that emits while the first call is mid read, made
+    /// deterministic.
+    struct RacingClock {
+        now: std::sync::atomic::AtomicU64,
+        racer_at: std::sync::atomic::AtomicU64,
+        racer_emitted: std::sync::atomic::AtomicBool,
+        rt: std::sync::OnceLock<std::sync::Weak<crate::graph::node::CerNodeRuntimeFields>>,
+    }
+
+    impl crate::clock::Clock for RacingClock {
+        fn now_ns(&self) -> u64 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let own = self.now.load(Relaxed);
+            let racer_at = self.racer_at.swap(NO_RACER, Relaxed);
+            if racer_at != NO_RACER {
+                let rt = self.rt.get().and_then(std::sync::Weak::upgrade);
+                let rt = rt.expect("the runtime outlives its clock");
+                self.now.store(racer_at, Relaxed);
+                let emitted = super::throttle_permits(&rt, &RACED_SITE, RACED_PERIOD);
+                self.racer_emitted.store(emitted, Relaxed);
+                self.now.store(own, Relaxed);
+            }
+            own
+        }
+    }
+
+    /// A call reads 100 ms; inside that read a second call at 200 ms emits.
+    /// The first call must leave the window at 200 ms, not move it back to
+    /// its own older reading, so a call 1 ms after the second one is still
+    /// inside the period.
+    #[test]
+    fn an_overlapping_older_call_never_moves_the_window_back() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Arc;
+        let clock = Arc::new(RacingClock {
+            now: 0.into(),
+            racer_at: NO_RACER.into(),
+            racer_emitted: false.into(),
+            rt: std::sync::OnceLock::new(),
+        });
+        let rt = Arc::new(crate::graph::node::CerNodeRuntimeFields {
+            clock: clock.clone(),
+            shutdown_signal: Default::default(),
+            log_sites: Default::default(),
+        });
+        clock.rt.set(Arc::downgrade(&rt)).expect("set once");
+        let call = |at: u64| {
+            clock.now.store(at, Relaxed);
+            super::throttle_permits(&rt, &RACED_SITE, RACED_PERIOD)
+        };
+        let saved = || super::decode(RACED_SITE.word(&rt.log_sites).unwrap().load(Relaxed));
+
+        assert!(call(0), "the first call emits");
+        clock.racer_at.store(200 * MS, Relaxed);
+        assert!(
+            !call(100 * MS),
+            "the older call lost its window to the racer"
+        );
+        assert!(
+            clock.racer_emitted.load(Relaxed),
+            "the racer emits at 200 ms"
+        );
+        assert_eq!(
+            saved(),
+            Some(200 * MS),
+            "the window starts at the racer's emit"
+        );
+        assert!(
+            !call(201 * MS),
+            "1 ms after the racer's emit is inside the period"
+        );
+        assert!(call(300 * MS), "one period after the racer's emit emits");
     }
 
     #[test]
