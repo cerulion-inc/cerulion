@@ -13,7 +13,8 @@ use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
 use cerulion_core::dynamic::{SchemaSet, WireLayout};
 use cerulion_core::graph::{
-    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, NodeEntry, NodeTickPanicRecords,
+    parse_graph, resolve_output_topic, DylibNodeEntry, GraphConfig, GraphTopology, NodeEntry,
+    NodeTickPanicRecords,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayPlan, GatewayRuntime, SchemaServing, TopicSchema,
@@ -488,6 +489,9 @@ struct ResolvedPublish {
     schema_hash: u64,
     wire_fixed_size: u32,
     max_payload_bytes: usize,
+    /// The deepest queue a graph input that reads this topic declares; 0
+    /// when no graph input reads it.
+    input_depth: usize,
 }
 
 struct ResolvedSubscribe {
@@ -862,6 +866,11 @@ impl EmbeddedRuntime {
         let graph_inputs = graph
             .map(|graph| self.load_graph(graph, &config))
             .transpose()?;
+        let input_depths = graph_inputs
+            .as_ref()
+            .map(input_depths_by_topic)
+            .transpose()?
+            .unwrap_or_default();
         let publishes = config
             .publish
             .iter()
@@ -885,6 +894,7 @@ impl EmbeddedRuntime {
                     schema_hash: layout.schema_hash,
                     wire_fixed_size,
                     max_payload_bytes: publish.max_payload_bytes,
+                    input_depth: input_depths.get(&publish.topic).copied().unwrap_or(0),
                 })
             })
             .collect::<Result<Vec<_>, EmbedError>>()?;
@@ -1733,13 +1743,19 @@ fn create_publishers(
                     "publisher slot size exceeds the wire transport limit".to_string(),
                 )
             })?;
-        // The app creates its topics before the graph builds, so each one is
-        // created at the borrow floor a graph output gets: a graph node that
-        // holds the topic as a latest-value input (an absolute `source:`)
-        // needs it to open the topic. A RECORDED app topic also gets the tap
-        // provisioning the graph build applies to recorded graph outputs.
+        // The app creates its topics before the graph builds, and a topic's
+        // limits are fixed when it is created, so each one is created with
+        // what the graph inputs that read it (an absolute `source:`) need to
+        // open it: the borrow floor a graph output gets, for a node that holds
+        // the topic as a latest-value input, and a queue limit as deep as the
+        // deepest input, the rule the graph applies to the topics it creates.
+        // A RECORDED app topic also gets the tap provisioning the graph build
+        // applies to recorded graph outputs.
         let mut topic_config = manager.default_topic_config();
         topic_config.create_borrow_floor = Some(SUBSCRIBER_MAX_BORROWED_HELD);
+        topic_config.subscriber_max_buffer_size = topic_config
+            .subscriber_max_buffer_size
+            .max(item.input_depth);
         if recorded_topics.is_some_and(|set| set.contains(&item.topic)) {
             topic_config = recorded_publisher_config(topic_config, slot_len);
         }
@@ -1860,6 +1876,24 @@ fn resolve_subscribe(
         depth: subscribe.depth,
         produced_in_run: !producers.is_empty(),
     })
+}
+
+/// The deepest queue the graph's inputs declare on each topic they read.
+///
+/// The graph's own topology check runs here, before the app creates a
+/// topic, so a depth above `MAX_CONSUMER_DEPTH` (64) fails the start with
+/// the error the graph build gives and no topic is created at that depth.
+fn input_depths_by_topic(graph: &GraphInputs) -> Result<BTreeMap<String, usize>, EmbedError> {
+    let topology = GraphTopology::build(&graph.config, &graph.infos)
+        .and_then(|topology| topology.validate().map(|()| topology))
+        .map_err(|error| EmbedError::Graph(error.to_string()))?;
+    Ok(topology
+        .topics()
+        .filter_map(|flow| {
+            let depth = flow.consumers.iter().map(|edge| edge.depth).max()?;
+            Some((flow.topic.clone(), depth))
+        })
+        .collect())
 }
 
 /// Wait for bagd's ready marker. A recorder that exits first is joined here
@@ -2681,6 +2715,86 @@ nodes:
             format!("{live:?}"),
             "[NodeFailure { node_id: \"wheel\", message: \"injected candidate crash at tick 3 (exit-3 twin)\" }]"
         );
+    }
+
+    /// A graph whose nodes `a` and `b` read `/app/cmd` on input `cmd` with
+    /// the given depths, and whose node `c` reads `/app/other` on input `cmd`
+    /// with no input metadata.
+    fn depth_graph(depth_a: usize, depth_b: usize) -> GraphInputs {
+        let config = parse_graph(
+            "prefix: depths
+nodes:
+  - id: a
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/cmd
+  - id: b
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/cmd
+  - id: c
+    type: relay
+    inputs:
+      - name: cmd
+        source: /app/other
+",
+        )
+        .expect("parse the depth graph");
+        let input = |depth| cerulion_core::graph::node::InputMeta {
+            name: "cmd".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth,
+            backpressure: Default::default(),
+            expect_within_ms: None,
+        };
+        let infos = [("a", Some(depth_a)), ("b", Some(depth_b)), ("c", None)]
+            .into_iter()
+            .map(|(id, depth)| {
+                let inputs = depth.map(input).into_iter().collect();
+                (
+                    id.to_string(),
+                    cerulion_core::graph::NodeInfo::with_meta(inputs, Vec::new()),
+                )
+            })
+            .collect();
+        GraphInputs {
+            config,
+            factories: indexmap::IndexMap::new(),
+            infos,
+        }
+    }
+
+    #[test]
+    fn an_app_topic_takes_the_deepest_input_that_reads_it() {
+        let depths = input_depths_by_topic(&depth_graph(32, 64)).expect("depths");
+        // An input with no metadata gets the default depth, 10.
+        let expected =
+            BTreeMap::from([("/app/cmd".to_string(), 64), ("/app/other".to_string(), 10)]);
+        assert_eq!(depths, expected);
+        // The deepest input wins whichever node declares it.
+        let swapped = input_depths_by_topic(&depth_graph(64, 32)).expect("depths");
+        assert_eq!(swapped, expected);
+    }
+
+    #[test]
+    fn an_input_deeper_than_64_is_refused_with_the_limit_named() {
+        let error =
+            input_depths_by_topic(&depth_graph(32, 65)).expect_err("a depth above 64 is refused");
+        let EmbedError::Graph(message) = &error else {
+            panic!("expected a graph error, got: {error}");
+        };
+        assert!(
+            message.contains(
+                "input 'b.cmd' on topic '/app/cmd' declares depth = 65; the maximum queue \
+                 depth is 64"
+            ),
+            "{message}"
+        );
+        // 64 itself is the limit, not past it.
+        assert!(input_depths_by_topic(&depth_graph(64, 64)).is_ok());
     }
 
     #[test]
