@@ -22,6 +22,28 @@ stop path (a hardwired e-stop) to stop motion. The `teleop` verb is classified
 and the daemon does not run the deadman yet. The deadman and renewal rules below
 are the contract a teleop handler runs under.
 
+## What a desk can do today
+
+The `cerulion/wire/2` protocol carries data from the robot to the desk only. A
+paired desk with observe access can:
+
+- read the robot's topic catalog;
+- start and stop a stream of any topic it may observe, and read each frame as
+  the robot publishes it (`cerulion connect` brings these into the desk's own
+  shared memory);
+- fetch a topic's schema, so a desk that has never seen the type can decode it;
+- read the per-topic counters (`status`);
+- deliver a revocation epoch it carries, which the robot checks on its own.
+
+A desk cannot write a topic on the robot or send it a command over the remote
+plane. No verb on `cerulion/wire/2` takes a frame from the desk, and the robot
+never reads a data stream from the desk. The `teleop` and `deploy` verbs are
+classified but have no handler. The ops protocol (`cerulion/ops/1`) runs the
+verbs the robot has registered, such as `inventory`, `log-tail`, `restart` and
+`engage-estop`; none of them carries topic data. The only desk to robot topic
+path today is LAN ingress (an `ingress:` block in a graph), which proves no
+identity per peer and is closed when `CERULION_LAN_ACCESS=paired`.
+
 ## The deadman: a quiet operator loses the lease
 
 Actuation is held by a control lease, and the holder must renew it inside the

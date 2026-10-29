@@ -94,8 +94,10 @@ default + gateway, the discovery ladder, and pairing.
 - **Android is paired by default.** On an Android device the gateway and
   `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
   re-inject no frame a LAN peer publishes, so the LAN can neither read nor
-  write topics, unless `CERULION_LAN_ACCESS=open` is set. Commands from a
-  paired desk travel over the remote plane; an Android app selects the same posture
+  write topics, unless `CERULION_LAN_ACCESS=open` is set. A paired
+  desk can read topics over the remote plane, which carries data from robot to
+  desk only: a desk cannot send commands over it today, because the `teleop`
+  verb has no handler yet. An Android app selects the same posture
   with its `lan_access` key (see [Android](android.md)). The gateway keeps the
   posture in front of every installed demand authorizer; changing an inner
   authorizer does not disable it. Choose the posture at startup with
