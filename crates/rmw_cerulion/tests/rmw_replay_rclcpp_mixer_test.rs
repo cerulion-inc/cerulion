@@ -139,7 +139,7 @@ fn record_cpp(run: &mut Run, mixer_env: &[(&str, String)], ticks: u32) -> (PathB
     for (name, _, _) in NODES {
         let st = run.stop(name);
         assert!(
-            st.success() || st.code().is_none(),
+            st.success(),
             "{name} exited {st:?}; stderr: {}",
             stderr_of(&out, name)
         );
@@ -195,17 +195,20 @@ fn the_rclcpp_probe_replays_byte_identical_five_times() {
                 &format!("rep-{name}-{i}"),
             );
             assert!(
-                st.success() || st.code().is_none(),
+                st.success(),
                 "{name} replay {i} exited {st:?}: {}",
                 stderr_of(&rout, name)
             );
+            // The verdict first: a replay that is not identical names its
+            // cause there, and its callback log is then short of the
+            // recording's by what the replay could not serve.
+            let v = verdict(log);
+            assert_eq!(v["verdict"], "identical", "{name} replay {i}: {v:#}");
             let replayed = callbacks(&rout.join(format!("{cblog}.jsonl")));
             assert_eq!(
                 replayed, recorded,
                 "{name} replay {i}: every callback and output equals the recording, in order"
             );
-            let v = verdict(log);
-            assert_eq!(v["verdict"], "identical", "{name} replay {i}: {v:#}");
             assert_eq!(v["segments_divergent"], 0, "{name} replay {i}: {v:#}");
             assert_eq!(
                 v["units_served"], v["units_recorded"],
@@ -349,7 +352,7 @@ fn an_rclcpp_multithreaded_executor_is_refused_and_a_single_thread_is_not() {
     );
     let (rout, st) = replay(&mut run, "mixer", exe("mixer_cpp"), &[], &logs[1], "rep-st");
     assert!(
-        st.success() || st.code().is_none(),
+        st.success(),
         "control exited {st:?}: {}",
         stderr_of(&rout, "mixer")
     );

@@ -1271,6 +1271,8 @@ pub(crate) struct Player {
     created: Vec<(u64, EntityId)>,
     /// The creation fence's position in `created` (`usize::MAX` once lifted).
     fence_cursor: Mutex<usize>,
+    /// The unit a stale wait gave back, and since when (see `stale_wait`).
+    stale_since: Mutex<Option<(usize, Instant)>>,
     state: Mutex<PlayState>,
 }
 
@@ -1403,6 +1405,7 @@ impl Player {
             first_attached,
             created,
             fence_cursor: Mutex::new(0),
+            stale_since: Mutex::new(None),
             state: Mutex::new(PlayState {
                 takes: TakeQueues::new(&takes, torn),
                 graph: GraphAnswers::new(&graphs),
@@ -1539,6 +1542,46 @@ impl Player {
         }
     }
 
+    /// Whether this wait cannot take unit `i` yet: the unit reports ready an
+    /// entity this process has created (bound) that the wait does not
+    /// attach. rclcpp's clock thread can enter `rmw_wait` before the main
+    /// thread creates `/clock` in its callback group; the recording's wait
+    /// that reports `/clock` ready came after a collection that held it.
+    /// Answered `true` for at most [`CREATION_FENCE`] per unit; after that
+    /// the unit is served and the missing entity is an input mismatch.
+    unsafe fn stale_wait(&self, arrays: WaitArrays, unit: &gate::Unit, i: usize) -> bool {
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut attached: HashSet<EntityId> = HashSet::new();
+        arrays.for_each_slot(|_, slot| {
+            let h = *slot;
+            if let Some(r) = (!h.is_null())
+                .then(|| reg.by_key.get(&(h as usize)).and_then(|e| e.rec))
+                .flatten()
+            {
+                attached.insert(r);
+            }
+        });
+        let stale = unit
+            .ready
+            .iter()
+            .any(|r| !attached.contains(r) && reg.bound.contains(r));
+        drop(reg);
+        let mut since = self.stale_since.lock().unwrap_or_else(|e| e.into_inner());
+        if !stale {
+            if since.is_some_and(|(u, _)| u == i) {
+                *since = None;
+            }
+            return false;
+        }
+        match *since {
+            Some((u, at)) if u == i => at.elapsed() < CREATION_FENCE,
+            _ => {
+                *since = Some((i, Instant::now()));
+                true
+            }
+        }
+    }
+
     fn rec_of(&self, key: usize) -> Option<(EntityId, String)> {
         let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.by_key
@@ -1662,6 +1705,16 @@ impl Player {
                 let window = &self.schedule.windows[unit.window];
                 if unit.first {
                     self.creation_fence(window.k, rec_thread);
+                }
+                if self.stale_wait(arrays, unit, i) {
+                    // This wait's arrays were collected before an entity the
+                    // unit reports ready was created (the creation fence ran
+                    // inside it): give the unit back and return nothing
+                    // ready, so the executor collects again and waits with it.
+                    self.gate.give_back(rec_thread, i);
+                    arrays.null_all();
+                    std::thread::sleep(IDLE_AFTER_LOG);
+                    return RMW_RET_TIMEOUT;
                 }
                 let mut st = self.lock();
                 if unit.first {

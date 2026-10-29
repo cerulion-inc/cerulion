@@ -1187,6 +1187,16 @@ missing is an input mismatch, and the fence is lifted). Without it, rclcpp's clo
 thread is served its "entities changed" guard before the executor thread creates
 `/clock`'s subscription, and its next wait lacks it.
 
+**Stale wait** (`Player::stale_wait`, `Gate::give_back`). The fence runs inside
+the `rmw_wait` that is served the unit, and that wait's arrays were collected
+when it was entered. When the unit reports ready an entity the process has
+created but this wait does not attach (rclcpp's clock thread entered `rmw_wait`
+before `/clock`'s subscription existed), the unit is given back to the gate
+unserved and the wait returns `RMW_RET_TIMEOUT` with nothing ready; the executor
+collects again and its next wait, with the entity, is served the unit. Other
+threads stay behind the given-back unit. After 2 s for one unit the unit is
+served and the missing entity is an input mismatch.
+
 **Clock section, while recording** (`Recorder::clock_section`). The recording
 must not hold an order that replay cannot serve. A `rmw_wait` return waits until
 no `/clock` take is between its take and its thread's next `rmw_wait` (its callback

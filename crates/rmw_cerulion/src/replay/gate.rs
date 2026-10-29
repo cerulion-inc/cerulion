@@ -339,6 +339,22 @@ impl Gate {
         self.cv.notify_all();
     }
 
+    /// Undo the [`Turn::Serve`] of unit `idx` to `thread` (its wait could not
+    /// take it, see `Player::wait`): the unit is the next one again, still
+    /// `thread`'s, and the token is free.
+    pub(crate) fn give_back(&self, thread: u32, idx: usize) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert_eq!(st.next, idx + 1);
+        debug_assert_eq!(st.holder, Some((thread, idx)));
+        if st.next != idx + 1 || st.holder != Some((thread, idx)) {
+            return;
+        }
+        st.next = idx;
+        st.holder = None;
+        *st.remaining.entry(thread).or_default() += 1;
+        self.cv.notify_all();
+    }
+
     /// Block until it is `thread`'s turn. Releases the token if `thread`
     /// holds it (it is back in `rmw_wait`). `on_stall` is called once per
     /// stall that lasts [`WATCHDOG`] with no progress.
@@ -813,6 +829,31 @@ mod tests {
         // Thread 0 comes back: the token passes and thread 1 is served.
         assert_eq!(gate.wait_turn(0, |_| {}), Turn::NoMore);
         assert_eq!(waiter.join().unwrap(), Turn::Serve(1));
+    }
+
+    #[test]
+    fn a_unit_given_back_is_served_again_to_its_thread_and_keeps_the_order() {
+        let waits = [wait(10, 1, RMW_RET_OK, &[B]), wait(12, 0, RMW_RET_OK, &[A])];
+        let s = Schedule::build(&waits, &[take(11, 1, B), take(13, 0, A)], &clock_set());
+        let gate = Gate::new(&s);
+        assert_eq!(gate.wait_turn(1, |_| panic!("no stall")), Turn::Serve(0));
+        // Thread 1's wait could not take unit 0 (a stale wait): given back,
+        // the token is free and unit 0 is still the next one, so thread 0
+        // is not served unit 1 ahead of it.
+        gate.give_back(1, 0);
+        assert_eq!(gate.served(), 0);
+        let g = std::sync::Arc::new(gate);
+        let g0 = g.clone();
+        let t0 = std::thread::spawn(move || g0.wait_turn(0, |_| panic!("no stall")));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !t0.is_finished(),
+            "thread 0 waits for unit 0 to be served first"
+        );
+        assert_eq!(g.wait_turn(1, |_| panic!("no stall")), Turn::Serve(0));
+        assert_eq!(g.wait_turn(1, |_| panic!("no stall")), Turn::NoMore);
+        assert_eq!(t0.join().unwrap(), Turn::Serve(1));
+        assert_eq!(g.wait_turn(0, |_| panic!("no stall")), Turn::Exhausted);
     }
 
     #[test]
