@@ -97,7 +97,9 @@ struct GatewayOwnership {
     manager: Arc<TransportManager>,
     /// The ingress topics this run's gateway bridges. The gateway leaves
     /// each bridge registered on the manager when it stops, so the release
-    /// unregisters them before a later start registers its own.
+    /// unregisters them before a later start registers its own. A topic
+    /// another user of the manager bridged before the lease is left out: the
+    /// gateway cannot register it, and the release must not take it away.
     ingress: Vec<String>,
     // Declared last: fields drop in declaration order, so the lease is
     // released after everything else this hold owns.
@@ -108,6 +110,13 @@ impl GatewayOwnership {
     fn acquire(manager: &Arc<TransportManager>, ingress: Vec<String>) -> Result<Self, EmbedError> {
         let lease = GatewayLease::acquire()?;
         quiesce(manager);
+        let ingress = match manager.network() {
+            Some(network) => ingress
+                .into_iter()
+                .filter(|topic| !network.is_ingress_registered(topic))
+                .collect(),
+            None => ingress,
+        };
         Ok(Self {
             manager: Arc::clone(manager),
             ingress,
@@ -3218,6 +3227,26 @@ nodes:
         assert!(!network.is_ingress_registered(never_registered));
         assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
         assert_baseline(&manager);
+        // A topic another user bridged before the lease keeps its bridge
+        // and its demand GET through this run's teardown.
+        let foreign = "/half_built/foreign";
+        manager
+            .register_run_ingress_topic(foreign, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("another user's ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(foreign)
+            .expect("another user's demand GET");
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership =
+            Some(GatewayOwnership::acquire(&manager, vec![foreign.to_string()]).expect("lease"));
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+        assert!(network.is_ingress_registered(foreign));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+        network.remove_ingress_demand_keepalive(foreign);
+        manager
+            .unregister_ingress_topic(foreign)
+            .expect("release the other user's bridge");
         // The released topic registers again, as the next start does.
         manager
             .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))

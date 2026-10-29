@@ -759,12 +759,14 @@ topic from a graph that lists it under `network: egress:` (see
 [The egress/ingress model](networking.md#the-egressingress-model)), and the
 app demands it from the desk as a graph run does.
 
-Each `ingress` topic must be read by at least one graph input, and every
-input that reads it must declare the same schema, as a `#[cerulion_node]`
-input does. It must be neither a graph output nor a publish topic, because a
-topic has one writer. A start that breaks one of these rules fails with error
-code 3, or with error code 5 for a schema the inputs do not declare or do not
-agree on, and the error names the topic.
+Each `ingress` topic must be read by at least one graph input that declares
+its schema, as a `#[cerulion_node]` input does, and the inputs that declare a
+schema must declare the same one. An input that declares none, as a node
+entry written by hand can, is not checked against the others and gets the
+frames the declared schema lets in. The topic must be neither a graph output
+nor a publish topic, because a topic has one writer. A start that breaks one of
+these rules fails with error code 3, or with error code 5 for a schema no input
+declares or the inputs do not agree on, and the error names the topic.
 
 Under `"paired"` the gateway opens no ingress: it subscribes to no `ingress`
 topic on the LAN and demands none, so it refuses every frame a LAN peer

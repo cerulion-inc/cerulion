@@ -997,9 +997,9 @@ fn gateway_ingress_reinjects_into_local_shm() {
 
 /// A manager runs one demand-GET loop for its lifetime. A gateway booted on
 /// a manager whose earlier gateway stopped (an embedder that starts its run
-/// again) must still have its OWN ingress topics demanded: the manager's
-/// demand set holds its topic (and only it, once the earlier owner removed
-/// its own), and the loop keeps running passes over that set.
+/// again) must still have its OWN ingress topics demanded: once the earlier
+/// owner removed its topic, a peer on the listener gets demand GETs for the
+/// later gateway's topic, and for it only.
 #[test]
 fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
     let id = unique_id();
@@ -1027,23 +1027,48 @@ fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
             schema_hash: Vector3::SCHEMA_HASH,
         }],
     };
-    // The pass counter belongs to the manager's one demand set, so each wait
-    // starts from the count the gateway saw at boot.
-    let await_pass = |gateway: &GatewayRuntime, which: &str| {
-        let before = gateway.demand_get_pass_count();
+    let network = mgr.network().expect("network");
+
+    let gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&first)).expect("first gateway");
+    // A peer on the gateway's listener records the topic of every demand GET
+    // it gets: `cerulion_q/<robot or *>/demand<topic>`.
+    let mut config = zenoh::Config::default();
+    config.insert_json5("mode", r#""client""#).unwrap();
+    config
+        .insert_json5("connect/endpoints", &format!(r#"["tcp/127.0.0.1:{port}"]"#))
+        .unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
+    let peer = zenoh::open(config).wait().expect("peer session opens");
+    let asked = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+    let seen = Arc::clone(&asked);
+    let _queryable = peer
+        .declare_queryable("cerulion_q/gwseq_peer/demand/**")
+        .callback(move |query| {
+            if let Some((_, topic)) = query
+                .key_expr()
+                .as_str()
+                .strip_prefix("cerulion_q/")
+                .and_then(|rest| rest.split_once("/demand"))
+            {
+                seen.lock().unwrap().insert(topic.to_string());
+            }
+        })
+        .wait()
+        .expect("declare the demand queryable");
+    let await_get = |topic: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while gateway.demand_get_pass_count() == before {
+        while !asked.lock().unwrap().contains(topic) {
             assert!(
                 Instant::now() < deadline,
-                "the manager's demand-GET loop ran no pass after the {which} gateway booted"
+                "no demand GET for '{topic}' reached the peer"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    let network = mgr.network().expect("network");
 
-    let gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&first)).expect("first gateway");
-    await_pass(&gateway, "first");
+    await_get(&first);
     assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
     drop(gateway);
     network.remove_ingress_demand_keepalive(&first);
@@ -1051,9 +1076,18 @@ fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
         .expect("release the first ingress bridge");
     assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
 
-    let gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&second)).expect("second gateway");
-    await_pass(&gateway, "second");
+    let _gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&second)).expect("second gateway");
     assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+    // The loop runs one pass at a time, so once a pass asked for the second
+    // topic no earlier pass is left; the next pass asks for it alone.
+    await_get(&second);
+    asked.lock().unwrap().clear();
+    await_get(&second);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        HashSet::from([second.clone()]),
+        "the restarted gateway's demand GETs name its own topic only"
+    );
 }
 
 // ---------------------------------------------------------------------------

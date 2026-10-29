@@ -1144,6 +1144,11 @@ pub struct DemandGetState {
     /// EXPLICIT GETs. Empty ⇒ the WILDCARD fallback (`cerulion_q/*/demand{topic}`,
     /// which intersects every producer's `cerulion_q/{robot}/**` queryable).
     identities: Mutex<BTreeSet<String>>,
+    /// Bumped, under the `identities` lock, each time the last topic leaves
+    /// and the identities are forgotten. A pass records it before its harvest
+    /// query and stores what it harvested only if it is unchanged, so a pass
+    /// of an earlier demand lifecycle cannot refill the forgotten set.
+    identity_epoch: AtomicU64,
     /// cumulative demand-GET passes run.
     passes: AtomicU64,
     /// cumulative replies acking "enabled".
@@ -1203,11 +1208,48 @@ impl DemandGetState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         topics.retain(|t| t != canonical);
         if topics.is_empty() {
-            self.identities
+            let mut identities = self
+                .identities
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            identities.clear();
+            self.identity_epoch.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// The identity epoch a pass records before its harvest query.
+    fn identity_epoch(&self) -> u64 {
+        self.identity_epoch.load(Ordering::Acquire)
+    }
+
+    /// Store the producer identities a harvest started at `epoch` learned,
+    /// leaving out `self_identity`. Dropped whole when the identities were
+    /// forgotten since `epoch`: they belong to an earlier demand lifecycle.
+    fn record_harvest(
+        &self,
+        epoch: u64,
+        robots: impl IntoIterator<Item = String>,
+        self_identity: Option<&str>,
+    ) {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.identity_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        // Belt and suspenders: NEVER demand from OURSELVES. A Strict gateway
+        // announces its own identity, so the harvest would otherwise learn
+        // self and emit a `cerulion_q/{self}/demand{...}` self-query every
+        // pass - including for its own INGRESS topics, which the grant-side
+        // self-ingress guard already refuses without warning. Dropping self
+        // here avoids the wasted self round-trip entirely (the wildcard-`*`
+        // fallback residual stays covered by that grant-side guard).
+        identities.extend(
+            robots
+                .into_iter()
+                .filter(|robot| self_identity != Some(robot.as_str())),
+        );
     }
 
     /// Observable state (Principle #3): the number of canonical topics currently demanded.
@@ -2899,25 +2941,14 @@ fn run_demand_get_pass_on_session(
     //    working direction). The producer announces its egress topics + a bare
     //    identity token, so this learns the producer's robot chunk. A failure is
     //    non-fatal - the wildcard fallback still reaches every producer.
+    let epoch = demand_state.identity_epoch();
     match query_announce_entries(session, DEMAND_IDENTITY_WINDOW) {
         Ok(entries) => {
-            let mut ids = demand_state
-                .identities
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (robot, _topic) in entries {
-                // Belt and suspenders: NEVER demand from OURSELVES. A
-                // Strict gateway announces its own identity, so the harvest would
-                // otherwise learn self and emit a `cerulion_q/{self}/demand{...}`
-                // self-query every pass - including for its own INGRESS topics,
-                // which the grant-side self-ingress guard already refuses without
-                // warning. Dropping self here avoids the wasted self round-trip
-                // entirely (the wildcard-`*` fallback residual stays covered by
-                // that grant-side guard).
-                if self_identity != Some(robot.as_str()) {
-                    ids.insert(robot);
-                }
-            }
+            demand_state.record_harvest(
+                epoch,
+                entries.into_iter().map(|(robot, _topic)| robot),
+                self_identity,
+            );
         }
         Err(e) => tracing::debug!(
             error = %e,
@@ -7208,12 +7239,29 @@ mod tests {
             "a topic is still demanded, so its peers stay"
         );
 
+        // A pass that started its harvest before the reset finishes after it.
+        let in_flight = state.identity_epoch();
         state.remove_topic("/run_one/b");
         assert!(state.identities.lock().unwrap().is_empty());
+        state.record_harvest(in_flight, ["departed_desk".to_string()], None);
+        assert!(
+            state.identities.lock().unwrap().is_empty(),
+            "a harvest of the earlier lifecycle does not refill the set"
+        );
         state.add_topic("/run_two/c".to_string());
         assert_eq!(
             demand_get_selectors("/run_two/c", &state.identities.lock().unwrap()),
             vec![cerulion_q::demand_selector("*", "/run_two/c")]
+        );
+        // A harvest of the new lifecycle is stored, without our own name.
+        state.record_harvest(
+            state.identity_epoch(),
+            ["new_desk".to_string(), "self".to_string()],
+            Some("self"),
+        );
+        assert_eq!(
+            *state.identities.lock().unwrap(),
+            BTreeSet::from(["new_desk".to_string()])
         );
     }
 
