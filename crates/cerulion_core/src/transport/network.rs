@@ -1192,12 +1192,22 @@ impl DemandGetState {
     /// Remove a canonical ingress topic from the DYNAMIC demand set (a
     /// mirror's last consumer left, the bridge is torn down). The loop stops
     /// GETting it on the next pass. A topic that was never present is a no-op.
+    /// Removing the last topic also forgets the harvested producer
+    /// identities: the next user of the set (a gateway started again on the
+    /// same manager) starts from the wildcard GET and harvests its own peers,
+    /// so a peer that left is never the only one asked.
     pub fn remove_topic(&self, canonical: &str) {
         let mut topics = self
             .topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         topics.retain(|t| t != canonical);
+        if topics.is_empty() {
+            self.identities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
     }
 
     /// Observable state (Principle #3): the number of canonical topics currently demanded.
@@ -7176,6 +7186,36 @@ mod tests {
     // -----------------------------------------------------------------------
     // Queryable inversion - pure oracle tests (no transport, no clock)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn demand_get_forgets_its_peers_once_its_last_topic_leaves() {
+        // A later user of the manager's demand set (a gateway started again)
+        // must not GET only the peers an earlier one learned: with no
+        // identity the pass falls back to the wildcard that reaches any peer.
+        let state = DemandGetState::default();
+        state.add_topic("/run_one/a".to_string());
+        state.add_topic("/run_one/b".to_string());
+        state
+            .identities
+            .lock()
+            .unwrap()
+            .insert("departed_desk".to_string());
+
+        state.remove_topic("/run_one/a");
+        assert_eq!(
+            state.identities.lock().unwrap().len(),
+            1,
+            "a topic is still demanded, so its peers stay"
+        );
+
+        state.remove_topic("/run_one/b");
+        assert!(state.identities.lock().unwrap().is_empty());
+        state.add_topic("/run_two/c".to_string());
+        assert_eq!(
+            demand_get_selectors("/run_two/c", &state.identities.lock().unwrap()),
+            vec![cerulion_q::demand_selector("*", "/run_two/c")]
+        );
+    }
 
     /// `demand_get_selectors` - WILDCARD when no identity is
     /// harvested (reaches every producer's `cerulion_q/{robot}/**` queryable),
