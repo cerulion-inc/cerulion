@@ -149,6 +149,7 @@ started_graph=0
 started_app=0
 created_dev=0
 added_forward=0
+added_reverse=0
 # The host netd can only be spawned by this run's own CLI invocations into
 # this run's private HOST_STATE, so its pid file alone proves ownership;
 # no separate flag is needed.
@@ -222,6 +223,9 @@ APP_IDENTITY="$(sed -nE 's/.*CerulionRuntime\.init\(getFilesDir\(\)\.getAbsolute
 [[ -n "$APP_IDENTITY" ]] ||
   fail "app identity" "could not read the robot name the sample app passes to CerulionRuntime.init"
 PROBE_ENDPOINT=tcp/127.0.0.1:7683
+# The host port the connect run's probe listens on. `adb reverse` maps the
+# same port on the device's loopback to it, and the app dials that.
+CONNECT_PORT=7690
 # probe_refuses LABEL WANT ARG...: the probe refuses a bad argument, or an
 # endpoint its session cannot open, before it demands anything, so this needs
 # no device: exit 1, WANT in its output, and no report line.
@@ -236,12 +240,17 @@ probe_refuses() {
   fi
 }
 probe_argument_error() { probe_refuses "probe argument errors" "$@"; }
-# run_probe LABEL EXPECT SCHEMA FILE: one direct data demand for the heartbeat
-# over a 10 s window, judged by android_e2e_probe_verdict.sh. `topic echo`
-# reads the catalog before it demands data; the probe demands without one.
+# run_probe LABEL EXPECT SCHEMA FILE [--listen LOCATOR]: one direct data
+# demand for the heartbeat over a 10 s window, judged by
+# android_e2e_probe_verdict.sh. `topic echo` reads the catalog before it
+# demands data; the probe demands without one. The probe dials the app at
+# PROBE_ENDPOINT, or with `--listen` it listens on LOCATOR for the app to dial.
 run_probe() {
   local label=$1 expect=$2 schema=$3 file=$4 rc=0 out verdict
-  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "$PROBE_ENDPOINT" /app/heartbeat \
+  shift 4
+  local -a endpoint=("$PROBE_ENDPOINT")
+  (( $# == 0 )) || endpoint=("$@")
+  out="$(host_capture timeout 30 "${HOST_ENV[@]}" "$PROBE" "${endpoint[@]}" /app/heartbeat \
     "$schema" 10)" || rc=$?
   printf 'rc=%s\n%s\n' "$rc" "$out" > "$OUT/$file"
   (( rc == 0 )) || fail "$label" "rc=$rc output=$out"
@@ -318,6 +327,8 @@ cleanup() {
   done
   (( added_forward == 1 )) &&
     "${ADB[@]}" forward --remove tcp:7683 >/dev/null 2>&1
+  (( added_reverse == 1 )) &&
+    "${ADB[@]}" reverse --remove "tcp:$CONNECT_PORT" >/dev/null 2>&1
   HOST_NETD_OWNED && kill -TERM "$(cat "$HOST_NETD_PID")" >/dev/null 2>&1
   "${ADB[@]}" shell logcat -d > "$OUT/logcat.txt" 2>&1
   device "find '$DEV' -maxdepth 1 -type f -name '*.log' -exec sh -c 'for f; do printf \"%s\\n\" \"--- \$f ---\"; cat \"\$f\"; done' sh {} +" \
@@ -362,7 +373,9 @@ probe_argument_error "window 'ten' is not a whole number of seconds" "$PROBE_END
   /app/heartbeat std_msgs/String ten
 probe_argument_error 'window must be at least one second' "$PROBE_ENDPOINT" /app/heartbeat \
   std_msgs/String 0
-pass "probe argument errors" "cases=6 rc=1 no report"
+probe_argument_error 'usage: android-e2e-demand-probe' --listen "$PROBE_ENDPOINT" /app/heartbeat \
+  std_msgs/String
+pass "probe argument errors" "cases=7 rc=1 no report"
 # A connect endpoint zenoh cannot parse: the probe's session does not open.
 probe_refuses "probe setup error" "the probe's session did not open" not-an-endpoint \
   /app/heartbeat std_msgs/String 1
@@ -800,11 +813,46 @@ printf '%s\n' "$restart_info" > "$OUT/app-restart-bag-info.txt"
 assert_node_rows "app restart bag node frames" "$restart_info" $((restart_stopped_ms - restart_started_ms))
 pass "app restart same process" "start=0 and stop=0 twice in pid $open_pid, second bag $restart_bag"
 
+# Connect: an open app in a new process dials the host (connect locators are
+# fixed for the process lifetime). The probe listens on the host and dials
+# nothing, and `adb reverse` carries the app's dial of the device's loopback
+# to it, so the only link is the one the app opens. The restart echo spawned
+# a host netd: stop it, so the app is the only peer left to answer.
+stop_host_netd
+rev_rc=0
+rev_out="$("${ADB[@]}" reverse --no-rebind "tcp:$CONNECT_PORT" "tcp:$CONNECT_PORT" 2>&1)" || rev_rc=$?
+(( rev_rc == 0 )) ||
+  fail "adb reverse" "tcp:$CONNECT_PORT failed (--no-rebind refuses to replace an existing reverse): $rev_out"
+added_reverse=1
+device "am force-stop '$APP'"
+device "am start -n '$APP/.MainActivity' --es lan_access open --es connect 'tcp/127.0.0.1:$CONNECT_PORT'" >/dev/null
+connect_pid=
+connect_ready=0
+deadline=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+  connect_pid="$(device "pidof '$APP'" 2>/dev/null | tr -d '\r' || true)"
+  connect_log=
+  if [[ "$connect_pid" =~ ^[0-9]+$ && "$connect_pid" != "$open_pid" ]]; then
+    connect_log="$(device logcat -d --pid="$connect_pid" -s CerulionSample:I 2>/dev/null |
+      tr -d '\r' || true)"
+  fi
+  if grep -q 'start=0' <<<"$connect_log"; then
+    connect_ready=1
+    break
+  fi
+  sleep 1
+done
+(( connect_ready == 1 )) ||
+  fail "connect app start" "no start=0 from a new app process: pid=${connect_pid:-none} log=${connect_log:-none}"
+pass "connect app start" "start=0 in pid $connect_pid, dialing tcp/127.0.0.1:$CONNECT_PORT"
+run_probe "connect direct demand" connect std_msgs/String connect-demand-probe.txt \
+  --listen "tcp/127.0.0.1:$CONNECT_PORT"
+
 "${ADB[@]}" logcat -d > "$OUT/logcat-open.txt" 2>&1
 app_log="$(tr -d '\r' < "$OUT/logcat-open.txt")"
 grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
 denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
   grep 'avc: denied' | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' || true)"
 [[ -z "$denials" ]] || fail "app SELinux" "untrusted_app denial was logged: $denials"
-pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open and restart runs (no dlopen or execute denial)"
+pass "app lifecycle and SELinux" "start=0, no app-context avc denial in the paired, open, restart and connect runs (no dlopen or execute denial)"
 echo "android e2e: $CHECKS checks passed"
