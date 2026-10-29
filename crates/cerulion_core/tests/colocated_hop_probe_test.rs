@@ -93,11 +93,12 @@ use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::testing::iceoryx_test_config;
 use cerulion_core::transport::publisher::CerulionPublisher;
-use cerulion_core::OutputProxy;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
+use cerulion_core::OutputProxy;
 use indexmap::IndexMap;
 use native_ros2_messages::sensor_msgs::Image;
+use serial_test::serial;
 
 /// The two payload sizes every row sweeps.
 const SIZES: [usize; 2] = [64, 1024 * 1024];
@@ -475,6 +476,7 @@ fn isolated_manager() -> Arc<TransportManager> {
 
 #[test]
 #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
 fn the_queued_hop_through_the_level_loop() {
     require_release();
     for size in SIZES {
@@ -494,6 +496,7 @@ fn the_queued_hop_through_the_level_loop() {
 
 #[test]
 #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
 fn what_a_hop_is_made_of() {
     use iceoryx2::prelude::*;
 
@@ -644,6 +647,7 @@ fn loaned(publisher: &mut CerulionPublisher, payload_len: usize) -> OutputProxy<
 
 #[test]
 #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
 fn the_called_hop_and_its_parts() {
     require_release();
     let size = SIZES[0];
@@ -662,19 +666,18 @@ fn the_called_hop_and_its_parts() {
         collect_graph_row(build_called(hop_graph, true), "called-hop"),
     );
     for called in [false, true] {
-        let label = if called { "called-chain" } else { "queued-chain" };
+        let label = if called {
+            "called-chain"
+        } else {
+            "queued-chain"
+        };
         let chain = collect_graph_row(build_called(chain_graph, called), label);
         let per_hop: Vec<u64> = chain.iter().map(|ns| ns / CHAIN_HOPS).collect();
         report(label, size, 1, chain);
         report(&format!("{label}/hop"), size, 1, per_hop);
     }
 
-    report(
-        "clock-pair",
-        size,
-        1,
-        per_op(|| (), |()| ()),
-    );
+    report("clock-pair", size, 1, per_op(|| (), |()| ()));
 
     // The consumer side of a hop, through a graph-style subscriber: an event
     // listener, and the pop-one discipline every data-trigger input runs.

@@ -1003,7 +1003,9 @@ fn assemble_chains(
                     levels,
                     topology,
                 )
-                .or_else(|| early_reader_bar(&consumer, head_level, trigger_edges, levels, topology))
+                .or_else(|| {
+                    early_reader_bar(&consumer, head_level, trigger_edges, levels, topology)
+                })
             };
             if let Some(bar) = cut {
                 edges[idx].bar = Some(bar);
@@ -1227,7 +1229,7 @@ pub fn resolve_fusion() -> FusionDecision {
 /// `false`: a build with the seam unset runs every hop through the level loop.
 /// `tests/chain_call_identity_test.rs` compares a chain-called run of one
 /// graph with its queued run, fire trace, read log and frames, entry for
-/// entry; that comparison holding is the condition for turning this on.
+/// entry.
 const FUSE_CHAINS_DEFAULT: bool = false;
 
 /// Under the `oracle-mutants` feature, setting this variable makes a chain

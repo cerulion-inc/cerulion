@@ -1125,8 +1125,9 @@ impl ChainCalls {
     /// Turn the census chains into calls over this build's bindings.
     ///
     /// A member becomes a call when it sits on the level its chain position
-    /// names and its trigger input drains unified; the chain is cut at the
-    /// first member that is not, which keeps the queued path from there on.
+    /// names, is in its level's non-block set, has exactly one data-trigger
+    /// binding and that binding drains unified; the chain is cut at the first
+    /// member that is not, which keeps the queued path from there on.
     /// Every member and its producer must be nodes of this build: a census
     /// judged against another graph would name nodes this runtime does not
     /// run, and the build then calls nothing rather than half a chain.
@@ -1135,14 +1136,14 @@ impl ChainCalls {
         chains: &[super::chain::FusedChain],
         bindings: &[DataTriggerBinding],
         levels: &Levels,
+        level_plans: &[LevelPlan],
         nodes: &IndexMap<String, Arc<Mutex<Box<dyn NodeEntry>>>>,
     ) -> Option<Self> {
         let mut by_head: Vec<(usize, ChainCall)> = Vec::new();
         for chain in chains {
             for (pos, member) in chain.nodes.iter().enumerate().skip(1) {
                 let producer = &chain.nodes[pos - 1];
-                if !nodes.contains_key(member.as_str()) || !nodes.contains_key(producer.as_str())
-                {
+                if !nodes.contains_key(member.as_str()) || !nodes.contains_key(producer.as_str()) {
                     tracing::error!(
                         member = %member,
                         producer = %producer,
@@ -1152,15 +1153,23 @@ impl ChainCalls {
                     return None;
                 }
                 let level = chain.head_level + pos;
-                if levels.level_of(member) != Some(level) {
+                if levels.level_of(member) != Some(level)
+                    || !level_plans
+                        .get(level)
+                        .is_some_and(|p| p.other_ids.iter().any(|id| id == member))
+                {
                     break;
                 }
-                let Some(binding) = bindings.iter().position(|b| {
-                    b.node_id.as_ref() == member.as_str()
-                        && matches!(b.drain, DrainSource::Unified { .. })
-                }) else {
+                let mut own = bindings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.node_id.as_ref() == member.as_str());
+                let (Some((binding, b)), None) = (own.next(), own.next()) else {
                     break;
                 };
+                if !matches!(b.drain, DrainSource::Unified { .. }) {
+                    break;
+                }
                 by_head.push((
                     chain.head_level,
                     ChainCall {
@@ -9753,6 +9762,7 @@ impl GraphRuntime {
             &called_chains,
             &data_trigger_bindings,
             &levels,
+            &level_plans,
             &nodes,
         );
         if let Some(calls) = chain_calls.as_ref() {
@@ -15721,10 +15731,9 @@ impl GraphRuntime {
         // so BOTH the polled (run_until_shutdown) and live (live_step) paths
         // get it identically — the replay-determinism firewall holds.
         let new_time = self.scheduler.begin_step(gating.0);
-        // CHAIN CALLS, decided once per step. A barrier participant opens its
-        // levels by global generation, and a replay drives its fires from the
-        // recording; both run every member at its own level. That is the same
-        // program: a chain-called step and a queued step write the same trace.
+        // CHAIN CALLS, decided once per step. Under a barrier participant, a
+        // replay fire plan, replay pauses or an armed read gate the step runs
+        // every member at its own level through the ordinary level pass.
         self.chain_calls_engaged = self.chain_calls.is_some()
             && self.barrier_participant.is_none()
             && !self.replay_read_armed
@@ -15982,11 +15991,11 @@ impl GraphRuntime {
                 if skip_dequeue {
                     let _ = self.scheduler.signal_data(&call.node_id);
                 } else {
-                    self.drain_data_binding(call.binding, &mut timestamps);
+                    self.drain_data_binding(call.binding, &mut timestamps, false);
                 }
             }
             #[cfg(not(feature = "oracle-mutants"))]
-            self.drain_data_binding(call.binding, &mut timestamps);
+            self.drain_data_binding(call.binding, &mut timestamps, false);
             timestamps.clear();
             let nodes = &self.nodes;
             let snapshot_input_names = &self.snapshot_input_names;
@@ -15999,13 +16008,20 @@ impl GraphRuntime {
                 step,
                 &mut snapshot,
             );
+            // The member's event queue is emptied after its fire, still inside
+            // the step; its fire reads the frame the drain above froze.
+            if let DrainSource::Unified { listener_idx } =
+                self.data_trigger_bindings[call.binding].drain
+            {
+                self.empty_unified_listener(listener_idx);
+            }
         }
         self.drain_timestamps = timestamps;
     }
 
-    /// How many chain calls this runtime has made since build. Zero on every
-    /// build where `CERULION_FUSE_CHAINS` is not `1`, and on every step a
-    /// barrier, a replay plan or an armed read gate runs.
+    /// How many chain calls this runtime has made since build: one per member
+    /// per step that calls chains, due or not.
+    #[doc(hidden)]
     pub fn chain_calls_made(&self) -> u64 {
         self.scheduler.chain_calls_made()
     }
@@ -18804,8 +18820,10 @@ impl GraphRuntime {
     /// per-binding pass, shared with the chain call
     /// ([`Self::run_chain_calls`]) so a called member takes its frame off its
     /// own queue exactly as its level's drain would. `timestamps` is the
-    /// reused scratch the separate discipline fills.
-    fn drain_data_binding(&mut self, i: usize, timestamps: &mut Vec<u64>) {
+    /// reused scratch the separate discipline fills. With `empty_listener`
+    /// false a unified binding's event queue is left for the caller to empty
+    /// with [`Self::empty_unified_listener`].
+    fn drain_data_binding(&mut self, i: usize, timestamps: &mut Vec<u64>, empty_listener: bool) {
         // Cheap clone: Arc<str> is a single atomic increment.
         let node_id = Arc::clone(&self.data_trigger_bindings[i].node_id);
         // Borrow `input_name` (Option<Arc<str>>) for
@@ -18845,11 +18863,9 @@ impl GraphRuntime {
                 // `timestamps` scratch + `warn_suppressed` flag are touched
                 // ONLY on this (separate) path.
                 let mut try_receive_failed = false;
-                if let Err(e) = self.trigger_subscribers[sub_idx].try_receive_timestamps(
-                    &node_id,
-                    sub_idx,
-                    timestamps,
-                ) {
+                if let Err(e) = self.trigger_subscribers[sub_idx]
+                    .try_receive_timestamps(&node_id, sub_idx, timestamps)
+                {
                     try_receive_failed = true;
                     log_drain_failure(
                         self.data_trigger_bindings[i].warn_suppressed,
@@ -18937,9 +18953,7 @@ impl GraphRuntime {
                     // step-aligned e2e differential test (it would be fragile) —
                     // the scheduler-direct pin + this contract is the coverage.
                     if let Some(input) = input_name.as_deref() {
-                        if let Err(e) =
-                            self.scheduler.signal_input_received(&node_id, input, ts)
-                        {
+                        if let Err(e) = self.scheduler.signal_input_received(&node_id, input, ts) {
                             tracing::debug!(
                                 node_id = %node_id,
                                 input = %input,
@@ -19020,10 +19034,8 @@ impl GraphRuntime {
                 // step ends (see `Scheduler::set_trigger_refill`). Anything
                 // past the per-step cap carries and reports due-NOW, so the
                 // live loop comes straight back for it.
-                {
-                    let wake_listener = self.trigger_subscribers[listener_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
+                if empty_listener {
+                    self.empty_unified_listener(listener_idx);
                 }
                 // UNIFIED data-trigger input. Lock the node,
                 // drain its body subscriber ONCE (which freezes the surviving
@@ -19149,6 +19161,13 @@ impl GraphRuntime {
         }
     }
 
+    /// Empty the event queue of the unified listener at `listener_idx`
+    /// (iceoryx2 0.10: one `try_wait` empties it).
+    fn empty_unified_listener(&mut self, listener_idx: usize) {
+        let wake_listener = self.trigger_subscribers[listener_idx].listener();
+        let _ = wake_listener.try_wait(|_activation| {});
+    }
+
     /// Drain the trigger inputs for ONE DAG level.
     ///
     /// Runs the same two binding-loop passes (data-trigger then sync) the
@@ -19223,7 +19242,7 @@ impl GraphRuntime {
             {
                 continue;
             }
-            self.drain_data_binding(i, &mut timestamps);
+            self.drain_data_binding(i, &mut timestamps, true);
         }
         // Give the scratch buffer (capacity preserved) back to the
         // runtime so the next tick's drain reuses the allocation. Placed after

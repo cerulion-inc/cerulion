@@ -5714,6 +5714,7 @@ impl Scheduler {
 
     /// How many chain calls this scheduler has made since build. A call is
     /// counted whether or not the member was due.
+    #[doc(hidden)]
     pub fn chain_calls_made(&self) -> u64 {
         self.chain_calls_made
     }
@@ -5907,6 +5908,11 @@ impl Scheduler {
         // THIS step's clamp (see `decide_fires`).
         let cap_override = self.catchup_cap_override;
         for id in node_ids {
+            debug_assert!(
+                !(self.chain_calls_engaged
+                    && self.nodes.get(id.as_str()).is_some_and(|n| n.chain_member)),
+                "chain member {id} reached the block subset while chain calls are engaged"
+            );
             let Some(idx) = self.nodes.get_index_of(id.as_str()) else {
                 // Same loud desync guard as `decide_fires`: a level node id
                 // absent from the scheduler is a levelization/registration
@@ -9588,7 +9594,10 @@ mod tests {
         assert!(s.call_chain_member("m", t, 1, step, &mut |_: &str| {}));
         run_chain_level(&mut s, &ids, t, step);
         assert_eq!(trace_ids(&mut s), vec!["a", "m", "b"]);
-        assert!(s.trace().iter().all(|e| e.global_level == 1 && e.step == step));
+        assert!(s
+            .trace()
+            .iter()
+            .all(|e| e.global_level == 1 && e.step == step));
         assert_eq!(s.chain_calls_made(), 1);
         // The member does not fire again at its level.
         assert_eq!(s.pending_data_count("m"), 0);
@@ -9659,10 +9668,9 @@ mod tests {
                 v[0]
             );
         }
-        assert!(
-            !cfg!(debug_assertions),
-            "this measurement is meaningful only in a release build"
-        );
+        if cfg!(debug_assertions) {
+            panic!("this measurement is meaningful only in a release build");
+        }
         let ids = vec!["m".to_string()];
         let pool = one_thread_pool();
         let serial = HashSet::new();

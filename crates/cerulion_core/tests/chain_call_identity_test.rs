@@ -68,6 +68,22 @@ const DELTAS_MS: [u64; 7] = [1, 1, 3, 1, 2, 1, 4];
 /// three, p2 -> q2 -> r2 two, x3 -> late one.
 const MEMBERS: usize = 6;
 
+/// Every node that reads, and how many inputs it reads through: each must
+/// log read outcomes on every input.
+const READ_INPUTS: &[(&str, u16)] = &[
+    ("fan", 1),
+    ("q2", 1),
+    ("z", 3),
+    ("head", 1),
+    ("x2", 1),
+    ("r2", 1),
+    ("a", 2),
+    ("x3", 1),
+    ("b", 1),
+    ("late", 2),
+    ("sink", 1),
+];
+
 // ---------------------------------------------------------------------------
 // The nodes.
 // ---------------------------------------------------------------------------
@@ -551,16 +567,36 @@ fn assert_floors(run: &Run, label: &str) {
         bursts >= STEPS / 20,
         "{label}: {bursts} steps where the chain tail fired twice; the bursts must reach it"
     );
-    assert!(
-        run.reads.len() >= STEPS,
-        "{label}: {} read outcomes; the read log must be armed",
-        run.reads.len()
-    );
+    let mut per_input: std::collections::BTreeMap<(String, u16), usize> = Default::default();
+    for r in &run.reads {
+        *per_input
+            .entry((r.node_id.clone(), r.input_idx))
+            .or_default() += 1;
+    }
+    eprintln!("{label}: read outcomes per input {per_input:?}");
+    for (node, inputs) in READ_INPUTS {
+        for idx in 0..*inputs {
+            let n = per_input
+                .get(&(node.to_string(), idx))
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                n >= STEPS / 4,
+                "{label}: {node} input {idx} logged {n} read outcomes, under the floor {}",
+                STEPS / 4
+            );
+        }
+    }
     let mut per_tag: std::collections::BTreeMap<&str, usize> = Default::default();
     for (tag, _) in &run.frames {
         *per_tag.entry(tag).or_default() += 1;
     }
-    assert_eq!(per_tag.len(), 15, "{label}: frame streams {:?}", per_tag.keys());
+    assert_eq!(
+        per_tag.len(),
+        15,
+        "{label}: frame streams {:?}",
+        per_tag.keys()
+    );
     for (tag, n) in &per_tag {
         assert!(
             *n >= STEPS / 4,
@@ -606,11 +642,12 @@ fn a_chain_called_run_matches_the_queued_run_entry_for_entry() {
     let queued = run(false);
     let fused = run(true);
     assert_eq!(queued.calls, 0, "the queued run must make no chain call");
-    assert!(
-        fused.calls >= (STEPS * MEMBERS / 2) as u64,
-        "the fused run made {} chain calls; expected about {} (every member, every step)",
+    // One call per member per step, due or not: a chain the census lost
+    // would show here.
+    assert_eq!(
         fused.calls,
-        STEPS * MEMBERS
+        (STEPS * MEMBERS) as u64,
+        "the fused run must call every member of the three chains every step"
     );
     assert_floors(&queued, "queued");
     assert_floors(&fused, "fused");
@@ -627,8 +664,8 @@ fn an_unset_seam_makes_no_chain_call() {
     std::env::remove_var(FUSE_CHAINS_ENV);
     let config = parse_graph(GRAPH).expect("the fixture graph must parse");
     let clock = Arc::new(VirtualClock::new());
-    let mut runtime =
-        GraphRuntime::build_for_test(config, factories(), clock, 8).expect("the fixture must build");
+    let mut runtime = GraphRuntime::build_for_test(config, factories(), clock, 8)
+        .expect("the fixture must build");
     runtime.set_trace_limit(usize::MAX);
     for _ in 0..50 {
         runtime.step(Duration::from_millis(1));
@@ -644,7 +681,9 @@ fn an_unset_seam_makes_no_chain_call() {
 #[cfg(feature = "oracle-mutants")]
 mod mutants {
     use super::*;
-    use cerulion_core::graph::{CHAIN_CALL_INLINE_TRACE_MUTANT_ENV, CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV};
+    use cerulion_core::graph::{
+        CHAIN_CALL_INLINE_TRACE_MUTANT_ENV, CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV,
+    };
 
     struct MutantEnv(&'static str);
 
@@ -669,8 +708,12 @@ mod mutants {
     fn the_inline_trace_mutant_is_caught() {
         let (queued, fused) = mutated_run(CHAIN_CALL_INLINE_TRACE_MUTANT_ENV);
         assert!(fused.calls > 0, "the mutant run must make chain calls");
-        let err = compare(&queued, &fused).expect_err("the oracle must catch an inline trace write");
-        assert!(err.starts_with("fire trace:"), "caught at the wrong log: {err}");
+        let err =
+            compare(&queued, &fused).expect_err("the oracle must catch an inline trace write");
+        assert!(
+            err.starts_with("fire trace:"),
+            "caught at the wrong log: {err}"
+        );
     }
 
     /// A chain call that skips the member's own dequeue fires on a frame it
