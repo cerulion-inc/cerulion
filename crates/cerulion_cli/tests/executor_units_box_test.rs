@@ -77,6 +77,7 @@
 mod det_scaffold;
 mod mp_support;
 mod read_identity;
+mod scaffold_dir;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -84,7 +85,7 @@ use std::time::{Duration, Instant};
 use cerulion_core::graph::params::ParamValue;
 use read_identity::{
     graph_config, judge_replayed, node_def, unique_names, write_graph, Fixture, Floors, Placement,
-    ReplayMode, RowVerdict, SAMPLES_DIR_ENV,
+    ReplayMode, RowVerdict, Workspace, SAMPLES_DIR_ENV,
 };
 use serial_test::serial;
 
@@ -180,8 +181,7 @@ fn leg_numbers(dir: &Path) -> Leg {
 
 /// Run one leg with all three nodes in one process group and return the fast
 /// node's numbers. `env` adds variables to the run.
-fn run_leg(leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
-    let ws = read_identity::workspace();
+fn run_leg(ws: &Workspace, leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     let (graph, prefix) = unique_names("units");
     let slow_node = match slow {
         Slow::DropOldest(us) => node_def(
@@ -209,7 +209,7 @@ fn run_leg(leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     ];
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = read_identity::RunDir::new();
+    let dir = scaffold_dir::ScaffoldDir::new("units_leg");
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let start = Instant::now();
@@ -228,8 +228,8 @@ fn run_leg(leg: &str, slow: Slow, env: &[(&str, &Path)]) -> Leg {
     n
 }
 
-fn baseline() -> Leg {
-    let base = run_leg("baseline", Slow::DropOldest(0), &[]);
+fn baseline(ws: &Workspace) -> Leg {
+    let base = run_leg(ws, "baseline", Slow::DropOldest(0), &[]);
     assert!(
         base.fires >= MIN_BASELINE_SAMPLES && base.rate_hz >= 500.0,
         "RI_HARNESS: the baseline fast node fired {} times at {:.1} Hz; a 1 ms pacer should \
@@ -266,8 +266,9 @@ fn slow_within_bound(base: &Leg, slow: &Leg) -> Result<(), String> {
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
-    let base = baseline();
-    let control = run_leg("control", Slow::Block(SLOW_SLEEP_US), &[]);
+    let ws = read_identity::workspace();
+    let base = baseline(&ws);
+    let control = run_leg(&ws, "control", Slow::Block(SLOW_SLEEP_US), &[]);
     assert!(
         control.rate_hz <= base.rate_hz * 0.5,
         "RI_HARNESS: the block control did not slow the fast node ({:.1} Hz against a {:.1} Hz \
@@ -275,7 +276,7 @@ fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
         control.rate_hz,
         base.rate_hz
     );
-    let slow = run_leg("slow", Slow::DropOldest(SLOW_SLEEP_US), &[]);
+    let slow = run_leg(&ws, "slow", Slow::DropOldest(SLOW_SLEEP_US), &[]);
     assert!(
         slow.fires >= MIN_SLOW_SAMPLES,
         "RI_HARNESS: the slow leg's fast node fired only {} times",
@@ -291,9 +292,9 @@ fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn the_unit_collapse_mutant_is_caught() {
-    let base = baseline();
-    let mutant = run_leg(
-        "mutant",
+    let ws = read_identity::workspace();
+    let base = baseline(&ws);
+    let mutant = run_leg(&ws, "mutant",
         Slow::DropOldest(SLOW_SLEEP_US),
         &[(
             cerulion_cli_engine::multiprocess::UNIT_COLLAPSE_MUTANT_ENV,
@@ -319,8 +320,7 @@ fn the_unit_collapse_mutant_is_caught() {
 /// Run one leg of the CHAIN shape, all three nodes in one process group and
 /// no profile: `pace -> fast -> slow` is one linear chain, so only the
 /// no-profile rule keeps `slow` off `fast`'s thread.
-fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
-    let ws = read_identity::workspace();
+fn run_chain_leg(ws: &Workspace, leg: &str, env: &[(&str, &Path)]) -> Leg {
     let (graph, prefix) = unique_names("units_chain");
     let nodes = vec![
         node_def("pace", "ri_pace", &[], &["out", "side"], &[]),
@@ -344,7 +344,7 @@ fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
     ];
     let groups = vec![("g_all", vec!["pace", "fast", "slow"])];
     write_graph(ws, &graph_config(&graph, &prefix, nodes, &groups, vec![]));
-    let dir = read_identity::RunDir::new();
+    let dir = scaffold_dir::ScaffoldDir::new("units_leg");
     let samples = dir.path().join("samples");
     std::fs::create_dir_all(&samples).expect("RI_HARNESS: samples dir");
     let start = Instant::now();
@@ -369,8 +369,9 @@ fn run_chain_leg(leg: &str, env: &[(&str, &Path)]) -> Leg {
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
-    let base = baseline();
-    let chain = run_chain_leg("chain_slow", &[]);
+    let ws = read_identity::workspace();
+    let base = baseline(&ws);
+    let chain = run_chain_leg(&ws, "chain_slow", &[]);
     assert!(
         chain.fires >= MIN_SLOW_SAMPLES,
         "RI_HARNESS: the chain leg's fast node fired only {} times",
@@ -388,9 +389,9 @@ fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn the_unprofiled_merge_mutant_is_caught() {
-    let base = baseline();
-    let mutant = run_chain_leg(
-        "merge_mutant",
+    let ws = read_identity::workspace();
+    let base = baseline(&ws);
+    let mutant = run_chain_leg(&ws, "merge_mutant",
         &[(
             cerulion_core::graph::executor::MERGE_MUTANT_ENV,
             Path::new("1"),
@@ -407,11 +408,12 @@ fn the_unprofiled_merge_mutant_is_caught() {
 
 /// Record `fixture` under `placement`, resim it, judge and print.
 fn record_and_judge(
+    ws: &Workspace,
     fixture: Fixture,
     placement: Placement,
 ) -> (read_identity::RecordedRun, read_identity::Verdict) {
-    let run = read_identity::record_live(fixture, placement);
-    let replayed = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let run = read_identity::record_live(ws, fixture, placement);
+    let replayed = read_identity::resim(ws, &run, ReplayMode::ResimNeutral, None);
     let outcome = judge_replayed(fixture, &run.live, &replayed, Floors::default())
         .unwrap_or_else(|e| panic!("RI_HARNESS: {}: {e}", fixture.name()));
     outcome.print(
@@ -523,11 +525,12 @@ impl Drop for CpuStressor {
 /// judge the same under both placements. `leg` names the host condition in
 /// the printed lines.
 fn replays_like_separate_processes(leg: &str) {
+    let ws = &read_identity::workspace();
     let mut compared = 0usize;
     let mut excess = 0usize;
     for fixture in [Fixture::FanOut, Fixture::Ranks3] {
-        let (run, units) = record_and_judge(fixture, Placement::OneGroup);
-        let (declared_run, processes) = record_and_judge(fixture, Placement::Declared);
+        let (run, units) = record_and_judge(ws, fixture, Placement::OneGroup);
+        let (declared_run, processes) = record_and_judge(ws, fixture, Placement::Declared);
         assert!(
             !units.rows.is_empty(),
             "RI_HARNESS: {} judged no stream",
@@ -695,8 +698,9 @@ fn embedded_graph(bag: &Path) -> String {
 #[ignore = "box-only: real runs on a quiet Linux host"]
 #[serial]
 fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
-    let mut run = read_identity::record_live(Fixture::Ranks2, Placement::Declared);
-    let reference = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let ws = read_identity::workspace();
+    let mut run = read_identity::record_live(&ws, Fixture::Ranks2, Placement::Declared);
+    let reference = read_identity::resim(&ws, &run, ReplayMode::ResimNeutral, None);
     let read_identity::Replayed::Reads { log: reference, .. } = reference else {
         panic!("RI_HARNESS: the unrewritten bag's replay refused");
     };
@@ -720,7 +724,7 @@ fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
     assert!(embedded_graph(&rewritten).contains("fuse: false"));
     run.bag = rewritten;
 
-    let replayed = read_identity::resim(&run, ReplayMode::ResimNeutral, None);
+    let replayed = read_identity::resim(&ws, &run, ReplayMode::ResimNeutral, None);
     let log = match replayed {
         read_identity::Replayed::Reads { exit, log } => {
             assert_eq!(
@@ -880,8 +884,9 @@ fn print_read_window(bag: &Path, label: &str, seq: u64) {
 #[ignore = "box-only: real runs on a quiet Linux host"]
 #[serial]
 fn a_late_relay_with_one_process_per_node_replay_probe() {
+    let ws = read_identity::workspace();
     let fixture = Fixture::Ranks3LateRelay;
-    let (run, verdict) = record_and_judge(fixture, Placement::Declared);
+    let (run, verdict) = record_and_judge(&ws, fixture, Placement::Declared);
     assert!(
         verdict.compared_floor(Floors::default()).is_ok(),
         "RI_HARNESS: {} compared too few reads\n{}",
@@ -1073,6 +1078,7 @@ fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &s
 #[ignore = "box-only: timing on a quiet Linux host"]
 #[serial]
 fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
+    let ws = read_identity::workspace();
     /// Turns the unit-thread sampler on for this arm only.
     struct Sampling;
     impl Drop for Sampling {
@@ -1086,7 +1092,7 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
     for rep in 0..FIRST_FIRE_REPS {
         let mut relay = std::collections::BTreeMap::new();
         for placement in [Placement::Declared, Placement::OneGroup] {
-            let run = read_identity::record_live(Fixture::Ranks3, placement);
+            let run = read_identity::record_live(&ws, Fixture::Ranks3, placement);
             let fires = first_fires(&run.bag);
             assert_eq!(
                 fires.len(),

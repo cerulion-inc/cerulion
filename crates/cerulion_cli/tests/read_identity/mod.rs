@@ -1080,6 +1080,57 @@ impl RiFastNode {
 }
 "#,
     },
+    // The fast node as the HEAD side of a chain: records the same samples as
+    // `ri_fast` and republishes the frame, so a slow node can follow it.
+    NodeType {
+        name: "ri_fast_relay",
+        policy: MacroPolicy::DataTrigger {
+            input_name: String::new(),
+        },
+        trigger: Some("inp"),
+        inputs: &["inp"],
+        outputs: &["out"],
+        body: r#"#[cerulion_node]
+struct RiFastRelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    samples: Vec<(u64, u64)>,
+}
+
+#[cerulion_node_impl]
+impl RiFastRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let stamp = self.inp.x;
+        let now = self.real_ns();
+        self.samples.push((now, now.saturating_sub(stamp as u64)));
+        self.out.x = self.inp.x;
+        self.out.y = self.inp.y;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), NodeError> {
+        use std::io::Write as _;
+        if self.samples.is_empty() {
+            return Ok(());
+        }
+        let Some(dir) = std::env::var_os("CER_RI_SAMPLES_DIR") else {
+            return Ok(());
+        };
+        let mut out = String::with_capacity(self.samples.len() * 24);
+        for (t, lat) in &self.samples {
+            out.push_str(&format!("{t} {lat}\n"));
+        }
+        let path = std::path::Path::new(&dir).join(format!("fast_{}.samples", std::process::id()));
+        if let Ok(mut f) = std::fs::File::create(path) {
+            let _ = f.write_all(out.as_bytes());
+        }
+        Ok(())
+    }
+}
+"#,
+    },
     // The slow consumer behind a declared `block` edge: its producer is
     // deferred while two frames are unserved.
     NodeType {
@@ -1249,6 +1300,9 @@ pub enum Placement {
     Declared,
     /// Every node in one process (`graph run --single-process`).
     SingleProcess,
+    /// Every node in one declared process group: one worker process of a
+    /// multi-process run, whose nodes run in executor units.
+    OneGroup,
 }
 
 impl Placement {
@@ -1256,6 +1310,7 @@ impl Placement {
         match self {
             Placement::Declared => "declared",
             Placement::SingleProcess => "single_process",
+            Placement::OneGroup => "one_group",
         }
     }
 }
@@ -1313,7 +1368,7 @@ impl Fixture {
                     inputs: Vec<InputDef>,
                     outputs: Vec<OutputDef>,
                     params: &[(&str, ParamValue)]| NodeDef {
-            fuse: None,
+            isolate: None,
             ros2: None,
             params: params
                 .iter()
@@ -1465,7 +1520,7 @@ pub fn node_def(
     params: &[(&str, ParamValue)],
 ) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         ros2: None,
         params: params
             .iter()
@@ -1526,54 +1581,12 @@ pub fn graph_config(
 // Drivers.
 // ===========================================================================
 
-/// The env var that keeps a failing run's directory (its bag and its read
-/// logs) instead of deleting it.
-pub const KEEP_TEST_WS_ENV: &str = "CERULION_KEEP_TEST_WS";
-
-/// A run's private directory. It is deleted when dropped, except while the
-/// test is panicking with [`KEEP_TEST_WS_ENV`] set to `1`: then it is kept and
-/// its path printed, so a failing box run leaves its bag and read logs behind.
-pub struct RunDir {
-    dir: Option<tempfile::TempDir>,
-}
-
-impl RunDir {
-    pub fn new() -> Self {
-        RunDir {
-            dir: Some(tempfile::tempdir().expect("RI_HARNESS: run dir")),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        self.dir.as_ref().expect("RI_HARNESS: run dir").path()
-    }
-}
-
-impl Default for RunDir {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for RunDir {
-    fn drop(&mut self) {
-        let keep =
-            std::thread::panicking() && std::env::var(KEEP_TEST_WS_ENV).as_deref() == Ok("1");
-        if let (true, Some(dir)) = (keep, self.dir.take()) {
-            eprintln!(
-                "RI_HARNESS: kept the failing run's directory {}",
-                dir.keep().display()
-            );
-        }
-    }
-}
-
 /// One recorded live run: its private directory, the finalized bag and the
 /// live read log.
 pub struct RecordedRun {
     pub fixture: Fixture,
     pub placement: Placement,
-    pub dir: RunDir,
+    pub dir: ScaffoldDir,
     pub bag: PathBuf,
     pub live: ReadLog,
     /// Where the live run's nodes wrote their records.
@@ -1909,9 +1922,15 @@ fn recording_defect(bag: &Path) -> Option<String> {
 pub fn record_live(ws: &Workspace, fixture: Fixture, placement: Placement) -> RecordedRun {
     let mut last = String::new();
     for attempt in 0..RECORD_ATTEMPTS {
-        let dir = RunDir::new();
+        let dir = ScaffoldDir::new("ri_run");
         let (graph, prefix) = unique_names(fixture.name());
-        write_graph(ws, &fixture.graph_config(&graph, &prefix));
+        let mut config = fixture.graph_config(&graph, &prefix);
+        if placement == Placement::OneGroup {
+            let all: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
+            config.process_groups = [("g_all".to_string(), all)].into_iter().collect();
+            config.process_group_order = Vec::new();
+        }
+        write_graph(ws, &config);
         let reads = dir.path().join("live_reads");
         let recordings = dir.path().join("recordings");
         std::fs::create_dir_all(&reads).expect("RI_HARNESS: reads dir");
