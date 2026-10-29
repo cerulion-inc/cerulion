@@ -222,19 +222,18 @@ mod logcat {
 
 /// Set the filter of the installed subscriber; a no-op while none is.
 ///
-/// Dropping the returned change puts the previous filter back, so a start
-/// that fails after setting its level leaves the level it found; a start
-/// that succeeds calls [`LevelChange::keep`].
+/// Dropping the returned change returns to the level the last successful
+/// start kept, so a start that fails after setting its level leaves no
+/// trace; a start that succeeds calls [`LevelChange::keep`].
 pub(crate) fn set_level(level: LogLevelConfig) -> Option<LevelChange<'static>> {
     LEVEL.get().map(|levels| levels.set(level))
 }
 
-/// A level filter whose changes count up, so an undo can tell whether a
-/// later change came after it.
+/// A level filter and the level the last successful start kept.
 struct Levels {
     handle: LevelHandle,
-    /// The number of the last change; held while a change or an undo runs.
-    last: Mutex<u64>,
+    /// The level an undo returns to; `info` until a start keeps one.
+    kept: Mutex<LevelFilter>,
 }
 
 impl Levels {
@@ -242,66 +241,69 @@ impl Levels {
     fn new(handle: LevelHandle) -> Self {
         Self {
             handle,
-            last: Mutex::new(0),
+            kept: Mutex::new(LevelFilter::INFO),
         }
     }
 
     fn set(&self, level: LogLevelConfig) -> LevelChange<'_> {
-        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        *last += 1;
-        let previous = self.handle.clone_current();
-        apply(&self.handle, level);
+        let filter = filter_of(level);
+        let _kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        reload(&self.handle, filter);
         LevelChange {
             levels: self,
-            number: *last,
-            previous,
+            filter,
+            kept: false,
         }
     }
 }
 
 /// A level set by [`set_level`], undone on drop unless kept.
 ///
-/// The undo puts the previous filter back only while no later change was
-/// made: a start that fails after another start set its own level leaves
-/// that level.
+/// An undo returns to the level the last successful start kept, so starts
+/// that overlap and fail in any order never leave a failed start's level.
 #[must_use = "dropping it puts the previous level back"]
 pub(crate) struct LevelChange<'a> {
     levels: &'a Levels,
-    number: u64,
-    previous: Option<LevelFilter>,
+    filter: LevelFilter,
+    kept: bool,
 }
 
 impl LevelChange<'_> {
-    /// Keep the new level.
+    /// Keep the new level, also over an undo that ran since it was set.
     pub(crate) fn keep(mut self) {
-        self.previous = None;
+        let mut kept = self
+            .levels
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *kept = self.filter;
+        reload(&self.levels.handle, self.filter);
+        self.kept = true;
     }
 }
 
 impl Drop for LevelChange<'_> {
     fn drop(&mut self) {
-        let last = self
+        if self.kept {
+            return;
+        }
+        let kept = self
             .levels
-            .last
+            .kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let (Some(previous), true) = (self.previous, *last == self.number) {
-            reload(&self.levels.handle, previous);
-        }
+        reload(&self.levels.handle, *kept);
     }
 }
 
-fn apply(handle: &LevelHandle, level: LogLevelConfig) {
-    reload(
-        handle,
-        match level {
-            LogLevelConfig::Error => LevelFilter::ERROR,
-            LogLevelConfig::Warn => LevelFilter::WARN,
-            LogLevelConfig::Info => LevelFilter::INFO,
-            LogLevelConfig::Debug => LevelFilter::DEBUG,
-            LogLevelConfig::Trace => LevelFilter::TRACE,
-        },
-    );
+fn filter_of(level: LogLevelConfig) -> LevelFilter {
+    match level {
+        LogLevelConfig::Error => LevelFilter::ERROR,
+        LogLevelConfig::Warn => LevelFilter::WARN,
+        LogLevelConfig::Info => LevelFilter::INFO,
+        LogLevelConfig::Debug => LevelFilter::DEBUG,
+        LogLevelConfig::Trace => LevelFilter::TRACE,
+    }
 }
 
 fn reload(handle: &LevelHandle, filter: LevelFilter) {
@@ -314,6 +316,10 @@ fn reload(handle: &LevelHandle, filter: LevelFilter) {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn apply(handle: &LevelHandle, level: LogLevelConfig) {
+        reload(handle, filter_of(level));
+    }
 
     #[derive(Clone, Default)]
     struct FakeSink(Arc<Mutex<Vec<(LogPriority, String)>>>);
@@ -431,31 +437,54 @@ mod tests {
         sink.lines().into_iter().map(|(_, line)| line).collect()
     }
 
-    #[test]
-    fn a_start_that_fails_after_a_later_start_kept_its_level_leaves_that_level() {
+    /// Run `steps` on fresh levels at `info` and return what a debug, an
+    /// info and an error line then leave in the sink.
+    fn after(steps: impl FnOnce(&Levels)) -> Vec<String> {
         let sink = FakeSink::default();
         let (subscriber, handle) = subscriber(sink.clone());
         let levels = Levels::new(handle);
         tracing::subscriber::with_default(subscriber, || {
-            let first = levels.set(LogLevelConfig::Debug);
-            let second = levels.set(LogLevelConfig::Error);
-            second.keep();
-            drop(first);
-            assert_eq!(written(&sink), ["app: error"]);
-        });
+            steps(&levels);
+            written(&sink)
+        })
     }
 
     #[test]
-    fn a_later_start_that_fails_puts_back_the_level_of_the_start_before_it() {
-        let sink = FakeSink::default();
-        let (subscriber, handle) = subscriber(sink.clone());
-        let levels = Levels::new(handle);
-        tracing::subscriber::with_default(subscriber, || {
+    fn a_failed_start_returns_to_the_level_a_later_start_kept() {
+        let lines = after(|levels| {
+            let first = levels.set(LogLevelConfig::Debug);
+            levels.set(LogLevelConfig::Error).keep();
+            drop(first);
+        });
+        assert_eq!(lines, ["app: error"]);
+    }
+
+    #[test]
+    fn a_start_kept_after_a_later_start_failed_holds_its_own_level() {
+        let lines = after(|levels| {
+            let first = levels.set(LogLevelConfig::Debug);
+            drop(levels.set(LogLevelConfig::Error));
+            first.keep();
+        });
+        assert_eq!(lines, ["app: debug", "app: info", "app: error"]);
+    }
+
+    #[test]
+    fn two_failed_starts_return_to_the_last_kept_level_in_either_order() {
+        let later_first = after(|levels| {
+            levels.set(LogLevelConfig::Warn).keep();
+            let first = levels.set(LogLevelConfig::Debug);
+            drop(levels.set(LogLevelConfig::Error));
+            drop(first);
+        });
+        let earlier_first = after(|levels| {
+            levels.set(LogLevelConfig::Warn).keep();
             let first = levels.set(LogLevelConfig::Debug);
             let second = levels.set(LogLevelConfig::Error);
+            drop(first);
             drop(second);
-            first.keep();
-            assert_eq!(written(&sink), ["app: debug", "app: info", "app: error"]);
         });
+        assert_eq!(later_first, ["app: error"]);
+        assert_eq!(earlier_first, ["app: error"]);
     }
 }

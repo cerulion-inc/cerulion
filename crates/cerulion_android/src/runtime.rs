@@ -606,10 +606,11 @@ impl EmbeddedRuntime {
                 return Err(error);
             }
         };
-        // Set after the transport, so a start refused there (another
-        // runtime owns the gateway) never touches the process-wide level.
-        // The build's lines use it; a later failure drops `level` and puts
-        // the previous one back. A restart without the key returns to `info`.
+        // Set just before the build, so the build's lines use it. A start
+        // refused before this point never touches the process-wide level; a
+        // later failure (another runtime owns the gateway, a recording file
+        // exists) drops `level`, which returns to the last kept level. A
+        // restart without the key returns to `info`.
         let level = crate::log::set_level(log_level);
         let mut run = match build(&mut plan, manager, &self.status) {
             Ok(run) => run,

@@ -165,6 +165,25 @@ fn a_graph_that_does_not_parse_leaves_the_level_unchanged() {
 }
 
 #[test]
+fn the_lines_of_a_start_use_its_level_before_it_commits() {
+    let (_serial, sink) = sink();
+    run_once(json!({ "log_level": "warn" })).expect("start at warn");
+    let temp = tempdir().unwrap();
+    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
+    runtime.set_before_commit_hook_for_test(|_| {
+        tracing::info!(target: "app", "info before the commit");
+    });
+    runtime
+        .start(&json!({ "listen": ["tcp/127.0.0.1:0"], "log_level": "info" }).to_string())
+        .expect("start at info");
+    runtime.stop().expect("stop");
+    assert!(
+        texts(&sink.take()).contains(&"app: info before the commit"),
+        "the start's own level must apply before it commits"
+    );
+}
+
+#[test]
 fn a_start_that_fails_in_its_build_puts_the_previous_level_back() {
     let (_serial, sink) = sink();
     run_once(json!({ "log_level": "warn" })).expect("start at warn");
