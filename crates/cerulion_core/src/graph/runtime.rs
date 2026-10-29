@@ -15980,7 +15980,6 @@ impl GraphRuntime {
         if range.is_empty() {
             return;
         }
-        // hot-path-alloc-ok: not a heap allocation: cloning an `Arc<[_]>` is a refcount bump
         let calls_now = Arc::clone(&calls.calls);
         #[cfg(feature = "oracle-mutants")]
         let skip_dequeue = calls.skip_dequeue_mutant;
@@ -18830,33 +18829,33 @@ impl GraphRuntime {
         // structured logging across this iteration. Cheap clone
         // (atomic increment for Some, no-op for None).
         // hot-path-alloc-ok: not a heap allocation: cloning an `Arc`/`Option<Arc>` is a
-        // refcount bump — the comment above says so, and `input_name` is an `Option<Arc<str>>`
+        // refcount bump, the comment above says so, and `input_name` is an `Option<Arc<str>>`
         let input_name = self.data_trigger_bindings[i].input_name.clone();
         let consume_latest = self.data_trigger_bindings[i].consume_latest;
 
-        // Dispatch on the binding's `DrainSource` — the two
+        // Dispatch on the binding's `DrainSource`, the two
         // drain disciplines are mutually exclusive in the type system, so the
         // SEPARATE path can no longer reach a `ListenerOnly` (it indexes an
         // `Ipc` by construction; the never-drain contract now lives once in
         // `TriggerSubscriber::try_receive_timestamps`).
-        //   `Separate` — legacy dual-subscriber: drain the dedicated
+        //   `Separate`, legacy dual-subscriber: drain the dedicated
         //             trigger-drain subscriber (`trigger_subscribers[sub_idx]`,
         //             a `TriggerSubscriber::Ipc`) via `try_receive` (UNCHANGED
-        //             path — timestamps scratch, warn-suppression, per-ts
+        //             path, timestamps scratch, warn-suppression, per-ts
         //             `signal_input_received` + `signal_data`).
-        //   `Unified`  — drain the node's BODY subscriber through the node
+        //   `Unified` , drain the node's BODY subscriber through the node
         //             lock (`drain_trigger_input`), which freezes the
         //             surviving sample for the tick's later `try_view` (one
         //             receive per hop instead of two), and returns
         //             `(popped, latest_ts)` to drive `signal_data` /
-        //             `signal_input_received` — exactly mirroring the
+        //             `signal_input_received`, exactly mirroring the
         //             separate path's per-arrival firing + watchdog reset.
         //             `listener_idx` points at a
         //             `TriggerSubscriber::ListenerOnly` (the WaitSet wake
         //             source) which is NEVER `try_receive`d.
         match self.data_trigger_bindings[i].drain {
             DrainSource::Separate { sub_idx } => {
-                // Reuse the scratch buffer — clear (capacity
+                // Reuse the scratch buffer, clear (capacity
                 // retained), not reallocate. Same observable result as the old
                 // per-binding `Vec::new()`: each binding starts with an empty
                 // timestamp list (`try_receive_timestamps` clears it). The
@@ -18880,7 +18879,7 @@ impl GraphRuntime {
                 // Update suppression flag: latch on first try_receive failure;
                 // clear on any successful receive (whether or not it produced
                 // a msg). The recovery message is scoped to the TRANSPORT
-                // try_receive layer — it does NOT assert that the downstream
+                // try_receive layer, it does NOT assert that the downstream
                 // scheduler.signal_data calls below also succeeded. A
                 // recovered transport with a still-failing scheduler is a
                 // legitimate state and the per-timestamp signal_data warns
@@ -18923,12 +18922,12 @@ impl GraphRuntime {
                     (true, false)
                 };
 
-                // Iterate by ref (`&ts`) — the buffer is reused
+                // Iterate by ref (`&ts`), the buffer is reused
                 // across bindings, not consumed. `ts` stays `u64` (Copy), so
                 // the body is unchanged.
                 for &ts in timestamps.iter() {
                     // Reset this trigger input's
-                    // `expect_within_ms` watchdog same-step — `drain_level`
+                    // `expect_within_ms` watchdog same-step, `drain_level`
                     // runs BEFORE that level fires (and thus before the
                     // scheduler's per-node `step()` watchdog check), so a
                     // trigger input that received data this tick is not
@@ -18939,7 +18938,7 @@ impl GraphRuntime {
                     // This is the SAME-STEP (zero-lag) reset. The node's tick
                     // body ALSO resets the anchor when it reads the input via
                     // `try_view` (subscriber.rs), but that fires inside
-                    // `fire_node` AFTER this step's watchdog check — a
+                    // `fire_node` AFTER this step's watchdog check, a
                     // one-step-lagged reset. For a sane window (W >> step
                     // size) the body read alone suffices, so the two paths are
                     // largely redundant under `VirtualClock`; this same-step
@@ -18950,7 +18949,7 @@ impl GraphRuntime {
                     // MECHANISM (signal_input_received advancing the window) is
                     // pinned directly in `deadline_qos_test::expect_within_miss_*`;
                     // we deliberately do not add a
-                    // step-aligned e2e differential test (it would be fragile) —
+                    // step-aligned e2e differential test (it would be fragile),
                     // the scheduler-direct pin + this contract is the coverage.
                     if let Some(input) = input_name.as_deref() {
                         if let Err(e) = self.scheduler.signal_input_received(&node_id, input, ts) {
@@ -18992,7 +18991,7 @@ impl GraphRuntime {
             }
             DrainSource::Unified { listener_idx } => {
                 // The multi-process free-run fix: drain the standalone
-                // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step —
+                // `ListenerOnly`'s NOTIFICATION queue here, INSIDE the step,
                 // exact parity with the Separate arm, whose
                 // `try_receive_timestamps` → `CerulionSubscriber::try_receive`
                 // runs the listener policy on ITS listener after a drain that
@@ -19001,7 +19000,7 @@ impl GraphRuntime {
                 // step (the FFI/body drain below clears only the BODY
                 // subscriber's own listener), and the next `live_step`'s idle
                 // polls (`spin_sources` / `monitor_wait_block`'s recheck) read
-                // the STALE event as "data pending" — one spurious wake+step
+                // the STALE event as "data pending", one spurious wake+step
                 // per publish. Under the multi-process split that
                 // runaway is SELF-SUSTAINING: the spurious step crosses every
                 // barrier boundary (waking peers via the predicate)
@@ -19011,7 +19010,7 @@ impl GraphRuntime {
                 // ~7.5kHz wall).
                 //
                 // RECORD-ONLY + firewall-safe: notification queue only, never
-                // the SHM message queue, never a scheduler mutation — it
+                // the SHM message queue, never a scheduler mutation, it
                 // changes only WHEN the idle path wakes (removes STALE wakes;
                 // Principle #7).
                 //
@@ -19021,7 +19020,7 @@ impl GraphRuntime {
                 // before the notify. That was written when the drain below
                 // consumed the whole queue. Under per-message FIFO the drain
                 // pops ONE frame, so the events for frames 2..N ARE consumed
-                // here while their data is still queued — this drain-all is
+                // here while their data is still queued, this drain-all is
                 // exactly what leaves the remainder unannounced.
                 //
                 // It stays drain-all, and the remainder is served WITHIN THE
@@ -19040,7 +19039,7 @@ impl GraphRuntime {
                 // UNIFIED data-trigger input. Lock the node,
                 // drain its body subscriber ONCE (which freezes the surviving
                 // sample so the tick's later `try_view` serves it with NO
-                // second receive — accounting-once), and read `(popped,
+                // second receive, accounting-once), and read `(popped,
                 // latest_ts)`. `self.nodes` is a DIFFERENT field from
                 // `self.scheduler`, and the lock guard drops at the end of its
                 // block BEFORE the `signal_*` calls below, so the
@@ -19091,7 +19090,7 @@ impl GraphRuntime {
                     }
                 }
 
-                // One `signal_data` per popped frame — identical to the
+                // One `signal_data` per popped frame, identical to the
                 // separate path's per-ts `signal_data`. Per-message FIFO
                 // firing: `decide_node` consumes ONE pending arrival per
                 // step and carries the remainder, so each popped frame
@@ -19101,14 +19100,14 @@ impl GraphRuntime {
                 // because on THIS path a pop is not the same thing as an
                 // arrival. `drain_trigger_input` returns `(1, head_ts)` for
                 // a RE-OFFER of a head no tick has taken yet (Principle #6
-                // — a fire that was deferred, or whose tick collapsed
+                //, a fire that was deferred, or whose tick collapsed
                 // before reaching the read, must not lose its signal), and
                 // a deferred node consumes nothing: `decide_node` runs its
                 // `throttle_ms` / `block` pre-fire check at the TOP and
                 // returns `None`. So an ungated mint added one signal per
                 // DEFERRED STEP for the SAME single held frame, saturating
                 // `pending_data_count` at `DATA_PENDING_CARRY_CLAMP` (64)
-                // and draining at one per throttle period — which made the
+                // and draining at one per throttle period, which made the
                 // count report a step tally rather than a queue depth, and
                 // suppressed the input's `expect_within_ms` watchdog for up
                 // to 64 throttle periods after its producer died (6.4 s at
@@ -19119,11 +19118,11 @@ impl GraphRuntime {
                 // all it is gated on: if `pending == 0` the node has no
                 // reason to fire and the signal is what gives it one (the
                 // collapsed-tick shape, where the fire CONSUMED the
-                // count but the tick never took the head — an un-minted
+                // count but the tick never took the head, an un-minted
                 // re-offer wedges the node permanently). If `pending > 0`
                 // the node is already due, `ns_until_next_fire` already
                 // reports 0, and `tick_data_burst` REFILLS from this very
-                // input between fires — so the frame is served this step or
+                // input between fires, so the frame is served this step or
                 // the next without a signal of its own. The invariant the
                 // gate maintains is exactly the wedge-freedom one: after
                 // this loop, `popped >= 1` implies `pending >= 1`.

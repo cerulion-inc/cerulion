@@ -5747,7 +5747,6 @@ impl Scheduler {
         self.run_qos_windows(idx, new_time);
         let cap_override = self.catchup_cap_override;
         let node = &mut self.nodes[idx];
-        // hot-path-alloc-ok: not a heap allocation: cloning an `Arc<str>` is a refcount bump
         let id = Arc::clone(&node.node_id);
         let Some(kind) = Self::decide_node(&id, node, new_time, cap_override) else {
             return false;
