@@ -18,6 +18,10 @@
 //!   node HOLDS `inp` across silent steps (`holds_input_snapshot() == true`)
 //!   while still firing serially (`performs_input_snapshot() == false`).
 //!
+//! `cerulion_android`'s `embedded_app_topic_feeds_linked_node_test` links it
+//! as a plain library (`default-features = false`, no C exports) and reads an
+//! app-published topic on its latest-value input.
+//!
 //! Why a NEW fixture: no existing macro cdylib fixture is a `period_ms` node
 //! with a plain (non-trigger) `#[input]` — `test_node_macro_period_cdylib` is
 //! output-only, `test_node_macro_cdylib` has an `#[input(trigger)]` (Data
@@ -35,7 +39,7 @@ use cerulion_core::prelude::*;
 use native_ros2_messages::geometry_msgs::Vector3;
 
 #[cerulion_node(period_ms = 10)]
-struct PeriodInputNode {
+pub struct PeriodInputNode {
     /// Plain (non-trigger) latest-value input → the node is classified into
     /// `snapshot_input_names`. It is routed serial under within-level parallel
     /// fire (`performs_input_snapshot() == false`), and the host makes its
