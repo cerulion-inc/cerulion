@@ -508,6 +508,16 @@ fn is_ingress_registered(topic: &str) -> bool {
         .is_ingress_registered(topic)
 }
 
+/// Number of topics in the demand set the app transport's demand-GET loop
+/// reads.
+fn demand_set_size() -> usize {
+    TransportManager::get()
+        .expect("initialized app transport manager")
+        .network()
+        .expect("the app transport has a network")
+        .ingress_demand_keepalive_topic_count()
+}
+
 fn relay_for(topic: &str) -> &'static str {
     if topic == CMD {
         "cmd_relay"
@@ -600,6 +610,9 @@ fn lan_run(
         assert!(!is_ingress_registered(ingress), "{run}: '{ingress}'");
         assert!(ingress_stats(ingress).is_none(), "{run}: '{ingress}'");
         assert_eq!(gets, "", "{run}: a paired app sends no demand GET");
+        // The GET record covers less than one loop interval; the demand set
+        // the loop reads is empty, so no pass would GET a topic either.
+        assert_eq!(demand_set_size(), 0, "{run}: a paired app demands nothing");
     } else {
         assert!(
             ingress_echoes.iter().all(|&x| x == RIGHT_X),
@@ -623,11 +636,21 @@ fn lan_run(
         assert_eq!(stats.decode_errors, 0, "{run}: {stats:?}");
         assert_eq!(stats.reinject_failure_drops, 0, "{run}: {stats:?}");
         assert_eq!(gets, format!("{ingress}\n"), "{run}: demand GETs");
+        assert_eq!(
+            demand_set_size(),
+            1,
+            "{run}: the run demands its topic only"
+        );
     }
     runtime.stop().unwrap();
     assert!(
         !is_ingress_registered(ingress),
         "{run}: stop releases '{ingress}'"
+    );
+    assert_eq!(
+        demand_set_size(),
+        0,
+        "{run}: stop ends the run's demand GETs"
     );
 }
 

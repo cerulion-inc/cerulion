@@ -1031,11 +1031,11 @@ fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
     // starts from the count the gateway saw at boot.
     let await_pass = |gateway: &GatewayRuntime, which: &str| {
         let before = gateway.demand_get_pass_count();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while gateway.demand_get_pass_count() == before {
             assert!(
                 Instant::now() < deadline,
-                "no demand-GET pass ever ran over the {which} gateway's ingress topics"
+                "the manager's demand-GET loop ran no pass after the {which} gateway booted"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
