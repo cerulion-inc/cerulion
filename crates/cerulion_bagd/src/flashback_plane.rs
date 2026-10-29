@@ -605,8 +605,7 @@ impl FlashbackPlane {
             anchor_steps,
             node_ids,
         );
-        trimmed.tail_cut = complete.cut;
-        trimmed.tail_steps_cut = complete.steps_cut;
+        trimmed.record_end_cut(complete.cut, complete.steps_cut, &complete.bounded_ranks);
         // The trim reads `target(S-1)` off the anchor step's own
         // boundary record ON ITS WAY PAST — which only works while that record
         // is among the ones the FRAME floor offers it. A boundary drained a pass
@@ -679,8 +678,7 @@ impl FlashbackPlane {
     ) -> crate::trace_window::TrimmedTrace {
         let complete = crate::trace_window::end_at_last_complete_step(snapshot.iter().copied());
         let mut kept = crate::trace_window::keep_all(complete.records.into_iter(), node_ids);
-        kept.tail_cut = complete.cut;
-        kept.tail_steps_cut = complete.steps_cut;
+        kept.record_end_cut(complete.cut, complete.steps_cut, &complete.bounded_ranks);
         kept
     }
 
@@ -1712,8 +1710,9 @@ pub(crate) struct CaptureHandoff {
     /// offered" from "there was nothing to discard" — two different facts about
     /// the run, with two different things for an operator to look at.
     pub trace_records_trimmed_away: usize,
-    /// Final steps THIS capture's end cut removed, one per rank that carried a
-    /// step boundary, and the records they held. Rendered as `trace_end_cut`.
+    /// Steps THIS capture's end cut removed, summed over the ranks that carried
+    /// a step boundary (each rank's final step and every step before it at the
+    /// same target), and the records they held. Rendered as `trace_end_cut`.
     pub trace_end_cut_steps: usize,
     /// See [`trace_end_cut_steps`](Self::trace_end_cut_steps).
     pub trace_end_cut_records: usize,
@@ -2016,11 +2015,13 @@ impl CaptureHandoff {
             return HANDOFF_TRACE_END_CUT_NONE.to_string();
         }
         format!(
-            "{} final step(s) removed ({} scheduler-trace record(s)), one per rank: at the close \
-             the trace held no next step boundary proving that rank's last step complete, so a \
-             node output in it could lack the read record that caused it. The trace ends at the \
-             step before (none, if no step past the anchor remained); the removed steps' frames \
-             stay in this capture, stamped at their own step's target.",
+            "{} step(s) removed from the end of the trace ({} scheduler-trace record(s)): at the \
+             close the trace held no next step boundary proving each rank's last step complete, \
+             so a node output in it could lack the read record that caused it, and any step \
+             sharing that last step's gating-clock target went with it, because their frames \
+             carry one stamp. Each rank's \
+             trace ends at the step before them (none, if no step past the anchor remained); the \
+             removed steps' frames stay in this capture, stamped at their own step's target.",
             self.trace_end_cut_steps, self.trace_end_cut_records
         )
     }

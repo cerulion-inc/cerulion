@@ -39490,3 +39490,138 @@ fn a_capture_cut_between_an_output_and_its_read_exits_6_and_the_end_cut_replays_
         "the relay's last-step output trails the range rather than being compared: {covered:?}"
     );
 }
+
+/// A CAPTURE WHOSE FINAL STEP TIES ITS PREDECESSOR'S TARGET, through the end cut.
+///
+/// Equal consecutive targets are legal (a 0-delta step), and a data-triggered
+/// node fires on one like on any other step, so the final step's frame carries
+/// the same stamp as the step before it. The end cut removes the final step
+/// because no next boundary proves it; its frame stays in the bag. A covered
+/// range ending at the kept step's target then holds that frame, and the replay,
+/// which never drives the removed step, reports it missing.
+///
+/// HAND ORACLE. Five steps stamped 5, 10, 15, 20 and 20 ms; the relay publishes
+/// once per step at its step's target. The end cut removes every step at the
+/// final target (steps 3 and 4), so the range ends at 15 ms, the two 20 ms relay
+/// frames trail it, and the three steps the trace carries verify clean.
+#[test]
+#[serial]
+fn a_capture_whose_final_step_ties_its_predecessors_target_replays_clean_through_the_end_cut() {
+    const STEPS: usize = 5;
+    let deltas = [DELTA_MS, DELTA_MS, DELTA_MS, DELTA_MS, 0];
+    let per_step: Vec<f64> = (0..STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    let rec = record_reference_impl(
+        ext_graph_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive::singles(RW_EXT_TOPIC, per_step)],
+        &deltas,
+        16,
+        true,
+    );
+    let out_topic = "/xr/relay/out";
+    let tie = rw_target_at(&rec, 4);
+    assert_eq!(
+        rw_target_at(&rec, 3),
+        tie,
+        "PRECONDITION: the final step ties its predecessor's target"
+    );
+    assert_eq!(
+        rw_values_at(&rec, out_topic, tie).len(),
+        2,
+        "PRECONDITION: the relay published at both tied steps, so the removed step's \
+         frame shares the kept step's stamp"
+    );
+
+    let complete = cerulion_bagd::end_at_last_complete_step(rec.trace.iter().copied());
+    let through = capture_last_boundary_target(&complete.records);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("capture_end_cut_tie.mcap");
+    write_capture_shaped_bag(&rec, &complete.records, &bag, through);
+    let outcome =
+        replay(&bag, ext_relay_factories, None, None).expect("the end-cut capture replays");
+    assert!(
+        outcome.passed,
+        "a capture whose final step ties its predecessor verifies clean: {:?}",
+        outcome.violations
+    );
+    assert_eq!(
+        through,
+        rw_target_at(&rec, 2),
+        "the range ends at step 2's target, below the tie"
+    );
+    assert!(
+        complete.records.iter().all(|r| r.step <= 2),
+        "every step at the final target is removed: {:?}",
+        complete.records.iter().map(|r| r.step).collect::<Vec<_>>()
+    );
+    assert_eq!(complete.steps_cut, 2, "steps 3 and 4 are removed");
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture-shaped bag reports its covered range");
+    assert_eq!(covered.through_ns, through);
+    assert_eq!(
+        covered.trailing_frames.get(out_topic).copied(),
+        Some(2),
+        "both tied relay frames trail the range: {covered:?}"
+    );
+}
+
+/// Why a rank with no complete step DECLINES the resume claim.
+///
+/// A two-rank from-start capture under free run whose peer's trace held only its
+/// first boundary when the trace was read, while the frames read afterwards hold
+/// the peer's step 1 output. The end cut removes the peer's every record. A
+/// covered range folded over the ranks that kept a boundary is rank 0's, 15 ms,
+/// and the peer's 10 ms frame sits inside it with no boundary of its own rank to
+/// match, so the replay refuses the bag as inconsistent. No declared range can
+/// avoid that (the reader raises a lower declaration to the same fold), which is
+/// why the recorder marks such a capture not resimmable rather than declaring a
+/// range for it.
+#[test]
+#[serial]
+fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
+    let rec = record_uniform(mp_slow_b_yaml(), mp_slow_b_factories, &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_peer_unproven.mcap");
+    write_multi_rank_bag_impl(
+        &rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |per_rank| {
+            // The snapshot: the peer's first boundary only.
+            per_rank[1].retain(|r| r.step == 0);
+            // The recorder's end cut over both ranks' records.
+            let all: Vec<TraceRingRecord> = per_rank.concat();
+            let complete = cerulion_bagd::end_at_last_complete_step(all);
+            for (rank, stream) in per_rank.iter_mut().enumerate() {
+                *stream = complete
+                    .records
+                    .iter()
+                    .copied()
+                    .filter(|r| r.rank() == rank as u32)
+                    .collect();
+            }
+            assert!(
+                per_rank[1].is_empty(),
+                "PRECONDITION: the end cut leaves the peer nothing"
+            );
+        },
+        None,
+        Some(production_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        Some(15_000_000),
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+    let refused = replay(&bag, mp_slow_b_factories, None, None);
+    match &refused {
+        Err(ReplayError::RecordingInconsistent { .. }) => {}
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+}

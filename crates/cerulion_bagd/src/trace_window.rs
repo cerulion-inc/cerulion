@@ -441,11 +441,29 @@ pub(crate) struct TrimmedTrace {
     /// Records the trim discarded as belonging to steps before the resume.
     pub discarded: usize,
     /// Records removed before the trim as belonging to a rank's final,
-    /// unfinished step ([`end_at_last_complete_step`]). Zero out of
-    /// [`trim_to_anchor`] and [`keep_all`], which see only what survived it.
+    /// unfinished step or a step tied to its target
+    /// ([`end_at_last_complete_step`]). Zero out of [`trim_to_anchor`] and
+    /// [`keep_all`], which see only what survived it.
     pub tail_cut: usize,
-    /// Final steps the end cut removed, one per rank that carried a boundary.
+    /// Steps the end cut removed, summed over ranks: each rank's final step and
+    /// every step before it at the same target. A tied run that reaches back to
+    /// the anchor counts the anchor step and any earlier tied step too, which
+    /// the trim would have discarded anyway; their records are counted once, in
+    /// [`tail_cut`](Self::tail_cut).
     pub tail_steps_cut: usize,
+    /// Ranks that carried a step boundary into the end cut and keep none in
+    /// these records, ascending, while the records still hold another rank's.
+    ///
+    /// Such a rank has no complete step in the capture: the end cut removed
+    /// its final step and every step tied to that step's target, and the trim
+    /// removed any step before those. The frames its removed steps published
+    /// stay in the bag, and no covered range can
+    /// hold them, because the reader folds the range over the ranks that kept
+    /// a boundary and matches a peer's frames against that peer's own
+    /// boundaries. The capture is therefore not resimmable
+    /// (`ResimGap::RankWithoutCompleteStep`). Empty when no rank keeps a
+    /// boundary, which the judge reports as `ResimGap::NoBoundary` instead.
+    pub ranks_without_a_kept_step: Vec<u32>,
     /// The same five facts PER RANK, keyed by the rank on the record.
     ///
     /// # Why the scalars above cannot serve
@@ -521,10 +539,38 @@ pub(crate) fn trim_to_anchor(
 pub struct CompleteSteps {
     /// The records that survive the cut, in retained order.
     pub records: Vec<TraceRingRecord>,
-    /// Records removed because they belong to a rank's final, unfinished step.
+    /// Records removed because they belong to a rank's final, unfinished step
+    /// or to a step tied to its target.
     pub cut: usize,
-    /// Final steps removed: one per rank that carried a step boundary.
+    /// Steps removed, summed over ranks: each rank's final step and every step
+    /// before it at the same target.
     pub steps_cut: usize,
+    /// The ranks that carried a step boundary into the cut, ascending, whether
+    /// or not one survives it.
+    pub bounded_ranks: Vec<u32>,
+}
+
+impl TrimmedTrace {
+    /// Record what [`end_at_last_complete_step`] removed before this trace was
+    /// trimmed, and which of the ranks it saw bounded keep no boundary here.
+    pub(crate) fn record_end_cut(&mut self, cut: usize, steps_cut: usize, bounded_ranks: &[u32]) {
+        self.tail_cut = cut;
+        self.tail_steps_cut = steps_cut;
+        let kept_a_boundary = |rank: &u32| {
+            self.per_rank
+                .get(rank)
+                .is_some_and(|per| per.last_boundary_target_ns.is_some())
+        };
+        self.ranks_without_a_kept_step = if bounded_ranks.iter().any(kept_a_boundary) {
+            bounded_ranks
+                .iter()
+                .copied()
+                .filter(|rank| !kept_a_boundary(rank))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
 }
 
 /// PURE: end a retained trace at the last step each rank finished recording.
@@ -551,41 +597,81 @@ pub struct CompleteSteps {
 /// A rank's step `S` is complete when the trace holds that rank's boundary for
 /// step `S + 1`, because the ring is one producer's FIFO and the scheduler
 /// pushes boundary `S + 1` only after every record of step `S`. The final
-/// boundary on each rank has no successor, so its step is not proven: every
-/// record of that rank stamped at or after that step is removed. Departure
-/// records (`is_departure_boundary`, on any rank and at any step) are kept
-/// unchanged, and so is every record of a rank that carries no boundary.
+/// boundary on each rank has no successor, so its step is not proven.
+///
+/// # Steps tied to the final target go with it
+///
+/// Equal consecutive targets are legal (a 0-delta step), and a frame carries
+/// its step's target and nothing else, so the frames of a final step at target
+/// `T` cannot be told apart from those of an earlier step at `T`. A covered
+/// range that ends at `T` would hold the removed step's frames, and a replay
+/// never drives that step, so it would report them missing. The cut therefore
+/// starts at the earliest step of the run of steps before the final one whose
+/// targets are not below `T`. On a well-formed trace (targets non-decreasing)
+/// the rank's kept boundaries then all end strictly below `T`.
+///
+/// Every record of the rank stamped at or after that step is removed.
+/// Departure records (`is_departure_boundary`, on any rank and at any step)
+/// are kept unchanged, and so is every record of a rank that carries no
+/// boundary.
 ///
 /// Every record kept is from a step whose read records all reached the ring
 /// before the next boundary, hence before the close read the trace, hence
-/// before the close drained the frames. The frames of the removed step stay in
-/// the capture, stamped at that step's target. Where the clock advanced into
-/// that step, the target is above the last kept boundary's, the trailing shape
-/// the capture's covered range excludes from verification.
+/// before the close drained the frames. The frames of the removed steps stay
+/// in the capture, stamped at the final target, above every kept boundary of
+/// their rank: the trailing shape the capture's covered range excludes from
+/// verification.
+///
+/// A rank can lose every boundary to the cut. Its frames are then outside
+/// anything the trace can cover, which [`CompleteSteps::bounded_ranks`] lets
+/// the caller see.
 pub fn end_at_last_complete_step(
     records: impl IntoIterator<Item = TraceRingRecord>,
 ) -> CompleteSteps {
     let records: Vec<TraceRingRecord> = records.into_iter().collect();
-    let mut last_boundary: BTreeMap<u32, u64> = BTreeMap::new();
+    // Per rank, each boundary's target by step.
+    let mut boundaries: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
     for rec in &records {
         if rec.record_type == RECORD_TYPE_STEP_BOUNDARY && !rec.is_departure_boundary() {
-            let slot = last_boundary.entry(rec.rank()).or_insert(rec.step);
-            *slot = (*slot).max(rec.step);
+            boundaries
+                .entry(rec.rank())
+                .or_default()
+                .insert(rec.step, rec.fire_time_ns);
         }
+    }
+    // Per rank, the first step removed, and how many boundary steps that takes.
+    let mut cut_from: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut steps_cut = 0;
+    for (rank, steps) in &boundaries {
+        let mut from_last = steps.iter().rev();
+        let Some((&last_step, &final_target)) = from_last.next() else {
+            continue;
+        };
+        let mut from = last_step;
+        steps_cut += 1;
+        for (&step, &target) in from_last {
+            if target < final_target {
+                break;
+            }
+            from = step;
+            steps_cut += 1;
+        }
+        cut_from.insert(*rank, from);
     }
     let total = records.len();
     let kept: Vec<TraceRingRecord> = records
         .into_iter()
         .filter(|rec| {
             rec.is_departure_boundary()
-                || last_boundary
+                || cut_from
                     .get(&rec.rank())
-                    .is_none_or(|last| rec.step < *last)
+                    .is_none_or(|from| rec.step < *from)
         })
         .collect();
     CompleteSteps {
         cut: total - kept.len(),
-        steps_cut: last_boundary.len(),
+        steps_cut,
+        bounded_ranks: boundaries.into_keys().collect(),
         records: kept,
     }
 }
@@ -1752,5 +1838,122 @@ mod tests {
         );
         assert_eq!(out.records.len(), whole_step(1).len() + 1);
         assert_eq!(out.cut, whole_step(2).len());
+    }
+
+    /// A final step tied to its predecessor's target takes the predecessor with
+    /// it: their frames carry one stamp, so a range ending at that stamp would
+    /// hold the removed step's frames.
+    #[test]
+    fn the_end_cut_takes_every_step_tied_to_the_final_target() {
+        let mut records = Vec::new();
+        for (step, target) in [(1, 1_000), (2, 2_000), (3, 3_000), (4, 3_000), (5, 3_000)] {
+            records.push(boundary(step, target));
+            records.push(fire(step, 0));
+        }
+        let out = end_at_last_complete_step(records);
+        assert_eq!(
+            out.records.iter().map(|r| r.step).collect::<Vec<_>>(),
+            vec![1, 1, 2, 2],
+            "steps 3, 4 and 5 share the final target and are removed together"
+        );
+        assert_eq!(out.steps_cut, 3);
+        assert_eq!(out.cut, 6);
+        assert_eq!(
+            keep_all(out.records.into_iter(), &nodes()).last_boundary_target_ns,
+            Some(2_000),
+            "the range ends strictly below the final target"
+        );
+    }
+
+    /// An earlier tie, below the final target, is an ordinary pair of proven
+    /// steps and stays.
+    #[test]
+    fn a_tie_below_the_final_target_is_kept() {
+        let mut records = Vec::new();
+        for (step, target) in [(1, 1_000), (2, 1_000), (3, 2_000)] {
+            records.push(boundary(step, target));
+            records.push(fire(step, 0));
+        }
+        let out = end_at_last_complete_step(records);
+        assert_eq!(
+            out.records.iter().map(|r| r.step).collect::<Vec<_>>(),
+            vec![1, 1, 2, 2]
+        );
+        assert_eq!(out.steps_cut, 1);
+    }
+
+    /// A rank whose every step shares the final target keeps nothing, and the
+    /// ranks the cut saw bounded still name it.
+    #[test]
+    fn a_rank_tied_throughout_keeps_no_step_and_is_still_named() {
+        let records = vec![
+            ranked_boundary(0, 1, 1_000),
+            ranked_boundary(0, 2, 2_000),
+            ranked_boundary(1, 1, 5_000),
+            ranked_fire(1, 1, 0),
+            ranked_boundary(1, 2, 5_000),
+        ];
+        let out = end_at_last_complete_step(records);
+        assert_eq!(out.records, vec![ranked_boundary(0, 1, 1_000)]);
+        assert_eq!(out.bounded_ranks, vec![0, 1]);
+        assert_eq!(
+            out.steps_cut, 3,
+            "rank 0's step 2 and rank 1's steps 1 and 2"
+        );
+    }
+
+    /// A rank that carried a boundary and keeps none is named while another
+    /// rank keeps one, and only then: with no boundary anywhere the judge's
+    /// no-boundary arm owns the verdict.
+    #[test]
+    fn a_rank_left_without_a_step_is_named_beside_a_rank_that_kept_one() {
+        let records = vec![
+            ranked_boundary(0, 0, 1_000),
+            ranked_fire(0, 0, 0),
+            ranked_boundary(0, 1, 2_000),
+            ranked_boundary(1, 0, 1_500),
+            ranked_fire(1, 0, 0),
+        ];
+        let out = end_at_last_complete_step(records);
+        let mut kept = keep_all(out.records.clone().into_iter(), &nodes());
+        kept.record_end_cut(out.cut, out.steps_cut, &out.bounded_ranks);
+        assert_eq!(kept.ranks_without_a_kept_step, vec![1]);
+        assert_eq!(kept.tail_cut, 3);
+        assert_eq!(kept.tail_steps_cut, 2);
+        assert_eq!(
+            kept.last_boundary_target_ns,
+            Some(1_000),
+            "the fold sees rank 0 alone, which is why the rank must be named"
+        );
+
+        // Neither rank keeps a boundary: nothing is named.
+        let alone = end_at_last_complete_step(vec![
+            ranked_boundary(0, 0, 1_000),
+            ranked_boundary(1, 0, 1_500),
+        ]);
+        let mut none = keep_all(alone.records.clone().into_iter(), &nodes());
+        none.record_end_cut(alone.cut, alone.steps_cut, &alone.bounded_ranks);
+        assert!(none.ranks_without_a_kept_step.is_empty());
+    }
+
+    /// The trim can leave a rank without a step too: its one proven step is
+    /// its anchor step, which the trim discards.
+    #[test]
+    fn a_rank_whose_proven_steps_all_precede_its_anchor_is_named() {
+        let records = vec![
+            ranked_boundary(0, 4, 4_000),
+            ranked_boundary(0, 5, 5_000),
+            ranked_boundary(0, 6, 6_000),
+            ranked_boundary(1, 4, 4_000),
+            ranked_boundary(1, 5, 5_000),
+        ];
+        let out = end_at_last_complete_step(records);
+        let mut trimmed = trim_to_anchor(
+            out.records.clone().into_iter(),
+            &BTreeMap::from([(0, 4), (1, 4)]),
+            &nodes(),
+        );
+        trimmed.record_end_cut(out.cut, out.steps_cut, &out.bounded_ranks);
+        assert_eq!(trimmed.ranks_without_a_kept_step, vec![1]);
     }
 }

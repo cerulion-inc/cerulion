@@ -871,8 +871,9 @@ fn a_capture_carries_its_trace_trimmed_to_its_anchor_and_reads_resimmable() {
         .as_str()
         .expect("the handoff states the capture's end cut");
     assert!(
-        end_cut.starts_with("1 final step(s) removed (1 scheduler-trace record(s))")
-            && end_cut.contains("read record"),
+        end_cut.starts_with(
+            "1 step(s) removed from the end of the trace (1 scheduler-trace record(s))"
+        ) && end_cut.contains("read record"),
         "the end cut names its count and its cause: {end_cut}"
     );
     // The RECORDER's own drained count, on the mode whose
@@ -1774,6 +1775,127 @@ fn a_peer_ending_shorter_renders_the_folds_instant_and_names_it_as_the_fold() {
         !reason.contains("13000000"),
         "rank 0's own last target is in this bag and is not what the verdict \
          promises: {reason}"
+    );
+    h.cleanup();
+}
+
+/// A final step that SHARES its predecessor's target ends the covered range
+/// strictly below that target.
+///
+/// Equal consecutive targets are legal (a 0-delta step). Frames are stamped at
+/// their step's target, so the removed final step's frames carry the same stamp
+/// as the last kept step's, and a replay that covers through that stamp counts
+/// frames from a step it never drives. The end cut therefore removes every step
+/// at the final target, and the range ends at the step before them.
+///
+/// HAND ORACLE. Steps 0 to 2 are stamped 1, 5 and 9 ms; step 3 is stamped 9 ms
+/// as well and is the final step (no step 4 boundary). The cut removes steps 2
+/// and 3, so the range ends at 5 ms.
+#[test]
+fn a_final_step_tied_to_its_predecessors_target_ends_the_range_below_the_tie() {
+    let mut trace = Vec::new();
+    for step in 0..=2u64 {
+        trace.push(boundary(step));
+        trace.push(fire(step, 0));
+    }
+    let tie = boundary(2).fire_time_ns;
+    let mut last = boundary(3);
+    last.fire_time_ns = tie;
+    let mut last_fire = fire(3, 0);
+    last_fire.fire_time_ns = tie;
+    trace.push(last);
+    trace.push(last_fire);
+    let h = capture_inner_full(
+        "endcuttie",
+        &trace,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &[],
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "PRECONDITION: the window reaches step 0 and steps 0 and 1 are proven: {m}"
+    );
+    let covered = m["anchor"]["resim_covered_through_ns"]
+        .as_u64()
+        .expect("a positive verdict carries its covered range");
+    assert_eq!(
+        covered,
+        boundary(1).fire_time_ns,
+        "the range ends at step 1's target, strictly below the {tie} ns the removed \
+         final step's frames carry: {m}"
+    );
+    assert_eq!(
+        carried_records(&m),
+        4,
+        "steps 0 and 1 are carried (a boundary and a fire each); steps 2 and 3 are \
+         removed together: {m}"
+    );
+    let end_cut = m["handoff"]["trace_end_cut"]
+        .as_str()
+        .expect("the handoff states the capture's end cut");
+    assert!(
+        end_cut.starts_with(
+            "2 step(s) removed from the end of the trace (4 scheduler-trace record(s))"
+        ),
+        "the end cut counts both removed steps: {end_cut}"
+    );
+    h.cleanup();
+}
+
+/// A rank whose only step is its unfinished final one DECLINES the resume claim.
+///
+/// The end cut removes that rank's every record, while the frames its step
+/// published stay in the bag. A covered range folded over the ranks that kept a
+/// boundary then ends at rank 0's instant, and the peer's frames inside it match
+/// no boundary the bag carries for their rank, which a replay refuses as an
+/// inconsistent recording. So the capture states that the rank has no complete
+/// step and is not resimmable.
+#[test]
+fn a_rank_with_no_complete_step_declines_the_resume_claim() {
+    let mut rank0 = Vec::new();
+    for step in 0..=3u64 {
+        rank0.push(boundary(step));
+        rank0.push(fire(step, 0));
+    }
+    rank0.push(boundary(4));
+    // The peer's first step only: its boundary and the fire after its tick
+    // published, and no next boundary to prove it.
+    let peer = vec![boundary(0), fire(0, 0)];
+    let h = capture_inner_full(
+        "endcutpeerunproven",
+        &rank0,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &peer,
+    );
+
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        m["anchor"]["resimmable"],
+        serde_json::json!(false),
+        "rank 1 kept no complete step, so no range this capture can declare covers \
+         its frames: {m}"
+    );
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    assert!(
+        reason.contains("rank(s) [1]") && reason.contains("no complete step"),
+        "the reason names the rank and the cause: {reason}"
     );
     h.cleanup();
 }

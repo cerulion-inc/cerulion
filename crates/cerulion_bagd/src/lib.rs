@@ -219,7 +219,7 @@ pub use capture::FLASHBACK_ATTACHMENT;
 pub use flashback_plane::FlashbackManifest;
 
 // The rule a capture's trace END is cut by: per rank, records at or after the
-// last step boundary are removed.
+// last step boundary are removed, with every step before it tied to its target.
 pub use trace_window::{end_at_last_complete_step, CompleteSteps};
 
 // Flashback phase 2: the shared anchor retention and its poison-tolerant lock.
@@ -9868,6 +9868,10 @@ fn judge_capture_resimmable(
             // as the sweep's report that no rank published nothing.
             rank_space_walked,
             required_nodes: &trimmed.executed_nodes,
+            // The ranks the end cut and the trim left with no step boundary
+            // while another rank kept one. The recorder alone can say so: the
+            // bag carries no record of a rank's removed steps.
+            ranks_without_a_kept_step: &trimmed.ranks_without_a_kept_step,
             anchor_facts,
         },
     )
@@ -16288,9 +16292,12 @@ impl Recorder {
         // `select_trace_untrimmed` therefore cut the snapshot at the last step
         // each rank finished recording (`trace_window::end_at_last_complete_step`):
         // a step is kept only when the snapshot also holds that rank's next
-        // boundary, which the scheduler pushes after every record of the step.
-        // The cut step's frames stay in the bag, stamped at that step's target,
-        // above the last kept boundary's wherever the clock advanced. Pinned by
+        // boundary, which the scheduler pushes after every record of the step,
+        // and a step tied to the final step's target goes with it. The cut
+        // steps' frames stay in the bag, stamped at that target, above every
+        // kept boundary of their rank on a well-formed trace. A rank the cut
+        // and the trim leave with no boundary makes the capture not resimmable
+        // (`TrimmedTrace::ranks_without_a_kept_step`). Pinned by
         // `the_capture_close_snapshots_the_trace_before_the_taps_are_drained_and_the_frames_read`
         // (the order) and
         // `select_trace_ends_a_capture_cut_between_an_output_and_its_read_at_the_last_complete_step`
