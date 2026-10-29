@@ -2305,7 +2305,7 @@ impl TopicLivenessObserver {
     /// seam and the construction point for a caller that resolves the switch
     /// itself).
     pub fn with_budget(manager: Arc<TransportManager>, budget: usize, enabled: bool) -> Self {
-        // hot-path-alloc-ok: cold — one table per observer, built at boot.
+        // hot-path-alloc-ok: cold: one table per observer, built at boot.
         let table = Arc::new(Mutex::new(HashMap::new()));
         Self::build(manager, table, budget, enabled)
     }

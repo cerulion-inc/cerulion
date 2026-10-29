@@ -343,7 +343,7 @@ pub struct SchemaServing {
 /// The merge is the backfill seam that makes the standing boot and per-graph
 /// registrations compose in BOTH directions.
 ///
-/// Cheap to clone (`Arc`s only); `Send + Sync` (the maps are `Mutex`-guarded —
+/// Cheap to clone (`Arc`s only); `Send + Sync` (the maps are `Mutex`-guarded,
 /// the same discipline as the reg-channel hash table beside them).
 #[derive(Clone)]
 pub struct SchemaServingHandles {
