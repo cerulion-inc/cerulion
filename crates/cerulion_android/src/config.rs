@@ -330,6 +330,14 @@ fn validate_connect_locator(locator: &str) -> Result<(), EmbedError> {
                      'tcp/[<address>]:<port>'",
                 ));
             }
+            if !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            {
+                return Err(invalid(&format!(
+                    "has host '{host}'; a host name holds only letters, digits, '.', '-' and '_'"
+                )));
+            }
             (host, port)
         }
     };
@@ -687,6 +695,10 @@ mod tests {
             (
                 r#"{"connect":["tcp/::1:7690"]}"#,
                 "connect locator 'tcp/::1:7690' has a ':' in its host; an IPv6 host goes in brackets, as 'tcp/[<address>]:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/not a host:7690"]}"#,
+                "connect locator 'tcp/not a host:7690' has host 'not a host'; a host name holds only letters, digits, '.', '-' and '_'",
             ),
             (
                 r#"{"connect":["tcp/[desk.local]:7690"]}"#,
