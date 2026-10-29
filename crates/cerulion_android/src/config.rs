@@ -30,6 +30,27 @@ pub struct EmbeddedConfig {
     /// Raise the `_cerulion._tcp` mDNS beacon while the gateway listens on TCP.
     #[serde(default = "default_mdns")]
     pub mdns: bool,
+    /// Lowest level of the runtime's and the nodes' `tracing` lines that
+    /// reach logcat; `info` unless set.
+    #[serde(default)]
+    pub log_level: LogLevelConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// The `log_level` of the logcat output: lines below it are dropped.
+pub enum LogLevelConfig {
+    /// Errors only.
+    Error,
+    /// Warnings and errors.
+    Warn,
+    /// Lifecycle lines, warnings and errors.
+    #[default]
+    Info,
+    /// Operational detail and everything above it.
+    Debug,
+    /// Every line, including the hot path.
+    Trace,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -227,6 +248,44 @@ mod tests {
             r#"{"lan_access":""}"#,
             r#"{"lan_access":true}"#,
             r#"{"mdns":"yes"}"#,
+        ] {
+            let error = EmbeddedConfig::parse(raw).unwrap_err();
+            assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");
+        }
+    }
+
+    #[test]
+    fn log_level_defaults_to_info_and_parses_every_level() {
+        assert_eq!(
+            EmbeddedConfig::parse("{}").unwrap().log_level,
+            LogLevelConfig::Info
+        );
+        for (raw, level) in [
+            ("error", LogLevelConfig::Error),
+            ("warn", LogLevelConfig::Warn),
+            ("info", LogLevelConfig::Info),
+            ("debug", LogLevelConfig::Debug),
+            ("trace", LogLevelConfig::Trace),
+        ] {
+            let json = serde_json::json!({ "log_level": raw }).to_string();
+            assert_eq!(
+                EmbeddedConfig::parse(&json).unwrap().log_level,
+                level,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_log_level_and_a_misspelled_key() {
+        for raw in [
+            r#"{"log_level":"Info"}"#,
+            r#"{"log_level":"verbose"}"#,
+            r#"{"log_level":"off"}"#,
+            r#"{"log_level":""}"#,
+            r#"{"log_level":3}"#,
+            r#"{"loglevel":"info"}"#,
+            r#"{"log_levels":"info"}"#,
         ] {
             let error = EmbeddedConfig::parse(raw).unwrap_err();
             assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{raw}");

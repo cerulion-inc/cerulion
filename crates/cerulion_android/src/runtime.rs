@@ -579,6 +579,9 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
+        // Every accepted start sets the level, so a restart without the
+        // key returns to `info`.
+        crate::log::set_level(config.log_level);
         {
             let mut status = lock_status(&self.status);
             status.state = RuntimeState::Starting;

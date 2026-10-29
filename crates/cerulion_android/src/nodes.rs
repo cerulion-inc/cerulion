@@ -142,9 +142,13 @@ pub(crate) fn unlinked(node_type: &str) -> EmbedError {
 /// makes.
 ///
 /// `vm` and `reserved` are the `JNI_OnLoad` arguments; they are not used.
+/// On Android it first installs the logcat subscriber.
 /// A registration error never fails the library load: it is logged, and
 /// the first start with a graph reports it. Returns `JNI_VERSION_1_6`.
 pub fn on_load(_vm: *mut c_void, _reserved: *mut c_void, nodes: &[LinkedNode]) -> c_int {
+    // Before registration, so a registration error reaches logcat.
+    #[cfg(target_os = "android")]
+    crate::log::install_logcat();
     if let Err(error) = register(nodes) {
         tracing::error!(error = %error, "node registration failed");
     }
