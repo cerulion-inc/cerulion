@@ -502,6 +502,8 @@ struct StartPlan {
     recorded_topics: Option<HashSet<String>>,
     recorded_graph_topics: Option<HashSet<String>>,
     listen: Vec<String>,
+    /// `egress` is set but `listen` is empty, so no gateway reads the list.
+    inert_egress: bool,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
 }
@@ -867,20 +869,29 @@ impl EmbeddedRuntime {
                 "publish topic '{topic}' is a graph output; graph topics are single-writer"
             )));
         }
-        let publish_topics: HashSet<&str> =
-            publishes.iter().map(|item| item.topic.as_str()).collect();
-        if let Some(record) = &config.record {
-            let known: HashSet<&str> = graph_topics
-                .iter()
-                .map(String::as_str)
-                .chain(publish_topics.iter().copied())
-                .collect();
-            if let Some(topics) = &record.topics {
-                if let Some(topic) = topics.iter().find(|topic| !known.contains(topic.as_str())) {
-                    return Err(EmbedError::InvalidArgument(format!(
-                        "record topic '{topic}' is neither a graph output nor a publish topic"
-                    )));
-                }
+        let known: HashSet<&str> = graph_topics
+            .iter()
+            .map(String::as_str)
+            .chain(publishes.iter().map(|item| item.topic.as_str()))
+            .collect();
+        if let Some(topics) = config
+            .record
+            .as_ref()
+            .and_then(|record| record.topics.as_ref())
+        {
+            if let Some(topic) = topics.iter().find(|topic| !known.contains(topic.as_str())) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "record topic '{topic}' is neither a graph output nor a publish topic"
+                )));
+            }
+        }
+        if let Some(egress) = &config.egress {
+            // A misspelled name would leave the topic it meant unsent with no
+            // sign, so every listed topic must be one this start serves.
+            if let Some(topic) = egress.iter().find(|topic| !known.contains(topic.as_str())) {
+                return Err(EmbedError::InvalidArgument(format!(
+                    "egress topic '{topic}' is neither a graph output nor a publish topic"
+                )));
             }
         }
 
@@ -938,7 +949,12 @@ impl EmbeddedRuntime {
             serving.served_topics = announce.clone();
             GatewayStartPlan {
                 plan: GatewayPlan {
-                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    // The catalog still names every served topic; the list
+                    // decides which of them a LAN peer may receive.
+                    egress_policy: config.egress.clone().map_or(
+                        GatewayEgressPolicy::AllowAll,
+                        GatewayEgressPolicy::AllowList,
+                    ),
                     announce,
                     ingress: Vec::new(),
                 },
@@ -962,6 +978,7 @@ impl EmbeddedRuntime {
             subscribes,
             recorded_topics,
             recorded_graph_topics,
+            inert_egress: config.egress.is_some() && config.listen.is_empty(),
             listen: config.listen,
             gateway,
             recorder,
@@ -1606,6 +1623,12 @@ fn commit(
             "subscribe topic is neither an app publish topic nor a graph output"
         );
     }
+    if plan.inert_egress {
+        tracing::warn!(
+            "egress is set but listen is empty: this start builds no gateway, so the list has \
+             no effect"
+        );
+    }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
     // closes its slot, so a beacon raised after it stopped is dropped.
@@ -2178,6 +2201,7 @@ mod tests {
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -2716,6 +2740,7 @@ nodes:
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -2770,6 +2795,7 @@ nodes:
             recorded_topics: None,
             recorded_graph_topics: None,
             listen: Vec::new(),
+            inert_egress: false,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,

@@ -503,6 +503,7 @@ The configuration keys are:
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
+| `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 
@@ -684,6 +685,32 @@ topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
 The gateway does not forward incoming topics to the app, so `subscribe`
 reads topics of the app's own process. JSON publishing and polling support
 only the field types listed above.
+
+### Choose which topics leave the device
+
+An `open` gateway sends every topic the app serves. To open a desk connection
+while some topics stay on the device, list the topics a LAN peer may receive
+in `egress`:
+
+```json
+{
+  "listen": ["tcp/127.0.0.1:7683"],
+  "lan_access": "open",
+  "egress": ["/app/state"],
+  "publish": [
+    {"topic": "/app/state", "schema": "std_msgs/String"},
+    {"topic": "/app/notes", "schema": "std_msgs/String"}
+  ]
+}
+```
+
+A demand for a listed topic is served. A demand for any other topic is
+refused: the demand GET is answered `refused` and no frame of the topic
+leaves the device. An empty
+list refuses every topic. The catalog still names every topic the app serves,
+with its schema and liveness, so a desk can see that `/app/notes` exists but
+cannot receive it. A start with `egress` and an empty `listen` builds no
+gateway, so the list has no effect and the start logs a warning.
 
 ## Single-process apps
 
