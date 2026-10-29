@@ -1154,6 +1154,30 @@ fn capture_frame_output(frame: &[u8]) {
     crate::replay::capture_output_body(frame.get(WireHeader::SIZE..end).unwrap_or(&[]));
 }
 
+/// Delivery log / replay: hash the packed encoding of the message struct
+/// at `msg` (what a copying publish sends), for a path whose frame bytes are
+/// not that encoding. One thread-local flag read when no recorded or
+/// replayed output is in flight.
+///
+/// # Safety
+/// `msg` points at a valid message of the publisher's type.
+unsafe fn capture_struct_output(data: &PublisherData, msg: *const c_void) {
+    if !crate::replay::output_capture_armed() {
+        return;
+    }
+    match data.bridge.flatten(msg, 0, 0) {
+        Ok(frame) => capture_frame_output(&frame),
+        Err(e) => {
+            tracing::warn!(
+                topic = %data.topic,
+                error = %e,
+                "delivery log: the output could not be encoded for its hash; an empty body is hashed"
+            );
+            crate::replay::capture_output_body(&[]);
+        }
+    }
+}
+
 /// # Safety
 /// rmw ABI contract: `ros_message` points at a valid message of the
 /// publisher's type.
@@ -1766,6 +1790,13 @@ unsafe fn publish_windowed_loan(
         _ => None,
     };
     let armed = w.window_owner.is_some();
+    // Delivery log / replay: the sealed frame below can carry dead gap
+    // bytes (earlier fills, incidental allocations) and places the payload
+    // where the fill left it, so its bytes depend on more than the message.
+    // Hash the message's packed encoding instead, the same bytes the copy
+    // paths send. The window is disarmed here, so this flatten's
+    // allocation does not land in it.
+    capture_struct_output(data, key as *const c_void);
 
     match data.bridge.seal_borrowed_frame(
         key as *mut u8,
@@ -1800,8 +1831,7 @@ unsafe fn publish_windowed_loan(
             // where the fill placed it; the remainder is documented
             // gap/slack over OS-defined SHM bytes, and consumers slice on
             // `total_size`.
-            let mut sealed = loan.assume_init_shm_defined();
-            capture_frame_output(sealed.bytes_mut());
+            let sealed = loan.assume_init_shm_defined();
             if armed {
                 // The window's quarantine extent outlives the frame until
                 // the pool re-issues this slot (retire-on-reuse in

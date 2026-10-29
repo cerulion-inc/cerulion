@@ -1120,9 +1120,11 @@ recorded or replayed call arms. Nothing is copied, hashed or allocated otherwise
 **Entities.** Each subscription, publisher, service, client and guard condition is
 registered at creation, keyed by its `data` pointer (what `rmw_wait`'s arrays
 carry), and named stably for the life of the program: `sub:<topic>#n`,
-`pub:<topic>#n`, `srv:<name>#n`, `cli:<name>#n` (n counts earlier entities of that
-kind and name) and `gc#n` (guard creation order, node graph guards included). A
-replay maps each live entity to the recorded one by name. Threads get an index in
+`pub:<topic>#n`, `srv:<name>#n`, `cli:<name>#n` (n counts the owning node's earlier
+entities of that kind and name, so two nodes on two threads keep their numbers
+whichever creates its entity first) and `gc#n` (guard creation order across the
+process, node graph guards included). A replay maps each live entity to the
+recorded one by name and owning node. Threads get an index in
 the order they first reach a hook; a replaying thread is mapped to the recorded
 thread whose first wait attached the same entities.
 
@@ -1132,7 +1134,9 @@ sequence, the source and received timestamps (requests and responses: the reques
 id) and the payload BODY (the wire header, which carries the wall-clock stamp, is
 not part of it): the copying, adopted, loaned and sequence takes all capture at
 their decode point. Every output records a 64-bit FNV-1a of the body it sends and
-the return. Graph answers record the query, the name and the answer. The writer
+the return; a zero-copy windowed publish, whose frame can carry dead gap bytes and
+places the payload where the fill left it, records the hash of the message's packed
+encoding instead (`capture_struct_output`, the bytes a copying publish sends). Graph answers record the query, the name and the answer. The writer
 (`log::LogWriter`, under one mutex) mints the order key `k`, so file order is `k`
 order; it writes through `cerulion_bag::BagWriter` on four channels (`rdl/process`,
 `rdl/waits`, `rdl/deliveries`, `rdl/outputs`), chunks of 1 MiB, the process
@@ -1231,7 +1235,8 @@ thread that never called `rmw_wait`, made after some thread waited, are
 UNORDERED (`outputs_unordered`): the verdict is `refused`, cause `publishing
 thread outside every executor`, naming the first one's entity. The verdict
 (`<log>.verdict.json`, written atomically) says `running` from `Player::load` on,
-so a crashed replay never leaves an earlier verdict; the real one is written when the schedule is
+so a crashed replay never leaves an earlier verdict (a `running` verdict that cannot
+be written refuses the replay, `start_verdict`); the real one is written when the schedule is
 exhausted, on a refusal or a watchdog report, and at exit when none was written
 or the schedule was exhausted: outputs after
 exhaustion are counted (`outputs_after_exhaustion`), not compared, and those of a

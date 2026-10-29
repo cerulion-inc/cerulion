@@ -149,7 +149,7 @@ impl Mode {
             Requested::Replay(file) => match Player::load(&file) {
                 Ok(p) => Mode::Replay(Box::new(p)),
                 Err(e) => {
-                    write_verdict_file(&file, &refused_verdict(&file, &e));
+                    let _ = write_verdict_file(&file, &refused_verdict(&file, &e));
                     Mode::Refused(e)
                 }
             },
@@ -275,6 +275,26 @@ pub(crate) fn capture_output_body(body: &[u8]) {
     OUTPUT_CAPTURE.with(|c| c.set(Some((log::fnv1a(body), body.len() as u32))));
 }
 
+/// Test seam: run `f` with this thread's output capture armed, as an output
+/// under recording or replay is, and return the hash and length of the body
+/// the output path captured (`None` when it captured none).
+#[cfg(feature = "test-seams")]
+pub(crate) fn capture_output_for_test<R>(f: impl FnOnce() -> R) -> (R, Option<(u64, u32)>) {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOOKS_ON.store(self.0, Ordering::Release);
+        }
+    }
+    let _restore = Restore(HOOKS_ON.swap(true, Ordering::AcqRel));
+    OUTPUT_CAPTURE.with(|c| c.set(None));
+    let r = {
+        let _armed = Armed::new(&OUTPUT_ARMED);
+        f()
+    };
+    (r, OUTPUT_CAPTURE.with(Cell::take))
+}
+
 // ===========================================================================
 // Entities
 // ===========================================================================
@@ -292,7 +312,8 @@ struct Ent {
 #[derive(Default)]
 struct Registry {
     by_key: HashMap<usize, Ent>,
-    per_name: HashMap<String, u32>,
+    /// The next number per (kind and topic, owning node).
+    per_name: HashMap<(String, String), u32>,
     next_id: EntityId,
     guards: u32,
     nodes: Vec<String>,
@@ -309,8 +330,13 @@ impl Registry {
             self.guards += 1;
             format!("gc#{n}")
         } else {
+            // Numbered per owning node: two nodes' entities on one topic
+            // keep their numbers whichever node creates its entity first.
             let base = format!("{}:{}", kind.prefix(), topic);
-            let c = self.per_name.entry(base.clone()).or_insert(0);
+            let c = self
+                .per_name
+                .entry((base.clone(), node.to_string()))
+                .or_insert(0);
             let full = format!("{base}#{c}");
             *c += 1;
             full
@@ -1263,7 +1289,8 @@ pub(crate) struct Player {
     gate: Gate,
     registry: Mutex<Registry>,
     detector: Detector,
-    rec_by_name: HashMap<String, EntityRec>,
+    /// The recorded entities by (stable name, owning node).
+    rec_by_name: HashMap<(String, String), EntityRec>,
     rec_nodes: Vec<(String, String)>,
     /// Each recorded thread's first attached set (maps a replaying thread to
     /// the recorded one at its first wait).
@@ -1317,7 +1344,7 @@ pub(crate) fn verdict_path(log: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn write_verdict_file(log: &Path, v: &Verdict) {
+fn write_verdict_file(log: &Path, v: &Verdict) -> std::io::Result<()> {
     let path = verdict_path(log);
     let tmp = {
         let mut s = path.as_os_str().to_os_string();
@@ -1327,13 +1354,29 @@ fn write_verdict_file(log: &Path, v: &Verdict) {
     let mut bytes = serde_json::to_vec_pretty(v).unwrap_or_default();
     bytes.push(b'\n');
     let res = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(e) = res {
+    if let Err(e) = &res {
         tracing::error!(
             verdict = %path.display(),
             error = %e,
             "rmw_cerulion replay: cannot write the verdict file"
         );
     }
+    res
+}
+
+/// Before a replay starts: replace any earlier verdict with `v` (the
+/// `running` one). If that cannot be written, the earlier verdict is removed
+/// where possible and the replay is refused, so a later crash can never
+/// leave a previous run's verdict in place.
+fn start_verdict(log: &Path, v: &Verdict) -> Result<(), String> {
+    write_verdict_file(log, v).map_err(|e| {
+        let path = verdict_path(log);
+        let _ = std::fs::remove_file(&path);
+        format!(
+            "rmw_cerulion replay refused: cannot write the verdict file {}: {e}",
+            path.display()
+        )
+    })
 }
 
 impl Player {
@@ -1356,7 +1399,7 @@ impl Player {
                     names.name.insert(e.id, e.name.clone());
                     names.topic.insert(e.id, e.topic.clone());
                     names.node.insert(e.id, e.node.clone());
-                    rec_by_name.insert(e.name.clone(), e.clone());
+                    rec_by_name.insert((e.name.clone(), e.node.clone()), e.clone());
                 }
                 Record::Node {
                     name, namespace, ..
@@ -1428,18 +1471,18 @@ impl Player {
             }),
             schedule,
         };
-        player.write_running();
+        player.write_running()?;
         Ok(player)
     }
 
     /// Before the replay starts: a `running` verdict replaces any earlier
     /// one, so a replay that dies before it writes its own (a crash, an
     /// abort, SIGKILL) never leaves a previous run's verdict in place.
-    fn write_running(&self) {
+    fn write_running(&self) -> Result<(), String> {
         let st = self.lock();
         let mut v = self.verdict(&st);
         v.verdict = "running".to_string();
-        write_verdict_file(&self.path, &v);
+        start_verdict(&self.path, &v)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PlayState> {
@@ -1483,7 +1526,10 @@ impl Player {
     fn entity(&self, kind: EntityKind, key: usize, topic: &str, node: &str) {
         let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let ent = reg.add(kind, key, topic, node);
-        let rec = self.rec_by_name.get(&ent.name).map(|r| r.id);
+        let rec = self
+            .rec_by_name
+            .get(&(ent.name.clone(), ent.node.clone()))
+            .map(|r| r.id);
         if let Some(e) = reg.by_key.get_mut(&key) {
             e.rec = rec;
         }
@@ -2067,7 +2113,7 @@ impl Player {
     fn write_verdict(&self, st: &mut PlayState) {
         let v = self.verdict(st);
         // The file first: at process exit a log line may not get out.
-        write_verdict_file(&self.path, &v);
+        let _ = write_verdict_file(&self.path, &v);
         st.verdict_written = true;
         let file = verdict_path(&self.path).display().to_string();
         match (
@@ -2271,6 +2317,48 @@ mod tests {
         assert_eq!(r.add(EntityKind::Guard, 4, "", "").name, "gc#0");
         assert_eq!(r.add(EntityKind::Guard, 5, "", "").name, "gc#1");
         assert_eq!(r.by_key[&3].id, 2);
+    }
+
+    #[test]
+    fn two_nodes_keep_their_entity_numbers_whichever_creates_first() {
+        // The recording: /left subscribes /a first, then /right.
+        let mut rec = Registry::default();
+        let left = rec.add(EntityKind::Subscription, 1, "/a", "/left").name;
+        let right = rec.add(EntityKind::Subscription, 2, "/a", "/right").name;
+        // The replay creates them the other way round (two executor threads).
+        let mut rep = Registry::default();
+        let right2 = rep.add(EntityKind::Subscription, 3, "/a", "/right").name;
+        let left2 = rep.add(EntityKind::Subscription, 4, "/a", "/left").name;
+        assert_eq!((&left, &right), (&left2, &right2));
+        // Within one node, creation order still numbers them.
+        assert_eq!(
+            rep.add(EntityKind::Subscription, 5, "/a", "/left").name,
+            "sub:/a#1"
+        );
+    }
+
+    #[test]
+    fn a_verdict_that_cannot_be_written_refuses_the_replay_and_leaves_no_old_one() {
+        let dir = std::env::temp_dir().join(format!("rdl-verdict-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let log = dir.join("mixer-1.rdl.mcap");
+        let verdict = verdict_path(&log);
+        std::fs::write(&verdict, b"{\"verdict\": \"identical\"}\n").expect("old verdict");
+        // The temp file the write goes through is a directory: it fails.
+        let tmp = PathBuf::from(format!("{}.tmp", verdict.display()));
+        std::fs::create_dir_all(&tmp).expect("obstacle");
+        let mut v = refused_verdict(&log, "unused");
+        v.verdict = "running".to_string();
+        let err = start_verdict(&log, &v).expect_err("an unwritable verdict refuses");
+        assert!(err.contains("cannot write the verdict file"), "{err}");
+        assert!(!verdict.exists(), "the earlier `identical` verdict is gone");
+        // Control: once the file can be written, it says `running`.
+        std::fs::remove_dir_all(&tmp).expect("remove obstacle");
+        start_verdict(&log, &v).expect("a writable verdict starts");
+        let text = std::fs::read_to_string(&verdict).expect("verdict");
+        assert!(text.contains("\"running\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
