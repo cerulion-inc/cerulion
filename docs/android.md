@@ -302,6 +302,11 @@ error code 5; `start` still returns `OK` because it only queues the start, and
 that names the type and the linked types. `status` lists the linked types in
 `linked_nodes`.
 
+The runtime keeps a record of each node fire in memory, and keeps only the
+newest 100 000 fires, the same default as `cerulion graph run --trace-limit`.
+An older fire drops out when a new one arrives, so a graph that runs for days
+does not grow its memory with the number of fires.
+
 To send app events into a linked node, publish them on an app topic and read
 that topic in the graph through an absolute `source:` (a name that starts with
 `/`). No node in the graph produces the topic, so the graph attaches to the
