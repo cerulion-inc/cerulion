@@ -8,7 +8,7 @@
 mod mp_support;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -41,14 +41,31 @@ impl HttpSentinel {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     count.fetch_add(1, Ordering::SeqCst);
+                    // On macOS an accepted socket inherits the listener's
+                    // non-blocking mode, so the read timeout would not apply.
+                    // Read the request through the end of its headers before
+                    // the reply: request bytes that are unread at close, or
+                    // that arrive after it, reset the connection and fail the
+                    // client's read.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_millis(100)))
                         .unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_millis(100)))
                         .unwrap();
-                    let _ = stream.read(&mut [0; 2048]);
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while request.len() < chunk.len()
+                        && !request.windows(4).any(|end| end == b"\r\n\r\n")
+                    {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
                     let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.shutdown(Shutdown::Write);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     // Drain already queued connections before stopping.
