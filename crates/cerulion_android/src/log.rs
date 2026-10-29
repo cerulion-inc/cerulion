@@ -73,7 +73,9 @@ impl<S: LogSink, Sub: Subscriber> Layer<Sub> for LogcatLayer<S> {
         let written = LINE.try_with(|line| match line.try_borrow_mut() {
             Ok(mut line) => {
                 self.sink.write(priority, format_line(&mut line, event));
-                // Keep a line-sized buffer, not the largest line ever seen.
+                // Keep a line-sized buffer, not the largest line ever seen:
+                // empty it first, since a `Vec` never shrinks below its length.
+                line.clear();
                 line.shrink_to(LINE_CAPACITY);
                 true
             }
@@ -366,6 +368,20 @@ mod tests {
         assert_eq!(
             text,
             ["app: kept warn", "app: kept error", "app: kept info"]
+        );
+    }
+
+    #[test]
+    fn a_large_line_does_not_keep_its_buffer_after_it_is_written() {
+        let large = "x".repeat(64 * 1024);
+        let lines = capture(LogLevelConfig::Info, || {
+            tracing::info!(target: "app", "{large}");
+        });
+        assert_eq!(lines[0].1.len(), "app: ".len() + large.len());
+        let kept = LINE.with(|line| line.borrow().capacity());
+        assert!(
+            kept <= LINE_CAPACITY,
+            "kept {kept} bytes after a 64 KiB line"
         );
     }
 }
