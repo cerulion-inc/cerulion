@@ -552,6 +552,8 @@ struct StartPlan {
     /// `ingress` is set, but the start builds no gateway or the gateway is
     /// paired, so no LAN frame reaches the listed topics.
     inert_ingress: Option<InertIngress>,
+    /// Number of `ingress` topics, for the inert-ingress warning.
+    ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
     #[cfg(any(test, feature = "test-helpers"))]
@@ -559,7 +561,7 @@ struct StartPlan {
 }
 
 /// Why the `ingress` list of a start lets no LAN frame in.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InertIngress {
     /// `listen` and `connect` are empty: the start builds no gateway.
     NoGateway,
@@ -1030,11 +1032,8 @@ impl EmbeddedRuntime {
         // leaves both alone.
         let networked = !config.listen.is_empty() || !config.connect.is_empty();
         let lan_access = LanAccess::from(config.lan_access);
-        let inert_ingress = match (ingress.is_empty(), networked, lan_access) {
-            (true, _, _) | (false, true, LanAccess::Open) => None,
-            (false, false, _) => Some(InertIngress::NoGateway),
-            (false, true, LanAccess::Paired) => Some(InertIngress::Paired),
-        };
+        let inert_ingress = inert_ingress(!ingress.is_empty(), networked, lan_access);
+        let ingress_topics = ingress.len();
         let gateway = networked.then(|| {
             let extra = publishes
                 .iter()
@@ -1097,6 +1096,7 @@ impl EmbeddedRuntime {
             recorded_graph_topics,
             inert_egress: config.egress.is_some() && !networked,
             inert_ingress,
+            ingress_topics,
             listen: config.listen,
             connect: config.connect,
             gateway,
@@ -1782,10 +1782,12 @@ fn commit(
     match plan.inert_ingress {
         None => {}
         Some(InertIngress::NoGateway) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
             "ingress is set but listen and connect are empty: this start builds no gateway, so \
              no LAN frame reaches the ingress topics"
         ),
         Some(InertIngress::Paired) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
             "ingress is set but lan_access is paired: the gateway refuses every frame a LAN \
              peer publishes into the ingress topics"
         ),
@@ -1960,6 +1962,21 @@ fn resolve_subscribe(
         depth: subscribe.depth,
         produced_in_run: !producers.is_empty(),
     })
+}
+
+/// Why a start's `ingress` list lets no LAN frame in, or `None` when it
+/// does: the gateway takes LAN frames only when the start builds one (a
+/// `listen` endpoint or a `connect` locator) and its posture is `open`.
+fn inert_ingress(
+    has_ingress: bool,
+    networked: bool,
+    lan_access: LanAccess,
+) -> Option<InertIngress> {
+    match (has_ingress, networked, lan_access) {
+        (false, _, _) | (true, true, LanAccess::Open) => None,
+        (true, false, _) => Some(InertIngress::NoGateway),
+        (true, true, LanAccess::Paired) => Some(InertIngress::Paired),
+    }
 }
 
 /// Resolve one `ingress` topic to the schema hash its frames are checked
@@ -2458,6 +2475,7 @@ mod tests {
             connect: Vec::new(),
             inert_egress: false,
             inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3138,6 +3156,77 @@ nodes:
         assert_baseline(&manager);
     }
 
+    /// Hand oracle over every input: only a start with ingress topics, a
+    /// gateway and the `open` posture takes LAN frames.
+    #[test]
+    fn ingress_takes_lan_frames_only_with_a_gateway_that_is_open() {
+        for (has_ingress, networked, lan_access, expected) in [
+            (false, false, LanAccess::Paired, None),
+            (false, false, LanAccess::Open, None),
+            (false, true, LanAccess::Paired, None),
+            (false, true, LanAccess::Open, None),
+            (
+                true,
+                false,
+                LanAccess::Paired,
+                Some(InertIngress::NoGateway),
+            ),
+            (true, false, LanAccess::Open, Some(InertIngress::NoGateway)),
+            (true, true, LanAccess::Paired, Some(InertIngress::Paired)),
+            (true, true, LanAccess::Open, None),
+        ] {
+            assert_eq!(
+                inert_ingress(has_ingress, networked, lan_access),
+                expected,
+                "ingress={has_ingress} networked={networked} {lan_access:?}"
+            );
+        }
+    }
+
+    /// A gateway that failed after it registered an ingress bridge and its
+    /// demand GET leaves both on the manager. The teardown releases each
+    /// topic of the run's ingress list, and skips one the gateway never
+    /// registered.
+    #[test]
+    fn a_half_built_gateway_teardown_releases_its_ingress_bridges() {
+        let _serial = gateway_test_lock();
+        let manager = network_manager("halfingress");
+        let registered = "/half_built/ingress";
+        let never_registered = "/half_built/unregistered";
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.ownership = Some(
+            GatewayOwnership::acquire(
+                &manager,
+                vec![registered.to_string(), never_registered.to_string()],
+            )
+            .expect("lease"),
+        );
+        let network = manager.network().expect("network");
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register an ingress bridge");
+        network
+            .ensure_ingress_demand_keepalive(registered)
+            .expect("demand the ingress topic");
+        assert!(network.is_ingress_registered(registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+
+        let (_, error) = run.shutdown();
+
+        assert!(error.is_none(), "{error:?}");
+        assert!(!network.is_ingress_registered(registered));
+        assert!(!network.is_ingress_registered(never_registered));
+        assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
+        assert_baseline(&manager);
+        // The released topic registers again, as the next start does.
+        manager
+            .register_run_ingress_topic(registered, 0x1234, MaxSliceLen::const_new(4096))
+            .expect("register the released topic again");
+        manager
+            .unregister_ingress_topic(registered)
+            .expect("release it");
+    }
+
     /// The commit holds the run's commit gate, not the status lock, from its
     /// last failure check through opening LAN access and replaying
     /// announces, so a worker failure cannot land between the check and the
@@ -3191,6 +3280,7 @@ nodes:
             connect: Vec::new(),
             inert_egress: false,
             inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3249,6 +3339,7 @@ nodes:
             connect: Vec::new(),
             inert_egress: false,
             inert_ingress: None,
+            ingress_topics: 0,
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,

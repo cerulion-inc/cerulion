@@ -752,8 +752,8 @@ the input an absolute `source:`, list the topic in `ingress`, and set
 ```
 
 The gateway checks each frame against the schema hash of the graph inputs
-that read the topic. A frame with another schema hash is dropped and counted,
-and the first drop of a series logs a warning. A frame with the right hash
+that read the topic. A frame with another schema hash is dropped, and the
+first drop of a series logs a warning. A frame with the right hash
 reaches the inputs as a frame of an app publisher does. A desk sends such a
 topic from a graph that lists it under `network: egress:` (see
 [The egress/ingress model](networking.md#the-egressingress-model)), and the
@@ -813,10 +813,11 @@ example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
 ```
 
 With an empty `listen` the app opens no port of its own and raises no beacon.
-The `lan_access` posture and the `egress` list apply to a desk the app dials as
-they do to a desk that dials the app: under `paired` the desk's catalog request
-and topic demands are refused, and under `open` only the listed topics are
-sent. A desk that is not listening yet does not fail the start; the app
+The `lan_access` posture and the `egress` and `ingress` lists apply to a desk
+the app dials as they do to a desk that dials the app: under `paired` the
+desk's catalog request and topic demands are refused and no frame it publishes
+gets in, and under `open` only the `egress` topics are sent and only the
+`ingress` topics take its frames. A desk that is not listening yet does not fail the start; the app
 dials it again in the background, a few seconds apart. The app dials `tcp/`
 locators only. Like `listen`, `connect` is fixed for the process lifetime by the
 first start.

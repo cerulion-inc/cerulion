@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use cerulion_android::{codes, EmbeddedRuntime, RuntimeState};
 use cerulion_core::graph::{NodeContext, NodeEntry, NodeInfo};
+use cerulion_core::transport::discovery::query_robot_catalog;
 use cerulion_core::transport::network::{IngressStats, NetworkManager};
 use cerulion_core::transport::TransportManager;
 use cerulion_core::wire::{StepTag, WireHeader};
@@ -33,19 +34,14 @@ use zenoh::Wait;
 cerulion_android::embed_nodes! {
     "relay" => RelayNodeEntry,
     "hashless_relay" => HashlessRelayEntry,
+    "other_schema_relay" => OtherSchemaRelayEntry,
 }
 
-/// The relay, reporting no schema hash for its input, as a node entry
-/// written by hand can. The node macro always reports one.
-struct HashlessRelayEntry(RelayNodeEntry);
+/// The relay, reporting the given schema hash for its input, as a node
+/// entry written by hand can. The node macro always reports the relay's own.
+struct RelayWithInputHash(RelayNodeEntry, u64);
 
-impl HashlessRelayEntry {
-    fn new() -> Self {
-        Self(RelayNodeEntry::new())
-    }
-}
-
-impl NodeEntry for HashlessRelayEntry {
+impl RelayWithInputHash {
     fn info(&self) -> TransportResult<NodeInfo> {
         let info = self.0.info()?;
         let inputs = info
@@ -53,21 +49,45 @@ impl NodeEntry for HashlessRelayEntry {
             .iter()
             .cloned()
             .map(|mut meta| {
-                meta.schema_hash = 0;
+                meta.schema_hash = self.1;
                 meta
             })
             .collect();
         Ok(NodeInfo::with_meta(inputs, info.output_meta().to_vec()))
     }
-
-    fn init(&mut self, context: NodeContext) -> TransportResult<()> {
-        self.0.init(context)
-    }
-
-    fn tick(&mut self) -> TransportResult<()> {
-        self.0.tick()
-    }
 }
+
+/// Implements [`NodeEntry`] for a relay that reports `$hash` for its input.
+macro_rules! relay_with_input_hash {
+    ($name:ident, $hash:expr) => {
+        struct $name(RelayWithInputHash);
+
+        impl $name {
+            fn new() -> Self {
+                Self(RelayWithInputHash(RelayNodeEntry::new(), $hash))
+            }
+        }
+
+        impl NodeEntry for $name {
+            fn info(&self) -> TransportResult<NodeInfo> {
+                self.0.info()
+            }
+
+            fn init(&mut self, context: NodeContext) -> TransportResult<()> {
+                self.0 .0.init(context)
+            }
+
+            fn tick(&mut self) -> TransportResult<()> {
+                self.0 .0.tick()
+            }
+        }
+    };
+}
+
+// No schema hash: a node with no declared input schema.
+relay_with_input_hash!(HashlessRelayEntry, 0);
+// Another schema than the relay's.
+relay_with_input_hash!(OtherSchemaRelayEntry, WRONG_HASH);
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
 const ROBOT: &str = "lan_ingress_test";
@@ -124,11 +144,39 @@ fn echo_topic(relay: &str) -> String {
     format!("/{PREFIX}/{relay}/echo")
 }
 
-/// An `ingress` entry must name a topic a graph input reads, and one no
-/// other writer of the run sends: the start fails with the topic named and
-/// the runtime reports `failed`.
+/// A graph where `cmd_relay` and `other_relay` both read `CMD`, with the
+/// input schema of `other_type`.
+fn two_readers_yaml(other_type: &str) -> String {
+    format!(
+        "prefix: {PREFIX}
+nodes:
+  - id: cmd_relay
+    type: relay
+    inputs:
+      - name: cmd
+        source: {CMD}
+    outputs:
+      - name: echo
+        schema: {VECTOR3}
+  - id: other_relay
+    type: {other_type}
+    inputs:
+      - name: cmd
+        source: {CMD}
+    outputs:
+      - name: echo
+        schema: {VECTOR3}
+"
+    )
+}
+
+/// An `ingress` entry must name a topic a graph input reads, whose inputs
+/// declare one schema, and one no other writer of the run sends: the start
+/// fails with the topic named and the runtime reports `failed`. The schema
+/// refusals carry the text `graph run` gives; they are matched in parts.
 fn a_misdeclared_ingress_topic_fails_the_start(runtime: &mut EmbeddedRuntime, port: u16) {
     let listen = json!([format!("tcp/127.0.0.1:{port}")]);
+    let exact = |message: String| vec![message];
     let cases = [
         (
             json!({
@@ -136,12 +184,14 @@ fn a_misdeclared_ingress_topic_fails_the_start(runtime: &mut EmbeddedRuntime, po
                 "ingress": [CMD, "/lan_ingress_test/unread"],
             }),
             codes::INVALID_ARGUMENT,
-            "ingress topic '/lan_ingress_test/unread' is not read by any graph input".to_string(),
+            exact("ingress topic '/lan_ingress_test/unread' is not read by any graph input".into()),
         ),
         (
             json!({"ingress": [CMD]}),
             codes::INVALID_ARGUMENT,
-            format!("ingress topic '{CMD}' is not read by any graph input"),
+            exact(format!(
+                "ingress topic '{CMD}' is not read by any graph input"
+            )),
         ),
         (
             json!({
@@ -149,10 +199,10 @@ fn a_misdeclared_ingress_topic_fails_the_start(runtime: &mut EmbeddedRuntime, po
                 "ingress": [echo_topic("cmd_relay")],
             }),
             codes::INVALID_ARGUMENT,
-            format!(
+            exact(format!(
                 "ingress topic '{}' is a graph output; graph topics are single-writer",
                 echo_topic("cmd_relay")
-            ),
+            )),
         ),
         (
             json!({
@@ -161,7 +211,9 @@ fn a_misdeclared_ingress_topic_fails_the_start(runtime: &mut EmbeddedRuntime, po
                 "ingress": [CMD],
             }),
             codes::INVALID_ARGUMENT,
-            format!("ingress topic '{CMD}' is a publish topic; a topic has one writer"),
+            exact(format!(
+                "ingress topic '{CMD}' is a publish topic; a topic has one writer"
+            )),
         ),
         (
             json!({
@@ -169,21 +221,47 @@ fn a_misdeclared_ingress_topic_fails_the_start(runtime: &mut EmbeddedRuntime, po
                 "ingress": [CMD],
             }),
             codes::GRAPH,
-            format!(
-                "Graph validation error: network ingress topic '{CMD}' has no consumer with a declared schema — \
-                 ingress frames are validated against the consuming input's schema hash \
-                 (macro `#[input]` metadata); consume the topic from a `#[cerulion_node]` \
-                 input or remove the ingress entry"
-            ),
+            vec![
+                format!(
+                    "Graph validation error: network ingress topic '{CMD}' has no consumer \
+                     with a declared schema"
+                ),
+                "consume the topic from a `#[cerulion_node]` input or remove the ingress entry"
+                    .to_string(),
+            ],
+        ),
+        (
+            json!({
+                "graph_yaml": two_readers_yaml("other_schema_relay"),
+                "ingress": [CMD],
+            }),
+            codes::GRAPH,
+            vec![format!(
+                "Graph validation error: network ingress topic '{CMD}' is consumed with \
+                 CONFLICTING schema expectations: input 'cmd_relay.cmd' declares schema hash \
+                 {:#018x} but input 'other_relay.cmd' declares 0x0123456789abcdef",
+                relay_input_hash()
+            )],
         ),
     ];
-    for (mut config, code, message) in cases {
+    for (mut config, code, parts) in cases {
         config["listen"] = listen.clone();
         let error = runtime
             .start(&config.to_string())
             .expect_err("a misdeclared ingress topic cannot start");
         assert_eq!(error.code(), code, "{config}");
-        assert_eq!(error.to_string(), message, "{config}");
+        let message = error.to_string();
+        match parts.as_slice() {
+            [whole] if code == codes::INVALID_ARGUMENT => assert_eq!(&message, whole, "{config}"),
+            _ => {
+                for part in &parts {
+                    assert!(
+                        message.contains(part.as_str()),
+                        "{part:?} not in {message:?}"
+                    );
+                }
+            }
+        }
         let status = runtime.status_handle().lock().unwrap().clone();
         assert_eq!(status.state, RuntimeState::Failed, "{status:?}");
     }
@@ -258,10 +336,13 @@ fn client(port: u16) -> zenoh::Session {
 }
 
 /// DESK ROLE: the zenoh peer. It records the topic of every demand GET it
-/// gets. For each run in [`RUNS`]:
+/// gets, and writes `desk.ready` once its session and queryable are up. For
+/// each run in [`RUNS`]:
 ///
 /// 1. Wait for `{run}.go` and clear the GET record.
-/// 2. Under `paired`, put 20 right-hash frames on each topic, 50 ms apart.
+/// 2. Under `paired`, query the catalog until the app refuses it (the link
+///    works and the app is paired), then put 20 right-hash frames on each
+///    topic, 50 ms apart.
 ///    Otherwise, every 50 ms put a wrong-hash and a right-hash frame on the
 ///    ingress topic and a right-hash frame on the other topic, until
 ///    `{run}.stop` appears.
@@ -299,11 +380,25 @@ fn desk_role() {
             .wait()
             .expect("put a frame");
     };
+    touch(&dir, "desk.ready");
     let mut sequence = 0u32;
     for (run, ingress, other) in RUNS {
         wait_for_step(&dir, &format!("{run}.go"));
         gets.lock().unwrap().clear();
         if run == "paired" {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match query_robot_catalog(&session, ROBOT, Duration::from_secs(1)) {
+                    Some(reply) if reply.error.is_some() => {
+                        assert!(reply.entries.is_empty(), "a paired app lists no topic");
+                        break;
+                    }
+                    other => assert!(
+                        Instant::now() < deadline,
+                        "no catalog refusal from the paired app: {other:?}"
+                    ),
+                }
+            }
             for _ in 0..20 {
                 for topic in [ingress, other] {
                     sequence += 1;
@@ -510,6 +605,14 @@ fn lan_run(
             ingress_echoes.iter().all(|&x| x == RIGHT_X),
             "{run}: only right-hash frames reach the node: {ingress_echoes:?}"
         );
+        // Every re-injected frame ticks the relay once; its echo can trail
+        // the counter.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ingress_stats(ingress).is_some_and(|stats| stats.frames > ingress_echoes.len() as u64)
+            && Instant::now() < deadline
+        {
+            drain_echoes(&ingress_echo, &mut ingress_echoes);
+        }
         let stats = ingress_stats(ingress).expect("an open run bridges its ingress topic");
         assert_eq!(
             stats.frames,
@@ -552,12 +655,13 @@ fn ingress_topics_take_hash_checked_frames_from_a_lan_peer_only_when_open() {
                 "listen": [format!("tcp/127.0.0.1:{port}")],
             });
             runtime.start(&config.to_string()).unwrap();
-            desk = Some(DeskProcess(
+            let mut spawned = DeskProcess(
                 desk_command(dir, port, &log_path)
                     .spawn()
                     .expect("spawn desk process"),
-            ));
-            std::thread::sleep(Duration::from_secs(1));
+            );
+            await_step(&mut spawned.0, dir, "desk.ready", &log_path);
+            desk = Some(spawned);
             runtime.stop().unwrap();
         }
         let desk = desk.as_mut().expect("desk spawned");
