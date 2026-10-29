@@ -368,8 +368,9 @@ each subscription under `subscribed`: `polled` messages `poll` returned,
 `dropped` messages missing from a publisher's message sequence, which is the
 full queue dropping its oldest, and `undecodable` messages `poll` refused
 with `DECODE`. A frame too short for its wire header is skipped by the
-transport with a logged warning before `poll` sees it, so it reads as
-neither. A dropped message
+transport with a logged warning before `poll` sees it. It is never counted
+as `undecodable`, but when its publisher numbered it, the gap it leaves
+adds 1 to `dropped` at the next message from that publisher. A dropped message
 is counted from the gap in its publisher's message sequence, so a message
 dropped before the first one the subscription receives from that publisher
 is not counted. A message that
