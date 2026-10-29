@@ -658,6 +658,10 @@ struct ScheduledNode {
     /// read via [`Scheduler::replay_refill_shortfalls`]. Zero on every live path
     /// (nothing but the Replay arm touches it).
     replay_refill_shortfalls: u64,
+    /// Does the trace-driven burst this node is about to run end on a
+    /// trailing refill (see [`Scheduler::set_replay_trailing_refills`])? Set
+    /// by `take_planned_fire` from the plan, read by `tick_replay_burst`.
+    replay_trailing_refill: bool,
     /// Refills whose empty answer the REPLAY READ GATE caused, a queued frame
     /// the recording had not read yet. Split out from
     /// [`Self::replay_refill_shortfalls`] rather than folded into it because
@@ -1739,6 +1743,12 @@ struct PlannedFire {
     /// did NOT perform — reported by [`Scheduler::unconsumed_replay_fires`]
     /// rather than silently dropped (the never-fire class).
     consumed: bool,
+    /// The recording's burst for this node and step ended on a TRAILING
+    /// REFILL: its refill after the last fire POPPED a frame that the
+    /// [`DATA_PENDING_CARRY_CLAMP`] cap or the node's pre-fire check then left
+    /// unfired, and the next step's first fire serves it. Set by
+    /// [`Scheduler::set_replay_trailing_refills`].
+    trailing_refill: bool,
 }
 
 /// The installed trace-driven fire plan for ONE step.
@@ -2455,6 +2465,7 @@ impl Scheduler {
             throttle_ns: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
+            replay_trailing_refill: false,
             replay_enforced_empty_refills: 0,
             // No pauses until a replay engine installs some.
             replay_pauses: NodeReplayPauses::default(),
@@ -2734,6 +2745,7 @@ impl Scheduler {
                 fire_count: fire.fire_count,
                 interval_ns: fire.interval_ns,
                 consumed: false,
+                trailing_refill: false,
             });
         }
         if outcome.is_err() {
@@ -2745,6 +2757,73 @@ impl Scheduler {
         }
         self.replay_plan = Some(plan);
         outcome
+    }
+
+    /// Mark the nodes of the installed plan whose recorded burst at `step`
+    /// ended on a TRAILING REFILL: after the live burst's last fire its refill
+    /// hook popped one more frame, and the [`DATA_PENDING_CARRY_CLAMP`] cap or
+    /// the node's pre-fire check stopped the burst with that frame frozen
+    /// unfired (`tick_data_burst`'s `refilled_unfired` arm). The trace-driven
+    /// burst then drives the refill hook once after its last fire, as the live
+    /// burst did, so the next step's first fire serves the same frame.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::GraphError`] when no plan is installed for `step`, or
+    /// a named node has no planned fire there, is not a `Data` node with a
+    /// refill hook, or neither fires the cap at that step nor carries a
+    /// pre-fire check: a recording cannot hold a trailing refill on such a
+    /// node.
+    pub fn set_replay_trailing_refills(
+        &mut self,
+        step: u64,
+        node_ids: &[&str],
+    ) -> TransportResult<()> {
+        let refuse = |node_id: &str, why: &str| TransportError::GraphError {
+            reason: format!(
+                "replay fire plan (step {step}): node '{node_id}' cannot carry a trailing \
+                 refill: {why}"
+            ),
+        };
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        for node_id in node_ids {
+            let Some((idx, _, node)) = self.nodes.get_full(*node_id) else {
+                return Err(TransportError::NodeNotFound {
+                    // hot-path-alloc-ok: cold: plan-install ERROR arm.
+                    node_id: (*node_id).to_string(),
+                });
+            };
+            if !matches!(node.policy, TriggerPolicy::Data) || node.trigger_refill.is_none() {
+                return Err(refuse(node_id, "it is not a Data node with a refill hook"));
+            }
+            let deferrable = node.pre_fire_check.is_some();
+            let Some(plan) = self.replay_plan.as_mut().filter(|p| p.step == step) else {
+                return Err(refuse(node_id, "no fire plan is installed for this step"));
+            };
+            match plan.slots.get_mut(idx).and_then(Option::as_mut) {
+                Some(slot) if slot.fire_count == cap || deferrable => slot.trailing_refill = true,
+                Some(slot) => {
+                    return Err(refuse(
+                        node_id,
+                        &format!(
+                            "it fires {} times, not the cap of {cap}, and has no pre-fire check",
+                            slot.fire_count
+                        ),
+                    ))
+                }
+                None => return Err(refuse(node_id, "it has no planned fire at this step")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Does `node_id` carry a trigger refill hook (a unified `Data` binding)?
+    /// `false` for an unknown node.
+    #[must_use]
+    pub fn has_trigger_refill(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .is_some_and(|n| n.trigger_refill.is_some())
     }
 
     /// Drop the trace-driven fire plan — the scheduler decides
@@ -3278,6 +3357,7 @@ impl Scheduler {
                 return None;
             }
         }
+        node.replay_trailing_refill = planned.trailing_refill;
         match &node.policy {
             TriggerPolicy::Data => {
                 node.data_backlog_hint = false;
@@ -7605,7 +7685,9 @@ impl Scheduler {
     /// [`TriggerRefill`] hook whether another frame is queued, and stops when
     /// the hook reports nothing. Here the LENGTH is given — the recording states
     /// it — so the hook is driven once per fire beyond the first, purely to POP
-    /// the next FIFO frame into the subscriber's frozen slot. That is what makes
+    /// the next FIFO frame into the subscriber's frozen slot, and once after
+    /// the last fire on a step the plan marks with a trailing refill
+    /// ([`Self::set_replay_trailing_refills`]). That is what makes
     /// the k-th replayed fire read the k-th recorded frame rather than re-reading
     /// the head, and it is the same `NodeEntry::drain_trigger_input` the live
     /// refill calls (never a bypass — a bypass injection would silently lose the
@@ -7706,6 +7788,25 @@ impl Scheduler {
             fire_time = fire_time.saturating_add(interval_ns);
             if node.disabled {
                 break;
+            }
+        }
+        // The recorded burst ended on a TRAILING REFILL: the live burst's
+        // refill popped one more frame after its last fire and the cap froze it
+        // unfired. Drive the hook once more so the same frame sits in the
+        // frozen slot, and set the backlog hint as the live burst does.
+        let trailing = std::mem::take(&mut node.replay_trailing_refill);
+        #[cfg(feature = "oracle-mutants")]
+        let trailing = trailing && !crate::replay_feed::mutants::trailing_refills_dropped();
+        if trailing && !node.disabled {
+            if let Some(r) = refill.as_ref() {
+                let outcome = (r.drain)();
+                // A trailing refill that finds nothing precedes no fire, so it
+                // is no input shortfall: the frame it would have frozen is the
+                // next step's, served by that step's boundary drain.
+                if outcome.popped > 0 {
+                    Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
+                    node.data_backlog_hint = true;
+                }
             }
         }
     }
@@ -10613,6 +10714,104 @@ mod tests {
             0,
             "the supply really was drained by the burst, not left behind"
         );
+    }
+
+    /// A replay step marked with a trailing refill drives the refill hook once
+    /// after the burst's last fire, leaving the frame frozen for the next
+    /// step; an unmarked step asks only between fires.
+    #[test]
+    fn a_trailing_refill_drives_the_hook_once_after_the_last_fire() {
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        for (marked, want) in [(false, u64::from(cap) - 1), (true, u64::from(cap))] {
+            let mut replay =
+                Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+            add_data(&mut replay, "sink");
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_hook = Arc::clone(&calls);
+            replay
+                .set_trigger_refill("sink", "inp", move || {
+                    calls_hook.fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::drained(1, Some(7), false)
+                })
+                .unwrap();
+            replay
+                .set_replay_fire_plan(
+                    0,
+                    &[ReplayFire {
+                        node_id: "sink",
+                        first_fire_ns: 1_000_000,
+                        fire_count: cap,
+                        interval_ns: 0,
+                    }],
+                )
+                .unwrap();
+            if marked {
+                replay.set_replay_trailing_refills(0, &["sink"]).unwrap();
+            }
+            replay.step(Duration::from_millis(10));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                want,
+                "marked={marked}: the hook is asked between fires, and once more after the \
+                 last on a marked step"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("sink"), Some(0));
+        }
+    }
+
+    /// The trailing-refill marker refuses every node a recording cannot hold
+    /// one on, each by name.
+    #[test]
+    fn a_trailing_refill_is_refused_where_no_burst_can_end_on_one() {
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        let mut s = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        add_data(&mut s, "sink");
+        add_data(&mut s, "bare");
+        add_period(&mut s, "tick", Duration::from_millis(1));
+        s.set_trigger_refill("sink", "inp", RefillOutcome::empty_queue)
+            .unwrap();
+        let plan = |fires: u32| {
+            [
+                ReplayFire {
+                    node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: fires,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "bare",
+                    first_fire_ns: 1_000_000,
+                    fire_count: cap,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "tick",
+                    first_fire_ns: 1_000_000,
+                    fire_count: cap,
+                    interval_ns: 0,
+                },
+            ]
+        };
+        // No plan installed for the step.
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("no fire plan"), "{err}");
+        s.set_replay_fire_plan(0, &plan(3)).unwrap();
+        // An unknown node.
+        assert!(matches!(
+            s.set_replay_trailing_refills(0, &["ghost"]),
+            Err(TransportError::NodeNotFound { .. })
+        ));
+        // A Data node with no refill hook, and a Period node.
+        for id in ["bare", "tick"] {
+            let err = s.set_replay_trailing_refills(0, &[id]).unwrap_err();
+            assert!(err.to_string().contains("refill hook"), "{id}: {err}");
+        }
+        // Below the cap, with no pre-fire check.
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("not the cap"), "{err}");
+        // At the cap it is accepted.
+        s.set_replay_fire_plan(0, &plan(cap)).unwrap();
+        s.set_replay_trailing_refills(0, &["sink"]).unwrap();
     }
 }
 

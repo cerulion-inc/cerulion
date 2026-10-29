@@ -1351,6 +1351,9 @@ pub struct ReplayOptions {
     /// topic to a fresh bag here. `None` writes nothing. The path must not
     /// exist; the surface refuses one that does.
     pub record_out_path: Option<PathBuf>,
+    /// What the re-execution is for (`--verify` or a neutral `--resim`), which
+    /// decides whether reads are fed by recorded identity.
+    pub purpose: replay_engine::ReplayPurpose,
 }
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
@@ -1908,6 +1911,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         allow_param_change: opts.allow_param_change,
         ros2_entries_skipped,
         record_out,
+        purpose: opts.purpose,
     };
     let nodes = ReplayNodes::Cdylib {
         workspace_root,

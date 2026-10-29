@@ -913,7 +913,7 @@ pub fn run_resim(
             return EXIT_USAGE;
         }
     }
-    match replay_cmd::run_replay(bag, engine_options(options)) {
+    match replay_cmd::run_replay(bag, engine_options(options, verify)) {
         Ok(outcome) => {
             let report = ResimReport::from_outcome(&outcome);
             if verify {
@@ -948,7 +948,7 @@ pub fn run_resim(
 /// from-start bag, so an e2e over any bag this repo's CLI tests can build would
 /// pass with it discarded.
 #[cfg(unix)]
-fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
+fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
     let ResimOptions {
         duration_bound_ns,
         report_path,
@@ -964,6 +964,14 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         strict_state,
         allow_param_change,
         record_out_path,
+        // `--verify` feeds reads by recorded identity; a neutral resim keeps
+        // the queue re-creation, so the candidate's frames reach its in-rank
+        // consumers.
+        purpose: if verify {
+            crate::replay_engine::ReplayPurpose::Verify
+        } else {
+            crate::replay_engine::ReplayPurpose::Resim
+        },
     }
 }
 
@@ -2103,14 +2111,22 @@ mod tests {
     fn every_knob_survives_the_conversion_into_the_engines_options() {
         // The drop-a-knob guard. Asserted field by field rather than by struct
         // equality because `ReplayOptions` deliberately derives no `PartialEq`.
-        let got = engine_options(ResimOptions {
-            duration_bound_ns: Some(7_000_000_000),
-            report_path: Some(PathBuf::from("/tmp/r.json")),
-            tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
-            strict_state: true,
-            allow_param_change: true,
-            record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
-        });
+        let got = engine_options(
+            ResimOptions {
+                duration_bound_ns: Some(7_000_000_000),
+                report_path: Some(PathBuf::from("/tmp/r.json")),
+                tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
+                strict_state: true,
+                allow_param_change: true,
+                record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
+            },
+            true,
+        );
+        assert_eq!(
+            got.purpose,
+            crate::replay_engine::ReplayPurpose::Verify,
+            "`--verify` must reach the engine as the identity-fed purpose"
+        );
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
         assert_eq!(
             got.record_out_path.as_deref(),
@@ -2134,7 +2150,12 @@ mod tests {
         );
 
         // And the negative: a knob nobody set must not be invented.
-        let none = engine_options(ResimOptions::default());
+        let none = engine_options(ResimOptions::default(), false);
+        assert_eq!(
+            none.purpose,
+            crate::replay_engine::ReplayPurpose::Resim,
+            "a neutral resim keeps the queue re-creation"
+        );
         assert_eq!(none.duration_bound_ns, None);
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());
