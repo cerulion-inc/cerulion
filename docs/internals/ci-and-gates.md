@@ -721,12 +721,30 @@ Three rules inside the script keep a prune from deleting what another run still 
   ref), because GitHub stores one entry per pair and under the pull-request override every open
   branch holds its own entry under the same key string.
 
+In `ci.yml` the jobs that cache the root workspace's `target/` and build no other tracked
+workspace hash the root `Cargo.lock` only (`hashFiles('Cargo.lock')`); the bench, example,
+Python and Android lockfiles describe other workspaces and do not change that tree.
+`android-check`, the example jobs and `python-client` keep their wider hashes. A save happens only on a key miss, whose
+run restored the previous generation through `restore-keys`, and cargo writes the units whose
+hash changed next to the old ones without deleting those. So in `test-linux` and `test-macos`
+shard 0 runs `tools/scripts/ci_cache_trim_target.sh` twice around its build: `age` right after
+the restore sets the access time of every restored `.fingerprint` file to 2000-01-01, and `trim`
+before the prune deletes from every profile directory under `target/` (the scaffold target dirs
+under `target/tmp/` included) each `deps/`, `build/`, `examples/` and `.fingerprint/` entry whose
+unit hash no cargo command in the job read, plus `incremental/`. Cargo reads the fingerprint of
+every unit in a build graph, fresh or not, so a unit the job used stays. The trim deletes nothing
+when a read leaves an aged access time unchanged, when `target/debug` holds no unit read during
+the run, or (per profile) when no `deps/` entry carries a live unit hash, and it prints the
+target size before and after. It runs on `main` only, under the save's namespace gate. Shard 0's
+archive then holds only the units its own cargo commands read, so a unit that only shards 1 to 3
+or a fall-through job (`lint`, `docs`, `netd-wan`) builds is compiled by that run every time.
+
 `lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
 shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
 the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
 one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
 `cargo-Linux-netd-wan-`). Under the default all three are restore-only and fall through their
-`restore-keys` to `cargo-Linux-main-`, the shards' archive, a superset of what they need;
+`restore-keys` to `cargo-Linux-main-`, the shards' archive;
 `test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
 
 Two exemptions, both narrow. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed on
@@ -759,7 +777,7 @@ combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and 
 steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
 refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
 script's self-test and the checker's self-test, both of which flip every rule from both sides,
-before the checker reads the real files.
+and the target trim's self-test, before the checker reads the real files.
 
 ## Test map
 
@@ -773,6 +791,7 @@ before the checker reads the real files.
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
 | `tools/scripts/check_hot_path_allocs.sh --self-test` | the annotation grammar and scope rules | n/a |
+| `tools/scripts/ci_cache_trim_target.sh --self-test` | a synthetic target with a read and an unread generation: the unread units' artifacts, build dirs and fingerprints go, the read ones and unhashed files stay, an unread scaffold target and scratch files under `tmp/` go; nothing is deleted when nothing was read, when `age` never ran, or when no `deps/` entry carries a live hash; fails when the filesystem does not update access times | n/a |
 | `tools/scripts/check_pr_title.sh --self-test` | the title/branch oracle table | n/a |
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
