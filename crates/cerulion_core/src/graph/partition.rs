@@ -1236,12 +1236,13 @@ pub fn auto_partition(
 /// budget. The default is [`auto_partition`]'s result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutoPartitionOptions {
-    /// Put every linear chain ([`chain_colocation_seeds`]) in one group
-    /// before the cost-driven fusions, whatever the budget, the edge costs or
-    /// a zero rate say. For a run whose processes execute their nodes in
-    /// executor units (the free run on the real clock): the units split a
-    /// chain again inside its process where the profile does not show a merge
-    /// safe, so the budget is applied by the units there.
+    /// Put every linear chain ([`chain_colocation_seeds`]) whose summed node
+    /// cost is within the per-group budget in one group before the
+    /// cost-driven fusions, whatever the edge costs or a zero rate say; a
+    /// chain over the budget is cut where the cost model cuts it. For a run
+    /// whose processes execute their nodes in executor units (the free run on
+    /// the real clock): the units split a whole chain again inside its process
+    /// where the profile does not show a merge safe.
     pub keep_linear_chains: bool,
 }
 
@@ -1255,6 +1256,23 @@ fn chain_seed_mutant() -> bool {
     #[cfg(feature = "oracle-mutants")]
     {
         std::env::var_os(CHAIN_SEED_MUTANT_ENV).is_some()
+    }
+    #[cfg(not(feature = "oracle-mutants"))]
+    {
+        false
+    }
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes the chain
+/// seeding of [`AutoPartitionOptions::keep_linear_chains`] ignore the
+/// per-group budget.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_BUDGET_MUTANT_ENV: &str = "CERULION_CHAIN_BUDGET_MUTANT";
+
+fn chain_budget_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        std::env::var_os(CHAIN_BUDGET_MUTANT_ENV).is_some()
     }
     #[cfg(not(feature = "oracle-mutants"))]
     {
@@ -1501,6 +1519,8 @@ pub fn auto_partition_with_options(
             &chain_colocation_seeds(entry_infos, &topo, trigger_edges),
             &node_ids,
             &id_to_idx,
+            &node_cost,
+            budget_ns,
             config,
             entry_infos,
             trigger_edges,
@@ -1649,16 +1669,18 @@ pub fn chain_colocation_seeds(
 
 /// Union every chain's members into one group when the merged group is one a
 /// worker can run (the same re-levelization and contiguity check every
-/// candidate fusion passes); a chain whose group would not pass stays split,
-/// with a warn naming it. A chain is kept whole whatever the compute budget:
-/// inside the process the executor units split it again where the profile
-/// says a merge is unsafe, so the budget is the units' to apply.
+/// candidate fusion passes) and its summed node cost is within `budget_ns`,
+/// the bound every candidate fusion meets. A chain whose group would not
+/// re-levelize stays split, with a warn naming it; a chain over the budget is
+/// not seeded, so the greedy loop below places its cuts by the cost model.
 #[allow(clippy::too_many_arguments)]
 fn seed_linear_chains(
     uf: &mut UnionFind,
     chains: &[Vec<String>],
     node_ids: &[&str],
     id_to_idx: &HashMap<&str, usize>,
+    node_cost: &[u64],
+    budget_ns: u64,
     config: &GraphConfig,
     entry_infos: &IndexMap<String, NodeInfo>,
     trigger_edges: &TriggerEdges,
@@ -1679,6 +1701,20 @@ fn seed_linear_chains(
             continue;
         }
         let merged: Vec<usize> = (0..n).filter(|&i| roots.contains(&uf.find(i))).collect();
+        let load = merged
+            .iter()
+            .fold(0u64, |acc, &i| acc.saturating_add(node_cost[i]));
+        if load > budget_ns && !chain_budget_mutant() {
+            tracing::debug!(
+                graph = %config.identity(),
+                chain = %chain.join(" -> "),
+                load_ns = load,
+                budget_ns,
+                "a linear chain over the per-group budget is not kept whole; the cost model \
+                 places its cuts"
+            );
+            continue;
+        }
         let member_ids: Vec<&str> = merged.iter().map(|&i| node_ids[i]).collect();
         match check_group(
             &member_ids,
@@ -3563,15 +3599,16 @@ mod block_colocation_tests {
         );
     }
 
-    /// For a run in executor units (`keep_linear_chains`), the partitioner
-    /// never splits a linear chain across groups: a chain whose edges the
-    /// greedy loop would refuse (rate 0, over budget) is one group, and a
-    /// fan-out sibling off the chain keeps its own. Without the option the same
-    /// graph is process per node, as the cost model alone decides.
-    /// `CERULION_CHAIN_SEED_MUTANT` (`oracle-mutants`) ignores the option, and
-    /// this arm must then fail.
-    #[test]
-    fn a_linear_chain_in_a_unit_run_is_never_split_across_groups() {
+    /// The graph the chain arms partition: `src` fans out to `mid` and
+    /// `side`, so the one linear chain is `mid -> tail`. Every node costs
+    /// 1000 ns and every edge has rate 0, so the greedy loop fuses nothing on
+    /// its own.
+    fn chain_fixture() -> (
+        GraphConfig,
+        IndexMap<String, NodeInfo>,
+        TriggerEdges,
+        PartitionCosts,
+    ) {
         let config = config_of(vec![
             node("src", vec![], vec![out("a"), out("b")]),
             node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
@@ -3598,37 +3635,57 @@ mod block_colocation_tests {
                 .into_iter()
                 .map(|id| (id.to_string(), 1_000u64))
                 .collect(),
-            // Rate 0 on every edge: the greedy loop fuses nothing on its own.
             edge_rate_mhz: BTreeMap::new(),
             hop: HopCosts::platform_default(),
         };
-        let plain =
-            auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1).expect("derive");
+        (config, infos, edges, costs)
+    }
+
+    fn units_partition(budget_ns: u64) -> AutoPartition {
+        let (config, infos, edges, costs) = chain_fixture();
+        auto_partition_with_options(
+            &config,
+            &infos,
+            &edges,
+            &costs,
+            &BTreeSet::new(),
+            budget_ns,
+            AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )
+        .expect("derive")
+    }
+
+    fn group_of(out: &AutoPartition, id: &str) -> String {
+        out.groups
+            .iter()
+            .find(|(_, members)| members.iter().any(|m| m == id))
+            .map(|(g, _)| g.clone())
+            .expect("every node is in a group")
+    }
+
+    /// For a run in executor units (`keep_linear_chains`), a linear chain
+    /// whose summed cost is within the budget is one group even where the
+    /// greedy loop would fuse none of its edges (rate 0), and a fan-out
+    /// sibling off the chain keeps its own. Without the option the same graph
+    /// is process per node, as the cost model alone decides.
+    /// `CERULION_CHAIN_SEED_MUTANT` (`oracle-mutants`) drops the seeding, and
+    /// this arm must then fail.
+    #[test]
+    fn a_linear_chain_in_a_unit_run_is_never_split_across_groups() {
+        let (config, infos, edges, costs) = chain_fixture();
+        let plain = auto_partition(&config, &infos, &edges, &costs, &BTreeSet::new(), 1_000_000)
+            .expect("derive");
         assert_eq!(
             plain.groups.len(),
             4,
             "without the option a rate-0 graph is process per node: {:?}",
             plain.groups
         );
-        let out = auto_partition_with_options(
-            &config,
-            &infos,
-            &edges,
-            &costs,
-            &BTreeSet::new(),
-            1,
-            AutoPartitionOptions {
-                keep_linear_chains: true,
-            },
-        )
-        .expect("derive");
-        let group_of = |id: &str| {
-            out.groups
-                .iter()
-                .find(|(_, members)| members.iter().any(|m| m == id))
-                .map(|(g, _)| g.clone())
-                .expect("every node is in a group")
-        };
+        // The chain's two nodes cost 2000 ns together, within the budget.
+        let out = units_partition(1_000_000);
+        let group_of = |id: &str| group_of(&out, id);
         // `src` fans out to `mid` and `side`, so the chain is `mid -> tail`.
         let chains = chain_colocation_seeds(
             &infos,
@@ -3662,6 +3719,33 @@ mod block_colocation_tests {
             assert!(
                 chain.iter().all(|n| group_of(n) == g),
                 "chain {chain:?} split"
+            );
+        }
+    }
+
+    /// For a run in executor units, a linear chain whose summed cost is over
+    /// the per-group budget is not kept whole: the cost model places its cuts,
+    /// and no group the chain seeding made exceeds the budget. Here every edge
+    /// has rate 0, so the cost model cuts every hop. `CERULION_CHAIN_BUDGET_MUTANT`
+    /// (`oracle-mutants`) drops the budget check from the seeding, and this arm
+    /// must then fail.
+    #[test]
+    fn a_linear_chain_over_the_budget_in_a_unit_run_is_cut_by_the_cost_model() {
+        // `mid -> tail` costs 2000 ns; the budget holds one node, not both.
+        let budget_ns = 1_500;
+        let out = units_partition(budget_ns);
+        assert_ne!(
+            group_of(&out, "mid"),
+            group_of(&out, "tail"),
+            "an over-budget chain was kept whole: {:?}",
+            out.groups
+        );
+        let (_, _, _, costs) = chain_fixture();
+        for (group, members) in &out.groups {
+            let load: u64 = members.iter().map(|m| costs.node_p50_ns[m]).sum();
+            assert!(
+                load <= budget_ns,
+                "group {group} {members:?} costs {load} ns, over the {budget_ns} ns budget"
             );
         }
     }

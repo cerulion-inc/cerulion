@@ -17044,6 +17044,148 @@ fn run_keeps_linear_chains(
 #[cfg(test)]
 mod chain_keeping_tests {
     use super::*;
+    use crate::multiprocess::ExecutionMode;
+    use cerulion_core::graph::config::{InputDef, OutputDef};
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta};
+    use cerulion_core::graph::topology::{TriggerEdges, DEFAULT_CONSUMER_DEPTH};
+    use cerulion_core::graph::{
+        auto_partition, auto_partition_with_options, AutoPartition, AutoPartitionOptions, HopCosts,
+        PartitionCosts,
+    };
+    use cerulion_core::NodeInfo;
+    use indexmap::IndexMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `src` fans out to `mid` and `side`, so `mid -> tail` is the one linear
+    /// chain; every node costs 1000 ns and every edge has rate 0, so the cost
+    /// model alone fuses nothing, and chain keeping makes `mid -> tail` one
+    /// group.
+    fn chain_partition(options: AutoPartitionOptions) -> (AutoPartition, AutoPartition) {
+        let node = |id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs,
+            outputs,
+        };
+        let out = |name: &str| OutputDef {
+            name: name.to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: None,
+        };
+        let inp = |name: &str, source: &str| InputDef {
+            name: name.to_string(),
+            source: source.to_string(),
+        };
+        let config = GraphConfig {
+            level_assignments: None,
+            network: None,
+            name: None,
+            identity: "chain".to_string(),
+            prefix: "p".to_string(),
+            nodes: vec![
+                node("src", vec![], vec![out("a"), out("b")]),
+                node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
+                node("tail", vec![inp("inp", "mid/m")], vec![]),
+                node("side", vec![inp("inp", "src/b")], vec![]),
+            ],
+            multi_publisher_topics: Vec::new(),
+            process_groups: IndexMap::new(),
+            process_group_order: Vec::new(),
+        };
+        let meta = InputMeta {
+            name: "inp".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: DEFAULT_CONSUMER_DEPTH,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["mid", "tail", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![meta.clone()], vec![]),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("mid", "/p/src/a");
+        edges.insert("tail", "/p/mid/m");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "mid", "tail", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let isolated = BTreeSet::new();
+        let with = auto_partition_with_options(
+            &config, &infos, &edges, &costs, &isolated, 1_000_000, options,
+        )
+        .expect("derive");
+        let main =
+            auto_partition(&config, &infos, &edges, &costs, &isolated, 1_000_000).expect("derive");
+        (with, main)
+    }
+
+    /// The partition a run in `time_source` and `mode` takes, against
+    /// `auto_partition`'s own.
+    fn run_partition(
+        time_source: TimeSource,
+        mode: Option<ExecutionMode>,
+    ) -> (AutoPartition, AutoPartition) {
+        chain_partition(AutoPartitionOptions {
+            keep_linear_chains: run_keeps_linear_chains(time_source, mode),
+        })
+    }
+
+    /// A lockstep run takes `auto_partition`'s result byte for byte.
+    #[test]
+    fn a_lockstep_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Real, Some(ExecutionMode::Lockstep));
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on the virtual (simulated) clock takes `auto_partition`'s result
+    /// byte for byte.
+    #[test]
+    fn a_virtual_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Virtual, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on an external clock takes `auto_partition`'s result byte for
+    /// byte.
+    #[test]
+    fn an_external_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::External, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// The control: a free run on the real clock keeps the chain, so the
+    /// fixture does tell the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_free_run_on_the_real_clock_keeps_the_chain() {
+        let (run, main) = run_partition(TimeSource::Real, None);
+        assert_ne!(run.groups, main.groups);
+        let group_of = |p: &AutoPartition, id: &str| {
+            p.groups
+                .iter()
+                .find(|(_, members)| members.iter().any(|m| m == id))
+                .map(|(g, _)| g.clone())
+                .expect("every node is in a group")
+        };
+        assert_eq!(group_of(&run, "mid"), group_of(&run, "tail"));
+        assert_ne!(group_of(&main, "mid"), group_of(&main, "tail"));
+    }
 
     /// Chains are kept whole only for a run whose processes run executor
     /// units: the real clock outside the lockstep mode.

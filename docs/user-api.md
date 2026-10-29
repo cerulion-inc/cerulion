@@ -2559,8 +2559,9 @@ Each unit `cerulion graph plan <NAME>` prints names why its first node starts it
 Latest-value inputs never join units. Every producer and consumer of a topic with a `block` consumer
 stay in one unit, a node declaring `isolate: true` included. Units are decided when the graph loads and never move during a run. When
 `graph run` derives process groups from the graph's profile for a free run on the real clock, the
-cost-aware partitioner keeps every linear chain in one process group, so a chain's units share one
-process; `graph partition` and the lockstep execution mode partition by the cost rules alone.
+cost-aware partitioner keeps every linear chain within the per-group compute budget in one process
+group, so a chain's units share one process; a chain over the budget is cut where the cost model
+cuts it. `graph partition` and the lockstep execution mode partition by the cost rules alone.
 
 **Overrides: `isolate:`.** `isolate: true` gives a node a unit of its own. `isolate: false` keeps it
 in the unit of every node of its process that triggers it, whatever the rules above say: a fan-in node
