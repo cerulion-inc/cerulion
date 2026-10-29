@@ -19,7 +19,7 @@ and `cerulion_dds`.
 | CLI topic list, echo, info, hz | Yes | Yes | Remote access uses the netd gateway. |
 | CLI bag record, info, play | Yes | Yes | Recordings are standard MCAP files. |
 | Recorder | Yes | Yes | App and graph recording use the same recorder. |
-| netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint. |
+| netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint, and an app can dial a `tcp/` locator. |
 | mDNS discovery | Yes | Yes | Android needs a multicast lock and a LAN-dialable nonzero TCP listen port for its beacon. |
 | LAN access default | Open | Paired | The device identity remains discoverable, but topic announcements are withheld and LAN catalog, schema, and data requests are refused. |
 | wsd | Yes | Yes | Android control sockets use the abstract namespace. |
@@ -498,13 +498,14 @@ The configuration keys are:
 |---|---|
 | `graph_yaml` | Optional graph YAML text. |
 | `node_lib_dir` | Optional absolute path to node libraries, for a host runtime on the cross-process transport. A node type linked into the library wins over a library in this directory. The in-process transport an Android app uses refuses it for a graph with native nodes, with error code 5. |
-| `listen` | Gateway listen endpoints. Defaults to `[]`, which disables the gateway. |
+| `listen` | Gateway listen endpoints. Defaults to `[]`. With an empty `listen` and an empty `connect`, the gateway is disabled. |
+| `connect` | Optional array of `tcp/<host>:<port>` locators the app dials, the mirror of `listen`. Defaults to `[]`. A peer that is not up yet does not fail the start: the app dials it again in the background. A locator that is not a well-formed `tcp/` locator (`quic/` and `tls/` included), a duplicate, or a value that is not an array of strings is rejected with error code 3. See [Dial a desk](#dial-a-desk). |
 | `record` | Optional recording object with `file` and optional `topics`. The file must be a plain `.mcap` name. An existing file is refused with error code 7, so each start needs a new name. |
 | `publish` | Optional array of `{ "topic", "schema", "max_payload_bytes" }` entries. Defaults to `[]`. |
 | `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
-| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon. Defaults to `true`. |
+| `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon, and neither do `connect` locators. Defaults to `true`. Android passes multicast to the app only while it holds a `WifiManager.MulticastLock`, which needs the `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission; see [Discovery and access](#discovery-and-access). |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 
 Omitting `record.topics` records all graph output and app-published topics.
@@ -676,12 +677,14 @@ written file in `record_path`; substitute its basename:
 adb exec-out run-as com.cerulion.sample cat files/bags/<record_path basename> > recording.mcap
 ```
 
-Listen endpoints and the robot name are fixed for the process lifetime by the
-first start. A later start with a different robot name returns `BAD_STATE`.
-A first start with an empty `listen` fixes the gateway as disabled for the
-process; restart the app process to change either setting. One runtime at a
-time owns the gateway: while it runs, another runtime's start with a non-empty
-`listen` returns `BAD_STATE`; stop the first runtime before starting it.
+Listen endpoints, connect locators and the robot name are fixed for the
+process lifetime by the first start. A later start with a different `listen`,
+`connect` or robot name returns `BAD_STATE`. A first start with an empty
+`listen` and an empty `connect` fixes the gateway as disabled for the
+process; restart the app process to change any of these settings. One runtime
+at a time owns the gateway: while it runs, another runtime's start with a
+non-empty `listen` or `connect` returns `BAD_STATE`; stop the first runtime
+before starting it.
 App publish topics must not collide with graph output topics because graph
 topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
 The gateway does not forward incoming topics to the app, so `subscribe`
@@ -711,8 +714,58 @@ refused: the demand GET is answered `refused` and no frame of the topic
 leaves the device. An empty
 list refuses every topic. The catalog still names every topic the app serves,
 with its schema and liveness, so a desk can see that `/app/notes` exists but
-cannot receive it. A start with `egress` and an empty `listen` builds no
-gateway, so the list has no effect and the start logs a warning.
+cannot receive it. A start with `egress` and an empty `listen` and `connect`
+builds no gateway, so the list has no effect and the start logs a warning.
+
+### Reach a desk over USB with adb forward
+
+The configuration above listens on the device's loopback address only. Use it
+to serve a desk on USB without opening the app to the Wi-Fi network: no host on
+the network can reach `127.0.0.1` on the device, and a loopback endpoint raises
+no mDNS beacon, so `mdns_advertised` reads `false` and the app is not announced
+either. Other processes on the device can still reach a loopback listener, so
+keep the `egress` list to the topics the desk needs. On the desk:
+
+```sh
+adb forward tcp:7683 tcp:7683
+cerulion topic list --connect tcp/127.0.0.1:7683
+```
+
+### Dial a desk
+
+Some networks block multicast or connections into the device, so a desk can
+neither discover the app nor dial it. When the app can still reach the desk,
+it can dial the desk instead: list the desk's locator in `connect`. The desk must listen on that locator, for
+example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
+[Making a robot discoverable](networking.md#making-a-robot-discoverable)).
+
+```json
+{
+  "connect": ["tcp/192.0.2.20:7690"],
+  "lan_access": "open",
+  "egress": ["/app/state"],
+  "publish": [{"topic": "/app/state", "schema": "std_msgs/String"}]
+}
+```
+
+With an empty `listen` the app opens no port of its own and raises no beacon.
+The `lan_access` posture and the `egress` list apply to a desk the app dials as
+they do to a desk that dials the app: under `paired` the desk's catalog request
+and topic demands are refused, and under `open` only the listed topics are
+sent. A desk that is not listening yet does not fail the start; the app
+dials it again in the background, a few seconds apart. The app dials `tcp/`
+locators only. Like `listen`, `connect` is fixed for the process lifetime by the
+first start.
+
+The sample app reads a `connect` launch intent extra in debuggable builds only,
+as it does `lan_access`. The sample keeps its own `listen` entry, so the extra
+adds a dialed link next to its listener. For a desk on USB, `adb reverse` maps a port on the
+device's loopback address to the desk, and the app dials that port:
+
+```sh
+adb reverse tcp:7690 tcp:7690
+adb shell am start -n com.cerulion.sample/.MainActivity --es lan_access open --es connect tcp/127.0.0.1:7690
+```
 
 ## Single-process apps
 
@@ -748,7 +801,11 @@ sends a heartbeat data demand directly, without reading the catalog first,
 through a host probe (`crates/test_fixtures/android_e2e_demand_probe`). The
 paired app must refuse that demand twice in a row and send no frame. The open
 app must grant the same demand and deliver frames, which shows that the paired
-refusal comes from the posture and not from the topic or the allow-list. When
+refusal comes from the posture and not from the topic or the allow-list. A
+last run starts the open app in a new process with the `connect` extra behind
+`adb reverse`: the probe listens on the host and dials nothing, and the demand
+must be granted and frames delivered over the link the app dialed. The
+emulator passes no multicast, so the lane checks no mDNS discovery. When
 the probe expects `std_msgs/Int32`, the open app's frames must all be dropped
 on the schema hash. In every run the probe's ingress must lose no frame to a
 decode error, a local re-injection failure or its own LAN posture. No host
