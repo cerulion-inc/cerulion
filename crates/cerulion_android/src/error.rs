@@ -33,6 +33,10 @@ pub mod codes {
     pub const PANIC: i32 = 12;
     /// The OS refused to create a worker thread; retry later.
     pub const SPAWN: i32 = 13;
+    /// A received frame could not be decoded into JSON; it was consumed.
+    pub const DECODE: i32 = 14;
+    /// The subscription queue holds no message.
+    pub const EMPTY: i32 = 15;
 }
 
 #[derive(Debug, Error)]
@@ -77,6 +81,9 @@ pub enum EmbedError {
     /// The OS refused to create a worker thread.
     #[error("{0}")]
     Spawn(String),
+    /// A received frame could not be decoded into JSON.
+    #[error("{0}")]
+    Decode(String),
 }
 
 impl EmbedError {
@@ -96,6 +103,7 @@ impl EmbedError {
             Self::Busy(_) => codes::BUSY,
             Self::Panic(_) => codes::PANIC,
             Self::Spawn(_) => codes::SPAWN,
+            Self::Decode(_) => codes::DECODE,
         }
     }
 }
@@ -120,13 +128,16 @@ mod tests {
             (EmbedError::Busy(String::new()), 11),
             (EmbedError::Panic(String::new()), 12),
             (EmbedError::Spawn(String::new()), 13),
+            (EmbedError::Decode(String::new()), 14),
         ];
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
         actual.sort_unstable();
-        assert_eq!(actual, (1..=13).collect::<Vec<_>>());
+        assert_eq!(actual, (1..=14).collect::<Vec<_>>());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }
         assert_eq!(codes::OK, 0);
+        // EMPTY is a poll outcome, not an error: no variant carries it.
+        assert_eq!(codes::EMPTY, 15);
     }
 }

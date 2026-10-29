@@ -143,7 +143,19 @@ pub(crate) fn max_publish_json_len(max_payload_bytes: usize) -> usize {
 }
 
 fn ensure_supported(field_type: &FieldType, name: &str) -> Result<(), EmbedError> {
-    if matches!(
+    if is_flat(field_type) {
+        Ok(())
+    } else {
+        Err(EmbedError::Encode(format!(
+            "field {name} has type {field_type:?}, which publish does not support"
+        )))
+    }
+}
+
+/// The field types the JSON surface carries, publish and poll alike: the
+/// primitives, `String`, `StringFixed(n)` and byte arrays.
+pub(crate) fn is_flat(field_type: &FieldType) -> bool {
+    matches!(
         field_type,
         FieldType::Bool
             | FieldType::I8
@@ -159,13 +171,6 @@ fn ensure_supported(field_type: &FieldType, name: &str) -> Result<(), EmbedError
             | FieldType::String
             | FieldType::StringFixed(_)
     ) || is_byte_array(field_type)
-    {
-        Ok(())
-    } else {
-        Err(EmbedError::Encode(format!(
-            "field {name} has type {field_type:?}, which publish does not support"
-        )))
-    }
 }
 
 fn encode_fixed(
@@ -411,7 +416,7 @@ fn write_variable(
     }
 }
 
-fn is_byte_array(field_type: &FieldType) -> bool {
+pub(crate) fn is_byte_array(field_type: &FieldType) -> bool {
     matches!(field_type, FieldType::Bytes)
         || matches!(
             field_type,

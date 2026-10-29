@@ -17,6 +17,8 @@ public final class CerulionRuntime {
     public static final int BUSY = 11;
     public static final int PANIC = 12;
     public static final int SPAWN = 13;
+    public static final int DECODE = 14;
+    public static final int EMPTY = 15;
 
     private static String loadedLibrary;
 
