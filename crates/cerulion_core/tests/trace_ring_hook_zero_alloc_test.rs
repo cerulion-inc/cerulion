@@ -316,15 +316,17 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
     // (contract addendum) + 1 kind-6 READ-OUTCOME record (zsink's
     // unified trigger drain pops za0's one frame per step; the burst's refill
     // after the fire finds the queue empty and stages nothing, because a
-    // plan-driven replay makes no consult for that probe) = 6 records.
+    // plan-driven replay makes no consult for that probe) = 6 records, plus ONE
+    // PRODUCER annotation over the whole run: za0 is the edge's one writer, so
+    // its first read opens the run and every later read continues it bare.
     let mut consumer = TraceRingConsumer::open(&ring_name).expect("open parallel consumer");
     let mut records = Vec::new();
     consumer.drain(&mut records).expect("drain (no overrun)");
     assert_eq!(
         records.len(),
-        (WARM_STEPS + MEASURE_STEPS) * 6,
+        (WARM_STEPS + MEASURE_STEPS) * 6 + 1,
         "every fire (4/step) + the step boundary (1/step) + zsink's read-outcome \
-         record (1/step) must reach the ring"
+         record (1/step) + the run's one producer annotation must reach the ring"
     );
     let kind6 = records
         .iter()
@@ -332,8 +334,9 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         .count();
     assert_eq!(
         kind6,
-        WARM_STEPS + MEASURE_STEPS,
-        "the armed capture really recorded inside the measured window \
+        WARM_STEPS + MEASURE_STEPS + 1,
+        "the armed capture really recorded inside the measured window, one read \
+         per step and the run's one producer annotation \
          (anti-vacuity for the zero-alloc claim above)"
     );
     drop(consumer);

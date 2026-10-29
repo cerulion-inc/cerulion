@@ -119,10 +119,24 @@ than taking new record kinds, which is what kept them from moving the format at
 all; a reader that predates them decodes every field to the value the writer
 meant and renders the kind as `unknown(6)` / `unknown(7)`. (They are defined
 from format 3 on. A bag stamps 5 for the read-site role, 6 for folded runs and 7
-for the every-consult record, each a WIRE change rather than a diagnostic, so a
-bag recorded with the defaults carries these annotations under a 7, folding on or
-off: `CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult
-record is written either way.)
+for the every-consult record, each a WIRE change rather than a diagnostic, and
+8 for read identity, so a bag recorded with the defaults carries these
+annotations under an 8, folding on or off: `CERULION_READ_LOG_FOLD=off` moves no
+stamp, because the every-consult record and the annotations are written either
+way.)
+
+From `trace_format` 8 on, every edge carries `producer` annotations, not only
+a `multi_publisher_topics` or producer-less external topic. A multi-writer edge
+still carries one before every read. On every other edge each annotation opens
+a WRITER RUN: it names the writer (the token) of the read right after it and of
+every later read of the same read stage and read site up to the next
+annotation. A read site is the node body (`body`), or the scheduler (`drain`
+and `peek` together). A single-writer edge therefore shows one annotation per
+read site in the whole log. With the wire sequence
+on every read record, the log names the writer and the sequence of every frame
+a read served. That is what lets `bag play --resim all --verify` feed each read
+its recorded frames (see "Read identity" in [`docs/bag.md`](bag.md)). Below
+format 8 only multi-writer edges carry annotations, one before every read.
 
 ### The read-site role (`trace_format` 5)
 

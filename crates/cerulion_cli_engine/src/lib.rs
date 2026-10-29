@@ -168,6 +168,11 @@ pub mod replay_rank;
 // sequences and returns a schedule, touching neither `cerulion_bag` nor the
 // transport, so it builds and tests on every platform the crate does.
 pub mod replay_inject;
+// The identity-keyed PRIVATE REPLAY FEEDS: which recorded frames each read
+// consumed, by writer and sequence, and the feed that publishes them onto a
+// read stage's private service at the gate's admission.
+#[cfg(unix)]
+pub mod replay_feed;
 // The PURE rank-local re-derivation VERIFIER. Replay fires
 // are trace-driven, so the structural "would this schedule have
 // happened?" verdict is produced here — Period / `throttle_ms` / Sync / FIFO

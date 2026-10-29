@@ -224,9 +224,23 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
     runtime.shutdown();
     drop(owner);
 
+    // The cdylib's own copy of the capture code carries its reads' writer
+    // (trace format 8), one annotation per writer run: the annotations are
+    // counted here and the READ records are compared below.
+    let is_annotation = |r: &&cerulion_core::trace_ring::TraceRingRecord| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1
+                == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    };
+    let annotations = records.iter().filter(is_annotation).count();
+    assert_eq!(
+        annotations, 1,
+        "the cdylib's capture code opens the input's one writer run across the FFI, \
+         and the later reads of that writer are bare"
+    );
     let kind6: Vec<ReadRec> = records
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && !is_annotation(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             ReadRec {

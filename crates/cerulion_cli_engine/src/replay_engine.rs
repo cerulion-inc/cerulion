@@ -505,6 +505,10 @@ pub struct ReplayOutcome {
     /// schema-compat sense (old readers ignore the unknown key);
     /// `report_version` is unchanged.
     pub coordination: CoordinationReport,
+    /// How this replay's reads were fed: by recorded identity through private
+    /// per-input feeds, or best effort by queue re-creation, with the reason.
+    /// Additive; old readers ignore the key.
+    pub read_identity: ReadIdentityReport,
     /// Which DIVERGENCE CLASSES
     /// this replay found, as the same descriptive phrases the verdict header
     /// prints ([`DivergenceClass`]).
@@ -569,6 +573,42 @@ pub fn render_coordination_line(report: &CoordinationReport) -> String {
         (CoordinationMode::Lockstep, false) => "coordination: lockstep".to_string(),
         (CoordinationMode::Lockstep, true) => {
             "coordination: lockstep (inferred: no coordination stamp)".to_string()
+        }
+    }
+}
+
+/// How a replay fed its reads, the second provenance line of the verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ReadIdentityReport {
+    /// Every gated read was fed exactly the frames its recorded read named,
+    /// through the stage's private feed.
+    Fed {
+        /// Reads fed.
+        reads: usize,
+        /// Frames fed.
+        frames: usize,
+    },
+    /// The reads were replayed by re-creating each consumer's queue, which
+    /// reproduces a read only when the queue behaves as it did live.
+    BestEffort {
+        /// Why the reads were not fed by identity.
+        reason: String,
+    },
+}
+
+/// The verdict line [`ReadIdentityReport`] renders as.
+pub fn render_read_identity_line(report: &ReadIdentityReport) -> String {
+    match report {
+        ReadIdentityReport::Fed { reads, frames } => format!(
+            "reads: fed by recorded identity ({reads} reads, {frames} frames, each read through \
+             its own private feed)"
+        ),
+        ReadIdentityReport::BestEffort { reason } if reason.is_empty() => {
+            "reads: best effort, no read identity".to_string()
+        }
+        ReadIdentityReport::BestEffort { reason } => {
+            format!("reads: best effort, no read identity ({reason})")
         }
     }
 }
@@ -1501,7 +1541,17 @@ pub fn stamp_trace_format(
     stamps_roles: bool,
     folds_runs: bool,
     records_consults: bool,
+    records_identity: bool,
 ) -> u32 {
+    if records_consults && records_identity {
+        // Every edge carries producer annotations, one per writer run, so
+        // the read log names the writer and the sequence of every frame a read
+        // served, and a replay can feed each read exactly its frames. A format
+        // 7 reader reads such a stream correctly (it strips annotations before
+        // its compare) but would replay it by queue re-creation and call the
+        // result clean, so the stamp moves and that reader refuses instead.
+        return 8;
+    }
     if records_consults {
         // A stream in which EVERY gated consult wrote a record holds a
         // `NoFrame` record under the `Drain` role at each empty drain. A
@@ -1591,6 +1641,31 @@ pub fn recorder_stamps_read_site_roles() -> bool {
 /// stamping site reads the answer through this one call.
 pub fn recorder_stamps_consult_records() -> bool {
     true
+}
+
+/// Does THIS binary's recorder carry producer annotations on every edge, one
+/// per writer run, so the read log names the identity (writer and wire
+/// sequence) of every frame a read served?
+///
+/// `true`, unconditionally: every runtime this binary builds for a recording
+/// annotates every edge (`cerulion_core::replay_feed::EdgeIdentity::EveryEdge`).
+pub fn recorder_records_read_identity() -> bool {
+    true
+}
+
+/// The lowest `trace_format` whose read log names the identity of every read:
+/// the bags a `--verify` replay feeds read by read through private per-input
+/// feeds, refusing by name what it cannot feed, instead of re-creating each
+/// consumer queue. Below it a replay takes the queue re-creation path and its
+/// verdict says the reads were replayed best effort.
+pub const READ_IDENTITY_MIN_TRACE_FORMAT: u32 = 8;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(READ_IDENTITY_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's read log name the identity of every read?
+pub fn recorder_records_read_identity_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= READ_IDENTITY_MIN_TRACE_FORMAT)
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -1713,6 +1788,12 @@ pub fn replay_stages_every_consult(
 /// readable: their empty drains wrote nothing, and the reader takes the counted
 /// arm by the format ([`EVERY_CONSULT_MIN_TRACE_FORMAT`]).
 ///
+/// Bumped to 8 by read identity: every edge carries producer annotations, one
+/// per writer run, so the read log names the writer and the sequence of
+/// every served frame and a `--verify` replay feeds each read its own frames
+/// ([`READ_IDENTITY_MIN_TRACE_FORMAT`]). Formats 1 to 7 stay fully readable and
+/// replay on the queue re-creation path, best effort.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
@@ -1721,7 +1802,7 @@ pub fn replay_stages_every_consult(
 /// because every one records every consult), but the two remain separate
 /// functions serving separate questions, and the READ gate still admits 1 to 6
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 7;
+pub const SUPPORTED_TRACE_FORMAT: u32 = 8;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -2957,11 +3038,21 @@ impl RecordedMessages {
     /// is the only thing the recorded frame stream means (a bag interleaves
     /// topics arbitrarily), so no caller may depend on the cross-topic order.
     fn for_each_frame(&self, f: &mut dyn FnMut(&str, &[u8])) -> Result<(), ReplayError> {
+        self.for_each_frame_span(&mut |topic, _span, frame| f(topic, frame))
+    }
+
+    /// [`Self::for_each_frame`] with each frame's [`FrameSpan`] beside its
+    /// bytes, so a caller can keep the 16-byte span and read the frame back from
+    /// the mapped bag later ([`Self::reader`]).
+    fn for_each_frame_span(
+        &self,
+        f: &mut dyn FnMut(&str, FrameSpan, &[u8]),
+    ) -> Result<(), ReplayError> {
         match &self.packed {
             Some(by_topic) => {
                 for (topic, spans) in by_topic {
                     for span in spans {
-                        f(topic, self.reader.frame(span));
+                        f(topic, *span, self.reader.frame(span));
                     }
                 }
             }
@@ -2973,7 +3064,7 @@ impl RecordedMessages {
                 {
                     let frame = self.reader.frame(&span);
                     let topic = walk.topic(channel_id);
-                    f(topic, frame);
+                    f(topic, span, frame);
                     // The same per-pass advise cursor `from_reader`'s aggregate
                     // fold uses — a cursor of THIS walk, never the replay
                     // loop's shared state).
@@ -3605,6 +3696,27 @@ pub struct ReplayInputs {
     /// `--record-out`: write every captured graph-produced frame to this bag.
     /// `None` writes nothing and leaves the run byte-identical.
     pub record_out: Option<crate::resim_record_out::RecordOutPlan>,
+    /// What the re-execution is for, see [`ReplayPurpose`].
+    pub purpose: ReplayPurpose,
+}
+
+/// What a re-execution is FOR, which decides how its reads are fed.
+///
+/// Under [`Self::Verify`] a free-run bag that records read identity
+/// ([`READ_IDENTITY_MIN_TRACE_FORMAT`]) feeds every read stage its recorded
+/// frames through a private per-input feed (`crate::replay_feed`) and refuses
+/// by name what it cannot feed. Under [`Self::Resim`] the candidate's own
+/// frames must reach its in-rank consumers, so every edge keeps the recorded
+/// queue re-creation (injection plus the read gate) and the verdict says the
+/// reads were replayed best effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayPurpose {
+    /// `--verify`: does the re-execution reproduce the recording.
+    #[default]
+    Verify,
+    /// A neutral `--resim`: re-execute the current build and report.
+    Resim,
 }
 
 /// Which side of the trace-divergence compare a [`FireTap`] observation is on.
@@ -3677,6 +3789,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         allow_param_change,
         ros2_entries_skipped,
         record_out,
+        purpose,
     } = inputs;
 
     // 0-pre. WHICH coordination contract this bag was recorded
@@ -3692,6 +3805,50 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     //    byte-unchanged on the whole existing corpus.
     let coordination_report = CoordinationReport::from_recorder(recorder.as_ref());
     let coordination = coordination_report.mode;
+    // READ IDENTITY: does this bag's read log name the writer and sequence of
+    // every read, and is this re-execution one that feeds reads by it? A
+    // `--verify` replay of a free-run bag recorded at format 8 or later is
+    // FED: every read stage subscribes to a private feed holding exactly the
+    // frames its recorded read consumed. Everything else keeps the queue
+    // re-creation path, and the verdict says so.
+    let identity_recorded = recorder_records_read_identity_at(recorder.as_ref());
+    let fed = purpose == ReplayPurpose::Verify
+        && coordination == CoordinationMode::FreeRun
+        && identity_recorded;
+    // The annotation rule the RECORDING staged under, so this replay's read
+    // stages stage the same records and truncate at the same rim.
+    let edge_identity = if identity_recorded {
+        cerulion_core::replay_feed::EdgeIdentity::EveryEdge
+    } else {
+        cerulion_core::replay_feed::EdgeIdentity::MultiWriterEdges
+    };
+    let best_effort_reason = if fed {
+        String::new()
+    } else if !identity_recorded {
+        "recorded below trace format 8, before reads named their frames".to_string()
+    } else if coordination == CoordinationMode::Lockstep {
+        "a lockstep recording replays on its one gating clock".to_string()
+    } else {
+        "a resim without --verify keeps each consumer's queue, so the candidate's own frames \
+         reach its in-rank consumers"
+            .to_string()
+    };
+    // An rmw (`ros2:`) node is not re-executed and its takes are not in the
+    // read log, so a fed replay cannot claim its reads: refused by name.
+    if fed {
+        if let Some(first) = ros2_entries_skipped.first() {
+            return Err(read_identity_refusal(
+                Some(first.clone()),
+                "read_identity_rmw_node",
+                format!(
+                    "the recorded graph carries ros2 node(s) {} whose takes the read log does \
+                     not record, so a replay fed by read identity cannot reproduce their reads. \
+                     Replay this bag without --verify",
+                    ros2_entries_skipped.join(", ")
+                ),
+            ));
+        }
+    }
     // And WHETHER this bag's kind-6 role bits may be read as
     // roles. Resolved here, once, for the same reason `coordination` is —
     // `false` on every archived bag, which is what keeps the pre-roles arm
@@ -4091,7 +4248,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         coordination == CoordinationMode::Lockstep,
         roles_stamped,
         kind_width,
+        fed.then_some(&recorded_messages),
     )?;
+    let mut fed_totals = (0usize, 0usize);
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
@@ -4103,6 +4262,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             let (node_infos, node_info_notes) = collect_pass_node_infos(plan, &factories);
             let pass = PassInputs {
                 plan,
+                fed,
                 is_last_pass: pass_idx == last_pass,
                 coordination,
                 roles_stamped,
@@ -4142,10 +4302,24 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             // schedule decides how deep a bag-fed input's subscriber is built
             // (`PassVerification::depth_floors`). The admission half, which
             // needs the built runtime's stage census, runs inside the pass.
-            let topics = pass_topics(plan, &classes, pass.is_lockstep());
+            let topics = pass_topics(plan, &classes, pass.is_lockstep(), pass.fed);
             let verification = match plan_pass_verification(&pass, &topics) {
                 Ok(verification) => verification,
                 Err(e) => break 'passes Some((rank, e)),
+            };
+            let wiring = cerulion_core::replay_feed::ReplayWiring {
+                identity: edge_identity,
+                feeds: if fed {
+                    Some(
+                        bag_side
+                            .get(&rank)
+                            .and_then(|b| b.feed.as_ref())
+                            .map(|f| f.buffers().clone())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                },
             };
             let mut runtime = match build_pass_runtime(
                 plan,
@@ -4155,6 +4329,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 &clock,
                 schema_hashes.as_ref(),
                 pass_wiring(&burst_floors, &verification.depth_floors),
+                &wiring,
             ) {
                 Ok(runtime) => runtime,
                 Err(e) => break 'passes Some((rank, e)),
@@ -4227,6 +4402,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 Ok(outcome) => outcome,
                 Err(e) => break 'passes Some((rank, e)),
             };
+            fed_totals.0 += outcome.fed.0;
+            fed_totals.1 += outcome.fed.1;
             // Harvest everything the epilogue needs BEFORE the runtime is dropped.
             acc.node_failures.extend(
                 runtime
@@ -4274,6 +4451,16 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         },
         abort_marker,
     );
+    outcome.read_identity = if fed {
+        ReadIdentityReport::Fed {
+            reads: fed_totals.0,
+            frames: fed_totals.1,
+        }
+    } else {
+        ReadIdentityReport::BestEffort {
+            reason: best_effort_reason,
+        }
+    };
     match &record_out_result {
         Some(Ok(path)) => outcome.record_out = Some(path.clone()),
         Some(Err(e)) => outcome.record_out_error = Some(e.to_string()),
@@ -4356,6 +4543,7 @@ impl PassAccumulators {
     /// Fold one COMPLETED pass in.
     fn absorb(&mut self, outcome: PassOutcome) {
         let PassOutcome {
+            fed: _,
             captures,
             tail_notes,
             divergence,
@@ -5029,6 +5217,11 @@ fn assemble_outcome(
         rank_execution,
         aborted,
         coordination: coordination_report,
+        // Decided by `run_engine`, which knows the purpose and the bag's
+        // format, and written over this placeholder there.
+        read_identity: ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         divergence_classes,
         report_version: REPORT_VERSION,
         record_out: None,
@@ -6297,6 +6490,23 @@ fn scan_frames_around_anchor(
         }
     }
     Ok(out)
+}
+
+/// Every `(node, input)` whose topic can carry more than one writer: a
+/// `multi_publisher_topics` topic, or one no graph node produces (an external
+/// topic, which any number of foreign writers may attach to).
+fn multi_writer_edges(config: &GraphConfig) -> BTreeSet<(String, String)> {
+    let produced = topic_producers(config);
+    let mut out = BTreeSet::new();
+    for node in &config.nodes {
+        for input in &node.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if config.is_multi_publisher(&topic) || !produced.contains_key(&topic) {
+                out.insert((node.id.clone(), input.name.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Per node id, the topic each of its outputs resolves to — the producer side
@@ -7761,6 +7971,8 @@ fn pass_wiring<'a>(
 /// `plan_ranks` already cross-checked every manifest node against the embedded
 /// graph, and the factories were built from that same graph — so it reports as
 /// [`ReplayError::Internal`] (exit 5), never as a divergence.
+// Eight parameters, each a distinct type.
+#[allow(clippy::too_many_arguments)]
 fn build_pass_runtime(
     plan: &RankPlan,
     subgraph: GraphConfig,
@@ -7770,6 +7982,8 @@ fn build_pass_runtime(
     schema_hashes: Option<&std::collections::HashMap<String, u64>>,
     // The pass's provisioning, from `pass_wiring`.
     wiring: cerulion_core::graph::CrossProcessWiring<'_>,
+    // The annotation rule and, on a fed replay, the private feed per stage.
+    replay_wiring: &cerulion_core::replay_feed::ReplayWiring,
 ) -> Result<GraphRuntime, ReplayError> {
     // GRAPH order, so the runtime's node insertion order (which decides
     // within-level fire order) is the graph's — Principle #5.
@@ -7786,13 +8000,14 @@ fn build_pass_runtime(
             })?;
         pass_factories.insert(member.clone(), entry);
     }
-    GraphRuntime::build_with_schema_hashes_and_wiring(
+    GraphRuntime::build_for_replay(
         subgraph,
         pass_factories,
         transport,
         clock.clone(),
         schema_hashes,
         wiring,
+        replay_wiring,
     )
     .map_err(|e| ReplayError::Internal {
         reason: format!(
@@ -7870,6 +8085,10 @@ fn build_rank_plans(
 
 /// Everything one pass needs that it does not own.
 struct PassInputs<'a> {
+    /// FED: every read stage of this pass subscribes to its private feed and
+    /// is fed by recorded identity (see `crate::replay_feed`); nothing is
+    /// injected and every consumed topic is gated.
+    fed: bool,
     plan: &'a RankPlan,
     /// The LAST pass may evict bag pages behind its cursors; an
     /// earlier one must not, because the next pass re-walks the same map from
@@ -8028,6 +8247,9 @@ impl CaptureSummary {
 
 /// What one pass hands back to the epilogue.
 struct PassOutcome {
+    /// `(reads, frames)` this pass's private feeds published; zero on a pass
+    /// that is not fed.
+    fed: (usize, usize),
     /// The SUMMARY of each topic's capture, not the capture.
     /// See [`CaptureSummary`] — the ports die with the pass that opened them.
     captures: IndexMap<String, CaptureSummary>,
@@ -8600,6 +8822,147 @@ fn fold_step_fire_plan(
 // ===========================================================================
 // Feeding the two PURE halves (the injection planner + the re-derivation judge)
 // ===========================================================================
+
+/// Every step of this rank's recording at which a FIFO `Data` node's burst
+/// ended on a trailing refill ([`fifo_trailing_refills`]), from one walk of the
+/// rank's recorded boundaries and fires up to the `--duration` bound. Run
+/// before step 0. Empty, with no walk, when the rank declares no FIFO `Data`
+/// node with a refill hook or its verification declined.
+///
+/// # Errors
+///
+/// A trace the walk cannot read.
+fn derive_trailing_refills(
+    pass: &PassInputs<'_>,
+    rank: u32,
+    verification: &PassVerification,
+    runtime: &GraphRuntime,
+    resumed: bool,
+) -> Result<BTreeMap<u64, Vec<String>>, ReplayError> {
+    let mut out = BTreeMap::new();
+    let any_fifo = verification.decls.iter().any(|d| {
+        matches!(d.trigger, replay_rederive::TriggerDecl::Data { .. })
+            && runtime.has_trigger_refill(&d.node_id)
+    });
+    if !any_fifo || verification.declined.is_some() {
+        return Ok(out);
+    }
+    let trust =
+        replay_rederive::RoleTrust::from_stamped(pass.roles_stamped, pass.consults_recorded);
+    let mut boundaries = BoundaryCursor::for_rank(pass.trace, rank)?;
+    let mut fire_cursors = RankedFireCursors::single_rank(pass.trace, rank)?;
+    let mut fires: Vec<RecordedFire> = Vec::new();
+    let mut carried: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(boundary) = boundaries.next()? {
+        // The main loop's `--duration` bound: a step it never executes plans
+        // nothing.
+        if let Some(d) = pass.duration_bound_ns {
+            if crate::replay_rank::beyond_duration_bound(
+                boundary.target_ns.saturating_sub(pass.run_epoch_ns),
+                d,
+            ) {
+                break;
+            }
+        }
+        fires.clear();
+        fire_cursors.pull_merged_step_fires(boundary.step, pass.rank_tables, &mut fires)?;
+        let trailing = fifo_trailing_refills(
+            verification,
+            &fires,
+            boundary.step,
+            trust,
+            resumed,
+            &|node: &str| runtime.has_trigger_refill(node),
+            &mut carried,
+            &mut seen,
+        );
+        if !trailing.is_empty() {
+            out.insert(boundary.step, trailing);
+        }
+    }
+    Ok(out)
+}
+
+/// The FIFO `Data` nodes whose recorded burst at `step` ended on a TRAILING
+/// REFILL (`replay_rederive::fifo_step_carry`): the read log holds one pop more
+/// than fires, the burst fired at least once, and the cap or the node's
+/// throttle left the last popped frame unfired for the next step's first
+/// fire. Derived only from the recording: each node's drain-site pops on its
+/// trigger inputs this step, its recorded fires, and the carry the previous
+/// step left, which `carried` threads across steps (and `seen`, so a resumed
+/// pass's first step can take a carry its recording does not show).
+///
+/// Only a node with a refill hook (`has_refill`, a unified `Data` binding)
+/// can carry: its burst is the one that refills before the cap and throttle
+/// checks. A node whose reads a pop count cannot be taken over (a
+/// `block`-gated node, a truncated or decimated stream, a declined
+/// verification) is skipped and carries nothing. A step no carry explains (a
+/// stopped node, a fire on a re-offered head that no pop recorded, a signal
+/// clamp) carries nothing and is left to the re-derivation verdict.
+// Eight parameters, each a distinct role: the step's evidence, the rules'
+// inputs and the two threads of per-node state.
+#[allow(clippy::too_many_arguments)]
+fn fifo_trailing_refills(
+    verification: &PassVerification,
+    fires: &[RecordedFire],
+    step: u64,
+    trust: replay_rederive::RoleTrust,
+    resumed: bool,
+    has_refill: &dyn Fn(&str) -> bool,
+    carried: &mut std::collections::HashMap<String, bool>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if verification.declined.is_some() {
+        return out;
+    }
+    let no_reads = Vec::new();
+    let reads = verification.reads_by_step.get(&step).unwrap_or(&no_reads);
+    for decl in &verification.decls {
+        let replay_rederive::TriggerDecl::Data { trigger_inputs } = &decl.trigger else {
+            continue;
+        };
+        if !has_refill(&decl.node_id) {
+            continue;
+        }
+        if verification
+            .block_edges
+            .iter()
+            .any(|e| e.producer_node == decl.node_id)
+        {
+            continue;
+        }
+        let Ok(popped) =
+            replay_rederive::fifo_step_pops(&decl.node_id, trigger_inputs, reads, trust)
+        else {
+            carried.remove(&decl.node_id);
+            continue;
+        };
+        let fired = u32::try_from(fires.iter().filter(|f| *f.node_id == *decl.node_id).count())
+            .unwrap_or(u32::MAX);
+        let first = seen.insert(decl.node_id.clone());
+        let carried_in = carried.get(&decl.node_id).copied().unwrap_or(false)
+            || replay_rederive::fifo_resume_seed(resumed && first, popped, fired);
+        match replay_rederive::fifo_step_carry(
+            carried_in,
+            popped,
+            fired,
+            decl.throttle_ns.is_some(),
+        ) {
+            Ok(true) => {
+                carried.insert(decl.node_id.clone(), true);
+                if fired > 0 {
+                    out.push(decl.node_id.clone());
+                }
+            }
+            Ok(false) | Err(_) => {
+                carried.remove(&decl.node_id);
+            }
+        }
+    }
+    out
+}
 
 /// How many kind-6 records ONE free-run pass will materialise before it
 /// DECLINES both the steered injection and the re-derivation verdict.
@@ -10735,8 +11098,11 @@ fn wiring_may_block_the_gate(
     // (`cerulion_core::graph::runtime::node_per_set_capable` over the node's entry
     // and the drain-discipline knob), never a restatement of its three terms here.
     per_set_capable: bool,
+    // A FED stage is fed by (writer, sequence), so a per-publisher sequence
+    // blocks nothing there (the core drops the blocker on a fed stage too).
+    fed: bool,
 ) -> bool {
-    if config.is_multi_publisher(topic) {
+    if config.is_multi_publisher(topic) && !fed {
         return true;
     }
     let Some(info) = node_infos.get(node) else {
@@ -10765,6 +11131,79 @@ struct RankBagSide {
     /// lacks: a stage its own census gates and this plan does not carry, because
     /// the wiring answer here is conservative and may exclude one.
     admission: BTreeMap<String, Vec<replay_inject::StageAdmission>>,
+    /// On a FED replay, the frames every admission that pops consumed, by
+    /// recorded identity: what the rank's private feeds publish.
+    feed: Option<Arc<crate::replay_feed::FeedPlan>>,
+}
+
+/// The exit-2 refusal a FED replay answers for a read it cannot feed.
+fn read_identity_refusal(edge: Option<String>, cause: &str, detail: String) -> ReplayError {
+    tracing::warn!(
+        edge = ?edge,
+        cause,
+        detail = %detail,
+        "replay: a recorded read cannot be fed by its recorded identity, so the replay is \
+         REFUSED before its first step rather than fed some other frame"
+    );
+    ReplayError::ReadLogNotEnforceable {
+        edge,
+        cause: cause.to_string(),
+        detail,
+    }
+}
+
+/// Index the recorded frames of `topics` by identity, for the private feeds.
+fn build_feed_frame_index(
+    rm: &RecordedMessages,
+    topics: &BTreeSet<String>,
+) -> Result<crate::replay_feed::FrameIndex, ReplayError> {
+    let mut frames: BTreeMap<String, Vec<crate::replay_feed::RecordedFrame>> =
+        topics.iter().map(|t| (t.clone(), Vec::new())).collect();
+    rm.for_each_frame_span(&mut |topic, span, bytes| {
+        if let Some(list) = frames.get_mut(topic) {
+            let header = WireHeader::read_from_buf(bytes);
+            list.push(crate::replay_feed::RecordedFrame {
+                span,
+                sequence: header.as_ref().map(|h| h.sequence),
+                timestamp_ns: header.as_ref().map(|h| h.timestamp_ns),
+            });
+        }
+    })?;
+    let sidecar = read_producer_sidecar(&rm.reader, topics);
+    let labels: BTreeMap<String, crate::replay_feed::TopicLabels> = sidecar
+        .by_topic
+        .into_iter()
+        .map(|(topic, labels)| {
+            (
+                topic,
+                labels
+                    .into_iter()
+                    .map(|l| (l.attribution, l.publisher_id))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(crate::replay_feed::FrameIndex::build(&frames, &labels))
+}
+
+/// Each step's recorded boundary target on `rank`, for the feed mutant that
+/// feeds by timestamp.
+#[cfg(feature = "oracle-mutants")]
+fn rank_step_targets(trace: &RecordedTrace, rank: u32) -> Result<BTreeMap<u64, u64>, ReplayError> {
+    let mut out = BTreeMap::new();
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    while let Some(b) = cursor.next()? {
+        out.insert(b.step, b.target_ns);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "oracle-mutants"))]
+fn rank_step_targets(
+    _trace: &RecordedTrace,
+    _rank: u32,
+) -> Result<BTreeMap<u64, u64>, ReplayError> {
+    Ok(BTreeMap::new())
 }
 
 /// Plan the BAG SIDE of every rank's read-log enforcement BEFORE pass 0, and
@@ -10807,17 +11246,51 @@ fn plan_bag_side_admissions(
     lockstep: bool,
     roles_stamped: bool,
     kind_width: KindFieldWidth,
+    // FED: every consumed edge of every rank is planned and fed by recorded
+    // identity (see `crate::replay_feed`), and anything that cannot be is
+    // refused here by name. `false` keeps the queue re-creation path.
+    fed: Option<&RecordedMessages>,
 ) -> Result<BTreeMap<u32, RankBagSide>, ReplayError> {
     // A lockstep bag arms no gate at all: one gating clock already orders every
     // publish against every step.
     if lockstep {
         return Ok(BTreeMap::new());
     }
-    let Ok((recorded_inputs, producer_tokens, rims)) = load_recorded_input_tables(trace) else {
-        return Ok(BTreeMap::new());
+    let tables = load_recorded_input_tables(trace);
+    let (recorded_inputs, producer_tokens, rims) = match tables {
+        Ok(t) => t,
+        Err(refusal) if fed.is_some() => {
+            return Err(read_identity_refusal(
+                None,
+                "read_identity_unplanned",
+                format!(
+                    "the bag's rank manifests cannot address its read log ({}), so no read can \
+                     be fed its recorded frames",
+                    refusal.detail
+                ),
+            ))
+        }
+        Err(_) => return Ok(BTreeMap::new()),
     };
-    let Some(rows) = rims.per_edge else {
-        return Ok(BTreeMap::new());
+    let rows =
+        match (rims.per_edge, fed) {
+            (Some(rows), _) => rows,
+            (None, Some(_)) => return Err(read_identity_refusal(
+                None,
+                "read_identity_unplanned",
+                "the bag states no per-stage staging rows, so no read can be placed on the stage \
+                 that staged it"
+                    .to_string(),
+            )),
+            (None, None) => return Ok(BTreeMap::new()),
+        };
+    // The identity index of every topic a fed rank consumes, built once.
+    let frame_index = match fed {
+        Some(rm) => {
+            let topics: BTreeSet<String> = plans.iter().flat_map(rank_consumed_topics).collect();
+            Some(build_feed_frame_index(rm, &topics)?)
+        }
+        None => None,
     };
     // ONE read of the drain-discipline knob for the whole pre-pass, through the
     // core's own reader, as the graph build takes one per build.
@@ -10825,7 +11298,13 @@ fn plan_bag_side_admissions(
         cerulion_core::graph::runtime::drain_discipline_forces_separate();
     let mut out: BTreeMap<u32, RankBagSide> = BTreeMap::new();
     for plan in plans {
-        let enforce_topics = rank_enforce_topics(plan, classes);
+        // FED: every topic the rank consumes, external and cross-rank included,
+        // is read through private feeds and so gated.
+        let enforce_topics: Vec<String> = if fed.is_some() {
+            rank_consumed_topics(plan).into_iter().collect()
+        } else {
+            rank_enforce_topics(plan, classes)
+        };
         if enforce_topics.is_empty() {
             continue;
         }
@@ -10837,9 +11316,21 @@ fn plan_bag_side_admissions(
             kind_width,
         )? {
             ReadLogCensus::Collected(reads) => reads,
+            ReadLogCensus::Declined(cause) if fed.is_some() => {
+                return Err(read_identity_refusal(
+                    None,
+                    "read_identity_unplanned",
+                    format!(
+                        "rank {}'s read log was declined ({}): {}",
+                        plan.rank(),
+                        cause.code(),
+                        cause.reason()
+                    ),
+                ))
+            }
             ReadLogCensus::Declined(_) => continue,
         };
-        if reads.is_empty() {
+        if reads.is_empty() && fed.is_none() {
             continue;
         }
         let consumed = rank_consumed_edges(plan);
@@ -10898,6 +11389,7 @@ fn plan_bag_side_admissions(
                         node,
                         input,
                         per_set_capable,
+                        fed.is_some(),
                     )
                 })
         };
@@ -10910,6 +11402,37 @@ fn plan_bag_side_admissions(
         for topic in &enforce_topics {
             let planned = topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
             match replay_inject::plan_edge_admission(&planned, &stages) {
+                // A FED replay reads every stage through its private feed, so a
+                // stage the gate cannot drive is a read nothing can feed.
+                replay_inject::AdmissionPlan::Enforced { ungateable, .. }
+                    if fed.is_some() && !ungateable.is_empty() =>
+                {
+                    let (key, why) = &ungateable[0];
+                    return Err(read_identity_refusal(
+                        Some(key.label()),
+                        "read_identity_ungateable_stage",
+                        format!(
+                            "stage {} on '{topic}' cannot be fed by recorded identity: {why}",
+                            key.label()
+                        ),
+                    ));
+                }
+                replay_inject::AdmissionPlan::NotGateable(ungateable) if fed.is_some() => {
+                    let detail = ungateable.first().map_or_else(
+                        || format!("no stage consuming '{topic}' can be gated"),
+                        |(key, why)| {
+                            format!(
+                                "stage {} on '{topic}' cannot be fed by recorded identity: {why}",
+                                key.label()
+                            )
+                        },
+                    );
+                    return Err(read_identity_refusal(
+                        ungateable.first().map(|(k, _)| k.label()),
+                        "read_identity_ungateable_stage",
+                        detail,
+                    ));
+                }
                 replay_inject::AdmissionPlan::Enforced { stages, .. } => {
                     admission.insert(topic.clone(), stages);
                 }
@@ -10938,7 +11461,41 @@ fn plan_bag_side_admissions(
                 }
             }
         }
-        out.insert(plan.rank(), RankBagSide { admission });
+        let feed = match &frame_index {
+            Some(index) => {
+                let mut fed_stages: Vec<crate::replay_feed::FedStage<'_>> = Vec::new();
+                let every_read_edges = multi_writer_edges(config);
+                for (topic, stages) in &admission {
+                    for stage in stages {
+                        let input = recorded_inputs
+                            .get(&stage.key.node)
+                            .and_then(|names| names.get(usize::from(stage.key.input_idx)))
+                            .map_or("<unnamed input>", String::as_str);
+                        let every_read =
+                            every_read_edges.contains(&(stage.key.node.clone(), input.to_string()));
+                        fed_stages.push(crate::replay_feed::FedStage {
+                            admission: stage,
+                            input,
+                            topic,
+                            every_read,
+                        });
+                    }
+                }
+                let targets = rank_step_targets(trace, plan.rank())?;
+                match crate::replay_feed::plan_feeds(&fed_stages, index, &targets) {
+                    Ok(feed) => Some(Arc::new(feed)),
+                    Err(refusal) => {
+                        return Err(read_identity_refusal(
+                            Some(format!("{}.{}", refusal.node, refusal.input)),
+                            refusal.reason.code(),
+                            refusal.to_string(),
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+        out.insert(plan.rank(), RankBagSide { admission, feed });
     }
     Ok(out)
 }
@@ -11066,6 +11623,7 @@ fn decode_enforcement_read(
         None if kind == ReadOutcomeKind::Producer => replay_inject::RecordedRead::producer(
             r.step,
             resolve_producer_token(producer_tokens, r.aux),
+            r.aux,
         ),
         None => replay_inject::RecordedRead::truncated(r.step, r.popped),
     };
@@ -12490,21 +13048,27 @@ struct PassTopics {
 /// external sources. Both lists are filtered out of the GRAPH-ordered class
 /// lists rather than out of the plan's sorted sets, so a whole-graph (lockstep)
 /// plan keeps the graph's own order exactly.
-fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool) -> PassTopics {
+fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: bool) -> PassTopics {
     let produced: Vec<String> = classes
         .produced
         .iter()
         .filter(|t| plan.produced().contains(*t))
         .cloned()
         .collect();
-    let mut inject_topics: Vec<String> = classes
-        .external
-        .iter()
-        .filter(|t| plan.external_consumed().contains(*t))
-        .cloned()
-        .collect();
+    // A FED pass injects nothing: every consumed topic, external and
+    // cross-rank included, reaches its consumers through their private feeds.
+    let mut inject_topics: Vec<String> = if fed {
+        Vec::new()
+    } else {
+        classes
+            .external
+            .iter()
+            .filter(|t| plan.external_consumed().contains(*t))
+            .cloned()
+            .collect()
+    };
     let mut cross: BTreeSet<&str> = BTreeSet::new();
-    if !lockstep {
+    if !lockstep && !fed {
         // Cross-rank edges, in graph order, deduped (a topic can feed several
         // of this rank's inputs).
         cross = plan
@@ -12536,6 +13100,9 @@ fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool) -> PassT
     // consumers apart, which is every shipped split.
     let enforce_topics: Vec<String> = if lockstep {
         Vec::new()
+    } else if fed {
+        // Every consumed topic is gated and fed.
+        rank_consumed_topics(plan).into_iter().collect()
     } else {
         rank_enforce_topics(plan, classes)
     };
@@ -12730,6 +13297,86 @@ fn run_rank_pass(
         }
         read_gate = Some(gate);
     }
+    // FED: every wired read stage must be driven by the gate, or a read
+    // nothing feeds would pop an empty private queue for the whole pass.
+    let fed_stages = if pass.fed {
+        runtime.read_outcome_stage_keys()
+    } else {
+        Vec::new()
+    };
+    for key in &fed_stages {
+        if !read_gate.as_ref().is_some_and(|g| g.keys().contains(key)) {
+            return Err(read_identity_refusal(
+                Some(key.label()),
+                "read_identity_unplanned",
+                format!(
+                    "rank {}: stage {} is wired by this build and the recording plans no read \
+                     for it, so nothing could feed it",
+                    plan.rank(),
+                    key.label()
+                ),
+            ));
+        }
+    }
+    // FED: open one feed port per gated stage and install the feed on the
+    // gates, before step 0. A rank with no read stage (a pure source) has
+    // nothing to feed.
+    let read_feed: Option<Arc<crate::replay_feed::BagReadFeed>> = if !fed_stages.is_empty() {
+        let Some(feed_plan) = pass.bag_side.get(&plan.rank()).and_then(|b| b.feed.clone()) else {
+            return Err(read_identity_refusal(
+                None,
+                "read_identity_unplanned",
+                format!("rank {} holds no feed plan", plan.rank()),
+            ));
+        };
+        let mut ports = std::collections::HashMap::new();
+        for key in feed_plan.stages() {
+            let topic = cerulion_core::replay_feed::replay_feed_topic(key);
+            let max_frame = feed_plan
+                .topic(key)
+                .map_or(0, |t| pass.recorded_messages.max_frame_len(t));
+            let msl =
+                MaxSliceLen::try_new(max_frame.max(WireHeader::SIZE) as u32).ok_or_else(|| {
+                    ReplayError::Internal {
+                        reason: format!(
+                            "rank {}: a recorded frame feeding {} is larger than u32::MAX bytes",
+                            plan.rank(),
+                            key.label()
+                        ),
+                    }
+                })?;
+            let publisher =
+                transport
+                    .create_publisher(&topic, msl, 0)
+                    .map_err(|e| ReplayError::Internal {
+                        reason: format!(
+                            "rank {}: failed to open the private feed for {}: {e}",
+                            plan.rank(),
+                            key.label()
+                        ),
+                    })?;
+            ports.insert(key.clone(), publisher);
+        }
+        let feed = Arc::new(crate::replay_feed::BagReadFeed::new(
+            Arc::clone(&pass.recorded_messages.reader),
+            feed_plan,
+            ports,
+        ));
+        let as_dyn: Arc<dyn cerulion_core::replay_feed::ReadFeed> = feed.clone();
+        if let Err(key) = runtime.install_replay_read_feed(&as_dyn) {
+            return Err(ReplayError::Internal {
+                reason: format!(
+                    "rank {}: stage {} already carries a private feed. This is a bug in the \
+                     replay engine, please report",
+                    plan.rank(),
+                    key.label()
+                ),
+            });
+        }
+        Some(feed)
+    } else {
+        None
+    };
     // The injectors are opened BEFORE the capture partitionings,
     // because on a SPLIT `multi_publisher_topics` topic the injector is one of
     // the writers the capture has to tell apart — its publisher id stands in
@@ -12880,6 +13527,10 @@ fn run_rank_pass(
         pass.consults_recorded,
         pass.stages_every_consult,
     )?;
+    if pass.fed {
+        read_log.feed_by_identity();
+    }
+    read_log.scope_token_checks(multi_writer_edges(pass.config));
     // ONE streaming pass over the mapped trace PER RANK, held across the whole
     // loop (each per-step pull advances its rank's cursor monotonically —
     // never a per-step re-walk).
@@ -12910,6 +13561,15 @@ fn run_rank_pass(
     // fires of the node the stopping step performed, so a recording that
     // stopped at another fire of the same burst is still a finding.
     let mut rederive_stops = replay_rederive::PassStops::none();
+    // Per step, the FIFO `Data` nodes whose recorded burst ended on a trailing
+    // refill (`fifo_trailing_refills`), derived from the recording alone in a
+    // walk of this rank's boundaries and fires before step 0, so a fed pass
+    // refuses an inconsistent recording before it executes anything.
+    let trailing_refills = if lockstep {
+        BTreeMap::new()
+    } else {
+        derive_trailing_refills(&pass, plan.rank(), &verification, runtime, resume.is_some())?
+    };
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
     // The fires the recording holds that a trace-driven pass did NOT perform,
@@ -13130,6 +13790,19 @@ fn run_rank_pass(
                         boundary.step
                     ),
                 })?;
+            if let Some(trailing) = trailing_refills.get(&boundary.step) {
+                let ids: Vec<&str> = trailing.iter().map(String::as_str).collect();
+                runtime
+                    .set_replay_trailing_refills(boundary.step, &ids)
+                    .map_err(|e| ReplayError::Internal {
+                        reason: format!(
+                            "failed to install rank {}'s trailing refills for step {}: {e} — \
+                             this is a bug in the replay engine, please report",
+                            plan.rank(),
+                            boundary.step
+                        ),
+                    })?;
+            }
         }
         runtime.step(Duration::from_nanos(delta));
         if !lockstep {
@@ -13568,6 +14241,29 @@ fn run_rank_pass(
                             v.step
                         ),
                     ),
+                    cerulion_core::read_outcome::ReplayReadViolationKind::FeedFailed {
+                        ordinal,
+                    } => (
+                        v.kind.code(),
+                        None,
+                        None,
+                        format!(
+                            "at step {} the private replay feed could not publish the frames \
+                             of recorded read {ordinal} (the feed's report names the frames)",
+                            v.step
+                        ),
+                    ),
+                    cerulion_core::read_outcome::ReplayReadViolationKind::UnrecordedTake => (
+                        v.kind.code(),
+                        None,
+                        None,
+                        format!(
+                            "at step {} the node took a frame through a read path the read log \
+                             does not record (the rmw take path), so the replay holds no \
+                             identity for it and cannot reproduce that read",
+                            v.step
+                        ),
+                    ),
                 };
                 UnmetReadReport {
                     node_id: v.key.node.clone(),
@@ -13742,7 +14438,8 @@ fn run_rank_pass(
                 &verification.decls,
                 &rederive_steps,
                 &verification.block_edges,
-                // The ONE conversion of the two bag terms to `RoleTrust`. They
+                // The conversion of the two bag terms to `RoleTrust` the verdict
+                // uses (the trailing-refill pre-pass makes the same one). They
                 // stay bools at the pass boundary because the injection
                 // steering reads the role term too; below this line the trust
                 // is a named type.
@@ -14108,7 +14805,25 @@ fn run_rank_pass(
     drop(dispatch);
     drop(feed);
     drop(captures_owned);
+    let fed = match &read_feed {
+        Some(f) => {
+            let (faults, dropped) = f.faults();
+            for fault in &faults {
+                tracing::warn!(rank = plan.rank(), fault = %fault, "replay: private feed fault");
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    rank = plan.rank(),
+                    dropped,
+                    "replay: more private feed faults than the report keeps"
+                );
+            }
+            f.published()
+        }
+        None => (0, 0),
+    };
     Ok(PassOutcome {
+        fed,
         captures,
         tail_notes,
         // ROOT CAUSE first (the exit-precedence rule this repo already applies
@@ -18439,7 +19154,21 @@ mod admission_cursor_tests {
     use cerulion_core::read_outcome::DueRead;
 
     fn at(step: u64, due: Vec<DueRead>) -> replay_inject::StepAdmission {
-        replay_inject::StepAdmission { step, due }
+        let identity = due
+            .iter()
+            .map(|_| replay_inject::ReadIdentity {
+                writer: None,
+                annotated: false,
+                served_seq: None,
+                popped: 0,
+                kind: None,
+            })
+            .collect();
+        replay_inject::StepAdmission {
+            step,
+            due,
+            identity,
+        }
     }
 
     fn served(seq: u32) -> DueRead {
@@ -21367,6 +22096,18 @@ struct ActiveReadLog<'a> {
     /// table-less / degraded / unparsable-section bag, in which case every
     /// producer annotation resolves to `foreign` and stands its edge down.
     producer_tokens: BTreeMap<u64, ProducerResolution>,
+    /// The pass is FED by recorded identity: every read's writer was matched
+    /// to recorded frames by its raw token before the first step, so an edge is
+    /// not stood down for a token the manifests do not resolve to a name (an
+    /// external writer, two names hashing alike).
+    identity_fed: bool,
+    /// The `(node, input)` edges whose wire sequence names no writer on its
+    /// own (a `multi_publisher_topics` topic, or one no graph node produces).
+    /// An annotation whose token the manifests cannot resolve stands its edge
+    /// down only there: on a one-writer edge the sequence alone names the
+    /// frame, and every edge carries annotations from `trace_format` 8 on.
+    /// `None` stands every such edge down.
+    multi_writer_edges: Option<BTreeSet<(String, String)>>,
     /// The nodes whose RECORDED input list names one
     /// input more than once, each mapped to the first name it repeats.
     ///
@@ -22359,6 +23100,23 @@ fn load_recorded_input_tables(
 }
 
 impl<'a> ReadLogVerifier<'a> {
+    /// Mark the pass FED by recorded identity (see [`ActiveReadLog`]'s
+    /// `identity_fed`).
+    fn feed_by_identity(&mut self) {
+        if let ReadLogState::Active(active) = &mut self.state {
+            active.identity_fed = true;
+        }
+    }
+
+    /// Scope the unresolvable-token stand-down to the edges whose wire
+    /// sequence names no writer on its own (see [`ActiveReadLog`]'s
+    /// `multi_writer_edges`).
+    fn scope_token_checks(&mut self, edges: BTreeSet<(String, String)>) {
+        if let ReadLogState::Active(active) = &mut self.state {
+            active.multi_writer_edges = Some(edges);
+        }
+    }
+
     /// Build the verifier for this bag — see the type doc for the three
     /// states (active / inert-on-a-kind-6-less-bag / loud-disabled). Arming
     /// the runtime's in-memory sink happens HERE (active only), so an inert
@@ -22736,6 +23494,8 @@ impl<'a> ReadLogVerifier<'a> {
                 recorded_inputs,
                 ambiguous_recorded_inputs,
                 producer_tokens,
+                identity_fed: false,
+                multi_writer_edges: None,
                 replayed_inputs,
                 diverged: BTreeSet::new(),
                 stood_down: BTreeSet::new(),
@@ -23141,7 +23901,12 @@ impl ActiveReadLog<'_> {
                 // The token names the producer of the NEXT read on this edge.
                 // Resolve it through the bag's OWN manifest table; anything
                 // other than exactly one answer stands the edge down.
+                let single_writer_edge = self
+                    .multi_writer_edges
+                    .as_ref()
+                    .is_some_and(|edges| !edges.contains(&key));
                 let reason = match self.producer_tokens.get(&r.aux) {
+                    _ if self.identity_fed || single_writer_edge => None,
                     Some(ProducerResolution::Named { .. }) => None,
                     Some(ProducerResolution::Collision { labels }) => Some(format!(
                         "its recorded producer token {:016x} is AMBIGUOUS — this bag's \
@@ -24265,6 +25030,7 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     // free-run bag skips the cross-rank lockstep equality check, this line is
     // the statement that it was skipped, never a silent difference.
     let _ = writeln!(s, "{}", render_coordination_line(&outcome.coordination));
+    let _ = writeln!(s, "{}", render_read_identity_line(&outcome.read_identity));
 
     for d in &outcome.env_divergence {
         let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
@@ -25753,10 +26519,12 @@ mod recorder_info_version_tests {
         // would silently under-count reads), and v7 marks a stream in which
         // EVERY gated consult wrote a record (an empty drain's `NoFrame`
         // included, which a v6 reader convicts as an impossible shape and
-        // plans no position for). A recorder.json stamped v7 is NOT newer than
-        // this binary, and the absent-field back-compat default stays v1
-        // (`trace_format_v1`). A bump must move this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 7);
+        // plans no position for), and v8 marks a stream in which every edge
+        // names its frames' writers by run (read identity). A recorder.json
+        // stamped v8 is NOT newer than this binary, and the absent-field
+        // back-compat default stays v1 (`trace_format_v1`). A bump must move
+        // this pin DELIBERATELY.
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 8);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -25765,6 +26533,7 @@ mod recorder_info_version_tests {
         // than here).
         assert_eq!(ROLE_STAMPED_MIN_TRACE_FORMAT, 5);
         assert_eq!(EVERY_CONSULT_MIN_TRACE_FORMAT, 7);
+        assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
     }
 
     /// The decoupling pin.
@@ -25790,20 +26559,21 @@ mod recorder_info_version_tests {
             recorder_stamps_read_site_roles(),
             true,
             recorder_stamps_consult_records(),
+            recorder_records_read_identity(),
         );
         assert_eq!(
-            stamp, 7,
-            "a recorder that records every consult stamps 7: the empty drain's \
-             NoFrame record is a shape a format-6 reader convicts and plans no \
-             position for"
+            stamp, 8,
+            "a recorder that records every consult AND the identity of every read \
+             stamps 8: a format-7 reader would replay its reads by queue \
+             re-creation and call the result clean"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: six formats this binary
+        // The gate is strictly WIDER than the stamp: seven formats this binary
         // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6] {
+        for archived in [1u32, 2, 3, 4, 5, 6, 7] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -25841,7 +26611,7 @@ mod recorder_info_version_tests {
         ];
         for (mode, needs_v4, roles, expected) in cases {
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false, false),
+                stamp_trace_format(mode, needs_v4, roles, false, false, false),
                 expected,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
             );
@@ -25849,7 +26619,7 @@ mod recorder_info_version_tests {
             // unreadable to anything below 6 whatever the coordination mode or
             // the role bits say.
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true, false),
+                stamp_trace_format(mode, needs_v4, roles, true, false, false),
                 6,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
             );
@@ -25858,9 +26628,21 @@ mod recorder_info_version_tests {
             // else is true of it, folding included.
             for folds in [false, true] {
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false),
                     7,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
+                );
+                // Read identity rides the consult term: 8 over every axis, and
+                // it claims nothing without the consult records under it.
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true),
+                    8,
+                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
+                );
+                assert_ne!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true),
+                    8,
+                    "identity without the consult records is not format 8"
                 );
             }
         }
@@ -25946,6 +26728,7 @@ mod recorder_info_version_tests {
                         stamps_roles,
                         true,
                         false,
+                        false,
                     );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
@@ -25964,7 +26747,7 @@ mod recorder_info_version_tests {
         // format-5 reader's range, so the arm above is about folding rather than
         // about the bump having happened.
         assert!(
-            stamp_trace_format(CoordinationMode::Lockstep, false, true, false, false)
+            stamp_trace_format(CoordinationMode::Lockstep, false, true, false, false, false)
                 <= PRE_FOLD_SUPPORTED,
             "a non-folding lockstep recorder that records no consult stamps 5, \
              inside a format-5 reader's range"
@@ -30338,5 +31121,164 @@ mod read_log_enforcement_fold_tests {
                 other => panic!("{label}: a pass that gated makes the run enforced: {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod trailing_refill_tests {
+    use super::*;
+    use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+
+    const CAP: usize = cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP as usize;
+
+    fn decl(id: &str, throttled: bool) -> replay_rederive::NodeDecl {
+        replay_rederive::NodeDecl {
+            node_id: id.to_string(),
+            trigger: replay_rederive::TriggerDecl::Data {
+                trigger_inputs: vec!["inp".to_string()],
+            },
+            throttle_ns: throttled.then_some(1_000_000),
+            has_non_trigger_inputs: false,
+            trigger_input_capacities: BTreeMap::new(),
+        }
+    }
+
+    fn pops(id: &str, n: usize) -> Vec<replay_rederive::RecordedRead> {
+        (0..n)
+            .map(|_| replay_rederive::RecordedRead {
+                node_id: id.to_string(),
+                input: "inp".to_string(),
+                kind: ReadOutcomeKind::DrainedBatch,
+                served_seq: Some(1),
+                popped: 1,
+                wire_stamp_ns: None,
+                role: ReadSiteRole::Drain,
+            })
+            .collect()
+    }
+
+    fn fires(id: &str, step: u64, n: usize) -> Vec<RecordedFire> {
+        (0..n)
+            .map(|_| RecordedFire {
+                node_id: Arc::from(id),
+                step,
+                fire_time_ns: 0,
+                global_level: 0,
+                rank: None,
+                discarded: false,
+            })
+            .collect()
+    }
+
+    /// Run the derivation over `(step, pops, fires)` triples of node `n`.
+    fn derive(
+        verification: &PassVerification,
+        steps: &[(u64, usize)],
+        resumed: bool,
+        has_refill: bool,
+    ) -> Vec<(u64, Vec<String>)> {
+        let mut carried = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        steps
+            .iter()
+            .map(|&(step, fired)| {
+                (
+                    step,
+                    fifo_trailing_refills(
+                        verification,
+                        &fires("n", step, fired),
+                        step,
+                        replay_rederive::RoleTrust::Declined,
+                        resumed,
+                        &|_: &str| has_refill,
+                        &mut carried,
+                        &mut seen,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn verification(per_step_pops: &[(u64, usize)], throttled: bool) -> PassVerification {
+        let mut v = PassVerification::inert();
+        v.decls = vec![decl("n", throttled)];
+        v.reads_by_step = per_step_pops
+            .iter()
+            .map(|&(step, n)| (step, pops("n", n)))
+            .collect();
+        v
+    }
+
+    /// A cap step with one pop more than fires marks a trailing refill; the
+    /// next step, firing the carried frame, does not.
+    #[test]
+    fn a_capped_step_with_one_more_pop_marks_a_trailing_refill() {
+        let v = verification(&[(0, CAP + 1), (1, CAP - 1)], false);
+        let got = derive(&v, &[(0, CAP), (1, CAP)], false, true);
+        assert_eq!(got, vec![(0, vec!["n".to_string()]), (1, vec![])]);
+    }
+
+    /// No refill hook, a block-gated node, or a declined verification: nothing.
+    #[test]
+    fn a_node_that_cannot_carry_marks_nothing() {
+        let v = verification(&[(0, CAP + 1)], false);
+        assert_eq!(derive(&v, &[(0, CAP)], false, false), vec![(0, vec![])]);
+        let mut blocked = verification(&[(0, CAP + 1)], false);
+        blocked.block_edges = vec![replay_rederive::BlockEdgeObservation {
+            topic: "/t".to_string(),
+            producer_node: "n".to_string(),
+            consumer_node: "c".to_string(),
+            consumer_input: "inp".to_string(),
+            depth: 1,
+            published_frames: 0,
+        }];
+        assert_eq!(
+            derive(&blocked, &[(0, CAP)], false, true),
+            vec![(0, vec![])]
+        );
+        let mut declined = verification(&[(0, CAP + 1)], false);
+        declined.declined = Some(VerifierDecline::ReadLogBudget);
+        assert_eq!(
+            derive(&declined, &[(0, CAP)], false, true),
+            vec![(0, vec![])]
+        );
+    }
+
+    /// A step no carry explains (a stopped node's pops with no fire, more
+    /// fires than frames) marks nothing and is never an error.
+    #[test]
+    fn a_step_no_carry_explains_marks_nothing() {
+        let v = verification(&[(0, 3), (1, 0)], false);
+        assert_eq!(
+            derive(&v, &[(0, 0), (1, 2)], false, true),
+            vec![(0, vec![]), (1, vec![])]
+        );
+    }
+
+    /// A throttled node carries below the cap: a refill after its last fire
+    /// marks a trailing refill; a deferred first fire (no fire at the step)
+    /// carries without one.
+    #[test]
+    fn a_throttled_node_carries_below_the_cap() {
+        let v = verification(&[(0, 3), (1, 0), (2, 1), (3, 0)], true);
+        assert_eq!(
+            derive(&v, &[(0, 2), (1, 1), (2, 0), (3, 1)], false, true),
+            vec![
+                (0, vec!["n".to_string()]),
+                (1, vec![]),
+                (2, vec![]),
+                (3, vec![])
+            ]
+        );
+    }
+
+    /// A resumed pass's first step that fires one frame more than it pops (a
+    /// frame carried in across the anchor) marks nothing, and a cap step after
+    /// it still marks its trailing refill.
+    #[test]
+    fn a_resumed_first_step_with_a_carried_in_frame_marks_nothing() {
+        let v = verification(&[(5, 2), (6, CAP + 1)], false);
+        let got = derive(&v, &[(5, 3), (6, CAP)], true, true);
+        assert_eq!(got, vec![(5, vec![]), (6, vec!["n".to_string()])]);
     }
 }

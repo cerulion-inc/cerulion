@@ -924,23 +924,28 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 7.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 7; a
+`recorder.json` stamps 8.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as an 8; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Three encodings set the number. Every kind-6 record carries a
+in it. Four encodings set the number; the fourth, read identity, has its own
+section below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
 record, and reading that count is what `trace_format` 6 means. The recorder
 also writes a kind-6 record at every gated consult a replay of the bag also
 makes, an empty boundary drain's `none` record included, and reading a `drain`
-role on a `none` record as that empty consult is what `trace_format` 7 means.
+role on a `none` record as that empty consult is what `trace_format` 7 means,
+and producer annotations on every edge (before every read of a multi-writer
+edge, once per writer run on a single-writer one) are what `trace_format` 8
+means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
-decodes as one occurrence each). A bag
+decodes as one occurrence each), and since read identity every such bag is
+format 8. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -964,6 +969,95 @@ stamp and parked it as the per-set Sync matcher's `next_head`. Format 5
 defines all three roles, so no bag on disk changes meaning. The field is full:
 a fourth site needs a wider subfield and a format bump. See `docs/read_log_forensics.md` for the role
 table and what each `(kind, role)` pairing means offline.
+
+### Read identity (`trace_format` 8)
+
+A format 8 recording names, for every read on every edge, the frame it
+served. The read record carries the frame's wire sequence, and the writer is
+named by a PRODUCER annotation whose token is a 64-bit hash of the writer's
+port id. A multi-writer edge (a `multi_publisher_topics` topic, or one no graph
+node produces) carries an annotation before every read, as it has since the
+annotation existed. Every other edge carries it once per WRITER RUN: the
+recorder stages it before a read whose writer differs from the writer of the
+last annotation on the same read stage and read site, and every later read of
+that site up to the next annotation was served by that writer. A read site is
+the node body's reads, or the scheduler's trigger drain and `Sync` peek
+together, so a reader that splits an input's records by site finds each read's
+annotation in its own split. A single-writer edge therefore carries one
+annotation per read site for the whole recording. Before format 8 only
+multi-writer edges carried the annotation. A reader below 8 decodes such a
+stream (it strips annotations before comparing) but would replay it by
+re-creating each consumer's queue, so the stamp moves and that reader refuses
+the bag.
+
+On a single-writer edge the read log grows by one record per read site for the
+whole recording, and its stage holds its plain bound plus two records (one
+run-opening annotation per read site); a read of the run equal to the run's
+first read folds into it. A multi-writer edge's records and its stage's pair
+factor of two are what they were before format 8, so a replay of any bag
+stages the recording's records on it and truncates at the same rim.
+
+`cerulion bag play --resim all --verify` replays a free-run format 8 bag with
+**private per-input feeds**. Every read stage of the re-executed graph (a
+node's body read, and its trigger drain where it has one) subscribes to its own
+service, `/__cerulion/replay_feed/<node>/<input index>/<body|drain>`, and
+nothing else publishes there. When a read is about to pop, the replay publishes
+onto that service exactly the frames the recorded read consumed, found in the
+bag by `(writer, sequence)`: a multi-writer topic's frames carry the
+recorder's per-frame producer labels (`__cerulion/frame_producers`), and a
+topic with no label had one writer. A read that popped `n` frames on a
+single-writer edge consumed that writer's `n` frames ending at the served one,
+because a queue that drops its oldest frame keeps a contiguous run. Live
+evictions, several consumers of one topic and several writers on one topic
+then change nothing about what a replayed read sees.
+
+What cannot be fed is refused by name before the first step (exit 2), with the
+node, the input, the writer and the sequence:
+
+| Cause (`--report` code) | Meaning |
+|---|---|
+| `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
+| `read_identity_absent` | A read popped frames and no annotation named their writer, or a read on a multi-writer edge carries no annotation of its own |
+| `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
+| `read_identity_batch_unattributed` | A read popped several frames on a topic with several writers, and the recording names only the newest |
+| `read_identity_decimated_unattributed` | A `sample(N)` read dropped the frames it popped and names none of them |
+| `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
+| `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
+| `read_identity_ungateable_stage` | A stage the read gate cannot drive (a per-set `Sync` trigger input) |
+| `read_identity_rmw_node` | The graph has `ros2` nodes, whose takes the read log does not record |
+
+A take on an rmw path inside a replayed node (`try_receive_one`) has no
+recorded identity either; it is reported as an edge-read divergence (exit 6,
+`unrecorded_take`).
+
+**Graphs `--verify` cannot feed yet.** These shapes are refused rather than
+fed:
+
+- A graph with `ros2` nodes (`read_identity_rmw_node`): an rmw take does not
+  pass through the read log, so its frames have no recorded identity.
+- A per-set `Sync` trigger input (`read_identity_ungateable_stage`): its pops
+  run through the matcher's peek and promote operations, which the read gate
+  does not drive, so a feed on that stage is never asked for frames.
+- A `sample(N)` input whose gate dropped frames
+  (`read_identity_decimated_unattributed`): the decimated read names the last
+  accepted frame, not the frames it popped and dropped.
+
+- A read that popped several frames on a topic with several writers
+  (`read_identity_batch_unattributed`): the read names only its newest frame.
+- A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
+  Flashback window): a free-run replay refuses a mid-run bag before any feed is
+  planned.
+
+ Replay such a bag with `--resim all` and no
+`--verify`, which re-creates each consumer's queue and labels its reads best
+effort.
+
+The verdict's second line says how reads were fed: `reads: fed by recorded
+identity (R reads, F frames, ...)`, or `reads: best effort, no read identity
+(<reason>)` for a bag recorded before format 8, a lockstep bag, and a resim
+without `--verify`. A resim without `--verify` keeps each consumer's queue so a
+changed node's own frames reach its in-rank consumers. The `--report` JSON
+carries the same fact as `read_identity`.
 
 ### The kind-6 annotations ride INSIDE the record kind
 

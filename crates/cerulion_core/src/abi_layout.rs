@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 28;
+const EXPECTED_ABI: u32 = 29;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -644,18 +644,22 @@ static EXPECTED: &[Expected] = &[
         // that carries this field is the one the `PlanInner` row below states:
         // the gate's own struct is pinned by OFFSET and gains the rule byte in
         // the same change, and one version describes one shipped layout.
+        // v29 adds `annotates_every_read: bool`, which takes offset rank 7
+        // (last); every other field keeps its rank (MEASURED via
+        // `dump_measured_table`).
         fields: &[
             "input_idx",
             "role",
             "capacity",
             "armed",
             "records_every_consult",
+            "annotates_every_read",
             "pending",
             "inner",
         ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 6, 1, 4, 5, 2, 0],
+            ranks: &[3, 6, 1, 4, 5, 7, 2, 0],
         },
     },
     Expected {
@@ -663,6 +667,7 @@ static EXPECTED: &[Expected] = &[
         fields: &[
             "records",
             "fold_anchor",
+            "run_writer",
             "last_served_seq",
             "dropped",
             "dropped_reported",
@@ -670,14 +675,14 @@ static EXPECTED: &[Expected] = &[
             "next_decade",
         ],
         // Re-snapshot (MEASURED via `dump_measured_table`, never
-        // hand-computed): `fold_anchor: FoldAnchor` is a one-byte enum that
-        // lands at offset 57, in what was tail padding — the struct stays 64
-        // bytes and every other offset is unchanged. It carries the two facts a
+        // hand-computed), at v19: `fold_anchor: FoldAnchor` is a one-byte enum
+        // that landed at offset 57, in what was tail padding — the struct
+        // stayed 64 bytes and every other offset was unchanged. It carries the two facts a
         // run count asserts that no single record can hold: that the run is
         // ADJACENT (a drop at the rim breaks it) and that its provenance is its
         // own (a bare read never folds into an annotated pair's read half).
         //
-        // The ABI VERSION is unchanged at 19, on the same rule applied to
+        // At v19 the ABI VERSION was unchanged at 19, on the same rule applied to
         // `StagedReadOutcome` two entries down: the version already moved for
         // this struct family, and a later change to an FFI-closure struct in
         // the same release is a re-snapshot rather than a second bump. Host and
@@ -692,10 +697,13 @@ static EXPECTED: &[Expected] = &[
         // structs across the same FFI cannot
         // share a version, or a cdylib built against one reads the other's fields
         // at the wrong offsets.
+        // v29 adds `run_writer: [Option<u64>; 2]`, 32 bytes at offset 0: the
+        // struct grows from 64 to 96 bytes and every other field moves
+        // (MEASURED via `dump_measured_table`).
         layout: Layout::Pinned {
-            size: 64,
+            size: 96,
             align: 8,
-            offsets: &[0, 57, 24, 32, 40, 56, 48],
+            offsets: &[32, 89, 0, 56, 64, 72, 88, 80],
         },
     },
     Expected {
@@ -744,14 +752,18 @@ static EXPECTED: &[Expected] = &[
     // ---- the ENFORCEMENT side (v24) -------------------------------------
     Expected {
         name: "ReadPlanStage",
-        fields: &["key", "rim", "blocker", "armed", "now_step", "inner"],
+        fields: &[
+            "key", "rim", "blocker", "armed", "now_step", "inner", "feed",
+        ],
         // MEASURED via `dump_measured_table`, never hand computed: the field
         // order this target packs the row in, as the permutation of its
         // offsets. The row entered the table at v24 and its order is pinned
         // from v25, the version that made a re-pack of this family visible.
+        // v29 adds `feed`, the replay's private-feed slot, which packs between
+        // `inner` and `rim` (MEASURED via `dump_measured_table`).
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[0, 3, 4, 5, 1, 2],
+            ranks: &[0, 4, 5, 6, 1, 2, 3],
         },
     },
     Expected {

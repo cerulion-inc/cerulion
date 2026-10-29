@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 use crate::barrier::{MappedBarrier, WaitOutcome};
 use crate::clock::{Clock, VirtualClock};
 use crate::error::{InertReason, TransportError, TransportResult};
-use crate::read_outcome::{FireBurstBound, ProducerAnnotation, StageBurstBound, SyncTriggerShape};
+use crate::read_outcome::{FireBurstBound, StageBurstBound, SyncTriggerShape};
 // Gated with its only consumer, `read_outcome_stage_capacities` — see that
 // Now a PRODUCTION type — the manifest writer's row shape.
 use crate::read_outcome::ReadStageCapacity;
@@ -4056,6 +4056,7 @@ impl GraphRuntime {
             // never carries a cross-process credit binding.
             CrossProcessWiring::requirements_only(provisioning_overrides),
             purpose,
+            &crate::replay_feed::ReplayWiring::default(),
         )
     }
 
@@ -4085,12 +4086,45 @@ impl GraphRuntime {
             None,
             cross_process,
             BuildPurpose::Execution,
+            &crate::replay_feed::ReplayWiring::default(),
+        )
+    }
+
+    /// The REPLAY build: [`Self::build_with_schema_hashes_and_wiring`] plus the
+    /// [`crate::replay_feed::ReplayWiring`] a replay builds under.
+    ///
+    /// `wiring.identity` must be the rule the recording staged producer
+    /// annotations under, so the replay stages the same records and truncates
+    /// at the same rim. `wiring.feeds` set makes every read stage subscribe to
+    /// its private [`crate::replay_feed::replay_feed_topic`] instead of the
+    /// topic it reads live; the replay then installs its feed with
+    /// [`Self::install_replay_read_feed`].
+    pub fn build_for_replay(
+        config: GraphConfig,
+        node_factories: IndexMap<String, Box<dyn NodeEntry>>,
+        transport: &TransportManager,
+        clock: Arc<VirtualClock>,
+        schema_hashes: Option<&HashMap<String, u64>>,
+        cross_process: CrossProcessWiring<'_>,
+        wiring: &crate::replay_feed::ReplayWiring,
+    ) -> TransportResult<Self> {
+        Self::build_virtual(
+            config,
+            node_factories,
+            transport,
+            clock,
+            schema_hashes,
+            None,
+            cross_process,
+            BuildPurpose::Execution,
+            wiring,
         )
     }
 
     /// The shared body of the VIRTUAL-clock build entries.
-    // Eight parameters for the reason stated at
-    // `build_with_schema_hashes_provisioning_and_recorded`.
+    // Nine parameters: the eight stated at
+    // `build_with_schema_hashes_provisioning_and_recorded` plus the replay
+    // wiring, each a distinct type.
     #[allow(clippy::too_many_arguments)]
     // hot-path-alloc-ok-fn: cold: graph BUILD, runs once per process, before the first step
     fn build_virtual(
@@ -4102,6 +4136,7 @@ impl GraphRuntime {
         recorded_topics: Option<&std::collections::HashSet<String>>,
         cross_process: CrossProcessWiring<'_>,
         purpose: BuildPurpose,
+        replay_wiring: &crate::replay_feed::ReplayWiring,
     ) -> TransportResult<Self> {
         // Run `validate_graph` at the
         // runtime build boundary, not just CLI-side. Direct library
@@ -4148,6 +4183,7 @@ impl GraphRuntime {
             recorded_topics,
             cross_process,
             purpose,
+            replay_wiring,
         )
     }
 
@@ -4372,6 +4408,7 @@ impl GraphRuntime {
             cross_process,
             // A live build exists to be driven.
             BuildPurpose::Execution,
+            &crate::replay_feed::ReplayWiring::default(),
         )
     }
 
@@ -4752,6 +4789,7 @@ impl GraphRuntime {
             cross_process,
             // A deterministic-live build (monolith or worker) is driven.
             BuildPurpose::Execution,
+            &crate::replay_feed::ReplayWiring::default(),
         )?;
         Ok(runtime)
     }
@@ -5067,6 +5105,11 @@ impl GraphRuntime {
         // teardown reconciliation line by marking the context BEFORE `init()`
         // moves it into a cdylib.
         purpose: BuildPurpose,
+        // How a REPLAY wires this runtime (see `crate::replay_feed`): the
+        // producer-annotation rule its recording staged under, and whether its
+        // read stages subscribe to private feeds. The default (every edge
+        // annotated, no feeds) on every live, recording and test build.
+        replay_wiring: &crate::replay_feed::ReplayWiring,
     ) -> TransportResult<Self> {
         // A `ros2:` entry is SPAWNED by `cerulion graph run` as a supervised
         // process, never scheduled by this runtime — a config still carrying
@@ -5899,7 +5942,13 @@ impl GraphRuntime {
                      attach; the graph imposes only its consumer buffer \
                      requirement"
                 );
-                external_silence_topics.push(flow.topic.clone());
+                // A FED build subscribes every read stage to its private feed
+                // service, so no consumer of this process opens `flow.topic`
+                // and the silence watch's open-only probe would find no
+                // service: a fed build watches no external topic.
+                if replay_wiring.feeds.is_none() {
+                    external_silence_topics.push(flow.topic.clone());
+                }
                 PublisherProvisioning::External
             };
             // Standalone listener-only wake sources (unified
@@ -7277,7 +7326,45 @@ impl GraphRuntime {
                 // keeps its listener here. That is the safe direction: it keeps a
                 // port it may not need rather than losing a wake it might.
                 let latest_value_input = node_snapshot_inputs.iter().any(|n| n == &input.name);
-                let mut subscriber = if input_topic_config.publisher_provisioning
+                let input_idx_u16 = u16::try_from(input_pos).unwrap_or(u16::MAX);
+                // A FED replay subscribes this input's body stage to its own
+                // private service (`crate::replay_feed`), create-or-open, so the
+                // replay's feed is the one thing that ever publishes to it.
+                let body_feed = replay_wiring.feed_buffer(
+                    &node_def.id,
+                    input_idx_u16,
+                    crate::read_outcome::ReadStageRole::Body,
+                );
+                let mut subscriber = if let Some(feed_buffer) = body_feed {
+                    let feed_topic =
+                        crate::replay_feed::replay_feed_topic(&crate::read_outcome::StageKey {
+                            node: node_def.id.clone(),
+                            input_idx: input_idx_u16,
+                            role: crate::read_outcome::ReadStageRole::Body,
+                        });
+                    let buffer = input_depth.max(feed_buffer);
+                    let feed_config =
+                        crate::replay_feed::replay_feed_topic_config(input_topic_config, buffer);
+                    // The replay is the private service's one writer, so the
+                    // build creates it, at the feed's buffer, before the
+                    // subscriber attaches; the handle lives as long as the
+                    // runtime.
+                    precreated_services
+                        .push(transport.precreate_topic_services(&feed_topic, feed_config)?);
+                    if latest_value_input {
+                        transport.create_subscriber_with_buffers_no_listener(
+                            &feed_topic,
+                            feed_config,
+                            buffer,
+                        )?
+                    } else {
+                        transport.create_subscriber_with_buffers(
+                            &feed_topic,
+                            feed_config,
+                            buffer,
+                        )?
+                    }
+                } else if input_topic_config.publisher_provisioning
                     == PublisherProvisioning::External
                 {
                     if latest_value_input {
@@ -7394,39 +7481,45 @@ impl GraphRuntime {
                     &topic,
                     input_topic_config.publisher_provisioning,
                 );
-                let annotated = if annotated_edge {
-                    ProducerAnnotation::Annotated
-                } else {
-                    ProducerAnnotation::Plain
-                };
+                // Every edge carries its reads' writer under the default rule,
+                // one annotation per writer run, so the read log names the
+                // identity of every served frame; a replay of a recording made
+                // before that rule stages what that recording staged.
+                let identity_edge = replay_wiring.identity.annotates(annotated_edge);
+                let annotated = replay_wiring.identity.sizing(annotated_edge);
                 // The role is named ONCE per site, as a local, and then used
                 // twice — by the constructor and by the burst resolver. Naming
                 // it twice by hand lets a `Body` stage take a `Drain`
                 // sizing; a single local makes that desync
                 // unrepresentable without restructuring the sizing type.
                 let stage_role = crate::read_outcome::ReadStageRole::Body;
-                let read_stage = Arc::new(crate::read_outcome::ReadOutcomeStage::new(
-                    u16::try_from(input_pos).unwrap_or(u16::MAX),
-                    stage_role,
-                    crate::read_outcome::ReadStageSizing {
-                        depth: u32::try_from(input_depth).unwrap_or(u32::MAX),
-                        annotated,
-                        sync_shape: if node_per_set_sync
-                            && node_trigger_names.contains(input.name.as_str())
-                        {
-                            SyncTriggerShape::PerSetSyncTrigger
-                        } else {
-                            SyncTriggerShape::Ordinary
+                let read_stage = Arc::new(
+                    crate::read_outcome::ReadOutcomeStage::new(
+                        u16::try_from(input_pos).unwrap_or(u16::MAX),
+                        stage_role,
+                        crate::read_outcome::ReadStageSizing {
+                            depth: u32::try_from(input_depth).unwrap_or(u32::MAX),
+                            annotated,
+                            sync_shape: if node_per_set_sync
+                                && node_trigger_names.contains(input.name.as_str())
+                            {
+                                SyncTriggerShape::PerSetSyncTrigger
+                            } else {
+                                SyncTriggerShape::Ordinary
+                            },
+                            burst: read_stage_burst_bound(
+                                stage_role,
+                                &input.name,
+                                node_snapshot_inputs,
+                                node_holds_snapshot,
+                                node_fire_burst,
+                            ),
                         },
-                        burst: read_stage_burst_bound(
-                            stage_role,
-                            &input.name,
-                            node_snapshot_inputs,
-                            node_holds_snapshot,
-                            node_fire_burst,
-                        ),
-                    },
-                ));
+                    )
+                    .annotating_every_read(
+                        crate::replay_feed::annotates_every_read(annotated_edge),
+                    ),
+                );
                 subscriber.set_read_outcome_stage(Arc::clone(&read_stage));
                 // The enforcement twin, DISARMED. The rim is READ OFF the
                 // capture stage rather than derived a second time, so the two
@@ -7449,7 +7542,9 @@ impl GraphRuntime {
                         // not, where an ambiguous sequence only fails to pin
                         // one.
                         Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
-                    } else if annotated_edge {
+                    } else if annotated_edge && body_feed.is_none() {
+                        // A FED stage is fed by (writer, sequence), so a
+                        // per-publisher sequence blocks nothing there.
                         Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
                     } else {
                         None
@@ -7464,7 +7559,7 @@ impl GraphRuntime {
                 // ANNOTATION. The graph config is the only place that knows,
                 // and it is a build-time property, so it becomes a bit on the
                 // subscriber (the hot path never consults the config).
-                if annotated_edge {
+                if identity_edge {
                     subscriber.mark_multi_publisher_edge();
                 }
                 node_read_stages.push(read_stage);
@@ -7478,7 +7573,9 @@ impl GraphRuntime {
                 // live count below the expected one for the life of the process and
                 // the topic never elides again. Kill switch off means no
                 // bookkeeping at all; see the arm-site comment.
-                if notify_elision_enabled && !latest_value_input {
+                // A FED body subscriber listens on its private feed service, not
+                // on `topic`, so it adds no listener to `topic`'s total.
+                if notify_elision_enabled && !latest_value_input && body_feed.is_none() {
                     bump_expected_listener(&mut expected_listeners_by_topic, &topic);
                 }
 
@@ -7496,12 +7593,18 @@ impl GraphRuntime {
                 // producer's publisher. Finalized into a
                 // `LivelinessWatch` after `add_node` (which mints the
                 // disconnect counter) and the QoS-store registration.
-                let probe = transport.external_publisher_probe(&topic)?;
-                liveliness_probe_specs.push((
-                    node_def.id.clone(),
-                    Arc::from(input.name.as_str()),
-                    probe,
-                ));
+                // A FED body subscriber reads its private feed service, never
+                // `topic`, so it holds no probe on `topic`: on a topic another
+                // rank or an external writer produces, no port of this process
+                // creates that service.
+                if body_feed.is_none() {
+                    let probe = transport.external_publisher_probe(&topic)?;
+                    liveliness_probe_specs.push((
+                        node_def.id.clone(),
+                        Arc::from(input.name.as_str()),
+                        probe,
+                    ));
+                }
             }
 
             // Synthesize a
@@ -7703,7 +7806,43 @@ impl GraphRuntime {
                     // Same owned/External split as the body
                     // subscriber — owned trigger topics open OPEN-ONLY on the
                     // pre-created service; external ones create-or-open.
-                    let mut trigger_sub = if trigger_topic_config.publisher_provisioning
+                    // A FED replay gives the trigger-drain stage its own
+                    // private service, beside the body stage's.
+                    let trigger_feed = node_def
+                        .inputs
+                        .iter()
+                        .position(|i| i.name == yaml_input.name)
+                        .and_then(|pos| {
+                            let idx = u16::try_from(pos).unwrap_or(u16::MAX);
+                            replay_wiring
+                                .feed_buffer(
+                                    &node_def.id,
+                                    idx,
+                                    crate::read_outcome::ReadStageRole::Drain,
+                                )
+                                .map(|floor| (idx, floor))
+                        });
+                    let mut trigger_sub = if let Some((idx, floor)) = trigger_feed {
+                        let feed_topic =
+                            crate::replay_feed::replay_feed_topic(&crate::read_outcome::StageKey {
+                                node: node_def.id.clone(),
+                                input_idx: idx,
+                                role: crate::read_outcome::ReadStageRole::Drain,
+                            });
+                        let buffer = trigger_buffer.max(floor);
+                        let feed_config = crate::replay_feed::replay_feed_topic_config(
+                            trigger_topic_config,
+                            buffer,
+                        );
+                        // Created by the build, as at the Body site.
+                        precreated_services
+                            .push(transport.precreate_topic_services(&feed_topic, feed_config)?);
+                        transport.create_subscriber_with_buffers(
+                            &feed_topic,
+                            feed_config,
+                            buffer,
+                        )?
+                    } else if trigger_topic_config.publisher_provisioning
                         == PublisherProvisioning::External
                     {
                         transport.create_subscriber_with_buffers(
@@ -7739,29 +7878,32 @@ impl GraphRuntime {
                             &trigger_topic,
                             trigger_topic_config.publisher_provisioning,
                         );
-                        let annotated = if annotated_edge {
-                            ProducerAnnotation::Annotated
-                        } else {
-                            ProducerAnnotation::Plain
-                        };
+                        // The body site's identity rule.
+                        let identity_edge = replay_wiring.identity.annotates(annotated_edge);
+                        let annotated = replay_wiring.identity.sizing(annotated_edge);
                         // One local, used twice — see the Body site.
                         let stage_role = crate::read_outcome::ReadStageRole::Drain;
-                        let stage = Arc::new(crate::read_outcome::ReadOutcomeStage::new(
-                            u16::try_from(pos).unwrap_or(u16::MAX),
-                            stage_role,
-                            crate::read_outcome::ReadStageSizing {
-                                depth: u32::try_from(trigger_depth).unwrap_or(u32::MAX),
-                                annotated,
-                                sync_shape: SyncTriggerShape::Ordinary,
-                                burst: read_stage_burst_bound(
-                                    stage_role,
-                                    &yaml_input.name,
-                                    node_snapshot_inputs,
-                                    node_holds_snapshot,
-                                    node_fire_burst,
-                                ),
-                            },
-                        ));
+                        let stage = Arc::new(
+                            crate::read_outcome::ReadOutcomeStage::new(
+                                u16::try_from(pos).unwrap_or(u16::MAX),
+                                stage_role,
+                                crate::read_outcome::ReadStageSizing {
+                                    depth: u32::try_from(trigger_depth).unwrap_or(u32::MAX),
+                                    annotated,
+                                    sync_shape: SyncTriggerShape::Ordinary,
+                                    burst: read_stage_burst_bound(
+                                        stage_role,
+                                        &yaml_input.name,
+                                        node_snapshot_inputs,
+                                        node_holds_snapshot,
+                                        node_fire_burst,
+                                    ),
+                                },
+                            )
+                            .annotating_every_read(
+                                crate::replay_feed::annotates_every_read(annotated_edge),
+                            ),
+                        );
                         trigger_sub.set_read_outcome_stage(Arc::clone(&stage));
                         // The enforcement twin, see the Body site. This
                         // binding is NOT per-set-capable (the per-set path
@@ -7775,7 +7917,7 @@ impl GraphRuntime {
                                 role: stage_role,
                             },
                             stage.capacity(),
-                            if annotated_edge {
+                            if annotated_edge && trigger_feed.is_none() {
                                 Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
                             } else {
                                 None
@@ -7787,7 +7929,7 @@ impl GraphRuntime {
                         // The trigger drain is a second read
                         // path on the SAME edge, so it carries the producer
                         // annotation under the same rule (see the body site).
-                        if annotated_edge {
+                        if identity_edge {
                             trigger_sub.mark_multi_publisher_edge();
                         }
                         node_read_stages.push(stage);
@@ -8011,7 +8153,45 @@ impl GraphRuntime {
                         // LEGACY latest-per-set: keep the earlier dedicated
                         // drain subscriber, whose timestamps fill the heads while
                         // the body reads drain-to-latest.
-                        let mut drain_sub = if topic_config.publisher_provisioning
+                        // A FED replay gives the legacy Sync drain stage its own
+                        // private service, beside the body stage's.
+                        let drain_feed = node_def
+                            .inputs
+                            .iter()
+                            .position(|i| i.name == input.name)
+                            .and_then(|pos| {
+                                let idx = u16::try_from(pos).unwrap_or(u16::MAX);
+                                replay_wiring
+                                    .feed_buffer(
+                                        &node_def.id,
+                                        idx,
+                                        crate::read_outcome::ReadStageRole::Drain,
+                                    )
+                                    .map(|floor| (idx, floor))
+                            });
+                        let mut drain_sub = if let Some((idx, floor)) = drain_feed {
+                            let feed_topic = crate::replay_feed::replay_feed_topic(
+                                &crate::read_outcome::StageKey {
+                                    node: node_def.id.clone(),
+                                    input_idx: idx,
+                                    role: crate::read_outcome::ReadStageRole::Drain,
+                                },
+                            );
+                            let feed_buffer = buffer.max(floor);
+                            let feed_config = crate::replay_feed::replay_feed_topic_config(
+                                topic_config,
+                                feed_buffer,
+                            );
+                            // Created by the build, as at the Body site.
+                            precreated_services.push(
+                                transport.precreate_topic_services(&feed_topic, feed_config)?,
+                            );
+                            transport.create_subscriber_with_buffers(
+                                &feed_topic,
+                                feed_config,
+                                feed_buffer,
+                            )?
+                        } else if topic_config.publisher_provisioning
                             == PublisherProvisioning::External
                         {
                             transport.create_subscriber_with_buffers(
@@ -8041,29 +8221,32 @@ impl GraphRuntime {
                                 &sync_topic,
                                 topic_config.publisher_provisioning,
                             );
-                            let annotated = if annotated_edge {
-                                ProducerAnnotation::Annotated
-                            } else {
-                                ProducerAnnotation::Plain
-                            };
+                            // The body site's identity rule.
+                            let identity_edge = replay_wiring.identity.annotates(annotated_edge);
+                            let annotated = replay_wiring.identity.sizing(annotated_edge);
                             // One local, used twice — see the Body site.
                             let stage_role = crate::read_outcome::ReadStageRole::Drain;
-                            let stage = Arc::new(crate::read_outcome::ReadOutcomeStage::new(
-                                u16::try_from(pos).unwrap_or(u16::MAX),
-                                stage_role,
-                                crate::read_outcome::ReadStageSizing {
-                                    depth: u32::try_from(depth).unwrap_or(u32::MAX),
-                                    annotated,
-                                    sync_shape: SyncTriggerShape::Ordinary,
-                                    burst: read_stage_burst_bound(
-                                        stage_role,
-                                        &input.name,
-                                        node_snapshot_inputs,
-                                        node_holds_snapshot,
-                                        node_fire_burst,
-                                    ),
-                                },
-                            ));
+                            let stage = Arc::new(
+                                crate::read_outcome::ReadOutcomeStage::new(
+                                    u16::try_from(pos).unwrap_or(u16::MAX),
+                                    stage_role,
+                                    crate::read_outcome::ReadStageSizing {
+                                        depth: u32::try_from(depth).unwrap_or(u32::MAX),
+                                        annotated,
+                                        sync_shape: SyncTriggerShape::Ordinary,
+                                        burst: read_stage_burst_bound(
+                                            stage_role,
+                                            &input.name,
+                                            node_snapshot_inputs,
+                                            node_holds_snapshot,
+                                            node_fire_burst,
+                                        ),
+                                    },
+                                )
+                                .annotating_every_read(
+                                    crate::replay_feed::annotates_every_read(annotated_edge),
+                                ),
+                            );
                             drain_sub.set_read_outcome_stage(Arc::clone(&stage));
                             // The enforcement twin, see the Separate arm. The
                             // legacy-`Sync` drain is the `else` arm of
@@ -8076,7 +8259,7 @@ impl GraphRuntime {
                                     role: stage_role,
                                 },
                                 stage.capacity(),
-                                if annotated_edge {
+                                if annotated_edge && drain_feed.is_none() {
                                     Some(crate::read_outcome::GateBlocker::MultiPublisherEdge)
                                 } else {
                                     None
@@ -8087,7 +8270,7 @@ impl GraphRuntime {
                             node_read_plans.push(drain_plan);
                             // Same rule as the Separate arm — the
                             // Sync drain is a second read path on one edge.
-                            if annotated_edge {
+                            if identity_edge {
                                 drain_sub.mark_multi_publisher_edge();
                             }
                             node_read_stages.push(stage);
@@ -16750,6 +16933,29 @@ impl GraphRuntime {
         self.scheduler.set_replay_fire_plan(step, fires)
     }
 
+    /// Mark the nodes of this step's installed fire plan whose recorded burst
+    /// ended on a trailing refill — see
+    /// [`crate::scheduler::Scheduler::set_replay_trailing_refills`]. Call after
+    /// [`Self::set_replay_fire_plan`] for the same step.
+    ///
+    /// # Errors
+    ///
+    /// As the scheduler's.
+    pub fn set_replay_trailing_refills(
+        &mut self,
+        step: u64,
+        node_ids: &[&str],
+    ) -> TransportResult<()> {
+        self.scheduler.set_replay_trailing_refills(step, node_ids)
+    }
+
+    /// Does `node_id` carry a trigger refill hook (a unified `Data` binding)?
+    /// See [`crate::scheduler::Scheduler::has_trigger_refill`].
+    #[must_use]
+    pub fn has_trigger_refill(&self, node_id: &str) -> bool {
+        self.scheduler.has_trigger_refill(node_id)
+    }
+
     /// Drop the trace-driven fire plan (triggers decide again).
     pub fn clear_replay_fire_plan(&mut self) {
         self.scheduler.clear_replay_fire_plan();
@@ -16987,6 +17193,27 @@ impl GraphRuntime {
                     ),
                 };
                 return Err(TransportError::GraphError { reason });
+            }
+        }
+        Ok(())
+    }
+
+    /// Install the replay's private feed on every read stage, ONCE, before
+    /// step 0. Only meaningful on a runtime built FED
+    /// ([`Self::build_for_replay`] with `feeds` set), whose stages subscribe to
+    /// their private services; an armed, fed stage asks the feed to publish a
+    /// read's frames at the admission that pops them.
+    ///
+    /// `Err` names the first stage that already carries a feed: a second
+    /// install would publish every read's frames twice.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn install_replay_read_feed(
+        &self,
+        feed: &Arc<dyn crate::replay_feed::ReadFeed>,
+    ) -> Result<(), crate::read_outcome::StageKey> {
+        for (_node, plan) in &self.replay_read_plans {
+            if !plan.install_feed(Arc::clone(feed)) {
+                return Err(plan.key().clone());
             }
         }
         Ok(())

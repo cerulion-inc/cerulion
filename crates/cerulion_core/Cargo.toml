@@ -279,6 +279,10 @@ test-helpers = ["dep:ed25519-dalek", "dep:sha2"]
 # Uses process-local transport for single-process apps. Do not enable in the CLI
 # or daemons, which may need cross-process shared memory.
 local-transport = []
+# The read-identity oracle MUTANT (`replay_feed::mutants`): a runtime that
+# stages writer runs on multi-writer edges. Off by default and in every release
+# build; the engine's `oracle-mutants` feature turns it on.
+oracle-mutants = []
 
 [dev-dependencies]
 # The internal dev-deps below are INTENTIONALLY path-only (no
