@@ -15969,7 +15969,8 @@ impl GraphRuntime {
     /// order: drain the member's trigger input with the level drain's own
     /// per-binding body, then decide, freeze and fire it through
     /// [`Scheduler::call_chain_member`]. Each member's publish is the ordinary
-    /// one, so the next member's drain finds the frame on its own queue.
+    /// one, so the next member's drain finds the frame on its own queue. The
+    /// members' event queues are emptied after the last call of the walk.
     fn run_chain_calls(&mut self, done: usize, new_time: u64, step: u64) {
         let Some(calls) = self.chain_calls.as_ref() else {
             return;
@@ -15983,6 +15984,7 @@ impl GraphRuntime {
         let calls_now = Arc::clone(&calls.calls);
         #[cfg(feature = "oracle-mutants")]
         let skip_dequeue = calls.skip_dequeue_mutant;
+        let range_after = range.clone();
         let mut timestamps = std::mem::take(&mut self.drain_timestamps);
         for call in &calls_now[range] {
             #[cfg(feature = "oracle-mutants")]
@@ -16007,8 +16009,11 @@ impl GraphRuntime {
                 step,
                 &mut snapshot,
             );
-            // The member's event queue is emptied after its fire, still inside
-            // the step; its fire reads the frame the drain above froze.
+        }
+        // The members' event queues are emptied once every member of this
+        // walk has fired, still inside the step; each fire read the frame its
+        // drain froze.
+        for call in &calls_now[range_after] {
             if let DrainSource::Unified { listener_idx } =
                 self.data_trigger_bindings[call.binding].drain
             {
