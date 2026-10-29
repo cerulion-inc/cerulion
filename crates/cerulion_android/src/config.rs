@@ -39,6 +39,10 @@ pub struct EmbeddedConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The `log_level` of the logcat output: lines below it are dropped.
+///
+/// A release build of the app library compiles out `debug` and `trace`
+/// lines, so there [`Debug`](Self::Debug) and [`Trace`](Self::Trace) write
+/// what [`Info`](Self::Info) writes.
 pub enum LogLevelConfig {
     /// Errors only.
     Error,

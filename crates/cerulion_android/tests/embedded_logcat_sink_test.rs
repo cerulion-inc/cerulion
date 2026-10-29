@@ -110,7 +110,7 @@ fn log_level_warn_drops_info_lines_until_a_start_without_the_key() {
 }
 
 #[test]
-fn a_refused_start_leaves_the_level_unchanged() {
+fn a_config_that_fails_to_parse_or_validate_leaves_the_level_unchanged() {
     let (_serial, sink) = sink();
     run_once(json!({ "log_level": "warn" })).expect("start at warn");
     let refused = run_once(json!({ "log_level": "debug", "record": { "file": "../x.mcap" } }))
@@ -122,6 +122,20 @@ fn a_refused_start_leaves_the_level_unchanged() {
     tracing::info!(target: "app", "info after refusals");
     tracing::warn!(target: "app", "warn after refusals");
     assert_eq!(texts(&sink.take()), ["app: warn after refusals"]);
+    run_once(json!({})).expect("reset to info for the other tests");
+}
+
+#[test]
+fn a_start_refused_after_its_path_checks_still_sets_the_level() {
+    let (_serial, sink) = sink();
+    run_once(json!({ "log_level": "warn" })).expect("start at warn");
+    let refused = run_once(json!({ "log_level": "error", "graph_yaml": "nodes: [" }))
+        .expect_err("a graph that does not parse is refused");
+    assert_eq!(refused.code(), codes::GRAPH);
+    sink.take();
+    tracing::warn!(target: "app", "warn after a graph refusal");
+    tracing::error!(target: "app", "error after a graph refusal");
+    assert_eq!(texts(&sink.take()), ["app: error after a graph refusal"]);
     run_once(json!({})).expect("reset to info for the other tests");
 }
 
@@ -172,6 +186,9 @@ fn a_line_logged_while_a_thread_exits_still_reaches_the_sink() {
     .expect("a line logged during thread exit must not panic");
     assert_eq!(
         texts(&sink.take()),
-        ["worker: running", "teardown: from a thread-local destructor"]
+        [
+            "worker: running",
+            "teardown: from a thread-local destructor"
+        ]
     );
 }

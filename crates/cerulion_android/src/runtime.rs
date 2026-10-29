@@ -579,7 +579,8 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
-        // Every accepted start sets the level, so a restart without the
+        // Every start whose config parses and passes its path checks sets
+        // the level, also when a later step fails, so a restart without the
         // key returns to `info`.
         crate::log::set_level(config.log_level);
         {
