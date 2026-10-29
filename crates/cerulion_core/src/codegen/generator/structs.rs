@@ -1777,7 +1777,7 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
     writeln!(out, "    ///").unwrap();
     writeln!(
         out,
-        "    /// `Arc<str>` preserves the zero-alloc invariant: each"
+        "    /// A writer's `Arc<str>` preserves the zero-alloc invariant: each"
     )
     .unwrap();
     writeln!(
@@ -1805,8 +1805,32 @@ pub(super) fn generate_variable_shm_struct(out: &mut String, schema: &MessageSch
         "    /// required in `loan_proxy`. Only the error path allocates"
     )
     .unwrap();
-    writeln!(out, "    /// (`self.topic.to_string()` per error).").unwrap();
-    writeln!(out, "    topic: ::std::sync::Arc<str>,").unwrap();
+    writeln!(
+        out,
+        "    /// (one `String` from `self.topic.as_deref()` per error)."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// `None` on a reader built by `from_bytes`, so building and dropping"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// a reader does no refcount work. A setter called on a reader names"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// [`READ_ONLY_TOPIC`](::cerulion_core::message::READ_ONLY_TOPIC) in its error."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    topic: ::std::option::Option<::std::sync::Arc<str>>,"
+    )
+    .unwrap();
     writeln!(
         out,
         "    /// Lifetime carrier. Written-side construction goes through"
@@ -2850,8 +2874,8 @@ fn generate_var_shm_from_bytes(
     writeln!(out, "            ptr: bytes.as_ptr() as *mut u8,").unwrap();
     writeln!(out, "            len: bytes.len(),").unwrap();
     writeln!(out, "            state: ::cerulion_core::shm_runtime::WriterState::new(Self::WIRE_FIXED_SIZE as u32),").unwrap();
-    // Reader-side never writes, so the overflow / max_capacity /
-    // topic fields hold sentinel defaults — the writer-side accessors that
+    // Reader-side never writes, so overflow holds None, max_capacity holds
+    // ZERO and topic holds None; the writer-side accessors that
     // would consume them are gated behind `&mut self` and are unreachable
     // through `from_bytes` (which returns `Self` whose `&mut` method
     // surface is documented unsound per the panic doc above).
@@ -2864,20 +2888,15 @@ fn generate_var_shm_from_bytes(
     // misuse return immediately via `required_end > 0` → PayloadTooLarge
     // with no allocation attempt.
     //
-    // The topic is an `Arc<str>`. Reader-side uses the
-    // cached `read_only_topic()` sentinel — one `Arc::clone` per build_reader
-    // (refcount bump, no allocation), preserving subscriber hot-path
-    // zero-alloc invariants.
+    // The reader's topic is `None`: no `Arc` is cloned on build or released
+    // on drop, so a reader build does no atomic read-modify-write. The
+    // `&mut self` error paths name `READ_ONLY_TOPIC` for a `None` topic.
     writeln!(
         out,
         "            max_capacity: ::cerulion_core::wire::MaxPayloadCapacity::ZERO,"
     )
     .unwrap();
-    writeln!(
-        out,
-        "            topic: ::cerulion_core::message::read_only_topic(),"
-    )
-    .unwrap();
+    writeln!(out, "            topic: ::std::option::Option::None,").unwrap();
     writeln!(out, "            _phantom: ::std::marker::PhantomData,").unwrap();
     // Zero-sized diagnostic proxies (one per variable field). Each is a
     // unit struct, so the field initializer is the type name itself.
@@ -2953,7 +2972,7 @@ fn generate_var_shm_from_bytes_mut(
     writeln!(out, "    ///   `PayloadTooLarge` (no rescue possible).").unwrap();
     writeln!(
         out,
-        "    /// - `topic`: the publisher's topic name, borrowed for the"
+        "    /// - `topic`: the publisher's topic name, stored as `Some(topic)` for the"
     )
     .unwrap();
     writeln!(
@@ -3073,7 +3092,11 @@ fn generate_var_shm_from_bytes_mut(
     writeln!(out, "            state: ::cerulion_core::shm_runtime::WriterState::new(Self::WIRE_FIXED_SIZE as u32),").unwrap();
     writeln!(out, "            overflow: ::std::option::Option::None,").unwrap();
     writeln!(out, "            max_capacity,").unwrap();
-    writeln!(out, "            topic,").unwrap();
+    writeln!(
+        out,
+        "            topic: ::std::option::Option::Some(topic),"
+    )
+    .unwrap();
     writeln!(out, "            _phantom: ::std::marker::PhantomData,").unwrap();
     // Zero-sized diagnostic proxies (one per variable field).
     emit_proxy_field_inits(out, schema);
@@ -3300,7 +3323,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::AllocationFailed {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(
@@ -3414,7 +3437,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::AllocationFailed {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(out, "                requested: max_cap,").unwrap();
@@ -3556,7 +3579,7 @@ fn generate_var_shm_payload_helpers(out: &mut String) {
     writeln!(out, "            return ::std::result::Result::Err(::cerulion_core::TransportError::PayloadTooLarge {{").unwrap();
     writeln!(
         out,
-        "                topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&self.topic)),"
+        "                topic: ::std::string::String::from(self.topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(out, "                requested: required_end,").unwrap();
@@ -5572,7 +5595,7 @@ fn generate_var_shm_staging_resume(
     writeln!(out, "    #[inline]").unwrap();
     writeln!(
         out,
-        "    pub fn __cer_staging_resume(bytes: &'a mut [u8], max_capacity: ::cerulion_core::wire::MaxPayloadCapacity, topic: ::std::sync::Arc<str>, cursor: u32, written: u64, field_starts: &[u32]) -> Self {{"
+        "    pub fn __cer_staging_resume(bytes: &'a mut [u8], max_capacity: ::cerulion_core::wire::MaxPayloadCapacity, topic: ::std::option::Option<::std::sync::Arc<str>>, cursor: u32, written: u64, field_starts: &[u32]) -> Self {{"
     )
     .unwrap();
     writeln!(
@@ -5913,7 +5936,7 @@ fn emit_with_nested_complex(out: &mut String, field: &FieldDef, var_idx: usize) 
     writeln!(out, "        let max_capacity = self.max_capacity;").unwrap();
     writeln!(
         out,
-        "        let topic = ::std::sync::Arc::clone(&self.topic);"
+        "        let topic = ::std::clone::Clone::clone(&self.topic);"
     )
     .unwrap();
     writeln!(out, "        if self.__cer_staged_{raw}.is_none() {{").unwrap();
@@ -5944,7 +5967,7 @@ fn emit_with_nested_complex(out: &mut String, field: &FieldDef, var_idx: usize) 
     .unwrap();
     writeln!(
         out,
-        "                    topic: ::std::string::String::from(::std::convert::AsRef::<str>::as_ref(&topic)),"
+        "                    topic: ::std::string::String::from(topic.as_deref().unwrap_or(::cerulion_core::message::READ_ONLY_TOPIC)),"
     )
     .unwrap();
     writeln!(
@@ -6248,7 +6271,11 @@ fn emit_flush_staged(out: &mut String, schema: &MessageSchema) {
         )
         .unwrap();
         writeln!(out, "                self.max_capacity,").unwrap();
-        writeln!(out, "                ::std::sync::Arc::clone(&self.topic),").unwrap();
+        writeln!(
+            out,
+            "                ::std::clone::Clone::clone(&self.topic),"
+        )
+        .unwrap();
         writeln!(out, "                staged.cursor,").unwrap();
         writeln!(out, "                staged.written,").unwrap();
         writeln!(out, "                &staged.field_starts,").unwrap();
