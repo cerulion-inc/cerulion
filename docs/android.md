@@ -305,7 +305,8 @@ that names the type and the linked types. `status` lists the linked types in
 To send app events into a linked node, publish them on an app topic and read
 that topic in the graph through an absolute `source:` (a name that starts with
 `/`). No node in the graph produces the topic, so the graph attaches to the
-topic the app publishes:
+topic the app publishes. Here `logic` is a node type listed in the library's
+`embed_nodes!`:
 
 ```json
 {
@@ -330,7 +331,8 @@ nodes:
 Each `CerulionRuntime.publish("/myapp/taps", ...)` call is one frame on the
 node's input. A trigger input (`#[input(trigger)]`) ticks the node once per
 frame, in publish order; a burst larger than the input's `depth` (default 10)
-drops its oldest frames. A plain `#[input]` on a `period_ms` node holds the
+drops its oldest frames. On an app topic that is not recorded, a `depth` above
+16 fails the start. A plain `#[input]` on a `period_ms` node holds the
 latest frame: the node produces nothing until the first publish, and then
 reads the newest value on each tick. The runtime creates every `publish` topic
 with room for a node that holds its latest value, so both kinds of input start.

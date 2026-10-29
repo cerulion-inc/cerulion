@@ -153,6 +153,16 @@ fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntim
         .expect("transport manager")
         .create_subscriber(&out_topic)
         .expect("subscribe to the period node output");
+    // About 20 period ticks with nothing published: the node must produce
+    // nothing, never a default value it was not sent.
+    let mut early = 0;
+    let quiet_until = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < quiet_until {
+        subscriber
+            .wait_for_message(Duration::from_millis(50), |_| early += 1)
+            .expect("wait for period node output");
+    }
+    assert_eq!(early, 0, "the period node sent output before any publish");
     let mut shown: Vec<f64> = Vec::new();
     for x in [1.5, 2.5, 3.5, 4.5, 5.5] {
         publish_x(runtime, &app_topic, x);

@@ -978,10 +978,10 @@ pub struct TopicServiceConfig {
     /// (`rmw_take_loaned_message`) HOLDS an [`OwnedInboundSample`](subscriber::OwnedInboundSample)
     /// across the C ABI until rclcpp returns it, so the per-connection borrow
     /// peak is the held-loan count — above the iceoryx2 default of
-    /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` (2). It differs from the
+    /// `ICEORYX2_DEFAULT_BORROWED_SAMPLES` (2). That rmw floor differs from the
     /// owned-topic floor (which is keyed on [`PublisherProvisioning`] and pinned
-    /// at [`SUBSCRIBER_MAX_BORROWED_HELD`] = 3) in both trigger and value, so it
-    /// is its own knob rather than a special case folded into that rule.
+    /// at [`SUBSCRIBER_MAX_BORROWED_HELD`] = 3) in both trigger and value, so
+    /// this is its own knob, and each caller picks its value.
     ///
     /// Also set by the Android embedded runtime on every app publisher, at
     /// [`SUBSCRIBER_MAX_BORROWED_HELD`]: the app creates its topics before the
