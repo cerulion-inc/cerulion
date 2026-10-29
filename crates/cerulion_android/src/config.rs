@@ -290,28 +290,51 @@ fn validate_connect_locator(locator: &str) -> Result<(), EmbedError> {
     // The address ends where zenoh's metadata (`?`) or config (`#`) begins.
     let address = rest.split(['?', '#']).next().unwrap_or_default();
     let (host, port) = match address.strip_prefix('[') {
-        Some(bracketed) => match bracketed.split_once(']') {
-            Some((host, tail)) => (host, tail.strip_prefix(':')),
-            None => (bracketed, None),
-        },
-        None => match address.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (address, None),
-        },
-    };
-    let Some(port) = port else {
-        return Err(invalid("has no port: write it as 'tcp/<host>:<port>'"));
+        Some(bracketed) => {
+            let Some((host, tail)) = bracketed.split_once(']') else {
+                return Err(invalid("has no port: write it as 'tcp/<host>:<port>'"));
+            };
+            let port = match tail.strip_prefix(':') {
+                Some(port) => port,
+                None if tail.is_empty() => {
+                    return Err(invalid("has no port: write it as 'tcp/<host>:<port>'"))
+                }
+                None => {
+                    return Err(invalid(&format!(
+                        "has '{tail}' after ']'; write it as 'tcp/[<address>]:<port>'"
+                    )))
+                }
+            };
+            // The dial resolves a link-local scope by number only, never by
+            // name.
+            let (address, scope) = host.split_once('%').unwrap_or((host, "0"));
+            if address.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(invalid(&format!(
+                    "has '{host}' in brackets, which is not an IPv6 address"
+                )));
+            }
+            if scope.is_empty() || !scope.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid(&format!(
+                    "has IPv6 scope '{scope}'; the scope is the interface number"
+                )));
+            }
+            (host, port)
+        }
+        None => {
+            let Some((host, port)) = address.rsplit_once(':') else {
+                return Err(invalid("has no port: write it as 'tcp/<host>:<port>'"));
+            };
+            if host.contains(':') {
+                return Err(invalid(
+                    "has a ':' in its host; an IPv6 host goes in brackets, as \
+                     'tcp/[<address>]:<port>'",
+                ));
+            }
+            (host, port)
+        }
     };
     if host.is_empty() {
         return Err(invalid("has no host: write it as 'tcp/<host>:<port>'"));
-    }
-    // The dial resolves a link-local scope by number only, never by name.
-    if let Some((_, scope)) = host.split_once('%') {
-        if scope.is_empty() || !scope.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid(&format!(
-                "has IPv6 scope '{scope}'; the scope is the interface number"
-            )));
-        }
     }
     if !port.parse::<u16>().is_ok_and(|port| port != 0) {
         return Err(invalid(&format!(
@@ -656,6 +679,22 @@ mod tests {
             (
                 r#"{"connect":["tcp/desk.local:65536"]}"#,
                 "connect locator 'tcp/desk.local:65536' has port '65536'; a port is a number from 1 to 65535",
+            ),
+            (
+                r#"{"connect":["tcp/desk.local:7690:123"]}"#,
+                "connect locator 'tcp/desk.local:7690:123' has a ':' in its host; an IPv6 host goes in brackets, as 'tcp/[<address>]:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/::1:7690"]}"#,
+                "connect locator 'tcp/::1:7690' has a ':' in its host; an IPv6 host goes in brackets, as 'tcp/[<address>]:<port>'",
+            ),
+            (
+                r#"{"connect":["tcp/[desk.local]:7690"]}"#,
+                "connect locator 'tcp/[desk.local]:7690' has 'desk.local' in brackets, which is not an IPv6 address",
+            ),
+            (
+                r#"{"connect":["tcp/[::1]x:7690"]}"#,
+                "connect locator 'tcp/[::1]x:7690' has 'x:7690' after ']'; write it as 'tcp/[<address>]:<port>'",
             ),
             (
                 r#"{"connect":["tcp/[fe80::1%en0]:7690"]}"#,
