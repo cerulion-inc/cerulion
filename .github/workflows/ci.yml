@@ -1610,6 +1610,9 @@ jobs:
       - name: local-transport subscribe and poll tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_subscribe_poll_test -- --test-threads=1
+      - name: local-transport trace cap tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_trace_cap_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -2738,6 +2741,9 @@ jobs:
       - name: cerulion_android logcat app subscriber integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_logcat_app_subscriber_test -- --test-threads=1
+      - name: cerulion_android trace cap integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_trace_cap_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test sample_graph_asset_test
