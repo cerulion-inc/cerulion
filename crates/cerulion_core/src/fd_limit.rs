@@ -543,6 +543,120 @@ fn log_outcome(outcome: &RaiseOutcome, scope: RaiseScope) {
     }
 }
 
+// ===========================================================================
+// The descriptor table, sized once before a process's threads start
+// ===========================================================================
+
+/// The most descriptors [`presize_descriptor_table`] makes room for.
+pub const DESCRIPTOR_TABLE_PRESIZE_CAP: u64 = 1 << 16;
+
+/// The descriptor number a pre-size duplicates to: one below the smaller of
+/// `soft` and [`DESCRIPTOR_TABLE_PRESIZE_CAP`], so the table then holds that
+/// many slots. `None` for a soft limit below 2, where there is no room above
+/// descriptor 0.
+#[must_use]
+pub fn presize_target(soft: u64) -> Option<u64> {
+    let slots = soft.min(DESCRIPTOR_TABLE_PRESIZE_CAP);
+    (slots >= 2).then(|| slots - 1)
+}
+
+/// What [`presize_descriptor_table`] found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresizeOutcome {
+    /// A descriptor was duplicated to `highest` and both were closed: the
+    /// table holds at least `highest + 1` slots.
+    Presized {
+        /// The descriptor number the duplicate took.
+        highest: u64,
+    },
+    /// No descriptor at or above the target was free, so the table already
+    /// reaches the target.
+    AlreadyLarge {
+        /// The descriptor number that was asked for.
+        target: u64,
+    },
+    /// The soft limit leaves no room above descriptor 0.
+    NoRoom,
+    /// A step failed with `errno`; the table grows on demand as before.
+    Failed {
+        /// The `errno` of the failed call.
+        errno: i32,
+    },
+}
+
+/// Grow this process's descriptor table to [`presize_target`] of the soft
+/// `RLIMIT_NOFILE` slots now, while it is cheap.
+///
+/// Linux grows the table on the open that needs a slot past its end, and
+/// when the table is shared by several threads that open waits for an RCU
+/// grace period before it returns (`expand_fdtable`). A thread that opens a
+/// file in the middle of a step then stops for that wait. Sizing the table
+/// once, before the threads that open files start, leaves no growth for a
+/// later open.
+///
+/// The call opens `/dev/null`, duplicates it with `F_DUPFD_CLOEXEC` to the
+/// lowest free descriptor at or above the target (which grows the table to
+/// cover it, and never replaces a descriptor that is open), and closes both.
+/// A soft limit raised later does not shrink the table. Call it after
+/// [`raise_open_file_limit`] so the target uses the raised limit.
+#[cfg(unix)]
+pub fn presize_descriptor_table() -> PresizeOutcome {
+    let soft = match current_open_file_limit() {
+        Ok(limit) => limit.soft,
+        Err(errno) => return PresizeOutcome::Failed { errno },
+    };
+    let Some(target) = presize_target(soft) else {
+        return PresizeOutcome::NoRoom;
+    };
+    let Ok(target_fd) = libc::c_int::try_from(target) else {
+        return PresizeOutcome::NoRoom;
+    };
+    // SAFETY: the path is a NUL-terminated literal; `open` reads nothing else.
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if null < 0 {
+        return PresizeOutcome::Failed {
+            errno: last_errno(),
+        };
+    }
+    // SAFETY: `null` is a descriptor this call opened; `F_DUPFD_CLOEXEC`
+    // allocates a new descriptor and touches no memory.
+    let high = unsafe { libc::fcntl(null, libc::F_DUPFD_CLOEXEC, target_fd) };
+    let outcome = if high >= 0 {
+        // SAFETY: `high` is the descriptor `fcntl` just returned to this call.
+        unsafe { libc::close(high) };
+        PresizeOutcome::Presized {
+            highest: high as u64,
+        }
+    } else {
+        match last_errno() {
+            libc::EMFILE => PresizeOutcome::AlreadyLarge { target },
+            errno => PresizeOutcome::Failed { errno },
+        }
+    };
+    // SAFETY: `null` is the descriptor this call opened, closed once.
+    unsafe { libc::close(null) };
+    match outcome {
+        PresizeOutcome::Presized { highest } => tracing::debug!(
+            highest,
+            soft,
+            "sized the descriptor table before the process's threads start"
+        ),
+        PresizeOutcome::AlreadyLarge { target } => tracing::debug!(
+            target,
+            soft,
+            "the descriptor table already reaches the pre-size target"
+        ),
+        PresizeOutcome::NoRoom => {}
+        PresizeOutcome::Failed { errno } => tracing::warn!(
+            errno,
+            error = %std::io::Error::from_raw_os_error(errno),
+            "could not size the descriptor table up front; it grows on demand, and a thread \
+             that opens a file while it grows waits for the kernel"
+        ),
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +934,56 @@ mod tests {
             Some(now)
         );
         assert_eq!(RaiseOutcome::Unreadable { errno: 14 }.limit(), None);
+    }
+
+    #[test]
+    fn the_presize_target_is_one_below_the_capped_soft_limit() {
+        assert_eq!(presize_target(0), None);
+        assert_eq!(presize_target(1), None);
+        assert_eq!(presize_target(2), Some(1));
+        assert_eq!(presize_target(1024), Some(1023));
+        assert_eq!(
+            presize_target(DESCRIPTOR_TABLE_PRESIZE_CAP),
+            Some(DESCRIPTOR_TABLE_PRESIZE_CAP - 1)
+        );
+        assert_eq!(
+            presize_target(LINUX_RAISE_CAP),
+            Some(DESCRIPTOR_TABLE_PRESIZE_CAP - 1)
+        );
+        assert_eq!(
+            presize_target(u64::MAX),
+            Some(DESCRIPTOR_TABLE_PRESIZE_CAP - 1)
+        );
+    }
+
+    /// The pre-size leaves the table reaching its target and holds no
+    /// descriptor afterwards. On Linux the table size is read back from
+    /// `FDSize` in `/proc/self/status`.
+    #[cfg(unix)]
+    #[test]
+    fn the_presize_grows_the_table_and_leaves_no_descriptor_open() {
+        let soft = current_open_file_limit().expect("RLIMIT_NOFILE").soft;
+        let target = presize_target(soft).expect("the test process has room above fd 0");
+        let open_before = std::fs::read_dir("/dev/fd").map(|d| d.count()).ok();
+        let outcome = presize_descriptor_table();
+        assert!(
+            matches!(
+                outcome,
+                PresizeOutcome::Presized { highest } if highest >= target
+            ) || outcome == PresizeOutcome::AlreadyLarge { target },
+            "{outcome:?} for target {target}"
+        );
+        let open_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).ok();
+        assert_eq!(open_before, open_after, "the pre-size left a descriptor open");
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").expect("status");
+            let fd_size: u64 = status
+                .lines()
+                .find_map(|l| l.strip_prefix("FDSize:"))
+                .and_then(|v| v.trim().parse().ok())
+                .expect("FDSize line");
+            assert!(fd_size > target, "FDSize {fd_size} does not reach {target}");
+        }
     }
 }

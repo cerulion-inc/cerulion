@@ -46,9 +46,11 @@
 //!   `UNDER_LOAD stressor=...` line naming the load.
 //! * `a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process`:
 //!   the three-rank chain recorded both ways; the relay's first fire co-hosted
-//!   must stay within a bound of its own-process twin. A first fire longer than
+//!   must take at most twice its own-process twin. A first fire longer than
 //!   the relay's queue depth in source periods drains frames that arrived
-//!   during it, which the replay can only place by its recorded-clock fallback.
+//!   during it. `the_descriptor_presize_mutant_is_caught` (`oracle-mutants`)
+//!   skips the descriptor-table pre-size of a process hosting several units
+//!   and must fail it.
 //!
 //! Each timing leg prints one line:
 //!
@@ -909,12 +911,9 @@ fn a_late_relay_with_one_process_per_node_replay_probe() {
 
 /// Runs of each placement the first-fire arm records.
 const FIRST_FIRE_REPS: usize = 3;
-/// The floor of the first-fire bound: a co-hosted first fire within this is
-/// within the noise of a quiet host whatever its own-process twin took.
-const FIRST_FIRE_FLOOR_NS: u64 = 2_000_000;
-/// The co-hosted first fire may take at most this many times its own-process
-/// twin, above the floor.
-const FIRST_FIRE_RATIO: u64 = 4;
+/// The co-hosted first fire may take at most this many times its
+/// own-process twin of the same rep.
+const FIRST_FIRE_RATIO: u64 = 2;
 
 /// One rank's first fire as the bag records it.
 #[derive(Debug, Clone)]
@@ -1058,9 +1057,9 @@ fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &s
 /// A node's first fire costs the same whether its unit shares a process or has
 /// one of its own. The three-rank chain is recorded with one process per node
 /// and with every node in one process, `FIRST_FIRE_REPS` times each, and each
-/// rank's first fire is read off the bag. A co-hosted relay's first fire must
-/// take at most `FIRST_FIRE_RATIO` times its own-process twin, or
-/// `FIRST_FIRE_FLOOR_NS`, whichever is more. Each run prints
+/// rank's first fire is read off the bag. In every rep the co-hosted relay's
+/// first fire must take at most `FIRST_FIRE_RATIO` times the relay's first
+/// fire in its own process. Each run prints
 ///
 /// ```text
 /// FIRST_FIRE rep=<r> placement=<p> rank=<k> node=<id> dur_us=<u> first_step_fires=<n>
@@ -1120,7 +1119,7 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
         }
         let alone = relay[Placement::Declared.label()];
         let hosted = relay[Placement::OneGroup.label()];
-        let bound = (alone * FIRST_FIRE_RATIO).max(FIRST_FIRE_FLOOR_NS);
+        let bound = alone * FIRST_FIRE_RATIO;
         if hosted > bound {
             failures.push(format!(
                 "rep {rep}: co-hosted relay first fire {} us > bound {} us (own process {} us)",
@@ -1131,4 +1130,35 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The probe with the descriptor pre-size skipped
+/// (`DESCRIPTOR_PRESIZE_MUTANT_ENV`): the co-hosted relay's first fire grows
+/// the shared descriptor table, and the probe's bound must fail on it.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[ignore = "box-only: timing on a quiet Linux host"]
+#[serial]
+fn the_descriptor_presize_mutant_is_caught() {
+    // The `graph run` children inherit the variable; `#[serial]` keeps every
+    // other arm of this binary from running while it is set.
+    std::env::set_var(
+        cerulion_cli_engine::graph_cmd::DESCRIPTOR_PRESIZE_MUTANT_ENV,
+        "1",
+    );
+    let caught =
+        std::panic::catch_unwind(a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process);
+    std::env::remove_var(cerulion_cli_engine::graph_cmd::DESCRIPTOR_PRESIZE_MUTANT_ENV);
+    let message = match caught {
+        Ok(()) => panic!("the first-fire probe passed with the descriptor pre-size skipped"),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    };
+    assert!(
+        message.contains("co-hosted relay first fire"),
+        "the probe failed, but not on its first-fire bound: {message}"
+    );
 }

@@ -7129,6 +7129,21 @@ fn worker_transport(
     Ok(transport)
 }
 
+/// Under the `oracle-mutants` feature, setting this variable makes a process
+/// that hosts several executor units skip sizing its descriptor table.
+#[cfg(feature = "oracle-mutants")]
+pub const DESCRIPTOR_PRESIZE_MUTANT_ENV: &str = "CERULION_DESCRIPTOR_PRESIZE_MUTANT";
+
+fn descriptor_presize_skipped_by_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        if std::env::var_os(DESCRIPTOR_PRESIZE_MUTANT_ENV).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Run the worker plans of one process: one plan runs on this thread exactly
 /// as [`graph_run_worker`]; several plans (the executor units one process
 /// group was split into) run one per thread.
@@ -7158,6 +7173,16 @@ pub fn graph_run_worker_host(
         units = plan_paths.len(),
         "worker process hosts several executor units, one thread each"
     );
+    // The unit threads below share this process's descriptor table, and an
+    // open that grows a shared table waits for an RCU grace period. The table
+    // is sized here, before those threads start.
+    if !descriptor_presize_skipped_by_mutant() {
+        #[cfg(unix)]
+        {
+            let _ = cerulion_core::fd_limit::raise_open_file_limit();
+            let _ = cerulion_core::fd_limit::presize_descriptor_table();
+        }
+    }
     /// Clears `running` when its unit's thread leaves `graph_run_worker`, by
     /// return or by unwind, so a panicking unit stops its siblings and the
     /// process exits instead of running on without it.
