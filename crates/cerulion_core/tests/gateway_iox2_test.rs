@@ -5071,6 +5071,108 @@ fn catalog_liveness_separates_a_streaming_topic_from_a_silent_publisher() {
     );
 }
 
+/// A gateway rebuilt on a manager whose query surface an EARLIER gateway
+/// latched reports ITS observed frames through that surface's catalog, and
+/// a host restart's teardown (`serve_nothing`) drops the earlier run's
+/// frames: the surface outlives the first gateway, so a restarted observer
+/// recording into a fresh table would leave the catalog reading the first
+/// run's activity forever. Hand oracle: one frame in the first run, two in
+/// the second.
+#[test]
+fn a_restarted_gateway_reports_its_liveness_through_the_latched_catalog() {
+    let id = unique_id();
+    let topic = format!("/lv/restart/{id}");
+    let plan = || GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![topic.clone()],
+        ingress: vec![],
+    };
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(1_000_000_000);
+    let producer = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("gwlv_p_restart_{id}"),
+            clock: clock.clone() as Arc<dyn Clock>,
+            ..Default::default()
+        },
+        root.clone(),
+    )
+    .expect("init producer");
+    let mut publisher = producer
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .expect("producer publisher");
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("gwlv_g_restart_{id}"),
+            clock: clock.clone() as Arc<dyn Clock>,
+            network: Some(NetworkConfig {
+                robot_identity: Some("gw".to_string()),
+                ..NetworkConfig::default()
+            }),
+            ..Default::default()
+        },
+        root,
+    )
+    .expect("init gateway manager");
+    const MS: u64 = 1_000_000;
+    let frames = |at: u64| {
+        manager
+            .network()
+            .and_then(|network| network.query_surface_serving_handles())
+            .expect("the first gateway latches the query surface")
+            .liveness_for_test(&topic, at)
+            .map(|liveness| liveness.frames_observed)
+    };
+
+    // Run 1: the tap attaches, then one frame is observed.
+    let mut first = GatewayRuntime::new(Arc::clone(&manager), plan()).expect("first gateway boot");
+    let t0 = clock.now_ns();
+    drive_with_sweep(&mut first, &clock, t0);
+    publish_one(&mut publisher, &clock, t0 + 100 * MS, (1.0, 0.0, 0.0));
+    drive_with_sweep(&mut first, &clock, t0 + 110 * MS);
+    assert_eq!(
+        frames(t0 + 110 * MS),
+        Some(1),
+        "the first run observed one frame"
+    );
+    drop(first);
+
+    // The host's teardown empties the latched surface, frames included.
+    manager
+        .network()
+        .and_then(|network| network.query_surface_serving_handles())
+        .expect("latched surface")
+        .serve_nothing();
+    assert_eq!(
+        frames(t0 + 120 * MS),
+        None,
+        "the teardown drops the first run's frames"
+    );
+
+    // Run 2: a new gateway on the same manager observes two frames.
+    let mut restarted =
+        GatewayRuntime::new(Arc::clone(&manager), plan()).expect("restarted gateway boot");
+    let t1 = t0 + 200 * MS;
+    drive_with_sweep(&mut restarted, &clock, t1);
+    for step in 1..=2u64 {
+        let at = t1 + step * 100 * MS;
+        publish_one(&mut publisher, &clock, at, (step as f64, 0.0, 0.0));
+        drive_with_sweep(&mut restarted, &clock, at + 10 * MS);
+    }
+    let settled = t1 + 210 * MS;
+    assert_eq!(
+        restarted.topic_liveness(&topic).map(|l| l.frames_observed),
+        Some(2),
+        "precondition: the restarted gateway observed both frames"
+    );
+    assert_eq!(
+        frames(settled),
+        Some(2),
+        "the latched catalog must report the restarted gateway's frames, and only those"
+    );
+}
+
 /// The RETIRE adjudication pin — registration is PRESENCE-BASED and
 /// the desk-visible surface stays accurate WITHOUT a withdraw primitive. A topic
 /// registered at runtime over the control channel (the rmw / dds_bridge shape)

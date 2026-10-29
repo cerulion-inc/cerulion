@@ -661,7 +661,9 @@ paired default. A non-Unicode `CERULION_LAN_ACCESS` value also fails closed to
 Stopping the runtime, or a start that fails, closes LAN access, withdraws every
 topic announcement, drops every registered bridge grant and empties the served
 catalog and schemas, so demand workers cannot restore grants from an earlier
-open run and no LAN peer sees the topics of a run that is not running.
+open run and no LAN peer sees the topics of a run that is not running. The
+next start's catalog lists that run's topics, schemas and observed frames
+only, never an earlier run's.
 
 The Android emulator's network sits behind NAT and does not pass multicast to
 the host, so test discovery from the device itself or from a physical device
