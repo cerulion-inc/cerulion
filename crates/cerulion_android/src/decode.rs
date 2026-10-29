@@ -32,10 +32,23 @@ pub fn decode_json_into(
     out: &mut String,
 ) -> Result<(), EmbedError> {
     let mut bytes = std::mem::take(out).into_bytes();
-    write_object(layout, frame, &mut bytes)?;
-    *out = String::from_utf8(bytes)
-        .map_err(|error| EmbedError::Decode(error.utf8_error().to_string()))?;
-    Ok(())
+    let written = write_object(layout, frame, &mut bytes);
+    if written.is_err() {
+        bytes.clear();
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            *out = text;
+            written
+        }
+        Err(error) => {
+            let message = error.utf8_error().to_string();
+            let mut bytes = error.into_bytes();
+            bytes.clear();
+            *out = String::from_utf8(bytes).unwrap_or_default();
+            Err(EmbedError::Decode(message))
+        }
+    }
 }
 
 fn write_object(layout: &WireLayout, frame: &[u8], out: &mut Vec<u8>) -> Result<(), EmbedError> {
@@ -80,8 +93,8 @@ fn write_fixed(
     field_name: &str,
     field_type: &FieldType,
 ) -> Result<(), EmbedError> {
-    // `FrameView` checked each fixed field's span against the layout, and
-    // the layout's width per type, so each `try_into` below is exact.
+    // `FrameView` hands out each fixed field's span from the layout without
+    // checking it against the type, so `width` checks it before each copy.
     let width = |n: usize| -> Result<(), EmbedError> {
         if bytes.len() == n {
             Ok(())
@@ -136,7 +149,7 @@ fn write_fixed(
 
 fn unsupported(field_name: &str, field_type: &FieldType) -> EmbedError {
     EmbedError::Decode(format!(
-        "field {field_name} has type {field_type:?}, which poll does not support"
+        "field '{field_name}' has type {field_type:?}, which poll does not support"
     ))
 }
 
@@ -330,9 +343,12 @@ mod tests {
         assert_eq!(out, r#"{"data":"x"}"#);
         decode_json_into(&layout, &long, &mut out).unwrap();
         assert_eq!(out, first);
-        // A frame that fails leaves the buffer empty, never a partial object.
+        // A frame that fails leaves the buffer empty, never a partial object,
+        // and keeps its capacity.
+        let capacity = out.capacity();
         decode_json_into(&layout, &long[..WireHeader::SIZE], &mut out).unwrap_err();
         assert_eq!(out, "");
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]
@@ -364,6 +380,31 @@ mod tests {
         assert_eq!(
             decode(&layout, &frame).unwrap(),
             r#"{"b":2,"d":true,"a":"s","c":[3]}"#
+        );
+    }
+
+    /// Integers and floats read from hand-written little-endian bytes, not
+    /// only from what the encoder wrote.
+    #[test]
+    fn reads_hand_written_little_endian_numbers() {
+        let layout = layout("int16 a\nuint32 b\nfloat32 c\n", "Numbers", "test_msgs");
+        let mut frame = encode_json(&layout, "{}", 64, 0, 0).unwrap();
+        for (name, bytes) in [
+            ("a", &[0xFE, 0xFF][..]),
+            ("b", &[4, 3, 2, 1][..]),
+            ("c", &[0, 0, 0xC0, 0x3F][..]),
+        ] {
+            let field = layout
+                .fixed_fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap();
+            let start = WireHeader::SIZE + field.offset;
+            frame[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        assert_eq!(
+            decode(&layout, &frame).unwrap(),
+            r#"{"a":-2,"b":16909060,"c":1.5}"#
         );
     }
 }

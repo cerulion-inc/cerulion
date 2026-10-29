@@ -82,8 +82,9 @@ impl Subscription {
 }
 
 /// Publishers whose baseline a subscription keeps. A topic has one
-/// publisher unless it is a multi-publisher topic; a publisher that is
-/// gone gives its slot to a new one.
+/// publisher unless it is a multi-publisher topic. When every slot is used,
+/// a new publisher takes the slot of the one seen longest ago, which starts
+/// over with a new baseline if it sends again.
 const MAX_STREAMS: usize = 8;
 
 /// Counts the messages a full queue dropped, from gaps in each publisher's

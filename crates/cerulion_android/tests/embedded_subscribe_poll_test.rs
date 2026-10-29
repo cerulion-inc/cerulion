@@ -248,22 +248,25 @@ fn refuses_a_subscription_it_cannot_serve(runtime: &mut EmbeddedRuntime, topics:
     let refusals = [
         (
             json!({"subscribe": [{"topic": "/poll/deep", "schema": VECTOR3, "depth": 17}]}),
-            "depth 17 for '/poll/deep' exceeds the subscription queue limit 16",
+            "depth 17 for '/poll/deep' exceeds the subscription queue limit 16".to_string(),
         ),
         (
             json!({"subscribe": [{"topic": "/poll/pose", "schema": "geometry_msgs/Pose"}]}),
-            "subscribe schema 'geometry_msgs/Pose' field position has type",
+            "subscribe schema 'geometry_msgs/Pose' field position has type Nested".to_string(),
         ),
         (
             json!({"subscribe": [{"topic": "/poll/none", "schema": "no_msgs/Missing"}]}),
-            "unknown subscribe schema 'no_msgs/Missing'",
+            "unknown subscribe schema 'no_msgs/Missing'".to_string(),
         ),
         (
             json!({
                 "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
                 "subscribe": [{"topic": topics.cmd, "schema": "std_msgs/String"}],
             }),
-            "subscribe topic '",
+            format!(
+                "subscribe topic '{}' has schema 'std_msgs/String', but the app publishes '{VECTOR3}'",
+                topics.cmd
+            ),
         ),
         (
             json!({
@@ -271,7 +274,10 @@ fn refuses_a_subscription_it_cannot_serve(runtime: &mut EmbeddedRuntime, topics:
                 "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
                 "subscribe": [{"topic": topics.echo, "schema": "std_msgs/String"}],
             }),
-            "subscribe topic '",
+            format!(
+                "subscribe topic '{}' has schema 'std_msgs/String', but a graph output declares '{VECTOR3}'",
+                topics.echo
+            ),
         ),
     ];
     for (config, message) in refusals {
@@ -279,7 +285,7 @@ fn refuses_a_subscription_it_cannot_serve(runtime: &mut EmbeddedRuntime, topics:
             .start(&config.to_string())
             .expect_err("the subscription must be refused");
         assert_eq!(error.code(), codes::INVALID_ARGUMENT, "{config}");
-        assert!(error.to_string().starts_with(message), "{config}: {error}");
+        assert!(error.to_string().starts_with(&message), "{config}: {error}");
     }
 }
 

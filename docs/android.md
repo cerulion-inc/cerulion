@@ -358,7 +358,7 @@ if (code == CerulionRuntime.OK) {
 } else if (code == CerulionRuntime.EMPTY) {
     // No new message: poll again later, for example on the next frame.
 } else if (code == CerulionRuntime.BUSY) {
-    // A start or stop is in flight: retry.
+    // A start, a stop, or another publish or poll is in flight: retry.
 }
 ```
 
@@ -378,8 +378,8 @@ sends. A subscription can read a graph output, an app `publish` topic, or a
 topic another publisher in the process sends; a start logs a warning for a
 subscribe topic that is neither an app `publish` topic nor a graph output,
 because a misspelled topic polls `EMPTY` forever. `poll` reads a run that
-is `running`, and also one that is `finished` or `failed`, until `stop`, so
-the last messages of a graph that ended can still be read.
+is `running`, and also one that is `finished`, until `stop`, so the last
+messages of a graph that ended can still be read.
 
 The app's graph topics are served by its gateway. A host sees them with
 `adb forward tcp:7683 tcp:7683` and
@@ -529,7 +529,8 @@ The stable return codes are `0 OK`, `1 NOT_INITIALIZED`,
 `6 NETWORK`, `7 RECORDER`, `8 UNKNOWN_TOPIC`, `9 ENCODE`, `10 PUBLISH`,
 `11 BUSY`, `12 PANIC`, `13 SPAWN`, `14 DECODE`, `15 EMPTY`, and
 `16 RECEIVE`. `EMPTY` is the `poll` result for an empty queue, not an
-error. `RECEIVE` means the transport refused to receive from a subscription.
+error. `RECEIVE` means the transport refused to create a subscription (from
+`start`, in `last_error`) or to receive from one (from `poll`).
 
 `status` returns JSON with `state`, `robot`, `graph`, `nodes`, `listen`,
 `lan_access`, `mdns_advertised`, `record_path`, `published`, `subscribed`,

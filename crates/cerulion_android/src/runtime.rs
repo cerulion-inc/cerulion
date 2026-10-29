@@ -478,8 +478,11 @@ struct ResolvedPublish {
 
 struct ResolvedSubscribe {
     topic: String,
+    schema: String,
     layout: WireLayout,
     depth: usize,
+    /// An app publisher or a graph output of this run produces the topic.
+    produced_in_run: bool,
 }
 
 struct GraphInputs {
@@ -731,16 +734,16 @@ impl EmbeddedRuntime {
     /// Take the oldest message of the subscription on `topic` and return it
     /// as JSON object text, or `None` when its queue is empty. A message that
     /// does not decode is still taken: the error is DECODE and the next poll
-    /// reads the message after it. A run that finished or failed keeps its
-    /// subscriptions until `stop`, so their last messages can still be read.
+    /// reads the message after it. A graph that finished keeps the run's
+    /// subscriptions until `stop`, so its last messages can still be read.
     pub fn poll(&mut self, topic: &str) -> Result<Option<&str>, EmbedError> {
-        let started = matches!(
+        let readable = matches!(
             lock_status(&self.status).state,
-            RuntimeState::Running | RuntimeState::Finished | RuntimeState::Failed
+            RuntimeState::Running | RuntimeState::Finished
         );
-        let Some(run) = self.run.as_mut().filter(|_| started) else {
+        let Some(run) = self.run.as_mut().filter(|_| readable) else {
             return Err(EmbedError::BadState(
-                "poll requires a started runtime".to_string(),
+                "poll requires a running or finished runtime".to_string(),
             ));
         };
         let subscription = run.subscriptions.get_mut(topic).ok_or_else(|| {
@@ -1593,6 +1596,16 @@ fn commit(
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
     }
+    // Another publisher in the process may send such a topic, so it is
+    // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
+    // Logged once the start goes ahead, at its own level.
+    for subscribe in plan.subscribes.iter().filter(|item| !item.produced_in_run) {
+        tracing::warn!(
+            topic = %subscribe.topic,
+            schema = %subscribe.schema,
+            "subscribe topic is neither an app publish topic nor a graph output"
+        );
+    }
     // mDNS registration does I/O: raise it with no lock held. The beacon
     // names only the device, never a topic, and a gateway that stops
     // closes its slot, so a beacon raised after it stopped is dropped.
@@ -1718,19 +1731,12 @@ fn resolve_subscribe(
             subscribe.topic, subscribe.schema
         )));
     }
-    if producers.is_empty() {
-        // Another publisher in the process may send it, so this is allowed;
-        // a misspelled topic would otherwise poll EMPTY with no sign.
-        tracing::warn!(
-            topic = %subscribe.topic,
-            schema = %subscribe.schema,
-            "subscribe topic is neither an app publish topic nor a graph output"
-        );
-    }
     Ok(ResolvedSubscribe {
         topic: subscribe.topic.clone(),
+        schema: subscribe.schema.clone(),
         layout: layout.clone(),
         depth: subscribe.depth,
+        produced_in_run: !producers.is_empty(),
     })
 }
 

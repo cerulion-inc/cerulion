@@ -37,7 +37,7 @@ pub mod codes {
     pub const DECODE: i32 = 14;
     /// The subscription queue holds no message.
     pub const EMPTY: i32 = 15;
-    /// The transport refused to receive from a subscription.
+    /// The transport refused to create a subscription or receive from it.
     pub const RECEIVE: i32 = 16;
 }
 
@@ -86,7 +86,7 @@ pub enum EmbedError {
     /// A received frame could not be decoded into JSON.
     #[error("{0}")]
     Decode(String),
-    /// The transport refused to receive from a subscription.
+    /// The transport refused to create a subscription or receive from it.
     #[error("{0}")]
     Receive(String),
 }
