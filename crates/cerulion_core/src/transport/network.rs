@@ -1138,7 +1138,7 @@ impl GetDemandState {
 /// Principle-#3 accessors.
 #[derive(Default)]
 pub struct DemandGetState {
-    /// canonical ingress topics to demand each pass (fixed at gateway boot).
+    /// canonical ingress topics to demand each pass.
     topics: Mutex<Vec<String>>,
     /// producer robot identities harvested from the announce space - targets the
     /// EXPLICIT GETs. Empty ⇒ the WILDCARD fallback (`cerulion_q/*/demand{topic}`,
@@ -1186,7 +1186,7 @@ impl DemandGetState {
     /// set every pass, so a topic added while the loop runs is demanded on the very
     /// next pass. This is the seam that lets a PURE-INGRESS demander
     /// (`cerulion-netd`) grow its keepalive set as consumers demand new mirrors,
-    /// versus the gateway's fixed boot set ([`Self::from_topics`]).
+    /// and a gateway add its ingress topics at boot.
     pub fn add_topic(&self, canonical: String) {
         let mut topics = self
             .topics
@@ -5592,8 +5592,10 @@ impl NetworkManager {
     ///
     /// Lifecycle mirrors [`Self::start_demand_reconciler`]: a dedicated
     /// `"cerulion-demand-get"` thread stopped by `stop_bg_thread` at
-    /// [`Drop`]. IDEMPOTENT - one loop per gateway. An empty `topics` set skips
-    /// the thread (a pure-egress gateway has no ingress to demand).
+    /// [`Drop`]. IDEMPOTENT - one loop per manager: a call while the loop
+    /// runs leaves it on the state it started with and ignores
+    /// `demand_state`. An empty `topics` set skips the thread (a pure-egress
+    /// gateway has no ingress to demand).
     ///
     /// # Errors
     ///
@@ -5625,7 +5627,7 @@ impl NetworkManager {
                 reason: "demand-get loop state mutex poisoned".to_string(),
             })?;
         if state.handle.is_some() {
-            // Already running - one loop per gateway (idempotent).
+            // Already running - one loop per manager (idempotent).
             return Ok(());
         }
 
@@ -5669,10 +5671,10 @@ impl NetworkManager {
 
     /// Register `topic` in the DYNAMIC demand-keepalive set and ensure the
     /// background demand-GET loop is running over it - the PURE-INGRESS demander's
-    /// self-heal wiring (`cerulion-netd`). A gateway starts its own loop from a
-    /// fixed boot set ([`Self::start_demand_get_loop`]); a pure-ingress demander
-    /// (which only ever calls [`crate::transport::TransportManager::register_ingress_topic`],
-    /// never boots a gateway) instead calls THIS per demanded topic so the
+    /// self-heal wiring (`cerulion-netd`), and a gateway's for its ingress
+    /// topics at boot. A pure-ingress demander (which only ever calls
+    /// [`crate::transport::TransportManager::register_ingress_topic`], never
+    /// boots a gateway) calls THIS per demanded topic so the
     /// re-affirming GET keepalive runs - the dialer→accepter query that
     /// (a) crosses a strict connect-only link the demand-token declaration cannot,
     /// and (b) RE-AFFIRMS egress within one pass after a restarted robot gateway's
@@ -5697,6 +5699,13 @@ impl NetworkManager {
         // and the running loop re-reads the grown topic set every pass - so the
         // newly-added topic is demanded on the very next pass without a restart.
         self.start_demand_get_loop(Arc::clone(&self.ingress_demand_state))
+    }
+
+    /// The DYNAMIC demand-keepalive set itself: the topics and counters the
+    /// manager's one demand-GET loop reads once a keepalive or a gateway
+    /// started it.
+    pub(crate) fn ingress_demand_state(&self) -> Arc<DemandGetState> {
+        Arc::clone(&self.ingress_demand_state)
     }
 
     /// Remove `topic` from the DYNAMIC demand-keepalive set (its mirror's

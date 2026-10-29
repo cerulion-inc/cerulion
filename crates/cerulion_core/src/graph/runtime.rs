@@ -637,8 +637,12 @@ fn build_input_meta_lookup(metas: &[InputMeta]) -> HashMap<String, &InputMeta> {
 /// - **two consumers disagree** (distinct non-zero hashes) → `Err` naming
 ///   both `(node, input)` sites and both hashes.
 /// - otherwise → the one declared hash.
+///
+/// An embedder that opens ingress without a `network:` block (the Android
+/// app runtime) calls this too, so it and `graph run` refuse the same graphs
+/// with the same words.
 // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
-fn resolve_ingress_schema_hash(
+pub fn resolve_ingress_schema_hash(
     topic: &str,
     config: &GraphConfig,
     entry_infos: &IndexMap<String, NodeInfo>,

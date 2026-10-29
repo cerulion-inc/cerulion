@@ -878,8 +878,10 @@ pub struct GatewayRuntime {
     /// a pure-ingress gateway (no queryable declared).
     get_demand_state: Arc<GetDemandState>,
     /// Queryable inversion: DEMANDER-side demand-GET tracking, present
-    /// iff this gateway has ingress topics (the demand-GET loop is running). Its
-    /// counters surface via [`Self::demand_get_pass_count`] etc.
+    /// iff this gateway has ingress topics (the demand-GET loop is running):
+    /// the manager's shared demand set, so its counters cover every pass the
+    /// manager's one loop ran. They surface via [`Self::demand_get_pass_count`]
+    /// etc.
     demand_get_state: Option<Arc<DemandGetState>>,
     /// The belt's LIVE iteration set for the
     /// synchronous [`Self::reconcile_demand_once`] seam (the background thread owns
@@ -1257,21 +1259,20 @@ impl GatewayRuntime {
         //     — every ~2 s it GETs each ingress topic's egress ON at the producer
         //     (a dialer QUERY that reaches a listening accepter — the direction
         //     that survives a strict connect-only link where the ingress DEMAND
-        //     token declaration above never forwards).
+        //     token declaration above never forwards). A manager runs ONE loop
+        //     for its lifetime, so the topics go into the manager's shared
+        //     demand set the loop reads: a later gateway on the same manager
+        //     (an embedder that starts its run again) is demanded too. Whoever
+        //     stops this gateway removes its topics again
+        //     (`NetworkManager::remove_ingress_demand_keepalive`).
         let demand_get_state = if plan.ingress.is_empty() {
             None
         } else {
-            let ingress_topics: Vec<String> = plan
-                .ingress
-                .iter()
-                .map(|e| canonical_topic(&e.topic).into_owned())
-                .collect();
-            let state = Arc::new(DemandGetState::from_topics(ingress_topics));
-            manager
-                .network()
-                .expect("network present (checked above)")
-                .start_demand_get_loop(Arc::clone(&state))?;
-            Some(state)
+            let network = manager.network().expect("network present (checked above)");
+            for entry in &plan.ingress {
+                network.ensure_ingress_demand_keepalive(&entry.topic)?;
+            }
+            Some(network.ingress_demand_state())
         };
 
         // Open the READER on the runtime-registration control service.

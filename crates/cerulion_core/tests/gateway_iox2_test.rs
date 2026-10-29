@@ -995,6 +995,64 @@ fn gateway_ingress_reinjects_into_local_shm() {
     );
 }
 
+/// A manager runs one demand-GET loop for its lifetime. A gateway booted on
+/// a manager whose earlier gateway stopped (an embedder that starts its run
+/// again) must still have its OWN ingress topics demanded: its passes count
+/// up, and the manager's demand set holds its topic only once the earlier
+/// owner removed its own.
+#[test]
+fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
+    let id = unique_id();
+    let first = format!("/gwseq/{id}/first");
+    let second = format!("/gwseq/{id}/second");
+    let port = probe_ephemeral_port();
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("gwseq_{id}"),
+            network: Some(NetworkConfig {
+                listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                robot_identity: Some("gwseq".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("init manager");
+    let plan = |topic: &str| GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowList(vec![]),
+        announce: vec![],
+        ingress: vec![GatewayIngressEntry {
+            topic: topic.to_string(),
+            schema_hash: Vector3::SCHEMA_HASH,
+        }],
+    };
+    let await_pass = |gateway: &GatewayRuntime, which: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gateway.demand_get_pass_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no demand-GET pass ever ran over the {which} gateway's ingress topics"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let network = mgr.network().expect("network");
+
+    let gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&first)).expect("first gateway");
+    await_pass(&gateway, "first");
+    assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+    drop(gateway);
+    network.remove_ingress_demand_keepalive(&first);
+    mgr.unregister_ingress_topic(&first)
+        .expect("release the first ingress bridge");
+    assert_eq!(network.ingress_demand_keepalive_topic_count(), 0);
+
+    let gateway = GatewayRuntime::new(Arc::clone(&mgr), plan(&second)).expect("second gateway");
+    await_pass(&gateway, "second");
+    assert_eq!(network.ingress_demand_keepalive_topic_count(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // The demand RECONCILER — the query-shaped belt to the subscriber
 // watch. Test 1 is LIVE (cross-session, with the subscriber path SUPPRESSED so

@@ -82,9 +82,9 @@ pub use partition::{
     ProfileResult, WarmupObservation, REMEDY_CO_LOCATE, REMEDY_SINGLE_PROCESS,
 };
 pub use runtime::{
-    build_trigger_edges, compute_gateway_plan, validate_network_ingress, BuildPurpose,
-    CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime, NodeTickPanicRecords,
-    BARRIER_BOUNDARY_TIMEOUT, EXTERNAL_TOPIC_SILENCE_GRACE_MS,
+    build_trigger_edges, compute_gateway_plan, resolve_ingress_schema_hash,
+    validate_network_ingress, BuildPurpose, CreditBinding, CreditRole, CrossProcessWiring,
+    GraphRuntime, NodeTickPanicRecords, BARRIER_BOUNDARY_TIMEOUT, EXTERNAL_TOPIC_SILENCE_GRACE_MS,
 };
 pub use sibling_topics::{SiblingConsumedTopics, SiblingProducedTopics};
 pub use topology::{
