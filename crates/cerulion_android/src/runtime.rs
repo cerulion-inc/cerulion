@@ -808,6 +808,21 @@ impl EmbeddedRuntime {
         Ok(crate::encode::max_publish_json_len(state.max_payload_bytes))
     }
 
+    /// Refuse `stamp_ns` for a publish on `topic` when it is more than
+    /// [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead of the clock, the same check
+    /// [`publish_stamped`](Self::publish_stamped) makes. The JNI layer runs it
+    /// after [`publish_json_limit`](Self::publish_json_limit) and before it
+    /// reads the message, so a stamped publish checks the state, the topic,
+    /// the stamp and then the message.
+    pub(crate) fn check_publish_stamp(&self, topic: &str, stamp_ns: u64) -> Result<(), EmbedError> {
+        let state = self
+            .run
+            .as_ref()
+            .and_then(|run| run.publishers.get(topic))
+            .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
+        frame_stamp(state.clock.now_ns(), Some(stamp_ns)).map(drop)
+    }
+
     /// Test seam: the publish-decision test needs a running status without a
     /// live transport.
     #[cfg(test)]

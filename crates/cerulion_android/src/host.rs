@@ -347,6 +347,13 @@ impl Host {
             Ok(limit) => limit,
             Err(error) => return error.code(),
         };
+        // A stamp too far ahead is refused before `prepare` reads the
+        // message, so its refusal does not depend on the message.
+        if let Some(stamp_ns) = stamp_ns {
+            if let Err(error) = runtime.check_publish_stamp(topic, stamp_ns) {
+                return error.code();
+            }
+        }
         let json = match prepare(limit) {
             Ok(json) => json,
             Err(code) => return code,
@@ -975,6 +982,13 @@ mod tests {
         assert_eq!(
             host.publish_prepared("/host_test/heartbeat", |_| Err(codes::ENCODE)),
             codes::ENCODE
+        );
+        // A stamp too far ahead is refused before the message is prepared.
+        assert_eq!(
+            host.publish_stamped_prepared("/host_test/heartbeat", Some(u64::MAX), |_| {
+                unreachable!("a refused stamp must not prepare the message")
+            }),
+            codes::INVALID_ARGUMENT
         );
         assert_eq!(
             lock_status(&host.status)

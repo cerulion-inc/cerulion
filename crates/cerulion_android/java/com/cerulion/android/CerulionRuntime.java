@@ -93,10 +93,10 @@ public final class CerulionRuntime {
      * checks the runtime state and the topic as
      * {@link #publish(String, String)} does, with the same codes. Then a
      * stamp more than one second ahead of the runtime clock returns
-     * {@link #INVALID_ARGUMENT}. This check runs before the message is
-     * encoded, so a message that is not valid and also carries a stamp too
-     * far ahead can return {@link #INVALID_ARGUMENT} where {@code publish}
-     * returns {@link #ENCODE}. A refused call sends nothing.
+     * {@link #INVALID_ARGUMENT} before the message is read, so a message
+     * {@code publish} refuses with {@link #ENCODE} returns
+     * {@link #INVALID_ARGUMENT} when its stamp is also too far ahead. A
+     * refused call sends nothing.
      */
     public static int publishStamped(String topic, String json, long stampNs) {
         ensureLoaded();
