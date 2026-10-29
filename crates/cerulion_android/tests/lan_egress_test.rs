@@ -288,10 +288,11 @@ fn an_egress_list_serves_only_its_topics_and_refuses_the_rest() {
     let log_path = dir.join("observer.log");
     let port = free_port();
     let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
+    // A loopback listen with the default `mdns`: the desk recipe behind
+    // `adb forward`, which never raises a beacon.
     let config = |extra: serde_json::Value| {
         let mut config = json!({
             "listen": [format!("tcp/127.0.0.1:{port}")],
-            "mdns": false,
             "publish": [
                 {"topic": SHARED, "schema": "std_msgs/String"},
                 {"topic": PRIVATE, "schema": "std_msgs/String"}
@@ -367,6 +368,10 @@ fn an_egress_list_serves_only_its_topics_and_refuses_the_rest() {
         ),
     ] {
         runtime.start(&config(extra)).unwrap();
+        assert!(
+            !runtime.status_handle().lock().unwrap().mdns_advertised,
+            "{run}: a loopback listen raises no beacon"
+        );
         touch(dir, &format!("{run}.go"));
         await_step(&mut observer.0, dir, &format!("{run}.probed"), &log_path);
         assert_eq!(read_report(dir, &format!("{run}.acks")), acks, "{run}");

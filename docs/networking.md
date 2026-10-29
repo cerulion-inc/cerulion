@@ -428,7 +428,9 @@ serialized plan + the run's iceoryx2 namespace.
   against that version and configuration: the DIALER's declarations do not
   reach the ACCEPTER and the ACCEPTER's GETs do not route to the DIALER. The
   directions that carry are ACCEPTER→DIALER declarations (at connect) and
-  DIALER→ACCEPTER queries. A
+  DIALER→ACCEPTER queries. An Android app that dials a listening desk with its
+  `connect` key is not held back by this on the zenoh this release builds: the
+  desk's catalog and demand GETs reach the app over the link the app dialed. A
   demand design on either of the other directions (the dialer DECLARING a
   `cerulion_lv` token, or the accepter GETting `cerulion_lv/**`) stays dark on
   such a link, so demand rides the two directions that carry, folded

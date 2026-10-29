@@ -271,8 +271,18 @@ public final class MainActivity extends Activity {
             if (lanAccess != null) {
                 config.put("lan_access", lanAccess);
             }
-        } else if (getIntent().hasExtra("lan_access")) {
-            Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
+            // One locator the app dials, such as a desk behind `adb reverse`.
+            String connect = getIntent().getStringExtra("connect");
+            if (connect != null) {
+                config.put("connect", new JSONArray().put(connect));
+            }
+        } else {
+            if (getIntent().hasExtra("lan_access")) {
+                Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
+            }
+            if (getIntent().hasExtra("connect")) {
+                Log.w(TAG, "ignoring connect extra in a release build; the app dials no peer");
+            }
         }
         // No node_lib_dir: graph nodes come from the node registry of the
         // loaded runtime library.
