@@ -1532,7 +1532,8 @@ fn wait_recorder_ready(
 
 /// The topic service config an app publisher on a
 /// RECORDED topic creates the service with: the graph build's recorded-topic
-/// raise applied to a default-opener base, so the bagd tap gets the same
+/// raise applied to `base` (the caller passes the default config with the
+/// app topics' borrow floor set), so the bagd tap gets the same
 /// borrow headroom (`RECORDING_SUBSCRIBER_MAX_BORROWED`) and receive-queue
 /// depth (`recording_tap_buffer_depth`) a recorded graph output gets.
 fn recorded_publisher_config(

@@ -54,9 +54,8 @@ pub struct PeriodInputNode {
 impl PeriodInputNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         // A real read of the (frozen/live) input slot + a real publish — no
-        // fake data (Principle #13). The trace records only fire order/time, so
-        // the body's value is incidental, but the read/publish exercise the
-        // wired ports.
+        // fake data (Principle #13). The trace tests read only fire order/time;
+        // `cerulion_android`'s app topic test asserts the copied `x`.
         self.out.x = self.inp.x;
         Ok(())
     }

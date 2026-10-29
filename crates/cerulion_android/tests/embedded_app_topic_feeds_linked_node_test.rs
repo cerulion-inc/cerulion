@@ -131,8 +131,9 @@ fn trigger_input_gets_every_app_frame_in_order(runtime: &mut EmbeddedRuntime, pi
 /// The period node copies its latest-value input's `x` into every output
 /// frame. Until the app publishes, the node produces nothing; after each
 /// publish its output holds the new value. Each value is published once the
-/// node has shown the previous one, so the node must show every value, in
-/// order, and never a value the app did not send.
+/// node has shown the previous one on two ticks (a second frame with no new
+/// publish is the hold), so the node must show every value, in order, and
+/// never a value the app did not send.
 fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntime, pid: u32) {
     let app_topic = format!("/app_feed_latest_{pid}/cmd");
     let prefix = format!("app_feed_latest_graph_{pid}");
@@ -163,22 +164,33 @@ fn latest_value_input_holds_each_app_frame_in_order(runtime: &mut EmbeddedRuntim
             .expect("wait for period node output");
     }
     assert_eq!(early, 0, "the period node sent output before any publish");
-    let mut shown: Vec<f64> = Vec::new();
+    // `(x, frames)`: each value the node showed, and on how many frames.
+    let mut shown: Vec<(f64, usize)> = Vec::new();
     for x in [1.5, 2.5, 3.5, 4.5, 5.5] {
         publish_x(runtime, &app_topic, x);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while shown.last() != Some(&x) && Instant::now() < deadline {
+        while shown
+            .last()
+            .is_none_or(|&(value, frames)| value != x || frames < 2)
+            && Instant::now() < deadline
+        {
             subscriber
                 .wait_for_message(Duration::from_millis(200), |message| {
                     let (value, _) = x_and_z(message.payload());
-                    if shown.last() != Some(&value) {
-                        shown.push(value);
+                    match shown.last_mut() {
+                        Some((last, frames)) if *last == value => *frames += 1,
+                        _ => shown.push((value, 1)),
                     }
                 })
                 .expect("wait for period node output");
         }
     }
-    assert_eq!(shown, [1.5, 2.5, 3.5, 4.5, 5.5]);
+    let values: Vec<f64> = shown.iter().map(|&(value, _)| value).collect();
+    assert_eq!(values, [1.5, 2.5, 3.5, 4.5, 5.5], "{shown:?}");
+    assert!(
+        shown.iter().all(|&(_, frames)| frames >= 2),
+        "each value must be held over at least two ticks: {shown:?}"
+    );
     runtime.stop().expect("stop the latest-value graph");
 }
 
