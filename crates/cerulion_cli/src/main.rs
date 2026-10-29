@@ -410,7 +410,9 @@ fn dispatch(cli: Cli) -> ExitCode {
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
-        CliError::NodeFatal { .. } | CliError::WorkerNodeFatal { .. } => EXIT_NODE_FATAL,
+        CliError::NodeFatal { .. }
+        | CliError::WorkerNodeFatal { .. }
+        | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
         _ => 1,
     }
 }
@@ -5195,6 +5197,10 @@ mod cli_error_exit_code_tests {
         };
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced),
+            3
+        );
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1

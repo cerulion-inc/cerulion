@@ -6058,13 +6058,14 @@ pub fn graph_run(
     let raw_execution_mode =
         std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
     let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
-    let single_process = single_process
-        && !single_process_hosts_units(
+    let single_process_in_units = single_process
+        && single_process_hosts_units(
             workspace_root,
             &mut config,
             time_source,
             execution_mode_request,
         )?;
+    let single_process = single_process && !single_process_in_units;
     let deployment = resolve_deployment(
         config.has_process_groups(),
         single_process,
@@ -6417,7 +6418,16 @@ pub fn graph_run(
                     )
                 })
                 .flatten();
-            return ros2_children.finish(graph_run_supervisor(
+            // A `--single-process` run in executor units is one worker
+            // process, which prints a fatal node's own `Error:` line; the
+            // verdict then adds no line naming the process.
+            let announce = |result: CliResult<()>| match result {
+                Err(CliError::WorkerNodeFatal { .. }) if single_process_in_units => {
+                    Err(CliError::WorkerNodeFatalAnnounced)
+                }
+                other => other,
+            };
+            return ros2_children.finish(announce(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
                 config,
@@ -6469,7 +6479,7 @@ pub fn graph_run(
                 #[cfg(not(unix))]
                 None,
                 &embed_config,
-            ));
+            )));
         }
         Ok(Deployment::MonolithFallback { reason }) => {
             tracing::warn!(graph = %config.identity(), "{reason}");
@@ -9441,7 +9451,7 @@ fn kill_stragglers(guards: &mut [ChildGuard]) -> Vec<String> {
     for g in guards.iter_mut() {
         if let Some(status) = g.kill_and_reap_status() {
             if classify_worker_exit(&status) == WorkerExit::NodeFatal {
-                node_fatal_groups.extend(g.units());
+                node_fatal_groups.push(g.group.clone());
             }
         }
     }
@@ -9469,7 +9479,7 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
             ChildPoll::Running => {}
             ChildPoll::Exited(status) if classify_worker_exit(&status).is_clean() => {
                 if classify_worker_exit(&status) == WorkerExit::NodeFatal {
-                    node_fatal_groups.extend(g.units());
+                    node_fatal_groups.push(g.group.clone());
                 }
                 // Consumed a clean-exit event mid-sweep — surface it so the caller
                 // runs the Draining transition (at most one is possible per pass in
@@ -12704,7 +12714,7 @@ fn graph_run_supervisor(
                 ChildPoll::Exited(status) if normal => {
                     let exit = classify_worker_exit(&status);
                     if exit == WorkerExit::NodeFatal {
-                        node_fatal_groups.extend(units.iter().cloned());
+                        node_fatal_groups.push(group.clone());
                     }
                     if exit.is_clean() {
                         // A CLEAN worker exit = graph shutdown. Flip to Draining AND
@@ -12884,7 +12894,7 @@ fn graph_run_supervisor(
                 ChildPoll::Exited(status) => {
                     let exit = classify_worker_exit(&status);
                     if exit == WorkerExit::NodeFatal {
-                        node_fatal_groups.extend(units.iter().cloned());
+                        node_fatal_groups.push(group.clone());
                     }
                     if exit.is_clean() {
                         tracing::debug!(group = %group, "worker drained (clean exit)");
