@@ -32,21 +32,21 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 
 - `cargo test -p cerulion_bagd -- --test-threads=1` - serial for a process-GLOBAL panic
   hook, not SHM (each test builds an isolated transport).
-- Rendezvous with a rescan-attached tap via `await_rescan_tap` (condition poll), never
-  `sleep(...)` - data-only taps have no back-fill, so earlier frames are simply gone.
+- Rendezvous on `topic_subscriber_count`, never `sleep(...)`: a data-only tap has no back-fill.
 - No wall-clock assertion bands: verdicts and frame-set relations only; every wait is a condition under a seconds-scale ceiling.
 
 ## Gotchas
 
-- Topic ENUMERATION stays OFF the drive loop (`discovery_scan::DiscoveryScanner` walks on
-  its own thread; the loop takes an O(1) snapshot). An inline walk starves the drain and
-  loses frames the writer never saw. Both failures are loud: unspawnable degrades to inline
-  with a `warn!`, spawned-but-silent rides `ScanSilenceLatch`.
+- Topic ENUMERATION stays OFF the drive loop (`discovery_scan::DiscoveryScanner`; the loop
+  takes an O(1) snapshot) and is EVENT-driven, never timed: the worker blocks on a kernel
+  watch of the iceoryx2 service directory (`service_dir_watch`, inotify/kqueue) and walks
+  only on a change, so an idle machine runs ZERO walks. An inline walk starves the drain;
+  a cadence burns a core. Degradations are loud AND observable via `wake_source()`; a dead
+  worker is caught by its HEARTBEAT (`ScanSilenceLatch`), never by silence, normal here.
 - Live discovery defaults ON only for `--topics-json` and `--run`; OFF for
   `--topic`/`--all`/`--regex` and `BagdConfig::new`. `graph run --record` builds bagd's argv
   itself: retune with `CERULION_RECORD_DISCOVERY=off` / `CERULION_RECORD_DISCOVERY_SETTLE_MS`.
-- Even a quiet graph pays the settle floor (`DISCOVERY_SETTLE_MIN`); the
-  arm-time scan does NOT count as a quiet scan.
+- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found, AND no woken walk is still pending; an arm-time find does NOT start it.
 - Bag creation is held for max(discovery settle, schema wait) - measure it from
   `BagdSummary::channel_set_closed_after`, never the bag file's appearance (reads short).
 - Both record paths run on the default `iox2_` namespace: discovery also taps
