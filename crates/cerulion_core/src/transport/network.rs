@@ -1173,14 +1173,6 @@ pub struct DemandGetState {
 }
 
 impl DemandGetState {
-    /// Build a demander state for a fixed set of canonical ingress topics.
-    pub fn from_topics(topics: Vec<String>) -> Self {
-        Self {
-            topics: Mutex::new(topics),
-            ..Default::default()
-        }
-    }
-
     /// Add a canonical ingress topic to the DYNAMIC demand set (idempotent -
     /// a duplicate is a no-op). The background demand-GET loop re-reads the topic
     /// set every pass, so a topic added while the loop runs is demanded on the very
@@ -3573,9 +3565,11 @@ pub struct NetworkManager {
     reconciler: Mutex<BgThreadState>,
     /// Queryable inversion: the DEMANDER-side background DEMAND-GET loop
     /// thread's lifecycle state - re-issues demand GETs every
-    /// `DEMAND_GET_INTERVAL` for every registered ingress topic. Started by
-    /// [`Self::start_demand_get_loop`] (once, from the gateway); stopped by
-    /// `stop_bg_thread` in [`Drop`].
+    /// `DEMAND_GET_INTERVAL` for every topic of the demand set it was started
+    /// over. Started by [`Self::start_demand_get_loop`] once per manager,
+    /// through the first gateway boot with ingress or the first
+    /// [`Self::ensure_ingress_demand_keepalive`]; stopped by `stop_bg_thread`
+    /// in [`Drop`].
     demand_get: Mutex<BgThreadState>,
     /// The unified query surface: the PRODUCER-side retained verb-dispatched
     /// QUERYABLE (`cerulion_q/{robot}/**`) - serves both the `demand` verb
@@ -3692,19 +3686,15 @@ pub struct NetworkManager {
     /// demand. `None` on a manager that is not a gateway (no probe installed) —
     /// both paths then serve registered topics only.
     permissive_probe: Mutex<Option<Arc<PermissiveShmProbe>>>,
-    /// The DYNAMIC demand set for a PURE-INGRESS demander's self-heal
-    /// keepalive loop (`cerulion-netd`). A gateway builds its OWN
-    /// [`DemandGetState`] from its fixed boot ingress list and passes it to
-    /// [`Self::start_demand_get_loop`]; a pure-ingress demander instead calls
-    /// [`Self::ensure_ingress_demand_keepalive`] per demanded topic, which grows
-    /// THIS shared set and start-once-drives the SAME loop over it. Both share the
-    /// manager's single `demand_get` thread slot (start-once, idempotent), and a
-    /// manager is only ever ONE role - a gateway (fixed set) or a pure-ingress
-    /// demander (this dynamic set) - so they never contend. The self-heal is the
-    /// dialer→accepter demand GET (the wire direction that survives a
-    /// strict connect-only link AND re-crosses after a restarted robot gateway
-    /// reconnects), which the gateway-only wiring never started for the
-    /// pure-ingress netd path (the silent-black-hole root cause).
+    /// The manager's one DYNAMIC demand set, read by the single `demand_get`
+    /// loop. A pure-ingress demander (`cerulion-netd`) adds each demanded
+    /// topic through [`Self::ensure_ingress_demand_keepalive`]; a gateway adds
+    /// its ingress topics the same way at boot, and whoever stops the gateway
+    /// removes them with [`Self::remove_ingress_demand_keepalive`]. So a later
+    /// gateway on the same manager is demanded its own topics. The demand GET
+    /// is the dialer→accepter query (the wire direction that survives a strict
+    /// connect-only link AND re-crosses after a restarted robot gateway
+    /// reconnects).
     ingress_demand_state: Arc<DemandGetState>,
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.

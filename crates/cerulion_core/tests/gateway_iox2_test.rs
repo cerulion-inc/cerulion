@@ -997,9 +997,9 @@ fn gateway_ingress_reinjects_into_local_shm() {
 
 /// A manager runs one demand-GET loop for its lifetime. A gateway booted on
 /// a manager whose earlier gateway stopped (an embedder that starts its run
-/// again) must still have its OWN ingress topics demanded: its passes count
-/// up, and the manager's demand set holds its topic only once the earlier
-/// owner removed its own.
+/// again) must still have its OWN ingress topics demanded: the manager's
+/// demand set holds its topic (and only it, once the earlier owner removed
+/// its own), and the loop keeps running passes over that set.
 #[test]
 fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
     let id = unique_id();
@@ -1027,9 +1027,12 @@ fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
             schema_hash: Vector3::SCHEMA_HASH,
         }],
     };
+    // The pass counter belongs to the manager's one demand set, so each wait
+    // starts from the count the gateway saw at boot.
     let await_pass = |gateway: &GatewayRuntime, which: &str| {
+        let before = gateway.demand_get_pass_count();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while gateway.demand_get_pass_count() == 0 {
+        while gateway.demand_get_pass_count() == before {
             assert!(
                 Instant::now() < deadline,
                 "no demand-GET pass ever ran over the {which} gateway's ingress topics"
