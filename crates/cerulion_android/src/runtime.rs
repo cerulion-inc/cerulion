@@ -370,14 +370,34 @@ type BeforeCommitHook = Box<dyn FnOnce(&TransportManager) + Send>;
 #[cfg(any(test, feature = "test-helpers"))]
 type GraphExitHook = Box<dyn FnOnce(&[cerulion_core::TraceEntry]) + Send>;
 
+/// How far ahead of the runtime clock a caller stamp may be, in
+/// nanoseconds (one second). [`EmbeddedRuntime::publish_stamped`] refuses a
+/// stamp further ahead.
+pub const MAX_PUBLISH_STAMP_LEAD_NS: u64 = 1_000_000_000;
+
+/// The wire stamp of an app frame published at clock time `now_ns`: the
+/// caller's `stamp_ns` when it is given, else `now_ns`. A caller stamp more
+/// than [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead of `now_ns` is refused.
+fn frame_stamp(now_ns: u64, stamp_ns: Option<u64>) -> Result<u64, EmbedError> {
+    match stamp_ns {
+        None => Ok(now_ns),
+        Some(stamp) if stamp <= now_ns.saturating_add(MAX_PUBLISH_STAMP_LEAD_NS) => Ok(stamp),
+        Some(stamp) => Err(EmbedError::InvalidArgument(format!(
+            "publish stamp {stamp} ns is more than {MAX_PUBLISH_STAMP_LEAD_NS} ns ahead of the runtime clock ({now_ns} ns)"
+        ))),
+    }
+}
+
 /// Synchronous owner of embedded graph, gateway, recorder, and publisher resources.
 /// Dropping it stops and joins whatever is still running.
 pub struct EmbeddedRuntime {
     files_dir: PathBuf,
     robot_name: String,
     status: Arc<Mutex<Status>>,
-    /// The runtime's clock: the graph runs on it and app publishes take
-    /// their wire stamp from it.
+    /// The clock a start gives the process transport manager when it
+    /// creates it. Every frame published in this process, by a graph node
+    /// or by the app, takes its wire stamp from the manager's clock, and the
+    /// graph runs on it. A frame from a LAN peer keeps its sender's stamp.
     clock: Arc<dyn Clock>,
     /// The committed run. A start builds its run off to the side and stores
     /// it here only once the commit succeeds.
@@ -509,7 +529,8 @@ impl Drop for RecordingReservation {
 
 struct PublisherState {
     publisher: CerulionPublisher,
-    /// The run's clock: each frame takes its wire stamp from it.
+    /// The transport clock, which stamps graph node frames too: each app
+    /// frame takes its wire stamp from it.
     clock: Arc<dyn Clock>,
     layout: WireLayout,
     max_payload_bytes: usize,
@@ -570,8 +591,6 @@ struct StartPlan {
     ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
     recorder: Option<RecorderPlan>,
-    /// The clock the graph runs on and app frames are stamped from.
-    clock: Arc<dyn Clock>,
     #[cfg(any(test, feature = "test-helpers"))]
     graph_exit: Option<GraphExitHook>,
 }
@@ -642,8 +661,10 @@ impl EmbeddedRuntime {
         self.start_accepted(config_json)
     }
 
-    /// TEST SEAM: run every later start on `clock` in place of the real
-    /// monotonic clock. A running start keeps the clock it started on.
+    /// TEST SEAM: give `clock`, in place of the real monotonic clock, to the
+    /// process transport manager when a later start of this runtime creates
+    /// it. The manager is process wide and keeps its first clock, so every
+    /// runtime of a test binary shares one clock.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn set_clock_for_test(&mut self, clock: Arc<dyn Clock>) {
@@ -794,8 +815,35 @@ impl EmbeddedRuntime {
         set_state(&self.status, RuntimeState::Running);
     }
 
-    /// Publish a JSON object and return its wire sequence number.
+    /// Publish a JSON object and return its wire sequence number. The frame
+    /// is stamped with the runtime clock's time.
     pub fn publish(&mut self, topic: &str, json: &str) -> Result<u32, EmbedError> {
+        self.publish_with_stamp(topic, json, None)
+    }
+
+    /// Publish a JSON object stamped `stamp_ns` and return its wire sequence
+    /// number. `stamp_ns` is in nanoseconds on the runtime clock's base, the
+    /// base of the stamp [`publish`](Self::publish) takes. A stamp in the
+    /// past is taken as is; one more than [`MAX_PUBLISH_STAMP_LEAD_NS`] ahead
+    /// of the clock is refused with [`EmbedError::InvalidArgument`] and
+    /// sends nothing.
+    pub fn publish_stamped(
+        &mut self,
+        topic: &str,
+        json: &str,
+        stamp_ns: u64,
+    ) -> Result<u32, EmbedError> {
+        self.publish_with_stamp(topic, json, Some(stamp_ns))
+    }
+
+    /// Publish a JSON object stamped with `stamp_ns`, or with the runtime
+    /// clock's time when it is `None`.
+    pub(crate) fn publish_with_stamp(
+        &mut self,
+        topic: &str,
+        json: &str,
+        stamp_ns: Option<u64>,
+    ) -> Result<u32, EmbedError> {
         if !matches!(lock_status(&self.status).state, RuntimeState::Running) {
             return Err(EmbedError::BadState(
                 "publish requires a running runtime".to_string(),
@@ -806,7 +854,7 @@ impl EmbeddedRuntime {
             .as_mut()
             .and_then(|run| run.publishers.get_mut(topic))
             .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
-        let timestamp = state.clock.now_ns();
+        let timestamp = frame_stamp(state.clock.now_ns(), stamp_ns)?;
         let sequence = state.sequence;
         encode_json_into(
             &state.layout,
@@ -1126,7 +1174,6 @@ impl EmbeddedRuntime {
             connect: config.connect,
             gateway,
             recorder,
-            clock: Arc::clone(&self.clock),
             #[cfg(any(test, feature = "test-helpers"))]
             graph_exit: None,
         })
@@ -1233,7 +1280,7 @@ impl EmbeddedRuntime {
         });
         let manager = TransportManager::init(TransportConfig {
             node_name: format!("{}_app", self.robot_name),
-            clock: Arc::new(RealClock),
+            clock: Arc::clone(&self.clock),
             network,
             ..TransportConfig::default()
         })
@@ -1521,13 +1568,14 @@ fn build_into(
         &plan.publishes,
         &manager,
         plan.recorded_topics.as_ref(),
-        &plan.clock,
         &mut run.publishers,
     )?;
 
     // 3. The graph, built but not yet running.
     let graph_runtime = if let Some(inputs) = plan.graph.as_mut() {
-        let clock = Arc::clone(&plan.clock);
+        // The graph runs on the transport clock, the clock that stamps its
+        // nodes' frames and the app's.
+        let clock = manager.clock_arc();
         let schema_hashes = schema_hash_map(&plan.schemas);
         let mut graph_runtime = GraphRuntime::build_live_with_schema_hashes_policy_and_recorded(
             inputs.config.clone(),
@@ -1844,7 +1892,6 @@ fn create_publishers(
     config: &[ResolvedPublish],
     manager: &TransportManager,
     recorded_topics: Option<&HashSet<String>>,
-    clock: &Arc<dyn Clock>,
     publishers: &mut BTreeMap<String, PublisherState>,
 ) -> Result<(), EmbedError> {
     for item in config {
@@ -1880,7 +1927,7 @@ fn create_publishers(
             item.topic.clone(),
             PublisherState {
                 publisher,
-                clock: Arc::clone(clock),
+                clock: manager.clock_arc(),
                 layout: item.layout.clone(),
                 max_payload_bytes: item.max_payload_bytes,
                 sequence: 0,
@@ -2505,7 +2552,6 @@ mod tests {
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
-            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3331,7 +3377,6 @@ nodes:
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
-            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3391,7 +3436,6 @@ nodes:
             inert_egress: false,
             inert_ingress: None,
             ingress_topics: 0,
-            clock: Arc::new(RealClock),
             gateway: Some(GatewayStartPlan {
                 plan: GatewayPlan {
                     egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3496,5 +3540,45 @@ nodes:
         let status = lock_status(&status);
         assert_eq!(status.state, RuntimeState::Failed);
         assert_eq!(status.last_error, Some(failure));
+    }
+
+    #[test]
+    fn a_frame_without_a_caller_stamp_takes_the_clock_time() {
+        assert_eq!(frame_stamp(42, None).unwrap(), 42);
+    }
+
+    #[test]
+    fn a_caller_stamp_up_to_one_second_ahead_is_taken_as_is() {
+        assert_eq!(frame_stamp(5_000_000_000, Some(0)).unwrap(), 0);
+        assert_eq!(
+            frame_stamp(5_000_000_000, Some(4_999_999_999)).unwrap(),
+            4_999_999_999
+        );
+        assert_eq!(
+            frame_stamp(5_000_000_000, Some(6_000_000_000)).unwrap(),
+            6_000_000_000
+        );
+    }
+
+    #[test]
+    fn a_caller_stamp_more_than_one_second_ahead_is_refused() {
+        let error = frame_stamp(5_000_000_000, Some(6_000_000_001)).unwrap_err();
+        assert!(matches!(error, EmbedError::InvalidArgument(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "publish stamp 6000000001 ns is more than 1000000000 ns ahead of the runtime clock (5000000000 ns)"
+        );
+        assert!(frame_stamp(0, Some(1_000_000_001)).is_err());
+        assert!(frame_stamp(0, Some(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn the_lead_bound_saturates_at_the_end_of_the_clock() {
+        // Near u64::MAX the bound would overflow; it saturates, so every
+        // stamp is within it.
+        assert_eq!(
+            frame_stamp(u64::MAX - 10, Some(u64::MAX)).unwrap(),
+            u64::MAX
+        );
     }
 }

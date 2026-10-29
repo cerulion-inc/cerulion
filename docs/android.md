@@ -354,6 +354,24 @@ first publish, and then reads the newest value on each tick. The runtime
 creates every `publish` topic with room for a node that holds its latest
 value, so both kinds of input start.
 
+Each frame `publish` sends is stamped with the runtime clock, the clock the
+graph runs on: nanoseconds of `CLOCK_MONOTONIC`, the clock `System.nanoTime()`
+reads on Android. `SystemClock.elapsedRealtimeNanos()` is another clock: it
+also counts deep sleep. A recording keeps the stamp as the log time of each
+message. To stamp a frame with the time an event happened, not the time of
+the call, give that time to `publishStamped`:
+
+```java
+long tappedAt = System.nanoTime(); // read when the tap lands
+int code = CerulionRuntime.publishStamped(
+        "/myapp/taps", "{\"x\":1.5,\"y\":0.0,\"z\":2.0}", tappedAt);
+```
+
+A stamp in the past is taken as is. A negative stamp, or one more than one
+second ahead of the runtime clock, returns `INVALID_ARGUMENT` (3) and sends
+nothing. In all other cases `publishStamped` returns the codes `publish`
+returns.
+
 To read a node's output in the app, list the topic under `subscribe` and
 call `CerulionRuntime.poll`. It takes the oldest message off the
 subscription's queue without waiting and appends it to a `StringBuilder` as

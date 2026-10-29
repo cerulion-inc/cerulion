@@ -328,6 +328,17 @@ impl Host {
         topic: &str,
         prepare: impl FnOnce(usize) -> Result<String, i32>,
     ) -> i32 {
+        self.publish_stamped_prepared(topic, None, prepare)
+    }
+
+    /// [`Self::publish_prepared`] with the frame stamped `stamp_ns`, or with
+    /// the runtime clock's time when it is `None`.
+    fn publish_stamped_prepared(
+        &self,
+        topic: &str,
+        stamp_ns: Option<u64>,
+        prepare: impl FnOnce(usize) -> Result<String, i32>,
+    ) -> i32 {
         let mut runtime = match self.app_runtime() {
             Ok(runtime) => runtime,
             Err(code) => return code,
@@ -341,7 +352,7 @@ impl Host {
             Err(code) => return code,
         };
         runtime
-            .publish(topic, &json)
+            .publish_with_stamp(topic, &json, stamp_ns)
             .map(|_| codes::OK)
             .unwrap_or_else(|error| error.code())
     }
@@ -465,6 +476,22 @@ pub(crate) fn publish_prepared(
     guarded_code(
         || match HOST.get() {
             Some(host) => host.publish_prepared(topic, prepare),
+            None => codes::NOT_INITIALIZED,
+        },
+        panic_code,
+    )
+}
+
+/// [`publish_prepared`] with the frame stamped `stamp_ns`, in nanoseconds
+/// on the runtime clock's base.
+pub(crate) fn publish_stamped_prepared(
+    topic: &str,
+    stamp_ns: u64,
+    prepare: impl FnOnce(usize) -> Result<String, i32>,
+) -> i32 {
+    guarded_code(
+        || match HOST.get() {
+            Some(host) => host.publish_stamped_prepared(topic, Some(stamp_ns), prepare),
             None => codes::NOT_INITIALIZED,
         },
         panic_code,

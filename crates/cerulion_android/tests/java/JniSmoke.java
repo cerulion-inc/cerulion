@@ -179,6 +179,15 @@ public final class JniSmoke {
         System.out.println("poll-overflow=" + poll("/jni/heartbeat") + ", " + poll("/jni/heartbeat")
                 + ", " + poll("/jni/heartbeat"));
         System.out.println("subscribed=" + field(CerulionRuntime.status(), "subscribed"));
+        System.out.println("publish-stamped=" + whenSettled(() -> CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"stamped\"}", 1L)));
+        System.out.println("publish-stamped-negative=" + CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"negative\"}", -1L));
+        System.out.println("publish-stamped-ahead=" + whenSettled(() -> CerulionRuntime.publishStamped(
+                "/jni/heartbeat", "{\"data\":\"ahead\"}", Long.MAX_VALUE)));
+        System.out.println("publish-stamped-null=" + CerulionRuntime.publishStamped(
+                "/jni/heartbeat", null, 1L));
+        System.out.println("poll-stamped=" + poll("/jni/heartbeat"));
 
         int stop = whenSettled(CerulionRuntime::stop);
         String stoppedStatus = waitForState("stopped");
