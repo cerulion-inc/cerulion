@@ -392,6 +392,31 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   remote DEMAND tokens, forwards demanded topics' SHM frames to zenoh via listener-less
   taps (egress), re-injects declared ingress topics into local SHM. The zenoh payload is
   the Cerulion wire frame VERBATIM (no envelope); ONE network task serves all topics.
+- Egress puts run OFF the drive loop (`transport/egress_send.rs`): the drive pass drains
+  each tap into that topic's bounded `EgressLane`, and the lane's own sender thread makes
+  the zenoh put. Reliable puts use `CongestionControl::Block` (zenoh's `Drop` default
+  discards at the sender and still returns `Ok`); best-effort puts use `Drop` (zenoh
+  treats every best-effort message as droppable anyway). A full reliable lane REFUSES the
+  new frame (counted, `FailureRegimeLatch`-logged naming the topic); a full best-effort
+  lane drops its oldest. The bound is the entry's declared `send_queue`, else the tap's
+  depth. Counters: `queued + in_flight + forwarded + dropped + refused + failed +
+  discarded` covers every frame offered. `forwarded` counts puts that returned `Ok`; two
+  losses stay invisible because zenoh 1.10.1 returns `Ok` for both: a best-effort frame
+  discarded inside the transmit queue, and a `Block` put that waited out
+  `wait_before_close` (zenoh then also closes the link to that peer). `LossReport`
+  logs every 10 s per topic whose losses rose (WARN for refused/failed, INFO for
+  best-effort drops alone), and the gateway logs totals on drop;
+  netd's `status` carries `EgressStats` for its own gateway only (a `network:`-block run
+  uses the per-run child, which reports by log).
+- The sender holds the egress-pass guard (shared) across each put and re-checks the flag
+  under it, so `set_lan_access(Paired)` still returns only after every put that saw the
+  flag ON. Cost: a close during a stalled `Block` put waits for that put (up to
+  `wait_before_close`), and because std's `RwLock` queues new readers behind a waiting
+  writer, the drive pass and the other senders wait with it. No frame is sent wrongly in
+  that window (every flag is already OFF). Topics to the SAME peer share zenoh's
+  per-priority transmit queue (`stage_in` mutex held while a `Block` push waits), so a
+  congested link slows every topic on it; lanes keep the wait off the drive loop and off
+  other links.
 - Ingress validates `total_size` + `schema_hash` on every received frame BEFORE
   re-injecting; a mismatch is counted (`ingress_stats`), never delivered. Re-injection
   is byte-identical including header `sequence`/`timestamp_ns`.
@@ -573,6 +598,7 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 | `data_only_tap_iox2_test.rs` | listener-less tap; non-consuming `has_samples()` |
 | `topic_liveness_iox2_test.rs` | dating rule, baselines, epoch reset, rate estimate (observer plane) |
 | `gateway_iox2_test.rs` | gateway egress/demand, liveness-over-egress, slot hand-off ordering |
+| `gateway_egress_congestion_iox2_test.rs` | stalled link: reliable loses nothing, full queue refuses loudly, best effort drops, default bound, demand-end and LAN-close discards, a stalled link does not stall another link |
 | `topic_buffer_sizing_test.rs` | depth-is-real; subscriber/event-cap provisioning; single-writer |
 | `failure_regime_latch_test.rs` | shared latch decisions, decade ladder, frame-drop reporting layer |
 | `network_ingress_test.rs` / `network_ingress_e2e_test.rs` | byte-identical re-inject; loop exclusion; cross-session hop |

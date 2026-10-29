@@ -156,7 +156,7 @@
 21 crates/cerulion_core/src/transport/discovery.rs
 1 crates/cerulion_core/src/transport/fill_from.rs
 4 crates/cerulion_core/src/transport/frame_drop_latch.rs
-16 crates/cerulion_core/src/transport/gateway.rs
+13 crates/cerulion_core/src/transport/gateway.rs
 6 crates/cerulion_core/src/transport/ingress_build.rs
 60 crates/cerulion_core/src/transport/liveness.rs
 24 crates/cerulion_core/src/transport/mirror_registry.rs

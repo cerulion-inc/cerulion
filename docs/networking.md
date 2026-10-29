@@ -555,7 +555,7 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external, send_queue}` map (see "Carriers and per-topic reliability"). |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
 | `tls` | Certificate files for `quic/` locators (see below). |
 
@@ -670,6 +670,37 @@ network:
     tls:
       certificate: /etc/cerulion/robot.pem
       private_key: /etc/cerulion/robot.key
+  ```
+- **`send_queue`**: how many frames the gateway holds for the topic while
+  the link is congested (a whole number, 1 or more; default: the depth of the
+  gateway's tap on the topic). Each egress topic has its own queue and its own
+  sender, so a congested link holds up the topics it carries and not the
+  gateway's other links (closing LAN access while a put waits on a congested
+  link waits for that put); topics sent to the same peer share that peer's
+  link. Each queued frame is a heap copy, so a topic's queue can hold up to
+  `send_queue` times its frame size.
+  The node that publishes the topic writes to shared memory and does not wait
+  on the network. A `reliable` frame waits for zenoh's transmit queue instead
+  of being dropped at the sender, for up to zenoh's `wait_before_close` (5 s
+  by default); then zenoh drops it and closes the link to that peer. When the
+  topic's queue is full, a `reliable` topic refuses the new frame, counts it
+  as `refused` and logs a warning naming the topic; a `best_effort` topic
+  drops its oldest queued frame and counts it as `dropped`. Every 10 s the
+  gateway logs a warning for a topic whose `refused` or `failed` rose (an
+  info line when only best-effort `dropped` rose), and each topic's totals
+  when it stops. A graph with a `network:`
+  block runs its own gateway process, so its log is where these appear. The
+  gateway `cerulion-netd` hosts for runs without a `network:` block also
+  reports each topic's `forwarded`, `dropped`, `refused`, `failed`,
+  `discarded`, `queued`, `in_flight` and `send_queue` in its `status` reply.
+  A sustained `refused` count means the link is slower than the topic: raise
+  `send_queue` to ride out longer bursts, lower the publish rate, or mark the
+  topic `best_effort`.
+
+  ```yaml
+  egress:
+    - topic: /robot/camera/image
+      send_queue: 32
   ```
 - **`tls`**: absolute paths to PEM files, read when the gateway opens its
   session (a missing file fails the open, naming the path). A `quic/` or
@@ -1113,6 +1144,12 @@ status reply):
 `lan_access` is the shared gateway's LAN posture (`open` or `paired`). A daemon
 without a network session, or an older daemon, omits it, and the omission means
 unknown, never open.
+
+`egress` appears once the daemon's shared gateway has booted: one entry per
+egress topic a remote has demanded, with that topic's `reliability`,
+`send_queue`, `queued`, `in_flight`, `forwarded`, `dropped`, `refused`,
+`failed` and `discarded` (see `send_queue` under "Carriers and per-topic
+reliability"). A daemon with no gateway, or an older daemon, omits it.
 
 Interpreting `connect_endpoints`:
 

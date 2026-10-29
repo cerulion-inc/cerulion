@@ -101,8 +101,9 @@ pub enum EgressReliability {
     BestEffort,
 }
 
-/// One topic's egress put policy. A graph's `network:` block carries only its
-/// best-effort topics; a topic with no entry is put reliable.
+/// One topic's egress put policy. A graph's `network:` block carries an entry
+/// for each topic that is put best effort or declares a `send_queue`; a topic
+/// with no entry is put reliable behind a send queue as deep as its egress tap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressQos {
@@ -110,6 +111,11 @@ pub struct EgressQos {
     pub topic: String,
     /// How the topic's frames are put.
     pub reliability: EgressReliability,
+    /// How many frames the gateway queues for the topic while zenoh's
+    /// transmit queue is full. `None` sizes the queue to the topic's egress
+    /// tap depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_queue: Option<std::num::NonZeroUsize>,
 }
 
 /// A QUIC endpoint's `mixed_rel` metadata value.

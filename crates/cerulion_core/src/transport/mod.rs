@@ -36,6 +36,7 @@ pub mod cerulion_q;
 pub mod dead_node_sweep;
 pub mod demand_authorizer;
 pub mod discovery;
+pub(crate) mod egress_send;
 pub mod events;
 pub mod failure_regime_latch;
 pub mod fill_from;
@@ -6193,6 +6194,13 @@ impl TransportManager {
     /// Access the network manager (if network transport is enabled).
     pub fn network(&self) -> Option<&NetworkManager> {
         self.network.as_deref()
+    }
+
+    /// An owned clone of the network manager's `Arc`, for a thread that must
+    /// put frames after the caller's borrow ends (the gateway's per-topic
+    /// egress senders).
+    pub(crate) fn network_arc(&self) -> Option<Arc<NetworkManager>> {
+        self.network.clone()
     }
 
     /// Access the topic bridge manager.

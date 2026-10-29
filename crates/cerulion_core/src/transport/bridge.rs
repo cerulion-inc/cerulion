@@ -201,14 +201,21 @@ pub struct TopicBridgeManager {
     /// [`Self::enable_bridge`] before any flag flips true.
     egress: Mutex<EgressGate>,
     /// The demand-transition wake a zero-demand gateway blocks
-    /// on. Bumped by [`Self::enable_bridge`] on a genuine `false → true` edge and
-    /// by [`Self::register_topic`] when the registered set grows. Shared out via
+    /// on. Bumped by [`Self::enable_bridge`] on a genuine `false → true` edge,
+    /// by [`Self::register_topic`] when the registered set grows, and by
+    /// [`Self::set_lan_closed`]`(true)`. Shared out via
     /// [`Self::demand_signal`].
     demand_signal: Arc<DemandSignal>,
-    /// The egress-pass rendezvous: a gateway forwarding pass holds it SHARED
-    /// for the whole pass; closing LAN takes it EXCLUSIVELY once to wait every
-    /// pass that started before the close to finish.
+    /// The egress-pass rendezvous: a gateway drive pass holds it SHARED for the
+    /// whole pass, and an egress sender holds it SHARED across each put;
+    /// closing LAN takes it EXCLUSIVELY once to wait for every pass and put that
+    /// started before the close to finish.
     egress_pass: std::sync::RwLock<()>,
+    /// The LAN access epoch: advanced by every [`Self::set_lan_closed`]`(true)`
+    /// after it stores the egress flags `false`. A queued egress frame carries
+    /// the epoch of the drive pass that queued it and is put only while the
+    /// epoch is unchanged.
+    lan_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl Default for TopicBridgeManager {
@@ -225,6 +232,7 @@ impl TopicBridgeManager {
             egress: Mutex::new(EgressGate::default()),
             demand_signal: Arc::new(DemandSignal::new()),
             egress_pass: std::sync::RwLock::new(()),
+            lan_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -237,16 +245,18 @@ impl TopicBridgeManager {
         Arc::clone(&self.demand_signal)
     }
 
-    /// The SHARED end of the egress-pass rendezvous, held by one gateway
-    /// forwarding pass for its whole duration (every flag load through the last
-    /// forward). Poison-recovering: a panicked pass must not wedge the close.
+    /// The SHARED end of the egress-pass rendezvous, held by one gateway drive
+    /// pass for its whole duration (every flag load through the last queued
+    /// frame) and by an egress sender across one put (its flag re-check through
+    /// the put's return). Poison-recovering: a panicked holder must not wedge
+    /// the close.
     pub(crate) fn egress_pass(&self) -> std::sync::RwLockReadGuard<'_, ()> {
         self.egress_pass
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Wait out every gateway forwarding pass that started before this call:
+    /// Wait out every gateway drive pass and egress put that started before this call:
     /// returns once the last shared `egress_pass` guard has dropped. MUST be
     /// called with NO bridge-manager or [`NetworkManager`](super::network::NetworkManager)
     /// lock held, and NEVER from inside a gateway pass (a pass holds the shared
@@ -338,8 +348,9 @@ impl TopicBridgeManager {
     /// Closing disables every registered bridge flag while holding the same gate
     /// that [`Self::enable_bridge`] checks, so no demand can enable a bridge after
     /// this call closes LAN access. Closing recovers poisoned gate and bridge-map
-    /// locks so the posture change always takes effect. This call itself is
-    /// NON-BLOCKING; [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
+    /// locks so the posture change always takes effect. After the flag stores
+    /// closing advances the LAN access epoch and signals
+    /// the demand wake. This call itself is NON-BLOCKING; [`NetworkManager::set_lan_access`](super::network::NetworkManager::set_lan_access)
     /// waits for in-flight gateway passes after closing.
     pub fn set_lan_closed(&self, closed: bool) -> TransportResult<()> {
         let mut gate = if closed {
@@ -360,8 +371,22 @@ impl TopicBridgeManager {
             for flag in bridges.values() {
                 flag.store(false, Ordering::Relaxed);
             }
+            drop(bridges);
+            // After the flag stores: a reader whose Acquire load returns this
+            // epoch sees every `false` store above, or a later store.
+            self.lan_epoch.fetch_add(1, Ordering::Release);
+            // Wake a gateway parked on zero demand, so its next pass reads
+            // the new epoch and detaches its taps without waiting out the
+            // park.
+            self.demand_signal.signal();
         }
         Ok(())
+    }
+
+    /// The LAN access epoch (see the field docs). A drive pass reads it once,
+    /// right after taking the egress-pass guard and before any flag load.
+    pub(crate) fn lan_epoch(&self) -> u64 {
+        self.lan_epoch.load(Ordering::Acquire)
     }
 
     /// Whether LAN egress is closed.

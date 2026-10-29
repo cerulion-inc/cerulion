@@ -822,6 +822,7 @@ pub use transport::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject, LanAccess, LAN_ACCESS_ENV,
 };
 pub use transport::discovery::TopicToken;
+pub use transport::egress_send::{EgressStats, EgressTopicStats};
 pub use transport::events::PubSubEvent;
 pub use transport::gateway::{
     GatewayDriveStats, GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime,
