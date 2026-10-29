@@ -538,7 +538,8 @@ writes nothing to logcat, and `log_level` has no effect.
 The `log_level` start key sets the lowest level written, `info` unless set.
 Each start whose config parses and passes its path checks sets it again,
 also when that start then fails, so a start without the key returns to
-`info`. A start whose config fails to parse or fails its path checks leaves
+`info`. A start refused because the runtime is already starting, running
+or stopping, or whose config fails to parse or fails its path checks, leaves
 it unchanged. A release build of the app library keeps only `info` and
 above: its `debug` and `trace` lines are compiled out, whatever `log_level`
 says.

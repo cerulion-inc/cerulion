@@ -579,9 +579,9 @@ impl EmbeddedRuntime {
             set_error(&self.status, &error);
             return Err(error);
         }
-        // Every start whose config parses and passes its path checks sets
-        // the level, also when a later step fails, so a restart without the
-        // key returns to `info`.
+        // Every start that gets here and whose config parses and passes its
+        // path checks sets the level, also when a later step fails, so a
+        // restart without the key returns to `info`.
         crate::log::set_level(config.log_level);
         {
             let mut status = lock_status(&self.status);

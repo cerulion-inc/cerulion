@@ -13,6 +13,10 @@ use cerulion_android::{codes, install_log_sink_for_test, EmbeddedRuntime, LogPri
 use serde_json::json;
 use tempfile::tempdir;
 
+/// The robot name of every runtime here: the first start of the process
+/// fixes it, with the listen endpoints.
+const ROBOT: &str = "logcat-sink";
+
 /// The runtime's line for a gateway with no LAN-dialable port to advertise.
 const BEACON_SKIPPED: &str = "cerulion_android::runtime: mDNS beacon not raised: no LAN-dialable nonzero TCP listen port; port 0 and loopback hosts are not advertised";
 
@@ -54,7 +58,7 @@ fn sink() -> (MutexGuard<'static, ()>, &'static FakeSink) {
 /// stop it.
 fn run_once(extra: serde_json::Value) -> Result<(), cerulion_android::EmbedError> {
     let temp = tempdir().unwrap();
-    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), "logcat-sink".into())?;
+    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into())?;
     let mut config = json!({ "listen": ["tcp/127.0.0.1:0"] });
     config
         .as_object_mut()
@@ -122,6 +126,27 @@ fn a_config_that_fails_to_parse_or_validate_leaves_the_level_unchanged() {
     tracing::info!(target: "app", "info after refusals");
     tracing::warn!(target: "app", "warn after refusals");
     assert_eq!(texts(&sink.take()), ["app: warn after refusals"]);
+    run_once(json!({})).expect("reset to info for the other tests");
+}
+
+#[test]
+fn a_start_refused_while_running_leaves_the_level_unchanged() {
+    let (_serial, sink) = sink();
+    let temp = tempdir().unwrap();
+    let mut runtime = EmbeddedRuntime::new(temp.path().to_path_buf(), ROBOT.into()).unwrap();
+    // The same listen endpoints as `run_once` (see `ROBOT`).
+    runtime
+        .start(&json!({ "listen": ["tcp/127.0.0.1:0"], "log_level": "warn" }).to_string())
+        .expect("start at warn");
+    let refused = runtime
+        .start(&json!({ "listen": ["tcp/127.0.0.1:0"], "log_level": "error" }).to_string())
+        .expect_err("a second start while running is refused");
+    assert_eq!(refused.code(), codes::BAD_STATE);
+    sink.take();
+    tracing::info!(target: "app", "info while running");
+    tracing::warn!(target: "app", "warn while running");
+    assert_eq!(texts(&sink.take()), ["app: warn while running"]);
+    runtime.stop().expect("stop");
     run_once(json!({})).expect("reset to info for the other tests");
 }
 
