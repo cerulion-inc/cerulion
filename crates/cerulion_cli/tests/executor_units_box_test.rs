@@ -60,7 +60,7 @@
 //!
 //! ## Scope and how to run
 //!
-//! Every arm is `#[ignore]` (box-only, a quiet Linux host) and `#[serial]`.
+//! Every arm is `#[ignore]` (a quiet Linux host) and `#[serial]`.
 //!
 //! ```bash
 //! cargo test -p cerulion_cli --test executor_units_box_test -- --ignored --nocapture --test-threads=1
@@ -265,7 +265,7 @@ fn slow_within_bound(base: &Leg, slow: &Leg) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
     let ws = read_identity::workspace();
@@ -291,7 +291,7 @@ fn a_slow_node_in_the_same_process_does_not_slow_the_fast_node() {
 
 #[cfg(feature = "oracle-mutants")]
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn the_unit_collapse_mutant_is_caught() {
     let ws = read_identity::workspace();
@@ -370,7 +370,7 @@ fn run_chain_leg(ws: &Workspace, leg: &str, env: &[(&str, &Path)]) -> Leg {
 /// Without a profile every data-triggered node is a unit of its own, so a
 /// slow tail of a linear chain does not hold the fast node at its head.
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
     let ws = read_identity::workspace();
@@ -390,7 +390,7 @@ fn without_a_profile_a_slow_tail_does_not_slow_the_chain_that_feeds_it() {
 /// unit again, and the bound must fail.
 #[cfg(feature = "oracle-mutants")]
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn the_unprofiled_merge_mutant_is_caught() {
     let ws = read_identity::workspace();
@@ -463,7 +463,7 @@ fn kind(v: &RowVerdict) -> &'static str {
 }
 
 #[test]
-#[ignore = "box-only: real runs on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: real runs"]
 #[serial]
 fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
     replays_like_separate_processes("idle");
@@ -472,7 +472,7 @@ fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes() {
 /// The comparison above with half the host's CPUs held busy for the whole
 /// arm, so the units' threads and the recorder compete for CPU time.
 #[test]
-#[ignore = "box-only: real runs on a Linux host, loaded by the arm itself"]
+#[ignore = "needs a Linux host: real runs, loaded by the arm itself"]
 #[serial]
 fn a_run_on_executor_units_replays_like_the_same_graph_in_separate_processes_under_load() {
     let _load = CpuStressor::start(stressor_children());
@@ -699,7 +699,7 @@ fn embedded_graph(bag: &Path) -> String {
 /// `oracle-mutants` feature, `CERULION_RECORDED_FUSE_MUTANT` makes the replay
 /// refuse the key, and this arm must fail.
 #[test]
-#[ignore = "box-only: real runs on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: real runs"]
 #[serial]
 fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
     let ws = read_identity::workspace();
@@ -771,7 +771,7 @@ fn a_bag_recorded_with_the_retired_fuse_key_still_replays() {
 
 #[cfg(feature = "oracle-mutants")]
 #[test]
-#[ignore = "box-only: real runs on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: real runs"]
 #[serial]
 fn the_recorded_fuse_refusal_mutant_is_caught() {
     // The `bag play` child inherits the variable; `#[serial]` keeps every
@@ -885,7 +885,7 @@ fn print_read_window(bag: &Path, label: &str, seq: u64) {
 /// (it feeds a real queue of fixed depth), not the executor units'. It prints;
 /// its floors are the only assertions.
 #[test]
-#[ignore = "box-only: real runs on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: real runs"]
 #[serial]
 fn a_late_relay_with_one_process_per_node_replay_probe() {
     let ws = read_identity::workspace();
@@ -1090,7 +1090,7 @@ fn print_relay_ticks(run: &read_identity::RecordedRun, rep: usize, placement: &s
 /// set, the `UNIT_THREAD` samples inside it name where each unit thread was
 /// waiting.
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
     let ws = read_identity::workspace();
@@ -1154,7 +1154,7 @@ fn a_co_hosted_relays_first_fire_costs_what_it_costs_in_its_own_process() {
 /// the shared descriptor table, and the probe's bound must fail on it.
 #[cfg(feature = "oracle-mutants")]
 #[test]
-#[ignore = "box-only: timing on a quiet Linux host"]
+#[ignore = "needs a quiet Linux host: timing"]
 #[serial]
 fn the_descriptor_presize_mutant_is_caught() {
     // The `graph run` children inherit the variable; `#[serial]` keeps every
