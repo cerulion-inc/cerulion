@@ -24,8 +24,9 @@ are the contract a teleop handler runs under.
 
 ## What a desk can do today
 
-The `cerulion/wire/2` protocol carries data from the robot to the desk only. A
-paired desk with observe access can:
+The `cerulion/wire/2` protocol carries topic data from the robot to the desk
+only; the desk sends control requests, nothing else. A paired desk with observe
+access can:
 
 - read the robot's topic catalog;
 - start and stop a stream of any topic it may observe, and read each frame as

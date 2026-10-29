@@ -298,9 +298,10 @@ robot registers (for example `restart` and `engage-estop`).
 ## 6. The wire plane (robot side)
 
 A `cerulion/wire/2` connection (admitted only for a paired `CAP_OBSERVE`
-account) is robot to desk only: no verb takes a frame from the desk, the robot
-opens uni streams and never accepts one, and the desk accepts them and never
-opens one. It carries ONE bidi control stream (length-prefixed JSON:
+account) carries topic data robot to desk only: no verb takes a topic frame from
+the desk, the robot opens uni data streams and never accepts one, and the desk
+accepts them and never opens one. The desk sends control requests only. It
+carries ONE bidi control stream (length-prefixed JSON:
 `catalog`/`demand`/`undemand`/`schema`/`status`/`sync_epoch`, the same
 `cerulion_q` vocabulary the LAN uses, imported not mirrored) and ONE uni data
 stream per demanded topic (a JSON `StreamPreamble`, then raw wire frames
