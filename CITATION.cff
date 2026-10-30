@@ -9,7 +9,7 @@ authors:
   - family-names: Kariyawasam
     given-names: Raveen
   - name: "Cerulion Inc. and contributors"
-version: 1.1.0
+version: 2.0.0
 date-released: "2026-09-21"
 url: "https://github.com/cerulion-inc/cerulion"
 repository-code: "https://github.com/cerulion-inc/cerulion"

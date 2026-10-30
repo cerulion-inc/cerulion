@@ -42,7 +42,7 @@ path = "src/main.rs"
 # `[workspace.dependencies]` (see lib/cerulion_viz/Cargo.toml on cross-workspace
 # path-dep inheritance).
 cerulion_core = { path = "../../../cerulion_core" }
-cerulion_hygiene = { path = "../../../cerulion_hygiene", version = "=1.1.0" }
+cerulion_hygiene = { path = "../../../cerulion_hygiene", version = "=2.0.0" }
 cerulion_viz = { path = "../../lib/cerulion_viz" }
 # `attach_remote` DEMANDS a remote topic's shared mirror from the
 # one-per-computer `cerulion-netd` daemon (over its UDS control seam) instead of

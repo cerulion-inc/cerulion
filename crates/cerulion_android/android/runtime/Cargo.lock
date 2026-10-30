@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "cerud"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_ops_proto",
  "clap",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android_remote"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_android",
  "cerulion_core",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bag"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
  "crc32fast",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bagd"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_core",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_engine"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_bag",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_dds"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "thiserror 2.0.17",
  "tracing",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_discovery"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "dirs",
  "serde",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_hygiene"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "rustix",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_link"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "iroh",
  "rustls",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_mdns"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_discovery",
  "mdns-sd",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_netd"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
  "cerulion_discovery",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_ops_proto"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_remoted"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -3317,7 +3317,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cerulion_core",
 ]

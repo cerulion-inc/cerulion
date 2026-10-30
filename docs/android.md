@@ -256,8 +256,8 @@ checkout uses `path` dependencies, which no patch moves; take
 `cerulion_android` from that same checkout with `path =` in place of `git`
 and `rev`. Once crates.io lists `cerulion_android`, a version requirement
 equal to the node workspace's pins replaces the git source and the two
-entries, for example `cerulion_android = "=1.1.0"` beside nodes made by
-`cerulion` 1.1.0.
+entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
+`cerulion` 2.0.0.
 
 Whatever the source of `cerulion_android`, crates.io included, an app
 copies two things into its own build from the Cerulion release or commit it
