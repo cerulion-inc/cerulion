@@ -46,6 +46,7 @@ fn build_single_node_runtime_with_trace(
         });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -107,6 +108,7 @@ fn explicit_shutdown_fires_before_drop_observer() {
         });
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -206,6 +208,7 @@ fn shutdown_all_nodes_fires_in_insertion_order() {
     };
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -285,6 +288,7 @@ fn shutdown_error_in_one_node_does_not_skip_others() {
     };
 
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

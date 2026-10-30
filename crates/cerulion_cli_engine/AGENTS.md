@@ -1,7 +1,7 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+All `cerulion` CLI command logic, testable without spawning processes;
+`cerulion_cli` is its thin clap binary.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
@@ -54,4 +54,4 @@ pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks
   `parse_int_literal` or `syn::LitInt::base10_parse`.
 - Numeric checks have false-pass classes (NaN folds, >2^53 widening, length fields).
 Read `docs/internals/cli.md` before changing topics/local scope, starters,
-replay, completions, Python nodes (§13), or graph run/profile/partition.
+replay, completions, Python nodes (§13), sim time (§15), or graph run/profile/partition.

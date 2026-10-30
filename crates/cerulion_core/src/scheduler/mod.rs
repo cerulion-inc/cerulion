@@ -36,6 +36,10 @@ mod catchup_clamp_wiring_tests;
 pub mod handle;
 // The NODE-DEATH ledger both mint sites write.
 pub mod node_death;
+// The sim-time fire ceiling. Hidden: one fire per accepted sample is how a
+// sim-time run behaves today, not part of its contract.
+#[doc(hidden)]
+pub mod period_ceiling;
 /// The per-set Sync matcher (the pure verdict engine replacing
 /// `check_sync`).
 pub mod sync_match;
@@ -1862,6 +1866,10 @@ pub struct Scheduler {
     /// caps — a fire set that depends on where a wall instant fell inside a
     /// step, which replay cannot reproduce (Principle #7).
     catchup_cap_override: Option<u32>,
+    /// The run-wide ceiling on `Period` fires per step, over every node,
+    /// declared `max_catchup` included (see [`period_ceiling`]). `None` (the
+    /// default) on every run except sim time, which sets one fire per step.
+    period_fire_ceiling: Option<u32>,
     /// The IN-MEMORY read-outcome sink, the
     /// replay engine's collection seam for the level-end merge (see
     /// [`MergedReadOutcome`]). `None` (the default, and the only state on a
@@ -2037,6 +2045,7 @@ impl Scheduler {
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
+            period_fire_ceiling: None,
             read_outcome_sink: None,
             replay_plan: None,
             replay_injection_hook: None,
@@ -2063,6 +2072,7 @@ impl Scheduler {
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
+            period_fire_ceiling: None,
             read_outcome_sink: None,
             replay_plan: None,
             replay_injection_hook: None,
@@ -2100,6 +2110,7 @@ impl Scheduler {
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
+            period_fire_ceiling: None,
             read_outcome_sink: None,
             replay_plan: None,
             replay_injection_hook: None,
@@ -2131,6 +2142,7 @@ impl Scheduler {
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
+            period_fire_ceiling: None,
             read_outcome_sink: None,
             replay_plan: None,
             replay_injection_hook: None,
@@ -4905,6 +4917,33 @@ impl Scheduler {
         self.catchup_cap_override
     }
 
+    /// Bound every `Period` node to at most `ceiling` fires per step, the
+    /// latest deadlines the step passes (see [`period_ceiling`]). `None`
+    /// removes the bound. Set once, before the first step.
+    ///
+    /// Hidden from the documented surface: the ceiling is how a sim-time run
+    /// behaves today, not part of its contract.
+    #[doc(hidden)]
+    pub fn set_period_fire_ceiling(&mut self, ceiling: Option<u32>) {
+        self.period_fire_ceiling = ceiling;
+    }
+
+    /// The run-wide `Period` fire ceiling, `None` when unbounded. Hidden
+    /// with [`Self::set_period_fire_ceiling`].
+    #[doc(hidden)]
+    pub fn period_fire_ceiling(&self) -> Option<u32> {
+        self.period_fire_ceiling
+    }
+
+    /// THIS step's `Period` bounds: the state-arm clamp derived in
+    /// `begin_step` and the run-wide ceiling.
+    fn period_caps(&self) -> period_ceiling::PeriodCaps {
+        period_ceiling::PeriodCaps {
+            override_cap: self.catchup_cap_override,
+            ceiling: self.period_fire_ceiling,
+        }
+    }
+
     /// Evaluate the single node at insertion index `idx`
     /// against the already-advanced `new_time`. This is the EXACT per-node body
     /// of the pre-split `step` loop (the `input_expect_within` window check, the
@@ -4931,7 +4970,7 @@ impl Scheduler {
         let step = self.current_step();
         // Copied out BEFORE the `self.nodes` borrow below —
         // one value for the whole step, derived in `begin_step`.
-        let cap_override = self.catchup_cap_override;
+        let cap_override = self.period_caps();
         // `idx` comes from a `get_index_of` /
         // a `0..self.nodes.len()` loop, so it is always in range — pin that
         // invariant loud in debug before the unwrap below.
@@ -5388,7 +5427,7 @@ impl Scheduler {
         // THIS step's clamp, read once (in `begin_step`) and
         // hoisted here before the `self.nodes` borrows — every node of every
         // level in the step decides under the same value.
-        let cap_override = self.catchup_cap_override;
+        let cap_override = self.period_caps();
         self.fire_decisions.clear();
         // A TRACE-DRIVEN step never consults a trigger — the
         // recording IS the fire schedule. One never-taken branch on every live
@@ -5584,7 +5623,7 @@ impl Scheduler {
     ) {
         let max_trace = self.max_trace_entries;
         // THIS step's clamp (see `decide_fires`).
-        let cap_override = self.catchup_cap_override;
+        let cap_override = self.period_caps();
         for id in node_ids {
             let Some(idx) = self.nodes.get_index_of(id.as_str()) else {
                 // Same loud desync guard as `decide_fires`: a level node id
@@ -7018,9 +7057,9 @@ impl Scheduler {
         max_trace_entries: Option<usize>,
         entries_appended: &mut u64,
         ring: Option<&mut TraceRingHook>,
-        catchup_cap_override: Option<u32>,
+        period_caps: period_ceiling::PeriodCaps,
     ) {
-        if let Some(kind) = Self::decide_node(id, node, current_time_ns, catchup_cap_override) {
+        if let Some(kind) = Self::decide_node(id, node, current_time_ns, period_caps) {
             Self::tick_node(
                 id,
                 node,
@@ -7048,17 +7087,18 @@ impl Scheduler {
     /// side-effect + warn) runs EXACTLY ONCE per node per step, here. The Period
     /// per-catch-up `pre_fire_check` re-check runs later, in `tick_node`.
     ///
-    /// `catchup_cap_override` is THIS step's clamp, derived
-    /// ONCE in [`Self::begin_step`] and passed down rather than re-read here —
-    /// see [`Scheduler::catchup_cap_override`] and
-    /// [`catchup_clamp::effective_max_catchup`]. It is `None` on every
-    /// un-armed run, where the Period arm is byte-identical to its earlier
-    /// form.
+    /// `period_caps` is THIS step's `Period` bounds: the clamp derived
+    /// ONCE in [`Self::begin_step`] and passed down rather than re-read here
+    /// (see [`Scheduler::catchup_cap_override`] and
+    /// [`catchup_clamp::effective_max_catchup`]), and the run-wide ceiling
+    /// (see [`Scheduler::set_period_fire_ceiling`]). Both are `None` on every
+    /// un-armed, non-sim-time run, where the Period arm is byte-identical to
+    /// its earlier form.
     fn decide_node(
         id: &str,
         node: &mut ScheduledNode,
         current_time_ns: u64,
-        catchup_cap_override: Option<u32>,
+        period_caps: period_ceiling::PeriodCaps,
     ) -> Option<FireKind> {
         if node.disabled {
             return None;
@@ -7117,27 +7157,24 @@ impl Scheduler {
                 // reconstruction in `tick_node[_collect]` mirrors the old
                 // pushed sequence byte-for-byte.
                 let interval_ns = interval.as_nanos() as u64;
-                // An EXPLICIT `max_catchup` always wins;
+                // An EXPLICIT `max_catchup` always wins over the clamp;
                 // the clamp only replaces the unbounded default, and only while
-                // a state arm is attached past its agreed onset step.
-                let cap = catchup_clamp::effective_max_catchup(*max_catchup, catchup_cap_override);
+                // a state arm is attached past its agreed onset step. The
+                // run-wide ceiling bounds both (`period_ceiling`).
                 let mut fire_count: u32 = 0;
                 let mut first_fire_ns: u64 = 0;
                 if let Some(next_fire) = node.next_fire_ns.as_mut() {
                     // ONE implementation of the advance
-                    // (`catchup_clamp::period_advance`), shared with the replay
+                    // (`catchup_clamp::period_advance`, reached through
+                    // `PeriodCaps::advance`), shared with the replay
                     // verifier's re-derivation. It was a `while` loop here and
                     // an O(1) form there — two spellings of one rule, whose
                     // whole job is to agree — and the loop could not terminate
                     // at all on a zero interval or a wall-faithful anchor. The
                     // O(1) form is adopted; see that function's doc for why the
                     // two are the same answer wherever the loop finished.
-                    let adv = catchup_clamp::period_advance(
-                        *next_fire,
-                        current_time_ns,
-                        interval_ns,
-                        cap,
-                    );
+                    let adv =
+                        period_caps.advance(*max_catchup, *next_fire, current_time_ns, interval_ns);
                     fire_count = adv.fire_count;
                     // The earliest un-fired interval (the old loop's first
                     // pushed `*next_fire`, recorded before any advance).

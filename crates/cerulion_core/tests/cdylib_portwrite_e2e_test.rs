@@ -222,6 +222,7 @@ fn run_capture(
 ) -> (Option<Captured>, u64) {
     let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

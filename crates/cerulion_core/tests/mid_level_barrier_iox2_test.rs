@@ -153,6 +153,7 @@ fn out_def(name: &str) -> OutputDef {
 
 fn base_config(name: &str, prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

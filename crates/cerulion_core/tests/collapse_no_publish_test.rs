@@ -183,6 +183,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
     let delivered = Arc::new(AtomicU64::new(0));
     let last_value = Arc::new(AtomicU64::new(u64::MAX));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -257,6 +258,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
     let delivered = Arc::new(AtomicU64::new(0));
     let last_value = Arc::new(AtomicU64::new(u64::MAX));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -576,6 +578,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
     let delivered = Arc::new(AtomicU64::new(0));
     let last_value = Arc::new(AtomicU64::new(u64::MAX));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

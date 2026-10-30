@@ -90,6 +90,7 @@ fn infos(config: &GraphConfig) -> IndexMap<String, NodeInfo> {
 
 fn config_of(nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         name: None,

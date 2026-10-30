@@ -166,6 +166,7 @@ fn vec3_out(name: &str) -> OutputDef {
 
 fn one_node_config(prefix: &str, id: &str, node_type: &str) -> GraphConfig {
     GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

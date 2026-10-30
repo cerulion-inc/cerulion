@@ -1305,3 +1305,50 @@ earlier set's verb). `the_registered_nested_verbs_attach` runs the production re
 through it. The public-surface doc check reads the verbs of the sets `NESTED` names and
 files them under the verb their `PARENT` names. A flag on a built-in verb (such as
 `topic list -t`) is still a field of that verb.
+
+## 15. Sim time: `sim_time:` and `/clock`
+
+`sim_time_run.rs` owns the sim-time run loop. Its contract:
+
+- `resolve_time_source` folds the graph's `sim_time:` into `TimeSource` BEFORE
+  partition intent, network and record guards read it. `--time-source external`
+  IS sim time, and is held to `validate_sim_time_for`'s load rules.
+- External-policy nodes are refused from the loaded entries' metadata BEFORE the
+  transport exists.
+- The loop builds the runtime only after the first `/clock` sample and steps once
+  per accepted sample, through a data-only `/clock` tap (no listener).
+- The loop is two halves. `ClockFeeder` is the sole reader and judge of the tap:
+  it emits one `ClockEvent::Epoch`, then one numbered `ClockEvent::Step` per
+  accepted sample (zero for an equal one, nothing for a refused one).
+  `ClockApplier` moves the graph from those events alone and judges nothing.
+  `the_feeder_events_replayed_through_a_bare_applier_match_the_run` pins the
+  seam: the feeder's events for the scripted schedule are a hand-written list,
+  and a bare applier fed that list fires at the same stamps as the loop.
+- The tap (`ClockTopicSource`) notes every read frame's origin and wire sequence
+  number (`SequenceGapWatch`, a `FailureRegimeLatch` keyed by origin): a skip
+  inside one publisher's stream warns on the first gap, is counted after, and is
+  announced again at each tenfold count (`CLOCK_SEQUENCE_GAP_WARNING`); a frame
+  from another origin starts the count over. The feeder calls
+  `ClockSource::rebaseline_sequence` on its first poll after the epoch, so the
+  numbers the next frame skips (lost to the runtime build) print once as
+  `CLOCK_BUILD_WINDOW_LOSS_WARNING`, not as a gap. `run_sim_time` logs the
+  feeder's `sequence_gaps()` total at the end of the run. A gap is a hint, not
+  proof: a publisher can consume a number without sending a frame. With one
+  publisher, a sample the full queue evicted always leaves one. The queue is
+  at most `CLOCK_TAP_DEPTH` deep: the tap asks for that, the topic's ceiling
+  (set by the publisher at create) caps it, and the tap logs the depth it got
+  at open (`CLOCK_TAP_CAPPED_WARNING` when it is under; `queue_depth()` is the
+  observable).
+- A period fires at most once per sample: a jump fires the latest passed deadline,
+  never a catch-up burst. This ceiling (`SIM_TIME_PERIOD_FIRES_PER_SAMPLE`,
+  `GraphRuntime::set_period_fire_ceiling`) is current behaviour, not contract:
+  the items are `#[doc(hidden)]`, and the user pages say "today".
+- A frame is decoded only after its wire framing is checked.
+- `ros2:` entries are put on `/clock` by `ros2_graph::spawn_plan`
+  (`put_ros2_entry_on_sim_time`, which returns the `SimTimeArgument` it added:
+  the launch argument, the `-p` parameter placed ahead of `--params-file` so a
+  file value wins, or nothing for an entry that sets `use_sim_time` itself). The
+  spawn log prints the plan's command (`command_line` of the argv as spawned),
+  and a `LaunchArgument` plan logs `ROS2_LAUNCH_USE_SIM_TIME_NOTICE` once: one
+  decision drives the argv and the log.
+- Every warning and refusal text is a pinned constant.

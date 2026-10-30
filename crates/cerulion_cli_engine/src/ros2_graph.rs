@@ -44,8 +44,9 @@ use cerulion_core::graph::config::Ros2NodeDef;
 use cerulion_core::graph::GraphConfig;
 
 use crate::error::{CliError, CliResult};
-use crate::graph_cmd::{ChildGuard, ChildPoll, PeerLossPolicy};
+use crate::graph_cmd::{ChildGuard, ChildPoll, PeerLossPolicy, TimeSource};
 use crate::ros2_cmd;
+use crate::sim_time_run::{SimTimeArgument, ROS2_LAUNCH_USE_SIM_TIME_NOTICE};
 
 /// Death-watch poll cadence — how quickly a child's exit is noticed.
 pub const ROS2_CHILD_WATCH_POLL: Duration = Duration::from_millis(200);
@@ -78,17 +79,54 @@ pub fn take_ros2_entries(config: &mut GraphConfig) -> Vec<Ros2Entry> {
         .collect()
 }
 
-/// Human-readable one-line rendering of what an entry runs (`ros2 run pkg
-/// exe` / `ros2 launch file`) — for reports and log lines.
-pub fn describe(entry: &Ros2Entry) -> String {
-    format!("ros2 {}", entry.def.argv(None).join(" "))
+/// The one-line command a spawn argv runs (`ros2 run pkg exe ...` /
+/// `ros2 launch file ...`), for the spawn log and the spawn errors. Built
+/// from the argv AS SPAWNED ([`spawn_plan`]), so it shows the resolved paths
+/// and, under sim time, the `use_sim_time:=true` the run added.
+pub fn command_line(argv: &[String]) -> String {
+    format!("ros2 {}", argv.join(" "))
 }
 
-/// The spawn argv (everything after `ros2`), with a RELATIVE `launch:` /
+/// Everything [`Ros2Children::spawn`] does with one entry, decided ONCE and
+/// pure: the argv it spawns, the command line it logs (and names in its
+/// errors) for that same argv, and what the run added to put the entry on
+/// sim time. The spawn log reads from here, so it can only ever describe
+/// the argv as spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPlan {
+    /// The spawn argv (everything after `ros2`).
+    pub argv: Vec<String>,
+    /// [`command_line`] of `argv`.
+    pub command: String,
+    /// What a sim-time run added to `argv`; `None` on every other clock.
+    pub sim_time: Option<SimTimeArgument>,
+}
+
+/// The spawn plan for `entry`: its argv with a RELATIVE `launch:` /
 /// `params_file:` resolved against `workspace_root` — and both checked to
 /// EXIST, loudly, before anything is spawned (a missing launch file would
-/// otherwise be reinterpreted by `ros2 launch` as a PACKAGE name).
-pub fn spawn_argv(entry: &Ros2Entry, workspace_root: &Path) -> CliResult<Vec<String>> {
+/// otherwise be reinterpreted by `ros2 launch` as a PACKAGE name). Under sim
+/// time ([`TimeSource::External`]) the entry is also put on `/clock`
+/// ([`crate::sim_time_run::put_ros2_entry_on_sim_time`]), and the plan says
+/// how.
+pub fn spawn_plan(
+    entry: &Ros2Entry,
+    workspace_root: &Path,
+    time_source: TimeSource,
+) -> CliResult<SpawnPlan> {
+    let mut argv = resolved_argv(entry, workspace_root)?;
+    let sim_time = (time_source == TimeSource::External)
+        .then(|| crate::sim_time_run::put_ros2_entry_on_sim_time(&entry.def, &mut argv));
+    let command = command_line(&argv);
+    Ok(SpawnPlan {
+        argv,
+        command,
+        sim_time,
+    })
+}
+
+/// [`spawn_plan`] before the clock is chosen.
+fn resolved_argv(entry: &Ros2Entry, workspace_root: &Path) -> CliResult<Vec<String>> {
     let resolve = |raw: &str| -> PathBuf {
         let p = Path::new(raw);
         if p.is_absolute() {
@@ -290,6 +328,7 @@ impl Ros2Children {
         graph: &str,
         running: Arc<AtomicBool>,
         policy: PeerLossPolicy,
+        time_source: TimeSource,
     ) -> CliResult<Self> {
         let set = Self::with_policy(graph, policy, running);
         if entries.is_empty() {
@@ -297,7 +336,21 @@ impl Ros2Children {
         }
         let env = stage_ros2_child_env()?;
         for entry in entries {
-            let argv = spawn_argv(entry, workspace_root)?;
+            let SpawnPlan {
+                argv,
+                command,
+                sim_time,
+            } = spawn_plan(entry, workspace_root, time_source)?;
+            // A launch argument reaches the launched nodes only through the
+            // launch file: say so once, at spawn, for the entry it concerns.
+            if sim_time == Some(SimTimeArgument::LaunchArgument) {
+                tracing::info!(
+                    graph = %graph,
+                    node_id = %entry.id,
+                    command = %command,
+                    "{ROS2_LAUNCH_USE_SIM_TIME_NOTICE}"
+                );
+            }
             let mut cmd = std::process::Command::new("ros2");
             cmd.args(&argv).current_dir(workspace_root);
             for (k, v) in &env {
@@ -330,15 +383,13 @@ impl Ros2Children {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     CliError::Validation(format!(
                         "ros2 entry '{}': `ros2` not found on PATH — install ROS 2 (or source \
-                         its setup script) so `graph run` can spawn `{}`",
-                        entry.id,
-                        describe(entry)
+                         its setup script) so `graph run` can spawn `{command}`",
+                        entry.id
                     ))
                 } else {
                     CliError::Validation(format!(
-                        "ros2 entry '{}': failed to spawn `{}`: {e}",
-                        entry.id,
-                        describe(entry)
+                        "ros2 entry '{}': failed to spawn `{command}`: {e}",
+                        entry.id
                     ))
                 }
             })?;
@@ -346,7 +397,7 @@ impl Ros2Children {
                 graph = %graph,
                 node_id = %entry.id,
                 pid = child.id(),
-                command = %describe(entry),
+                command = %command,
                 "ros2 entry spawned on Cerulion transport (RMW_IMPLEMENTATION=rmw_cerulion)"
             );
             lock_children(&set.children).push(Ros2Child {
@@ -663,11 +714,11 @@ mod tests {
         }
     }
 
-    /// `spawn_argv` resolves a relative launch file against the workspace
+    /// `spawn_plan` resolves a relative launch file against the workspace
     /// root, refuses a missing one by name, and resolves a relative
     /// `params_file` the same way.
     #[test]
-    fn spawn_argv_resolves_relative_paths_and_refuses_missing_files() {
+    fn spawn_plan_resolves_relative_paths_and_refuses_missing_files() {
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(root.path().join("launch")).expect("mkdir");
         std::fs::write(root.path().join("launch/robot.launch.py"), b"#").expect("write");
@@ -683,7 +734,9 @@ mod tests {
         };
         let resolved = root.path().join("launch/robot.launch.py");
         assert_eq!(
-            spawn_argv(&launch, root.path()).expect("resolves"),
+            spawn_plan(&launch, root.path(), TimeSource::Real)
+                .expect("resolves")
+                .argv,
             ["launch", &resolved.display().to_string(), "a:=1"]
         );
 
@@ -694,7 +747,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let err = spawn_argv(&missing, root.path()).expect_err("missing launch file");
+        let err =
+            spawn_plan(&missing, root.path(), TimeSource::Real).expect_err("missing launch file");
         let msg = err.to_string();
         assert!(
             msg.contains("'bringup'") && msg.contains("nope.launch.py"),
@@ -712,7 +766,9 @@ mod tests {
         };
         let params = root.path().join("params.yaml");
         assert_eq!(
-            spawn_argv(&run, root.path()).expect("resolves"),
+            spawn_plan(&run, root.path(), TimeSource::Real)
+                .expect("resolves")
+                .argv,
             [
                 "run",
                 "pkg",
@@ -721,6 +777,99 @@ mod tests {
                 "--params-file",
                 &params.display().to_string()
             ]
+        );
+    }
+
+    /// The spawn log and the spawn errors name the command AS SPAWNED: the
+    /// plan's command is [`command_line`] of the plan's own argv, so it shows
+    /// the resolved paths and, under sim time, the `use_sim_time:=true` the
+    /// run added, which the entry's own `argv` does not carry. The plan also
+    /// says what it added, so the launch notice follows the same decision.
+    #[test]
+    fn the_spawn_plan_logs_the_argv_as_spawned_and_names_what_sim_time_added() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("robot.launch.py"), b"#").expect("write");
+        let launch = Ros2Entry {
+            id: "bringup".to_string(),
+            def: Ros2NodeDef {
+                launch: Some("robot.launch.py".to_string()),
+                args: vec!["a:=1".to_string()],
+                ..Default::default()
+            },
+        };
+        let resolved = root.path().join("robot.launch.py").display().to_string();
+        let real = spawn_plan(&launch, root.path(), TimeSource::Real).expect("plan");
+        assert_eq!(real.command, format!("ros2 launch {resolved} a:=1"));
+        assert_eq!(real.command, command_line(&real.argv));
+        assert_eq!(real.sim_time, None, "not a sim-time run: nothing added");
+        let external = spawn_plan(&launch, root.path(), TimeSource::External).expect("plan");
+        assert_eq!(
+            external.command,
+            format!("ros2 launch {resolved} a:=1 use_sim_time:=true")
+        );
+        assert_eq!(
+            external.command,
+            command_line(&external.argv),
+            "the logged command is the argv as spawned, argument included"
+        );
+        assert_eq!(
+            external.sim_time,
+            Some(SimTimeArgument::LaunchArgument),
+            "the plan carries the decision the spawn logs the notice on"
+        );
+        let run = Ros2Entry {
+            id: "talker".to_string(),
+            def: Ros2NodeDef {
+                package: Some("demo_nodes_cpp".to_string()),
+                executable: Some("talker".to_string()),
+                ..Default::default()
+            },
+        };
+        let run = spawn_plan(&run, root.path(), TimeSource::External).expect("plan");
+        assert_eq!(
+            run.command,
+            "ros2 run demo_nodes_cpp talker --ros-args -p use_sim_time:=true"
+        );
+        assert_eq!(run.command, command_line(&run.argv));
+        assert_eq!(run.sim_time, Some(SimTimeArgument::Parameter));
+    }
+
+    /// `spawn` takes its argv, its logged command and its launch notice from
+    /// ONE [`SpawnPlan`], never from the entry's own `argv` (which lacks what
+    /// sim time added) and never from a second predicate.
+    ///
+    /// STRUCTURAL because the spawn needs a ROS 2 install on PATH; what the
+    /// plan says is behaviourally pinned above.
+    #[test]
+    fn spawn_logs_and_launches_from_one_plan() {
+        let src = include_str!("ros2_graph.rs");
+        let start = src.find("    pub fn spawn(").expect("spawn must exist");
+        let end = src[start..]
+            .find("    fn spawn_death_watch(")
+            .map(|at| start + at)
+            .expect("spawn is followed by the death-watch starter");
+        let body = &src[start..end];
+        assert!(
+            body.contains("} = spawn_plan(entry, workspace_root, time_source)?;"),
+            "spawn destructures the plan it spawns from"
+        );
+        assert_eq!(
+            body.matches("command_line(").count(),
+            0,
+            "the command is the plan's, never rebuilt in spawn"
+        );
+        assert_eq!(
+            body.matches(".argv(").count(),
+            0,
+            "the entry's own argv is never what spawn logs or launches"
+        );
+        assert!(
+            body.contains("if sim_time == Some(SimTimeArgument::LaunchArgument) {"),
+            "the launch notice follows the plan's decision"
+        );
+        assert!(
+            body.contains("\"{ROS2_LAUNCH_USE_SIM_TIME_NOTICE}\""),
+            "the notice is logged as the constant, so the message is compile-time"
         );
     }
 
@@ -2586,6 +2735,7 @@ mod tests {
             "g",
             Arc::new(AtomicBool::new(true)),
             PeerLossPolicy::Continue,
+            TimeSource::Real,
         )
         .unwrap_or_else(|e| panic!("the production spawn path must succeed: {e}"));
         let pid = await_stand_in(&pidfile);

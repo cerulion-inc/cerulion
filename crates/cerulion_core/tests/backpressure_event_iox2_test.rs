@@ -126,6 +126,7 @@ fn drop_oldest_graph(
     max_dropped: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -306,6 +307,7 @@ fn run_discard_interleaved(steps: usize) -> (u64, u64, u64) {
     let seen = Arc::new(AtomicU64::new(0));
     let phantom = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -495,6 +497,7 @@ impl BlockHandlerConsumer {
 
 fn block_event_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -671,6 +674,7 @@ impl RearmBlockConsumer {
 fn block_event_rearms_after_below_threshold_drain() {
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),
@@ -944,6 +948,7 @@ fn overloaded_graph(
     max_dropped: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let config = GraphConfig {
+        sim_time: false,
         level_assignments: None,
         network: None,
         process_groups: Default::default(),

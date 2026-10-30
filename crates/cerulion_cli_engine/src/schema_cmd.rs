@@ -856,7 +856,7 @@ pub(crate) fn remove_failing_definitions(
     //
     // With a bare-slice parameter the
     // same-state caller — `retain_composed_sizable_schemas`, which runs a
-    // FIXPOINT — would clone the whole combined set (the 254-message built-in
+    // FIXPOINT: it would clone the whole combined set (the 255-message built-in
     // corpus plus the `.msg` store plus every workspace YAML entry) on EVERY
     // pass purely to hand back a slice identical to `schemas`. `None` says
     // "same state" without materializing that copy at all; the borrow
@@ -3630,7 +3630,7 @@ fn nested_stem_yaml_files(schemas_dir: &Path) -> Vec<std::path::PathBuf> {
 ///
 /// CHEAP, because `graph validate` asks it once per output and a graph in
 /// this tree carries hundreds: the qualified arm is a `SchemaStore` load plus
-/// a linear scan of the 254-entry `BUILTIN_MSGS` slice, never
+/// a linear scan of the 255-entry `BUILTIN_MSGS` slice, never
 /// [`schema_info_unified`], which PARSES the schema and seeds a resolution
 /// set for rendering a tree nobody asked for here. The bare arm runs the ONE
 /// workspace lookup (`workspace_lookup` — the claim) plus the size

@@ -256,6 +256,7 @@ pub mod schema_serve;
 // probe, so the whole thing is oracle-testable with no real processes and no
 // real shared memory.
 pub mod shm_state;
+pub mod sim_time_run;
 // The checkpoint arm TAG a running graph process is handed,
 // and the (best-effort, never fatal) attach it drives.
 pub mod state_arm_attach;

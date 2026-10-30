@@ -67,6 +67,7 @@ fn build_rig(prefix: &str) -> Rig {
         process_groups: Default::default(),
         process_group_order: Default::default(),
         multi_publisher_topics: Vec::new(),
+        sim_time: false,
         name: None,
         identity: format!("sport_driver_e2e_{prefix}"),
         prefix: prefix.to_string(),

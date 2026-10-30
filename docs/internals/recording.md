@@ -374,10 +374,11 @@ still reports its zero count).
   unexpected-argument PARSE ERROR, not an inert flag; they reach a graph run
   internally and mint no ring on the monolith shapes, but there is no flag on
   them to say so. Within `graph run`, on the shapes that mint no ring anyway it
-  is still NOT inert: a `--single-process` or `--time-source external` run has
-  its window recorder stopped by it, so that run takes NO captures. Only two
-  shapes are true no-ops: a `--time-source virtual` MONOLITH (it starts no
-  recorder either way), and any NON-UNIX build, where the recorder, the run
+  is still NOT inert: a `--single-process` run has its window recorder stopped
+  by it, so that run takes NO captures. Only three shapes are true no-ops: a
+  `--time-source virtual` MONOLITH and a sim-time run (`--time-source external`,
+  or `sim_time: true` in the graph YAML), which start no recorder either way,
+  and any NON-UNIX build, where the recorder, the run
   directory and the `flashback` verb are all `#[cfg(unix)]` and there is nothing
   for the flag to stop.
 - **An absence or refusal message names the CAUSE, never another verb's flag.**
