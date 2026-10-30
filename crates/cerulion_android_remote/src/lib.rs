@@ -152,17 +152,19 @@ impl BoundRemote for Hosted {
         let (stop, stopped) = oneshot::channel::<()>();
         let stopping = Arc::new(AtomicBool::new(false));
         let task_stopping = Arc::clone(&stopping);
+        // The plane serves on its own task, so a panic in it ends that task
+        // and this one still reports it.
+        let serving = self.runtime.spawn(bound.serve(async move {
+            let _ = stopped.await;
+        }));
         let task = self.runtime.spawn(async move {
-            let result = bound
-                .serve(async move {
-                    let _ = stopped.await;
-                })
-                .await;
+            let result = serving.await;
             // A stop that asked for this exit is not a failure.
             if !task_stopping.load(Ordering::SeqCst) {
                 exit(match result {
-                    Ok(()) => "the endpoint closed".to_string(),
-                    Err(error) => error.to_string(),
+                    Ok(Ok(())) => "the endpoint closed".to_string(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => format!("the plane task ended: {error}"),
                 });
             }
         });
@@ -204,5 +206,55 @@ impl BoundRemote for Hosted {
         };
         runtime.shutdown_timeout(STOP_BUDGET);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code(error: RemotedError) -> &'static str {
+        match start_error(error) {
+            RemoteStartError::NotProvisioned(_) => "not provisioned",
+            RemoteStartError::Failed(_) => "failed",
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unverifiable_key_or_trust_state_is_not_provisioned() {
+        let store = cerulion_pairing::PairingError::Serialization("bad MAC".into());
+        for (error, want) in [
+            (RemotedError::DeviceKey("absent".into()), "not provisioned"),
+            (RemotedError::MacKey("absent".into()), "not provisioned"),
+            (RemotedError::Store(store), "not provisioned"),
+            (RemotedError::Index("bad MAC".into()), "not provisioned"),
+            (
+                RemotedError::ProvisioningMismatch("another device".into()),
+                "not provisioned",
+            ),
+            (RemotedError::Config("bad".into()), "failed"),
+            (RemotedError::Provision("bad".into()), "failed"),
+        ] {
+            let shown = error.to_string();
+            assert_eq!(code(error), want, "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_message_says_what_failed() {
+        let RemoteStartError::NotProvisioned(message) =
+            start_error(RemotedError::DeviceKey("no file".into()))
+        else {
+            panic!("a missing device key is a provisioning gap");
+        };
+        assert_eq!(
+            message,
+            "the remote plane is not provisioned: device key: no file"
+        );
+        let RemoteStartError::Failed(message) = start_error(RemotedError::Config("x".into()))
+        else {
+            panic!("a config error is a plane failure");
+        };
+        assert_eq!(message, "the remote plane did not bind: config: x");
     }
 }

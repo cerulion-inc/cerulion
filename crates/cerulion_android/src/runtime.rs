@@ -728,6 +728,8 @@ impl EmbeddedRuntime {
         // recorder active behind the refusal.
         if let Some(mut run) = self.run.take() {
             let (_summary, teardown_error) = run.shutdown();
+            // The plane is stopped, even when the new config is refused below.
+            lock_status(&self.status).remote = None;
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }

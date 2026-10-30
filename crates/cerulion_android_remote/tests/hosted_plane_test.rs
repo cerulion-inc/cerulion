@@ -354,4 +354,54 @@ fn a_paired_desk_reads_the_hosted_catalog_and_a_topic_and_a_fresh_install_serves
         written.iter().all(|file| !file.contains("key")),
         "{written:?}"
     );
+
+    // A second start binds a fresh plane on the same keys, and the paired
+    // desk reads it again.
+    runtime
+        .start(&config(&topic, json!("disabled")))
+        .expect("the plane starts again");
+    let again = status(&runtime)
+        .remote
+        .expect("the plane is reported again");
+    assert_eq!(again.endpoint_id, device_hex);
+    let address = plane_address(&again.endpoint_id, &again.bound_sockets);
+    let mut control = desk_runtime.block_on(Control::open(&paired, address));
+    let WireResponse::Catalog(catalog) =
+        reply(&desk_runtime.block_on(control.request(json!({"verb": "catalog"}))))
+    else {
+        panic!("expected a catalog from the second plane");
+    };
+    assert!(catalog.entries.iter().any(|row| row.topic == topic));
+    control.connection.close(0u32.into(), b"done");
+    runtime.stop().expect("the second stop");
+    assert_eq!(status(&runtime).last_error, None);
+
+    // A plane that cannot open its receipt log binds, then stops serving on
+    // its own: the run fails with the remote code and withdraws the plane.
+    let receipts = state_root.join("remoted").join("receipts.log");
+    std::fs::remove_file(&receipts).expect("the plane wrote its receipt log");
+    std::fs::create_dir(&receipts).unwrap();
+    runtime
+        .start(&config(&topic, json!("disabled")))
+        .expect("the plane binds before it opens the receipt log");
+    let deadline = std::time::Instant::now() + STEP;
+    while status(&runtime).state != RuntimeState::Failed {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plane ends on its own: {:?}",
+            status(&runtime)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = status(&runtime);
+    assert_eq!(ended.remote, None);
+    let last = ended.last_error.expect("the end is recorded");
+    assert_eq!(last.code, codes::REMOTE);
+    assert!(
+        last.message
+            .starts_with("the remote plane stopped serving: ops plane: "),
+        "{last:?}"
+    );
+    runtime.stop().expect("a stop after the plane ended");
+    std::fs::remove_dir(&receipts).unwrap();
 }

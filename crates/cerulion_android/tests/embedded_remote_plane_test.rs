@@ -20,6 +20,7 @@ use tempfile::tempdir;
 
 cerulion_android::embed_nodes! {
     "test_node_macro_relay_rlib" => test_node_macro_relay_rlib::RelayNodeEntry,
+    "test_node_macro_period_cdylib" => test_node_macro_period_cdylib::PeriodNodeEntry,
 }
 
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
@@ -32,6 +33,10 @@ const SOCKET: &str = "127.0.0.1:4433";
 #[derive(Clone, Copy)]
 enum Answer {
     Bind,
+    /// Bind, then refuse to serve.
+    BindServeFails,
+    /// Bind and serve, then fail to stop.
+    BindStopFails,
     NotProvisioned,
     Fail,
 }
@@ -75,7 +80,9 @@ impl RemoteHost for FakeHost {
                 .collect(),
         });
         match shared.answer.expect("each step sets the answer") {
-            Answer::Bind => Ok(Box::new(FakeBound(self.0.clone()))),
+            answer @ (Answer::Bind | Answer::BindServeFails | Answer::BindStopFails) => {
+                Ok(Box::new(FakeBound(self.0.clone(), answer)))
+            }
             Answer::NotProvisioned => Err(RemoteStartError::NotProvisioned(
                 "no device key under the state directory".into(),
             )),
@@ -86,7 +93,7 @@ impl RemoteHost for FakeHost {
     }
 }
 
-struct FakeBound(Fake);
+struct FakeBound(Fake, Answer);
 
 impl BoundRemote for FakeBound {
     fn endpoint_id(&self) -> String {
@@ -98,11 +105,17 @@ impl BoundRemote for FakeBound {
     fn serve(&mut self, exit: RemoteExit) -> Result<(), String> {
         let mut shared = self.0.lock().unwrap();
         shared.log.push("remote.serve".into());
+        if matches!(self.1, Answer::BindServeFails) {
+            return Err("the plane could not open its receipt log".into());
+        }
         shared.exit = Some(exit);
         Ok(())
     }
     fn stop(self: Box<Self>) -> Result<(), String> {
         self.0.lock().unwrap().log.push("remote.stop".into());
+        if matches!(self.1, Answer::BindStopFails) {
+            return Err("the endpoint did not close".into());
+        }
         Ok(())
     }
 }
@@ -289,6 +302,87 @@ fn the_remote_block_binds_before_the_run_serves_at_commit_and_stops_first() {
     assert_eq!(last.code, codes::REMOTE);
     assert!(last.message.contains("the endpoint closed"), "{last:?}");
     runtime.stop().ok();
+
+    // A config the plan refuses never reaches the host.
+    answer(&fake, Answer::Bind);
+    let unlinked = json!({
+        "graph_yaml": "prefix: unlinked\nnodes:\n  - id: a\n    type: not_linked\n",
+        "remote": enabled.clone(),
+    });
+    let error = runtime
+        .start(&unlinked.to_string())
+        .expect_err("an unlinked node type fails the start");
+    assert_eq!(error.code(), codes::GRAPH, "{error}");
+    assert_eq!(log(&fake), Vec::<String>::new());
+
+    // A component that fails after the bind stops the bound plane: the
+    // start fails with that component's code and leaves no plane behind.
+    // A recording file that already exists fails the recorder's build step.
+    answer(&fake, Answer::Bind);
+    std::fs::create_dir_all(files.path().join("bags")).unwrap();
+    std::fs::write(files.path().join("bags").join("taken.mcap"), b"").unwrap();
+    let recorded = json!({
+        "publish": [{"topic": topics.cmd, "schema": VECTOR3}],
+        "record": {"file": "taken.mcap"},
+        "remote": enabled.clone(),
+    });
+    let error = runtime
+        .start(&recorded.to_string())
+        .expect_err("an existing recording file fails the start");
+    assert_eq!(error.code(), codes::RECORDER, "{error}");
+    assert_eq!(log(&fake), ["remote.bind", "remote.stop"]);
+    assert_eq!(status(&runtime).remote, None);
+
+    // A plane that refuses to serve fails the commit with the remote code
+    // and is stopped.
+    answer(&fake, Answer::BindServeFails);
+    let error = runtime
+        .start(&config(&topics, enabled.clone()))
+        .expect_err("a plane that cannot serve fails the start");
+    assert_eq!(error.code(), codes::REMOTE);
+    assert!(error.to_string().contains("receipt log"), "{error}");
+    assert_eq!(log(&fake), ["remote.bind", "remote.serve", "remote.stop"]);
+    let failed = status(&runtime);
+    assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
+
+    // A plane that does not stop cleanly fails the stop: the state is not
+    // `stopped` while an endpoint may still be open.
+    answer(&fake, Answer::BindStopFails);
+    runtime
+        .start(&config(&topics, enabled.clone()))
+        .expect("the plane serves");
+    let error = runtime.stop().expect_err("the plane did not stop");
+    assert_eq!(error.code(), codes::REMOTE);
+    let failed = status(&runtime);
+    assert_eq!((failed.state, failed.remote), (RuntimeState::Failed, None));
+
+    // A graph that finished on its own keeps its plane serving until the
+    // next start; a refused restart still stops it and withdraws it.
+    answer(&fake, Answer::Bind);
+    std::env::set_var("CER_PERIOD_REQUEST_SHUTDOWN", "1");
+    let finishing = json!({
+        "graph_yaml": "prefix: finishing\nnodes:\n  - id: ticker\n    type: test_node_macro_period_cdylib\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n",
+        "remote": enabled.clone(),
+    });
+    runtime
+        .start(&finishing.to_string())
+        .expect("a graph that finishes starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while status(&runtime).state != RuntimeState::Finished {
+        assert!(std::time::Instant::now() < deadline, "the graph finishes");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::env::remove_var("CER_PERIOD_REQUEST_SHUTDOWN");
+    assert!(status(&runtime).remote.is_some(), "the plane still serves");
+    let refused = runtime
+        .start(&config(
+            &topics,
+            json!({"enabled": true, "state_dir": "../outside"}),
+        ))
+        .expect_err("a state_dir outside the files directory is refused");
+    assert_eq!(refused.code(), codes::INVALID_ARGUMENT);
+    assert_eq!(log(&fake), ["remote.bind", "remote.serve", "remote.stop"]);
+    assert_eq!(status(&runtime).remote, None);
 
     // Stop stops the plane before the graph: no desk reads a run that is
     // going down. The default state directory is `remote`.
