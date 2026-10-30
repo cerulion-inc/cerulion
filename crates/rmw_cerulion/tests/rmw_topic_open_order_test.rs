@@ -344,3 +344,127 @@ fn a_late_volatile_subscription_receives_no_backlog_from_a_transient_local_publi
         );
     }
 }
+
+/// How a native (non-rmw) subscriber attaches in [`native_late_joiner_receives`]:
+/// the graph-input and Python path, or the open-only path `cerulion topic
+/// echo` and `hz` use.
+#[derive(Clone, Copy)]
+enum Native {
+    WithBuffers,
+    OpenOnly,
+}
+
+/// Publishes `RETAINED` messages from a VOLATILE rmw publisher on a topic it
+/// creates (or that `native_history` > 0 pre-created natively with that much
+/// history), attaches a native subscriber, publishes one LIVE message (its
+/// send delivers any retained history first), and returns how many messages
+/// the native subscriber received.
+unsafe fn native_late_joiner_receives(tag: &str, native: Native, native_history: usize) -> usize {
+    const RETAINED: usize = 4;
+    let suffix = unique_suffix();
+    let ts = point_ts(&format!("Nl{suffix}"));
+    let (_, node) = setup_node(&format!("native_late_{tag}_{suffix}"));
+    let topic_str = format!("/rmw_open_order/native/{tag}/{suffix}");
+    let topic = CString::new(topic_str.clone()).expect("topic");
+    let transport = &rmw_cerulion::runtime::runtime().expect("runtime").transport;
+    // A natively created topic with declared history: a core publisher creates
+    // the service, a holder keeps it alive, and the core publisher goes away
+    // so the rmw publisher below is the only writer.
+    let _holder = if native_history > 0 {
+        let msl = cerulion_core::wire::MaxSliceLen::try_new(4096).expect("slice len");
+        let creator = transport
+            .create_publisher(&topic_str, msl, native_history)
+            .expect("native creator");
+        let holder = transport
+            .create_subscriber_open_only(&topic_str)
+            .expect("service holder");
+        drop(creator);
+        Some(holder)
+    } else {
+        None
+    };
+    let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &volatile(10), &pub_opts);
+    assert!(
+        !publisher.is_null(),
+        "the VOLATILE rmw publisher opens the topic"
+    );
+    let send = |i: usize| {
+        let msg = CPoint {
+            x: i as f64,
+            y: 0.0,
+            z: 0.0,
+        };
+        assert_eq!(
+            rmw_publish(
+                publisher,
+                &msg as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+    };
+    for i in 0..RETAINED {
+        send(i);
+    }
+    let subscriber = match native {
+        Native::WithBuffers => transport
+            .create_subscriber_with_buffers(&topic_str, transport.default_topic_config(), 16)
+            .expect("native subscriber"),
+        Native::OpenOnly => transport
+            .create_subscriber_open_only(&topic_str)
+            .expect("native open-only subscriber"),
+    };
+    send(RETAINED);
+    let mut received = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        received += subscriber.try_receive(|_| {}).expect("receive");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(subscriber);
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    received
+}
+
+#[test]
+#[serial]
+fn a_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publisher() {
+    unsafe {
+        assert_eq!(
+            native_late_joiner_receives("with_buffers", Native::WithBuffers, 0),
+            1,
+            "a native subscriber (graph input, Python) that attaches after a VOLATILE \
+             rmw publisher sent 4 messages receives only the live one: the rmw-created \
+             service's history is the topic's limit, not a retention the publisher asked for"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn an_open_only_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publisher() {
+    unsafe {
+        assert_eq!(
+            native_late_joiner_receives("open_only", Native::OpenOnly, 0),
+            1,
+            "`cerulion topic echo` and `hz` attach open-only; after a VOLATILE rmw \
+             publisher sent 4 messages they receive only the live one"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_native_subscriber_still_receives_history_a_native_creator_declared() {
+    unsafe {
+        assert_eq!(
+            native_late_joiner_receives("native_history", Native::OpenOnly, 4),
+            5,
+            "on a topic a native creator made with history 4, a native late joiner still \
+             receives the 4 retained messages and the live one (graph latched topics keep \
+             their late-joiner replay)"
+        );
+    }
+}

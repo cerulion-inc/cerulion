@@ -727,7 +727,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // on every create of the ordinary ROS path (rclcpp's default QoS is
         // KeepLast(10) + VOLATILE) that says only "you chose VOLATILE". So the
         // gate is `depth_governs_retention`: it fires only where the CALLER'S
-        // DEPTH really was clamped — TRANSIENT_LOCAL above the type's limit
+        // DEPTH really was clamped, TRANSIENT_LOCAL above the type's limit
         // (depth 1000 ⇒ 16 for a small type) or below the floor (the
         // degenerate depth 0 ⇒ 1).
         if depth_governs_retention && requested_depth != provisioned_depth {

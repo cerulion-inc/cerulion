@@ -5793,6 +5793,13 @@ impl TransportManager {
         if let Some(buffer_size) = buffer_size {
             subscriber_builder = subscriber_builder.buffer_size(buffer_size);
         }
+        // A caller that asks for no particular history takes iceoryx2's default
+        // (the service history, capped at the port buffer), except on a service
+        // whose history is a create-leg floor: every publisher there retains
+        // frames, VOLATILE ones included, so such a caller takes none.
+        let history_request = history_request.or_else(|| {
+            wire_header_attribute::history_is_floor(data_service.attributes()).then_some(0)
+        });
         if let Some(requested) = history_request {
             let static_config = data_service.static_config();
             let port_buffer = buffer_size.unwrap_or(static_config.subscriber_max_buffer_size());
@@ -6585,7 +6592,14 @@ impl TransportManager {
         // its frames carry; an opened one is checked after the open (see
         // `wire_header_attribute`), so the open leg requires nothing and the
         // create leg defines the attribute.
-        let wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        // A service created with a history floor also states the floor, so a
+        // native subscriber that asks for no particular history can tell that
+        // the history is a floor and ask for none (see `finish_subscriber`).
+        let mut wire_header_specifier = wire_header_attribute::data_service_specifier()?;
+        if let Some(floor) = topic_config.create_history_floor.filter(|&floor| floor > 0) {
+            wire_header_specifier =
+                wire_header_attribute::with_history_floor(wire_header_specifier, floor)?;
+        }
         let node_defaults = &self.node.config().defaults.publish_subscribe;
         let default_caps = (node_defaults.max_publishers, node_defaults.max_subscribers);
         let (create_publishers, create_subscribers) = topic_config.create_port_caps(default_caps);
@@ -6916,7 +6930,7 @@ impl TransportManager {
                     topic = %topic,
                     floor,
                     live,
-                    "history floor degraded — the service pre-existed with a \
+                    "history floor degraded, the service pre-existed with a \
                      smaller history_size than this opener's create floor, so a \
                      late joiner receives at most the pre-existing value; stop \
                      the earlier creator and restart this opener to reclaim the floor"
