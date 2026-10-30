@@ -84,6 +84,28 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // The refresh-token reuse window's columns on `sessions`. A row an older build
+    // wrote keeps them NULL / 0, so its previous refresh token is never replayable.
+    for (column, decl) in [
+        ("prev_refresh_token_hash", "TEXT"),
+        ("prev_rotated_at_ns", "INTEGER"),
+        ("reuse_salt", "BLOB"),
+        ("reuse_spent", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !column_exists(conn, "sessions", column)? {
+            // `column` and `decl` are the fixed literals above, never input.
+            conn.execute(
+                &format!("ALTER TABLE sessions ADD COLUMN {column} {decl}"),
+                [],
+            )?;
+        }
+    }
+    // Created here, not in SCHEMA: on an older DB the column exists only after the
+    // ALTER above.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_prev_refresh ON sessions (prev_refresh_token_hash)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -206,6 +228,26 @@ pub enum RevocationTarget {
     Account([u8; 32]),
     /// Revoke ONE device key from the robot (the account's other devices keep access).
     Device([u8; 32]),
+}
+
+/// The latest rotation of a session, found by the refresh token it replaced.
+#[derive(Clone, Debug)]
+pub struct PreviousRotation {
+    /// The session row id.
+    pub id: String,
+    /// The owning user id.
+    pub user_id: String,
+    /// The session-token hash the rotation stored.
+    pub session_token_hash: String,
+    /// The refresh-token hash the rotation stored.
+    pub refresh_token_hash: String,
+    /// The session-token expiry the rotation stored (Unix ns).
+    pub session_expires_at_ns: u64,
+    /// When the rotation committed (Unix ns).
+    pub rotated_at_ns: u64,
+    /// The salt the rotation derived its pair with
+    /// ([`crate::session::derive_rotated_pair`]).
+    pub reuse_salt: [u8; 32],
 }
 
 /// A session identity + its validity snapshot.
@@ -941,6 +983,12 @@ impl Db {
     ///   the snapshot read and this write) from being clobbered back to valid — the
     ///   guard lives IN the statement because the Mutex is per-statement, not a
     ///   transaction spanning the read.
+    ///
+    /// The same statement records the replaced refresh hash, `rotated_at_ns` and
+    /// the derivation `reuse_salt`, and re-arms the single replay
+    /// (`reuse_spent = 0`), which is what [`Db::previous_rotation`] and
+    /// [`Db::claim_refresh_reuse`] read. Each rotation overwrites the previous
+    /// one's record, so only the most recently replaced token is ever replayable.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_session(
         &self,
@@ -950,11 +998,15 @@ impl Db {
         new_refresh_hash: &str,
         session_expires_at_ns: u64,
         refresh_expires_at_ns: u64,
+        rotated_at_ns: u64,
+        reuse_salt: &[u8; 32],
     ) -> Result<bool> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE sessions SET session_token_hash = ?1, refresh_token_hash = ?2, \
-             session_expires_at_ns = ?3, refresh_expires_at_ns = ?4 \
+             session_expires_at_ns = ?3, refresh_expires_at_ns = ?4, \
+             prev_refresh_token_hash = ?6, prev_rotated_at_ns = ?7, reuse_salt = ?8, \
+             reuse_spent = 0 \
              WHERE id = ?5 AND revoked = 0 AND refresh_token_hash = ?6",
             params![
                 new_session_hash,
@@ -962,10 +1014,88 @@ impl Db {
                 session_expires_at_ns as i64,
                 refresh_expires_at_ns as i64,
                 id,
-                old_refresh_hash
+                old_refresh_hash,
+                rotated_at_ns as i64,
+                reuse_salt.as_slice()
             ],
         )?;
         Ok(n == 1)
+    }
+
+    /// The latest rotation whose replaced refresh-token hash is `prev_refresh_hash`,
+    /// or `None` when no session's latest rotation replaced that token (including
+    /// a row an older build rotated, which recorded no salt). Reads no revoked or
+    /// spent state: [`Db::claim_refresh_reuse`] is the authoritative guard.
+    pub fn previous_rotation(&self, prev_refresh_hash: &str) -> Result<Option<PreviousRotation>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT id, user_id, session_token_hash, refresh_token_hash, \
+                 session_expires_at_ns, prev_rotated_at_ns, reuse_salt \
+                 FROM sessions WHERE prev_refresh_token_hash = ?1 \
+                 AND prev_rotated_at_ns IS NOT NULL AND reuse_salt IS NOT NULL",
+                params![prev_refresh_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? as u64,
+                        row.get::<_, i64>(5)? as u64,
+                        row.get::<_, Vec<u8>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, user_id, session_token_hash, refresh_token_hash, session_exp, rotated, salt)) =
+            row
+        else {
+            return Ok(None);
+        };
+        let reuse_salt: [u8; 32] = salt.try_into().map_err(|salt: Vec<u8>| {
+            AccountdError::Internal(format!(
+                "session reuse_salt is {} bytes, not 32 (corrupt row)",
+                salt.len()
+            ))
+        })?;
+        Ok(Some(PreviousRotation {
+            id,
+            user_id,
+            session_token_hash,
+            refresh_token_hash,
+            session_expires_at_ns: session_exp,
+            rotated_at_ns: rotated,
+            reuse_salt,
+        }))
+    }
+
+    /// Spend the single replay of session `id`'s replaced refresh token: an
+    /// atomic compare-and-swap guarded on `prev_refresh_token_hash`,
+    /// `reuse_spent = 0` and `revoked = 0`. Returns whether THIS call spent it, so
+    /// two concurrent replays of one token yield exactly one `true`, a later
+    /// rotation (which replaces `prev_refresh_token_hash`) makes it `false`, and
+    /// a revoked session is never replayed.
+    pub fn claim_refresh_reuse(&self, id: &str, prev_refresh_hash: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sessions SET reuse_spent = 1 \
+             WHERE id = ?1 AND prev_refresh_token_hash = ?2 AND reuse_spent = 0 AND revoked = 0",
+            params![id, prev_refresh_hash],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Close the replay of a replaced refresh token (`reuse_spent = 1` where
+    /// `prev_refresh_token_hash` matches), leaving the session itself live.
+    /// Returns whether a row was affected.
+    pub fn close_refresh_reuse(&self, prev_refresh_hash: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sessions SET reuse_spent = 1 WHERE prev_refresh_token_hash = ?1",
+            params![prev_refresh_hash],
+        )?;
+        Ok(n > 0)
     }
 
     /// Revoke the session whose session- OR refresh-token hash matches. Returns
@@ -1381,6 +1511,61 @@ mod tests {
             .expect("mints an epoch");
         assert_eq!(row.epoch, 1);
         assert_eq!(row.revoked_devices, vec![[0x99u8; 32]]);
+    }
+
+    /// A `sessions` table an older build created (no reuse columns) gains them and
+    /// their index at open; its rows keep NULL / 0, so none is replayable.
+    #[test]
+    fn the_reuse_migration_adds_the_session_columns_to_an_older_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id                    TEXT PRIMARY KEY,
+                    user_id               TEXT NOT NULL,
+                    session_token_hash    TEXT NOT NULL UNIQUE,
+                    refresh_token_hash    TEXT NOT NULL UNIQUE,
+                    session_expires_at_ns INTEGER NOT NULL,
+                    refresh_expires_at_ns INTEGER NOT NULL,
+                    revoked               INTEGER NOT NULL DEFAULT 0,
+                    created_at_ns         INTEGER NOT NULL
+                );
+                INSERT INTO sessions VALUES ('old', 'u', 's', 'r', 9, 9, 0, 1);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let cols = column_names(&db, "sessions");
+        for c in [
+            "prev_refresh_token_hash",
+            "prev_rotated_at_ns",
+            "reuse_salt",
+            "reuse_spent",
+        ] {
+            assert!(cols.iter().any(|x| x == c), "missing {c}: {cols:?}");
+        }
+        let indexed: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_sessions_prev_refresh'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+        assert!(db.previous_rotation("r").unwrap().is_none());
+        // Rotating the older row works and records its replaced token.
+        assert!(db
+            .rotate_session("old", "r", "s2", "r2", 9, 9, 5, &[3; 32])
+            .unwrap());
+        assert_eq!(db.previous_rotation("r").unwrap().unwrap().rotated_at_ns, 5);
+        // Re-opening (migrations again) is a no-op.
+        drop(db);
+        Db::open(&path).unwrap();
     }
 
     /// The migration is idempotent: running it on a FRESH DB (where SCHEMA already
