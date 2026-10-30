@@ -34,6 +34,7 @@ dev-dependencies are stripped by `cargo package`):
 | `cerulion_cli_engine` | `cerulion_core`, `native_ros2_messages`, `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_mdns`, `cerulion_pairing`, `cerulion_bag`, `cerulion_bagd`, `cerulion_netd` |
 | `cerulion_cli_tui` | `cerulion_cli_engine`, `cerulion_core` |
 | `cerulion_cli` | `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_core`, `cerulion_dds`, `cerulion_bagd`, `cerulion_bag`, `cerulion_netd`, `cerulion_telemetry`, `native_ros2_messages` |
+| `cerulion_android` | `cerulion_bag`, `cerulion_bagd`, `cerulion_cli_engine`, `cerulion_core`, `cerulion_mdns` |
 
 Publish in this order:
 
@@ -48,7 +49,8 @@ Publish in this order:
 6. **`cerulion_netd`**
 7. **`cerulion_bagd`**
 8. **`cerulion_cli_engine`**
-9. **`cerulion_cli_tui`** and **`cerulion_wsd`** (independent of each other)
+9. **`cerulion_cli_tui`**, **`cerulion_wsd`** and **`cerulion_android`**
+   (independent of one another)
 10. **`cerulion_cli`**
 
 > Note: the intuitive order `cerulion_core → cerulion_macros
@@ -151,7 +153,7 @@ Run from the workspace root, in order:
       `./tools/scripts/test_build_deb.sh` check the three lists; the install
       smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
-      access for all eighteen publishable crates listed above.
+      access for all nineteen publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
@@ -231,8 +233,9 @@ and runs in the `Lint` job.
 
 ## First publication: new-crate rate limit and partial publishes
 
-Seventeen of the eighteen publishable crates exist on crates.io; `cerulion_telemetry` is
-new and is published for the first time with the release that adds it. The `0.1.0` release
+Seventeen of the nineteen publishable crates exist on crates.io; `cerulion_telemetry` and
+`cerulion_android` are new and are published for the first time with the release that adds
+them. The `0.1.0` release
 published eleven of them for the first time (`cerulion_bag`, `cerulion_bagd`,
 `cerulion_dds`, `cerulion_discovery`, `cerulion_hygiene`, `cerulion_link`,
 `cerulion_mdns`, `cerulion_netd`, `cerulion_pairing`, `cerulion_wireclient` and
@@ -271,6 +274,16 @@ nor an unauthenticated `raw.githubusercontent.com` fetch; the install smoke
 serves them to `install.sh` from a loopback mirror. To re-run only that smoke
 against an existing release (no build, no publish), dispatch the workflow with
 `smoke_tag=vX.Y.Z`.
+
+Every tag also publishes `cerulion-android-java-<version>.tar.gz`, the Java
+facade of `cerulion_android` (the crate's `java/` tree and its `LICENSE`), which
+the `android-java` job builds with `tools/scripts/package_android_java.py`. The
+archive is reproducible, so running that script at the tagged commit gives the
+checksum the release's `SHA256SUMS` lists:
+
+```bash
+python3 tools/scripts/package_android_java.py --version "$(tools/scripts/workspace_version.sh)" --out /tmp/android-java
+```
 
 A stable tag also publishes a `stable.txt` asset holding that tag on one line,
 uploaded after the archives. That is the release channel: with no `--version`,
