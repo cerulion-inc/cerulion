@@ -2953,7 +2953,7 @@ fn verify_fifo(
     }
 }
 
-/// PURE — a FIFO `Data` node's frames POPPED at its trigger inputs in one
+/// PURE: a FIFO `Data` node's frames POPPED at its trigger inputs in one
 /// step's reads: the drain-site `DrainedBatch` pops, the per-message FIFO
 /// pop (`Served` / `Held` are body reads of an already-popped frame, and on a
 /// role-stamped bag so is a body `DrainedBatch`).
@@ -2998,7 +2998,7 @@ pub(crate) struct FifoCarryMismatch {
     pub fires: u32,
 }
 
-/// PURE — the frame a FIFO `Data` node's burst carries OUT of one step.
+/// PURE: the frame a FIFO `Data` node's burst carries OUT of one step.
 ///
 /// The live burst (`Scheduler::tick_data_burst`) fires once per frame and,
 /// when its signalled count is spent, asks the refill hook for another frame
@@ -3034,7 +3034,7 @@ pub(crate) fn fifo_step_carry(
     }
 }
 
-/// PURE — does a RESUMED pass's first step of a FIFO `Data` node start with a
+/// PURE: does a RESUMED pass's first step of a FIFO `Data` node start with a
 /// carried frame? Its recording begins after the anchor, so a frame the step
 /// before it popped and left unfired has no pop record here: the first step
 /// then fires exactly one more time than it pops. Only on the first step of

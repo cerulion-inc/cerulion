@@ -676,7 +676,7 @@ static EXPECTED: &[Expected] = &[
         ],
         // Re-snapshot (MEASURED via `dump_measured_table`, never
         // hand-computed), at v19: `fold_anchor: FoldAnchor` is a one-byte enum
-        // that landed at offset 57, in what was tail padding — the struct
+        // that landed at offset 57, in what was tail padding; the struct
         // stayed 64 bytes and every other offset was unchanged. It carries the two facts a
         // run count asserts that no single record can hold: that the run is
         // ADJACENT (a drop at the rim breaks it) and that its provenance is its

@@ -1052,7 +1052,7 @@ impl fmt::Display for StandDownReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProducerGap {
     /// No [`ReadOutcomeKind::Producer`] annotation precedes the read in its
-    /// site's stream, so the recording never named the frame's publisher — a
+    /// site's stream, so the recording never named the frame's publisher, a
     /// bag predating the annotations, or one whose annotation did not reach the
     /// file.
     MissingAnnotation,

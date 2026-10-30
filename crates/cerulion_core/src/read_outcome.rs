@@ -1771,7 +1771,7 @@ impl ReadOutcomeStage {
     }
 
     /// Stage one read outcome together with the writer that produced its
-    /// frame — the annotated-edge form of [`Self::record`]. `token` is the
+    /// frame, the annotated-edge form of [`Self::record`]. `token` is the
     /// 64-bit producer token (see `ReadOutcomeKind::Producer`); every other
     /// parameter means exactly what it does on `record`.
     ///

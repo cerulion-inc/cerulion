@@ -3344,7 +3344,7 @@ fn publisher_id_of(publishers: &WiringPublisherTable, node: &str, output: &str) 
 ///
 /// ANTI-TAUTOLOGY, in the same body and the same recording: the consumer's
 /// SECOND edge is a plain input on an ordinary single-writer graph-owned
-/// topic. It reads (records exist) and carries ONE annotation, its writer's run — so "the
+/// topic. It reads (records exist) and carries ONE annotation, its writer's run, so "the
 /// runtime annotates" cannot pass by annotating everything.
 #[test]
 #[serial]

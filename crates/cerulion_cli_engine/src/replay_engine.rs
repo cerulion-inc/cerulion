@@ -13796,7 +13796,7 @@ fn run_rank_pass(
                     .set_replay_trailing_refills(boundary.step, &ids)
                     .map_err(|e| ReplayError::Internal {
                         reason: format!(
-                            "failed to install rank {}'s trailing refills for step {}: {e} — \
+                            "failed to install rank {}'s trailing refills for step {}: {e}; \
                              this is a bug in the replay engine, please report",
                             plan.rank(),
                             boundary.step

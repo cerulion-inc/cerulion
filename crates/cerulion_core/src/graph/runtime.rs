@@ -16934,7 +16934,7 @@ impl GraphRuntime {
     }
 
     /// Mark the nodes of this step's installed fire plan whose recorded burst
-    /// ended on a trailing refill — see
+    /// ended on a trailing refill, see
     /// [`crate::scheduler::Scheduler::set_replay_trailing_refills`]. Call after
     /// [`Self::set_replay_fire_plan`] for the same step.
     ///
