@@ -14,13 +14,16 @@ mod common;
 mod fixture;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cerud::client::OpsClient;
 use cerud::error::CerudError;
 use cerud::receipt::{read_all, ReceiptOutcome};
 use cerulion_core::wire::MaxSliceLen;
-use cerulion_core::{GatewayEgressPolicy, GatewayPlan, SchemaServing, TopicSchema};
+use cerulion_core::{
+    GatewayEgressPolicy, GatewayPlan, SchemaDoc, SchemaEncoding, SchemaServing, TopicSchema,
+};
 use cerulion_link::{
     alpn, dial, open_frame_stream, read_frame, write_frame, Endpoint, EndpointAddr, QuicOpsStream,
     RelayConfig, DEFAULT_MAX_FRAME_LEN,
@@ -28,8 +31,8 @@ use cerulion_link::{
 use cerulion_pairing::format::{PrincipalKind, PublicKey, RootSet};
 use cerulion_pairing::verify::TrustStore;
 use cerulion_remoted::{
-    BoundPlane, DeviceAccountIndex, KeyProvider, RemotePlane, RemotedConfig, RemotedError,
-    WireRequest, WireResponse,
+    BoundPlane, DeviceAccountIndex, KeyFiles, KeyProvider, RemotePlane, RemotedConfig,
+    RemotedError, SchemaSource, WireRequest, WireResponse,
 };
 use common::{
     bounded, disabled_endpoint, loopback_addr, pk, sk, CHASSIS, MAC_KEY, OWNER, ROBOT_ID, T_NOW,
@@ -364,6 +367,99 @@ async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_e
         other => panic!("expected the provider error, got {other:?}"),
     }
     plane.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_in_process_schema_source_names_the_catalog_and_serves_the_closure() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let manager = fixture::manager(false);
+    let _publisher = manager
+        .create_publisher_simple(TOPIC, MaxSliceLen::const_new(256))
+        .unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let source: SchemaSource = Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        SchemaServing {
+            served_topics: vec![TOPIC.into()],
+            topic_schemas: vec![TopicSchema {
+                topic: TOPIC.into(),
+                schema_name: SCHEMA.into(),
+            }],
+            schema_hashes: vec![],
+            schema_docs: vec![SchemaDoc {
+                qualified: SCHEMA.into(),
+                encoding: SchemaEncoding::Msg,
+                text: "float64 value\n".into(),
+                deps: vec![],
+            }],
+        }
+    });
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::in_process(root.path(), ROBOT, RelayConfig::Disabled, source)
+        .with_transport(manager)
+        .bind_bounded(&keys)
+        .await
+        .expect("the in-process entry binds");
+    let plane = Hosted::start(bound);
+    let desk = disabled_endpoint([DESK_SEED; 32]).await;
+
+    let schema = WireRequest::Schema {
+        topic: TOPIC.into(),
+    };
+    let replies = wire_requests(&desk, &plane, &[WireRequest::Catalog, schema]).await;
+    let WireResponse::Catalog(catalog) = serde_json::from_slice(&replies[0]).unwrap() else {
+        panic!(
+            "expected a catalog: {}",
+            String::from_utf8_lossy(&replies[0])
+        );
+    };
+    assert_eq!(catalog.error, None);
+    let rows: Vec<_> = catalog
+        .entries
+        .iter()
+        .filter(|row| row.topic == TOPIC)
+        .collect();
+    assert_eq!(rows.len(), 1, "one row for {TOPIC}: {:?}", catalog.entries);
+    assert_eq!(rows[0].schema_name.as_deref(), Some(SCHEMA));
+    let WireResponse::Schema(schema) = serde_json::from_slice(&replies[1]).unwrap() else {
+        panic!(
+            "expected a schema reply: {}",
+            String::from_utf8_lossy(&replies[1])
+        );
+    };
+    assert_eq!(schema.error, None);
+    let docs: Vec<_> = schema
+        .docs
+        .iter()
+        .map(|doc| (doc.qualified.as_str(), doc.text.as_str()))
+        .collect();
+    assert_eq!(docs, vec![(SCHEMA, "float64 value\n")]);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each metadata reply reads the source once"
+    );
+    plane.stop().await;
+}
+
+#[tokio::test]
+async fn an_in_process_host_with_no_keys_binds_nothing_and_writes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let keys = KeyFiles {
+        key_file: root.path().join("remoted").join("device_key"),
+        store_mac_key_file: root.path().join("remoted").join("trust_store.mac_key"),
+    };
+    let source: SchemaSource = Arc::new(SchemaServing::default);
+    let refused = RemotePlane::in_process(root.path(), ROBOT, RelayConfig::Disabled, source)
+        .bind_bounded(&keys)
+        .await;
+    assert!(
+        matches!(refused, Err(RemotedError::DeviceKey(_))),
+        "a fresh state root is refused at the device key"
+    );
+    assert_eq!(state_files(root.path()), Vec::new(), "nothing is written");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

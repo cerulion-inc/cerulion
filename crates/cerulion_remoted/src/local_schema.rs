@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Read the local network daemon's current metadata without discovery or startup.
+//! Read the local network daemon's current metadata without discovery or startup,
+//! or a host's own metadata in process.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_core::transport::cerulion_q::{collect_schema_closure, SchemaDoc, SchemaReply};
@@ -13,6 +15,32 @@ use cerulion_netd::{ClientError, NetdClient};
 use crate::wire::WireError;
 
 const QUERY_BUDGET: Duration = Duration::from_secs(5);
+
+/// A host's own schema metadata: the topics it serves and their schemas, read on
+/// each `catalog` and `schema` request. A host that runs no network daemon passes
+/// one to [`WirePlane::with_in_process_schema_provider`](crate::WirePlane::with_in_process_schema_provider).
+pub type SchemaSource = Arc<dyn Fn() -> SchemaServing + Send + Sync>;
+
+/// Where a wire plane reads its current schema metadata.
+pub(crate) enum LocalSchemaSource {
+    /// The existing local network daemon's control socket.
+    Socket(PathBuf),
+    /// The host process itself. It shares the plane's transport, so there is no
+    /// namespace to check.
+    InProcess(SchemaSource),
+}
+
+impl LocalSchemaSource {
+    pub(crate) async fn load(
+        &self,
+        expected_namespace: IceoryxShmIdentity,
+    ) -> Result<LocalSchemas, WireError> {
+        match self {
+            LocalSchemaSource::Socket(socket) => load(socket.clone(), expected_namespace).await,
+            LocalSchemaSource::InProcess(source) => Ok(LocalSchemas::from_serving(source())),
+        }
+    }
+}
 
 pub(crate) struct LocalSchemas {
     topic_types: BTreeMap<String, String>,
@@ -72,7 +100,7 @@ impl LocalSchemas {
     }
 }
 
-pub(crate) async fn load(
+async fn load(
     socket: PathBuf,
     expected_namespace: IceoryxShmIdentity,
 ) -> Result<LocalSchemas, WireError> {

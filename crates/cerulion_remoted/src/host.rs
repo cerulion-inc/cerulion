@@ -10,9 +10,11 @@
 //! - the **keys**: a [`KeyProvider`] supplies the device key and the trust-store
 //!   MAC key. The daemon reads them from files ([`KeyFiles`]); a host can hold
 //!   them anywhere;
-//! - the **control connect**: the local network daemon's control socket that the
-//!   `catalog` and `schema` replies read through, each read bounded by its own
-//!   deadline.
+//! - the **schema source**: where the `catalog` and `schema` replies read the
+//!   served topics' schemas. [`RemotePlane::new`] reads the local network
+//!   daemon's control socket, each read bounded by its own deadline;
+//!   [`RemotePlane::in_process`] calls a [`SchemaSource`] the host supplies, for
+//!   a host that serves its own topics and runs no network daemon.
 //!
 //! [`RemotePlane::bind`] loads the trust state and binds the ONE endpoint;
 //! [`BoundPlane::serve`] runs the accept loop until shutdown. The two steps let a
@@ -55,6 +57,7 @@ use crate::clock::RemotedClock;
 use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::error::RemotedError;
+use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::wire::WirePlane;
 
 /// The ops handshake name the daemon announces.
@@ -154,7 +157,7 @@ pub struct RemotePlane {
     files: PlaneFiles,
     relay: RelayConfig,
     robot: String,
-    control_socket: PathBuf,
+    schemas: LocalSchemaSource,
     transport: Option<Arc<TransportManager>>,
     host: HostKind,
 }
@@ -172,12 +175,46 @@ impl RemotePlane {
         control_socket: impl Into<PathBuf>,
         relay: RelayConfig,
     ) -> Self {
+        Self::embedded(
+            state_root,
+            robot.into(),
+            relay,
+            LocalSchemaSource::Socket(control_socket.into()),
+        )
+    }
+
+    /// A library host's plane that reads the served topics' schemas from
+    /// `schemas` in this process instead of a network daemon's control socket.
+    /// Everything else is as [`RemotePlane::new`]: files under
+    /// `<state_root>/remoted/`, `restart` and `engage-estop` refused, no kill
+    /// switch read. The `catalog` still lists the live topics of the plane's
+    /// transport; `schemas` names their schemas and serves the `schema` verb.
+    pub fn in_process(
+        state_root: impl AsRef<Path>,
+        robot: impl Into<String>,
+        relay: RelayConfig,
+        schemas: SchemaSource,
+    ) -> Self {
+        Self::embedded(
+            state_root,
+            robot.into(),
+            relay,
+            LocalSchemaSource::InProcess(schemas),
+        )
+    }
+
+    fn embedded(
+        state_root: impl AsRef<Path>,
+        robot: String,
+        relay: RelayConfig,
+        schemas: LocalSchemaSource,
+    ) -> Self {
         let layout = RemotedConfig::from_state_root(state_root, relay, false);
         RemotePlane {
             files: PlaneFiles::of(&layout),
             relay: layout.relay,
-            robot: robot.into(),
-            control_socket: control_socket.into(),
+            robot,
+            schemas,
             transport: None,
             host: HostKind::Embedded,
         }
@@ -191,7 +228,7 @@ impl RemotePlane {
             files: PlaneFiles::of(config),
             relay: config.relay.clone(),
             robot: cerulion_core::graph::robot_identity_from_env(),
-            control_socket: cerulion_netd::hygiene::default_socket_path(),
+            schemas: LocalSchemaSource::Socket(cerulion_netd::hygiene::default_socket_path()),
             transport: None,
             host: HostKind::Daemon,
         }
@@ -200,9 +237,9 @@ impl RemotePlane {
     /// Tap topics through `manager` instead of the process's transport
     /// singleton, which the plane otherwise starts with the default
     /// configuration on the first wire request. A host that already runs its own
-    /// manager passes it here, so the process keeps one iceoryx2 node. The
-    /// control socket's daemon must serve the same shared-memory namespace, or
-    /// each metadata reply refuses.
+    /// manager passes it here, so the process keeps one iceoryx2 node. A control
+    /// socket's daemon must serve the same shared-memory namespace, or each
+    /// metadata reply refuses.
     pub fn with_transport(mut self, manager: Arc<TransportManager>) -> Self {
         self.transport = Some(manager);
         self
@@ -312,8 +349,11 @@ impl BoundPlane {
         let base = match plane.transport {
             Some(manager) => WirePlane::with_manager(plane.robot, manager),
             None => WirePlane::lazy(plane.robot),
-        }
-        .with_local_schema_provider(plane.control_socket);
+        };
+        let base = match plane.schemas {
+            LocalSchemaSource::Socket(socket) => base.with_local_schema_provider(socket),
+            LocalSchemaSource::InProcess(source) => base.with_in_process_schema_provider(source),
+        };
         let (ops_host, server_name) = match plane.host {
             HostKind::Daemon => (OpsHost::daemon(), DAEMON_SERVER_NAME),
             HostKind::Embedded => {
