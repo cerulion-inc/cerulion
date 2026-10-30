@@ -66,7 +66,6 @@ def tree_entries(crate):
 def member(name, size=None):
     info = tarfile.TarInfo(name)
     info.uid = info.gid = 0
-    info.uname = info.gname = ""
     info.mtime = 0
     if size is None:
         info.type = tarfile.DIRTYPE
