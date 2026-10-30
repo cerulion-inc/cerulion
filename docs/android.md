@@ -551,17 +551,27 @@ Omitting `record.topics` records all graph output and app-published topics.
 Topics use canonical names with a leading `/`. Publish schemas must be known
 built-in schemas or available under `files/schemas/`; duplicate publish topics
 are rejected. `max_payload_bytes` defaults to 4096 and must be from 1 to
-1048576. JSON publish values support `Bool`, `I8` through `U64`, `F32`, `F64`,
-`String`, `Bytes`, and `StringFixed(n)`. `Bytes` uses an array of integers from
-0 to 255. The top-level publish value must be an object; unknown fields and
-unsupported field types are rejected. Missing fields use zero or empty values.
-The JSON text is limited to `max_payload_bytes * 8 + 65536` bytes before it is
-parsed. This allows for escaped strings, byte arrays, field names, and
-whitespace while bounding the input size.
+1048576. Publish reads JSON with the reader `cerulion` uses for a message typed
+as text (JSON is YAML; see [Message YAML](user-api.md#message-yaml)), so it takes
+every field type a schema declares, nested messages and arrays included: a
+`std_msgs/Header` field is `{"stamp": {"sec": 1, "nanosec": 2}, "frame_id":
+"map"}`, and `bytes` and `uint8[]` are arrays of integers from 0 to 255. The
+top-level publish value must be a JSON object, and unknown fields are rejected.
+A field the JSON leaves out, at any depth, is written as its zero value: `0`,
+`false`, an empty string or array, or a fixed array of zero values. An error
+names the field path, for example `pose.position.x: expected float64, got
+string`. The text must be strict JSON (no comments, `NaN` or unquoted
+keys), and a duplicate key is refused. A bare `-0` reads as `0`; write
+`-0.0` for a negative zero float. The JSON text is limited to
+`max_payload_bytes * 8 + 65536` bytes before it is parsed. This allows for
+escaped strings, byte arrays, field names, and whitespace while bounding the
+input size. Publish allocates for each message: it is the app's convenience
+path, not the zero-copy path a node publishes on.
 
-Subscribe schemas follow the same rules and must have only the field types
-publish supports; a schema with a nested message or an array other than
-bytes is rejected with error code 3. `depth` defaults to 10 and must be from
+Subscribe schemas must have only the field types poll reads: `Bool`, `I8`
+through `U64`, `F32`, `F64`, `String`, `Bytes`, and `StringFixed(n)`; a schema
+with a nested message or an array other than bytes is rejected with error
+code 3. `depth` defaults to 10 and must be from
 1 to 16. Duplicate subscribe topics are rejected, and so is a subscribe topic
 the app publishes or the graph outputs under a different schema. `poll`
 writes the fixed-size fields first and then the strings and byte arrays,
@@ -728,8 +738,8 @@ App publish topics must not collide with graph output topics because graph
 topics are single-writer; a conflicting start returns `INVALID_ARGUMENT`.
 `subscribe` reads topics of the app's own process: the gateway forwards no
 incoming topic to the app except the `ingress` topics, which go to the graph
-inputs that read them. JSON publishing and polling support
-only the field types listed above.
+inputs that read them. JSON polling supports only the field types listed
+above for subscribe schemas.
 
 ### Choose which topics leave the device
 
