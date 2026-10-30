@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "dirs",
  "ed25519-dalek",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cerulion_core",
 ]
