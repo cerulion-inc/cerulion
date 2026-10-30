@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The remote plane hosted as a library: [`RemotePlane`] over a temporary state
+//! root, a [`KeyProvider`] that holds its keys in memory (no key file is
+//! written), and an injected local network daemon control socket.
+//!
+//! Every endpoint is loopback iroh with the relay disabled and every await is
+//! bounded. Keys come from fixed seeds; each expected value is a hand-written
+//! literal (the topic, its schema name, the refusal text), never a second run.
+
+mod common;
+// This test uses only the local network daemon from the provider fixture.
+#[allow(dead_code)]
+#[path = "local_schema_provider/fixture.rs"]
+mod fixture;
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use cerud::client::OpsClient;
+use cerud::error::CerudError;
+use cerud::receipt::{read_all, ReceiptOutcome};
+use cerulion_core::wire::MaxSliceLen;
+use cerulion_core::{GatewayEgressPolicy, GatewayPlan, SchemaServing, TopicSchema};
+use cerulion_link::{
+    alpn, dial, open_frame_stream, read_frame, write_frame, Endpoint, EndpointAddr, QuicOpsStream,
+    RelayConfig, DEFAULT_MAX_FRAME_LEN,
+};
+use cerulion_pairing::format::{PrincipalKind, PublicKey, RootSet};
+use cerulion_pairing::verify::TrustStore;
+use cerulion_remoted::{
+    BoundPlane, DeviceAccountIndex, KeyProvider, RemotePlane, RemotedConfig, RemotedError,
+    WireRequest, WireResponse,
+};
+use common::{
+    bounded, disabled_endpoint, loopback_addr, pk, sk, CHASSIS, MAC_KEY, OWNER, ROBOT_ID, T_NOW,
+};
+use fixture::LocalNetd;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+/// The identity the hosted plane is given; every wire reply names it.
+const ROBOT: &str = "library-host";
+/// The hosted plane's device key seed; its public half is the endpoint id.
+const ROBOT_SEED: u8 = 71;
+/// A desk the owner has paired.
+const DESK_SEED: u8 = 72;
+/// A key nobody has paired.
+const STRANGER_SEED: u8 = 73;
+const TOPIC: &str = "/library/reading";
+const SCHEMA: &str = "example_msgs/Reading";
+/// The provider's error when no daemon answers on the control socket.
+const NO_DAEMON: &str = "cannot reach the local network daemon";
+
+/// A key provider that holds both keys in memory and records each MAC key
+/// request's `required` flag.
+struct MemoryKeys {
+    device: Result<[u8; 32], String>,
+    asked_mac: Mutex<Vec<bool>>,
+}
+
+impl MemoryKeys {
+    fn new(seed: u8) -> Self {
+        MemoryKeys {
+            device: Ok([seed; 32]),
+            asked_mac: Mutex::new(Vec::new()),
+        }
+    }
+    fn refusing(reason: &str) -> Self {
+        MemoryKeys {
+            device: Err(reason.to_owned()),
+            asked_mac: Mutex::new(Vec::new()),
+        }
+    }
+    fn asked_mac(&self) -> Vec<bool> {
+        self.asked_mac.lock().unwrap().clone()
+    }
+}
+
+impl KeyProvider for MemoryKeys {
+    fn device_key(&self) -> Result<[u8; 32], RemotedError> {
+        self.device.clone().map_err(RemotedError::DeviceKey)
+    }
+    fn store_mac_key(&self, required: bool) -> Result<Vec<u8>, RemotedError> {
+        self.asked_mac.lock().unwrap().push(required);
+        Ok(MAC_KEY.to_vec())
+    }
+}
+
+fn public(seed: u8) -> PublicKey {
+    pk(&sk(seed))
+}
+
+/// Write a claimed trust store bound to `robot` and a side map that pairs the
+/// desk with the owner, both MAC'd with the provider's key, under `root`.
+fn provision(root: &Path, robot: PublicKey) {
+    let config = RemotedConfig::from_state_root(root, RelayConfig::Disabled, false);
+    std::fs::create_dir_all(config.store_file.parent().unwrap()).unwrap();
+    let mut store = TrustStore::provision(
+        ROBOT_ID,
+        robot,
+        RootSet::new(vec![pk(&sk(1))], 1).unwrap(),
+        CHASSIS,
+        0,
+    )
+    .unwrap()
+    .with_path(&config.store_file);
+    store
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    store.save(MAC_KEY).unwrap();
+    let mut index = DeviceAccountIndex::new().with_path(&config.index_file);
+    index.bind(public(DESK_SEED), OWNER);
+    index.save(MAC_KEY).unwrap();
+}
+
+/// A bound plane serving on its own task until [`Hosted::stop`].
+struct Hosted {
+    address: EndpointAddr,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), RemotedError>>,
+}
+
+impl Hosted {
+    fn start(bound: BoundPlane) -> Self {
+        let address = loopback_addr(bound.endpoint_id(), &bound.bound_sockets());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = stopped.await;
+        }));
+        Hosted {
+            address,
+            stop,
+            task,
+        }
+    }
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        bounded("plane stops", self.task)
+            .await
+            .expect("serve task joins")
+            .expect("serve returns Ok");
+    }
+}
+
+/// One `cerulion/wire/2` control request from `desk` and its reply.
+async fn wire_requests(desk: &Endpoint, plane: &Hosted, requests: &[WireRequest]) -> Vec<Vec<u8>> {
+    let connection = bounded("dial wire", dial(desk, plane.address.clone(), alpn::WIRE))
+        .await
+        .expect("wire dial");
+    let (mut send, mut recv) = bounded("open control", open_frame_stream(&connection))
+        .await
+        .expect("control stream");
+    let mut replies = Vec::new();
+    for request in requests {
+        let bytes = serde_json::to_vec(request).unwrap();
+        bounded("send request", write_frame(&mut send, &bytes))
+            .await
+            .unwrap();
+        replies.push(
+            bounded("read reply", read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN))
+                .await
+                .unwrap(),
+        );
+    }
+    connection.close(0u32.into(), b"test finished");
+    replies
+}
+
+/// The result of each call in one ops session.
+type CallResults = Vec<Result<serde_json::Value, CerudError>>;
+
+/// One ops session from `desk`: the server's handshake name, then each verb
+/// with its args and each result.
+async fn ops_calls(
+    desk: &Endpoint,
+    plane: &Hosted,
+    calls: Vec<(&'static str, serde_json::Value)>,
+) -> (String, CallResults) {
+    let connection = bounded("dial ops", dial(desk, plane.address.clone(), alpn::OPS))
+        .await
+        .expect("ops dial");
+    let (send, recv) = bounded("open ops stream", open_frame_stream(&connection))
+        .await
+        .expect("ops stream");
+    let stream = QuicOpsStream::new(send, recv);
+    let results = bounded(
+        "ops session",
+        tokio::task::spawn_blocking(move || {
+            let mut client = OpsClient::connect_current(stream).expect("ops handshake");
+            let server = client.server_name().to_owned();
+            let results = calls
+                .into_iter()
+                .map(|(verb, args)| client.call(verb, args))
+                .collect();
+            (server, results)
+        }),
+    )
+    .await
+    .expect("ops session joins");
+    drop(connection);
+    results
+}
+
+/// Each receipt's verb and outcome, in log order.
+fn receipt_rows(root: &Path) -> Vec<(String, ReceiptOutcome)> {
+    let config = RemotedConfig::from_state_root(root, RelayConfig::Disabled, false);
+    read_all(&config.receipt_file)
+        .unwrap()
+        .into_iter()
+        .map(|receipt| (receipt.verb, receipt.outcome))
+        .collect()
+}
+
+fn remote_error(result: &Result<serde_json::Value, CerudError>) -> (String, String) {
+    match result {
+        Err(CerudError::Remote { kind, message }) => (kind.clone(), message.clone()),
+        other => panic!("expected a remote error, got {other:?}"),
+    }
+}
+
+/// Register `TOPIC` as `SCHEMA` with the local daemon in the plane's namespace.
+fn register_topic(netd: &LocalNetd) {
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![TOPIC.into()],
+        ingress: vec![],
+    };
+    let serving = SchemaServing {
+        served_topics: vec![TOPIC.into()],
+        topic_schemas: vec![TopicSchema {
+            topic: TOPIC.into(),
+            schema_name: SCHEMA.into(),
+        }],
+        schema_hashes: vec![],
+        schema_docs: vec![],
+    };
+    let namespace = serde_json::to_string(&netd.manager.iox_config()).unwrap();
+    netd.client()
+        .register_egress(&plan, &serving, Some(&namespace))
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_library_host_serves_the_catalog_through_the_injected_control_socket() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let netd = LocalNetd::start();
+    register_topic(&netd);
+    let _publisher = netd
+        .manager
+        .create_publisher_simple(TOPIC, MaxSliceLen::const_new(256))
+        .unwrap();
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::new(root.path(), ROBOT, netd.path.clone(), RelayConfig::Disabled)
+        .with_transport(netd.manager.clone())
+        .bind(&keys)
+        .await
+        .expect("the library entry binds");
+    assert_eq!(*bound.endpoint_id().as_bytes(), public(ROBOT_SEED).0);
+    let plane = Hosted::start(bound);
+    let desk = disabled_endpoint([DESK_SEED; 32]).await;
+
+    let replies = wire_requests(&desk, &plane, &[WireRequest::Catalog, WireRequest::Catalog]).await;
+    let WireResponse::Catalog(catalog) = serde_json::from_slice(&replies[0]).unwrap() else {
+        panic!(
+            "expected a catalog: {}",
+            String::from_utf8_lossy(&replies[0])
+        );
+    };
+    assert_eq!(catalog.robot, ROBOT);
+    assert_eq!(catalog.error, None);
+    let rows: Vec<_> = catalog
+        .entries
+        .iter()
+        .filter(|row| row.topic == TOPIC)
+        .collect();
+    assert_eq!(rows.len(), 1, "one row for {TOPIC}: {:?}", catalog.entries);
+    assert_eq!(rows[0].schema_name.as_deref(), Some(SCHEMA));
+    assert_eq!(
+        replies[0], replies[1],
+        "a repeated catalog is byte-identical"
+    );
+
+    plane.stop().await;
+    netd.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_error() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let manager = fixture::manager(false);
+    let absent = root.path().join("no-daemon.sock");
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::new(root.path(), ROBOT, absent, RelayConfig::Disabled)
+        .with_transport(manager)
+        .bind(&keys)
+        .await
+        .unwrap();
+    let plane = Hosted::start(bound);
+    let desk = disabled_endpoint([DESK_SEED; 32]).await;
+
+    let replies = wire_requests(&desk, &plane, &[WireRequest::Catalog]).await;
+    match serde_json::from_slice(&replies[0]).unwrap() {
+        WireResponse::Error { message, .. } => {
+            assert!(message.contains(NO_DAEMON), "message: {message}")
+        }
+        other => panic!("expected the provider error, got {other:?}"),
+    }
+    plane.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_library_host_refuses_the_daemon_only_verbs_by_name() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("no-daemon.sock"),
+        RelayConfig::Disabled,
+    )
+    .bind(&keys)
+    .await
+    .unwrap();
+    let plane = Hosted::start(bound);
+    let desk = disabled_endpoint([DESK_SEED; 32]).await;
+
+    let (server, results) = ops_calls(
+        &desk,
+        &plane,
+        vec![
+            ("inventory", serde_json::json!({})),
+            ("restart", serde_json::json!({"graph": "demo"})),
+            ("engage-estop", serde_json::json!({})),
+        ],
+    )
+    .await;
+    assert_eq!(
+        server, "cerulion-remote-plane",
+        "a library host is not the daemon"
+    );
+    assert!(results[0].is_ok(), "inventory is served: {:?}", results[0]);
+    let (kind, message) = remote_error(&results[1]);
+    assert_eq!(kind, "unsupported_host");
+    assert!(
+        message.contains("restart is served only by the cerulion-remoted daemon"),
+        "message: {message}"
+    );
+    assert!(message.contains("systemd"), "message: {message}");
+    let (kind, message) = remote_error(&results[2]);
+    assert_eq!(kind, "unsupported_host");
+    assert!(
+        message.contains("engage-estop is served only by the cerulion-remoted daemon"),
+        "message: {message}"
+    );
+
+    // The authorizer still runs first: an unpaired key is denied, not refused.
+    let stranger = disabled_endpoint([STRANGER_SEED; 32]).await;
+    let (_, results) = ops_calls(
+        &stranger,
+        &plane,
+        vec![("engage-estop", serde_json::json!({}))],
+    )
+    .await;
+    assert_eq!(remote_error(&results[0]).0, "denied");
+    plane.stop().await;
+
+    // Every call is receipted; a refusal is an error outcome with no intent row.
+    let unsupported = || ReceiptOutcome::Error("unsupported_host".into());
+    assert_eq!(
+        receipt_rows(root.path()),
+        vec![
+            ("inventory".into(), ReceiptOutcome::Ok),
+            ("restart".into(), unsupported()),
+            ("engage-estop".into(), unsupported()),
+            ("engage-estop".into(), ReceiptOutcome::Denied),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_configuration_serves_the_real_restart_verb() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let config = RemotedConfig::from_state_root(root.path(), RelayConfig::Disabled, false);
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = config.remote_plane().bind(&keys).await.unwrap();
+    let plane = Hosted::start(bound);
+    let desk = disabled_endpoint([DESK_SEED; 32]).await;
+
+    // An empty graph name fails validation before any systemd command runs
+    // (`RestartVerb` validates the name before it checks the host), so this
+    // reaches the real verb on every platform without running anything.
+    let (server, results) = ops_calls(
+        &desk,
+        &plane,
+        vec![("restart", serde_json::json!({"graph": ""}))],
+    )
+    .await;
+    let (kind, message) = remote_error(&results[0]);
+    assert_eq!(kind, "verb_error");
+    assert!(
+        message.contains("graph name is empty"),
+        "message: {message}"
+    );
+    assert_eq!(server, "cerulion-remoted");
+    plane.stop().await;
+}
+
+#[tokio::test]
+async fn a_key_provider_error_surfaces_from_bind_before_any_other_key_is_read() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let keys = MemoryKeys::refusing("the host keystore is locked");
+    let error = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind(&keys)
+    .await
+    .err()
+    .expect("bind fails");
+    assert!(
+        matches!(&error, RemotedError::DeviceKey(reason) if reason == "the host keystore is locked"),
+        "error: {error:?}"
+    );
+    assert_eq!(keys.asked_mac(), Vec::<bool>::new());
+}
+
+#[tokio::test]
+async fn the_mac_key_is_required_only_when_trust_state_exists() {
+    let fresh = tempfile::tempdir().unwrap();
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let error = RemotePlane::new(
+        fresh.path(),
+        ROBOT,
+        fresh.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind(&keys)
+    .await
+    .err()
+    .expect("a fresh root has no trust store");
+    assert!(matches!(error, RemotedError::Store(_)), "error: {error:?}");
+    assert_eq!(keys.asked_mac(), vec![false]);
+
+    let provisioned = tempfile::tempdir().unwrap();
+    provision(provisioned.path(), public(ROBOT_SEED));
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::new(
+        provisioned.path(),
+        ROBOT,
+        provisioned.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind(&keys)
+    .await
+    .unwrap();
+    assert_eq!(keys.asked_mac(), vec![true]);
+    Hosted::start(bound).stop().await;
+}
+
+#[tokio::test]
+async fn a_device_key_that_is_not_the_stores_key_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let keys = MemoryKeys::new(STRANGER_SEED);
+    let error = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind(&keys)
+    .await
+    .err()
+    .expect("a store for another device is refused");
+    assert!(
+        matches!(error, RemotedError::ProvisioningMismatch(_)),
+        "error: {error:?}"
+    );
+}
+
+/// A provider that returns an empty MAC key even when trust state exists.
+struct EmptyMacKeys;
+
+impl KeyProvider for EmptyMacKeys {
+    fn device_key(&self) -> Result<[u8; 32], RemotedError> {
+        Ok([ROBOT_SEED; 32])
+    }
+    fn store_mac_key(&self, _required: bool) -> Result<Vec<u8>, RemotedError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn an_empty_mac_key_for_existing_trust_state_is_a_mac_key_error() {
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let error = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("s"),
+        RelayConfig::Disabled,
+    )
+    .bind(&EmptyMacKeys)
+    .await
+    .err()
+    .expect("an empty key cannot verify the existing store");
+    match error {
+        RemotedError::MacKey(message) => {
+            assert!(
+                message.contains("empty trust-store MAC key"),
+                "message: {message}"
+            )
+        }
+        other => panic!("expected a MAC key error, got {other:?}"),
+    }
+}

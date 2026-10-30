@@ -210,7 +210,7 @@
 4 crates/cerulion_remoted/src/authorizer.rs
 1 crates/cerulion_remoted/src/beacon_facts.rs
 1 crates/cerulion_remoted/src/config.rs
-7 crates/cerulion_remoted/src/daemon.rs
+6 crates/cerulion_remoted/src/daemon.rs
 3 crates/cerulion_remoted/src/device_index.rs
 8 crates/cerulion_remoted/src/flashback.rs
 2 crates/cerulion_remoted/src/ops.rs
