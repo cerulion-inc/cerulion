@@ -246,12 +246,18 @@ Take `cerulion_android` from git at one commit, `<rev>`, until crates.io
 lists it: check `https://crates.io/crates/cerulion_android` before you use
 a version requirement. `cerulion_android`, `cerulion_core` and
 `native_ros2_messages` must resolve from one source; a split fails to compile
-with two different `NodeEntry` traits. The node crates depend on
-`cerulion_core` from crates.io, so the two `[patch.crates-io]` entries move
-them to the same commit. A local checkout works the same way with `path =`
-in place of `git` and `rev`. Once crates.io lists `cerulion_android`, a
-version requirement replaces the git source and the two entries, for
-example `cerulion_android = "1.1"`.
+with two different `NodeEntry` traits. A node workspace made by a released
+`cerulion` pins `cerulion_core` and `native_ros2_messages` from crates.io at
+that release's exact version, and the two `[patch.crates-io]` entries move
+them to `<rev>` only when `<rev>` carries that same version: pick the commit
+of the release your `cerulion` is, or a later commit with the same
+workspace version. A node workspace made by a `cerulion` built from a
+checkout uses `path` dependencies, which no patch moves; take
+`cerulion_android` from that same checkout with `path =` in place of `git`
+and `rev`. Once crates.io lists `cerulion_android`, a version requirement
+equal to the node workspace's pins replaces the git source and the two
+entries, for example `cerulion_android = "=1.1.0"` beside nodes made by
+`cerulion` 1.1.0.
 
 Whatever the source of `cerulion_android`, crates.io included, an app
 copies two things into its own build from the Cerulion release or commit it

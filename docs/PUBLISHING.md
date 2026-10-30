@@ -278,8 +278,11 @@ against an existing release (no build, no publish), dispatch the workflow with
 Every tag also publishes `cerulion-android-java-<version>.tar.gz`, the Java
 facade of `cerulion_android` (the crate's `java/` tree and its `LICENSE`), which
 the `android-java` job builds with `tools/scripts/package_android_java.py`. The
-archive is reproducible, so running that script at the tagged commit gives the
-checksum the release's `SHA256SUMS` lists:
+script fixes member order, owner, mode and time, so the tar inside is the same
+for the same sources. Run at the tagged commit from a clean checkout with the
+zlib of the release runner (Ubuntu 22.04), it also gives the checksum the
+release's `SHA256SUMS` lists; another zlib can compress the same tar to other
+bytes:
 
 ```bash
 python3 tools/scripts/package_android_java.py --version "$(tools/scripts/workspace_version.sh)" --out /tmp/android-java
