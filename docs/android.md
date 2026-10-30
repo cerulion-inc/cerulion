@@ -233,28 +233,70 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-cerulion_android = "1"
+cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 timer = { path = "../nodes/timer", default-features = false }
 printer = { path = "../nodes/printer", default-features = false }
-```
-
-Copy the iceoryx2 `[patch.crates-io]` block from the node workspace's
-`Cargo.toml` into this file too: a patch applies only in the workspace that
-declares it. `cerulion_android`, `cerulion_core` and `native_ros2_messages`
-must resolve from one source; a split fails to compile with two different
-`NodeEntry` traits. When `cerulion_android` comes from git or a local
-checkout, take the other two from the same place:
-
-```toml
-[dependencies]
-cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 
 [patch.crates-io]
 cerulion_core = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 native_ros2_messages = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
 ```
 
-Its `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
+Take `cerulion_android` from git at one commit, `<rev>`, until crates.io
+lists it: check `https://crates.io/crates/cerulion_android` before you use
+a version requirement. `cerulion_android`, `cerulion_core` and
+`native_ros2_messages` must resolve from one source; a split fails to compile
+with two different `NodeEntry` traits. A node workspace made by a released
+`cerulion` pins `cerulion_core` and `native_ros2_messages` from crates.io at
+that release's exact version, and the two `[patch.crates-io]` entries move
+them to `<rev>` only when `<rev>` carries that same version: pick the commit
+of the release your `cerulion` is, or a later commit with the same
+workspace version. A node workspace made by a `cerulion` built from a
+checkout uses `path` dependencies, which no patch moves; take
+`cerulion_android` from that same checkout with `path =` in place of `git`
+and `rev`. Once crates.io lists `cerulion_android`, a version requirement
+equal to the node workspace's pins replaces the git source and the two
+entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
+`cerulion` 2.0.0.
+
+Whatever the source of `cerulion_android`, crates.io included, an app
+copies two things into its own build from the Cerulion release or commit it
+depends on:
+
+1. The iceoryx2 `[patch.crates-io]` block. Copy the complete block from the
+   root `Cargo.toml` of that release or commit (a node workspace made by
+   `cerulion workspace create` carries the same block) into this file, below
+   the entries above. A patch applies only in the workspace that declares it,
+   and a published crate carries none, so a crates.io dependency does not
+   bring it along. Without it the library links upstream iceoryx2, which has
+   no Android shared-memory support.
+2. The Java facade, `com.cerulion.android.CerulionRuntime`. It is Java
+   source in the `java/` directory of `cerulion_android`, and the app compiles
+   it into its own classes. Use the copy from the same release or commit as
+   the Rust crate, because its native method declarations must match the
+   library.
+
+Three places hold that `java/` directory:
+
+- A GitHub release that carries `cerulion_android` attaches it as
+  `cerulion-android-java-<version>.tar.gz`, with its checksum in the
+  release's `SHA256SUMS`. The archive holds `java/` and the crate's
+  `LICENSE` under one `cerulion-android-java-<version>/` directory.
+- Cargo unpacks a git source under
+  `$CARGO_HOME/git/checkouts/cerulion-<hash>/<short rev>/crates/cerulion_android/java`
+  and a crates.io source under
+  `$CARGO_HOME/registry/src/index.crates.io-<hash>/cerulion_android-<version>/java`
+  (`CARGO_HOME` is `~/.cargo` unless you set it). `cargo metadata` prints the
+  exact manifest path; `java/` is beside it:
+
+  ```sh
+  cargo metadata --format-version 1 --manifest-path runtime/Cargo.toml \
+    | jq -r '.packages[] | select(.name == "cerulion_android") | .manifest_path'
+  ```
+
+- A local checkout of Cerulion has it at `crates/cerulion_android/java`.
+
+The runtime crate's `src/lib.rs` is one macro call that maps each graph YAML `type:` to the
 node's generated entry type:
 
 ```rust
@@ -276,8 +318,8 @@ runtime. `tools/scripts/android_jnilibs_gate.sh <jniLibs> myapp_runtime`
 checks the result: exactly one library per ABI, built for that ABI, every
 `LOAD` segment aligned to 16 KB, `JNI_OnLoad` exported and no node export such as
 `cerulion_node_info`. In `app/build.gradle`, set `minSdk 30`, the
-`abiFilters` you built, and add the `java/` directory of `cerulion_android`
-to `sourceSets.main.java.srcDirs`. Ship the graph as
+`abiFilters` you built, and add the facade's `java/` directory (one of the
+three places above) to `sourceSets.main.java.srcDirs`. Ship the graph as
 `app/src/main/assets/graph.yaml` with an explicit `prefix:`, because without
 one the runtime names the topics after the device's host name, and pass its
 text as `graph_yaml` in the start configuration.
@@ -881,8 +923,20 @@ connection is checked against the plane's trust store; an unpaired desk is
 refused.
 
 The plane links iroh, so it lives in its own crate, `cerulion_android_remote`.
-The app runtime crate depends on it as it depends on `cerulion_android`, and
-lists its host first in `embed_nodes!` (the node list may then be empty):
+That crate is not published to crates.io, because the remote plane it links
+is not. Take it from git at the same `rev` as `cerulion_android`, so both
+resolve from one source; an app that hosts the plane therefore takes
+`cerulion_android` from git too, with the `[patch.crates-io]` entries shown
+in [Graph nodes in an app](#graph-nodes-in-an-app):
+
+```toml
+[dependencies]
+cerulion_android = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+cerulion_android_remote = { git = "https://github.com/cerulion-inc/cerulion", rev = "<rev>" }
+```
+
+The runtime crate lists the plane's host first in `embed_nodes!` (the node
+list may then be empty):
 
 ```rust
 cerulion_android::embed_nodes! {

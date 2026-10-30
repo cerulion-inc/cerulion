@@ -402,7 +402,7 @@ resolver = "2"
 # `<field>.workspace = true`. Bump `version` here to release
 # all crates in lockstep.
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cerulion-inc/cerulion"
@@ -511,23 +511,23 @@ disallowed_methods = "deny"
 # matching on a 0.0.x prerelease is surprising, and these crates are released
 # in lockstep anyway, so `=<workspace version>` is both correct and clearest.
 [workspace.dependencies]
-cerulion_macros = { path = "crates/cerulion_macros", version = "=1.0.0" }
-cerulion_core = { path = "crates/cerulion_core", version = "=1.0.0" }
-cerulion_bag = { path = "crates/cerulion_bag", version = "=1.0.0" }
-cerulion_bagd = { path = "crates/cerulion_bagd", version = "=1.0.0" }
-cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=1.0.0" }
+cerulion_macros = { path = "crates/cerulion_macros", version = "=2.0.0" }
+cerulion_core = { path = "crates/cerulion_core", version = "=2.0.0" }
+cerulion_bag = { path = "crates/cerulion_bag", version = "=2.0.0" }
+cerulion_bagd = { path = "crates/cerulion_bagd", version = "=2.0.0" }
+cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=2.0.0" }
 indexmap = "2.8"
-cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=1.0.0" }
-cerulion_dds = { path = "crates/cerulion_dds", version = "=1.0.0", default-features = false }
-cerulion_discovery = { path = "crates/cerulion_discovery", version = "=1.0.0" }
-cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=1.0.0" }
-cerulion_link = { path = "crates/cerulion_link", version = "=1.0.0" }
-cerulion_mdns = { path = "crates/cerulion_mdns", version = "=1.0.0" }
-cerulion_netd = { path = "crates/cerulion_netd", version = "=1.0.0", default-features = false }
-cerulion_pairing = { path = "crates/cerulion_pairing", version = "=1.0.0" }
-cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=1.0.0" }
-cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=1.0.0" }
-native_ros2_messages = { path = "crates/native_ros2_messages", version = "=1.0.0" }
+cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=2.0.0" }
+cerulion_dds = { path = "crates/cerulion_dds", version = "=2.0.0", default-features = false }
+cerulion_discovery = { path = "crates/cerulion_discovery", version = "=2.0.0" }
+cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=2.0.0" }
+cerulion_link = { path = "crates/cerulion_link", version = "=2.0.0" }
+cerulion_mdns = { path = "crates/cerulion_mdns", version = "=2.0.0" }
+cerulion_netd = { path = "crates/cerulion_netd", version = "=2.0.0", default-features = false }
+cerulion_pairing = { path = "crates/cerulion_pairing", version = "=2.0.0" }
+cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=2.0.0" }
+cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=2.0.0" }
+native_ros2_messages = { path = "crates/native_ros2_messages", version = "=2.0.0" }
 
 # ───────────────────────────── Published DDS forks ─────────────────────────
 # The DDS stack is published as the distinct crates
