@@ -51,6 +51,64 @@ pub struct EmbeddedConfig {
     /// reach logcat; `info` unless set.
     #[serde(default)]
     pub log_level: LogLevelConfig,
+    /// The paired remote plane this app hosts; absent hosts none.
+    pub remote: Option<RemoteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// The `remote` block: the paired remote plane hosted in the app process,
+/// served through the remote plane host the app library links.
+pub struct RemoteConfig {
+    /// Host the plane on this start.
+    pub enabled: bool,
+    /// How desks reach the plane; `public` unless set.
+    #[serde(default)]
+    pub relay: RemoteRelay,
+    /// The plane's state directory, relative to the app files directory:
+    /// its keys and trust state are read from `<state_dir>/remoted/`.
+    /// `remote` unless set.
+    #[serde(default = "default_remote_state_dir")]
+    pub state_dir: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The `relay` of the `remote` block.
+pub enum RemoteRelay {
+    /// The public relays and discovery of the iroh project: for development
+    /// only, since the project runs them and gives no service promise.
+    #[default]
+    Public,
+    /// No relay and no discovery: a desk dials the plane's direct address.
+    Disabled,
+    /// Relays the app's operator runs, by URL.
+    Custom(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for RemoteRelay {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Urls(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Name(name) if name == "public" => Ok(Self::Public),
+            Raw::Name(name) if name == "disabled" => Ok(Self::Disabled),
+            Raw::Name(_) => Err(serde::de::Error::custom(
+                "remote.relay must be \"public\", \"disabled\" or a list of relay URLs",
+            )),
+            Raw::Urls(urls) => Ok(Self::Custom(urls)),
+        }
+    }
+}
+
+fn default_remote_state_dir() -> String {
+    "remote".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -268,6 +326,32 @@ impl EmbeddedConfig {
                 )));
             }
         }
+        if let Some(remote) = &self.remote {
+            remote.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl RemoteConfig {
+    fn validate(&self) -> Result<(), EmbedError> {
+        let state_dir = Path::new(&self.state_dir);
+        let inside = !self.state_dir.is_empty()
+            && state_dir
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !inside {
+            return Err(EmbedError::InvalidArgument(
+                "remote.state_dir must be a relative path inside the app files directory, \
+                 without '.' or '..'"
+                    .into(),
+            ));
+        }
+        if matches!(&self.relay, RemoteRelay::Custom(urls) if urls.is_empty()) {
+            return Err(EmbedError::InvalidArgument(
+                "remote.relay must name at least one relay URL".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -386,6 +470,83 @@ fn validate_topics(topics: &[String], field: &str) -> Result<(), EmbedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote(json: &str) -> Result<RemoteConfig, EmbedError> {
+        let parsed = EmbeddedConfig::parse(&format!(r#"{{"remote":{json}}}"#))?;
+        let files = tempfile::tempdir().unwrap();
+        parsed.validate_paths(files.path())?;
+        Ok(parsed.remote.expect("the remote block parsed"))
+    }
+
+    fn refusal(json: &str) -> String {
+        match remote(json) {
+            Ok(config) => panic!("{json} must be refused, parsed {config:?}"),
+            Err(error) => {
+                assert_eq!(error.code(), crate::codes::INVALID_ARGUMENT, "{json}");
+                error.to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn remote_block_defaults_to_the_public_relay_under_remote() {
+        assert!(EmbeddedConfig::parse("{}").unwrap().remote.is_none());
+        let config = remote(r#"{"enabled":true}"#).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.relay, RemoteRelay::Public);
+        assert_eq!(config.state_dir, "remote");
+    }
+
+    #[test]
+    fn remote_relay_reads_public_disabled_or_a_url_list() {
+        let relay = |value: &str| {
+            remote(&format!(r#"{{"enabled":true,"relay":{value}}}"#))
+                .unwrap()
+                .relay
+        };
+        assert_eq!(relay(r#""public""#), RemoteRelay::Public);
+        assert_eq!(relay(r#""disabled""#), RemoteRelay::Disabled);
+        assert_eq!(
+            relay(r#"["https://relay.example.net/"]"#),
+            RemoteRelay::Custom(vec!["https://relay.example.net/".into()])
+        );
+    }
+
+    #[test]
+    fn remote_block_accepts_a_nested_state_dir() {
+        let config = remote(r#"{"enabled":false,"state_dir":"plane/one"}"#).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.state_dir, "plane/one");
+    }
+
+    #[test]
+    fn rejects_a_remote_state_dir_outside_the_files_dir() {
+        for state_dir in ["", "/data/plane", "../plane", "plane/../..", "./plane"] {
+            let message = refusal(&format!(r#"{{"enabled":true,"state_dir":"{state_dir}"}}"#));
+            assert_eq!(
+                message,
+                "remote.state_dir must be a relative path inside the app files directory, \
+                 without '.' or '..'",
+                "{state_dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_relay_and_an_empty_relay_list() {
+        assert!(refusal(r#"{"enabled":true,"relay":"n0"}"#)
+            .contains("remote.relay must be \"public\", \"disabled\" or a list of relay URLs"));
+        assert_eq!(
+            refusal(r#"{"enabled":true,"relay":[]}"#),
+            "remote.relay must name at least one relay URL"
+        );
+    }
+
+    #[test]
+    fn rejects_a_remote_block_without_enabled_or_with_an_unknown_key() {
+        assert!(refusal(r#"{"relay":"disabled"}"#).contains("missing field `enabled`"));
+        assert!(refusal(r#"{"enabled":true,"keys":"x"}"#).contains("unknown field `keys`"));
+    }
 
     #[test]
     fn defaults_and_happy_config_parse() {

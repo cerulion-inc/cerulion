@@ -39,6 +39,12 @@ pub mod codes {
     pub const EMPTY: i32 = 15;
     /// The transport refused to create a subscription or receive from it.
     pub const RECEIVE: i32 = 16;
+    /// The remote plane has no keys or trust state under its state directory;
+    /// provision them, then start again.
+    pub const REMOTE_NOT_PROVISIONED: i32 = 17;
+    /// The remote plane could not start or stopped serving: no host is
+    /// linked, its endpoint could not bind, or it ended on its own.
+    pub const REMOTE: i32 = 18;
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +95,12 @@ pub enum EmbedError {
     /// The transport refused to create a subscription or receive from it.
     #[error("{0}")]
     Receive(String),
+    /// The remote plane has no keys or trust state to load.
+    #[error("{0}")]
+    RemoteNotProvisioned(String),
+    /// The remote plane could not start or stopped serving.
+    #[error("{0}")]
+    Remote(String),
 }
 
 impl EmbedError {
@@ -110,6 +122,8 @@ impl EmbedError {
             Self::Spawn(_) => codes::SPAWN,
             Self::Decode(_) => codes::DECODE,
             Self::Receive(_) => codes::RECEIVE,
+            Self::RemoteNotProvisioned(_) => codes::REMOTE_NOT_PROVISIONED,
+            Self::Remote(_) => codes::REMOTE,
         }
     }
 }
@@ -136,13 +150,15 @@ mod tests {
             (EmbedError::Spawn(String::new()), 13),
             (EmbedError::Decode(String::new()), 14),
             (EmbedError::Receive(String::new()), 16),
+            (EmbedError::RemoteNotProvisioned(String::new()), 17),
+            (EmbedError::Remote(String::new()), 18),
         ];
         // EMPTY (15) is a poll outcome, not an error: no variant carries
-        // it, and with it the codes run 1 to 16 without a gap.
+        // it, and with it the codes run 1 to 18 without a gap.
         let mut actual = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
         actual.push(codes::EMPTY);
         actual.sort_unstable();
-        assert_eq!(actual, (1..=16).collect::<Vec<_>>());
+        assert_eq!(actual, (1..=18).collect::<Vec<_>>());
         for (error, code) in cases {
             assert_eq!(error.code(), code);
         }

@@ -145,10 +145,28 @@ pub(crate) fn unlinked(node_type: &str) -> EmbedError {
 /// On Android it first installs the logcat subscriber.
 /// A registration error never fails the library load: it is logged, and
 /// the first start with a graph reports it. Returns `JNI_VERSION_1_6`.
-pub fn on_load(_vm: *mut c_void, _reserved: *mut c_void, nodes: &[LinkedNode]) -> c_int {
+pub fn on_load(vm: *mut c_void, reserved: *mut c_void, nodes: &[LinkedNode]) -> c_int {
+    on_load_with_remote_host(vm, reserved, None, nodes)
+}
+
+/// [`on_load`] that also registers a remote plane host, the body of the
+/// `JNI_OnLoad` that `embed_nodes! { remote: <host>, ... }` makes. A host
+/// registration error is logged like a node registration error; a start
+/// with the plane enabled then reports that no host is linked.
+pub fn on_load_with_remote_host(
+    _vm: *mut c_void,
+    _reserved: *mut c_void,
+    remote: Option<Box<dyn crate::remote::RemoteHost>>,
+    nodes: &[LinkedNode],
+) -> c_int {
     // Before registration, so a registration error reaches logcat.
     #[cfg(target_os = "android")]
     crate::log::install_logcat();
+    if let Some(remote) = remote {
+        if let Err(error) = crate::remote::register_host(remote) {
+            tracing::error!(error = %error, "remote plane host registration failed");
+        }
+    }
     if let Err(error) = register(nodes) {
         tracing::error!(error = %error, "node registration failed");
     }
