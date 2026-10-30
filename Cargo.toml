@@ -251,6 +251,10 @@ members = [
     # (a plain `cargo build` stays iroh-free); build it via
     # `cargo build -p cerulion_remoted` or `--workspace`.
     "crates/cerulion_remoted",
+    # The remote plane an Android app hosts: cerulion_remoted behind
+    # cerulion_android's remote plane seam, linked by an app runtime library.
+    # Pulls iroh through cerulion_remoted, so it is NOT in default-members.
+    "crates/cerulion_android_remote",
     # The desk-side `cerulion/wire/1` CLIENT substrate (AGPL): the
     # control vocabulary + dial-config parsers + the per-topic re-inject reader,
     # extracted from `cerulion_connectd` so BOTH the connect worker AND

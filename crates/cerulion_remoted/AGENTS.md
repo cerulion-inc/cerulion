@@ -42,8 +42,8 @@ also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
-- Metadata reads the EXISTING local netd serving snapshot, its SHM namespace checked
-  first; it never starts netd or queries discovery. Catalog and Schema reauthorize
+- Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
+  or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).
 
 ## Testing

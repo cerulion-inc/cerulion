@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "cerulion_android_remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The paired remote plane an Android app hosts: the iroh plane of cerulion_remoted behind cerulion_android's remote plane seam"
+# Not published to crates.io: it links `cerulion_remoted`, which is not
+# published either. An app runtime library links it by path or git.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cerulion_android = { path = "../cerulion_android" }
+cerulion_core = { workspace = true }
+# The relay posture and its URL type.
+cerulion_link = { workspace = true }
+cerulion_remoted = { path = "../cerulion_remoted" }
+# The plane's own runtime, a small multi-thread one; already in the tree
+# through cerulion_core and cerulion_remoted.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+cerulion_android = { path = "../cerulion_android", features = ["test-helpers"] }
+cerulion_core = { workspace = true, features = ["test-helpers"] }
+# The test provisions a real trust store and dials as a paired desk.
+cerulion_pairing = { workspace = true }
+ed25519-dalek = "2"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[features]
+# Run the host tests on the in-process transport an Android app uses.
+local-transport = ["cerulion_android/local-transport"]

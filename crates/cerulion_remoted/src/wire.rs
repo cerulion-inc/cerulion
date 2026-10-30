@@ -43,6 +43,7 @@ use cerulion_pairing::verify::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::tap::{peek_schema_hash, TapManager};
 use crate::trust::TrustError;
 use crate::{AcceptDecision, PairingAuthorizer, RemotedClock, SharedTrust};
@@ -241,8 +242,9 @@ pub struct WirePlane {
     /// The served schema doc set, keyed by qualified name; the `schema` verb
     /// walks [`collect_schema_closure`] over it.
     schema_docs: BTreeMap<String, SchemaDoc>,
-    /// Fresh local metadata from the existing network daemon, when configured.
-    local_schema_socket: Option<PathBuf>,
+    /// Fresh local metadata, read on each `catalog` and `schema` request,
+    /// when configured.
+    local_schemas: Option<LocalSchemaSource>,
     /// The per-demand authorization gate. Each `demand` verb + a periodic
     /// mid-session sweep resolve the DEMANDER (the connection's authenticated remote
     /// peer key) through this. Production installs `PairingAuthorizer` (the SAME live
@@ -272,7 +274,7 @@ impl WirePlane {
             manager: ManagerCell::Lazy(OnceLock::new()),
             topic_types: BTreeMap::new(),
             schema_docs: BTreeMap::new(),
-            local_schema_socket: None,
+            local_schemas: None,
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
@@ -287,7 +289,7 @@ impl WirePlane {
             manager: ManagerCell::Ready(manager),
             topic_types: BTreeMap::new(),
             schema_docs: BTreeMap::new(),
-            local_schema_socket: None,
+            local_schemas: None,
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
@@ -298,7 +300,15 @@ impl WirePlane {
     /// Each metadata request checks the daemon's SHM namespace against this plane.
     /// This path never starts a daemon or queries another machine.
     pub fn with_local_schema_provider(mut self, socket: PathBuf) -> Self {
-        self.local_schema_socket = Some(socket);
+        self.local_schemas = Some(LocalSchemaSource::Socket(socket));
+        self
+    }
+
+    /// Use a schema source in this process instead of a network daemon: a host
+    /// that serves its own topics (and runs no daemon) names their schemas here.
+    /// `source` is called on each `catalog` and `schema` request.
+    pub fn with_in_process_schema_provider(mut self, source: SchemaSource) -> Self {
+        self.local_schemas = Some(LocalSchemaSource::InProcess(source));
         self
     }
 
@@ -501,11 +511,11 @@ impl WirePlane {
         topic: &str,
         taps: &mut TapManager,
     ) -> Result<SchemaReply, WireError> {
-        let Some(socket) = &self.local_schema_socket else {
+        let Some(source) = &self.local_schemas else {
             return Ok(self.serve_schema(topic));
         };
         let manager = self.manager()?;
-        let schemas = crate::local_schema::load(socket.clone(), manager.iox_shm_identity()).await?;
+        let schemas = source.load(manager.iox_shm_identity()).await?;
         let mut hash = taps.all_cached_schema_hashes().get(topic).copied();
         if hash.is_none() && schemas.root_type(topic, None).is_none() {
             let owned_topic = topic.to_owned();
@@ -894,10 +904,8 @@ async fn build_catalog(
 ) -> Result<CatalogReply, WireError> {
     let manager = plane.manager()?;
     let robot = plane.robot().to_string();
-    let schemas = match &plane.local_schema_socket {
-        Some(socket) => {
-            Some(crate::local_schema::load(socket.clone(), manager.iox_shm_identity()).await?)
-        }
+    let schemas = match &plane.local_schemas {
+        Some(source) => Some(source.load(manager.iox_shm_identity()).await?),
         None => None,
     };
 

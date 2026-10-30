@@ -33,9 +33,10 @@ use iceoryx2::config::Config as IoxConfig;
 use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
 
-use crate::config::{validate_robot_name, EmbeddedConfig};
+use crate::config::{validate_robot_name, EmbeddedConfig, RemoteRelay};
 use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
+use crate::remote::{HostedPlane, RemoteStart};
 use crate::subscribe::{Subscription, SubscriptionCounts};
 
 /// The listen endpoints, connect locators and robot name the first start
@@ -197,6 +198,16 @@ pub enum RuntimeState {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// The remote plane a running start hosts.
+pub struct RemoteStatus {
+    /// The endpoint id desks dial and authenticate.
+    pub endpoint_id: String,
+    /// The local sockets the endpoint is bound to. An unspecified address
+    /// (`0.0.0.0` or `[::]`) means every interface.
+    pub bound_sockets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// The last error exposed in runtime status.
 pub struct LastError {
     /// Stable error code.
@@ -338,6 +349,9 @@ pub struct Status {
     /// Graph nodes whose tick panicked, in graph order. The state stays
     /// `running`: the graph keeps running without them.
     pub node_failures: NodeFailures,
+    /// The remote plane this start serves; `None` when it hosts none or the
+    /// plane stopped.
+    pub remote: Option<RemoteStatus>,
 }
 
 impl Status {
@@ -357,6 +371,7 @@ impl Status {
             recorder: None,
             last_error: None,
             node_failures: NodeFailures::default(),
+            remote: None,
         }
     }
 }
@@ -412,6 +427,9 @@ pub struct EmbeddedRuntime {
 /// teardown in [`Run::shutdown`] (also run by `Drop`, so a panic mid-build
 /// tears down too) stops whatever was filled in a safe order.
 struct Run {
+    /// The remote plane: bound by the build, served by the commit, stopped
+    /// first by the teardown.
+    remote: Option<HostedPlane>,
     graph: Option<GraphWorker>,
     gateway: Option<GatewayWorker>,
     recorder: Option<RecorderWorker>,
@@ -587,9 +605,16 @@ struct StartPlan {
     /// Number of `ingress` topics, for the inert-ingress warning.
     ingress_topics: usize,
     gateway: Option<GatewayStartPlan>,
+    remote: Option<RemotePlan>,
     recorder: Option<RecorderPlan>,
     #[cfg(any(test, feature = "test-helpers"))]
     graph_exit: Option<GraphExitHook>,
+}
+
+struct RemotePlan {
+    state_root: PathBuf,
+    relay: RemoteRelay,
+    serving: SchemaServing,
 }
 
 /// Why the `ingress` list of a start lets no LAN frame in.
@@ -703,6 +728,8 @@ impl EmbeddedRuntime {
         // recorder active behind the refusal.
         if let Some(mut run) = self.run.take() {
             let (_summary, teardown_error) = run.shutdown();
+            // The plane is stopped, even when the new config is refused below.
+            lock_status(&self.status).remote = None;
             if let Some(error) = teardown_error {
                 tracing::warn!(error = %error, "stopping components left by a previous run before restart");
             }
@@ -735,6 +762,7 @@ impl EmbeddedRuntime {
             status.recorder = None;
             status.last_error = None;
             status.node_failures = NodeFailures::default();
+            status.remote = None;
         }
         let planned = install_iceoryx_config(&self.files_dir)
             .and_then(|()| self.plan_start(config))
@@ -756,7 +784,7 @@ impl EmbeddedRuntime {
         // exists) drops `level`, which returns to the last kept level. A
         // restart without the key returns to `info`.
         let level = crate::log::set_level(log_level);
-        let mut run = match build(&mut plan, manager, &self.status) {
+        let mut run = match build(&mut plan, manager, &self.status, &self.robot_name) {
             Ok(run) => run,
             Err(failure) => {
                 let StartFailure { error, summary } = *failure;
@@ -950,6 +978,7 @@ impl EmbeddedRuntime {
             return Ok(None);
         };
         let (summary, error) = run.shutdown();
+        lock_status(&self.status).remote = None;
         // A teardown error keeps Failed: the stopped state must mean every
         // resource actually released, not that the teardown was attempted.
         match &error {
@@ -1116,7 +1145,17 @@ impl EmbeddedRuntime {
         let lan_access = LanAccess::from(config.lan_access);
         let inert_ingress = inert_ingress(!ingress.is_empty(), networked, lan_access);
         let ingress_topics = ingress.len();
-        let gateway = networked.then(|| {
+        let remote = config.remote.as_ref().filter(|remote| remote.enabled);
+        // The served set names EVERY served topic, including schema-less
+        // outputs, which carry no topic_schemas binding.
+        let mut announce = graph_topics.clone();
+        for publish in &publishes {
+            if !announce.contains(&publish.topic) {
+                announce.push(publish.topic.clone());
+            }
+        }
+        // The gateway and the remote plane serve the same schemas.
+        let serving = (networked || remote.is_some()).then(|| {
             let extra = publishes
                 .iter()
                 .map(|publish| TopicSchema {
@@ -1129,15 +1168,17 @@ impl EmbeddedRuntime {
                 &schema_dir,
                 &extra,
             );
-            // The served set names EVERY served topic, including schema-less
-            // outputs, which carry no topic_schemas binding.
-            let mut announce = graph_topics.clone();
-            for publish in &publishes {
-                if !announce.contains(&publish.topic) {
-                    announce.push(publish.topic.clone());
-                }
-            }
             serving.served_topics = announce.clone();
+            serving
+        });
+        let remote = remote
+            .zip(serving.clone())
+            .map(|(remote, serving)| RemotePlan {
+                state_root: self.files_dir.join(&remote.state_dir),
+                relay: remote.relay.clone(),
+                serving,
+            });
+        let gateway = serving.filter(|_| networked).map(|serving| {
             GatewayStartPlan {
                 plan: GatewayPlan {
                     // The catalog still names every served topic; the list
@@ -1182,6 +1223,7 @@ impl EmbeddedRuntime {
             listen: config.listen,
             connect: config.connect,
             gateway,
+            remote,
             recorder,
             #[cfg(any(test, feature = "test-helpers"))]
             graph_exit: None,
@@ -1398,6 +1440,7 @@ impl Drop for EmbeddedRuntime {
         };
         set_state(&self.status, RuntimeState::Stopping);
         let (summary, error) = run.shutdown();
+        lock_status(&self.status).remote = None;
         match error {
             None => {
                 set_state(&self.status, RuntimeState::Stopped);
@@ -1414,6 +1457,7 @@ impl Drop for EmbeddedRuntime {
 impl Run {
     fn empty(manager: Arc<TransportManager>) -> Self {
         Self {
+            remote: None,
             graph: None,
             gateway: None,
             recorder: None,
@@ -1440,6 +1484,13 @@ impl Run {
             }
         }
         let mut first_error = None;
+        // The remote plane stops first, so no desk reads a run that is
+        // going down.
+        if let Some(remote) = self.remote.take() {
+            if let Err(error) = remote.stop() {
+                first_error.get_or_insert(EmbedError::Remote(error));
+            }
+        }
         if let Some(graph) = self.graph.take() {
             graph.running.store(false, Ordering::Relaxed);
             match graph.thread.join() {
@@ -1532,9 +1583,10 @@ fn build(
     plan: &mut StartPlan,
     manager: Arc<TransportManager>,
     status: &Arc<Mutex<Status>>,
+    robot: &str,
 ) -> Result<Run, Box<StartFailure>> {
     let mut run = Run::empty(manager);
-    match build_into(&mut run, plan, status) {
+    match build_into(&mut run, plan, status, robot) {
         Ok(()) => Ok(run),
         Err(error) => {
             let (summary, teardown_error) = run.shutdown();
@@ -1550,8 +1602,21 @@ fn build_into(
     run: &mut Run,
     plan: &mut StartPlan,
     status: &Arc<Mutex<Status>>,
+    robot: &str,
 ) -> Result<(), EmbedError> {
     let manager = Arc::clone(&run.manager);
+    // 0. The remote plane loads its keys and trust state and binds, before
+    //    any other component exists: a plane that is not provisioned fails
+    //    the start with nothing built. It serves nothing until the commit.
+    if let Some(remote) = &plan.remote {
+        run.remote = Some(crate::remote::bind(RemoteStart {
+            state_root: remote.state_root.clone(),
+            robot: robot.to_string(),
+            relay: remote.relay.clone(),
+            manager: Arc::clone(&manager),
+            serving: remote.serving.clone(),
+        })?);
+    }
     // 1. Own the gateway: the manager is now at the baseline and paired.
     //    A latched query surface (an earlier start created it) gets this
     //    run's serving before the constructor records any runtime hash;
@@ -1782,13 +1847,16 @@ fn build_into(
     Ok(())
 }
 
-/// Make a built run visible: open LAN access to the configured posture,
-/// replay the announces the paired build withheld, report the run and raise
-/// the beacon. The only step of a start that does so. On an error the
-/// caller shuts the run down, which closes LAN access first.
+/// Make a built run visible: start the bound remote plane serving, open LAN
+/// access to the configured posture, replay the announces the paired build
+/// withheld, report the run and raise the beacon. The only step of a
+/// start that does so. On an error the caller shuts the run down, which
+/// stops the remote plane and closes LAN access first.
 ///
 /// The run's commit gate is held from the last worker-failure check through
-/// the posture write, the announce replay and the switch to Running. A
+/// the remote plane's serve, the posture write, the announce replay and the
+/// switch to Running; a plane that ends on its own records its failure under
+/// the same gate, so its exit never runs inside `serve`. A
 /// worker records its failure under that same gate, so a failure either
 /// lands first (the commit refuses and LAN access never opens) or lands
 /// after the run is Running (a failure of a started run). A failed start
@@ -1810,6 +1878,34 @@ fn commit(
                 return Err(recorded_failure(&status));
             }
         }
+        // The paired plane serves before LAN access opens: a plane that
+        // refuses to serve fails the start while the LAN is still paired.
+        let remote = match run.remote.as_mut().map(HostedPlane::plane) {
+            Some(remote) => {
+                let thread_status = Arc::clone(status);
+                let thread_gate = Arc::clone(&gate);
+                remote
+                    .serve(Box::new(move |reason| {
+                        let _commit = lock_gate(&thread_gate);
+                        lock_status(&thread_status).remote = None;
+                        set_thread_error(
+                            &thread_status,
+                            codes::REMOTE,
+                            &format!("the remote plane stopped serving: {reason}"),
+                        );
+                    }))
+                    .map_err(EmbedError::Remote)?;
+                Some(RemoteStatus {
+                    endpoint_id: remote.endpoint_id(),
+                    bound_sockets: remote
+                        .bound_sockets()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                })
+            }
+            None => None,
+        };
         if let Some(gateway) = &plan.gateway {
             let network = run.manager.network().ok_or_else(|| {
                 EmbedError::Network("the gateway's transport manager has no network".to_string())
@@ -1853,6 +1949,7 @@ fn commit(
             .recorder
             .as_ref()
             .map(|recorder| recorder.record_path.to_string_lossy().into_owned());
+        status.remote = remote;
     }
     // Another publisher in the process may send such a topic, so it is
     // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
@@ -2216,6 +2313,8 @@ fn recorded_failure(status: &Status) -> EmbedError {
         Some(codes::NETWORK) => EmbedError::Network(message),
         Some(codes::RECORDER) => EmbedError::Recorder(message),
         Some(codes::SPAWN) => EmbedError::Spawn(message),
+        Some(codes::REMOTE_NOT_PROVISIONED) => EmbedError::RemoteNotProvisioned(message),
+        Some(codes::REMOTE) => EmbedError::Remote(message),
         Some(code) => EmbedError::Panic(format!("component failure (code {code}): {message}")),
         None => EmbedError::Panic(message),
     }
@@ -2573,6 +2672,7 @@ mod tests {
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: Some(recorder),
             graph_exit: None,
         }
@@ -2646,7 +2746,7 @@ mod tests {
         });
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
 
-        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+        let failure = match build(&mut plan, Arc::clone(&manager), &status, "robot") {
             Ok(_) => panic!("a ready marker that cannot be cleared fails the build"),
             Err(failure) => failure,
         };
@@ -2684,7 +2784,7 @@ mod tests {
         });
         let status = Arc::new(Mutex::new(Status::new("t".to_string())));
 
-        let failure = match build(&mut plan, Arc::clone(&manager), &status) {
+        let failure = match build(&mut plan, Arc::clone(&manager), &status, "robot") {
             Ok(_) => panic!("a recorder that exits before ready fails the build"),
             Err(failure) => failure,
         };
@@ -3194,6 +3294,8 @@ nodes:
             (codes::NETWORK, codes::NETWORK),
             (codes::RECORDER, codes::RECORDER),
             (codes::SPAWN, codes::SPAWN),
+            (codes::REMOTE_NOT_PROVISIONED, codes::REMOTE_NOT_PROVISIONED),
+            (codes::REMOTE, codes::REMOTE),
             (codes::PANIC, codes::PANIC),
         ] {
             let mut status = Status::new("t".to_string());
@@ -3398,6 +3500,7 @@ nodes:
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: None,
             graph_exit: None,
         };
@@ -3457,6 +3560,7 @@ nodes:
                 lan_access: LanAccess::Open,
                 mdns: false,
             }),
+            remote: None,
             recorder: None,
             graph_exit: None,
         };
@@ -3465,6 +3569,82 @@ nodes:
         let result = commit(&mut run, &plan, &status, "t");
 
         assert!(matches!(result, Err(EmbedError::Graph(_))), "{result:?}");
+        assert_eq!(network.lan_access(), LanAccess::Paired);
+        let (_, error) = run.shutdown();
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A remote plane that refuses to serve fails the commit while LAN access
+    /// is still paired: the plane serves before the posture opens.
+    #[test]
+    fn a_remote_plane_that_cannot_serve_fails_the_commit_before_lan_access_opens() {
+        struct Refusing {
+            manager: Arc<TransportManager>,
+            seen: Arc<Mutex<Option<LanAccess>>>,
+        }
+        impl crate::remote::BoundRemote for Refusing {
+            fn endpoint_id(&self) -> String {
+                "refusing".to_string()
+            }
+            fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+                Vec::new()
+            }
+            fn serve(&mut self, _exit: crate::remote::RemoteExit) -> Result<(), String> {
+                *self.seen.lock().unwrap() = self.manager.network().map(|n| n.lan_access());
+                Err("the plane refused to serve".to_string())
+            }
+            fn stop(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let _serial = gateway_test_lock();
+        let manager = network_manager("commitremote");
+        let network = manager.network().expect("network");
+        network.set_lan_access(LanAccess::Paired);
+        let status = Arc::new(Mutex::new(Status::new("t".to_string())));
+        let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
+        let plan = StartPlan {
+            graph: None,
+            graph_name: None,
+            nodes: 0,
+            schemas,
+            publishes: Vec::new(),
+            subscribes: Vec::new(),
+            recorded_topics: None,
+            recorded_graph_topics: None,
+            listen: Vec::new(),
+            connect: Vec::new(),
+            inert_egress: false,
+            inert_ingress: None,
+            ingress_topics: 0,
+            gateway: Some(GatewayStartPlan {
+                plan: GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: Vec::new(),
+                    ingress: Vec::new(),
+                },
+                serving: SchemaServing::default(),
+                lan_access: LanAccess::Open,
+                mdns: false,
+            }),
+            remote: None,
+            recorder: None,
+            graph_exit: None,
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let mut run = Run::empty(Arc::clone(&manager));
+        run.remote = Some(
+            crate::remote::hosted_for_test(Box::new(Refusing {
+                manager: Arc::clone(&manager),
+                seen: Arc::clone(&seen),
+            }))
+            .expect("the remote plane lease"),
+        );
+
+        let result = commit(&mut run, &plan, &status, "t");
+
+        assert!(matches!(result, Err(EmbedError::Remote(_))), "{result:?}");
+        assert_eq!(*seen.lock().unwrap(), Some(LanAccess::Paired));
         assert_eq!(network.lan_access(), LanAccess::Paired);
         let (_, error) = run.shutdown();
         assert!(error.is_none(), "{error:?}");

@@ -117,6 +117,7 @@ pub use device_index::DeviceAccountIndex;
 pub use error::RemotedError;
 pub use flashback::{EstopCaptureAsk, TransportAsk};
 pub use host::{BoundPlane, KeyFiles, KeyProvider, RemotePlane};
+pub use local_schema::SchemaSource;
 pub use ops::OpsServing;
 pub use tap::TapManager;
 pub use trust::{KeyAccess, SharedTrust, TrustError};

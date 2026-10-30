@@ -1622,6 +1622,9 @@ jobs:
       - name: local-transport LAN ingress tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test lan_ingress_test -- --test-threads=1
+      - name: local-transport remote plane host tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_remote_plane_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -4071,6 +4074,17 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
+      # The app's transport is the in-process one, and the hosted plane test
+      # starts the process runtime, so one thread.
+      - name: cerulion_android_remote tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote')
+        run: cargo test -p cerulion_android_remote --features local-transport -- --test-threads=1
+      - name: selection marker, cerulion_android_remote
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android_remote') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_android_remote (selected: $SELECTED)"
       - name: cerulion_accountd tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_accountd')
         run: cargo test -p cerulion_accountd

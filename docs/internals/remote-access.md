@@ -31,8 +31,11 @@ the same entry instead of running the daemon.
   through a `KeyProvider` and binds the endpoint; `BoundPlane::serve` runs the
   accept loop. Its inputs are injected: the state root (files under
   `<root>/remoted/`), the keys (device key and trust-store MAC key), the robot
-  identity, the local network daemon's control socket (the `catalog`/`schema`
-  metadata reads, each deadline-bounded) and optionally the transport manager.
+  identity, the schema source of the `catalog`/`schema` metadata reads and
+  optionally the transport manager. `RemotePlane::new` reads the local network
+  daemon's control socket (each read deadline-bounded); `RemotePlane::in_process`
+  calls a `SchemaSource` closure the host supplies, for a host that serves its
+  own topics and runs no daemon (the Android app library).
   The daemon's `run` checks the kill switch, then serves
   `RemotedConfig::daemon_plane()` with the `KeyFiles` provider; `serve_endpoint`
   (`#[doc(hidden)]`, tests only) shares the same serving core, which never
@@ -645,7 +648,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/device_index_test.rs` | Side-map MAC integrity: no forged key→owner binding |
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
-| `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket, daemon-only verbs refused, key provider error arms |
+| `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |
