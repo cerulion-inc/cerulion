@@ -3,16 +3,16 @@
 //!
 //! A start with `"remote": {"enabled": true}` hosts the plane a paired desk
 //! reads the app's catalog and topics through. This crate only drives it:
-//! the plane itself is served by a [`RemoteHost`] the app library links and
+//! the plane itself is served by a [`RemoteHost`](crate::remote::RemoteHost) the app library links and
 //! registers, `cerulion_android_remote::Host` for the iroh plane. An app
 //! that hosts no plane links no host and none of its dependencies.
 //!
-//! A start asks the host to [`bind`](RemoteHost::bind) before any other
+//! A start asks the host to [`bind`](crate::remote::RemoteHost::bind) before any other
 //! component is built: the host loads its keys and trust state and binds its
 //! endpoint, and serves nothing yet. A fresh install has no keys, so the start
 //! fails there with [`codes::REMOTE_NOT_PROVISIONED`](crate::codes) and
 //! nothing runs. The commit then asks the bound plane to
-//! [`serve`](BoundRemote::serve), as it opens LAN access, and a stop stops
+//! [`serve`](crate::remote::BoundRemote::serve), as it opens LAN access, and a stop stops
 //! the plane before any other component.
 
 use std::net::SocketAddr;
