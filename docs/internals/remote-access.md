@@ -35,7 +35,9 @@ the same entry instead of running the daemon.
   metadata reads, each deadline-bounded) and optionally the transport manager.
   The daemon's `run` checks the kill switch, then serves
   `RemotedConfig::daemon_plane()` with the `KeyFiles` provider; `serve_endpoint`
-  (`#[doc(hidden)]`, tests only) shares the same serving core. A library host
+  (`#[doc(hidden)]`, tests only) shares the same serving core, which never
+  reads a key file or the default socket path itself: a serving change lands
+  once for both hosts. A library host
   (`RemotePlane::new`) refuses the daemon-only verbs by name with
   `unsupported_host`: `restart` (it restarts a systemd unit) and `engage-estop`
   (it engages the daemon's control lease and incident capture; a host that served
