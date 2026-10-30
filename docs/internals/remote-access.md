@@ -212,9 +212,13 @@ returns, so no frame from the zenoh LAN plane is re-injected after the close;
 reopening redeclares both. A callback that checks the posture after the close,
 even one still in flight when the close returns, refuses and counts its frame.
 The demand GET loop does not consult the posture: it keeps sending GETs while
-paired, and each GET's selector names one ingress topic it demands. Writes
-from a paired desk travel over the remote plane, whose re-inject seam does not
-consult the LAN posture. Oracle tests:
+paired, and each GET's selector names one ingress topic it demands. The
+remote plane does not carry writes from a desk: `cerulion/wire/2` moves frames
+from robot to desk only, and the `teleop` verb has no handler yet (see
+`docs/remote_plane.md`). Its re-inject seam is the desk-side path that copies
+robot frames into the desk's own shared memory; it does not consult the LAN
+posture and it is not a write path to the robot. Under `Paired` a desk has no
+way to write a robot topic today. Oracle tests:
 `demand_authorizer.rs` unit tests,
 `demand_reconcile_never_enables_a_refused_demand` and
 `paired_switch_waits_out_a_receive_callback_holding_the_ingress_gate` (the
@@ -227,10 +231,13 @@ receive callback holds the ingress gate) in `network.rs`,
 
 The LAN posture is a whole-plane switch: a LAN source address proves no
 identity, so per-peer LAN authorization, with each LAN peer's identity bound to
-its pairing key, is not supported yet. Per-peer, per-topic and per-direction
-(observe or command) access with revocation is what the paired remote plane
-provides, binding each session to its pairing key over an authenticated
-transport.
+its pairing key, is not supported yet. The paired remote plane
+binds each session to its pairing key over an authenticated transport and
+authorizes each peer and each demanded topic, with revocation. It carries the
+observe direction only (robot to desk topic data). The teleop command direction is
+classified (`teleop` needs `CAP_TELEOP`) but has no handler, so a desk cannot
+teleoperate a robot over it yet. The ops protocol still runs the verbs the
+robot registers (for example `restart` and `engage-estop`).
 
 - **The verb → capability table is the sacred security surface** (module docs of
   `authorizer.rs`): bootstrap verbs (`claim`/`pair`/`present-grant`/
@@ -291,7 +298,10 @@ transport.
 ## 6. The wire plane (robot side)
 
 A `cerulion/wire/2` connection (admitted only for a paired `CAP_OBSERVE`
-account) carries ONE bidi control stream (length-prefixed JSON:
+account) carries topic data robot to desk only: no verb takes a topic frame from
+the desk, the robot opens uni data streams and never accepts one, and the desk
+accepts them and never opens one. The desk sends control requests only. It
+carries ONE bidi control stream (length-prefixed JSON:
 `catalog`/`demand`/`undemand`/`schema`/`status`/`sync_epoch`, the same
 `cerulion_q` vocabulary the LAN uses, imported not mirrored) and ONE uni data
 stream per demanded topic (a JSON `StreamPreamble`, then raw wire frames
