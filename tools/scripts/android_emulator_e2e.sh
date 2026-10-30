@@ -924,8 +924,8 @@ grep -q 'start=0' <<<"$app_log" || fail "app start" "start=0 absent"
 # /sys/class/net tree (label sysfs_net). The hosted remote plane's iroh
 # endpoint tries both while it binds and works without them, as the paired
 # read above shows. Audit logs whichever it records first, so those two, and
-# only those two, are expected.
-interface_listing='avc: denied \{ nlmsg_readpriv \} .*tclass=netlink_route_socket|avc: denied \{ [a-z_ ]+ \} .*tcontext=u:object_r:sysfs_net:s0 '
+# only those two (the sysfs one for reading permissions only), are expected.
+interface_listing='avc: denied \{ nlmsg_readpriv \} .*tclass=netlink_route_socket|avc: denied \{ ((search|getattr|open|read) )+\} .*tcontext=u:object_r:sysfs_net:s0 '
 app_denials="$(cat "$OUT/logcat-paired.txt" "$OUT/logcat-open.txt" | tr -d '\r' |
   grep 'avc: denied' | grep 'scontext=u:r:untrusted_app' | grep -v 'runas_app' || true)"
 denials="$(grep -Ev "$interface_listing" <<<"$app_denials" || true)"
