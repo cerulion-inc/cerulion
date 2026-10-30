@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Semantic Versioning in 1.x covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 28 (see Changed).
+Semantic Versioning in 1.x covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 29 (see Changed).
 
 ### Added
 - `tls/<host>:<port>` is a carrier: TLS 1.3 over TCP, for a path where UDP does not get through. It reads the same `tls:` files as `quic/` (`certificate` and `private_key` for a listener, `root_ca` for a connect) and graph-load validation applies the same file rules to it.

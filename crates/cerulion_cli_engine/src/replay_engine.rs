@@ -1515,8 +1515,9 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the CONSULT term and stamps 7, because
-///   [`recorder_stamps_consult_records`] is unconditionally true and this
+///   this binary writes takes the IDENTITY term and stamps 8, because
+///   [`recorder_stamps_consult_records`] and
+///   [`recorder_records_read_identity`] are unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
 ///   fold term at 6, the role term at 5, then the mode and stream arms) is the
 ///   `records_consults == false` fallback, i.e. the rules that produced the
@@ -1798,9 +1799,10 @@ pub fn replay_stages_every_consult(
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 7,
-/// because every one records every consult), but the two remain separate
-/// functions serving separate questions, and the READ gate still admits 1 to 6
+/// them to zero for the bags this binary writes (every one of them stamps 8,
+/// because every one records every consult and every read's frames), but the
+/// two remain separate functions serving separate questions, and the READ gate
+/// still admits 1 to 7
 /// while the WRITE stamp never emits them.
 pub const SUPPORTED_TRACE_FORMAT: u32 = 8;
 
@@ -26540,7 +26542,8 @@ mod recorder_info_version_tests {
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
-    /// its consults and therefore stamps 7, so the write stamp EQUALS the read
+    /// its consults and its reads' frames and therefore stamps 8, so the write
+    /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
     /// stated in `stamp_trace_format`'s own docs.

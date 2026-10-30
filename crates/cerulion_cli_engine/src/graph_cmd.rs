@@ -16384,7 +16384,7 @@ pub fn render_recorder_json(
             // makes: it does, at every consult that found its queue empty but
             // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
             // replay never runs, so no replay re-derives those consults), so
-            // every bag it writes stamps 7.
+            // every bag it writes stamps at least 7.
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
             // writer run: it does, so every bag this binary writes stamps 8.
