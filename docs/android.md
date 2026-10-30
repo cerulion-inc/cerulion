@@ -911,15 +911,18 @@ code 18.
 
 The plane reads its keys and trust state from `remoted/` under `state_dir`:
 `device_key` (the 32-byte device secret, whose public half is the endpoint
-id), `trust_store.mac_key`, `trust_store` and `device_index.json`, the same
-files `cerulion-remoted` keeps under its state root. The plane never creates
-them. Provision them on a host you trust and stream each one straight into
+id), `trust_store.mac_key`, `trust_store` and, once a desk is paired,
+`device_index.json`, the same files `cerulion-remoted` keeps under its state
+root. The plane never creates the keys or the trust store; without a device
+index no desk is paired yet, and a desk pairs through the plane as it does
+with a robot. Provision them on a host you trust and stream each one straight into
 the app's private files directory, for example with `adb` and a debuggable
 build:
 
 ```sh
 adb shell run-as com.example.app mkdir -p files/remote/remoted
 for file in device_key trust_store.mac_key trust_store device_index.json; do
+  [ -f "remoted/$file" ] || continue
   adb exec-in run-as com.example.app sh -c "cat > files/remote/remoted/$file" < "remoted/$file"
 done
 ```
@@ -928,8 +931,9 @@ Do not stage the keys in a shared directory such as `/data/local/tmp` on the
 way: another process that can read it could copy them and answer as the
 device.
 
-A start reads them before it builds anything else. When a file is missing or
-does not verify (a fresh install, a trust store bound to another device key),
+A start reads them before it builds anything else. When a key or the trust
+store is missing, or a file does not verify (a fresh install, a trust store
+bound to another device key),
 the start fails: `status` reports `state` `failed` with `last_error.code` 17
 (`REMOTE_NOT_PROVISIONED`), nothing runs and nothing is served. Any other
 plane failure is code 18 (`REMOTE`): an app library that links no host, an
