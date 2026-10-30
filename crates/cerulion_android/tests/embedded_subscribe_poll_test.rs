@@ -209,17 +209,24 @@ fn a_frame_of_another_schema_is_consumed_and_counted(runtime: &mut EmbeddedRunti
     })
     .to_string();
     runtime.start(&config).expect("a subscription-only start");
-    let vector = schemas_layout(VECTOR3);
-    let frame = cerulion_android::encode::encode_json(&vector, r#"{"x":1.0}"#, 64, 0, 0)
-        .expect("a Vector3 frame");
+    let schemas = builtin_schemas();
+    let frame =
+        cerulion_android::encode::encode_json(schemas.walker(), VECTOR3, r#"{"x":1.0}"#, 64, 0, 0)
+            .expect("a Vector3 frame");
     let slot = MaxSliceLen::try_new((WireHeader::SIZE + 64) as u32).expect("slot");
     let mut foreign = TransportManager::get()
         .expect("transport manager")
         .create_publisher(&topic, slot, 0)
         .expect("a foreign publisher");
-    let string = schemas_layout("std_msgs/String");
-    let after = cerulion_android::encode::encode_json(&string, r#"{"data":"after"}"#, 64, 0, 1)
-        .expect("a String frame");
+    let after = cerulion_android::encode::encode_json(
+        schemas.walker(),
+        "std_msgs/String",
+        r#"{"data":"after"}"#,
+        64,
+        0,
+        1,
+    )
+    .expect("a String frame");
     foreign
         .publish_raw(&frame)
         .expect("publish the Vector3 frame");
@@ -240,12 +247,12 @@ fn a_frame_of_another_schema_is_consumed_and_counted(runtime: &mut EmbeddedRunti
     runtime.stop().expect("stop the subscription-only run");
 }
 
-fn schemas_layout(name: &str) -> cerulion_core::dynamic::WireLayout {
+fn builtin_schemas() -> cerulion_core::dynamic::SchemaSet {
     let (schemas, _) = cerulion_core::dynamic::SchemaSet::from_schemas(
         cerulion_cli_engine::schema_cmd::parse_builtin_schemas(),
     )
     .expect("built-in schemas");
-    schemas.layout(name).expect("a built-in schema").clone()
+    schemas
 }
 
 /// A start refuses a subscription it could never serve.

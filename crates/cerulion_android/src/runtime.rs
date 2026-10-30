@@ -11,7 +11,7 @@ use cerulion_bagd::{run_bagd, BagdConfig, BagdSummary, RecordedTopic, RECORDED_T
 use cerulion_cli_engine::graph_cmd::{cdylib_name, resolve_recorded_topics};
 use cerulion_cli_engine::schema_cmd::parse_builtin_schemas;
 use cerulion_core::clock::{Clock, RealClock};
-use cerulion_core::dynamic::{SchemaSet, WireLayout};
+use cerulion_core::dynamic::{FrameWalker, SchemaSet, WireLayout};
 use cerulion_core::graph::{
     parse_graph, resolve_ingress_schema_hash, resolve_output_topic, DylibNodeEntry, GraphConfig,
     GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords,
@@ -34,7 +34,7 @@ use iceoryx2::prelude::{FilePath, SemanticString};
 use serde::Serialize;
 
 use crate::config::{validate_robot_name, EmbeddedConfig};
-use crate::encode::encode_json_into;
+use crate::encode::encode_json;
 use crate::error::{codes, EmbedError};
 use crate::subscribe::{Subscription, SubscriptionCounts};
 
@@ -532,20 +532,17 @@ struct PublisherState {
     /// The transport clock, which stamps graph node frames too: each app
     /// frame takes its wire stamp from it.
     clock: Arc<dyn Clock>,
-    layout: WireLayout,
+    /// The schemas of the start, shared by its publishers: publish reads
+    /// the JSON against `schema` in them.
+    walker: Arc<FrameWalker>,
+    schema: String,
     max_payload_bytes: usize,
     sequence: u32,
-    /// Reused encode buffer: cleared per publish, its capacity kept (the JSON
-    /// facade is an encoding boundary, not the zero-copy typed path).
-    frame: Vec<u8>,
-    /// Reused length scratch for the same reason.
-    lengths: Vec<usize>,
 }
 
 struct ResolvedPublish {
     topic: String,
     schema: String,
-    layout: WireLayout,
     schema_hash: u64,
     wire_fixed_size: u32,
     max_payload_bytes: usize,
@@ -871,16 +868,14 @@ impl EmbeddedRuntime {
             .ok_or_else(|| EmbedError::UnknownTopic(format!("unknown publish topic '{topic}'")))?;
         let timestamp = frame_stamp(state.clock.now_ns(), stamp_ns)?;
         let sequence = state.sequence;
-        encode_json_into(
-            &state.layout,
+        let frame = encode_json(
+            &state.walker,
+            &state.schema,
             json,
             state.max_payload_bytes,
             timestamp,
             sequence,
-            &mut state.frame,
-            &mut state.lengths,
         )?;
-        let frame = &state.frame;
         let mut loan = state
             .publisher
             .loan_raw_uninit(frame.len())
@@ -1017,7 +1012,6 @@ impl EmbeddedRuntime {
                 Ok(ResolvedPublish {
                     topic: publish.topic.clone(),
                     schema: publish.schema.clone(),
-                    layout: layout.clone(),
                     schema_hash: layout.schema_hash,
                     wire_fixed_size,
                     max_payload_bytes: publish.max_payload_bytes,
@@ -1581,6 +1575,7 @@ fn build_into(
     // 2. App publishers.
     create_publishers(
         &plan.publishes,
+        &plan.schemas,
         &manager,
         plan.recorded_topics.as_ref(),
         &mut run.publishers,
@@ -1905,10 +1900,12 @@ fn commit(
 
 fn create_publishers(
     config: &[ResolvedPublish],
+    schemas: &SchemaSet,
     manager: &TransportManager,
     recorded_topics: Option<&HashSet<String>>,
     publishers: &mut BTreeMap<String, PublisherState>,
 ) -> Result<(), EmbedError> {
+    let walker = Arc::new(schemas.walker().clone());
     for item in config {
         let slot_len = WireHeader::SIZE
             .checked_add(item.max_payload_bytes)
@@ -1943,11 +1940,10 @@ fn create_publishers(
             PublisherState {
                 publisher,
                 clock: manager.clock_arc(),
-                layout: item.layout.clone(),
+                walker: Arc::clone(&walker),
+                schema: item.schema.clone(),
                 max_payload_bytes: item.max_payload_bytes,
                 sequence: 0,
-                frame: Vec::new(),
-                lengths: Vec::new(),
             },
         );
     }
