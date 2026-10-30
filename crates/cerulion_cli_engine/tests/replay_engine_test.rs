@@ -21974,13 +21974,13 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 7 on every
-/// bag this binary writes (every gated consult records), so every "corpus" bag
-/// elsewhere in this file is a format-**7** bag, a PRECONDITION that roles are
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 8 on every
+/// bag this binary writes (every gated consult and every read's frames
+/// record), so every "corpus" bag elsewhere in this file is a format-**8** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 7, the consult term
-/// outranks the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 8, the identity and
+/// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
@@ -38698,7 +38698,7 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
 ///
 /// 1. the RECORDING holds it: the hand oracle `quiet_relay_read_log_oracle`,
 ///    derived from the fixture's two rates, names one `none` record per EVEN step
-///    and one pop per ODD step, and the bag stamps 7;
+///    and one pop per ODD step, and the bag stamps 7 or later;
 /// 2. the replay is BYTE EXACT with it: the per-edge verifier pairs the empty
 ///    consults position for position and retains nothing, and the gate reports
 ///    `enforced` over the relay's one stage with no over-run;
@@ -38826,7 +38826,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
 ///
 /// 1. the RECORDING is what the rates say: the hand oracle
 ///    `sync_quiet_read_log_oracle` names three records per step and the bag
-///    stamps 7. The consumer FIRES on every odd step, so a refill align pass
+///    stamps 7 or later. The consumer FIRES on every odd step, so a refill align pass
 ///    really ran there, and its two empty fills are absent from the table;
 /// 2. the replay is BYTE EXACT and the two logs pair position for position;
 /// 3. the GATE is armed over the one gateable edge and reports no over-run: a
