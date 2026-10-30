@@ -666,7 +666,15 @@ jobs:
       # shape) would otherwise leave this smoke GREEN while
       # `cargo install cerulion_cli` resolves nothing.
       - name: Wait for crates.io publication
-        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd cerulion_android
+        run: |
+          crates="cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd"
+          # v1.0.0 predates cerulion_android on crates.io; every later release
+          # publishes it.
+          if [ "$TAG" != v1.0.0 ]; then
+            crates="$crates cerulion_android"
+          fi
+          # shellcheck disable=SC2086 # one word per crate name
+          source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 $crates
 
       - name: Run README quick-start
         run: |
