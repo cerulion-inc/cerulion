@@ -61,7 +61,7 @@ pub use subscribe::SubscriptionCounts;
 ///
 /// An app that hosts the paired remote plane (the `remote` start block)
 /// lists its host first, from a runtime crate that also depends on
-/// `cerulion_android_remote`:
+/// `cerulion_android_remote`; the node list may then be empty:
 ///
 /// ```ignore
 /// cerulion_android::embed_nodes! {
@@ -71,7 +71,7 @@ pub use subscribe::SubscriptionCounts;
 /// ```
 #[macro_export]
 macro_rules! embed_nodes {
-    (remote: $host:expr, $($node_type:literal => $entry:path),+ $(,)?) => {
+    (remote: $host:expr $(, $node_type:literal => $entry:path)* $(,)?) => {
         /// Registers the remote plane host and the node types linked into
         /// this library.
         #[unsafe(no_mangle)]
@@ -91,7 +91,7 @@ macro_rules! embed_nodes {
                                 as ::std::boxed::Box<dyn $crate::nodes::NodeEntry>
                         },
                     }
-                ),+],
+                ),*],
             )
         }
     };
