@@ -5197,10 +5197,7 @@ mod cli_error_exit_code_tests {
         };
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
-        assert_eq!(
-            cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced),
-            3
-        );
+        assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1
