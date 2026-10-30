@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The daemon: load the device key + trust store + side-map, build the ONE iroh
-//! endpoint, and run the accept loop dispatching on the negotiated ALPN.
+//! The daemon: honor the kill switch, serve the [`crate::RemotePlane`] entry over
+//! the configured files, and run the accept loop dispatching on the negotiated ALPN.
 //!
 //! Every connection is first classified by the [`PairingAuthorizer`] (deny-by-
 //! default), then dispatched by plane:
@@ -13,14 +13,13 @@
 //!   [`AcceptDecision`] so the classification stays observable end-to-end.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use cerud::lease::ControlLease;
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, accept_one, build_endpoint, read_frame, write_frame, Accepted, Connection,
-    Endpoint, EndpointConfig, LinkError,
+    accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
+    LinkError,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -31,6 +30,7 @@ use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
+use crate::host::{OpsHost, PlaneFiles, DAEMON_SERVER_NAME};
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
 use crate::trust::SharedTrust;
@@ -53,22 +53,14 @@ const MAX_HELLO_LEN: usize = 4096;
 /// defensible additional guard and is not implemented.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// The loaded robot state the daemon serves from.
-struct RemotedState {
-    device_key: [u8; 32],
-    trust_store: TrustStore,
-    device_index: DeviceAccountIndex,
-    /// The firmware secure-storage MAC key that authenticates the trust store AND
-    /// the side-map — retained so the pairing verbs can PERSIST a mutation
-    /// (claim/pair/code-pair write both artifacts back to disk).
-    mac_key: Vec<u8>,
-}
-
 /// Build the daemon from config and serve until `shutdown` resolves (or the
 /// endpoint closes).
 ///
 /// Honors the `--network off` / `CERULION_NETWORK=off` kill-switch: if
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
+/// Otherwise it serves the same library entry a host embeds
+/// ([`RemotedConfig::daemon_plane`] with the [`RemotedConfig::key_files`]
+/// provider), which keeps `restart` and `engage-estop`.
 pub async fn run(
     config: RemotedConfig,
     shutdown: impl std::future::Future<Output = ()>,
@@ -82,71 +74,29 @@ pub async fn run(
         return Ok(());
     }
 
-    let state = load_state(&config)?;
-    let endpoint =
-        build_endpoint(EndpointConfig::new(state.device_key).with_relay(config.relay.clone()))
-            .await?;
-
-    // Bind the trust store to THIS device: the endpoint id (== the device key's
-    // public half, the identity peers TLS-authenticate against) MUST equal the
-    // store's recorded `robot_transport_key`. A transplanted / restored / fleet-
-    // misprovisioned store would otherwise boot cleanly and serve THIS robot
-    // under a DIFFERENT robot's owner + access list. LOUD refusal, never a silent
-    // wrong-robot boot.
-    if let Err(e) = check_store_device_binding(
-        endpoint.id().as_bytes(),
-        &state.trust_store.robot_transport_key(),
-    ) {
-        tracing::error!(error = %e, "cerulion_remoted: refusing to serve — trust store is not bound to this device");
-        endpoint.close().await;
-        return Err(e);
-    }
-
-    // Publish the PUBLIC beacon facts (eid / iroh_port / claimable) for the
-    // gateway's mDNS TXT enrichment. Best-effort + additive — a write
-    // failure warns, never fails the daemon. Read ownership BEFORE the store moves
-    // into the shared trust state; the claim / pair handlers refresh it after a
-    // successful claim.
-    crate::beacon_facts::write_at_startup(
-        &config.beacon_facts_file,
-        &endpoint,
-        state.trust_store.ownership(),
-    );
-
-    // Build the live trust state + the ops/wire planes and serve until shutdown. The
-    // access-check clock is the robot's own WALL clock and the wire plane uses its default
-    // revocation-sweep cadence; the `serve_endpoint` seam parameterizes both so a
-    // daemon-level test can drive a mid-session revoke deterministically through the SAME
-    // wiring.
-    let result = serve_endpoint(
-        &config,
-        state.trust_store,
-        state.device_index,
-        state.mac_key,
-        &endpoint,
-        RemotedClock::wall(),
-        None,
-        None,
-        shutdown,
-    )
-    .await;
-    endpoint.close().await;
-    result
+    // The store↔device binding check, the beacon facts and the endpoint close
+    // live in the entry: `bind` refuses a store bound to another device, `serve`
+    // closes the endpoint however serving ends.
+    config
+        .daemon_plane()
+        .bind(&config.key_files())
+        .await?
+        .serve(shutdown)
+        .await
 }
 
-/// The serving core `run` delegates to (its endpoint already built + device-bound): build
-/// the LIVE shared trust state (accept gate reads it, pairing verbs mutate it — a
-/// claim/pair takes effect at the next accept with no restart), the ops plane, and the
-/// authorizer-wired wire plane, then serve until `shutdown`.
+/// The daemon's serving core over an endpoint a test built and device-bound itself:
+/// [`serve_core`] with every ops verb and the daemon's wire plane.
 ///
 /// `access_clock` is the trusted clock every access check reads (production: the robot
 /// wall clock); `sweep_interval` overrides the wire plane's mid-session revocation-sweep
 /// cadence (`None` = the production default); `manager` overrides the wire plane's SHM
-/// transport (`None` = the production lazy singleton, `Some` = a per-test root). All three
-/// are parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a
-/// short sweep + an isolated SHM root and observe a mid-session revoke EVICT through the
-/// SAME `.with_demand_authorizer(classify)` wiring `run` uses — `#[doc(hidden)]`, not a
-/// public API.
+/// transport (`None` = the production lazy singleton reading metadata through the default
+/// control socket, `Some` = a per-test root with no metadata source). All three are
+/// parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a short
+/// sweep + an isolated SHM root and observe a mid-session revoke EVICT through the SAME
+/// `.with_demand_authorizer(classify)` wiring `run` uses. `#[doc(hidden)]`, not a public
+/// API. A host embeds [`crate::RemotePlane`] instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_endpoint(
@@ -158,6 +108,52 @@ pub async fn serve_endpoint(
     access_clock: RemotedClock,
     sweep_interval: Option<Duration>,
     manager: Option<Arc<TransportManager>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
+    // Robot identity resolves through `robot_identity_from_env`, the SAME
+    // override-aware resolver the LAN gateway uses (`CERULION_ROBOT_IDENTITY` override →
+    // else the hostname; by design the hostname is the default robot identity). The
+    // transport manager is LAZY: a `remoted` that never serves a wire peer never
+    // touches iceoryx2.
+    let robot = cerulion_core::graph::robot_identity_from_env();
+    let base = match manager {
+        Some(m) => WirePlane::with_manager(robot, m),
+        None => WirePlane::lazy(robot)
+            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
+    };
+    serve_core(
+        &PlaneFiles::of(config),
+        OpsHost::daemon(),
+        DAEMON_SERVER_NAME,
+        trust_store,
+        device_index,
+        mac_key,
+        endpoint,
+        access_clock,
+        sweep_interval,
+        base,
+        shutdown,
+    )
+    .await
+}
+
+/// The serving core every entry shares (its endpoint already built + device-bound):
+/// build the LIVE shared trust state (accept gate reads it, pairing verbs mutate it, so a
+/// claim/pair takes effect at the next accept with no restart), the ops plane with the
+/// `ops_host` verb set announcing `server_name`, and the authorizer-wired wire plane over
+/// `base`, then serve until `shutdown`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_core(
+    files: &PlaneFiles,
+    ops_host: OpsHost,
+    server_name: &str,
+    trust_store: TrustStore,
+    device_index: DeviceAccountIndex,
+    mac_key: Vec<u8>,
+    endpoint: &Endpoint,
+    access_clock: RemotedClock,
+    sweep_interval: Option<Duration>,
+    base: WirePlane,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let shared =
@@ -173,24 +169,17 @@ pub async fn serve_endpoint(
     // The ops plane over `cerulion/ops/1`: cerud's mechanical verbs + the pairing
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
-    let lease = Arc::new(Mutex::new(ControlLease::with_default_window()));
     let sessions = SharedCodePairSessions::new();
-    let ops = Arc::new(OpsServing::new(
+    let ops = Arc::new(OpsServing::for_host(
+        ops_host,
         shared,
-        lease,
         sessions,
         access_clock.clone(),
-        &config.receipt_file,
-        config.log_root.clone(),
-        "cerulion-remoted",
+        &files.receipt_file,
+        files.log_root.clone(),
+        server_name,
     )?);
 
-    // The production wire plane. Robot identity resolves through
-    // `robot_identity_from_env` — the SAME override-aware resolver the LAN gateway uses
-    // (`CERULION_ROBOT_IDENTITY` override → else the hostname; by design the hostname is the
-    // default robot identity). The transport manager is LAZY — a `remoted` that never
-    // serves a wire peer never touches iceoryx2.
-    //
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
     // plane then (a) authorizes each `demand` per topic and (b) sweeps established taps
@@ -198,12 +187,6 @@ pub async fn serve_endpoint(
     // admission EVICTS the already-streaming demander — both read the LIVE `SharedTrust`
     // the accept gate reads (no re-plumbing). `classify` is an `Arc<PairingAuthorizer>`; it
     // unsize-coerces to `Arc<dyn DemandAuthorizer>` here.
-    let robot = cerulion_core::graph::robot_identity_from_env();
-    let base = match manager {
-        Some(m) => WirePlane::with_manager(robot, m),
-        None => WirePlane::lazy(robot)
-            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
-    };
     //
     // Install the epoch-sync sink on the SAME plane (this line is the wiring
     // a daemon-level test pins). A desk that carries a newer revocation epoch delivers
@@ -228,7 +211,7 @@ pub async fn serve_endpoint(
     // only after every fallible plane is built, and owned by a guard that
     // aborts it however this future ends (an error, a cancelled future, a
     // normal return).
-    let pull = config.store_file.parent().map(|dir| {
+    let pull = files.store_file.parent().map(|dir| {
         let recheck = crate::epoch_pull::key_recheck_from_env();
         Arc::new(
             EpochPull::new(dir, shared_for_pull.clone(), pull_clock.clone()).with_recheck(recheck),
@@ -267,7 +250,7 @@ impl Drop for AbortOnDrop {
 /// device key's public half) must equal the store's `robot_transport_key`.
 /// A mismatch is a LOUD [`RemotedError::ProvisioningMismatch`] (a transplanted
 /// store governing the wrong robot). Pure so it is oracle-testable.
-fn check_store_device_binding(
+pub(crate) fn check_store_device_binding(
     endpoint_key: &[u8; 32],
     store_key: &PublicKey,
 ) -> Result<(), RemotedError> {
@@ -542,42 +525,9 @@ mod admission_reply_tests {
     }
 }
 
-/// Load the device key, trust store, and device→account side-map from disk.
-fn load_state(config: &RemotedConfig) -> Result<RemotedState, RemotedError> {
-    let device_key = load_device_key(&config.key_file)?;
-    // The trust-store MAC key authenticates BOTH the trust store AND the
-    // device→account side-map. It is REQUIRED whenever either MAC'd artifact is
-    // already on disk: a present store/index whose verification key is gone or
-    // unreadable is a PROVISIONING-class / potential-tamper failure (the secret
-    // that authenticates this robot's trust state is missing), NOT a config slip.
-    // On a genuinely-fresh robot (neither artifact present) the key is required by
-    // nothing — its absence is benign, and the absent trust store surfaces its OWN
-    // provisioning-gap error (`RemotedError::Store`) downstream (never fabricated
-    // into an empty store — see the `RemotedError::Store` docs).
-    let mac_required = config.store_file.exists() || config.index_file.exists();
-    let mac_key = load_mac_key(&config.store_mac_key_file, mac_required)?;
-    let trust_store =
-        TrustStore::load(&config.store_file, &mac_key).map_err(RemotedError::Store)?;
-    // The device→account side-map is MAC-authenticated with the SAME secure-
-    // storage key as the trust store: it is the sole device_key→
-    // account binding the accept gate trusts.
-    let device_index = DeviceAccountIndex::load(&config.index_file, &mac_key)?;
-    tracing::info!(
-        claimed = trust_store.is_claimed(),
-        bound_devices = device_index.len(),
-        "cerulion_remoted: state loaded"
-    );
-    Ok(RemotedState {
-        device_key,
-        trust_store,
-        device_index,
-        mac_key,
-    })
-}
-
 /// Load the 32-byte ed25519 device secret (raw bytes). An absent / wrong-size
 /// key is a provisioning gap, never fabricated.
-fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
+pub(crate) fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
     let bytes = std::fs::read(path).map_err(|e| {
         RemotedError::DeviceKey(format!(
             "{}: {e} (provision the robot's 32-byte device key)",
@@ -611,7 +561,11 @@ fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 /// - **not `expected` + present-but-unreadable** → still a LOUD
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
-fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
+///
+/// A present but EMPTY file loads as an empty key; when `expected`,
+/// [`crate::RemotePlane::bind`] then refuses it with [`RemotedError::MacKey`] (an
+/// empty key verifies nothing and cannot persist a mutation).
+pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
         // Genuinely-fresh robot: nothing on disk needs this key and it is simply

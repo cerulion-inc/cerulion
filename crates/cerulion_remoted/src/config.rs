@@ -48,8 +48,8 @@ pub struct RemotedConfig {
     pub receipt_file: PathBuf,
     /// The `log-tail` allow-list root.
     pub log_root: PathBuf,
-    /// The PUBLIC beacon-facts file the daemon writes at startup +
-    /// refreshes after a claim, read by the gateway for mDNS TXT enrichment.
+    /// The PUBLIC beacon-facts file the daemon writes at startup, read by the
+    /// gateway for mDNS TXT enrichment.
     pub beacon_facts_file: PathBuf,
     /// The relay posture (default: n0 public relays, by design).
     pub relay: RelayConfig,

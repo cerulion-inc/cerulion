@@ -152,3 +152,23 @@ async fn fresh_robot_missing_mac_key_defers_to_the_absent_store_gap() {
         "a fresh robot's absent store is the provisioning gap, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn present_store_with_an_empty_mac_key_file_is_a_provisioning_class_error() {
+    // An EMPTY MAC key file verifies nothing and cannot persist a claim, so a
+    // present store is never served under it: a LOUD MacKey error before any
+    // endpoint binds (the store content is never read).
+    let dir = tempdir().unwrap();
+    let remoted = dir.path().join("remoted");
+    fs::create_dir_all(&remoted).unwrap();
+    fs::write(remoted.join("device_key"), [7u8; 32]).unwrap();
+    fs::write(remoted.join("trust_store.mac_key"), b"").unwrap();
+    fs::write(remoted.join("trust_store"), b"present-but-unverifiable").unwrap();
+    let cfg =
+        RemotedConfig::from_state_root(dir.path(), RelayConfig::Disabled, /*disabled=*/ false);
+    let err = run(cfg, async {}).await.unwrap_err();
+    assert!(
+        matches!(&err, RemotedError::MacKey(m) if m.contains("empty trust-store MAC key")),
+        "expected an empty-key MacKey error, got {err:?}"
+    );
+}

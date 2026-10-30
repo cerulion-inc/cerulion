@@ -72,20 +72,23 @@ use std::time::Duration;
 use cerulion_link::{accept_frame_stream, Accepted, Connection, QuicOpsStream};
 
 use cerud::authz::Authorizer;
+use cerud::error::{CerudError, CerudResult};
 use cerud::lease::ControlLease;
 use cerud::receipt::ReceiptLog;
 use cerud::server::OpsServer;
 use cerud::transport::{CallerIdentity, OpsConnection};
-use cerud::verbs::{InventoryVerb, LogTailVerb, RestartVerb, VerbRegistry};
+use cerud::verbs::{InventoryVerb, LogTailVerb, RestartVerb, VerbHandler, VerbRegistry};
 
 use crate::authorizer::PairingAuthorizer;
 use crate::clock::RemotedClock;
 use crate::error::RemotedError;
+use crate::host::OpsHost;
 use crate::pairing_verbs::{
     ClaimVerb, CodePairFinishVerb, CodePairStartVerb, EngageEstopVerb, PairVerb, PresentGrantVerb,
     SharedCodePairSessions,
 };
 use crate::trust::SharedTrust;
+use crate::verbs;
 
 /// Sentinel returned by the blocking session task when the shared [`OpsServer`]'s
 /// hash-chained receipt SINK is POISONED (a prior session panicked mid receipt
@@ -140,33 +143,32 @@ impl OpsServing {
         log_root: PathBuf,
         server_name: impl Into<String>,
     ) -> Result<Self, RemotedError> {
-        let mut verbs = VerbRegistry::new();
-        // cerud's mechanical ops verbs.
-        verbs
-            .register(Box::new(InventoryVerb))
-            .register(Box::new(LogTailVerb::new(log_root)))
-            .register(Box::new(RestartVerb::new()))
-            // The remote-plane bootstrap + safety verbs (self-gating; the pairing
-            // authorizer classifies them bootstrap/e-stop-floor).
-            .register(Box::new(ClaimVerb::new(shared.clone(), clock.clone())))
-            .register(Box::new(PairVerb::new(shared.clone(), clock.clone())))
-            // Establish access from a desk-carried, owner-signed grant.
-            .register(Box::new(PresentGrantVerb::new(
-                shared.clone(),
-                clock.clone(),
-            )))
-            .register(Box::new(CodePairStartVerb::new(
-                shared.clone(),
-                sessions.clone(),
-                clock.clone(),
-            )))
-            .register(Box::new(CodePairFinishVerb::new(
-                shared.clone(),
-                sessions,
-                clock,
-            )))
-            .register(Box::new(EngageEstopVerb::new(lease)));
+        Self::for_host(
+            OpsHost::Daemon { lease },
+            shared,
+            sessions,
+            clock,
+            receipt_path,
+            log_root,
+            server_name,
+        )
+    }
 
+    /// [`OpsServing::new`] with the verb set of `host`: a library host registers
+    /// [`DaemonOnlyVerb`] under the `restart` and `engage-estop` names, so the
+    /// authorizer still classifies each call and a permitted caller gets a clear
+    /// refusal instead of an unknown verb.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_host(
+        host: OpsHost,
+        shared: SharedTrust,
+        sessions: SharedCodePairSessions,
+        clock: RemotedClock,
+        receipt_path: &Path,
+        log_root: PathBuf,
+        server_name: impl Into<String>,
+    ) -> Result<Self, RemotedError> {
+        let verbs = verb_registry(host, &shared, sessions, clock, log_root);
         let authorizer: Box<dyn Authorizer> = Box::new(PairingAuthorizer::from_shared(shared));
         let receipts = ReceiptLog::open(receipt_path).map_err(|e| {
             RemotedError::Ops(format!(
@@ -316,9 +318,155 @@ impl OpsServing {
     }
 }
 
+/// The ops verb registry of `host`: cerud's mechanical verbs and the remote-plane
+/// bootstrap and safety verbs, with `restart` and `engage-estop` refused by name
+/// on an embedded host. Both hosts register the same names.
+fn verb_registry(
+    host: OpsHost,
+    shared: &SharedTrust,
+    sessions: SharedCodePairSessions,
+    clock: RemotedClock,
+    log_root: PathBuf,
+) -> VerbRegistry {
+    let (restart, engage_estop): (Box<dyn VerbHandler>, Box<dyn VerbHandler>) = match host {
+        OpsHost::Daemon { lease } => (
+            Box::new(RestartVerb::new()),
+            Box::new(EngageEstopVerb::new(lease)),
+        ),
+        OpsHost::Embedded => (
+            Box::new(DaemonOnlyVerb::RESTART),
+            Box::new(DaemonOnlyVerb::ENGAGE_ESTOP),
+        ),
+    };
+    let mut verbs = VerbRegistry::new();
+    // cerud's mechanical ops verbs.
+    verbs
+        .register(Box::new(InventoryVerb))
+        .register(Box::new(LogTailVerb::new(log_root)))
+        .register(restart)
+        // The remote-plane bootstrap + safety verbs (self-gating; the pairing
+        // authorizer classifies them bootstrap/e-stop-floor).
+        .register(Box::new(ClaimVerb::new(shared.clone(), clock.clone())))
+        .register(Box::new(PairVerb::new(shared.clone(), clock.clone())))
+        // Establish access from a desk-carried, owner-signed grant.
+        .register(Box::new(PresentGrantVerb::new(
+            shared.clone(),
+            clock.clone(),
+        )))
+        .register(Box::new(CodePairStartVerb::new(
+            shared.clone(),
+            sessions.clone(),
+            clock.clone(),
+        )))
+        .register(Box::new(CodePairFinishVerb::new(
+            shared.clone(),
+            sessions,
+            clock,
+        )))
+        .register(engage_estop);
+    verbs
+}
+
+/// A verb a library host refuses by name: it acts on something only the
+/// `cerulion-remoted` daemon has. Registered under the daemon verb's own name, so
+/// the authorizer classifies the call exactly as on the daemon (an unpaired caller
+/// is still denied) and a permitted caller gets an `unsupported_host` error that
+/// says why. It has no side effect, so it is not mutating and writes no intent
+/// receipt.
+pub(crate) struct DaemonOnlyVerb {
+    name: &'static str,
+    why: &'static str,
+}
+
+impl DaemonOnlyVerb {
+    const RESTART: Self = DaemonOnlyVerb {
+        name: verbs::RESTART,
+        why: "it restarts a graph's systemd unit",
+    };
+    const ENGAGE_ESTOP: Self = DaemonOnlyVerb {
+        name: verbs::ENGAGE_ESTOP,
+        why: "it engages the daemon's control lease and asks for an incident capture, so \
+              this host would report an e-stop that stops nothing; stop through the host's \
+              own stop path",
+    };
+}
+
+impl VerbHandler for DaemonOnlyVerb {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn is_mutating(&self) -> bool {
+        false
+    }
+    fn execute(&self, _args: &serde_json::Value) -> CerudResult<serde_json::Value> {
+        Err(CerudError::UnsupportedHost(format!(
+            "{} is served only by the cerulion-remoted daemon: {}. This host serves the \
+             remote plane as a library",
+            self.name, self.why
+        )))
+    }
+}
+
 /// Close a QUIC connection with the ops-deadline application code + reason.
 /// `0u32.into()` resolves to the connection's `VarInt` error-code type by
 /// inference, so this needs no direct `iroh` dependency.
 fn close(connection: &Connection) {
     connection.close(0u32.into(), b"ops session deadline");
+}
+
+#[cfg(test)]
+mod verb_set_tests {
+    use super::*;
+    use crate::device_index::DeviceAccountIndex;
+    use cerulion_pairing::format::{PublicKey, RobotId, RootSet};
+    use cerulion_pairing::verify::TrustStore;
+
+    fn names(host: OpsHost) -> Vec<String> {
+        let root = PublicKey(
+            ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let store = TrustStore::provision(
+            RobotId([5; 32]),
+            PublicKey([7; 32]),
+            RootSet::new(vec![root], 1).unwrap(),
+            b"verb-set-chassis-secret",
+            0,
+        )
+        .unwrap();
+        let shared = SharedTrust::new(store, DeviceAccountIndex::new(), Vec::new());
+        let registry = verb_registry(
+            host,
+            &shared,
+            SharedCodePairSessions::new(),
+            RemotedClock::fixed(0),
+            PathBuf::from("logs"),
+        );
+        let mut names: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_embedded_host_registers_every_daemon_verb_name() {
+        // The authorizer classifies by name before dispatch, so the refusing
+        // stand-ins must carry the daemon verbs' exact names.
+        let daemon = names(OpsHost::Daemon {
+            lease: Arc::new(Mutex::new(ControlLease::with_default_window())),
+        });
+        let expected = [
+            "claim",
+            "code-pair-finish",
+            "code-pair-start",
+            "engage-estop",
+            "inventory",
+            "log-tail",
+            "pair",
+            "present-grant",
+            "restart",
+        ];
+        assert_eq!(daemon, expected);
+        assert_eq!(names(OpsHost::Embedded), expected);
+    }
 }
