@@ -354,6 +354,36 @@ jobs:
             ${{ runner.temp }}/debs/*.deb.sha256
           if-no-files-found: error
 
+  # The `cerulion_android` Java facade as a versioned asset,
+  # `cerulion-android-java-<version>.tar.gz`: the crate's `java/` tree and its
+  # LICENSE, the same files the crates.io package carries, so an app can add
+  # the facade to its Gradle sources without reading a Cargo checkout. The
+  # archive is reproducible, so its checksum in SHA256SUMS can be checked
+  # against a local `package_android_java.py` run at the tagged commit. The
+  # tag check is the `build` job's; `release` needs both jobs.
+  android-java:
+    name: Package the Android Java facade
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Package the facade
+        id: package
+        run: |
+          version=$(tools/scripts/workspace_version.sh)
+          python3 -I tools/scripts/package_android_java.py --version "$version" --out "$RUNNER_TEMP/android-java"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the facade artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cerulion-android-java-${{ steps.package.outputs.version }}
+          path: |
+            ${{ runner.temp }}/android-java/cerulion-android-java-${{ steps.package.outputs.version }}.tar.gz
+            ${{ runner.temp }}/android-java/cerulion-android-java-${{ steps.package.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
+
   # A Linux archive or deb whose rmw does not carry ROS 2 traffic must never
   # be published: install the deb in a clean Jazzy container and run the
   # README's own command through it. The same check runs on a plain dispatch,
@@ -420,7 +450,7 @@ jobs:
   release:
     name: Publish GitHub Release assets
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: [build, verify-rmw, rmw-lyrical]
+    needs: [build, android-java, verify-rmw, rmw-lyrical]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -428,7 +458,8 @@ jobs:
       # Only the `cerulion-*` artifacts are release assets. The `rmw-*` and
       # `rmw-lyrical-*` library artifacts and the `rmw-verify-*` logs are
       # build evidence, not downloads: the Jazzy library ships inside the Linux
-      # archives.
+      # archives. The Android Java facade archive is a `cerulion-*` artifact
+      # too, so it is a release asset with its line in SHA256SUMS.
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
