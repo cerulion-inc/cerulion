@@ -110,6 +110,49 @@ pub(crate) const ROS_TOPIC_CREATE_PUBLISHERS: usize = 32;
 /// [`TopicServiceConfig::create_subscriber_floor`]: cerulion_core::transport::TopicServiceConfig::create_subscriber_floor
 pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
 
+/// The native history every rmw endpoint CREATES a ROS topic's iceoryx2
+/// service with, whatever its own QoS, and the most a TRANSIENT_LOCAL
+/// publisher retains (its depth is clamped to `1..=` this). Applied as
+/// [`TopicServiceConfig::create_history_floor`], which also raises the
+/// created buffer ceiling to `(16 * 4).div_ceil(3)` = 22. The publisher and
+/// the subscription both carry it, so the first opener of a topic creates the
+/// service any later rmw opener needs, and open order cannot refuse a deeper
+/// TRANSIENT_LOCAL publisher. A late joiner's share of the retained frames is
+/// set per subscription by its history request (see `rmw_create_subscription`).
+/// Types whose slice ceiling exceeds [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`] take
+/// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] instead; see
+/// [`ros_topic_history_depth`].
+///
+/// [`TopicServiceConfig::create_history_floor`]: cerulion_core::transport::TopicServiceConfig::create_history_floor
+pub(crate) const ROS_TOPIC_HISTORY_DEPTH: usize = 16;
+
+/// The history limit for types whose slice ceiling exceeds
+/// [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`]: 12 is the deepest history the default
+/// subscriber buffer of 16 holds (`16 * 3 / 4`), so the created buffer ceiling
+/// is not raised.
+pub(crate) const ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH: usize = 12;
+
+/// The largest slice ceiling that takes [`ROS_TOPIC_HISTORY_DEPTH`]: the
+/// 16 MiB tier. At the 128 MiB tier (8 subscriber slots, 2 borrowed samples
+/// each, or 4 for a loan-take type such as `sensor_msgs/Image`, and 4 loaned
+/// samples) one publisher's segment is `8 * (22 + 2) + 16 + 4` = 212 slices
+/// (26.5 GiB of address space) at history 16, and `8 * (16 + 2) + 12 + 4` =
+/// 160 slices (20 GiB) at history 12; with 4 borrowed samples, 228 slices
+/// (28.5 GiB) and 176 slices (22 GiB).
+pub(crate) const ROS_TOPIC_FULL_HISTORY_MAX_SLICE: u32 = 16 * 1024 * 1024;
+
+/// The history limit of a ROS topic whose slices are `slice_len` bytes:
+/// [`ROS_TOPIC_HISTORY_DEPTH`] up to [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`],
+/// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] above it. Every rmw endpoint of a
+/// topic derives it from the same type, so they all create the same service.
+pub(crate) fn ros_topic_history_depth(slice_len: MaxSliceLen) -> usize {
+    if slice_len.get() <= ROS_TOPIC_FULL_HISTORY_MAX_SLICE {
+        ROS_TOPIC_HISTORY_DEPTH
+    } else {
+        ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH
+    }
+}
+
 /// The slice bytes the subscriber floor may account for, summed over the
 /// floor's slots: [`ros_topic_create_subscribers`] divides it by the topic's
 /// slice ceiling. 1 GiB gives 8 slots at the 128 MiB tier (`sensor_msgs/Image`,
@@ -509,11 +552,14 @@ pub unsafe extern "C" fn rmw_create_publisher(
             }
         };
         // Transient-local durability maps to Cerulion history (late-joiner
-        // replay); the requested depth is clamped to [1, 16] (floor 1 so a
-        // TRANSIENT_LOCAL request always retains at least one frame; cap 16 is
-        // an rmw policy choice — Cerulion core accepts a larger `history_size`,
-        // it just warns when history exceeds 75% of the subscriber buffer,
-        // which the ceiling raise below neutralizes by provisioning that buffer up).
+        // replay); the requested depth is clamped to [1, limit], where the limit
+        // is the type's `ros_topic_history_depth` (16, or 12 above the 16 MiB
+        // slice tier). Floor 1 so a TRANSIENT_LOCAL request always retains at
+        // least one frame; the cap is the history every rmw endpoint creates
+        // the topic with, so a clamped request always opens. Cerulion core
+        // warns when history exceeds 75% of the subscriber buffer; the create
+        // floor provisions a buffer that holds the limit, and the ceiling raise
+        // below sets this publisher's open requirement to match.
         // VOLATILE (and any non-TRANSIENT_LOCAL durability) retains nothing
         // (history = 0).
         //
@@ -526,24 +572,27 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // durability at the warn site is what keeps the two from drifting: a
         // future retaining durability cannot be added without visiting this
         // tuple, and the clamp constant can move without touching the gate.
+        // The per-type slice ceiling also sets the topic's history limit
+        // (`ros_topic_history_depth`), the clamp below and the create floor.
+        let slice_len = slice_len_for(&bridge);
+        let history_limit = ros_topic_history_depth(slice_len);
         let (history, depth_governs_retention) =
             if (*qos).durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL {
-                ((*qos).depth.clamp(1, 16), true)
+                ((*qos).depth.clamp(1, history_limit), true)
             } else {
                 (0, false)
             };
-        // The retention-depth reporting rule:
-        // the provisioned depth endpoint info reports is HISTORY / RETENTION —
-        // the frames this publisher actually keeps — NOT the subscriber-slot
-        // ceiling `topic_config.subscriber_max_buffer_size` computed below.
-        //
-        // A TRANSIENT_LOCAL depth-1000 publisher therefore reports 16 (the
-        // clamp), a depth-5 one reports 5, and a VOLATILE one reports 0. The
-        // ceiling (22 for a clamped history 16) is a slot BUDGET, not a depth
-        // anything retains: reporting it would make a depth-5 publisher claim
-        // 16 while retaining 5. The 22 ceiling stays pinned where
-        // it belongs, by the require-N probes in
-        // `rmw_transient_local_ceiling_test.rs`.
+        // The depth endpoint info reports is this publisher's clamped ask
+        // (`history`), NOT the subscriber-slot ceiling
+        // `topic_config.subscriber_max_buffer_size` computed below and NOT
+        // the service history. A TRANSIENT_LOCAL depth-1000 publisher of a
+        // small type reports 16 (the clamp), a depth-5 one reports 5, and a
+        // VOLATILE one reports 0. The service history is the topic's limit for
+        // every publisher (iceoryx2 sizes a publisher's retained ring from the
+        // service), and a late joiner takes up to its own history request from
+        // that ring, so a subscription deeper than this publisher's depth can
+        // receive more than the reported depth. The 22 ceiling stays pinned by
+        // the require-N probes in `rmw_transient_local_ceiling_test.rs`.
         let requested_depth = (*qos).depth;
         // A TRANSIENT_LOCAL publisher makes its own history request SATISFIABLE
         // by provisioning the
@@ -551,8 +600,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // history down or touching the core warn). cerulion_core warns when
         //   history_size > subscriber_max_buffer_size * 3 / 4
         // (transport/mod.rs — CORRECT and left untouched), so a latched
-        // /rosout-class topic (rclpy asks TRANSIENT_LOCAL depth 1000 → clamped
-        // to 16) would trip it on EVERY rclpy process. Raise the ceiling to the
+        // /rosout-class topic (rclpy asks TRANSIENT_LOCAL depth 1000, clamped
+        // to the type's limit: 12 for `rcl_interfaces/Log`, which takes the
+        // 128 MiB catch-all tier) would trip it on EVERY rclpy process. Raise the ceiling to the
         // smallest `c` with `history <= c*3/4` in that integer expression:
         // `c*3/4 >= history` ⇔ `c >= 4*history/3` ⇔ `c = ceil(4*history/3) =
         // (history*4).div_ceil(3)`. Then late-joiners CAN hold the full
@@ -562,6 +612,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // 1 <= default*3/4).
         let mut topic_config = rt.transport.default_topic_config();
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
+        topic_config.create_history_floor = Some(history_limit);
         topic_config.history_size = history;
         if history > 0 {
             topic_config.subscriber_max_buffer_size = topic_config
@@ -595,7 +646,6 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // create-time answer is the port's answer for its whole life. The
         // geometry is cached on the handle so the per-call paths never
         // recompute eligibility.
-        let slice_len = slice_len_for(&bridge);
         topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
         let windowed_geo = windowed_borrow_geometry(
             &bridge,
@@ -647,20 +697,15 @@ pub unsafe extern "C" fn rmw_create_publisher(
             }
         };
 
-        // The depth this endpoint really
-        // retains, READ BACK from the service the publisher just opened rather
-        // than assumed equal to `history`. The two diverge whenever this create
-        // ATTACHED to a service someone else made deeper — iceoryx2's
-        // `.history_size(N)` open verification is at-least, and the port is
-        // sized from the service's static config, so a depth-5 request on a
-        // depth-16 topic really retains 16 (MEASURED by a late joiner in
-        // `rmw_transient_local_ceiling_test.rs`). Reporting the ask there would
-        // understate what late joiners receive — the exact inversion of this
-        // decision. On a fresh CREATE the read-back equals `history`, so every
-        // decided value is unchanged: TL-1000 ⇒ 16, TL-5 ⇒ 5, VOLATILE ⇒ 0
-        // (iceoryx2's own default `publisher_history_size` is 0, and Cerulion
-        // only calls `.history_size()` when the request is nonzero).
-        let provisioned_depth = publisher.provisioned_history_size();
+        // The depth this endpoint reports is its clamped ask: TRANSIENT_LOCAL
+        // depth-N reports N clamped to the type's limit, VOLATILE reports 0.
+        // Every rmw endpoint creates the service at that limit
+        // (`create_history_floor`), so the retained ring is that deep whatever
+        // this publisher asked; what a late joiner takes from it is its own
+        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth), set in
+        // `rmw_create_subscription`. The open requirement is at-least, so an
+        // opened service always holds at least `history` frames.
+        let provisioned_depth = history;
 
         // Say LOUDLY, at create time, that the ask was not what the
         // endpoint got — naming BOTH numbers, so a ROS user asking for
@@ -682,8 +727,9 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // on every create of the ordinary ROS path (rclcpp's default QoS is
         // KeepLast(10) + VOLATILE) that says only "you chose VOLATILE". So the
         // gate is `depth_governs_retention`: it fires only where the CALLER'S
-        // DEPTH really was clamped — TRANSIENT_LOCAL above the ceiling
-        // (depth 1000 ⇒ 16) or below the floor (the degenerate depth 0 ⇒ 1).
+        // DEPTH really was clamped — TRANSIENT_LOCAL above the type's limit
+        // (depth 1000 ⇒ 16 for a small type) or below the floor (the
+        // degenerate depth 0 ⇒ 1).
         if depth_governs_retention && requested_depth != provisioned_depth {
             tracing::warn!(
                 topic = %topic,
@@ -2367,8 +2413,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // The subscriber-slot reporting rule: `create_subscriber` forwards
         // the transport DEFAULTS — the caller's `depth`/`history` are read
         // exactly once, below, to fill an introspection record, and are never
-        // applied to the iceoryx2 queue (the depth-honoring
-        // `create_subscriber_with_buffers` is not used on this path). So the
+        // applied to the iceoryx2 queue (the port buffer passed below is the
+        // transport default; the depth only sizes the history request). So the
         // depth this endpoint really got is the transport's default subscriber
         // buffer, and that is what endpoint info reports instead of
         // echoing an ask that changed nothing.
@@ -2386,8 +2432,23 @@ pub unsafe extern "C" fn rmw_create_subscription(
         // subscription carries the publisher's floors too, the subscriber
         // floor from the same per-type slice ceiling the publisher uses.
         topic_config.create_publisher_floor = Some(ROS_TOPIC_CREATE_PUBLISHERS);
-        topic_config.create_subscriber_floor =
-            Some(ros_topic_create_subscribers(slice_len_for(&bridge)));
+        let slice_len = slice_len_for(&bridge);
+        let history_limit = ros_topic_history_depth(slice_len);
+        topic_config.create_subscriber_floor = Some(ros_topic_create_subscribers(slice_len));
+        // The same history floor the publisher carries, so a subscription
+        // that creates the topic first creates the service any TRANSIENT_LOCAL
+        // publisher of this type can open.
+        topic_config.create_history_floor = Some(history_limit);
+        // The retained frames this subscription takes when it connects: a
+        // VOLATILE subscription takes none, a TRANSIENT_LOCAL one up to its
+        // depth (DDS durability). The core clamps the request to the service
+        // history and this port's buffer.
+        let history_request = if (*qos).durability == ffi::RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL
+        {
+            (*qos).depth.clamp(1, history_limit)
+        } else {
+            0
+        };
         // The take-side gate (fixed types AND forgeable-
         // sequence types) — distinct from the publisher's `can_loan`.
         let can_loan_take = bridge.can_loan_take();
@@ -2421,10 +2482,11 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
-        let subscriber = match rt.transport.create_subscriber_with_buffers(
+        let subscriber = match rt.transport.create_subscriber_with_history_request(
             &topic,
             topic_config,
             provisioned_depth,
+            history_request,
         ) {
             Ok(s) => s,
             Err(e) => {
