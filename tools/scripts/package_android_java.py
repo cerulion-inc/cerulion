@@ -11,7 +11,8 @@ package of `cerulion_android` carries for them.
 
 The archive is reproducible: members are sorted, owned by 0:0 with modes
 0755/0644 and time 0, and the gzip header carries no time and no name, so two
-runs over the same sources give the same bytes and the same checksum.
+runs over the same sources with the same zlib give the same bytes and the
+same checksum.
 
 Every refusal happens before anything is written: a version that is not
 `X.Y.Z` or `X.Y.Z-<pre>`, a crate with no `java/` directory, a `java/` tree
@@ -29,7 +30,7 @@ import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 DEFAULT_CRATE = ROOT / "crates" / "cerulion_android"
-VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?")
 
 
 def refuse(message):

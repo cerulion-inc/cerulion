@@ -143,8 +143,13 @@ class FixtureAsset(unittest.TestCase):
         self.assertEqual((out_a / name).read_bytes(), (out_b / name).read_bytes())
         self.assertEqual((out_a / f"{name}.sha256").read_bytes(), (out_b / f"{name}.sha256").read_bytes())
 
+    def test_a_prerelease_identifier_may_carry_a_hyphen(self):
+        result, out = self.package(version="1.1.0-rc-1.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((out / "cerulion-android-java-1.1.0-rc-1.2.tar.gz").is_file())
+
     def test_a_version_that_is_not_semver_is_refused(self):
-        for version in ("v1.1.0", "1.1", "", "1.1.0/../x", "1.1.0 "):
+        for version in ("v1.1.0", "1.1", "", "1.1.0/../x", "1.1.0 ", "1.1.0-", "1.1.0-rc..1", "1.1.0-rc/1"):
             with self.subTest(version=version):
                 result, out = self.package(version=version)
                 self.assertNotEqual(result.returncode, 0)
@@ -182,6 +187,31 @@ class FixtureAsset(unittest.TestCase):
         result, out = self.package()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("symbolic link", result.stderr)
+        self.assertFalse(out.exists())
+
+    def test_a_java_directory_that_is_a_symbolic_link_is_refused(self):
+        elsewhere = self.root / "elsewhere"
+        self.crate.joinpath("java").rename(elsewhere)
+        self.crate.joinpath("java").symlink_to(elsewhere, target_is_directory=True)
+        result, out = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("java", result.stderr)
+        self.assertFalse(out.exists())
+
+    def test_a_license_that_is_a_symbolic_link_is_refused(self):
+        elsewhere = self.root / "LICENSE.elsewhere"
+        self.crate.joinpath("LICENSE").rename(elsewhere)
+        self.crate.joinpath("LICENSE").symlink_to(elsewhere)
+        result, out = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LICENSE", result.stderr)
+        self.assertFalse(out.exists())
+
+    def test_an_entry_that_is_neither_file_nor_directory_is_refused(self):
+        os.mkfifo(self.crate / "java" / "com" / "pipe")
+        result, out = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("neither a file nor a directory", result.stderr)
         self.assertFalse(out.exists())
 
     def test_missing_arguments_are_refused(self):

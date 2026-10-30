@@ -358,9 +358,9 @@ jobs:
   # `cerulion-android-java-<version>.tar.gz`: the crate's `java/` tree and its
   # LICENSE, the same files the crates.io package carries, so an app can add
   # the facade to its Gradle sources without reading a Cargo checkout. The
-  # archive is reproducible, so its checksum in SHA256SUMS can be checked
-  # against a local `package_android_java.py` run at the tagged commit. The
-  # tag check is the `build` job's; `release` needs both jobs.
+  # script fixes member order, owner, mode and time, so the archive can be
+  # rebuilt from the tagged commit (byte for byte with this runner's zlib).
+  # The tag check is the `build` job's; `release` needs both jobs.
   android-java:
     name: Package the Android Java facade
     if: github.event_name != 'workflow_dispatch' || inputs.smoke_tag == ''
@@ -660,13 +660,14 @@ jobs:
       # three that already exist on crates.io: `cargo publish --workspace`
       # publishes in dependency order and cerulion_cli depends on every other
       # publishable crate, so its presence at this version proves the whole
-      # workspace landed — except cerulion_wsd, which nothing depends on and
-      # which publishes beside it, so it is waited for by name. A publish that
+      # workspace landed, except cerulion_wsd and cerulion_android, which
+      # nothing depends on and which publish beside it, so they are waited for
+      # by name. A publish that
       # stops at one of the twelve never-published names (the crates.io new-crate
       # rate-limit shape) would otherwise leave this smoke GREEN while
       # `cargo install cerulion_cli` resolves nothing.
       - name: Wait for crates.io publication
-        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd
+        run: source-checkout/tools/scripts/wait_for_crates_io.sh "${TAG#v}" 2700 cerulion_macros cerulion_core native_ros2_messages cerulion_netd cerulion_cli cerulion_wsd cerulion_android
 
       - name: Run README quick-start
         run: |
